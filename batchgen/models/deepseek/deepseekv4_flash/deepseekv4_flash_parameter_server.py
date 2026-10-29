@@ -28,6 +28,7 @@ from batchgen.config.model_registry import load_config
 from batchgen.server.process_utils import get_model_byte_size
 
 from .tensor_contract import build_v4_weight_contract
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -58,6 +59,7 @@ class DeepSeekV4Flash_Parameter_Server:
     def Init(self):
         self._parse_state_dict()
         self.parameter_server = Parameter_Server(
+            native_log_level(),
             self.enable_hugetlbfs,
             self.enable_thp,
         )

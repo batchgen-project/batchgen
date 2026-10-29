@@ -29,6 +29,7 @@ from tqdm import tqdm, trange
 from transformers import MixtralForCausalLM, MixtralConfig as HFMixtralConfig
 
 from batchgen.config.model_registry import load_config
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -58,7 +59,9 @@ class Mixtral_Parameter_Server:
     def Init(self):
         self._save_safetensors_to_pt()
         self._parse_state_dict()
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
         if "8x7B" in self.huggingface_ckpt_name:
             byte_size = 48 * 1024 * 1024 * 1024 * 2
         elif "8x22B" in self.huggingface_ckpt_name:

@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
+from batchgen.eventlog.process import native_log_level
 from batchgen.models.engine_loader import core_engine as bg_lib
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 	)
 
 	config = bg_lib.HostPagedKVConfig()
+	config.log_level = native_log_level()
 	config.shm_name = shm_name
 	config.num_layers = profile.num_layers
 	config.num_pages = num_pages

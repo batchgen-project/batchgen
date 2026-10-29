@@ -6,6 +6,7 @@ from typing import Any, Dict, Sequence
 
 import torch
 
+from batchgen.eventlog.process import native_log_level
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.models.engine_loader import core_engine as bg_lib
 
@@ -493,6 +494,7 @@ def build_host_kv_config(
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.log_level = native_log_level()
 	apply_page_format(config, profile.page_format)
 	config.logical_to_physical_layer = list(
 		profile.logical_to_physical_layer or ()
@@ -639,6 +641,7 @@ def build_host_kv_config_aux(
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.log_level = native_log_level()
 	apply_page_format(config, profile.page_format)
 	return config
 

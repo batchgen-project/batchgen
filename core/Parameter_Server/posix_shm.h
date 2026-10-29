@@ -22,7 +22,10 @@
 #include "Parameter_Server.h"
 #include <string>
 #include <unordered_map>
-void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
+// log_level is the configured level of the component that owns this
+// allocation; the shared-memory logger is created from it on first use.
+void* allocate_shared_pinned_memory(const std::string& log_level,
+                                    const std::string& shm_name, int64_t size,
                                     bool create, bool enable_hugetlbfs,
                                     bool pin_for_cuda = true,
                                     bool enable_thp = false,
@@ -30,7 +33,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     int memfd_fd = -1,
                                     int* out_memfd_fd = nullptr,
                                     int64_t* out_mapped_size = nullptr);
-void free_shared_pinned_memory(void* ptr, int64_t size);
+void free_shared_pinned_memory(const std::string& log_level, void* ptr,
+                               int64_t size);
 // Returns the creator's memfd, which must stay open for attachers to reach it
 // through /proc/<creator_pid>/fd/<N>.
 int serialize_to_memfd(

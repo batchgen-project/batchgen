@@ -54,6 +54,7 @@ from tqdm import trange
 
 from batchgen.config.model_registry import load_config
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -138,7 +139,9 @@ class KimiK25_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
 
         # Kimi K2.5: ~580GB INT4 experts + ~20GB BF16 (attn/shared/embed) ≈ 600GB
         # 650GB with buffer

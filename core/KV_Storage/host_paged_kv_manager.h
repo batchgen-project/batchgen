@@ -89,7 +89,7 @@ class HostPagedKVManager {
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache) {
-        this->logger_ = init_logger("info",
+        this->logger_ = init_logger(config_.log_level,
             config_.logger_name.empty() ? "HostPagedKVManager" : config_.logger_name);
         this->logger_->info(
             "Constructed HostPagedKVManager (shm_name={}, layers={}, pages={}, "

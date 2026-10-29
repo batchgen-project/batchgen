@@ -26,6 +26,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
+#include <cctype>
 #include <condition_variable>
 #include <iomanip>
 #include <memory>
@@ -251,10 +252,21 @@ Module_Batching_Config parse_module_batching_config(
 
 namespace {
 
-std::size_t CheckedSize(long long value, std::string_view field_name) {
+// The configured level of the engine config currently being parsed. The
+// config parsers are free functions with no component of their own, so the
+// level comes straight out of the object they are handed.
+std::string EngineConfigLogLevel(const py::object& engine_config) {
+    return engine_config.attr("Basic_Config")
+        .attr("log_level")
+        .cast<std::string>();
+}
+
+std::size_t CheckedSize(const std::shared_ptr<spdlog::logger>& logger,
+                        long long value, std::string_view field_name) {
     if (value < 0) {
         std::ostringstream oss;
         oss << field_name << " must be non-negative (got " << value << ')';
+        logger->error("Engine config rejected: {}", oss.str());
         throw std::invalid_argument(oss.str());
     }
     return static_cast<std::size_t>(value);
@@ -266,29 +278,31 @@ HostPagedKVConfig parse_host_paged_kv_config(
     if (!py::hasattr(engine_config, "Host_Paged_KV_Config")) {
         return config;
     }
+    const auto logger =
+        init_logger(EngineConfigLogLevel(engine_config), "EngineConfig");
     const py::object cfg = engine_config.attr("Host_Paged_KV_Config");
     config.shm_name = cfg.attr("shm_name").cast<std::string>();
-    config.total_byte_size = CheckedSize(
+    config.total_byte_size = CheckedSize(logger,
         cfg.attr("total_byte_size").cast<long long>(),
         "Host_Paged_KV_Config.total_byte_size");
-    config.num_layers = CheckedSize(
+    config.num_layers = CheckedSize(logger,
         cfg.attr("num_layers").cast<long long>(),
         "Host_Paged_KV_Config.num_layers");
-    config.num_pages_per_layer = CheckedSize(
+    config.num_pages_per_layer = CheckedSize(logger,
         cfg.attr("num_pages_per_layer").cast<long long>(),
         "Host_Paged_KV_Config.num_pages_per_layer");
-    config.page_size = CheckedSize(cfg.attr("page_size").cast<long long>(),
+    config.page_size = CheckedSize(logger, cfg.attr("page_size").cast<long long>(),
                                    "Host_Paged_KV_Config.page_size");
-    config.num_k_heads = CheckedSize(
+    config.num_k_heads = CheckedSize(logger,
         cfg.attr("num_k_heads").cast<long long>(),
         "Host_Paged_KV_Config.num_k_heads");
-    config.k_head_dim = CheckedSize(
+    config.k_head_dim = CheckedSize(logger,
         cfg.attr("k_head_dim").cast<long long>(),
         "Host_Paged_KV_Config.k_head_dim");
-    config.num_v_heads = CheckedSize(
+    config.num_v_heads = CheckedSize(logger,
         cfg.attr("num_v_heads").cast<long long>(),
         "Host_Paged_KV_Config.num_v_heads");
-    config.v_head_dim = CheckedSize(
+    config.v_head_dim = CheckedSize(logger,
         cfg.attr("v_head_dim").cast<long long>(),
         "Host_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
@@ -300,7 +314,7 @@ HostPagedKVConfig parse_host_paged_kv_config(
     if (py::hasattr(cfg, "page_format")) {
         config.page_format = cfg.attr("page_format").cast<std::string>();
     }
-    std::cout << "Host Paged KV Config Parsed Successfully" << std::endl;
+    logger->info("Host Paged KV Config parsed successfully");
     return config;
 }
 
@@ -310,30 +324,32 @@ DevicePagedKVConfig parse_device_paged_kv_config(
     if (!py::hasattr(engine_config, "Device_Paged_KV_Config")) {
         return config;
     }
+    const auto logger =
+        init_logger(EngineConfigLogLevel(engine_config), "EngineConfig");
     const py::object cfg = engine_config.attr("Device_Paged_KV_Config");
-    config.num_layers = CheckedSize(
+    config.num_layers = CheckedSize(logger,
         cfg.attr("num_layers").cast<long long>(),
         "Device_Paged_KV_Config.num_layers");
-    config.num_pages_per_layer = CheckedSize(
+    config.num_pages_per_layer = CheckedSize(logger,
         cfg.attr("num_pages_per_layer").cast<long long>(),
         "Device_Paged_KV_Config.num_pages_per_layer");
-    config.page_size = CheckedSize(
+    config.page_size = CheckedSize(logger,
         cfg.attr("page_size").cast<long long>(),
         "Device_Paged_KV_Config.page_size");
-    config.num_k_heads = CheckedSize(
+    config.num_k_heads = CheckedSize(logger,
         cfg.attr("num_k_heads").cast<long long>(),
         "Device_Paged_KV_Config.num_k_heads");
-    config.k_head_dim = CheckedSize(
+    config.k_head_dim = CheckedSize(logger,
         cfg.attr("k_head_dim").cast<long long>(),
         "Device_Paged_KV_Config.k_head_dim");
-    config.num_v_heads = CheckedSize(
+    config.num_v_heads = CheckedSize(logger,
         cfg.attr("num_v_heads").cast<long long>(),
         "Device_Paged_KV_Config.num_v_heads");
-    config.v_head_dim = CheckedSize(
+    config.v_head_dim = CheckedSize(logger,
         cfg.attr("v_head_dim").cast<long long>(),
         "Device_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
-    std::cout << "Device Paged KV Config Parsed Successfully" << std::endl;
+    logger->info("Device Paged KV Config parsed successfully");
     return config;
 }
 
@@ -381,8 +397,59 @@ ModelConfig parse_model_config(const py::object& model_config) {
     return config;
 };
 
+namespace {
+
+// Resolves a configured level name to an spdlog level. Accepts the spdlog
+// spellings and the Python ``logging`` spellings (any case, "warning",
+// "error", "fatal") so a single configured value can drive both logging
+// stacks. spdlog::level::from_str() answers `off` for anything it does not
+// recognise, which would silently mute a whole component, so an unknown name
+// is a hard error here instead.
+spdlog::level::level_enum ParseLogLevel(const std::string& log_level,
+                                        const std::string& logger_name) {
+    std::string normalized;
+    normalized.reserve(log_level.size());
+    for (const char c : log_level) {
+        if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            continue;
+        }
+        normalized.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    static const std::unordered_map<std::string, spdlog::level::level_enum>
+        kLevelNames = {
+            {"trace", spdlog::level::trace},
+            {"debug", spdlog::level::debug},
+            {"info", spdlog::level::info},
+            {"warn", spdlog::level::warn},
+            {"warning", spdlog::level::warn},
+            {"err", spdlog::level::err},
+            {"error", spdlog::level::err},
+            {"critical", spdlog::level::critical},
+            {"fatal", spdlog::level::critical},
+            {"off", spdlog::level::off},
+        };
+    const auto it = kLevelNames.find(normalized);
+    if (it == kLevelNames.end()) {
+        spdlog::error(
+            "init_logger({}): unsupported log level '{}'; expected one of "
+            "trace, debug, info, warn(ing), err(or), critical, off",
+            logger_name, log_level);
+        throw std::invalid_argument(
+            "init_logger: unsupported log level '" + log_level +
+            "' for logger '" + logger_name + "'");
+    }
+    return it->second;
+}
+
+}  // namespace
+
 std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
                                             const std::string& logger_name) {
+    // Validated before the idempotent fast path so a bad level is rejected on
+    // every call, not only on the one that happens to create the logger.
+    const spdlog::level::level_enum level =
+        ParseLogLevel(log_level, logger_name);
     auto logger = spdlog::get(logger_name);
     if (logger) {
         return logger;
@@ -401,7 +468,7 @@ std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
     }
 
     // Set the log level
-    logger->set_level(spdlog::level::from_str(log_level));
+    logger->set_level(level);
 
     // Set the pattern to match Python logging format:
     // 2026-01-10 10:51:29,379 - [LoggerName] - INFO - message

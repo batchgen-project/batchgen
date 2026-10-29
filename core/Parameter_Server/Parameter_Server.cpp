@@ -19,7 +19,9 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
 // #include <filesystem>
@@ -116,6 +118,8 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         }
         closedir(dir);
     } else {
+        this->logger->error("Failed to open weights directory: {}",
+                            model_weights_path);
         throw std::runtime_error("Failed to open directory: " + model_weights_path);
     };
 
@@ -130,6 +134,8 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         try {
             parsed = parseMetadata(json_path);
         } catch (const std::exception& e) {
+            this->logger->error("Failed to parse weight metadata {}: {}",
+                                json_path, e.what());
             throw std::runtime_error("Failed to parse JSON file: " + json_path + " - " + e.what());
         }
         batchgen::WeightFileExtent extent{json_path, parsed.file_name, parsed.total_byte_size, {}};
@@ -292,11 +298,15 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         if (!dest_aligned) alignment_info += "dest_ptr NOT aligned, ";
         if (!size_aligned) alignment_info += "total_size NOT aligned, ";
         if (dest_aligned && size_aligned) alignment_info += "both aligned, ";
-        std::cout << std::endl;
+        this->logger->debug("");
         this->logger->info(alignment_info + "using direct I/O for {} bytes", 
                         dest_aligned ? metadata.total_byte_size : 0);
 
         if (!dest_aligned) {
+            this->logger->error(
+                "Destination not aligned for direct I/O: file={}, "
+                "global_offset={}, alignment={}",
+                bin_file_path, global_offset, alignment);
             throw std::runtime_error("Destination memory not aligned for direct I/O. "
                                 "Global offset alignment failed.");
         }
@@ -311,6 +321,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         if (aligned_size > 0) {
             int fd = open(bin_file_path.c_str(), O_RDONLY | O_DIRECT | O_NOATIME);
             if (fd == -1) {
+                this->logger->error(
+                    "Failed to open weight file with direct I/O {}: {}",
+                    bin_file_path, strerror(errno));
                 throw std::runtime_error("Failed to open file with direct I/O: " + bin_file_path);
             }
 
@@ -328,6 +341,10 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                 ssize_t bytes_read = pread(fd, dest_ptr + file_offset, to_read, file_offset);
                 if (bytes_read <= 0) {
                     close(fd);
+                    this->logger->error(
+                        "Failed to read aligned portion of {} at offset {} "
+                        "({} bytes requested): {}",
+                        bin_file_path, file_offset, to_read, strerror(errno));
                     throw std::runtime_error("Failed to read aligned portion from file");
                 }
                 
@@ -343,12 +360,17 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         if (tail_size > 0) {
             std::ifstream tail_file(bin_file_path, std::ios::binary);
             if (!tail_file) {
+                this->logger->error("Failed to open {} for the tail read",
+                                    bin_file_path);
                 throw std::runtime_error("Failed to open file for tail read: " + bin_file_path);
             }
 
             // Seek to the tail portion
             tail_file.seekg(aligned_size);
             if (!tail_file) {
+                this->logger->error(
+                    "Failed to seek to the tail of {} at offset {}",
+                    bin_file_path, aligned_size);
                 throw std::runtime_error("Failed to seek to tail portion");
             }
 
@@ -358,6 +380,10 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                                               buffer_bytes, bin_file_path);
             tail_file.read(dest_ptr + file_offset, tail_size);
             if (!tail_file || tail_file.gcount() != static_cast<std::streamsize>(tail_size)) {
+                this->logger->error(
+                    "Failed to read the {} byte tail of {} (got {} bytes)",
+                    tail_size, bin_file_path,
+                    static_cast<int64_t>(tail_file.gcount()));
                 throw std::runtime_error("Failed to read tail portion (" + 
                                         std::to_string(tail_size) + " bytes)");
             }
@@ -414,6 +440,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                 } else if (tensor_info.dtype == "int64") {
                     dtype = torch::kInt64;
                 } else {
+                    this->logger->error(
+                        "Unsupported weight dtype '{}' for tensor {}",
+                        tensor_info.dtype, tensor_name);
                     throw std::runtime_error("Unsupported dtype: " + tensor_info.dtype);
                 }
                 // Create a tensor from the weight_ptr + global_offset + tensor_info.offset
@@ -456,7 +485,8 @@ void Parameter_Server::Init(
     void* weight_ptr = nullptr;
     int memfd_fd_out = -1;
     int64_t mapped_size = 0;
-    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
+    weight_ptr = allocate_shared_pinned_memory(this->log_level_,
+                                               weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
                                                this->enable_thp_, -1, -1,
                                                &memfd_fd_out,
@@ -476,15 +506,17 @@ void Parameter_Server::Init(
         serialize_to_memfd(this->module_weights_storage_);
     this->tensor_meta_shm_name = tensor_meta_shm_name;
 
-    std::cout << std::endl;
+    this->logger->debug("");
     this->logger->info("Parameter Server Initialized.");
 };
                     
 
 
 
-Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_thp) {
-    this->logger = init_logger("info", "Parameter_Server");
+Parameter_Server::Parameter_Server(const std::string& log_level,
+                                   bool enable_hugetlbfs, bool enable_thp)
+    : log_level_(log_level) {
+    this->logger = init_logger(this->log_level_, "Parameter_Server");
     this->enable_hugetlbfs = enable_hugetlbfs;
     this->enable_thp_ = enable_thp;
 };
@@ -630,7 +662,8 @@ Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_thp) {
 
 Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
+        free_shared_pinned_memory(this->log_level_, this->weight_ptr_,
+                                  this->mapped_size_);
     }
     // Closing the memfds drops the last reference the kernel needs: no name
     // survives this process in any mode, hugetlbfs included, so nothing is left

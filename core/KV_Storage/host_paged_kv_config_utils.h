@@ -103,6 +103,7 @@ inline HostPagedKVConfig BuildHostPagedKVConfig(
     config.sequence_table_capacity = detail::DetermineSequenceTableCapacity(
         engine_config.kv_storage_config, config.num_pages);
     config.alignment_bytes = 64;
+    config.log_level = engine_config.basic_config.log_level;
     return config;
 }
 

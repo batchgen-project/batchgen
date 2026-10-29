@@ -32,6 +32,7 @@ from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config as HFDeepseek
 from ...ckpt_converter.ckpt_converter import ckpt_converter
 from batchgen.config.model_registry import load_config
 from batchgen.server.process_utils import get_model_byte_size
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -88,7 +89,9 @@ class DeepSeek_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB")
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
         logging.info(f"architectures: {self.model_config.architectures[0]}")
         if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
             if "DeepSeek-V2-Lite" in self.huggingface_ckpt_name:

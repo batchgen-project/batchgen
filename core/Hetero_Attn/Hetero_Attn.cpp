@@ -231,6 +231,10 @@ torch::Tensor Hetero_Attn::attn(
     std::vector<std::vector<int64_t>> cur_batching_plan) {
     // Step 1: Checkings.
     if (!Py_IsInitialized()) {
+        this->logger_->error(
+            "Python interpreter is not running; cannot run attention for "
+            "layer {}",
+            layer_idx);
         PyErr_Print();
         throw std::runtime_error("Python interpreter is not running!");
     };
@@ -254,6 +258,7 @@ torch::Tensor Hetero_Attn::attn(
                                       hidden_states, attention_mask,
                                       position_ids, cur_batching_plan);
         default:
+            this->logger_->error("Unsupported attn_mode {}", this->attn_mode_);
             throw std::runtime_error("Unsupported attn_mode_");
             
     };
@@ -326,7 +331,8 @@ torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
             this->model_config_.num_attention_heads,
             this->model_config_.num_key_value_heads,
             this->model_config_.head_dim,
-            this->engine_config_.basic_config.num_threads);
+            this->engine_config_.basic_config.num_threads,
+            this->engine_config_.basic_config.log_level);
         auto kernel_end = std::chrono::high_resolution_clock::now();
         auto kernel_duration =
             std::chrono::duration_cast<std::chrono::microseconds>(kernel_end -
@@ -336,10 +342,11 @@ torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
 
         this->logger_->debug("CPU Attn output computed.");
     } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
+        this->logger_->error("CPU attention path failed: {}", e.what());
         throw;
     } catch (...) {
-        std::cerr << "Unknown error occurred." << std::endl;
+        this->logger_->error(
+            "CPU attention path failed with an unknown (non-std) exception");
         throw;
     }
     attn_output = this->h2d_engine_.tensor_on_demand_copy(attn_output);
@@ -749,7 +756,8 @@ std::future<torch::Tensor> Hetero_Attn::CPU_attn_mechanism(
                 this->model_config_.num_attention_heads,
                 this->model_config_.num_key_value_heads,
                 this->model_config_.head_dim,
-                this->engine_config_.basic_config.num_threads);
+                this->engine_config_.basic_config.num_threads,
+                this->engine_config_.basic_config.log_level);
             // attn_output =
             // this->h2d_engine_.tensor_on_demand_copy(attn_output);
             attn_output =

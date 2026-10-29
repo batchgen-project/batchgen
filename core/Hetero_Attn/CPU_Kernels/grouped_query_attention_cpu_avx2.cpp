@@ -24,9 +24,12 @@
 #include <immintrin.h>
 #include <omp.h>
 #include <stdexcept>
+#include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <vector>
+
+#include "../../utils.h"
 
 static inline __m256 bf16_to_fp32(__m128i bf16_vals) {
     __m256i tmp = _mm256_cvtepu16_epi32(bf16_vals);
@@ -83,14 +86,15 @@ inline void scalar_vector_multiply_add(const c10::BFloat16 scalar,
     }
 };
 
-void SetThreadAffinity(std::thread& th, int cpu_id) {
+void SetThreadAffinity(const std::shared_ptr<spdlog::logger>& logger,
+                       std::thread& th, int cpu_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
     if (pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t),
                                &cpuset)) {
-        std::cerr << "Failed to set Thread affinity : " << std::strerror(errno)
-                  << std::endl;
+        logger->error("Failed to set thread affinity to CPU {}: {}", cpu_id,
+                      std::strerror(errno));
         assert(false);
     }
 }
@@ -103,14 +107,16 @@ torch::Tensor grouped_query_attention_cpu_avx2(
         value_states,  // bsz x [cache_length, num_kv_head, head_dim]
     const torch::Tensor& attention_mask,  // [bsz, cache_length]
     int64_t cache_length, int64_t group_size, int64_t num_attention_heads,
-    int64_t num_kv_head, int64_t head_dim, int64_t num_threads) {
+    int64_t num_kv_head, int64_t head_dim, int64_t num_threads,
+    const std::string& log_level) {
+    const auto logger = init_logger(log_level, "CPU_Attn");
     try {
         int64_t bsz = query_states.size(0);
         if (bsz != key_states.size() || bsz != value_states.size()) {
-            std::cout << "bsz: " << bsz
-                      << ", key_states.size(): " << key_states.size()
-                      << ", value_states.size(): " << value_states.size()
-                      << std::endl;
+            logger->error(
+                "Batch size mismatch: bsz={}, key_states.size()={}, "
+                "value_states.size()={}",
+                bsz, key_states.size(), value_states.size());
             throw std::runtime_error("Batch size mismatch");
         }
         // int numThreads = std::thread::hardware_concurrency();
@@ -241,7 +247,7 @@ torch::Tensor grouped_query_attention_cpu_avx2(
                     std::free(accumulator);
                 }
             });
-            SetThreadAffinity(t_, t);
+            SetThreadAffinity(logger, t_, t);
             threads.push_back(std::move(t_));
         }
         for (auto& t : threads) {
@@ -272,12 +278,12 @@ torch::Tensor grouped_query_attention_cpu_avx2(
         // std::free(attn_output);
         return attn_output_tensor;
     } catch (const std::exception& e) {
-        std::cerr << "grouped_query_attention_cpu_avx2 error: " << e.what()
-                  << std::endl;
+        logger->error("grouped_query_attention_cpu_avx2 failed: {}", e.what());
         throw;
     } catch (...) {
-        std::cerr << "grouped_query_attention_cpu_avx2 error: unknown error."
-                  << std::endl;
+        logger->error(
+            "grouped_query_attention_cpu_avx2 failed with an unknown "
+            "(non-std) exception");
         throw;
     }
 };
@@ -291,14 +297,15 @@ torch::Tensor grouped_query_attention_cpu_avx2_deepseekv2(
     const torch::Tensor& attention_mask,  // [bsz, cache_length]
     int64_t cache_length, int64_t group_size, int64_t num_attention_heads,
     int64_t num_kv_head, int64_t qk_head_dim, int64_t v_head_dim,
-    int64_t num_threads) {
+    int64_t num_threads, const std::string& log_level) {
+    const auto logger = init_logger(log_level, "CPU_Attn");
     try {
         int64_t bsz = query_states.size(0);
         if (bsz != key_states.size() || bsz != value_states.size()) {
-            std::cout << "bsz: " << bsz
-                      << ", key_states.size(): " << key_states.size()
-                      << ", value_states.size(): " << value_states.size()
-                      << std::endl;
+            logger->error(
+                "Batch size mismatch: bsz={}, key_states.size()={}, "
+                "value_states.size()={}",
+                bsz, key_states.size(), value_states.size());
             throw std::runtime_error("Batch size mismatch");
         }
         int numThreads = std::thread::hardware_concurrency();
@@ -307,7 +314,7 @@ torch::Tensor grouped_query_attention_cpu_avx2_deepseekv2(
         } else {
             numThreads = 1;
         }
-        std::cerr << "numThreads: " << numThreads << std::endl;
+        logger->debug("numThreads: {}", numThreads);
         // int numThreads = num_threads;
         // Step 1: Compute the attention weights(attention_scores).
         c10::BFloat16* attn_weights = static_cast<c10::BFloat16*>(
@@ -444,12 +451,12 @@ torch::Tensor grouped_query_attention_cpu_avx2_deepseekv2(
         std::free(attn_weights);
         return attn_output_tensor;
     } catch (const std::exception& e) {
-        std::cerr << "grouped_query_attention_cpu_avx2 error: " << e.what()
-                  << std::endl;
+        logger->error("grouped_query_attention_cpu_avx2 failed: {}", e.what());
         throw;
     } catch (...) {
-        std::cerr << "grouped_query_attention_cpu_avx2 error: unknown error."
-                  << std::endl;
+        logger->error(
+            "grouped_query_attention_cpu_avx2 failed with an unknown "
+            "(non-std) exception");
         throw;
     }
 };

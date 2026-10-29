@@ -69,8 +69,10 @@ struct distributed_tensor_meta {
 
 class Weights_Storage {
    public:
-    // Simplified Constructor: takes device_id directly
-    Weights_Storage(int device_id);
+    // Simplified Constructor: takes device_id and the configured log level
+    // directly; this worker has no EngineConfig of its own, so the level is
+    // threaded in from the caller that does.
+    Weights_Storage(int device_id, const std::string& log_level);
     
     ~Weights_Storage();
     
@@ -110,6 +112,7 @@ class Weights_Storage {
 
    private:
     int device_id_; // Stored device ID
+    std::string log_level_;
     std::shared_ptr<spdlog::logger> logger;
 
     std::string shm_name;

@@ -170,7 +170,10 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     assert "unlink(" not in destructor
     assert "close(this->weights_memfd_fd_)" in destructor
     assert "close(this->tensor_meta_memfd_fd_)" in destructor
-    assert "free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)" in destructor
+    assert (
+        "free_shared_pinned_memory(this->log_level_, this->weight_ptr_,"
+        in destructor
+    )
     assert "memfd creator requires an output fd" in shm_source
 
 
@@ -194,7 +197,7 @@ def test_native_parameter_server_releases_full_memfd_mapping(tmp_path, enable_th
 
     weight_name = f"/shm_{uuid.uuid4()}"
     metadata_name = f"/shm_{uuid.uuid4()}"
-    parameter_server = core_engine.Parameter_Server(False, enable_thp)
+    parameter_server = core_engine.Parameter_Server("info", False, enable_thp)
     parameter_server.Init(weight_name, metadata_name, 4096, str(tmp_path), {})
     fd = parameter_server.weights_memfd_fd()
     metadata_fd = parameter_server.tensor_meta_memfd_fd()
@@ -266,7 +269,7 @@ def test_native_model_names_are_labels_only(tmp_path, shared_label):
     owner = shared_memory.SharedMemory(name=label[1:], create=True, size=64)
     sentinel = b"lane-owner-alive"
     owner.buf[: len(sentinel)] = sentinel
-    parameter_server = core_engine.Parameter_Server(False, False)
+    parameter_server = core_engine.Parameter_Server("info", False, False)
     try:
         parameter_server.Init(
             weight_name, metadata_name, 4096, str(tmp_path), {}

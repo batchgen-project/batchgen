@@ -66,9 +66,17 @@
 #endif
 namespace fs = std::filesystem;
 
-std::shared_ptr<spdlog::logger> logger = init_logger("info", "Server");
+// The logger is NOT a namespace-scope object any more: building it at
+// static-init time ran init_logger() before this translation unit's own
+// dependencies were guaranteed to be constructed, and it also pinned the
+// level to a hard-coded "info". Every entry point now resolves it from the
+// level its caller was configured with (init_logger is idempotent, so the
+// repeat calls reuse the same logger), and the file-local helpers receive it
+// as a parameter.
+constexpr char kShmLoggerName[] = "Server";
 
-bool check_hugepage_availability(int64_t required_size) {
+bool check_hugepage_availability(
+    const std::shared_ptr<spdlog::logger>& logger, int64_t required_size) {
     std::ifstream meminfo("/proc/meminfo");
     if (!meminfo) {
         logger->error("Failed to open /proc/meminfo");
@@ -153,7 +161,8 @@ static int create_huge_anonymous_memfd(const char* name) {
 
 // MFD_HUGETLB without a size flag uses the host's default huge page size, so
 // the region must be rounded and mapped to exactly that size.
-static size_t default_huge_page_size() {
+static size_t default_huge_page_size(
+    const std::shared_ptr<spdlog::logger>& logger) {
     std::ifstream meminfo("/proc/meminfo");
     std::string line;
     while (std::getline(meminfo, line)) {
@@ -173,8 +182,9 @@ static size_t default_huge_page_size() {
 // mapping is not advised at all, so its page size follows the host's
 // /sys/kernel/mm/transparent_hugepage/shmem_enabled policy. A failed hint is
 // not fatal.
-static void advise_transparent_huge_pages(void* ptr, int64_t size,
-                                          bool enable_thp) {
+static void advise_transparent_huge_pages(
+    const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t size,
+    bool enable_thp) {
     if (!enable_thp) {
         return;
     }
@@ -187,7 +197,8 @@ static void advise_transparent_huge_pages(void* ptr, int64_t size,
 }
 
 // Helper function to execute system command
-int execute_command(const std::string& cmd) {
+int execute_command(const std::shared_ptr<spdlog::logger>& logger,
+                    const std::string& cmd) {
     int ret = system(cmd.c_str());
     if (ret == -1) {
         logger->error("Failed to execute command: {}", cmd);
@@ -197,7 +208,8 @@ int execute_command(const std::string& cmd) {
 }
 
 // Helper function for page touching with signal handling
-bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
+bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
+                 int64_t size, long page_size, bool multi_threaded) {
     // Set up signal handlers
     struct sigaction sa;
     sa.sa_sigaction = segv_handler;
@@ -337,7 +349,8 @@ void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, siz
  * @return A void pointer to the allocated shared memory.
  * @throws std::runtime_error on failure.
  */
-void* allocate_shared_pinned_memory(const std::string& shm_name,
+void* allocate_shared_pinned_memory(const std::string& log_level,
+                                    const std::string& shm_name,
                                     int64_t size,
                                     bool create,
                                     bool enable_hugetlbfs,
@@ -347,10 +360,15 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int memfd_fd_arg,
                                     int* out_memfd_fd,
                                     int64_t* out_mapped_size) {
+    const auto logger = init_logger(log_level, kShmLoggerName);
     if (size <= 0) {
+        logger->error("Invalid allocation size: {}", size);
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
     if (create && out_memfd_fd == nullptr) {
+        logger->error(
+            "memfd creator requires an output fd (shm_name={}, size={})",
+            shm_name, size);
         throw std::runtime_error("memfd creator requires an output fd");
     }
     if (out_mapped_size) *out_mapped_size = 0;
@@ -371,7 +389,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     // name, because neither has a name, so it always takes the attach path in
     // STAGE 2 and discovers the page size from the fd itself.
     if (enable_hugetlbfs && create) {
-        const size_t hugetlb_page_size = default_huge_page_size();
+        const size_t hugetlb_page_size = default_huge_page_size(logger);
         const int64_t hugetlb_size =
             ((size + hugetlb_page_size - 1) / hugetlb_page_size) *
             hugetlb_page_size;
@@ -396,7 +414,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 logger->warn("hugepage memfd mmap failed: {}", strerror(errno));
                 ptr = nullptr;
                 close(fd);
-            } else if (!touch_pages(ptr, size, hugetlb_page_size, true)) {
+            } else if (!touch_pages(logger, ptr, size, hugetlb_page_size, true)) {
                 logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
                 munmap(ptr, hugetlb_size);
                 ptr = nullptr;
@@ -429,6 +447,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         if (create) {
             int fd = create_anonymous_memfd("batchgen_weights");
             if (fd < 0) {
+                logger->error("memfd_create for weights failed: {}",
+                              strerror(errno));
                 throw std::runtime_error(
                     "memfd_create for weights failed: " +
                     std::string(strerror(errno)));
@@ -436,6 +456,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (ftruncate64(fd, aligned_size) != 0) {
                 int err = errno;
                 close(fd);
+                logger->error(
+                    "ftruncate on weights memfd failed ({} bytes): {}",
+                    aligned_size, strerror(err));
                 throw std::runtime_error(
                     "ftruncate on weights memfd failed: " +
                     std::string(strerror(err)));
@@ -446,12 +469,15 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 int err = errno;
                 close(fd);
                 ptr = nullptr;
+                logger->error("mmap on weights memfd failed ({} bytes): {}",
+                              aligned_size, strerror(err));
                 throw std::runtime_error(
                     "mmap on weights memfd failed: " +
                     std::string(strerror(err)));
             }
             allocated_size = aligned_size;
-            advise_transparent_huge_pages(ptr, allocated_size, enable_thp);
+            advise_transparent_huge_pages(logger, ptr, allocated_size,
+                                          enable_thp);
             if (enable_thp) {
                 // Pre-fault THP pages before weight loading to avoid
                 // non-deterministic compaction stalls during direct I/O.
@@ -463,7 +489,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                         "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
                 } else {
                     auto touch_start = std::chrono::high_resolution_clock::now();
-                    bool ok = touch_pages(ptr, allocated_size, huge_page_size, /*multi_threaded=*/true);
+                    bool ok = touch_pages(logger, ptr, allocated_size,
+                                          huge_page_size,
+                                          /*multi_threaded=*/true);
                     auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - touch_start).count();
                     if (ok) {
@@ -474,7 +502,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                      touch_ms / 1000.0);
                     }
                 }
-            } else if (!touch_pages(ptr, size, page_size, true)) {
+            } else if (!touch_pages(logger, ptr, size, page_size, true)) {
                 logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
             *out_memfd_fd = fd;
@@ -484,6 +512,10 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         } else {
             // Worker: open the creator's memfd via /proc/<pid>/fd/<N>.
             if (memfd_creator_pid <= 0 || memfd_fd_arg < 0) {
+                logger->error(
+                    "weights attach requires a valid memfd_creator_pid and "
+                    "memfd_fd (got pid={}, fd={})",
+                    memfd_creator_pid, memfd_fd_arg);
                 throw std::runtime_error(
                     "weights attach requires a valid memfd_creator_pid and "
                     "memfd_fd (got pid=" + std::to_string(memfd_creator_pid) +
@@ -493,12 +525,18 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     "/fd/" + std::to_string(memfd_fd_arg);
             int fd = open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
             if (fd < 0) {
+                logger->error("weights attach cannot open {}: {}", proc_path,
+                              strerror(errno));
                 throw std::runtime_error(
                     "weights attach cannot open " + proc_path + ": " +
                     strerror(errno));
             }
-            struct stat sb;
+            struct stat sb{};
             if (fstat(fd, &sb) == -1 || sb.st_size < aligned_size) {
+                logger->error(
+                    "weights memfd too small or fstat failed (expected>={}, "
+                    "found={})",
+                    aligned_size, static_cast<int64_t>(sb.st_size));
                 close(fd);
                 throw std::runtime_error(
                     "weights memfd too small or fstat failed");
@@ -510,7 +548,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 fstatfs(fd, &sfs) == 0 &&
                 static_cast<unsigned long>(sfs.f_type) == HUGETLBFS_MAGIC;
             if (fd_is_hugetlb) {
-                alignment = std::max(default_huge_page_size(), page_size);
+                alignment = std::max(default_huge_page_size(logger), page_size);
             }
             ptr = mmap_aligned(sb.st_size, PROT_READ | PROT_WRITE,
                                MAP_SHARED, fd, 0, alignment);
@@ -518,6 +556,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 int err = errno;
                 close(fd);
                 ptr = nullptr;
+                logger->error("mmap on weights memfd failed ({} bytes): {}",
+                              static_cast<int64_t>(sb.st_size), strerror(err));
                 throw std::runtime_error(
                     "mmap on weights memfd failed: " +
                     std::string(strerror(err)));
@@ -527,7 +567,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             // Both sides advise, so one cannot promote the mapping while the
             // other keeps it at the base page size. Huge pages are already the
             // mapping's page size, and THP cannot apply to them.
-            advise_transparent_huge_pages(ptr, allocated_size,
+            advise_transparent_huge_pages(logger, ptr, allocated_size,
                                           enable_thp && !fd_is_hugetlb);
             close(fd);
             logger->info("Weights attached via memfd ({:.1f} GB, {} pages)",
@@ -549,6 +589,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 std::chrono::high_resolution_clock::now() - cuda_start);
 
             if (err != cudaSuccess) {
+                logger->error("cudaHostRegister failed on {:.3f}GB: {}",
+                              size / (1024.0 * 1024.0 * 1024.0),
+                              cudaGetErrorString(err));
                 throw std::runtime_error("cudaHostRegister failed: " + std::string(cudaGetErrorString(err)));
             }
 
@@ -577,9 +620,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
 
 // Helper function to verify NUMA allocation
-void verify_numa_allocation(void* ptr, size_t size) {
+void verify_numa_allocation(const std::shared_ptr<spdlog::logger>& logger, void* ptr, size_t size) {
     if (numa_available() < 0) {
-        std::cout << "NUMA not available for verification" << std::endl;
+        logger->warn("NUMA not available for verification");
         return;
     }
 
@@ -587,23 +630,26 @@ void verify_numa_allocation(void* ptr, size_t size) {
     long page_size = sysconf(_SC_PAGESIZE);
     int num_samples = std::min(10L, (long)(size / page_size));
     
-    std::cout << "Verifying NUMA allocation for " << num_samples << " sample pages:" << std::endl;
+    logger->debug("Verifying NUMA allocation for {} sample pages", num_samples);
     
     for (int i = 0; i < num_samples; i++) {
         void* page_addr = (char*)ptr + (i * size / num_samples);
         int node = -1;
         
         if (get_mempolicy(&node, nullptr, 0, page_addr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
-            std::cout << "Page at offset " << (i * size / num_samples) 
-                      << " is on NUMA node " << node << std::endl;
+            logger->debug("Page at offset {} is on NUMA node {}",
+                          i * size / num_samples, node);
         } else {
-            perror("get_mempolicy failed");
+            logger->error("get_mempolicy failed at offset {}: {}",
+                          i * size / num_samples, strerror(errno));
         }
     }
 }
 
 
-void free_shared_pinned_memory(void* ptr, int64_t size) {
+void free_shared_pinned_memory(const std::string& log_level, void* ptr,
+                               int64_t size) {
+    const auto logger = init_logger(log_level, kShmLoggerName);
     const auto start = std::chrono::steady_clock::now();
     const cudaError_t unregister_result = cudaHostUnregister(ptr);
     const auto unregister_done = std::chrono::steady_clock::now();

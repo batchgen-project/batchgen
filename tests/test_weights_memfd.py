@@ -124,8 +124,14 @@ def test_weights_follow_system_page_size_unless_thp_is_requested():
     assert "if (!enable_thp) {" in source
     # Creator and attacher advise identically, except that THP cannot apply to
     # a mapping whose pages already come from the huge page pool.
+    # Whitespace-normalised so the assertion pins the argument list, not the
+    # line wrapping.
+    flat = " ".join(source.split())
     assert (
-        source.count("advise_transparent_huge_pages(ptr, allocated_size, enable_thp)")
+        flat.count(
+            "advise_transparent_huge_pages(logger, ptr, allocated_size, "
+            "enable_thp);"
+        )
         == 1
     )
     assert "enable_thp && !fd_is_hugetlb);" in source
@@ -135,8 +141,12 @@ def test_weights_follow_system_page_size_unless_thp_is_requested():
     assert source.count("if (enable_thp) {") == 1
     thp_block = source.split("if (enable_thp) {", 1)[1]
     thp_block = thp_block.split("} else if (!touch_pages", 1)[0]
-    assert "touch_pages(ptr, allocated_size, huge_page_size" in thp_block
-    assert "} else if (!touch_pages(ptr, size, page_size, true)) {" in source
+    assert "touch_pages(logger, ptr, allocated_size," in thp_block
+    assert "huge_page_size," in thp_block
+    assert (
+        "} else if (!touch_pages(logger, ptr, size, page_size, true)) {"
+        in source
+    )
 
 
 def test_allocator_signature_drops_named_shm_ownership():
@@ -155,7 +165,11 @@ def test_parameter_server_owns_both_memfds_and_unlinks_nothing():
     header = PARAMETER_SERVER_HEADER.read_text()
     source = PARAMETER_SERVER.read_text()
 
-    assert "Parameter_Server(bool enable_hugetlbfs, bool enable_thp = false);" in header
+    assert (
+        "Parameter_Server(const std::string& log_level, bool enable_hugetlbfs,"
+        in header
+    )
+    assert "bool enable_thp = false);" in header
     assert "int tensor_meta_memfd_fd() const" in header
     assert "weight_posix_shm_owned_" not in header
     assert "tensor_meta_shm_owned_" not in header
@@ -179,7 +193,7 @@ def test_hugetlbfs_weights_are_an_unnamed_huge_page_memfd():
     assert 'create_huge_anonymous_memfd("batchgen_weights")' in source
     # The huge page size is the host's default, so the region is rounded and
     # mapped to exactly that, not to a hardcoded 2 MB.
-    assert "default_huge_page_size()" in source
+    assert "default_huge_page_size(logger)" in source
     assert "ftruncate64(fd, hugetlb_size)" in source
     # Only the creator allocates; an attacher cannot name a memfd, so it takes
     # the same /proc path in both modes.

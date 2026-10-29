@@ -35,7 +35,35 @@ DEFAULT_LOG_DIR = eventlog.DEFAULT_LOG_DIR
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 DEFAULT_LOG_LEVEL = "INFO"
 
+# Python level -> the spdlog level name the native (C++) loggers take, most
+# severe first. ``native_log_level`` walks it, so a non-standard numeric level
+# resolves to the nearest standard one instead of failing.
+_NATIVE_LEVEL_BY_PYTHON_LEVEL = (
+    (logging.CRITICAL, "critical"),
+    (logging.ERROR, "error"),
+    (logging.WARNING, "warning"),
+    (logging.INFO, "info"),
+    (logging.DEBUG, "debug"),
+)
+
 EXIT_EVENT = "process.exit"
+
+
+def native_log_level() -> str:
+    """The level the native (C++/spdlog) loggers of this process are built at.
+
+    The core components take their level as a string argument because they
+    have no access to the Python logging configuration. Rather than letting
+    each call site hard-code one, this reads back the level the Python
+    handlers were already configured with (``--log-level``), so one knob
+    drives both logging stacks. ``core/utils.cpp``'s ``init_logger`` accepts
+    these names case-insensitively.
+    """
+    effective = logging.getLogger().getEffectiveLevel()
+    for threshold, native_name in _NATIVE_LEVEL_BY_PYTHON_LEVEL:
+        if effective >= threshold:
+            return native_name
+    return "trace"
 
 
 @dataclass(frozen=True)

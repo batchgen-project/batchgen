@@ -19,6 +19,7 @@
 // clang-format on
 
 #pragma once
+#include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -36,6 +37,8 @@
                 attention_mask: torch::Tensor, [bsz, cache_length]
                 group_size: int64_t, number of attention heads per kv head.
                 num_threads: int64_t, number of threads to use.
+                log_level: std::string, configured level of the caller; the
+   kernel has no config of its own, so its logger is created from this.
                 num_attention_heads: int64_t, number of attention heads.
                 num_kv_head: int64_t, number of kv heads.
                 head_dim: int64_t, dimension of each attention head.
@@ -50,7 +53,7 @@ torch::Tensor grouped_query_attention_cpu_avx2(
     const std::vector<c10::BFloat16*>& value_states,
     const torch::Tensor& attention_mask, int64_t cache_length,
     int64_t group_size, int64_t num_attention_heads, int64_t num_kv_head,
-    int64_t head_dim, int64_t num_threads);
+    int64_t head_dim, int64_t num_threads, const std::string& log_level);
 
 // torch::Tensor grouped_query_attention_cpu_avx2_deepseekv2(
 //     const torch::Tensor& query_states,

@@ -78,6 +78,12 @@ struct HostPagedKVConfig {
     int memfd_fd = -1;
     LayerMapping logical_to_physical_layer;
     std::string logger_name;  // Custom logger name (empty = use default)
+    // Level this component's logger is created at. The config-only
+    // constructors have no EngineConfig to read, so the level travels with the
+    // config: BuildHostPagedKVConfig() copies it out of
+    // basic_config.log_level, and the Python builders set it from the
+    // process-wide configured level.
+    std::string log_level = "info";
 };
 
 inline std::uint64_t HashCombine(std::uint64_t seed, std::uint64_t value) {

@@ -30,6 +30,8 @@ struct CompressedStateHostConfig {
     std::size_t alignment_bytes = 64;
     LayerMapping logical_to_physical_layer;
     std::string logger_name;
+    // Level this component's logger is created at; see HostPagedKVConfig.
+    std::string log_level = "info";
 };
 
 inline std::string ToString(const CompressedStateHostConfig& config) {
@@ -90,9 +92,9 @@ class CompressedStateHostManager {
               config_.alignment_bytes)),
           total_bytes_(config_.num_layers * layer_stride_bytes_),
           logger_(init_logger(
-              "info", config_.logger_name.empty()
-                          ? "CompressedStateHostManager"
-                          : config_.logger_name)) {
+              config_.log_level, config_.logger_name.empty()
+                                     ? "CompressedStateHostManager"
+                                     : config_.logger_name)) {
         ResetFreeStateItems();
         ResetCopyStreams();
     }
