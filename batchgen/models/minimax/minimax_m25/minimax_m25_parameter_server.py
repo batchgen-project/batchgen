@@ -37,6 +37,7 @@ from tqdm import trange
 
 from batchgen.config.model_registry import load_config
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -95,7 +96,9 @@ class MiniMaxM25_Parameter_Server:
         """Initialize parameter server and load weights."""
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
 
         # M2.5: ~211GB safetensors (FP8 experts + FP8 attn + skeleton), 250GB with buffer
         byte_size = 250 * 1024 * 1024 * 1024

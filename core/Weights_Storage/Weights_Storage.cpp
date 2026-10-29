@@ -228,13 +228,14 @@ bool is_retry_response(const Response& response) {
 
 // Weights_Storage.cpp
 
-Weights_Storage::Weights_Storage(int device_id)
-    : device_id_(device_id) {
-    
-    // Initialize logger with a default level (e.g., 2 for INFO) 
-    // since we don't have engine_config anymore.
+Weights_Storage::Weights_Storage(int device_id,
+                                 const std::string& log_level)
+    : device_id_(device_id), log_level_(log_level) {
+
+    // There is no engine_config on this path, so the level arrives from the
+    // caller instead of being hard-coded here.
     this->logger = init_logger(
-        "info", // Default Log Level: INFO
+        this->log_level_,
         "Weights_Storage_" + std::to_string(this->device_id_));
         
     this->logger->info("Weights_Storage Instantiated on device {}.", this->device_id_);
@@ -246,7 +247,8 @@ Weights_Storage::~Weights_Storage() {
     // set only after a successful Init(), and the distributed path never sets
     // it, so this cannot fire twice or on a hierarchical_gdr instance.
     if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
+        free_shared_pinned_memory(this->log_level_, this->weight_ptr_,
+                                  this->mapped_size_);
         this->weight_ptr_ = nullptr;
     }
     // Unregister exactly what was registered. A hierarchical_gdr worker pins a
@@ -713,7 +715,8 @@ void Weights_Storage::Init(
     // Worker process: register with CUDA for DMA access (pin_for_cuda=true)
     int64_t mapped_size = 0;
     void* weight_ptr =
-        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true,
+        allocate_shared_pinned_memory(this->log_level_, shm_name, byte_size,
+                                      false, enable_hugetlbfs, true,
                                       enable_thp, memfd_creator_pid, memfd_fd_arg,
                                       nullptr, &mapped_size);
 

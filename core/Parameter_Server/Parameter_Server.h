@@ -61,7 +61,10 @@ struct tensor_meta {
 
 class Parameter_Server {
    public:
-    Parameter_Server(bool enable_hugetlbfs, bool enable_thp = false);
+    // log_level is the configured level this server logs at; it also drives
+    // the shared-memory logger of the allocations it owns.
+    Parameter_Server(const std::string& log_level, bool enable_hugetlbfs,
+                     bool enable_thp = false);
     ~Parameter_Server();
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
               int64_t byte_size, std::string& model_weights_path,
@@ -79,6 +82,7 @@ class Parameter_Server {
    private:
     /* Template */
     std::shared_ptr<spdlog::logger> logger;
+    std::string log_level_;
 
     /* "attn_0" -> "o_proj" -> ptr */
     // Both names are labels in every mode, including hugetlbfs: the regions are

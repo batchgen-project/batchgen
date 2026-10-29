@@ -1,5 +1,7 @@
 #include "host_paged_kv_backend.h"
 
+#include "../utils.h"
+
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <pthread.h>
@@ -127,6 +129,15 @@ struct SharedHeader {
     pthread_mutex_t sequence_mutex{};
 };
 
+// The backend is a plain struct with no logger member; this resolves the
+// component logger from the config that created the region, at the configured
+// level (init_logger is idempotent, so repeat calls reuse it).
+std::shared_ptr<spdlog::logger> BackendLogger(const HostPagedKVConfig& config) {
+    return init_logger(config.log_level, config.logger_name.empty()
+                                            ? "HostPagedKVBackend"
+                                            : config.logger_name);
+}
+
 std::size_t SafeHardwareConcurrency() {
     const unsigned int hint = std::thread::hardware_concurrency() / 4;
     return hint == 0 ? 1 : static_cast<std::size_t>(hint);
@@ -139,15 +150,16 @@ int memfd_create_wrapper(const char* name, unsigned int flags) {
 // --fast-init requests transparent huge pages explicitly. Without it the
 // mapping is not advised at all, so its page size follows the host's
 // /sys/kernel/mm/transparent_hugepage/shmem_enabled policy.
-void AdviseTransparentHugePages(void* ptr, std::size_t size, bool enable_thp) {
+void AdviseTransparentHugePages(const std::shared_ptr<spdlog::logger>& logger,
+                               void* ptr, std::size_t size, bool enable_thp) {
     if (!enable_thp) {
         return;
     }
     if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
-        std::fprintf(stderr,
-                     "[HostPagedKV] warning: madvise(MADV_HUGEPAGE) failed: %s; "
-                     "host KV page size follows the system THP setting\n",
-                     std::strerror(errno));
+        logger->warn(
+            "madvise(MADV_HUGEPAGE) failed: {}; host KV page size follows the "
+            "system THP setting",
+            std::strerror(errno));
     }
 }
 
@@ -553,7 +565,8 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
                                     "mmap on host KV memfd failed");
         }
 
-        AdviseTransparentHugePages(mapped, total_bytes, config.enable_thp);
+        AdviseTransparentHugePages(BackendLogger(config), mapped, total_bytes,
+                                   config.enable_thp);
         if (config.enable_thp) {
             TouchPagesMultiThreaded(mapped, total_bytes, kHugePageSize);
         }
@@ -609,7 +622,8 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
                                 "mmap on host KV memfd failed");
     }
 
-    AdviseTransparentHugePages(mapped, total_bytes, config.enable_thp);
+    AdviseTransparentHugePages(BackendLogger(config), mapped, total_bytes,
+                               config.enable_thp);
 
     shm_fd = fd;
     mapping = static_cast<std::byte*>(mapped);

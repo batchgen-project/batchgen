@@ -104,7 +104,8 @@ def test_backend_follows_system_page_size_unless_thp_is_requested():
     # Creator and attacher advise identically.
     assert (
         source.count(
-            "AdviseTransparentHugePages(mapped, total_bytes, config.enable_thp)"
+            "AdviseTransparentHugePages(BackendLogger(config), mapped, "
+            "total_bytes,"
         )
         == 2
     )

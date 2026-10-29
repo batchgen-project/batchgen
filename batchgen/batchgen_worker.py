@@ -1337,7 +1337,9 @@ class BatchGenWorker:
 		)
 		import time as _time
 		_t0 = _time.monotonic()
-		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
+		self.weights_storage = core_engine.Weights_Storage(
+			self.local_rank, args.log_level
+		)
 		if args.distributed_weight_config:
 			self.weights_storage.InitDistributed(
 				args.distributed_weight_config,

@@ -58,6 +58,7 @@ from .model import GptOss
 from .configuration_gpt_oss import GptOssConfig
 from .converted_ckpt_plan import check_converted_ckpt_format, plan_converted_ckpt_load
 from batchgen.config.model_registry import load_config
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -129,7 +130,9 @@ class GptOss_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
 
         # GPT-OSS-120B: ~65GB total (61GB MXFP4 experts + 4GB BF16 attn/embed)
         byte_size = 70 * 1024 * 1024 * 1024  # 70GB with buffer

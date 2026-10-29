@@ -689,7 +689,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     py::class_<Weights_Storage>(m, "Weights_Storage")
         // Updated Constructor Binding
-        .def(py::init<int>(), py::arg("device_id")) 
+        .def(py::init<int, const std::string&>(), py::arg("device_id"),
+             py::arg("log_level")) 
         
         .def("Init", &Weights_Storage::Init,
             py::arg("shm_name"),
@@ -758,6 +759,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("logical_to_physical_layer",
                        &kv::HostPagedKVConfig::logical_to_physical_layer)
         .def_readwrite("logger_name", &kv::HostPagedKVConfig::logger_name)
+        .def_readwrite("log_level", &kv::HostPagedKVConfig::log_level)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);
@@ -1075,6 +1077,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             &kv::CompressedStateHostConfig::logical_to_physical_layer)
         .def_readwrite("logger_name",
                        &kv::CompressedStateHostConfig::logger_name)
+        .def_readwrite("log_level",
+                       &kv::CompressedStateHostConfig::log_level)
         .def("__repr__",
              [](const kv::CompressedStateHostConfig& self) {
                  return kv::ToString(self);
@@ -1140,7 +1144,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "NonOverlapCompressedState128HostManager");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
-        .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
+        .def(py::init<const std::string&, bool, bool>(),
+             py::arg("log_level"), py::arg("enable_hugetlbfs"),
              py::arg("enable_thp") = false)
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",

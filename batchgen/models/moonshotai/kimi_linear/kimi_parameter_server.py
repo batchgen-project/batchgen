@@ -51,6 +51,7 @@ from batchgen.config.model_registry import load_config
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 from .config import require_num_routed_experts
+from batchgen.eventlog.process import native_log_level
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -213,7 +214,9 @@ class KimiLinear_Parameter_Server:
     def Init(self):
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
+        self.parameter_server = Parameter_Server(
+            native_log_level(), self.enable_hugetlbfs, self.enable_thp
+        )
 
         byte_size = self._shm_byte_size()
 

@@ -24,6 +24,9 @@
 // #include "caching_allocator.h"
 #include <cstdlib>
 #include <memory>
+#include <string>
+
+#include "utils.h"
 
 extern "C" {
 void* TorchAllocate(size_t n);
@@ -38,8 +41,25 @@ struct TorchCachingAllocator : public torch::Allocator {
     }
 
     void copy_data(void* dest, const void* src, size_t count) const override {
-        std::cerr << "Copying data" << std::endl;
+        // A canary for unexpected host-allocator copies: level-gated, so it
+        // costs a level comparison per copy instead of an unconditional write
+        // to stderr.
+        CopyCanaryLogger()->debug("Copying data ({} bytes)", count);
         memcpy(dest, src, count);
+    }
+
+    // This allocator is installed by a static initializer when the extension
+    // loads, long before any EngineConfig exists, so there is no configured
+    // level to thread in here. Its logger therefore follows spdlog's
+    // process-wide default level, which keeps the per-copy canary above
+    // silent unless that default is turned down to debug.
+    static const std::shared_ptr<spdlog::logger>& CopyCanaryLogger() {
+        const spdlog::string_view_t level_name =
+            spdlog::level::to_string_view(spdlog::default_logger()->level());
+        static const std::shared_ptr<spdlog::logger> logger = init_logger(
+            std::string(level_name.data(), level_name.size()),
+            "TorchCachingAllocator");
+        return logger;
     }
 
     // // Optional: Handle deallocation (if needed)

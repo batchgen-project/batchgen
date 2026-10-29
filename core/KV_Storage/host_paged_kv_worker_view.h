@@ -220,7 +220,7 @@ class HostPagedKVWorkerView : private LayerMapper {
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache),
-          logger_(init_logger("info",
+          logger_(init_logger(config_.log_level,
                               config_.logger_name.empty()
                                   ? "HostPagedKVWorkerView"
                                   : config_.logger_name)) {}
