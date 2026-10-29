@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from batchgen.config.cuda_graph_flag_policy import require_cuda_graph_flag_supported
 from batchgen.eventlog.process import (
     DEFAULT_LOG_LEVEL,
     add_logging_args,
@@ -810,6 +811,9 @@ def validate_server_args(args: ServerArgs) -> None:
         )
 
         require_prefix_cache_model_support(args.model)
+    require_cuda_graph_flag_supported(
+        args.model, enable_cuda_graph=args.enable_cuda_graph
+    )
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         _validate_distributed_weight_source(args)

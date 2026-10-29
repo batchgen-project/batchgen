@@ -12,6 +12,7 @@ are compiled in isolation and generate() is checked statically.
 import ast
 import copy
 import logging
+import time
 from pathlib import Path
 
 from batchgen.sequence import SequenceBatch, SequenceEntry
@@ -58,6 +59,7 @@ namespace = {
     "logging": logging,
     # Trims allocator arenas after tokenization; irrelevant to the totals.
     "_release_tokenizer_arenas": lambda **_: None,
+    "time": time,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
     body=[copy.deepcopy(_method("_admit_sequences_from_message")),

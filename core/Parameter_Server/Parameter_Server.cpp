@@ -25,6 +25,7 @@
 // #include <filesystem>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
@@ -45,6 +46,7 @@
 #include "../utils.h"
 #include "Parameter_Server.h"
 #include "posix_shm.h"
+#include "weight_load_plan.h"
 #include "tqdm.hpp"
 #include "nlohmann_json/json.hpp"
 
@@ -86,16 +88,17 @@ FileMetadata parseMetadata(const std::string& json_path) {
 void Parameter_Server::_load_cus_format_file_to_host_mem(
     const std::string& model_weights_path,
     void* weight_ptr,
+    int64_t buffer_bytes,
     std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map)
 {
     /*
         First get a list of all .json file.
-        Loop through each .json file and parse it.
-        Load the corresponding .bin file to weight_ptr + global_offset. 
+        Parse every .json file and plan the whole load against buffer_bytes
+        before any read: a file that would end past the buffer fails here.
+        Load the corresponding .bin file to weight_ptr + its planned offset.
         Update this->module_weights_storage_ and this->skeleton_state_dict_.
-        The global_offset is the sum of all previous tensor byte sizes.   
+        A file's offset is the end of the previous file rounded up to 4 KiB.
     */
-    int64_t global_offset = 0;
     // Step 1: Get all .json file paths in the model_weights_path directory
     std::vector<std::string> json_paths;
     DIR* dir = opendir(model_weights_path.c_str());
@@ -117,17 +120,38 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
     };
 
 
-    // Step 2: Loop through each .json file and parse it
-    auto bar = tq::tqdm(json_paths);
-    bar.set_prefix("Loading Weights");
-    for(const auto& json_path : bar) {
-        // Parse the JSON file
-        FileMetadata metadata;
+    // Step 2: Parse every .json file and plan the load before any read
+    std::vector<FileMetadata> all_metadata;
+    std::vector<batchgen::WeightFileExtent> extents;
+    all_metadata.reserve(json_paths.size());
+    extents.reserve(json_paths.size());
+    for (const auto& json_path : json_paths) {
+        FileMetadata parsed;
         try {
-            metadata = parseMetadata(json_path);
+            parsed = parseMetadata(json_path);
         } catch (const std::exception& e) {
             throw std::runtime_error("Failed to parse JSON file: " + json_path + " - " + e.what());
         }
+        batchgen::WeightFileExtent extent{json_path, parsed.file_name, parsed.total_byte_size, {}};
+        extent.tensors.reserve(parsed.state_dict.size());
+        for (const auto& [tensor_name, tensor_info] : parsed.state_dict) {
+            extent.tensors.push_back({tensor_name, tensor_info.offset, tensor_info.byte_size});
+        }
+        extents.push_back(std::move(extent));
+        all_metadata.push_back(std::move(parsed));
+    }
+    const std::vector<int64_t> file_starts = batchgen::plan_weight_load(extents, buffer_bytes);
+    this->logger->info("Weight load plan: {} files, {} bytes planned, {} bytes buffer",
+                       extents.size(), batchgen::planned_weight_load_bytes(extents), buffer_bytes);
+
+    // Step 3: Read each planned file
+    std::vector<size_t> file_indices(all_metadata.size());
+    std::iota(file_indices.begin(), file_indices.end(), 0);
+    auto bar = tq::tqdm(file_indices);
+    bar.set_prefix("Loading Weights");
+    for(const size_t file_index : bar) {
+        const FileMetadata& metadata = all_metadata[file_index];
+        const int64_t global_offset = file_starts[file_index];
 
         // // Step 3: Load the corresponding .bin file to weight_ptr + global_offset
         // std::string bin_file_path = model_weights_path + "/" + metadata.file_name;
@@ -298,6 +322,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                 // Ensure read size is aligned (should already be, but just in case)
                 to_read = (to_read / alignment) * alignment;
                 
+                batchgen::check_weight_read_bound(global_offset + file_offset,
+                                                  static_cast<int64_t>(to_read),
+                                                  buffer_bytes, bin_file_path);
                 ssize_t bytes_read = pread(fd, dest_ptr + file_offset, to_read, file_offset);
                 if (bytes_read <= 0) {
                     close(fd);
@@ -326,6 +353,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
             }
 
             // Read the tail directly to destination
+            batchgen::check_weight_read_bound(global_offset + file_offset,
+                                              static_cast<int64_t>(tail_size),
+                                              buffer_bytes, bin_file_path);
             tail_file.read(dest_ptr + file_offset, tail_size);
             if (!tail_file || tail_file.gcount() != static_cast<std::streamsize>(tail_size)) {
                 throw std::runtime_error("Failed to read tail portion (" + 
@@ -402,8 +432,6 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         elapsed = end_time - start_time;
         this->logger->info("Updated module_weights_storage_ and skeleton_state_dict_ in {:.2f} seconds",
                            elapsed.count());
-        global_offset += metadata.total_byte_size;
-        global_offset = (global_offset + 4095) & ~4095; // Round up to 4KB boundary
     }
 };
 
@@ -440,7 +468,7 @@ void Parameter_Server::Init(
     this->weight_ptr_ = weight_ptr;
 
     // Load weights from the model_weights_path
-    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, state_dict_name_map);
+    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, byte_size, state_dict_name_map);
 
     // Serialize the module weights storage into an anonymous memfd. Workers
     // read it once through /proc/<this pid>/fd/<tensor_meta_memfd_fd_>.

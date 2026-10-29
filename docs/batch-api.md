@@ -17,6 +17,10 @@ OpenAI-compatible REST API for batch inference. Base URL: `http://<host>:<port>`
 | GET | `/v1/batches` | List batches |
 | GET | `/v1/batches/{batch_id}` | Get batch status |
 | POST | `/v1/batches/{batch_id}/cancel` | Cancel batch |
+| POST | `/v1/sessions` | Open an agent session |
+| POST | `/v1/sessions/{session_id}/close` | Close a session (end of session / trajectory) |
+| POST | `/v1/sessions/{session_id}/abort` | Abort a session and its in-flight turn |
+| POST | `/v1/turns` | Run one chat-completions turn of a session |
 | GET | `/health` | Health check |
 
 ---
@@ -247,6 +251,149 @@ validating → in_progress → completed
 | `cancelled` | Batch was cancelled. `cancelled_at` is set. |
 
 **Timestamps:** `started_at`, `completed_at`, `cancelled_at`, `cancelling_at` are set as the batch transitions through states.
+
+---
+
+## Agent Turn and Session Endpoints
+
+For an offline agent harness that sends one model turn at a time: a turn is
+answered in its own HTTP response, with no file upload and no batch polling.
+Each turn carries its trajectory and session identity in-band; the session
+lifecycle is signalled out of band. Turns share the IntakePool and the workers
+with running batches. Like the batch routes, these are served by node 0 only.
+
+| Term | Meaning |
+|------|---------|
+| `traj_id` | One agent task (item); shared by its sub-agents |
+| `session_id` | One model context inside a trajectory; not reused (see below) |
+| `parent_session_id` | The session that spawned this one (optional; same trajectory) |
+
+Session states: `open` → (turn) `turn_in_flight` → (answered or failed) `idle`
+→ (turn) … ; `open`/`idle` → `closed`; `open`/`idle`/`turn_in_flight` →
+`aborted`. `closed` and `aborted` are terminal. A session must be opened
+explicitly: a turn for an unknown session gets `404 session_not_found`, and
+there is no implicit open. A session has at most one turn in flight.
+
+A `closed` or `aborted` session is kept as a tombstone that blocks reuse of
+its id until `terminal_ttl_s` (default 3600) seconds after it ended, or until
+`max_terminal` (default 65536) later sessions have ended, whichever comes
+first. After that the server forgets it: a turn for that id
+gets `404 session_not_found` and the id can be opened again. Clients should
+still use ids that are unique per run (e.g. `<traj_id>/<name>`).
+
+### POST /v1/sessions
+
+```json
+{"traj_id": "traj-17", "session_id": "traj-17/main", "parent_session_id": null}
+```
+
+**Response:** the session (`state: "open"`). `409 session_exists` if the id is
+live or still held as a tombstone; `404 parent_session_not_found` / `400 parent_session_other_trajectory`
+for a bad parent.
+
+### POST /v1/sessions/{session_id}/close
+
+```json
+{"reason": "end_of_session"}
+```
+
+The id is the rest of the path and may contain `/`
+(`POST /v1/sessions/traj-17/main/close`); the same holds for `/abort`.
+`reason` is `end_of_session` (this session) or `end_of_trajectory` (every live
+session of the same `traj_id`). All-or-nothing: `409 turn_in_flight` if any of
+them has a turn running. **Response:** `{"object": "session.close", "reason": …, "closed": [sessions]}`.
+
+### POST /v1/sessions/{session_id}/abort
+
+Optional body `{"reason": "tool_crash"}`. Marks the session `aborted` and
+cancels its in-flight turn, whose caller gets `409 turn_aborted`. A turn still
+queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`); a
+turn already running on a worker runs to completion there and its result is
+discarded (`cancelled_turn: "detached"`) — the same limit as batch cancel.
+
+A turn is finished once the server routes its worker completion, even before
+its HTTP response is written. An abort that arrives in that window gets
+`409 already_completed` and changes nothing: the turn returns its answer and
+the session goes `idle`. Abort again after the turn has returned to end the
+session.
+
+### POST /v1/turns
+
+An OpenAI chat-completions body (`model`, `messages`, `tools`, `max_tokens` or
+`max_completion_tokens` (required), sampling parameters, `reasoning_effort`, …)
+plus a `session` object and an optional per-turn `batchgen_debug`. The prompt is
+rendered exactly as for a `/v1/batches` chat request. `n` must be 1.
+
+```json
+{
+  "model": "gpt-oss-120b",
+  "messages": [{"role": "user", "content": "List the files."}],
+  "tools": [{"type": "function", "function": {"name": "ls", "parameters": {"type": "object"}}}],
+  "max_tokens": 1024,
+  "temperature": 0.6,
+  "session": {"traj_id": "traj-17", "session_id": "traj-17/main"}
+}
+```
+
+**Response:** a `chat.completion` object with
+`usage.prompt_tokens_details.cached_tokens` and a `batchgen` extension
+(values below are illustrative):
+
+```json
+{
+  "id": "chatcmpl-…", "object": "chat.completion", "model": "gpt-oss-120b",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "…"}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 812, "completion_tokens": 95, "total_tokens": 907,
+            "prompt_tokens_details": {"cached_tokens": 0}},
+  "batchgen": {
+    "turn_id": "turn_3f…",
+    "session": {"traj_id": "traj-17", "session_id": "traj-17/main", "parent_session_id": null},
+    "cached_tokens": 0,
+    "computed_tokens": 812,
+    "timing": {
+      "http_received_at": 1761650000.101, "intake_submitted_at": 1761650000.104,
+      "admit_sent_at": 1761650000.104, "worker_admitted_at": 1761650000.121,
+      "worker_completed_at": 1761650003.470, "completion_routed_at": 1761650003.471,
+      "http_responded_at": 1761650003.472,
+      "receipt_to_submit_ms": 3.0, "submit_to_admit_sent_ms": 0.2,
+      "admit_sent_to_worker_admit_ms": 17.0, "submit_to_worker_admit_ms": 17.2,
+      "worker_admit_to_complete_ms": 3349.0, "worker_complete_to_routed_ms": 1.0,
+      "routed_to_response_ms": 1.0, "worker_complete_to_response_ms": 2.0,
+      "overhead_ms": 22.0
+    }
+  }
+}
+```
+
+`cached_tokens` / `computed_tokens` are the prompt tokens the sequence's last
+prefill took from the prefix cache / computed. Timestamps are wall-clock seconds
+(server and worker rank 0 share node 0's clock); `overhead_ms` is everything but
+the worker's admit-to-complete time. Each turn also logs one `[TURN] … done`
+line on the server and `[SESSION] admit` / `[SESSION] complete` lines on the
+worker rank that owns the sequence.
+
+**Limits** (checked before the session is touched; `detail` is
+`{"code", "message"}`):
+
+| Limit | Value | Error |
+|-------|-------|-------|
+| Request body | 32 MiB (declared `Content-Length` and bytes received) | `413 request_body_too_large` |
+| `max_tokens`, `max_completion_tokens` | the model context length (`max_context_length` of `GET /v1/models`) | `400 max_tokens_exceeds_context` |
+| `messages` | 8192 entries | `400 too_many_messages` |
+| `tools` | 1024 entries | `400 too_many_tools` |
+| `batchgen_debug` | 64 KiB as JSON | `413 batchgen_debug_too_large` |
+
+The batch path has no request-size limit of its own; prompt plus output
+beyond the context is still rejected per request by the worker
+(`400 context_length_exceeded`).
+
+**Errors:** `503` when the worker pool is not serving and `429` under intake
+pressure (same gates and `Retry-After` as `POST /v1/batches`); `404` / `409` /
+`400` from the session checks; `422` for a malformed body; `400`/`413` for the
+limits above; `400` with the worker's code for a request the worker rejects
+(`context_length_exceeded`, `host_kv_capacity_exceeded`); `409 turn_aborted`;
+`503 worker_fatal` when the worker pool fails while the turn is pending, and
+for every new turn after that until the pool has restarted.
 
 ---
 

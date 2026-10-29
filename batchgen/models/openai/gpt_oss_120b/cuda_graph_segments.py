@@ -877,9 +877,12 @@ class WholeModelSegment:
                 self._kv_buffers[layer_idx]["key"][:B].copy_(key)
                 self._kv_buffers[layer_idx]["value"][:B].copy_(value)
 
-            # KV write to GPU paged cache
+            # KV write to GPU paged cache. The page table is the static
+            # input, so only the fixed-address cache tensors are needed; they
+            # exist on a rank that holds no sequence and has never built an
+            # active page table, which still has to capture this graph.
             gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
-            k_cache, v_cache, _ = gpu_kv_manager.get_layer_kv_with_page_table(layer_idx)
+            k_cache, v_cache = gpu_kv_manager.get_layer_kv_cache(layer_idx)
             run_paged_kv_token_update_fused(
                 k_cache=k_cache,
                 k_tokens=key.view(B, -1),

@@ -53,6 +53,7 @@ from batchgen.server.server_args import (
     validate_shared_runtime_capability,
 )
 from batchgen.server.storage import StorageManager
+from batchgen.server.turn_api import register_turn_routes
 from batchgen.server.worker_manager import WorkerExitState, WorkerManager
 
 logger = logging.getLogger(__name__)
@@ -64,8 +65,8 @@ _GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
 
 # Routes that read or change batch state. Only global rank 0, which runs on node
 # 0, reads the request queue, so a batch accepted by any other node's server is
-# stored and then never run.
-_COORDINATOR_ONLY_PREFIXES = ("/v1/files", "/v1/batches")
+# stored and then never run. Turns and their sessions go the same way.
+_COORDINATOR_ONLY_PREFIXES = ("/v1/files", "/v1/batches", "/v1/turns", "/v1/sessions")
 
 
 def coordinator_only_rejection(
@@ -573,6 +574,10 @@ def create_app(
         )
         updated = storage.load_batch(batch_id)
         return updated
+
+    # ==================== Turn and Session Endpoints ====================
+
+    register_turn_routes(app)
 
     @app.post("/v1/inference")
     async def run_inference():

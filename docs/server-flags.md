@@ -341,7 +341,7 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-cuda-graph` | `false` | Explicitly enable CUDA graph capture for decode (alias: `--enable-cuda-graphs`). Mutually exclusive with `--disable-cuda-graphs`. |
+| `--enable-cuda-graph` | `false` | Explicitly enable the decode CUDA graph (alias: `--enable-cuda-graphs`). Supported: GPT-OSS-120B, Kimi K2.5/K2.6, GLM-5 FP8 family. For any other model the server refuses to start (`UnsupportedCudaGraphFlagError`); Kimi-Linear/K3 graphs are chosen by the planner and `batchgen_debug.kimi_decode_graph_mode`. Mutually exclusive with `--disable-cuda-graphs`. |
 | `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. Mutually exclusive with `--enable-cuda-graph`. |
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
