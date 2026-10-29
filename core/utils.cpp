@@ -454,10 +454,16 @@ std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
     if (logger) {
         return logger;
     }
-    logger = spdlog::stdout_color_mt(logger_name);
+    // The console sink is stderr, which is where the Python side already
+    // logs (batchgen/eventlog installs its console handler on sys.stderr).
+    // One stream for both logging stacks keeps a merged capture in order and
+    // leaves stdout carrying program output only.
+    logger = spdlog::stderr_color_mt(logger_name);
 
-    // Set colors for all five standard levels
-    auto console_sink = dynamic_cast<spdlog::sinks::stdout_color_sink_mt*>(
+    // Set colors for all five standard levels. The cast target must track the
+    // factory above: dynamic_cast to the stdout sink type would answer null
+    // for a stderr sink and silently skip the colors.
+    auto console_sink = dynamic_cast<spdlog::sinks::stderr_color_sink_mt*>(
         logger->sinks()[0].get());
     if (console_sink) {
         console_sink->set_color(spdlog::level::trace, console_sink->white);
