@@ -274,11 +274,19 @@ _METHOD_NAMES = [
     "_publish_session_hold_metrics", "_note_session_evictions", "_owns_host_kv",
     "_decode_attn_tp_size", "_drop_unstarted_request", "_prefix_states_in_use",
     "_select_sequences_for_onhold", "_apply_worker_messages", "_poll_admissions",
+    "_sync_session_hold_owner_errors",
 ]
 
 
 class _Dist:
-    """One-process stand-in: broadcasts are identity, rank 0 is the source."""
+    """One-process stand-in: broadcasts are identity, rank 0 is the source.
+
+    ``peer_flag`` is what the other ranks contribute to a MAX all-reduce.
+    """
+
+    peer_flag = 0
+    all_reduces = 0
+    ReduceOp = SimpleNamespace(MAX="max")
 
     @staticmethod
     def broadcast(tensor, src):
@@ -287,6 +295,12 @@ class _Dist:
     @staticmethod
     def broadcast_object_list(container, src):
         pass
+
+    @classmethod
+    def all_reduce(cls, tensor, op):
+        assert op == cls.ReduceOp.MAX
+        cls.all_reduces += 1
+        tensor.clamp_(min=cls.peer_flag)
 
 
 _METHODS = load_worker_methods(_METHOD_NAMES, {
@@ -322,6 +336,7 @@ class _Worker:
         self._session_retained_pages = {}
         self._session_resumed_uuids = set()
         self._cancelled_request_ids = set()
+        self._session_hold_owner_errors = []
         self._session_resume_wave = {}
         self._session_resume_plans = {}
         self._session_reload_seconds = {}
@@ -673,3 +688,44 @@ def test_pages_are_retained_only_for_completed_sequences():
     assert worker._session_retained_pages == {}
     worker.host.release_sequence_pages([7])
     assert worker.host.resident() == []
+
+
+def test_an_owner_only_kv_append_failure_is_raised_on_every_rank():
+    """L3: the owner waits for its in-flight KV appends before a hold; a
+    failure there raised on the owner alone, leaving the other ranks blocked
+    in their next collective. It is deferred and raised by every rank at the
+    hold record's all-reduce."""
+    owner = _Worker(rank=0)
+    seq = _finish_turn(owner, "turn1", 7, list(range(100)), [1] * 30, own_pages=5)
+    owner._pending_kv_append_tasks = ["task"]
+    owner._deferred_kv_append_wait_errors = []
+
+    def wait(*, defer_errors=False, **_):
+        assert defer_errors, "the owner must not raise alone"
+        owner._pending_kv_append_tasks = []
+        owner._deferred_kv_append_wait_errors.append("RuntimeError: D2H failed")
+        return 1
+
+    owner._wait_pending_kv_append_tasks = wait
+    owner._retain_session_pages_for_hold(["turn1"])       # does not raise
+    assert owner.host.resident() == []                    # nothing held
+    slot = owner._trajectory_book.slot_for("turn1")
+    with pytest.raises(SessionHoldInvariantError, match="D2H failed"):
+        owner._record_session_hold(seq, slot)
+
+    peer = _Worker(rank=1)
+    peer_seq = _finish_turn(peer, "turn1", 7, list(range(100)), [1] * 30, own_pages=5)
+    _Dist.peer_flag = 1                                   # the owner failed
+    try:
+        with pytest.raises(SessionHoldInvariantError, match="owner rank"):
+            peer._record_session_hold(peer_seq, peer._trajectory_book.slot_for("turn1"))
+    finally:
+        _Dist.peer_flag = 0
+    assert peer._session_hold.get("s1") is None
+
+
+def test_a_hold_record_costs_one_flag_all_reduce_when_nothing_failed():
+    before = _Dist.all_reduces
+    worker, _, _ = _held_worker()
+    assert _Dist.all_reduces == before + 1
+    assert worker._session_hold.get("s1") is not None

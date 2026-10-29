@@ -1405,6 +1405,9 @@ class BatchGenWorker:
 		# Every rank: uuids that resumed from a hold, and cancelled requests.
 		self._session_resumed_uuids = set()
 		self._cancelled_request_ids = set()
+		# Owner rank: a hold failure deferred to the next hold record, where
+		# every rank raises it (see _sync_session_hold_owner_errors).
+		self._session_hold_owner_errors = []
 		# Every rank: the current wave's resume decisions (until commit), and
 		# each resumed turn's decision (until its completion is reported).
 		self._session_resume_wave = {}
@@ -3383,36 +3386,83 @@ class BatchGenWorker:
 				held.append(uuid)
 		if not held:
 			return
+		# Only the owner rank runs this, so it must not raise: the other ranks
+		# would block in their next collective. A failure here is deferred and
+		# raised on every rank by _sync_session_hold_owner_errors, which every
+		# rank runs before recording the hold.
+		errors = self._session_hold_owner_errors
 		# The Host copy must cover every token the turn decoded: retire the
 		# in-flight decode appends before the pages change hands.
 		if getattr(self, "_pending_kv_append_tasks", None):
-			self._wait_pending_kv_append_tasks()
-		view = self._session_host_view()
-		global_ids = [self.global_batch.get_sequence(uuid).global_idx for uuid in held]
-		tables = view.build_page_table(global_ids)
-		for uuid, global_id, table in zip(held, global_ids, tables):
-			seq = self.global_batch.get_sequence(uuid)
-			kv_tokens = int(seq.current_context_length) - 1
-			attached = self._session_attached_pages.pop(global_id, ())
-			pages, own = session_hold_lib.split_turn_pages_for_hold(
-				page_table=table,
-				attached_pages=attached,
-				kv_tokens=kv_tokens,
-				page_tokens=self._session_hold.page_tokens,
-			)
-			retained = (
-				[int(page) for page in view.retain_sequence_pages(global_id, own)]
-				if own else []
-			)
-			if retained != own:
-				raise session_hold_lib.SessionHoldInvariantError(
-					f"Host KV retained {len(retained)} pages for held turn {uuid}, "
-					f"asked for {len(own)}"
+			self._wait_pending_kv_append_tasks(defer_errors=True)
+			deferred = getattr(self, "_deferred_kv_append_wait_errors", None)
+			if deferred:
+				errors.extend(
+					f"KV append/offload before the hold: {error}"
+					for error in deferred
 				)
-			self._session_retained_pages[uuid] = tuple(pages)
+				deferred.clear()
+				# The Host copy is incomplete: hold nothing.
+				return
+		try:
+			view = self._session_host_view()
+			global_ids = [
+				self.global_batch.get_sequence(uuid).global_idx for uuid in held
+			]
+			tables = view.build_page_table(global_ids)
+			for uuid, global_id, table in zip(held, global_ids, tables):
+				seq = self.global_batch.get_sequence(uuid)
+				kv_tokens = int(seq.current_context_length) - 1
+				attached = self._session_attached_pages.pop(global_id, ())
+				pages, own = session_hold_lib.split_turn_pages_for_hold(
+					page_table=table,
+					attached_pages=attached,
+					kv_tokens=kv_tokens,
+					page_tokens=self._session_hold.page_tokens,
+				)
+				retained = (
+					[int(page) for page in view.retain_sequence_pages(global_id, own)]
+					if own else []
+				)
+				if retained != own:
+					raise session_hold_lib.SessionHoldInvariantError(
+						f"Host KV retained {len(retained)} pages for held turn "
+						f"{uuid}, asked for {len(own)}"
+					)
+				self._session_retained_pages[uuid] = tuple(pages)
+		except Exception as exc:
+			logging.exception(
+				"[SESSION_HOLD] rank %s: retaining held pages failed; every "
+				"rank raises at the hold record", self.rank,
+			)
+			errors.append(f"{type(exc).__name__}: {exc}")
+
+	def _sync_session_hold_owner_errors(self) -> None:
+		"""Every rank: raise an owner rank's deferred hold failure everywhere.
+
+		Called once per held turn from _record_session_hold, which every rank
+		runs for the same turns, so the collective count matches. A one-int
+		MAX all-reduce: the failing owner raises with its detail, the others
+		name it as a peer failure. The worker fatal boundary takes it from
+		there, and the restart's reconcile frees whatever was retained.
+		"""
+		errors = self._session_hold_owner_errors
+		flag = torch.tensor(
+			[1 if errors else 0], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+		if int(flag.item()) == 0:
+			return
+		detail = list(errors)
+		errors.clear()
+		raise session_hold_lib.SessionHoldInvariantError(
+			f"Rank {self.rank}: session hold failed on the Host KV owner rank: "
+			+ ("; ".join(detail[:4]) if detail else "see that rank's log")
+		)
 
 	def _record_session_hold(self, seq, trajectory_slot) -> dict:
 		"""Every rank: record a finished turn's held KV; returns its summary."""
+		self._sync_session_hold_owner_errors()
 		book = self._session_hold
 		if trajectory_slot is None:
 			raise session_hold_lib.SessionHoldInvariantError(
