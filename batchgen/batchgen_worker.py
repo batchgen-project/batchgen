@@ -3329,12 +3329,26 @@ class BatchGenWorker:
 			return False
 		if seq.uuid in self._cancelled_request_ids:
 			return False
-		if self._decode_attn_tp_size() != 1:
-			raise session_hold_lib.SessionHoldUnsupported(
-				"session KV hold supports pure DP attention (attn_tp_size == 1) "
-				f"only, got {self._decode_attn_tp_size()}"
-			)
+		# Attention TP > 1 was refused at Init (_require_session_hold_pure_dp).
 		return True
+
+	def _require_session_hold_pure_dp(self) -> None:
+		"""Refuse session hold under attention TP > 1, before any admission.
+
+		A hold lives on one rank's Host pages and pins the session's next turn
+		to that rank; a TP attention group spans several ranks. The attention
+		TP size is known once the parallel strategy manager exists, which is
+		at Init (``_init_session_hold`` runs before it), so this runs right
+		after the manager is built: no turn is admitted, so none is held.
+		"""
+		if getattr(self, "_session_hold", None) is None:
+			return
+		attn_tp = self._decode_attn_tp_size()
+		if attn_tp != 1:
+			raise session_hold_lib.SessionHoldUnsupported(
+				"session KV hold cannot run here: it supports pure DP "
+				f"attention (attn_tp_size == 1) only, got attn_tp_size={attn_tp}"
+			)
 
 	def _prefix_states_in_use(self) -> bool:
 		"""Prefix states exist: prefix-cache hits, or resumed session holds."""
@@ -5429,6 +5443,9 @@ class BatchGenWorker:
 			self.global_rank,
 			self.world_size
 		)
+		# Session hold needs pure DP attention; refused here, before anything
+		# is admitted, instead of at the first held completion.
+		self._require_session_hold_pure_dp()
 
 		# The token pool is fixed for the lifetime of the worker. Its byte budget
 		# is explicit, while the number of admitted trajectories is derived from

@@ -621,3 +621,37 @@ def test_session_hold_model_support_is_decided_by_the_prefix_reuse_config():
     assert require_session_hold_model_support("openai/gpt-oss-120b")
     with pytest.raises(ValueError, match="GPT-OSS only"):
         require_session_hold_model_support("moonshotai/Kimi-K2-Instruct")
+
+
+def test_attention_tp_is_refused_at_init_not_at_the_first_held_completion():
+    """M1: a TP attention group would raise on every rank at the first held
+    completion (and again after each restart); it is refused right after the
+    parallel strategy manager is built, before anything is admitted."""
+    import ast
+    from pathlib import Path
+
+    require = load_worker_methods(
+        ["_require_session_hold_pure_dp"],
+        {"session_hold_lib": session_hold_lib},
+    )["_require_session_hold_pure_dp"]
+    worker = _Worker()
+    worker.parallel_manager = SimpleNamespace(attn_tp_size=2)
+    with pytest.raises(session_hold_lib.SessionHoldUnsupported, match="attn_tp_size=2"):
+        require(worker)
+    worker.parallel_manager = SimpleNamespace(attn_tp_size=1)
+    require(worker)
+    # Hold off: nothing to refuse.
+    worker.parallel_manager = SimpleNamespace(attn_tp_size=2)
+    worker._session_hold = None
+    require(worker)
+
+    source = (Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py").read_text()
+    init = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_initialize_core_components"
+    )
+    calls = [ast.unparse(stmt) for stmt in init.body]
+    psm = max(i for i, text in enumerate(calls) if "self.parallel_manager = " in text)
+    check = calls.index("self._require_session_hold_pure_dp()")
+    assert psm < check
