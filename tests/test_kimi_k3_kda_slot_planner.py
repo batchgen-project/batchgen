@@ -70,10 +70,13 @@ def test_h200_tp8_uses_96_user_slots():
 
 
 def test_h20_tp8_keeps_single_long_prompt_prefill_cap():
+    # Raised 16,384 -> 32,768: the roofline per-pass time floor sits above the
+    # old cap, so a 64K prompt paid four model passes where two suffice, and
+    # the streamed weight volume is charged per pass.
     assert k3_prefill_micro_batch_token_cap(
         gpu_total_memory_bytes=96 * GIB,
         attention_group_size=8,
-    ) == 16_384
+    ) == 32_768
 
 
 def test_h200_tp8_batches_eight_exact_64k_prompts_per_model_pass():
@@ -120,7 +123,7 @@ def test_h200_non_tp8_fails_safe_to_four_slots():
     assert k3_prefill_micro_batch_token_cap(
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=1,
-    ) == 16_384
+    ) == 32_768
     assert k3_prefill_collective_stripe_threshold_rows(
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=1,
@@ -139,7 +142,7 @@ def test_unknown_memory_fails_safe_to_four_slots():
     assert k3_prefill_micro_batch_token_cap(
         gpu_total_memory_bytes=None,
         attention_group_size=8,
-    ) == 16_384
+    ) == 32_768
     assert k3_prefill_collective_stripe_threshold_rows(
         gpu_total_memory_bytes=None,
         attention_group_size=8,

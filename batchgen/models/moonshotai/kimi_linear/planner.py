@@ -16,7 +16,7 @@ from batchgen.planner.base_planner import BasePlanner
 
 _GIB = 1024 ** 3
 _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
-_K3_H20_PREFILL_TOKEN_CAP = 16_384
+_K3_H20_PREFILL_TOKEN_CAP = 32_768
 _K3_H200_PREFILL_TOKEN_CAP = 524_288
 # Admission waves after the first decode phase prefill through the resident
 # EP shard (kept on the GPU) in chunks of this many tokens — SGLang's
@@ -59,6 +59,17 @@ _KL48_H20_MIN_MEMORY_BYTES = 90 * _GIB
 # plateaus just under 13.5 GiB at and beyond the token cap, and the per-wave
 # token accounting identity was exact with zero OOM. This value keeps the
 # measured peak with >= 1.5x margin.
+#
+# CAUTION, the plateau above was measured with the token cap at its previous
+# value, half the current one. The forward terms that scale linearly with the
+# per-pass row count (the grouped MoE's global FP32 output in particular) grow
+# with the cap, so that plateau is NOT known to hold here and this reserve has
+# not been re-validated against the current cap. Treat the margin as unverified
+# until a pool run reports workspace_peak_bytes at this cap; such a run must
+# watch the first wave's peak and the per-wave token accounting identity, and
+# halve the cap again on any OOM or identity break.
+# Prior art for that failure mode: sub-project
+# k3-streamed-prefill-microbatch-cap-exceeds-activation-budget.
 _K3_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
 # KDA state slots held back from admission for pooled prefix segments: each
 # segment row holds one slot for its wave, and a wave that admits the full
