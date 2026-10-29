@@ -265,6 +265,7 @@ from batchgen.worker.kv_manager import (
 	WatermarkTriggerRequest,
 )
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
+from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
 from batchgen.worker.step_timing import (
 	FORWARD_EVENT_RING_SLOTS,
 	ForwardEventRing,
@@ -19001,6 +19002,14 @@ class BatchGenWorker:
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
+		# Per-worker step counters behind the rate-limited ``step.counters``
+		# event. Plain ints/floats that persist across decode rounds, so a
+		# window spanning several short rounds still reports.
+		_step_counters = getattr(self, "_step_counters", None)
+		if _step_counters is None:
+			_step_counters = StepCounters(logging.getLogger(__name__), _hb_last_time)
+			self._step_counters = _step_counters
+		_step_counters.begin_round(_hb_last_time)
 
 		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
 		# this decode round: a hot reload rebinds methods on the live worker,
@@ -19041,10 +19050,17 @@ class BatchGenWorker:
 			self.feed_watchdog()
 			self.feed_decode_watchdog()
 
+			# Step counters: field bumps and one time compare per step; the
+			# event payload is built only when its interval has elapsed.
+			_step_now_s = time.perf_counter()
+			_step_rows = len(decode_uuids)
+			_step_counters.add_step(_step_now_s, _step_rows)
+			_step_counters.maybe_emit(_step_now_s, STEP_COUNTERS_INTERVAL_S)
+
 			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
 			# monitor sees liveness during long decode phases
-			_hb_tokens += len(decode_uuids)
-			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
+			_hb_tokens += _step_rows
+			if self.rank == 0 and _step_now_s - _hb_last_time >= 30.0:
 				_hb_elapsed = time.perf_counter() - _hb_last_time
 				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
 				_split_txt = ""
@@ -20201,6 +20217,9 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
+		_step_now_s = time.perf_counter()
+		_step_counters.end_round(_step_now_s)
+		_step_counters.maybe_emit(_step_now_s, STEP_COUNTERS_INTERVAL_S)
 		# Decode intervals shorter than the 30 s heartbeat (128-token probes,
 		# small admission waves) would otherwise never report their step split.
 		if self.rank == 0 and _step_split[0] > 0:
