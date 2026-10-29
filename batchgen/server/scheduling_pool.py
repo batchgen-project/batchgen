@@ -63,6 +63,12 @@ class SchedulingPool:
         self._free_slots: List[int] = list(range(capacity))
         # Active sequences: request_id → slot_index
         self._active_slots: Dict[str, int] = {}
+        # Agent sessions whose KV the worker holds between turns
+        # (--enable-session-kv-hold): session_id -> the slot of the finished
+        # turn. The worker keeps that turn's trajectory reservation bound
+        # until the session's next turn commits, close or abort, so the slot
+        # is not free for new admissions either.
+        self._held_slots: Dict[str, int] = {}
         # Batch tracking
         self._batch_trackers: Dict[str, BatchTracker] = {}
         # Idempotency: track completed request IDs to prevent double-counting
@@ -83,6 +89,14 @@ class SchedulingPool:
         with self._lock:
             return len(self._active_slots)
 
+    def num_held_slots(self) -> int:
+        with self._lock:
+            return len(self._held_slots)
+
+    def held_session_ids(self) -> List[str]:
+        with self._lock:
+            return sorted(self._held_slots)
+
     def has_free_slots(self) -> bool:
         with self._lock:
             return len(self._free_slots) > 0
@@ -92,8 +106,10 @@ class SchedulingPool:
         if capacity < 0:
             raise ValueError(f"capacity must be non-negative, got {capacity}")
         with self._lock:
-            if self._active_slots:
-                raise RuntimeError("cannot change scheduling capacity with active slots")
+            if self._active_slots or self._held_slots:
+                raise RuntimeError(
+                    "cannot change scheduling capacity with active or held slots"
+                )
             self._capacity = int(capacity)
             self._free_slots = list(range(self._capacity))
 
@@ -144,6 +160,34 @@ class SchedulingPool:
                 f"[SCHED] Freed slot {slot} for {request_id} "
                 f"({len(self._free_slots)} free)"
             )
+            return slot
+
+    def hold_slot(self, request_id: str, session_id: str) -> Optional[int]:
+        """Keep a finished turn's slot as its session's held slot.
+
+        The worker held the turn's KV (its completion says so). A session holds
+        at most one turn, so a previous held slot -- a hold the worker replaced
+        without the turn consuming it -- is freed and returned.
+
+        Raises:
+            KeyError: If request_id has no active slot.
+        """
+        if not session_id:
+            raise ValueError("hold_slot needs a session_id")
+        with self._lock:
+            slot = self._active_slots.pop(request_id)
+            previous = self._held_slots.pop(session_id, None)
+            if previous is not None:
+                self._free_slots.append(previous)
+            self._held_slots[session_id] = slot
+            return previous
+
+    def release_held_slot(self, session_id: str) -> Optional[int]:
+        """Free a session's held slot (its hold was consumed or released)."""
+        with self._lock:
+            slot = self._held_slots.pop(session_id, None)
+            if slot is not None:
+                self._free_slots.append(slot)
             return slot
 
     def get_slot(self, request_id: str) -> Optional[int]:
@@ -250,11 +294,16 @@ class SchedulingPool:
             return tracker
 
     def clear_active_slots(self) -> int:
-        """Return every worker-owned slot to the free pool after a fatal stop."""
+        """Return every worker-owned slot to the free pool after a fatal stop.
+
+        Held session slots go too: a stopped worker holds no KV.
+        """
         with self._lock:
-            count = len(self._active_slots)
+            count = len(self._active_slots) + len(self._held_slots)
             self._free_slots.extend(self._active_slots.values())
+            self._free_slots.extend(self._held_slots.values())
             self._active_slots.clear()
+            self._held_slots.clear()
             return count
 
     # -------------------- Intake Selection --------------------
@@ -293,6 +342,7 @@ class SchedulingPool:
             return (
                 f"SchedulingPool(capacity={self._capacity}, "
                 f"active={len(self._active_slots)}, "
+                f"held={len(self._held_slots)}, "
                 f"free={len(self._free_slots)}, "
                 f"batches={len(self._batch_trackers)})"
             )

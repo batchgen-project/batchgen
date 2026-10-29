@@ -323,6 +323,10 @@ def create_app(
         }
         if scheduler._session_kv_hold:
             status["session_hold"] = scheduler._session_hold_info
+            # Footprint admission, and the slots of finished turns whose
+            # session KV the worker holds.
+            status["kv_admission"] = scheduler._kv_admission_info
+            status["scheduling_pool_held"] = spool.num_held_slots()
         return status
 
     # ==================== File Endpoints ====================
