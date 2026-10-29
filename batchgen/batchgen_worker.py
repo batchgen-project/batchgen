@@ -5374,6 +5374,7 @@ class BatchGenWorker:
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
+		self._a2_log_reload_probe(global_sequence_ids, load_duration)
 
 		# Option 1 (unified resident TP): NO prefill->decode KDA reshard. Under
 		# G>1 the sequence's serve-group ran prefill in TP-G lockstep, so each of
@@ -5381,6 +5382,68 @@ class BatchGenWorker:
 		# state in the GPU state pool (slot keyed by global seq id, persists
 		# prefill->decode). This host->GPU load handles only the MLA paged KV,
 		# which is REPLICATED across the group — nothing to reshard.
+
+	def _a2_log_reload_probe(
+		self, global_sequence_ids: List[int], load_duration: float
+	) -> None:
+		"""A2 step 0 probe: one [METRICS] line per host->GPU KV reload.
+
+		Enabled only by ``batchgen_debug.a2_reload_probe`` on a live request
+		(measurement branch tairan/a2-reload-probe, never merged). It reads
+		what the reload above already moved and changes nothing: the pages are
+		the sequence's own host pages, and the bytes come from the configured
+		host pool divided by its page count.
+		"""
+		active = self._active_batchgen_debug_for_sequences(self.global_batch)
+		if not active or not self._debug_flag_enabled(active.get("a2_reload_probe")):
+			return
+		by_global = {}
+		for uuid in self._uuid_to_local_map:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				by_global[seq.global_idx] = seq
+		rows = []
+		pages = 0
+		tokens = 0
+		for global_idx in global_sequence_ids:
+			seq = by_global.get(global_idx)
+			if seq is None:
+				rows.append({"global_idx": global_idx, "missing": True})
+				continue
+			seq_pages = int(seq.host_pages_allocated)
+			seq_tokens = int(seq.current_context_length)
+			pages += seq_pages
+			tokens += seq_tokens
+			rows.append({
+				"global_idx": global_idx,
+				"host_pages": seq_pages,
+				"context_tokens": seq_tokens,
+				"prompt_tokens": int(seq.prompt_length),
+				"decoded_tokens": int(seq.decoded_length),
+				"status": seq.status.name,
+			})
+		stats = self.host_paged_kv_worker_view.get_stats()
+		bytes_per_page = (
+			float(self.global_host_kv_cache_size_gb) * (1024 ** 3)
+			/ max(int(stats.num_total_pages), 1)
+		)
+		loaded_bytes = bytes_per_page * pages
+		logging.info("[METRICS] %s", json.dumps({
+			"component": "host_kv_reload",
+			"phase": "reload",
+			"sequences": len(global_sequence_ids),
+			"host_pages": pages,
+			"context_tokens": tokens,
+			"bytes_per_page": bytes_per_page,
+			"loaded_bytes": loaded_bytes,
+			"reload_s": load_duration,
+			"h2d_gb_s": (loaded_bytes / (1024 ** 3)) / load_duration
+			if load_duration > 0 else None,
+			"bytes_per_token": loaded_bytes / tokens if tokens else None,
+			"host_pool_pages": int(stats.num_total_pages),
+			"rank": self.rank,
+			"rows": rows,
+		}, separators=(",", ":")))
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
