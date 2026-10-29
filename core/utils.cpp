@@ -59,12 +59,16 @@ torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
     };
 
     auto it = dtype_map.find(dtype_str);
-    if (it != dtype_map.end()) {
-        return it->second;
+    if (it == dtype_map.end()) {
+        // An unknown dtype is a configuration error, never a silent float32.
+        spdlog::error(
+            "EngineConfig: unsupported dtype '{}'; expected one of float16, "
+            "float32, bfloat16, float8_e4m3fn, float8_e5m2, uint8",
+            dtype_str);
+        throw std::runtime_error(
+            "EngineConfig: unsupported dtype '" + dtype_str + "'");
     }
-    
-    // Default to float32 if not found
-    return torch::kFloat32;
+    return it->second;
 }
 
 // Basic_Config parse_basic_config(const py::object& engine_config) {
@@ -251,107 +255,6 @@ Module_Batching_Config parse_module_batching_config(
 };
 
 namespace {
-
-// The configured level of the engine config currently being parsed. The
-// config parsers are free functions with no component of their own, so the
-// level comes straight out of the object they are handed.
-std::string EngineConfigLogLevel(const py::object& engine_config) {
-    return engine_config.attr("Basic_Config")
-        .attr("log_level")
-        .cast<std::string>();
-}
-
-std::size_t CheckedSize(const std::shared_ptr<spdlog::logger>& logger,
-                        long long value, std::string_view field_name) {
-    if (value < 0) {
-        std::ostringstream oss;
-        oss << field_name << " must be non-negative (got " << value << ')';
-        logger->error("Engine config rejected: {}", oss.str());
-        throw std::invalid_argument(oss.str());
-    }
-    return static_cast<std::size_t>(value);
-}
-
-HostPagedKVConfig parse_host_paged_kv_config(
-    const py::object& engine_config) {
-    HostPagedKVConfig config;
-    if (!py::hasattr(engine_config, "Host_Paged_KV_Config")) {
-        return config;
-    }
-    const auto logger =
-        init_logger(EngineConfigLogLevel(engine_config), "EngineConfig");
-    const py::object cfg = engine_config.attr("Host_Paged_KV_Config");
-    config.shm_name = cfg.attr("shm_name").cast<std::string>();
-    config.total_byte_size = CheckedSize(logger,
-        cfg.attr("total_byte_size").cast<long long>(),
-        "Host_Paged_KV_Config.total_byte_size");
-    config.num_layers = CheckedSize(logger,
-        cfg.attr("num_layers").cast<long long>(),
-        "Host_Paged_KV_Config.num_layers");
-    config.num_pages_per_layer = CheckedSize(logger,
-        cfg.attr("num_pages_per_layer").cast<long long>(),
-        "Host_Paged_KV_Config.num_pages_per_layer");
-    config.page_size = CheckedSize(logger, cfg.attr("page_size").cast<long long>(),
-                                   "Host_Paged_KV_Config.page_size");
-    config.num_k_heads = CheckedSize(logger,
-        cfg.attr("num_k_heads").cast<long long>(),
-        "Host_Paged_KV_Config.num_k_heads");
-    config.k_head_dim = CheckedSize(logger,
-        cfg.attr("k_head_dim").cast<long long>(),
-        "Host_Paged_KV_Config.k_head_dim");
-    config.num_v_heads = CheckedSize(logger,
-        cfg.attr("num_v_heads").cast<long long>(),
-        "Host_Paged_KV_Config.num_v_heads");
-    config.v_head_dim = CheckedSize(logger,
-        cfg.attr("v_head_dim").cast<long long>(),
-        "Host_Paged_KV_Config.v_head_dim");
-    config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
-    // The page format is optional in the engine config: every model but the
-    // GLM-5.2 aux cache uses the default token-major arrangement, and that
-    // cache is built through the direct host-KV config path, not from here.
-    // An unknown value is rejected downstream (ResolvePageFormat), never
-    // defaulted.
-    if (py::hasattr(cfg, "page_format")) {
-        config.page_format = cfg.attr("page_format").cast<std::string>();
-    }
-    logger->info("Host Paged KV Config parsed successfully");
-    return config;
-}
-
-DevicePagedKVConfig parse_device_paged_kv_config(
-    const py::object& engine_config) {
-    DevicePagedKVConfig config;
-    if (!py::hasattr(engine_config, "Device_Paged_KV_Config")) {
-        return config;
-    }
-    const auto logger =
-        init_logger(EngineConfigLogLevel(engine_config), "EngineConfig");
-    const py::object cfg = engine_config.attr("Device_Paged_KV_Config");
-    config.num_layers = CheckedSize(logger,
-        cfg.attr("num_layers").cast<long long>(),
-        "Device_Paged_KV_Config.num_layers");
-    config.num_pages_per_layer = CheckedSize(logger,
-        cfg.attr("num_pages_per_layer").cast<long long>(),
-        "Device_Paged_KV_Config.num_pages_per_layer");
-    config.page_size = CheckedSize(logger,
-        cfg.attr("page_size").cast<long long>(),
-        "Device_Paged_KV_Config.page_size");
-    config.num_k_heads = CheckedSize(logger,
-        cfg.attr("num_k_heads").cast<long long>(),
-        "Device_Paged_KV_Config.num_k_heads");
-    config.k_head_dim = CheckedSize(logger,
-        cfg.attr("k_head_dim").cast<long long>(),
-        "Device_Paged_KV_Config.k_head_dim");
-    config.num_v_heads = CheckedSize(logger,
-        cfg.attr("num_v_heads").cast<long long>(),
-        "Device_Paged_KV_Config.num_v_heads");
-    config.v_head_dim = CheckedSize(logger,
-        cfg.attr("v_head_dim").cast<long long>(),
-        "Device_Paged_KV_Config.v_head_dim");
-    config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
-    logger->info("Device Paged KV Config parsed successfully");
-    return config;
-}
 
 constexpr double kKilobyte = 1024.0;
 constexpr double kMegabyte = kKilobyte * 1024.0;

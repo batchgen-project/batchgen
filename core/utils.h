@@ -55,17 +55,17 @@ inline void safeCall(Func&& func, Logger logger, const char* callerFunction) {
     try {
         func();
     } catch (const c10::Error& e) {
-        logger->debug("{}: CUDA/PyTorch error: {}", callerFunction, e.what());
+        logger->error("{}: CUDA/PyTorch error: {}", callerFunction, e.what());
         throw std::runtime_error(e.what());
     } catch (const cudaError_t& err) {
-        logger->debug("{}: CUDA runtime error: {}", callerFunction,
+        logger->error("{}: CUDA runtime error: {}", callerFunction,
                       cudaGetErrorString(err));
         throw std::runtime_error(cudaGetErrorString(err));
     } catch (const std::exception& e) {
-        logger->debug("{}: Error: {}", callerFunction, e.what());
+        logger->error("{}: Error: {}", callerFunction, e.what());
         throw std::runtime_error(e.what());
     } catch (...) {
-        logger->debug("{}:", callerFunction);
+        logger->error("{}:", callerFunction);
         throw std::runtime_error("Unknown error");
     }
 }
