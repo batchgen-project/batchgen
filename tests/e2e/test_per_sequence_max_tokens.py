@@ -31,10 +31,13 @@ _heavy_mods = [
 for mod in _heavy_mods:
     sys.modules.setdefault(mod, _mock)
 
-# Also stub batchgen_worker and config to avoid CUDA/model imports
-# We only need parse_batch_file (standalone function) and io_struct (pydantic models)
+# Also stub batchgen_worker and the config model registry to avoid CUDA/model
+# imports. We only need parse_batch_file (standalone function) and io_struct
+# (pydantic models). Stub only the model_registry leaf, never the
+# batchgen.config package itself: a MagicMock has no __path__, so replacing the
+# package breaks every real submodule import beneath it (e.g. server_args
+# imports batchgen.config.cuda_graph_flag_policy at module level).
 sys.modules.setdefault("batchgen.batchgen_worker", _mock)
-sys.modules.setdefault("batchgen.config", _mock)
 sys.modules.setdefault("batchgen.config.model_registry", _mock)
 
 from batchgen.server.batch_scheduler import parse_batch_file
