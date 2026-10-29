@@ -207,7 +207,22 @@ class BatchScheduler:
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
         self._scheduling_pool = SchedulingPool(capacity=0)
         self._trajectory_pool_info: Optional[Dict[str, Any]] = None
+        # Latest agent-session KV hold metrics published by the worker
+        # (--enable-session-kv-hold); None until the first hold event.
+        self._session_hold_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
+        # --enable-session-kv-hold: the request queue of the worker generation
+        # that has received its "init" and is serving, or None while no
+        # generation is live (before the first init, and from a quiesce or a
+        # fatal until the next generation is ready). session_control messages
+        # go only there: one put on a generation's queue ahead of its "init"
+        # kills that generation. Guarded by _control_lock because the restart
+        # thread clears it while the loop sends.
+        self._session_kv_hold = bool(
+            getattr(server_args, "enable_session_kv_hold", False)
+        )
+        self._control_lock = threading.Lock()
+        self._control_queue: Optional[Any] = None
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
         # Completion delivery is generation-scoped: one daemon pump thread per
@@ -233,8 +248,8 @@ class BatchScheduler:
         # keyed by its turn id; the completion listener resolves its waiter's
         # future directly, with no batch tracker and no output file.
         self._turn_waiters: Dict[str, _TurnWaiter] = {}
-        # Aborted turns already sent to a worker. The worker still finishes
-        # them (there is no worker-side cancel); their completion is dropped.
+        # Aborted turns already sent to a worker. The worker is told to cancel
+        # them and still reports one completion each, which is dropped.
         self._detached_turns: set = set()
         # A turn submission wakes an idle drain at once instead of at its next
         # 0.1 s poll.
@@ -304,6 +319,10 @@ class BatchScheduler:
 
     def quiesce(self) -> None:
         """Stop dispatching new work while retaining the upstream queues."""
+        # The generation is about to be torn down (restart) or is already dead
+        # (fatal): no session_control may reach it or its successor's queue
+        # until that successor is ready.
+        self._mark_generation_down()
         self._quiesced.set()
         if self._loop is not None and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
@@ -317,12 +336,30 @@ class BatchScheduler:
         self._call_on_loop(self._open_turn_gate, "reopen turn submission")
 
     def fail_in_flight(self, error_msg: str) -> int:
+        self._mark_generation_down()
         return self._fail_all_active_batches(error_msg)
+
+    def _mark_generation_live(self) -> None:
+        """The current worker generation got its "init": control may flow."""
+        with self._control_lock:
+            # None only if the channels were abandoned meanwhile: not live.
+            self._control_queue = getattr(self.worker, "request_queue", None)
+
+    def _mark_generation_down(self) -> None:
+        """No generation is serving: session_control is dropped until ready.
+
+        The generation's published hold metrics go with it: its held KV is
+        freed by the reconcile, and the next generation publishes its own.
+        """
+        with self._control_lock:
+            self._control_queue = None
+        self._session_hold_info = None
 
     def worker_generation_ready(self) -> None:
         # WorkerManager sends the generation's init message before this hook;
         # the drain task must not send a duplicate init after resume.
         self._pool_initialized = True
+        self._mark_generation_live()
         # The new cohort writes to a new response queue, and the previous
         # generation's pump owns a queue that was abandoned with its cohort.
         # Completion delivery therefore has to be rebuilt here or no batch of
@@ -973,26 +1010,109 @@ class BatchScheduler:
         """Cancel a submitted turn; its waiter fails with 409 turn_aborted.
 
         Returns "dequeued" when the turn was still in the IntakePool (it never
-        reaches a worker), "detached" when it was already admitted, or None
-        for a turn that is not pending. A detached turn runs to completion on
-        the worker -- the worker has no per-request cancel, the same as
-        /v1/batches/{id}/cancel -- and its completion is discarded. Runs on the
-        scheduler loop.
+        reaches a worker), or None for a turn that is not pending. A turn
+        already admitted to a worker returns:
+
+        * "detached" without --enable-session-kv-hold: the turn runs to
+          completion on the worker -- there is no worker-side cancel, the same
+          as /v1/batches/{id}/cancel -- and its completion is discarded;
+        * "cancelled" with it: the worker is told to cancel the turn (a
+          session_control message, handled at its next admission poll), which
+          drops it if it has not started or finishes it at the next completion
+          check, never held; its one completion is discarded here.
+
+        Runs on the scheduler loop.
         """
         waiter = self._turn_waiters.pop(turn_id, None)
         if waiter is None:
             return None
         removed = self._intake_pool.remove_batch_entries(turn_id)
         self._intake_pool.remove_batch_info(turn_id)
-        outcome = "dequeued" if removed else "detached"
-        if not removed:
-            self._detached_turns.add(turn_id)
+        if removed:
+            outcome = "dequeued"
+        elif self._session_kv_hold:
+            outcome = "cancelled"
+        else:
+            outcome = "detached"
+        # The waiter is already out of _turn_waiters, so nothing else will
+        # ever resolve it: fail it before anything below can raise.
         if not waiter.future.done():
             waiter.future.set_exception(TurnError(
                 409, "turn_aborted", f"turn {turn_id} was aborted: {reason}",
             ))
+        if not removed:
+            self._detached_turns.add(turn_id)
+            self._send_session_control(cancel=[turn_id], reason=reason)
         logger.info("[TURN] %s cancelled (%s): %s", turn_id, outcome, reason)
         return outcome
+
+    def release_sessions(self, session_ids: List[str], reason: str) -> None:
+        """Free the KV the worker holds for these sessions (close / abort).
+
+        A no-op on the worker for a session it holds nothing for. Runs on the
+        scheduler loop, so the message is ordered after every admission the
+        drain already sent.
+        """
+        if session_ids:
+            self._send_session_control(
+                release=[
+                    {"session_id": session_id, "reason": reason}
+                    for session_id in session_ids
+                ],
+                reason=reason,
+            )
+
+    def _send_session_control(
+        self,
+        *,
+        cancel: Optional[List[str]] = None,
+        release: Optional[List[Dict[str, str]]] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Put one session_control message on the live generation's queue.
+
+        Nothing is sent without --enable-session-kv-hold. With it, the message
+        goes only to a generation that has received its ``init`` and is
+        serving; with none live it is dropped, which loses nothing: before the
+        first init the worker has admitted nothing, and a generation being
+        restarted or failed has its in-flight turns failed and its held Host
+        pages swept by the reconcile. A message put on a fresh generation's
+        queue ahead of its ``init`` would kill it.
+        """
+        if not self._session_kv_hold:
+            return
+        cancel_ids = list(cancel or ())
+        released = [item["session_id"] for item in release or ()]
+        with self._control_lock:
+            control_queue = self._control_queue
+            if control_queue is not None:
+                try:
+                    control_queue.put({
+                        "type": "session_control",
+                        "cancel": cancel_ids,
+                        "release": list(release or ()),
+                        "reason": reason,
+                    })
+                except (ValueError, OSError) as exc:
+                    # A closed channel: its generation is being torn down,
+                    # and the restart reconciles what this message asked.
+                    logger.error(
+                        "[TURN] session_control could not be sent (%s: %s): "
+                        "cancel=%s release=%s reason=%s",
+                        type(exc).__name__, exc, cancel_ids, released, reason,
+                    )
+                    return
+        if control_queue is None:
+            logger.warning(
+                "[TURN] session_control dropped (no live worker generation; "
+                "a restart reconciles it): cancel=%s release=%s reason=%s",
+                cancel_ids, released, reason,
+            )
+            return
+        logger.info(
+            "[TURN] session_control sent: cancel=%s release=%s reason=%s",
+            cancel_ids, released, reason,
+        )
 
     def _resolve_turn(self, turn_id: str, result: dict) -> None:
         """Hand a turn's completion item to its waiter. Runs on the loop."""
@@ -1116,6 +1236,11 @@ class BatchScheduler:
             "computed_tokens": result.get("computed_tokens"),
             "timing": timing,
         }
+        if self._session_kv_hold:
+            # The hold this turn resumed from (LCP, reused tokens) and the KV
+            # it now holds for the next turn. Absent without the flag.
+            body["batchgen"]["session_resume"] = result.get("session_resume")
+            body["batchgen"]["session_hold"] = result.get("session_hold")
         logger.info(
             "[TURN] %s done traj=%s session=%s parent=%s prompt=%s cached=%s "
             "computed=%s decoded=%s finish=%s receipt_to_submit_ms=%s "
@@ -1311,6 +1436,7 @@ class BatchScheduler:
                 init_msg = {"type": "init", **self.pool_init_params()}
                 self.worker.request_queue.put(init_msg)
                 self._pool_initialized = True
+                self._mark_generation_live()
                 logger.info("[POOL] Init message sent to worker")
                 # Brief wait for worker to initialize before sending sequences
                 await asyncio.sleep(1.0)
@@ -1567,6 +1693,11 @@ class BatchScheduler:
                         else:
                             logger.info("[POOL] Worker shutdown signal received")
                         continue
+                    elif msg_type == "session_hold_metrics":
+                        self._session_hold_info = {
+                            key: value for key, value in result.items()
+                            if key != "type"
+                        }
                     elif msg_type == "trajectory_pool_capacity":
                         # ``total_capacity`` is immutable token-pool capacity and
                         # sizes SchedulingPool.  ``free_reservations`` changes on

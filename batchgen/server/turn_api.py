@@ -9,6 +9,10 @@ the body); the session lifecycle is signalled out of band:
     POST /v1/sessions/{session_id}/close    reason end_of_session | end_of_trajectory
     POST /v1/sessions/{session_id}/abort    cancels the in-flight turn, if any
                                             (session_id may contain "/")
+
+With --enable-session-kv-hold, a finished turn keeps its Host KV until the
+session's next turn (which prefills only the suffix past the longest common
+prefix with the held tokens), close or abort; close and abort free it.
     POST /v1/turns                          one chat-completions turn
 
 A turn is rendered exactly as a /v1/batches chat request, submitted to the
@@ -141,11 +145,17 @@ def register_turn_routes(app: FastAPI) -> None:
     # "<traj>/<name>" form); a plain parameter stops at the first slash and
     # the request 404s before reaching the handler.
     @app.post("/v1/sessions/{session_id:path}/close")
-    async def close_session(session_id: str, body: CloseSessionRequest):
+    async def close_session(
+        request: Request, session_id: str, body: CloseSessionRequest
+    ):
         try:
             closed = registry.close(session_id, body.reason)
         except TurnError as exc:
             raise _http_error(exc) from exc
+        # Free the KV the worker holds for every closed session.
+        request.app.state.scheduler.release_sessions(
+            [record.session_id for record in closed], "closed"
+        )
         return {
             "object": "session.close",
             "reason": body.reason,
@@ -166,10 +176,14 @@ def register_turn_routes(app: FastAPI) -> None:
         # registry.abort refused (409 already_completed) a turn whose
         # completion is routed, so a turn cancelled here has not completed.
         cancelled = None
+        scheduler = request.app.state.scheduler
         if turn_id is not None:
-            cancelled = request.app.state.scheduler.cancel_turn(
+            cancelled = scheduler.cancel_turn(
                 turn_id, f"session {session_id} aborted ({record.end_reason})"
             )
+        # Free the KV the worker holds for the session (after the cancel, so
+        # a cancelled resumed turn is not held again).
+        scheduler.release_sessions([session_id], "aborted")
         return {
             **record.to_dict(),
             "cancelled_turn_id": turn_id,

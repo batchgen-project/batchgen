@@ -102,6 +102,41 @@ def _launch_converted_ckpt_dir(args: "ServerArgs") -> Optional[Path]:
     return None
 
 
+def resolve_session_hold_idle_ttl_s(args: "ServerArgs") -> float:
+    """The idle TTL the worker uses: the flag, or the default when unset."""
+    from batchgen.worker.session_hold import DEFAULT_IDLE_TTL_S
+
+    ttl = getattr(args, "session_hold_idle_ttl_s", None)
+    return DEFAULT_IDLE_TTL_S if ttl is None else float(ttl)
+
+
+def validate_session_kv_hold_args(args: "ServerArgs") -> None:
+    """Refuse --enable-session-kv-hold where the worker cannot serve it.
+
+    The hold reuses held Host pages through the GPT-OSS prefix-hit prefill,
+    keeps them in one node's Host region, and cannot share pages with the
+    prefix cache yet (the worker re-checks the rest at startup).
+    """
+    from batchgen.prefix_reuse.config import require_session_hold_model_support
+
+    reasons = []
+    ttl = args.session_hold_idle_ttl_s
+    if ttl is not None and not float(ttl) >= 0:
+        reasons.append(f"--session-hold-idle-ttl-s={ttl} must be >= 0")
+    if args.enable_prefix_cache:
+        reasons.append("--enable-prefix-cache is also set")
+    try:
+        require_session_hold_model_support(args.model)
+    except ValueError as exc:
+        reasons.append(str(exc))
+    if int(args.nnodes) != 1:
+        reasons.append(f"--nnodes={args.nnodes}; held KV lives in one node's Host region")
+    if reasons:
+        raise ValueError(
+            "--enable-session-kv-hold is unsupported here: " + "; ".join(reasons)
+        )
+
+
 def _validate_distributed_weight_source(args: "ServerArgs") -> None:
     """Preflight of a ``--distributed-weight-config`` launch.
 
@@ -213,6 +248,13 @@ class ServerArgs:
     glm5_disable_decode_host_kv_staging: bool = False
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
+    # /v1/turns: a finished turn of an open session keeps its Host KV for the
+    # session's next turn (GPT-OSS, one node, prefix cache off).
+    enable_session_kv_hold: bool = False
+    # Held KV idle this long (no turn of its session in the worker) is
+    # released; 0 = never. None = the default (session_hold.DEFAULT_IDLE_TTL_S)
+    # when the hold is on; refused without it.
+    session_hold_idle_ttl_s: Optional[float] = None
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -446,6 +488,29 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable page-level Host prefix-cache reuse for qualified models",
+    )
+    parser.add_argument(
+        "--enable-session-kv-hold",
+        action="store_true",
+        default=False,
+        help=(
+            "Hold a finished /v1/turns turn's Host KV until its session's next "
+            "turn, close or abort; the next turn prefills only the suffix past "
+            "its longest common prefix with the held tokens (GPT-OSS, one "
+            "node, not with --enable-prefix-cache)"
+        ),
+    )
+    parser.add_argument(
+        "--session-hold-idle-ttl-s",
+        type=float,
+        default=None,
+        help=(
+            "With --enable-session-kv-hold: release a session's held KV once "
+            "it has been idle this many seconds (no turn of the session queued "
+            "or running), for sessions that are never closed. 0 = never. "
+            "Default 900 s, 1.5x the longest tool wait measured on agent eval "
+            "workloads (a 600 s fetch timeout)"
+        ),
     )
     parser.add_argument(
         "--prefix-cache-debug-stats",
@@ -814,6 +879,12 @@ def validate_server_args(args: ServerArgs) -> None:
     require_cuda_graph_flag_supported(
         args.model, enable_cuda_graph=args.enable_cuda_graph
     )
+    if args.enable_session_kv_hold:
+        validate_session_kv_hold_args(args)
+    elif args.session_hold_idle_ttl_s is not None:
+        raise ValueError(
+            "--session-hold-idle-ttl-s needs --enable-session-kv-hold"
+        )
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         _validate_distributed_weight_source(args)
@@ -984,6 +1055,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         glm5_disable_decode_host_kv_staging=parsed.glm5_disable_decode_host_kv_staging,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
+        enable_session_kv_hold=parsed.enable_session_kv_hold,
+        session_hold_idle_ttl_s=parsed.session_hold_idle_ttl_s,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,

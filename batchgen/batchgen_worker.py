@@ -164,6 +164,13 @@ def _malloc_trim() -> None:
 	except (AttributeError, OSError, TypeError):
 		pass
 
+from batchgen.worker import session_hold as session_hold_lib
+
+# Sentinel: the admission queue was empty when polled (None is the shutdown
+# message, so it cannot mean "nothing").
+_NO_MESSAGE = object()
+
+
 def _release_tokenizer_arenas(total_prompt_tokens: int, world_size: int) -> None:
 	"""Return the tokenizer's freed heap arenas to the OS (glibc, best effort).
 
@@ -1006,6 +1013,12 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 	enable_prefix_cache: bool = False
 	prefix_cache_debug_stats: bool = False
+	# Agent sessions: a finished /v1/turns turn of an open session keeps its
+	# Host KV for the session's next turn (batchgen.worker.session_hold).
+	enable_session_kv_hold: bool = False
+	# A hold idle this long (no turn of its session in the worker) is released;
+	# 0 = never. Default: session_hold.DEFAULT_IDLE_TTL_S.
+	session_hold_idle_ttl_s: float = session_hold_lib.DEFAULT_IDLE_TTL_S
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -1377,6 +1390,33 @@ class BatchGenWorker:
 		self._prefix_drain_metric_emitted = False
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
+		# Session hold (None when disabled). See batchgen.worker.session_hold.
+		self.enable_session_kv_hold = bool(
+			getattr(args, "enable_session_kv_hold", False)
+		)
+		self._session_hold = None
+		self._session_hold_page_bytes = 0
+		# Owner rank: Host pages a resumed turn attached from its session's
+		# hold, keyed by global_idx (freed with the turn unless held again);
+		# pages retained at completion, keyed by uuid, until the hold record
+		# is written; per-sequence reload seconds until its completion.
+		self._session_attached_pages = {}
+		self._session_retained_pages = {}
+		self._session_reload_seconds = {}
+		# id(materialization) -> {global_idx: cached tokens} of its session hits.
+		self._session_reload_pending = {}
+		# Every rank: uuids that resumed from a hold, and cancelled requests.
+		self._session_resumed_uuids = set()
+		self._cancelled_request_ids = set()
+		# Owner rank: a hold failure deferred to the next hold record, where
+		# every rank raises it (see _sync_session_hold_owner_errors).
+		self._session_hold_owner_errors = []
+		# Rank 0: last idle-TTL check (time.monotonic()).
+		self._session_hold_ttl_checked_at = 0.0
+		# Every rank: the current wave's resume decisions (until commit), and
+		# each resumed turn's decision (until its completion is reported).
+		self._session_resume_wave = {}
+		self._session_resume_plans = {}
 		self._prefill_pool_wave = None
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
@@ -1481,6 +1521,9 @@ class BatchGenWorker:
 			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
 			prefix_host_config, prefix_aux_config = worker_kv_config, None
+
+		if self.enable_session_kv_hold:
+			self._init_session_hold(args, prefix_host_config)
 
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
@@ -1982,25 +2025,43 @@ class BatchGenWorker:
 		msg_data = None
 
 		if self.rank == 0 and self._admission_queue is not None:
+			# Session control messages (cancel / release) are bookkeeping, so
+			# they do not use up the poll: keep reading past them up to the
+			# next admit, in queue order.
+			messages = []
 			try:
-				msg = self._admission_queue.get_nowait()
-				if msg is None:
-					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") == "admit":
-					msg_data = msg
-					has_new = True
-				elif isinstance(msg, dict) and "prompts" in msg:
-					# A legacy /v1/inference payload. It matches no branch above,
-					# so it used to be dropped right here while the caller sat on
-					# response_queue.get() and took the next batch's completion.
-					# Nothing in the tree still builds one (the HTTP route returns
-					# 410 and WorkerManager.infer is gone), so reaching this line
-					# means some other producer is putting legacy payloads on the
-					# queue: fail loudly rather than park. Deliberately NOT a
-					# Unknown messages must fail loudly rather than being swallowed.
-					raise LegacyInferenceDeprecated()
+				while True:
+					msg = self._admission_queue.get_nowait()
+					if isinstance(msg, dict) and msg.get("type") == "session_control":
+						messages.append(msg)
+						continue
+					break
 			except queue_mod.Empty:
+				msg = _NO_MESSAGE
+			# Rank 0's idle-TTL release joins the broadcast like a close.
+			ttl_release = self._session_hold_ttl_message()
+			if ttl_release is not None:
+				messages.append(ttl_release)
+			if messages:
+				msg_data = messages
+				has_new = True
+			if msg is _NO_MESSAGE:
 				pass
+			elif msg is None:
+				self._shutdown_requested = True
+			elif isinstance(msg, dict) and msg.get("type") == "admit":
+				msg_data = (msg_data or []) + [msg]
+				has_new = True
+			elif isinstance(msg, dict) and "prompts" in msg:
+				# A legacy /v1/inference payload. It matches no branch above,
+				# so it used to be dropped right here while the caller sat on
+				# response_queue.get() and took the next batch's completion.
+				# Nothing in the tree still builds one (the HTTP route returns
+				# 410 and WorkerManager.infer is gone), so reaching this line
+				# means some other producer is putting legacy payloads on the
+				# queue: fail loudly rather than park. Deliberately NOT a
+				# Unknown messages must fail loudly rather than being swallowed.
+				raise LegacyInferenceDeprecated()
 
 		# Broadcast status to all ranks
 		status = torch.tensor(
@@ -2015,9 +2076,25 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			self._admit_sequences_from_message(msg_data)
+			return self._apply_worker_messages(msg_data)
 
 		return has_new
+
+	def _apply_worker_messages(self, messages) -> bool:
+		"""Apply broadcast admission-queue messages in order; True if any admitted."""
+		admitted = False
+		for msg in messages:
+			kind = msg.get("type") if isinstance(msg, dict) else None
+			if kind == "admit":
+				self._admit_sequences_from_message(msg)
+				admitted = True
+			elif kind == "session_control":
+				self._apply_session_control(msg)
+			else:
+				raise RuntimeError(
+					f"Rank {self.rank}: unexpected admission-queue message {msg!r}"
+				)
+		return admitted
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -2336,7 +2413,14 @@ class BatchGenWorker:
 		on rank 14-15 under round-robin and stall the per-iteration barrier.
 
 		Fallback (BATCHGEN_L2_BALANCE=0): least-count argmin (legacy).
+
+		A turn of a session whose KV is held goes to the rank holding it, and
+		counts in that rank's load for the turns placed after it.
 		"""
+		if self._session_hold is not None:
+			uuids = self._pin_session_hold_ranks(uuids)
+			if not uuids:
+				return
 		if self._prefill_prefix_pool_enabled():
 			self._assign_ranks_for_prefix_sharing(uuids)
 			return
@@ -3116,9 +3200,27 @@ class BatchGenWorker:
 			except Exception:
 				fallback_text = ""
 
+		# A finished turn of an open session keeps its trajectory slot: the
+		# held tokens stay readable node-wide for the next turn's LCP. The
+		# decision is identical on every rank (broadcast inputs only).
+		held = False
+		session_hold = session_resume = None
+		if getattr(self, "_session_hold", None) is not None:
+			held = self._session_hold_eligible(seq)
+			self._cancelled_request_ids.discard(uuid)
+			session_resume = self._session_resume_plans.pop(uuid, None)
+			if held:
+				session_hold = self._record_session_hold(seq, trajectory_slot)
+			elif seq.uuid in self._session_resumed_uuids:
+				# A resumed turn that is not held again (cancelled): its
+				# attached held pages were freed with the sequence.
+				self._session_resumed_uuids.discard(seq.uuid)
+				self._session_hold.note_drop(session_hold_lib.DROP_CANCELLED)
+				self._publish_session_hold_metrics("cancelled_after_resume")
+
 		# Free the complete trajectory reservation on every rank. This is the
 		# only token-storage release point; multi-turn re-entry keeps the slot.
-		if trajectory_slot is not None:
+		if trajectory_slot is not None and not held:
 			self._trajectory_book.release(trajectory_slot)
 		self._publish_trajectory_pool_capacity()
 		seq._buffer_slot = -1
@@ -3178,7 +3280,626 @@ class BatchGenWorker:
 			"computed_tokens": computed_tokens,
 			"admitted_at": seq.admitted_at,
 			"completed_at": time.time(),
+			# Agent-session KV hold: what this turn reused and what it holds.
+			# Only with --enable-session-kv-hold; the item is unchanged without.
+			**({} if getattr(self, "_session_hold", None) is None else {
+				"session_resume": (
+					None if session_resume is None else {
+						"lcp_tokens": session_resume.lcp_tokens,
+						"cached_tokens": session_resume.cached_tokens,
+						"dropped": session_resume.drop_reason,
+					}
+				),
+				"session_hold": session_hold,
+			}),
 		})
+
+	# ============ Agent session KV hold (batchgen.worker.session_hold) ============
+
+	def _init_session_hold(self, args, host_kv_config) -> None:
+		"""Refuse an unsupported configuration by name, then create the book."""
+		from batchgen.prefix_reuse.config import (
+			_host_page_bytes_all_layers,
+			require_session_hold_model_support,
+		)
+
+		reasons = []
+		if self.enable_prefix_cache:
+			reasons.append(
+				"--enable-prefix-cache is on: the prefix cache takes ownership of "
+				"committed prompt pages, which a hold cannot keep yet"
+			)
+		try:
+			require_session_hold_model_support(args.model_name)
+		except ValueError as exc:
+			reasons.append(str(exc))
+		if not self.enable_prepack:
+			reasons.append("prepacked prefill is off")
+		if int(self.world_size) != int(self.local_world_size):
+			reasons.append(
+				"the world spans more than one node; held pages live in one "
+				"node's Host region"
+			)
+		page_tokens = int(host_kv_config.page_size_tokens)
+		if page_tokens != SequenceEntry.PAGE_SIZE:
+			reasons.append(
+				f"Host page size {page_tokens} != sequence page size "
+				f"{SequenceEntry.PAGE_SIZE}"
+			)
+		if reasons:
+			raise session_hold_lib.SessionHoldUnsupported(
+				"session KV hold cannot run here: " + "; ".join(reasons)
+			)
+		idle_ttl_s = float(getattr(
+			args, "session_hold_idle_ttl_s", session_hold_lib.DEFAULT_IDLE_TTL_S
+		))
+		if idle_ttl_s < 0:
+			raise session_hold_lib.SessionHoldUnsupported(
+				f"session_hold_idle_ttl_s must be >= 0, got {idle_ttl_s}"
+			)
+		self._session_hold = session_hold_lib.SessionHoldBook(
+			page_tokens=page_tokens, idle_ttl_s=idle_ttl_s,
+		)
+		self._session_hold_page_bytes = int(_host_page_bytes_all_layers(host_kv_config))
+		if self.rank == 0:
+			logging.info(
+				"[SESSION_HOLD] enabled: page_tokens=%s host_page_bytes=%s "
+				"idle_ttl_s=%s",
+				page_tokens, self._session_hold_page_bytes,
+				idle_ttl_s if idle_ttl_s > 0 else "off",
+			)
+
+	def _session_hold_eligible(self, seq) -> bool:
+		"""Whether a finished turn keeps its KV. Identical on every rank."""
+		if self._session_hold is None or seq is None or seq.session_id is None:
+			return False
+		if seq.uuid in self._cancelled_request_ids:
+			return False
+		# Attention TP > 1 was refused at Init (_require_session_hold_pure_dp).
+		return True
+
+	def _require_session_hold_pure_dp(self) -> None:
+		"""Refuse session hold under attention TP > 1, before any admission.
+
+		A hold lives on one rank's Host pages and pins the session's next turn
+		to that rank; a TP attention group spans several ranks. The attention
+		TP size is known once the parallel strategy manager exists, which is
+		at Init (``_init_session_hold`` runs before it), so this runs right
+		after the manager is built: no turn is admitted, so none is held.
+		"""
+		if getattr(self, "_session_hold", None) is None:
+			return
+		attn_tp = self._decode_attn_tp_size()
+		if attn_tp != 1:
+			raise session_hold_lib.SessionHoldUnsupported(
+				"session KV hold cannot run here: it supports pure DP "
+				f"attention (attn_tp_size == 1) only, got attn_tp_size={attn_tp}"
+			)
+
+	def _prefix_states_in_use(self) -> bool:
+		"""Prefix states exist: prefix-cache hits, or resumed session holds."""
+		return self.enable_prefix_cache or self._session_hold is not None
+
+	def _session_host_view(self):
+		return self._host_views_by_group()[0]
+
+	def _retain_session_pages_for_hold(self, uuids: List[str]) -> None:
+		"""Owner rank: move the Host pages covering a held turn's KV to resident.
+
+		Runs before the sequence's Host release, which then frees only the
+		pages past its KV. The pages a resumed turn attached from its previous
+		hold are resident already and move into the new hold unchanged.
+		"""
+		# Only a COMPLETED sequence is reported (and so recorded as a hold):
+		# the completion paths skip _report_completion for any other status
+		# (e.g. a stale eos_reached on a PREFILLED sequence), and pages
+		# retained for a sequence that is never recorded would be resident
+		# pages nobody owns.
+		held = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if (
+				seq is not None
+				and seq.status == SequenceStatus.COMPLETED
+				and self._session_hold_eligible(seq)
+			):
+				held.append(uuid)
+		if not held:
+			return
+		# Only the owner rank runs this, so it must not raise: the other ranks
+		# would block in their next collective. A failure here is deferred and
+		# raised on every rank by _sync_session_hold_owner_errors, which every
+		# rank runs before recording the hold.
+		errors = self._session_hold_owner_errors
+		# The Host copy must cover every token the turn decoded: retire the
+		# in-flight decode appends before the pages change hands.
+		if getattr(self, "_pending_kv_append_tasks", None):
+			self._wait_pending_kv_append_tasks(defer_errors=True)
+			deferred = getattr(self, "_deferred_kv_append_wait_errors", None)
+			if deferred:
+				errors.extend(
+					f"KV append/offload before the hold: {error}"
+					for error in deferred
+				)
+				deferred.clear()
+				# The Host copy is incomplete: hold nothing.
+				return
+		try:
+			view = self._session_host_view()
+			global_ids = [
+				self.global_batch.get_sequence(uuid).global_idx for uuid in held
+			]
+			tables = view.build_page_table(global_ids)
+			for uuid, global_id, table in zip(held, global_ids, tables):
+				seq = self.global_batch.get_sequence(uuid)
+				kv_tokens = int(seq.current_context_length) - 1
+				attached = self._session_attached_pages.pop(global_id, ())
+				pages, own = session_hold_lib.split_turn_pages_for_hold(
+					page_table=table,
+					attached_pages=attached,
+					kv_tokens=kv_tokens,
+					page_tokens=self._session_hold.page_tokens,
+				)
+				retained = (
+					[int(page) for page in view.retain_sequence_pages(global_id, own)]
+					if own else []
+				)
+				if retained != own:
+					raise session_hold_lib.SessionHoldInvariantError(
+						f"Host KV retained {len(retained)} pages for held turn "
+						f"{uuid}, asked for {len(own)}"
+					)
+				self._session_retained_pages[uuid] = tuple(pages)
+		except Exception as exc:
+			logging.exception(
+				"[SESSION_HOLD] rank %s: retaining held pages failed; every "
+				"rank raises at the hold record", self.rank,
+			)
+			errors.append(f"{type(exc).__name__}: {exc}")
+
+	def _sync_session_hold_owner_errors(self) -> None:
+		"""Every rank: raise an owner rank's deferred hold failure everywhere.
+
+		Called once per held turn from _record_session_hold, which every rank
+		runs for the same turns, so the collective count matches. A one-int
+		MAX all-reduce: the failing owner raises with its detail, the others
+		name it as a peer failure. The worker fatal boundary takes it from
+		there, and the restart's reconcile frees whatever was retained.
+		"""
+		errors = self._session_hold_owner_errors
+		flag = torch.tensor(
+			[1 if errors else 0], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+		if int(flag.item()) == 0:
+			return
+		detail = list(errors)
+		errors.clear()
+		raise session_hold_lib.SessionHoldInvariantError(
+			f"Rank {self.rank}: session hold failed on the Host KV owner rank: "
+			+ ("; ".join(detail[:4]) if detail else "see that rank's log")
+		)
+
+	def _record_session_hold(self, seq, trajectory_slot) -> dict:
+		"""Every rank: record a finished turn's held KV; returns its summary."""
+		self._sync_session_hold_owner_errors()
+		book = self._session_hold
+		if trajectory_slot is None:
+			raise session_hold_lib.SessionHoldInvariantError(
+				f"held turn {seq.uuid} has no trajectory slot"
+			)
+		kv_tokens = int(seq.current_context_length) - 1
+		owner = self._owns_host_kv(seq)
+		page_ids = self._session_retained_pages.pop(seq.uuid, None)
+		if owner and page_ids is None:
+			raise session_hold_lib.SessionHoldInvariantError(
+				f"the owner rank retained no Host pages for held turn {seq.uuid}"
+			)
+		record = session_hold_lib.HeldSession(
+			session_id=seq.session_id,
+			traj_id=seq.traj_id,
+			request_id=seq.uuid,
+			rank=int(seq.assigned_rank),
+			trajectory_slot=int(trajectory_slot),
+			kv_tokens=kv_tokens,
+			page_tokens=book.page_tokens,
+			page_ids=page_ids if owner else None,
+			held_at=time.monotonic(),
+		)
+		if owner and len(page_ids) != record.pages:
+			raise session_hold_lib.SessionHoldInvariantError(
+				f"held turn {seq.uuid}: {len(page_ids)} pages for {kv_tokens} tokens"
+			)
+		self._session_resumed_uuids.discard(seq.uuid)
+		previous = book.add(record)
+		if previous is not None:
+			# An older hold the turn never consumed (it was not resumed, e.g.
+			# it was admitted before the hold existed): free it.
+			self._free_held_session(previous)
+			book.note_drop(session_hold_lib.DROP_SUPERSEDED)
+		if owner:
+			logging.info(
+				"[SESSION_HOLD] hold request=%s traj=%s session=%s kv_tokens=%d "
+				"pages=%d rank=%d",
+				seq.uuid, seq.traj_id, seq.session_id, kv_tokens,
+				record.pages, self.rank,
+			)
+		self._publish_session_hold_metrics("hold")
+		return {"held": True, "kv_tokens": kv_tokens, "pages": record.pages}
+
+	def _free_held_session(self, record) -> None:
+		"""Every rank: free a hold's slot; the owner also frees its Host pages."""
+		if record.page_ids is not None:
+			if record.page_ids:
+				self._session_host_view().release_resident_pages(list(record.page_ids))
+		self._trajectory_book.release(record.trajectory_slot)
+		self._publish_trajectory_pool_capacity()
+
+	def _apply_session_control(self, msg: dict) -> None:
+		"""Every rank: cancel requests and release held sessions (broadcast msg).
+
+		Bookkeeping at the poll point only: a cancelled request that has not
+		started (QUEUEING, EVICTED) is dropped here; one with KV finishes at
+		the next completion check and is never held. Released holds free their
+		pages and slots here.
+		"""
+		reason = msg.get("reason")
+		for request_id in msg.get("cancel") or ():
+			self._cancel_request(str(request_id), reason)
+		changed = False
+		for item in msg.get("release") or ():
+			session_id = item["session_id"]
+			release_reason = item.get("reason") or "closed"
+			record = (
+				None if self._session_hold is None
+				else self._session_hold.pop(session_id)
+			)
+			if record is None:
+				continue
+			self._free_held_session(record)
+			self._session_hold.note_release(release_reason)
+			changed = True
+			if release_reason == session_hold_lib.RELEASE_IDLE_TTL:
+				# Loud: an expired hold means a client never closed its
+				# session, or a tool gap outlived the TTL.
+				if self.rank == 0:
+					logging.warning(
+						"[SESSION_HOLD] idle TTL expired: released session=%s "
+						"traj=%s idle_s=%.1f ttl_s=%s kv_tokens=%d pages=%d "
+						"(idle_ttl releases so far: %d)",
+						session_id, record.traj_id, float(item.get("idle_s", -1.0)),
+						self._session_hold.idle_ttl_s, record.kv_tokens,
+						record.pages,
+						self._session_hold.releases[release_reason],
+					)
+			elif record.page_ids is not None:
+				logging.info(
+					"[SESSION_HOLD] release session=%s reason=%s kv_tokens=%d "
+					"pages=%d rank=%d",
+					session_id, release_reason, record.kv_tokens,
+					record.pages, self.rank,
+				)
+		if changed:
+			self._publish_session_hold_metrics("release")
+
+	def _sessions_with_live_turns(self) -> set:
+		"""Sessions with a turn queued or running in this worker (replicated)."""
+		return {
+			seq.session_id
+			for seq in self.global_batch.sequences.values()
+			if seq.session_id is not None
+			and seq.status != SequenceStatus.COMPLETED
+		}
+
+	def _session_hold_ttl_message(self):
+		"""Rank 0: a session_control releasing holds idle past the TTL, or None.
+
+		Rank 0 decides (its clock) and the message is broadcast and applied
+		in queue order like a close, so every rank releases the same holds.
+		Checked at most once a second.
+		"""
+		book = self._session_hold
+		if book is None or self.rank != 0 or book.idle_ttl_s <= 0 or not book.sessions:
+			return None
+		now = time.monotonic()
+		if now - self._session_hold_ttl_checked_at < 1.0:
+			return None
+		self._session_hold_ttl_checked_at = now
+		expired = session_hold_lib.expired_holds(
+			book.sessions, now=now, idle_ttl_s=book.idle_ttl_s,
+			busy_sessions=self._sessions_with_live_turns(),
+		)
+		if not expired:
+			return None
+		return {
+			"type": "session_control",
+			"cancel": [],
+			"release": [
+				{
+					"session_id": session_id,
+					"reason": session_hold_lib.RELEASE_IDLE_TTL,
+					"idle_s": round(idle_s, 3),
+				}
+				for session_id, idle_s in expired
+			],
+			"reason": session_hold_lib.RELEASE_IDLE_TTL,
+		}
+
+	def drop_lru_session_holds(
+		self,
+		pages_needed: int,
+		*,
+		reason: str = session_hold_lib.DROP_PRESSURE_LRU,
+	) -> List[str]:
+		"""Every rank: free the least recently held sessions under pressure.
+
+		Hook for the footprint-admission and tool-gap policies (A3 / A4);
+		nothing in this module calls it. It must be called on every rank at
+		the same point (rank-uniform inputs: the replicated book and
+		global_batch), like any hold bookkeeping. Sessions with a turn queued
+		or running are skipped (that turn is about to resume its hold).
+		Frees holds in ``hold_seq`` order until their pages cover
+		``pages_needed`` (all candidates if they cannot), counts each under
+		``drops[reason]`` and returns the released session ids.
+		"""
+		book = self._session_hold
+		if book is None:
+			return []
+		victims = session_hold_lib.lru_hold_victims(
+			book.sessions, pages_needed=int(pages_needed),
+			exclude=self._sessions_with_live_turns(),
+		)
+		freed_pages = 0
+		for session_id in victims:
+			record = book.pop(session_id)
+			self._free_held_session(record)
+			book.note_drop(reason)
+			freed_pages += record.pages
+		if victims:
+			if self.rank == 0:
+				logging.warning(
+					"[SESSION_HOLD] LRU drop (%s): released %d session(s), %d "
+					"Host pages for a need of %d: %s",
+					reason, len(victims), freed_pages, int(pages_needed), victims,
+				)
+			self._publish_session_hold_metrics("lru_drop")
+		return victims
+
+	def _cancel_request(self, request_id: str, reason: Optional[str]) -> None:
+		"""Every rank: per-request cancel (an aborted turn)."""
+		seq = self.global_batch.get_sequence(request_id)
+		if seq is None or seq.status == SequenceStatus.COMPLETED:
+			if self.rank == 0:
+				logging.info(
+					"[SESSION] cancel request=%s: not running (%s)", request_id,
+					"unknown" if seq is None else "completed",
+				)
+			return
+		status = seq.status
+		if status in (SequenceStatus.QUEUEING, SequenceStatus.EVICTED):
+			# No KV and no decode row: drop it now, reported as cancelled.
+			self._drop_unstarted_request(
+				seq, "cancelled",
+				f"request {request_id} was cancelled ({reason or 'abort'})",
+			)
+			# An EVICTED resumed turn already lost its held KV at eviction;
+			# its per-turn records end here since it never completes.
+			self._session_resume_plans.pop(request_id, None)
+			self._session_reload_seconds.pop(seq.global_idx, None)
+			if request_id in self._session_resumed_uuids:
+				self._session_resumed_uuids.discard(request_id)
+				self._session_hold.note_drop(session_hold_lib.DROP_CANCELLED)
+				self._publish_session_hold_metrics("cancelled_after_resume")
+		else:
+			# Finishes at the next completion check, exactly like an EOS; a
+			# cancelled turn is never held.
+			if self._session_hold is not None:
+				self._cancelled_request_ids.add(request_id)
+			seq.eos_reached = True
+		if self.rank == 0:
+			logging.info(
+				"[SESSION] cancel request=%s session=%s status=%s reason=%s",
+				request_id, seq.session_id, status.name, reason,
+			)
+
+	def _pin_session_hold_ranks(self, uuids: List[str]) -> List[str]:
+		"""Place a held session's next turn on its KV's rank; return the rest."""
+		if self._session_hold is None or not self._session_hold.sessions:
+			return uuids
+		rest = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			rank = None if seq is None else self._session_hold.rank_of(seq.session_id)
+			if rank is None:
+				rest.append(uuid)
+				continue
+			self.global_batch.assign_rank(uuid, rank)
+		return rest
+
+	def _plan_session_resumes(self, prefill_uuids: List[str]) -> None:
+		"""Every rank: decide how each queued turn of a held session reuses it.
+
+		The LCP is computed from the node-shared trajectory book on every rank,
+		so the decisions (and the metrics) agree everywhere; only the owner
+		installs the prefix state its prefill reads. Nothing is freed here:
+		the wave can still be rejected, and then the hold stays as it was.
+		"""
+		from batchgen.prefix_reuse.prefill import (
+			PrefixCacheSequenceState,
+			SessionHeldPrefixPages,
+		)
+
+		self._session_resume_wave = {}
+		book = self._session_hold
+		if not book.sessions:
+			return
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.status != SequenceStatus.QUEUEING:
+				continue
+			record = book.get(seq.session_id)
+			if record is None:
+				continue
+			if seq.assigned_rank != record.rank:
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"turn {uuid} of held session {seq.session_id} is on rank "
+					f"{seq.assigned_rank}, its KV on rank {record.rank}"
+				)
+			held_tokens = torch.empty(record.kv_tokens, dtype=torch.int32)
+			self._trajectory_book.copy_span_to(
+				record.trajectory_slot, held_tokens, start=0, length=record.kv_tokens
+			)
+			prompt = self._trajectory_tokens(seq, length=seq.prompt_length)
+			plan = session_hold_lib.plan_resume(
+				session_id=seq.session_id,
+				lcp_tokens=session_hold_lib.longest_common_prefix(held_tokens, prompt),
+				kv_tokens=record.kv_tokens,
+				prompt_tokens=int(seq.prompt_length),
+				page_tokens=record.page_tokens,
+			)
+			self._session_resume_wave[uuid] = plan
+			if plan.resumes and self._owns_host_kv(seq):
+				pages = tuple(record.page_ids[: plan.keep_pages])
+				self._prefix_sequence_states[seq.global_idx] = PrefixCacheSequenceState(
+					lookup_result=SessionHeldPrefixPages(
+						session_id=seq.session_id,
+						page_ids=pages,
+						cached_tokens=plan.cached_tokens,
+					),
+					attached_tokens=plan.keep_pages * record.page_tokens,
+					compute_cached_tokens=plan.cached_tokens,
+				)
+
+	def _commit_session_resumes(self) -> None:
+		"""Every rank, after the wave's Host reservation committed: consume holds.
+
+		A resumed turn takes the held pages up to its LCP (they are already in
+		its Host page table as attached pages); the owner frees the held pages
+		past it. A dropped hold (LCP below one page) frees all of them.
+		"""
+		wave = self._session_resume_wave
+		self._session_resume_wave = {}
+		if not wave:
+			return
+		book = self._session_hold
+		for uuid, plan in wave.items():
+			seq = self.global_batch.get_sequence(uuid)
+			record = book.pop(plan.session_id)
+			if record is None:
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"held session {plan.session_id} vanished before its turn "
+					f"{uuid} committed"
+				)
+			if record.page_ids is not None:
+				pages = list(record.page_ids)
+				keep, release = pages[: plan.keep_pages], pages[plan.keep_pages:]
+				if release:
+					self._session_host_view().release_resident_pages(release)
+				if keep:
+					self._session_attached_pages[seq.global_idx] = tuple(keep)
+				logging.info(
+					"[SESSION_HOLD] resume request=%s session=%s held_kv_tokens=%d "
+					"prompt_tokens=%d lcp_tokens=%d cached_tokens=%d "
+					"suffix_tokens=%d kept_pages=%d freed_pages=%d dropped=%s rank=%d",
+					uuid, plan.session_id, record.kv_tokens, seq.prompt_length,
+					plan.lcp_tokens, plan.cached_tokens,
+					seq.prompt_length - plan.cached_tokens, len(keep), len(release),
+					plan.drop_reason, self.rank,
+				)
+			self._trajectory_book.release(record.trajectory_slot)
+			book.note_resume(plan)
+			if plan.resumes:
+				self._session_resumed_uuids.add(uuid)
+			self._session_resume_plans[uuid] = plan
+		self._publish_trajectory_pool_capacity()
+		self._publish_session_hold_metrics("resume")
+
+	def _release_session_prefix_states(self, global_sequence_ids) -> None:
+		"""Drop resumed turns' session prefix states; free attached held pages.
+
+		A turn held again took its attached pages already; a rejected wave never
+		got any (the hold is consumed only at commit), so this frees exactly
+		the pages of a resumed turn that ends without a hold or is evicted.
+		"""
+		for sequence_id in global_sequence_ids:
+			state = self._prefix_sequence_states.get(int(sequence_id))
+			if state is not None and state.is_session_hold:
+				self._prefix_sequence_states.pop(int(sequence_id))
+			pages = self._session_attached_pages.pop(int(sequence_id), None)
+			if pages:
+				self._session_host_view().release_resident_pages(list(pages))
+
+	def _note_session_evictions(self, evicted_uuids) -> None:
+		"""Every rank: Host-growth eviction chose running sequences (never a hold).
+
+		A resumed turn evicted mid-decode loses the KV it took from its hold
+		(it re-enters by full recompute), so that is counted as a drop.
+		"""
+		book = self._session_hold
+		resumed = [uuid for uuid in evicted_uuids if uuid in self._session_resumed_uuids]
+		for uuid in resumed:
+			self._session_resumed_uuids.discard(uuid)
+			book.note_drop(session_hold_lib.DROP_EVICTED_AFTER_RESUME)
+		if book.sessions or resumed:
+			book.evictions_while_held += len(evicted_uuids)
+			if self.rank == 0:
+				logging.warning(
+					"[SESSION_HOLD] Host KV eviction of %d running sequence(s) "
+					"while %d session(s) hold %d Host pages (%d of them resumed "
+					"turns); held sessions are not eviction candidates",
+					len(evicted_uuids), len(book.sessions), book.held_pages,
+					len(resumed),
+				)
+			self._publish_session_hold_metrics("eviction")
+
+	def _note_admission_wait_on_held_kv(self, admitted: int) -> bool:
+		"""Every rank: a wave admitted nothing because held KV fills Host KV.
+
+		True only when nothing was admitted, nothing is live, and held KV is
+		the blocker: a slot-admissible candidate would fit if the held pages
+		were free (``admission_blocked_by_held_kv``, over the wave's
+		rank-uniform selection snapshot). The queued turns then wait for a
+		close, an abort or an idle-TTL release (footprint admission is a later
+		step); counted, logged loudly, and paced so the scheduler does not
+		spin, and the no-progress guard is reset for it. Any other stall
+		returns False, so the guard sees its real state.
+		"""
+		book = self._session_hold
+		if (
+			book is None or not book.sessions or admitted
+			or self._prefill_admission_live or not self.global_batch.has_queueing()
+		):
+			return False
+		if not session_hold_lib.admission_blocked_by_held_kv(
+			self._prefill_admission_selection, book.held_pages
+		):
+			return False
+		book.admission_waits += 1
+		if self.rank == 0 and (
+			book.admission_waits == 1 or book.admission_waits % 50 == 0
+		):
+			logging.warning(
+				"[SESSION_HOLD] admission waits on held KV (#%d): %d queued "
+				"request(s), %d held session(s) hold %d Host pages (%d tokens); "
+				"nothing is dropped, waiting for a close or abort",
+				book.admission_waits,
+				len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)),
+				len(book.sessions), book.held_pages, book.held_kv_tokens,
+			)
+			self._publish_session_hold_metrics("admission_wait")
+		time.sleep(0.2)
+		return True
+
+	def _publish_session_hold_metrics(self, event: str) -> None:
+		"""Rank 0: send the (rank-uniform) hold metrics for /v1/pool/status."""
+		book = self._session_hold
+		if book is None or self.rank != 0:
+			return
+		snapshot = book.snapshot()
+		session_hold_lib.log_metrics(book, self.rank, event)
+		if self._response_queue is None:
+			return
+		self._response_queue.put({"type": "session_hold_metrics", **snapshot})
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
 		"""Gather decoded tokens from owning ranks for completed sequences.
@@ -3211,10 +3932,14 @@ class BatchGenWorker:
 					except Exception:
 						text = ""
 					cached = None
+					reload_s = None
 					if self._owns_host_kv(seq):
 						state = self._prefix_sequence_states.get(seq.global_idx)
 						cached = 0 if state is None else int(state.compute_cached_tokens)
-					my_tokens[uuid] = (text, cached)
+						reload_store = getattr(self, "_session_reload_seconds", None)
+						if reload_store is not None:
+							reload_s = reload_store.pop(seq.global_idx, None)
+					my_tokens[uuid] = (text, cached, reload_s)
 
 		# All ranks participate in gather
 		all_tokens = [None] * self.world_size
@@ -3228,8 +3953,11 @@ class BatchGenWorker:
 		owner_cached = {}
 		for src_rank, rank_tokens in enumerate(all_tokens):
 			if rank_tokens:
-				for uuid, (text, cached) in rank_tokens.items():
+				for uuid, (text, cached, reload_s) in rank_tokens.items():
 					merged[uuid] = text
+					if reload_s is not None:
+						# Gathered, so every rank's hold metrics agree.
+						self._session_hold.note_reload_seconds(reload_s)
 					if cached is None:
 						continue
 					if uuid in owner_cached and owner_cached[uuid][1] != cached:
@@ -4921,6 +5649,9 @@ class BatchGenWorker:
 			self.global_rank,
 			self.world_size
 		)
+		# Session hold needs pure DP attention; refused here, before anything
+		# is admitted, instead of at the first held completion.
+		self._require_session_hold_pure_dp()
 
 		# The token pool is fixed for the lifetime of the worker. Its byte budget
 		# is explicit, while the number of admitted trajectories is derived from
@@ -6821,7 +7552,7 @@ class BatchGenWorker:
 				private_tokens = tokens
 				state = (
 					self._prefix_sequence_states.get(seq.global_idx)
-					if self.enable_prefix_cache
+					if self._prefix_states_in_use()
 					else None
 				)
 				if state is not None and state.attached_tokens:
@@ -7189,6 +7920,8 @@ class BatchGenWorker:
 		try:
 			if self.enable_prefix_cache and self.prefix_cache_coordinator is not None:
 				self._attach_prefix_cache_for_prefill(prefill_uuids)
+			if self._session_hold is not None:
+				self._plan_session_resumes(prefill_uuids)
 			reservations, owner_requests = self._prefill_host_reservation_plan(
 				prefill_uuids
 			)
@@ -7282,7 +8015,7 @@ class BatchGenWorker:
 							in self._prefix_sequence_states
 						},
 					)
-				if self.enable_prefix_cache:
+				if self._prefix_states_in_use():
 					# Shared prefix pages join the sequence's page table before
 					# private allocation so release_sequence_pages covers both.
 					# A group's shared pages live in that group's own region.
@@ -7367,13 +8100,15 @@ class BatchGenWorker:
 			owned = pages
 			state = (
 				self._prefix_sequence_states.get(seq.global_idx)
-				if self.enable_prefix_cache
+				if self._prefix_states_in_use()
 				else None
 			)
 			if state is not None and state.attached_tokens:
 				owned = pages - state.attached_tokens // seq.PAGE_SIZE
 			seq.host_owned_pages = owned
 		self._prefill_reservation_outcome = "committed"
+		if self._session_hold is not None:
+			self._commit_session_resumes()
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -8196,36 +8931,48 @@ class BatchGenWorker:
 					"exceeds the whole node pool (total=%s)",
 					uuid[:8], needed, total,
 				)
-			if (
-				self._trajectory_book is not None
-				and self._trajectory_book.has_sequence(uuid)
-			):
-				self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
-				seq._buffer_slot = -1
-			release_local_query_slot(
-				uuid,
-				uuid_to_local_map=self._uuid_to_local_map,
-				local_to_uuid_map=self._local_to_uuid_map,
-				query_book=self.query_book,
-				free_local_indices=self._free_local_indices,
+			self._drop_unstarted_request(
+				seq,
+				"host_kv_capacity_exceeded",
+				f"Prompt needs {needed} Host KV pages, more than the "
+				f"whole node pool ({total} pages)",
 			)
-			if self.rank == 0 and self._response_queue is not None:
-				self._response_queue.put({
-					"type": "completion",
-					"request_id": uuid,
-					"batch_id": getattr(seq, "batch_id", None),
-					"error": {
-						"code": "host_kv_capacity_exceeded",
-						"message": (
-							f"Prompt needs {needed} Host KV pages, more than the "
-							f"whole node pool ({total} pages)"
-						),
-					},
-					"text": "",
-				})
-			self.global_batch.remove_sequence(uuid)
-		self._publish_trajectory_pool_capacity()
 		return rejected
+
+	def _drop_unstarted_request(self, seq, code: str, message: str) -> None:
+		"""Every rank: drop a request that holds no KV, reporting ``code``.
+
+		Used for a QUEUEING request that can never fit and for a cancelled
+		QUEUEING / EVICTED one. ``SequenceStatus`` has no failure state, so the
+		request is reported on the per-request error channel and removed from
+		``global_batch``. Admission bound it a full model-context reservation in
+		the unified trajectory pool (its token store), released here exactly as
+		completion releases it, together with any local QueryBook slot.
+		"""
+		uuid = seq.uuid
+		if (
+			self._trajectory_book is not None
+			and self._trajectory_book.has_sequence(uuid)
+		):
+			self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
+			seq._buffer_slot = -1
+		release_local_query_slot(
+			uuid,
+			uuid_to_local_map=self._uuid_to_local_map,
+			local_to_uuid_map=self._local_to_uuid_map,
+			query_book=self.query_book,
+			free_local_indices=self._free_local_indices,
+		)
+		if self.rank == 0 and self._response_queue is not None:
+			self._response_queue.put({
+				"type": "completion",
+				"request_id": uuid,
+				"batch_id": getattr(seq, "batch_id", None),
+				"error": {"code": code, "message": message},
+				"text": "",
+			})
+		self.global_batch.remove_sequence(uuid)
+		self._publish_trajectory_pool_capacity()
 
 	def _prefill_sequence_limits(self) -> dict:
 		"""Return persistent model-state limits for prefill admission.
@@ -9563,6 +10310,14 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
+						elif isinstance(msg, dict) and msg.get("type") == "session_control":
+							# Cancel / release while idle: bookkeeping only, no
+							# new batch group.
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+							container = [msg]
+							dist.broadcast_object_list(container, src=0)
+							self._apply_worker_messages([msg])
 						elif isinstance(msg, dict) and msg.get("type") == "admit":
 							# Broadcast that we got new work
 							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
@@ -9588,6 +10343,16 @@ class BatchGenWorker:
 							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 					except queue_mod.Empty:
+						# Idle: a hold may have outlived the TTL. The release
+						# is broadcast like a received session_control.
+						ttl_release = self._session_hold_ttl_message()
+						if ttl_release is not None:
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+							container = [ttl_release]
+							dist.broadcast_object_list(container, src=0)
+							self._apply_worker_messages([ttl_release])
+							continue
 						# No work arrived, broadcast no-work to other ranks
 						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 						dist.broadcast(status, src=0)
@@ -9601,13 +10366,21 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._group_uuids = set()
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						idle_msg = container[0]
+						if not (
+							isinstance(idle_msg, dict)
+							and idle_msg.get("type") == "session_control"
+						):
+							self._group_uuids = set()
+							self._admit_sequences_from_message(idle_msg)
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
+						else:
+							# Cancel / release while idle: no new batch group.
+							self._apply_worker_messages([idle_msg])
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
@@ -9721,10 +10494,18 @@ class BatchGenWorker:
 				# derived from a digest-checked snapshot -- so every rank
 				# raises on the SAME iteration instead of diverging on the
 				# failure path.
+				# Queued turns waiting for Host pages that held sessions occupy
+				# are a wait, not a stall: they proceed when a session closes.
+				waiting_on_held_kv = self._note_admission_wait_on_held_kv(
+					len(prefill_uuids)
+				)
 				self._prefill_progress_guard.observe(
 					admitted=len(prefill_uuids),
 					live=self._prefill_admission_live,
-					state=self._prefill_admission_guard_state(),
+					state=(
+						None if waiting_on_held_kv
+						else self._prefill_admission_guard_state()
+					),
 					describe=self._describe_prefill_admission_blockers,
 				)
 				
@@ -11927,6 +12708,10 @@ class BatchGenWorker:
 			uuid for uuid in my_uuids
 			if self._owns_host_kv(self.global_batch.get_sequence(uuid))
 		]
+		if getattr(self, "_session_hold", None) is not None:
+			# Held turns: the pages covering their KV leave the sequence chain
+			# first, so the release below frees only the unused headroom.
+			self._retain_session_pages_for_hold(host_release_uuids)
 
 		if host_release_uuids:
 			global_sequence_ids = [
@@ -12072,15 +12857,35 @@ class BatchGenWorker:
 	def _close_prefix_materialization(
 		self, materialization, *, empty_cuda_cache: bool
 	) -> None:
+		session_cached = self._session_reload_pending.pop(id(materialization), None)
 		try:
 			materialization.close(empty_cuda_cache=empty_cuda_cache)
 		finally:
-			if self.prefix_cache_debug_stats:
-				fields = materialization.take_metrics_fields()
-				if fields is not None:
-					self._emit_prefix_cache_metric(
-						"prefix_h2d",
-						**fields,
+			fields = (
+				materialization.take_metrics_fields()
+				if self.prefix_cache_debug_stats or session_cached
+				else None
+			)
+			if fields is not None and self.prefix_cache_debug_stats:
+				self._emit_prefix_cache_metric(
+					"prefix_h2d",
+					**fields,
+				)
+			if fields is not None and session_cached:
+				# Held-KV reload time (launch to load complete, an upper
+				# bound on the H2D), split over the micro-batch's resumed
+				# turns by reused tokens; reported with each turn's completion.
+				for global_id, seconds in session_hold_lib.attribute_reload_seconds(
+					fields["launch_to_wait_return_s"], session_cached
+				).items():
+					self._session_reload_seconds[global_id] = (
+						self._session_reload_seconds.get(global_id, 0.0) + seconds
+					)
+					logging.info(
+						"[SESSION_HOLD] reload sequence=%s cached_tokens=%s "
+						"reload_ms=%.3f rank=%s",
+						global_id, session_cached[global_id], seconds * 1000.0,
+						self.rank,
 					)
 
 	def _close_active_prefix_materializations(self) -> None:
@@ -13973,6 +14778,8 @@ class BatchGenWorker:
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
 	) -> None:
+		if getattr(self, "_session_hold", None) is not None:
+			self._release_session_prefix_states(global_sequence_ids)
 		if not self.enable_prefix_cache:
 			return
 		# M3 Slice 2: a trajectory attachment that never reached its restore
@@ -15153,6 +15960,11 @@ class BatchGenWorker:
 				if prefix_state is not None
 				else 0
 			)
+			if prefix_state is not None and prefix_state.is_session_hold:
+				# The turn consumed its session's hold, so it owns the held
+				# pages, a partial last page included: its suffix KV is
+				# written from the first uncached position, into that page.
+				attached = compute_cached
 			query_len = L - compute_cached
 			if query_len <= 0:
 				raise RuntimeError(
@@ -15391,7 +16203,16 @@ class BatchGenWorker:
 				batch_max_seqlen = max(batch_seq_lengths)
 				prefix_materialization = None
 				if any(tokens > 0 for tokens in batch_compute_cached):
-					if any(result is None for result in batch_lookup_results):
+					# A row with no cached prefix needs no lookup result (a
+					# resumed session turn can share a micro-batch with fresh
+					# rows, which have no prefix state when the prefix cache
+					# is off); every row that reads cached KV must have one.
+					if any(
+						result is None and tokens > 0
+						for result, tokens in zip(
+							batch_lookup_results, batch_compute_cached
+						)
+					):
 						raise RuntimeError(
 							"prefix-hit microbatch is missing lookup results"
 						)
@@ -15401,11 +16222,32 @@ class BatchGenWorker:
 					from batchgen.prefix_reuse.materialization import (
 						materialize_gpt_oss_prefixes,
 					)
-
-					host_page_tokens = int(
-						self.prefix_cache_runtime_config.group_specs[0]
-						.raw_page_tokens
+					from batchgen.prefix_reuse.prefill import (
+						SessionHeldPrefixPages,
 					)
+
+					session_cached = {
+						int(global_id): int(cached)
+						for global_id, cached, result in zip(
+							prefill_sequence_spans_to_global_seq_ids(batch_spans),
+							batch_compute_cached,
+							batch_lookup_results,
+						)
+						if cached > 0 and isinstance(result, SessionHeldPrefixPages)
+					}
+					if self.prefix_cache_runtime_config is not None:
+						host_page_tokens = int(
+							self.prefix_cache_runtime_config.group_specs[0]
+							.raw_page_tokens
+						)
+						host_page_bytes = int(
+							self.prefix_cache_runtime_config
+							.host_page_bytes_all_layers
+						)
+					else:
+						# Session hold only (it refuses the prefix cache).
+						host_page_tokens = int(self._session_hold.page_tokens)
+						host_page_bytes = int(self._session_hold_page_bytes)
 					gpu_config = build_gpu_kv_config(
 						self.huggingface_ckpt_name,
 						batch_full_seq_lengths,
@@ -15438,14 +16280,17 @@ class BatchGenWorker:
 						prompt_lengths=batch_full_seq_lengths,
 						compute_cached_tokens=batch_compute_cached,
 						raw_page_tokens=host_page_tokens,
-						collect_metrics=self.prefix_cache_debug_stats,
-						host_page_bytes_all_layers=(
-							self.prefix_cache_runtime_config
-							.host_page_bytes_all_layers
+						# Session reloads are always timed (hold metrics).
+						collect_metrics=(
+							self.prefix_cache_debug_stats or bool(session_cached)
 						),
+						host_page_bytes_all_layers=host_page_bytes,
 					)
 					self._active_prefix_materializations.append(
 						prefix_materialization
+					)
+					self._session_reload_pending[id(prefix_materialization)] = (
+						session_cached
 					)
 
 				# Set up Attn_Wrapper for this micro-batch.
@@ -16561,6 +17406,8 @@ class BatchGenWorker:
 			# trajectory length is original_prompt_length + decoded_length; the
 			# effective prompt for the next prefill is the previous effective prompt
 			# plus only the newly generated suffix from this KV residency cycle.
+			if self._session_hold is not None:
+				self._note_session_evictions(host_evicted_uuids)
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				baseline = seq.reentry_decoded_baseline

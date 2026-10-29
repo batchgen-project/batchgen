@@ -311,7 +311,7 @@ def create_app(
             for t in spool._batch_trackers.values():
                 if not t.is_complete and not t.is_failed:
                     active_batches += 1
-        return {
+        status = {
             "intake_pool_size": ipool.size(),
             "intake_pool_capacity": ipool.max_capacity,
             "scheduling_pool_active": spool.num_active_slots(),
@@ -321,6 +321,9 @@ def create_app(
             "active_batches": active_batches,
             "pool_mode": scheduler._pool_mode,
         }
+        if scheduler._session_kv_hold:
+            status["session_hold"] = scheduler._session_hold_info
+        return status
 
     # ==================== File Endpoints ====================
 

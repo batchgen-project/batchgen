@@ -97,6 +97,10 @@ void BindHostPagedManager(py::module& m, const char* name) {
        .def("free_sequences", &Manager::FreeSequences,
            py::arg("sequence_ids"))
         .def("release_all_sequences", &Manager::ReleaseAllSequences)
+        .def("release_all_sequences_and_resident_pages",
+             &Manager::ReleaseAllSequencesAndResidentPages,
+             "Release every sequence and every resident page (cohort "
+             "reconcile with session KV holds); returns resident pages freed")
         .def("build_page_table", &Manager::BuildPageTable,
              py::arg("sequence_ids"))
         .def("get_stats", &Manager::GetStats)

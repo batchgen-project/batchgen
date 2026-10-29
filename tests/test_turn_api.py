@@ -94,6 +94,9 @@ class _FakeWorker:
         self.response_queue = queue.Queue()
         self.admitted = []
         self.admit_messages = []
+        self.control_messages = []
+        # Every message the server put on request_queue, in order.
+        self.messages = []
         self.release = threading.Event()
         self.fatals = []
         self._capacity = capacity
@@ -124,10 +127,15 @@ class _FakeWorker:
                 msg = "idle"
             if msg is None:
                 return
+            if msg != "idle":
+                self.messages.append(msg)
             if self.release.is_set():
                 for entry, admitted_at in held:
                     self._answer(entry, admitted_at)
                 held = []
+            if isinstance(msg, dict) and msg.get("type") == "session_control":
+                self.control_messages.append(msg)
+                continue
             if not isinstance(msg, dict) or msg.get("type") != "admit":
                 continue
             self.admit_messages.append(msg)
@@ -153,6 +161,12 @@ class _FakeWorker:
             "admitted_at": admitted_at,
             "completed_at": time.time(),
         }
+        if "KVKEPT" in entry["text"]:
+            # --enable-session-kv-hold: the worker reports what the turn
+            # reused from its session's hold and what it holds now.
+            item["session_resume"] = {"lcp_tokens": 70, "cached_tokens": 7,
+                                      "dropped": None}
+            item["session_hold"] = {"held": True, "kv_tokens": 12, "pages": 1}
         if "TOO_LONG" in entry["text"]:
             item = {
                 "type": "completion",
@@ -181,9 +195,10 @@ class _Storage:
         self.metadata[file_id] = meta
 
 
-def _scheduler(tmp_path, worker):
+def _scheduler(tmp_path, worker, session_hold=False):
     args = SimpleNamespace(
         model=MODEL,
+        enable_session_kv_hold=session_hold,
         max_intake_capacity=64,
         incremental_output_dir=str(tmp_path / "incr"),
         no_incremental_save=False,
@@ -195,6 +210,10 @@ def _scheduler(tmp_path, worker):
     # The fake worker needs no init message (WorkerManager sends it for a
     # real generation before worker_generation_ready()).
     scheduler._pool_initialized = True
+    mark_live = getattr(scheduler, "_mark_generation_live", None)
+    if mark_live is not None and hasattr(worker, "request_queue"):
+        # ... and this generation is live: session_control may reach it.
+        mark_live()
     return scheduler
 
 
@@ -216,10 +235,10 @@ def _turn_body(session_id, content="hi", traj_id="traj-1", parent=None, **extra)
     return body
 
 
-async def _serve(tmp_path, scenario, capacity=8):
+async def _serve(tmp_path, scenario, capacity=8, session_hold=False):
     worker = _FakeWorker(capacity=capacity)
     worker.start()
-    scheduler = _scheduler(tmp_path, worker)
+    scheduler = _scheduler(tmp_path, worker, session_hold=session_hold)
     await scheduler.start()
     app = FastAPI()
     app.state.scheduler = scheduler
@@ -363,6 +382,138 @@ def test_listener_resolves_the_turn_future_without_a_tracker_or_file(tmp_path):
     assert waiter.timing["completion_routed_at"] >= waiter.timing["worker_completed_at"]
     assert scheduler._turn_waiters == {}
     assert not (tmp_path / "incr").exists() or not list((tmp_path / "incr").iterdir())
+
+
+def _drain_queue(q):
+    items = []
+    while True:
+        try:
+            items.append(q.get_nowait())
+        except queue.Empty:
+            return items
+
+
+def test_session_control_never_precedes_a_restarted_generations_init(tmp_path):
+    """A close or abort during a worker restart must not reach the new
+    generation's queue ahead of its "init" (the worker dies on it)."""
+    old_queue = queue.Queue()
+    worker = _ns_worker(request_queue=old_queue)
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler.release_sessions(["s0"], "closed")
+    assert [m["type"] for m in _drain_queue(old_queue)] == ["session_control"]
+
+    # WorkerManager.restart_workers: quiesce, teardown, fresh channels, spawn.
+    scheduler.quiesce()
+    scheduler.release_sessions(["s1"], "closed")      # close mid-restart
+    new_queue = queue.Queue()
+    worker.request_queue = new_queue
+    scheduler.release_sessions(["s2"], "aborted")     # abort mid-restart
+    assert _drain_queue(old_queue) == []
+    assert _drain_queue(new_queue) == []
+    # The manager sends the generation's init, then calls the ready hook.
+    new_queue.put({"type": "init"})
+    scheduler.worker_generation_ready()
+    scheduler.release_sessions(["s3"], "closed")
+    sent = _drain_queue(new_queue)
+    assert [m["type"] for m in sent] == ["init", "session_control"]
+    assert sent[1]["release"] == [{"session_id": "s3", "reason": "closed"}]
+
+
+def test_a_restart_clears_the_previous_generations_hold_metrics(tmp_path):
+    """The restart frees the old generation's held KV; /v1/pool/status must
+    not keep reporting its holds until the new generation publishes."""
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler._session_hold_info = {"held_sessions": 4, "held_kv_pages": 90}
+    scheduler.quiesce()
+    assert scheduler._session_hold_info is None
+
+
+def test_session_control_is_dropped_after_a_fatal_until_the_next_generation(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    # WorkerManager._handle_worker_failure: quiesce, teardown, reconcile.
+    scheduler.fail_in_flight("rank 3 died")
+    worker.request_queue = queue.Queue()
+    scheduler.release_sessions(["s1"], "closed")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_session_control_waits_for_the_first_generations_init(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    args = SimpleNamespace(model=MODEL, max_intake_capacity=64,
+                           enable_session_kv_hold=True)
+    scheduler = bs.BatchScheduler(_Storage(tmp_path), worker, args)
+    scheduler.release_sessions(["s1"], "closed")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_nothing_is_sent_to_the_worker_without_session_hold(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=False)
+    scheduler.release_sessions(["s1"], "closed")
+    scheduler._send_session_control(cancel=["turn_x"], reason="abort")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_worker_main_loop_skips_session_control_before_init():
+    """Every rank gets the broadcast message and skips it with ``continue``,
+    before the init branch and the unexpected-message raise."""
+    import ast
+
+    source = (SERVER.parent / "server_worker_main_loop.py").read_text()
+    impl = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_server_worker_main_impl"
+    )
+    loop = next(
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.While) and any(
+            "Pool mode init received" in ast.unparse(stmt) for stmt in node.body)
+    )
+    texts = [ast.unparse(stmt) for stmt in loop.body]
+    guard = next(i for i, text in enumerate(texts)
+                 if "'session_control'" in text and text.startswith("if "))
+    init = next(i for i, text in enumerate(texts) if "Pool mode init received" in text)
+    assert guard < init
+    assert isinstance(loop.body[guard].body[-1], ast.Continue)
+
+
+class _ClosedQueue:
+    def put(self, item):
+        raise ValueError("Queue is closed")
+
+
+def test_cancel_fails_the_waiter_even_when_the_worker_send_fails(tmp_path):
+    """L1: the waiter leaves _turn_waiters first, so a send that raises must
+    not leave its future pending forever."""
+    async def run():
+        worker = _ns_worker(request_queue=queue.Queue())
+        scheduler = _scheduler(tmp_path, worker, session_hold=True)
+        waiter = scheduler.submit_turn(
+            "turn_a", io_struct.TurnRequest(**_turn_body("s1")), time.time())
+        # Admitted: the drain took it out of the IntakePool.
+        scheduler._intake_pool.remove_batch_entries("turn_a")
+        # The generation's channel closed under the cancel (restart window).
+        scheduler._control_queue = _ClosedQueue()
+        outcome = scheduler.cancel_turn("turn_a", "test")
+        with pytest.raises(TurnError) as info:
+            await asyncio.wait_for(waiter.future, timeout=1.0)
+        return outcome, info.value, scheduler
+
+    outcome, error, scheduler = asyncio.run(run())
+    assert outcome == "cancelled"
+    assert (error.status_code, error.code) == (409, "turn_aborted")
+    assert scheduler._detached_turns == {"turn_a"}
+
+
+def test_a_generation_without_a_request_queue_is_not_live(tmp_path):
+    worker = _ns_worker(request_queue=None)
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler._mark_generation_live()
+    scheduler.release_sessions(["s1"], "closed")   # no AttributeError
+    assert scheduler._control_queue is None
 
 
 def test_cancel_dequeues_a_turn_that_never_reached_a_worker(tmp_path):
@@ -627,15 +778,376 @@ def test_e2e_abort_cancels_the_in_flight_turn(tmp_path):
         after = await client.post("/v1/turns", json=_turn_body("s1"))
         return aborted, answer, detached, after
 
-    aborted, answer, detached, after = asyncio.run(_serve(tmp_path, scenario))
+    holder = {}
+
+    async def scenario_with_worker(client, scheduler, worker, app):
+        holder["worker"] = worker
+        return await scenario(client, scheduler, worker, app)
+
+    aborted, answer, detached, after = asyncio.run(
+        _serve(tmp_path, scenario_with_worker, session_hold=True)
+    )
     assert aborted.status_code == 200, aborted.text
     payload = aborted.json()
     assert payload["state"] == "aborted" and payload["end_reason"] == "tool_crash"
-    assert payload["cancelled_turn"] == "detached"
+    # The worker is told to cancel the admitted turn and to free the
+    # session's held KV, in that order, through its admission queue.
+    assert payload["cancelled_turn"] == "cancelled"
     assert detached == {payload["cancelled_turn_id"]}
+    control = holder["worker"].control_messages
+    assert [m["cancel"] for m in control] == [[payload["cancelled_turn_id"]], []]
+    assert [m["release"] for m in control] == [
+        [], [{"session_id": "s1", "reason": "aborted"}]]
     assert answer.status_code == 409
     assert answer.json()["detail"]["code"] == "turn_aborted"
     assert after.status_code == 409 and after.json()["detail"]["code"] == "session_aborted"
+
+
+def test_e2e_close_releases_the_held_kv_of_every_closed_session(tmp_path):
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "main"})
+        await client.post("/v1/sessions", json={
+            "traj_id": "traj-1", "session_id": "sub", "parent_session_id": "main"})
+        await client.post("/v1/turns", json=_turn_body("main"))
+        single = await client.post("/v1/sessions/sub/close",
+                                   json={"reason": "end_of_session"})
+        await client.post("/v1/sessions", json={"traj_id": "traj-2", "session_id": "m2"})
+        await client.post("/v1/sessions", json={
+            "traj_id": "traj-2", "session_id": "s2", "parent_session_id": "m2"})
+        await client.post("/v1/turns", json=_turn_body("m2", traj_id="traj-2"))
+        whole = await client.post("/v1/sessions/s2/close",
+                                  json={"reason": "end_of_trajectory"})
+        await _until(lambda: len(worker.control_messages) == 2)
+        return single, whole, list(worker.control_messages)
+
+    single, whole, control = asyncio.run(
+        _serve(tmp_path, scenario, session_hold=True))
+    assert single.status_code == 200 and whole.status_code == 200
+    assert control[0]["release"] == [{"session_id": "sub", "reason": "closed"}]
+    assert sorted(item["session_id"] for item in control[1]["release"]) == ["m2", "s2"]
+    assert all(m["cancel"] == [] for m in control)
+
+
+def test_e2e_turn_reports_its_session_hold_and_pool_status_metrics(tmp_path):
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        answer = await client.post("/v1/turns", json=_turn_body("s1", "KVKEPT"))
+        worker.response_queue.put({
+            "type": "session_hold_metrics", "held_sessions": 1,
+            "held_kv_tokens": 12, "held_kv_pages": 1})
+        await _until(lambda: scheduler._session_hold_info is not None)
+        return answer, scheduler._session_hold_info
+
+    answer, metrics = asyncio.run(_serve(tmp_path, scenario, session_hold=True))
+    assert answer.status_code == 200, answer.text
+    meta = answer.json()["batchgen"]
+    assert meta["session_resume"] == {"lcp_tokens": 70, "cached_tokens": 7,
+                                      "dropped": None}
+    assert meta["session_hold"] == {"held": True, "kv_tokens": 12, "pages": 1}
+    assert metrics == {"held_sessions": 1, "held_kv_tokens": 12, "held_kv_pages": 1}
+
+
+_TURN_ID = __import__("re").compile(r"turn_[0-9a-f]{24}")
+_VOLATILE_KEYS = {"created", "opened_at", "updated_at", "timing", "id",
+                  "admitted_at", "completed_at"}
+
+
+def _normalize_flag_off_record(record):
+    """Replace ids and wall-clock values so two runs compare equal."""
+    names = {}
+
+    def turn_name(match):
+        return names.setdefault(match.group(0), f"turn_{len(names)}")
+
+    def walk(value):
+        if isinstance(value, dict):
+            return {key: ("<volatile>" if key in _VOLATILE_KEYS else walk(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, str):
+            return _TURN_ID.sub(turn_name, value)
+        return value
+
+    return walk(record)
+
+
+def record_flag_off_turn_traffic(tmp_path):
+    """Turns, an abort of an admitted turn, a close and the server -> worker
+    request_queue traffic they cause, without --enable-session-kv-hold.
+
+    Also run against the server modules of main (merge base 686d8e78) to
+    produce FLAG_OFF_MAIN_RECORD below.
+    """
+    async def scenario(client, scheduler, worker, app):
+        out = []
+
+        async def call(label, method, path, body=None):
+            response = await getattr(client, method)(path, json=body)
+            out.append([label, response.status_code, response.json()])
+
+        await call("open s1", "post", "/v1/sessions",
+                   {"traj_id": "traj-1", "session_id": "s1"})
+        await call("turn s1", "post", "/v1/turns", _turn_body("s1", "first"))
+        held = asyncio.ensure_future(
+            client.post("/v1/turns", json=_turn_body("s1", "HOLD")))
+        await _until(lambda: len(worker.admitted) == 2)
+        await call("abort s1", "post", "/v1/sessions/s1/abort",
+                   {"reason": "tool_crash"})
+        aborted = await held
+        out.append(["aborted turn", aborted.status_code, aborted.json()])
+        worker.release.set()
+        await _until(lambda: not scheduler._detached_turns)
+        await call("open s2", "post", "/v1/sessions",
+                   {"traj_id": "traj-2", "session_id": "s2"})
+        await call("turn s2", "post", "/v1/turns",
+                   _turn_body("s2", "second", traj_id="traj-2"))
+        await call("close s2", "post", "/v1/sessions/s2/close",
+                   {"reason": "end_of_trajectory"})
+        await asyncio.sleep(0.1)
+        return {"http": out, "request_queue": list(worker.messages)}
+
+    return _normalize_flag_off_record(asyncio.run(_serve(tmp_path, scenario)))
+
+
+# record_flag_off_turn_traffic() run against the server modules of main at
+# 686d8e78 (the merge base of this branch), normalized.
+FLAG_OFF_MAIN_RECORD = json.loads(r"""
+{
+ "http": [
+  [
+   "open s1",
+   200,
+   {
+    "end_reason": null,
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s1",
+    "state": "open",
+    "traj_id": "traj-1",
+    "turns": 0
+   }
+  ],
+  [
+   "turn s1",
+   200,
+   {
+    "batchgen": {
+     "cached_tokens": 7,
+     "computed_tokens": 37,
+     "session": {
+      "parent_session_id": null,
+      "session_id": "s1",
+      "traj_id": "traj-1"
+     },
+     "timing": "<volatile>",
+     "turn_id": "turn_0"
+    },
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+       "content": "reply to turn_0",
+       "role": "assistant"
+      }
+     }
+    ],
+    "created": "<volatile>",
+    "id": "<volatile>",
+    "model": "gpt-oss-120b",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 44,
+     "prompt_tokens_details": {
+      "cached_tokens": 7
+     },
+     "total_tokens": 47
+    }
+   }
+  ],
+  [
+   "abort s1",
+   200,
+   {
+    "cancelled_turn": "detached",
+    "cancelled_turn_id": "turn_1",
+    "end_reason": "tool_crash",
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s1",
+    "state": "aborted",
+    "traj_id": "traj-1",
+    "turns": 2
+   }
+  ],
+  [
+   "aborted turn",
+   409,
+   {
+    "detail": {
+     "code": "turn_aborted",
+     "message": "turn turn_1 was aborted: session s1 aborted (tool_crash)"
+    }
+   }
+  ],
+  [
+   "open s2",
+   200,
+   {
+    "end_reason": null,
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s2",
+    "state": "open",
+    "traj_id": "traj-2",
+    "turns": 0
+   }
+  ],
+  [
+   "turn s2",
+   200,
+   {
+    "batchgen": {
+     "cached_tokens": 7,
+     "computed_tokens": 38,
+     "session": {
+      "parent_session_id": null,
+      "session_id": "s2",
+      "traj_id": "traj-2"
+     },
+     "timing": "<volatile>",
+     "turn_id": "turn_2"
+    },
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+       "content": "reply to turn_2",
+       "role": "assistant"
+      }
+     }
+    ],
+    "created": "<volatile>",
+    "id": "<volatile>",
+    "model": "gpt-oss-120b",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 45,
+     "prompt_tokens_details": {
+      "cached_tokens": 7
+     },
+     "total_tokens": 48
+    }
+   }
+  ],
+  [
+   "close s2",
+   200,
+   {
+    "closed": [
+     {
+      "end_reason": "end_of_trajectory",
+      "in_flight_turn_id": null,
+      "object": "session",
+      "parent_session_id": null,
+      "session_id": "s2",
+      "state": "closed",
+      "traj_id": "traj-2",
+      "turns": 1
+     }
+    ],
+    "object": "session.close",
+    "reason": "end_of_trajectory"
+   }
+  ]
+ ],
+ "request_queue": [
+  {
+   "entries": [
+    {
+     "batch_id": "turn_0",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_0",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s1",
+     "text": "<system>Reasoning: low<user>first<assistant>",
+     "traj_id": "traj-1"
+    }
+   ],
+   "type": "admit"
+  },
+  {
+   "entries": [
+    {
+     "batch_id": "turn_1",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_1",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s1",
+     "text": "<system>Reasoning: low<user>HOLD<assistant>",
+     "traj_id": "traj-1"
+    }
+   ],
+   "type": "admit"
+  },
+  {
+   "entries": [
+    {
+     "batch_id": "turn_2",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_2",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s2",
+     "text": "<system>Reasoning: low<user>second<assistant>",
+     "traj_id": "traj-2"
+    }
+   ],
+   "type": "admit"
+  }
+ ]
+}
+""")
+
+
+def test_flag_off_turn_responses_and_worker_traffic_match_main(tmp_path):
+    """M2: without --enable-session-kv-hold, /v1/turns, abort and close
+    answer exactly as on main and put exactly main's messages on the worker
+    queue (no session_control, abort leaves the turn "detached")."""
+    record = record_flag_off_turn_traffic(tmp_path)
+    assert json.loads(json.dumps(record)) == FLAG_OFF_MAIN_RECORD
 
 
 def test_e2e_turns_coexist_with_a_running_batch(tmp_path):
