@@ -3367,10 +3367,20 @@ class BatchGenWorker:
 		pages past its KV. The pages a resumed turn attached from its previous
 		hold are resident already and move into the new hold unchanged.
 		"""
-		held = [
-			uuid for uuid in uuids
-			if self._session_hold_eligible(self.global_batch.get_sequence(uuid))
-		]
+		# Only a COMPLETED sequence is reported (and so recorded as a hold):
+		# the completion paths skip _report_completion for any other status
+		# (e.g. a stale eos_reached on a PREFILLED sequence), and pages
+		# retained for a sequence that is never recorded would be resident
+		# pages nobody owns.
+		held = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if (
+				seq is not None
+				and seq.status == SequenceStatus.COMPLETED
+				and self._session_hold_eligible(seq)
+			):
+				held.append(uuid)
 		if not held:
 			return
 		# The Host copy must cover every token the turn decoded: retire the

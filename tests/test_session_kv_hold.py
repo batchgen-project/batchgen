@@ -497,6 +497,9 @@ def test_holding_a_resumed_turn_carries_its_attached_pages_forward():
     worker._commit_session_resumes()
     # Turn 2's chain: the 2 attached held pages, then its own pages.
     turn2 = worker.global_batch.get_sequence("turn2")
+    for status in (SequenceStatus.IN_PREFILL, SequenceStatus.PREFILLED,
+                   SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED):
+        worker.global_batch.update_status("turn2", status)
     turn2.decoded_length = 20
     turn2.original_prompt_length = len(new_prompt)
     turn2.current_context_length = len(new_prompt) + 20  # 170 -> KV 169 tokens
@@ -655,3 +658,18 @@ def test_attention_tp_is_refused_at_init_not_at_the_first_held_completion():
     psm = max(i for i, text in enumerate(calls) if "self.parallel_manager = " in text)
     check = calls.index("self._require_session_hold_pure_dp()")
     assert psm < check
+
+
+def test_pages_are_retained_only_for_completed_sequences():
+    """L2: a sequence the completion path does not report (status is not
+    COMPLETED, e.g. a stale eos_reached on PREFILLED) is never recorded as a
+    hold, so retaining its pages would leak them as resident pages."""
+    worker = _Worker()
+    seq = worker.add_seq("turnp", 7, list(range(100)), status=(
+        SequenceStatus.IN_PREFILL, SequenceStatus.PREFILLED))
+    seq.current_context_length = 100
+    worker.host.allocate(7, 2)
+    worker._retain_session_pages_for_hold(["turnp"])
+    assert worker._session_retained_pages == {}
+    worker.host.release_sequence_pages([7])
+    assert worker.host.resident() == []
