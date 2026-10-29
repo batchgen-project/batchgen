@@ -31,7 +31,7 @@ def _boundary_snapshot_row(raw_position: int) -> int:
 
 @pytest.fixture(scope="module")
 def bg():
-    from batchgen.models.engine_loader import core_engine as bg_module
+    from batchgen.native_loader import core_engine as bg_module
 
     return bg_module
 

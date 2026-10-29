@@ -12,7 +12,7 @@ from dataclasses import replace
 import pytest
 
 from batchgen.continuous_batching import plan_host_kv_growth_evictions
-from batchgen.models.engine_loader import core_engine as bg
+from batchgen.native_loader import core_engine as bg
 from batchgen.prefix_reuse.commit import (
     build_prefix_commit_request,
     collect_group_pages_for_commit,

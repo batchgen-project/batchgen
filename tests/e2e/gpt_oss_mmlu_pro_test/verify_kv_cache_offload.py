@@ -261,7 +261,7 @@ def test_kv_offload_to_host():
         return False
 
     try:
-        from batchgen.models.engine_loader import core_engine as bg
+        from batchgen.native_loader import core_engine as bg
     except ImportError as e:
         print(f"Could not import core_engine: {e}")
         print("Make sure BatchGen is properly built with C++ bindings")

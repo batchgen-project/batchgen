@@ -8,7 +8,7 @@ import torch
 
 from batchgen.eventlog.process import native_log_level
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
-from batchgen.models.engine_loader import core_engine as bg_lib
+from batchgen.native_loader import core_engine as bg_lib
 
 HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
 

@@ -12,7 +12,7 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
 )
-from batchgen.models.engine_loader import core_engine as bg
+from batchgen.native_loader import core_engine as bg
 from batchgen.prefix_reuse.materialization import (
     _expand_device_ptrs_for_host_pages,
 )

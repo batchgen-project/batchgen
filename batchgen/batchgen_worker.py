@@ -219,7 +219,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_whole_model_cuda_graph_requested_for_model,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
-from batchgen.models.engine_loader import core_engine
+from batchgen.native_loader import core_engine
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.completion import CompletionContext, CompletionHandler
 from batchgen.worker.sync import (

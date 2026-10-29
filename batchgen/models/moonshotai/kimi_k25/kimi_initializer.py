@@ -42,7 +42,7 @@ from .planner import KimiK25Planner
 try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
-    from batchgen.models.engine_loader import core_engine as loader_module
+    from batchgen.native_loader import core_engine as loader_module
     core_engine = loader_module.batchgen
 
 

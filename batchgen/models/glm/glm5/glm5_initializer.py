@@ -31,7 +31,7 @@ from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
-    from batchgen.models.engine_loader import core_engine as loader_module
+    from batchgen.native_loader import core_engine as loader_module
     core_engine = loader_module.batchgen
 
 

@@ -180,7 +180,7 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
 def _core_engine():
     """Import the compiled extension or skip; source checks still have to run."""
     try:
-        from batchgen.models.engine_loader import core_engine
+        from batchgen.native_loader import core_engine
     except Exception as exc:
         pytest.skip(f"compiled extension unavailable: {exc}")
     return core_engine

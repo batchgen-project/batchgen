@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 def bg():
     if not torch.cuda.is_available():
         pytest.skip("mapped HostKV tests require CUDA")
-    from batchgen.models.engine_loader import core_engine as bg_module
+    from batchgen.native_loader import core_engine as bg_module
 
     return bg_module
 

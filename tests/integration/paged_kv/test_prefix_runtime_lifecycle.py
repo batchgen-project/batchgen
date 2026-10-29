@@ -2,7 +2,7 @@ import os
 import uuid
 from dataclasses import replace
 
-from batchgen.models.engine_loader import core_engine as bg
+from batchgen.native_loader import core_engine as bg
 from batchgen.prefix_reuse.commit import (
     build_prefix_commit_request,
     collect_group_pages_for_commit,

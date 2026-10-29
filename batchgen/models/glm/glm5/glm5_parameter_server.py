@@ -48,10 +48,10 @@ try:
     from batchgen.core_engine import Parameter_Server
     _diag("core_engine (prebuilt) done")
 except ImportError:
-    _diag("core_engine ImportError -> engine_loader JIT")
-    from batchgen.models.engine_loader import core_engine
+    _diag("core_engine ImportError -> native_loader")
+    from batchgen.native_loader import core_engine
     Parameter_Server = core_engine.Parameter_Server
-    _diag("engine_loader done")
+    _diag("native_loader done")
 
 
 class GLM5_Parameter_Server:

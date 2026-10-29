@@ -12,8 +12,8 @@ def _load_host_kv_config(monkeypatch):
         "batchgen.kv_cache.gpu_paged_kv_manager"
     )
     gpu_config.GPUPagedKVConfig = object
-    engine_loader = types.ModuleType("batchgen.models.engine_loader")
-    engine_loader.core_engine = types.SimpleNamespace()
+    native_loader = types.ModuleType("batchgen.native_loader")
+    native_loader.core_engine = types.SimpleNamespace()
     monkeypatch.setitem(
         sys.modules,
         "batchgen.kv_cache.gpu_paged_kv_manager",
@@ -21,8 +21,8 @@ def _load_host_kv_config(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
-        "batchgen.models.engine_loader",
-        engine_loader,
+        "batchgen.native_loader",
+        native_loader,
     )
 
     path = ROOT / "batchgen" / "kv_cache" / "host_kv_mananger_config.py"

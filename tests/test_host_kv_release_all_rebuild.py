@@ -68,7 +68,7 @@ def test_rebuild_runs_under_both_locks_at_the_end_of_release_all():
 
 def _core_engine():
     try:
-        from batchgen.models.engine_loader import core_engine
+        from batchgen.native_loader import core_engine
     except Exception as exc:
         pytest.skip(f"compiled extension unavailable: {exc}")
     return core_engine

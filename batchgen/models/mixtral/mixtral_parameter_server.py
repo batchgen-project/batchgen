@@ -37,7 +37,7 @@ except ImportError:
     # jit compile
     from core_engine import Parameter_Server
 
-    from batchgen.models.engine_loader import core_engine
+    from batchgen.native_loader import core_engine
 
 
 class Mixtral_Parameter_Server:

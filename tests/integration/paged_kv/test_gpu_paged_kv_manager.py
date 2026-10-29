@@ -19,7 +19,7 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
 )
-from batchgen.models.engine_loader import core_engine as bg
+from batchgen.native_loader import core_engine as bg
 
 logging.basicConfig(
     level=logging.INFO,  # Set to the lowest level to capture all messages
