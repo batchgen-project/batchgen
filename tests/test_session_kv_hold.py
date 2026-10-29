@@ -324,6 +324,7 @@ class _Worker:
         self._cancelled_request_ids = set()
         self._session_resume_wave = {}
         self._session_resume_plans = {}
+        self._session_reload_seconds = {}
         self._uuid_to_local_map = {}
         self._local_to_uuid_map = {}
         self.query_book = {}
