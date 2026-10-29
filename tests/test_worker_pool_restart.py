@@ -4209,3 +4209,64 @@ def test_cohort_epoch_is_zero_without_a_daemon(monkeypatch):
     assert manager._distributed_weight_cohort() == 0
     manager.distributed_weight_daemon = _FakeWeightDaemon([])
     assert manager._distributed_weight_cohort() == 1
+
+
+class _HostRegion:
+    """Host KV region as the reconcile sees it: sequence and resident pages."""
+
+    def __init__(self, total=16, sequence_pages=4, resident_pages=3):
+        self.total = total
+        self.sequence_pages = sequence_pages
+        self.resident_pages = resident_pages
+
+    def release_all_sequences(self):
+        self.sequence_pages = 0
+
+    def release_all_sequences_and_resident_pages(self):
+        self.sequence_pages = 0
+        swept, self.resident_pages = self.resident_pages, 0
+        return swept
+
+    def get_stats(self):
+        free = self.total - self.sequence_pages - self.resident_pages
+        return SimpleNamespace(num_free_pages=free, num_total_pages=self.total)
+
+
+def test_restart_with_session_hold_frees_the_held_host_pages(monkeypatch, caplog):
+    """Held session KV is resident pages in a region that survives the
+    restart; the dead cohort's hold book is gone, so the reconcile frees it."""
+    manager = _manager(monkeypatch)
+    region = _HostRegion()
+    manager.host_kv_manager = region
+    manager.host_kv_aux_manager = None
+    manager.args.enable_session_kv_hold = True
+    manager.args.enable_prefix_cache = False
+
+    with caplog.at_level(logging.WARNING):
+        manager.restart_workers(timeout_s=1)
+
+    assert (region.sequence_pages, region.resident_pages) == (0, 0)
+    assert region.get_stats().num_free_pages == region.total
+    assert "reconcile freed 3 held Host KV page(s)" in caplog.text
+
+
+def test_restart_without_session_hold_keeps_resident_pages(monkeypatch):
+    """Without holds, resident pages belong to the prefix cache, which keeps
+    them across a restart: the reconcile releases sequences only."""
+    manager = _manager(monkeypatch)
+    region = _HostRegion()
+    manager.host_kv_manager = region
+    manager.host_kv_aux_manager = None
+
+    manager.restart_workers(timeout_s=1)
+
+    assert (region.sequence_pages, region.resident_pages) == (0, 3)
+
+
+def test_session_hold_reconcile_needs_the_resident_sweep_primitive(monkeypatch):
+    manager = _manager(monkeypatch)
+    manager.host_kv_manager = SimpleNamespace(release_all_sequences=lambda: None)
+    manager.host_kv_aux_manager = None
+    manager.args.enable_session_kv_hold = True
+    with pytest.raises(RuntimeError, match="release_all_sequences_and_resident_pages"):
+        manager._release_host_kv_sequences()

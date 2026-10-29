@@ -415,6 +415,16 @@ def test_session_control_never_precedes_a_restarted_generations_init(tmp_path):
     assert sent[1]["release"] == [{"session_id": "s3", "reason": "closed"}]
 
 
+def test_a_restart_clears_the_previous_generations_hold_metrics(tmp_path):
+    """The restart frees the old generation's held KV; /v1/pool/status must
+    not keep reporting its holds until the new generation publishes."""
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler._session_hold_info = {"held_sessions": 4, "held_kv_pages": 90}
+    scheduler.quiesce()
+    assert scheduler._session_hold_info is None
+
+
 def test_session_control_is_dropped_after_a_fatal_until_the_next_generation(tmp_path):
     worker = _ns_worker(request_queue=queue.Queue())
     scheduler = _scheduler(tmp_path, worker, session_hold=True)

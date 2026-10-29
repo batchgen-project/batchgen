@@ -308,6 +308,12 @@ class HostPagedKVBackend {
     // writes the host-KV data region.
     void ReleaseAllSequences();
 
+    // ReleaseAllSequences plus every resident page: the allocator ends as a
+    // fresh region. For a cohort reconcile when the resident pages' owner
+    // (agent-session KV holds) died with the cohort; never with a live prefix
+    // cache. Same precondition: no worker attached. Returns pages freed.
+    std::size_t ReleaseAllSequencesAndResidentPages();
+
     std::vector<std::int32_t> ReleaseSequencePrefixPages(
         std::int64_t sequence_id, std::size_t num_pages);
 

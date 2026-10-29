@@ -345,9 +345,14 @@ class BatchScheduler:
             self._control_queue = self.worker.request_queue
 
     def _mark_generation_down(self) -> None:
-        """No generation is serving: session_control is dropped until ready."""
+        """No generation is serving: session_control is dropped until ready.
+
+        The generation's published hold metrics go with it: its held KV is
+        freed by the reconcile, and the next generation publishes its own.
+        """
         with self._control_lock:
             self._control_queue = None
+        self._session_hold_info = None
 
     def worker_generation_ready(self) -> None:
         # WorkerManager sends the generation's init message before this hook;

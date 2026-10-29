@@ -230,6 +230,7 @@ struct HostPagedKVBackend::SharedState {
     void ReleaseSequence(std::int64_t sequence_id);
 
     void ReleaseAllSequences();
+    std::size_t ReleaseAllSequencesAndResidentPages();
     std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
                                                  std::size_t num_pages);
     std::vector<std::int32_t> RetainPages(
@@ -925,6 +926,31 @@ void HostPagedKVBackend::SharedState::RebuildFreeStateLocked() {
     header->active_sequences.store(0, std::memory_order_relaxed);
 }
 
+// ReleaseAllSequences, then free every resident page too: the allocator ends
+// identical to a fresh region. Only for a region whose resident pages have no
+// owner left after the cohort died -- agent-session KV holds, which keep their
+// page ids in the dead workers' memory (the server refuses the prefix cache,
+// the other resident-page owner, when holds are on). Same precondition as
+// ReleaseAllSequences: no worker is attached. Returns the resident pages freed.
+std::size_t
+HostPagedKVBackend::SharedState::ReleaseAllSequencesAndResidentPages() {
+    ReleaseAllSequences();
+    ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    std::size_t released = 0;
+    for (std::size_t page = 0; page < config.num_pages; ++page) {
+        if (page_owners[page] == kPrefixResidentSequenceId) {
+            page_owners[page] = kEmptySequenceId;
+            page_links[page] = kInvalidPageIndex;
+            ++released;
+        }
+    }
+    if (released != 0) {
+        RebuildFreeStateLocked();
+    }
+    return released;
+}
+
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
     if (num_pages == 0) {
@@ -1211,6 +1237,10 @@ void HostPagedKVBackend::ReleaseSequences(
 
 void HostPagedKVBackend::ReleaseAllSequences() {
     state_->ReleaseAllSequences();
+}
+
+std::size_t HostPagedKVBackend::ReleaseAllSequencesAndResidentPages() {
+    return state_->ReleaseAllSequencesAndResidentPages();
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(

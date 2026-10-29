@@ -991,6 +991,10 @@ def _server_worker_main_impl(
 					worker.set_admission_queue(request_queue)
 					worker.set_response_queue(response_queue)
 					worker._publish_trajectory_pool_capacity()
+					# A fresh generation holds no session KV (a restart's
+					# reconcile freed the previous one's): publish the empty
+					# hold book so /v1/pool/status does not show stale holds.
+					worker._publish_session_hold_metrics("init")
 
 					if global_rank == 0:
 						logging.info(
