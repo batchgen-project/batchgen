@@ -248,13 +248,13 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
 def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
     config = _plan_k3(memory_bytes)
 
-    # Streamed-SP8 leases consumer batches of 8 experts. The ring must hold
-    # MORE THAN ONE LAYER of this rank's experts (112 on the 8-worker shard):
-    # a smaller ring caps the HtoD producer's lookahead below a layer, so
-    # layer k+1's transfers serialize inside layer k+1 instead of hiding
-    # behind layer k's compute.
+    # Streamed-SP8 leases a whole layer of this rank's experts (112 on the
+    # 8-worker shard). The ring must hold TWO layers plus a lease of margin:
+    # with only one layer, the consumer's hold and the producer's capacity
+    # compete for the same slots, so the producer stalls on a full ring while
+    # layer k is held instead of streaming layer k+1 ahead of it.
     assert K3_PREFILL_EXPERT_BATCH == 112
-    assert K3_PREFILL_EXPERT_RING == 112 + 16
+    assert K3_PREFILL_EXPERT_RING == 2 * 112 + 16
     assert (
         config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"]
         == K3_PREFILL_EXPERT_RING

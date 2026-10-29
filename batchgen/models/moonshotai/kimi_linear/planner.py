@@ -141,11 +141,20 @@ _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
 # single stream-ordered event once its D2D into the local shard is enqueued:
 # prefill advances layer by layer into one grouped GEMM (the Kimi-K2.5
 # default path), so sub-layer lease batches only add acquire/release round
-# trips. The hold window is the D2D enqueue, a few ms; the 16 extra ring
-# slots keep the HtoD producer streaming layer k+2 during it.
+# trips. The hold window is the D2D enqueue, a few ms; the extra ring slots
+# keep the HtoD producer streaming the layer after next during it.
+#
+# The ring holds TWO layers plus one lease of margin, not one layer plus a
+# margin. A one-layer ring makes the producer's capacity and the consumer's
+# hold compete for the same slots: while the consumer holds layer k the
+# producer has only the margin left to stream layer k+1 into, so it stalls on
+# a full ring rather than running ahead. Two layers lets layer k+1 land in
+# full while layer k is still held, which is what "one layer of lookahead
+# everywhere" actually requires. Cost is linear in HBM: one layer is
+# 112 x 16.73 MiB = 1.83 GiB, so this ring is ~3.9 GiB.
 _K3_EXPERTS_PER_RANK = 112
 K3_PREFILL_EXPERT_BATCH = _K3_EXPERTS_PER_RANK
-K3_PREFILL_EXPERT_RING = _K3_EXPERTS_PER_RANK + 16
+K3_PREFILL_EXPERT_RING = 2 * _K3_EXPERTS_PER_RANK + 16
 
 
 def k3_shard_latent_projections(
