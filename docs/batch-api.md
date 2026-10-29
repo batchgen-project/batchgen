@@ -397,6 +397,12 @@ its KV in Host memory until the session's next turn, `close` or `abort`:
   tokens) the hold is dropped and the turn is prefilled in full. The turn runs
   on the rank that holds its session's KV.
 - **Release.** `close` (either reason) and `abort` free the held KV.
+- **Idle expiry.** A hold whose session has no turn queued or running for
+  `--session-hold-idle-ttl-s` seconds (default 900; 0 = never) is released,
+  for clients that never close. The default is 1.5x the longest tool wait
+  measured on agent evaluation workloads (a 600 s fetch timeout). Each expiry
+  is logged as a warning (`[SESSION_HOLD] idle TTL expired`) and counted under
+  `releases.idle_ttl`.
 - **Never a victim.** Held KV is not a running sequence, so preemption and
   Host-KV eviction never select it. When Host KV runs short, running and
   queued work waits or is evicted as before; held KV is never dropped to make
@@ -411,8 +417,8 @@ and `[SESSION_HOLD] metrics`
 log lines): `held_sessions`, `held_kv_tokens`, `held_kv_pages`, `holds`,
 `resumes`, `reload_tokens`, `reload_ms`, `lcp_histogram`, `drops` (held KV not
 reused, by reason: `lcp_below_page`, `superseded`, `evicted_after_resume`,
-`cancelled`), `releases` (`closed`, `aborted`),
-`admission_waits_on_held_kv`, `evictions_while_held`.
+`cancelled`, `pressure_lru`), `releases` (`closed`, `aborted`, `idle_ttl`),
+`admission_waits_on_held_kv`, `evictions_while_held`, `idle_ttl_s`.
 
 Supported for GPT-OSS on one node with pure DP attention; the server refuses
 the flag together with `--enable-prefix-cache` or on another model.

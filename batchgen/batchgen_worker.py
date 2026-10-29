@@ -1016,6 +1016,9 @@ class BatchGenWorkerArgs:
 	# Agent sessions: a finished /v1/turns turn of an open session keeps its
 	# Host KV for the session's next turn (batchgen.worker.session_hold).
 	enable_session_kv_hold: bool = False
+	# A hold idle this long (no turn of its session in the worker) is released;
+	# 0 = never. Default: session_hold.DEFAULT_IDLE_TTL_S.
+	session_hold_idle_ttl_s: float = session_hold_lib.DEFAULT_IDLE_TTL_S
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -1408,6 +1411,8 @@ class BatchGenWorker:
 		# Owner rank: a hold failure deferred to the next hold record, where
 		# every rank raises it (see _sync_session_hold_owner_errors).
 		self._session_hold_owner_errors = []
+		# Rank 0: last idle-TTL check (time.monotonic()).
+		self._session_hold_ttl_checked_at = 0.0
 		# Every rank: the current wave's resume decisions (until commit), and
 		# each resumed turn's decision (until its completion is reported).
 		self._session_resume_wave = {}
@@ -2033,6 +2038,10 @@ class BatchGenWorker:
 					break
 			except queue_mod.Empty:
 				msg = _NO_MESSAGE
+			# Rank 0's idle-TTL release joins the broadcast like a close.
+			ttl_release = self._session_hold_ttl_message()
+			if ttl_release is not None:
+				messages.append(ttl_release)
 			if messages:
 				msg_data = messages
 				has_new = True
@@ -3321,12 +3330,23 @@ class BatchGenWorker:
 			raise session_hold_lib.SessionHoldUnsupported(
 				"session KV hold cannot run here: " + "; ".join(reasons)
 			)
-		self._session_hold = session_hold_lib.SessionHoldBook(page_tokens=page_tokens)
+		idle_ttl_s = float(getattr(
+			args, "session_hold_idle_ttl_s", session_hold_lib.DEFAULT_IDLE_TTL_S
+		))
+		if idle_ttl_s < 0:
+			raise session_hold_lib.SessionHoldUnsupported(
+				f"session_hold_idle_ttl_s must be >= 0, got {idle_ttl_s}"
+			)
+		self._session_hold = session_hold_lib.SessionHoldBook(
+			page_tokens=page_tokens, idle_ttl_s=idle_ttl_s,
+		)
 		self._session_hold_page_bytes = int(_host_page_bytes_all_layers(host_kv_config))
 		if self.rank == 0:
 			logging.info(
-				"[SESSION_HOLD] enabled: page_tokens=%s host_page_bytes=%s",
+				"[SESSION_HOLD] enabled: page_tokens=%s host_page_bytes=%s "
+				"idle_ttl_s=%s",
 				page_tokens, self._session_hold_page_bytes,
+				idle_ttl_s if idle_ttl_s > 0 else "off",
 			)
 
 	def _session_hold_eligible(self, seq) -> bool:
@@ -3484,6 +3504,7 @@ class BatchGenWorker:
 			kv_tokens=kv_tokens,
 			page_tokens=book.page_tokens,
 			page_ids=page_ids if owner else None,
+			held_at=time.monotonic(),
 		)
 		if owner and len(page_ids) != record.pages:
 			raise session_hold_lib.SessionHoldInvariantError(
@@ -3538,7 +3559,20 @@ class BatchGenWorker:
 			self._free_held_session(record)
 			self._session_hold.note_release(release_reason)
 			changed = True
-			if record.page_ids is not None:
+			if release_reason == session_hold_lib.RELEASE_IDLE_TTL:
+				# Loud: an expired hold means a client never closed its
+				# session, or a tool gap outlived the TTL.
+				if self.rank == 0:
+					logging.warning(
+						"[SESSION_HOLD] idle TTL expired: released session=%s "
+						"traj=%s idle_s=%.1f ttl_s=%s kv_tokens=%d pages=%d "
+						"(idle_ttl releases so far: %d)",
+						session_id, record.traj_id, float(item.get("idle_s", -1.0)),
+						self._session_hold.idle_ttl_s, record.kv_tokens,
+						record.pages,
+						self._session_hold.releases[release_reason],
+					)
+			elif record.page_ids is not None:
 				logging.info(
 					"[SESSION_HOLD] release session=%s reason=%s kv_tokens=%d "
 					"pages=%d rank=%d",
@@ -3547,6 +3581,89 @@ class BatchGenWorker:
 				)
 		if changed:
 			self._publish_session_hold_metrics("release")
+
+	def _sessions_with_live_turns(self) -> set:
+		"""Sessions with a turn queued or running in this worker (replicated)."""
+		return {
+			seq.session_id
+			for seq in self.global_batch.sequences.values()
+			if seq.session_id is not None
+			and seq.status != SequenceStatus.COMPLETED
+		}
+
+	def _session_hold_ttl_message(self):
+		"""Rank 0: a session_control releasing holds idle past the TTL, or None.
+
+		Rank 0 decides (its clock) and the message is broadcast and applied
+		in queue order like a close, so every rank releases the same holds.
+		Checked at most once a second.
+		"""
+		book = self._session_hold
+		if book is None or self.rank != 0 or book.idle_ttl_s <= 0 or not book.sessions:
+			return None
+		now = time.monotonic()
+		if now - self._session_hold_ttl_checked_at < 1.0:
+			return None
+		self._session_hold_ttl_checked_at = now
+		expired = session_hold_lib.expired_holds(
+			book.sessions, now=now, idle_ttl_s=book.idle_ttl_s,
+			busy_sessions=self._sessions_with_live_turns(),
+		)
+		if not expired:
+			return None
+		return {
+			"type": "session_control",
+			"cancel": [],
+			"release": [
+				{
+					"session_id": session_id,
+					"reason": session_hold_lib.RELEASE_IDLE_TTL,
+					"idle_s": round(idle_s, 3),
+				}
+				for session_id, idle_s in expired
+			],
+			"reason": session_hold_lib.RELEASE_IDLE_TTL,
+		}
+
+	def drop_lru_session_holds(
+		self,
+		pages_needed: int,
+		*,
+		reason: str = session_hold_lib.DROP_PRESSURE_LRU,
+	) -> List[str]:
+		"""Every rank: free the least recently held sessions under pressure.
+
+		Hook for the footprint-admission and tool-gap policies (A3 / A4);
+		nothing in this module calls it. It must be called on every rank at
+		the same point (rank-uniform inputs: the replicated book and
+		global_batch), like any hold bookkeeping. Sessions with a turn queued
+		or running are skipped (that turn is about to resume its hold).
+		Frees holds in ``hold_seq`` order until their pages cover
+		``pages_needed`` (all candidates if they cannot), counts each under
+		``drops[reason]`` and returns the released session ids.
+		"""
+		book = self._session_hold
+		if book is None:
+			return []
+		victims = session_hold_lib.lru_hold_victims(
+			book.sessions, pages_needed=int(pages_needed),
+			exclude=self._sessions_with_live_turns(),
+		)
+		freed_pages = 0
+		for session_id in victims:
+			record = book.pop(session_id)
+			self._free_held_session(record)
+			book.note_drop(reason)
+			freed_pages += record.pages
+		if victims:
+			if self.rank == 0:
+				logging.warning(
+					"[SESSION_HOLD] LRU drop (%s): released %d session(s), %d "
+					"Host pages for a need of %d: %s",
+					reason, len(victims), freed_pages, int(pages_needed), victims,
+				)
+			self._publish_session_hold_metrics("lru_drop")
+		return victims
 
 	def _cancel_request(self, request_id: str, reason: Optional[str]) -> None:
 		"""Every rank: per-request cancel (an aborted turn)."""
@@ -10200,6 +10317,16 @@ class BatchGenWorker:
 							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 					except queue_mod.Empty:
+						# Idle: a hold may have outlived the TTL. The release
+						# is broadcast like a received session_control.
+						ttl_release = self._session_hold_ttl_message()
+						if ttl_release is not None:
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+							container = [ttl_release]
+							dist.broadcast_object_list(container, src=0)
+							self._apply_worker_messages([ttl_release])
+							continue
 						# No work arrived, broadcast no-work to other ranks
 						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 						dist.broadcast(status, src=0)

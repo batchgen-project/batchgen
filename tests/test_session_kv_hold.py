@@ -274,7 +274,8 @@ _METHOD_NAMES = [
     "_publish_session_hold_metrics", "_note_session_evictions", "_owns_host_kv",
     "_decode_attn_tp_size", "_drop_unstarted_request", "_prefix_states_in_use",
     "_select_sequences_for_onhold", "_apply_worker_messages", "_poll_admissions",
-    "_sync_session_hold_owner_errors",
+    "_sync_session_hold_owner_errors", "_session_hold_ttl_message",
+    "_sessions_with_live_turns", "drop_lru_session_holds",
 ]
 
 
@@ -337,6 +338,7 @@ class _Worker:
         self._session_resumed_uuids = set()
         self._cancelled_request_ids = set()
         self._session_hold_owner_errors = []
+        self._session_hold_ttl_checked_at = 0.0
         self._session_resume_wave = {}
         self._session_resume_plans = {}
         self._session_reload_seconds = {}
@@ -729,3 +731,117 @@ def test_a_hold_record_costs_one_flag_all_reduce_when_nothing_failed():
     worker, _, _ = _held_worker()
     assert _Dist.all_reduces == before + 1
     assert worker._session_hold.get("s1") is not None
+
+
+# --------------------------------------------------------------------------- #
+#  Idle TTL and the LRU drop hook
+# --------------------------------------------------------------------------- #
+
+
+def _record(session, seq_no, pages, held_at=0.0):
+    record = HeldSession(session, "t", f"r-{session}", 0, seq_no, pages * PAGE, PAGE)
+    record.hold_seq, record.held_at = seq_no, held_at
+    return record
+
+
+def test_expired_holds_are_idle_past_the_ttl_and_not_busy():
+    sessions = {s: _record(s, i, 1, held_at=t) for i, (s, t) in
+                enumerate([("old", 0.0), ("busy", 0.0), ("new", 950.0), ("mid", 50.0)])}
+    expired = session_hold_lib.expired_holds(
+        sessions, now=1000.0, idle_ttl_s=900.0, busy_sessions={"busy"})
+    assert expired == [("old", 1000.0), ("mid", 950.0)]
+    assert session_hold_lib.expired_holds(
+        sessions, now=1e9, idle_ttl_s=0, busy_sessions=set()) == []
+
+
+def test_lru_victims_cover_the_need_oldest_hold_first():
+    sessions = {"a": _record("a", 3, 4), "b": _record("b", 1, 2),
+                "c": _record("c", 2, 5), "live": _record("live", 0, 9)}
+    victims = session_hold_lib.lru_hold_victims
+    assert victims(sessions, pages_needed=6, exclude={"live"}) == ["b", "c"]
+    assert victims(sessions, pages_needed=2, exclude={"live"}) == ["b"]
+    assert victims(sessions, pages_needed=100, exclude={"live"}) == ["b", "c", "a"]
+    assert victims(sessions, pages_needed=0) == []
+
+
+def test_book_numbers_holds_in_order_and_reports_the_ttl():
+    book = SessionHoldBook(page_tokens=PAGE, idle_ttl_s=60.0)
+    first, second = _record("a", 0, 1), _record("b", 0, 1)
+    book.add(first)
+    book.add(second)
+    assert (first.hold_seq, second.hold_seq) == (1, 2)
+    assert book.snapshot()["idle_ttl_s"] == 60.0
+    assert session_hold_lib.DEFAULT_IDLE_TTL_S == 900.0
+
+
+def test_an_idle_hold_past_the_ttl_is_released_and_counted(caplog):
+    worker, prompt, _ = _held_worker()
+    worker._session_hold.idle_ttl_s = 900.0
+    record = worker._session_hold.get("s1")
+    record.held_at = time.monotonic() - 901.0
+    # A turn of another session in the worker does not keep s1 busy.
+    worker.add_seq("other", 30, [1, 2, 3], session="s2")
+    msg = worker._session_hold_ttl_message()
+    assert msg["type"] == "session_control" and msg["cancel"] == []
+    assert [item["session_id"] for item in msg["release"]] == ["s1"]
+    assert msg["release"][0]["reason"] == "idle_ttl"
+    assert msg["release"][0]["idle_s"] >= 901.0
+    # Checked at most once a second.
+    assert worker._session_hold_ttl_message() is None
+    with caplog.at_level(logging.WARNING):
+        worker._apply_session_control(msg)
+    assert worker._session_hold.get("s1") is None
+    assert worker.host.resident() == []
+    snap = worker._session_hold.snapshot()
+    assert snap["releases"] == {"idle_ttl": 1} and snap["held_kv_pages"] == 0
+    assert "idle TTL expired: released session=s1" in caplog.text
+
+
+def test_a_hold_whose_next_turn_is_in_the_worker_does_not_expire():
+    worker, prompt, _ = _held_worker()
+    worker._session_hold.get("s1").held_at = time.monotonic() - 10_000.0
+    worker.add_seq("turn2", 8, prompt + [1] * 10)      # queued, same session
+    assert worker._session_hold_ttl_message() is None
+    worker._session_hold_ttl_checked_at = 0.0
+    worker._session_hold.idle_ttl_s = 0                 # TTL off
+    worker.global_batch.remove_sequence("turn2")
+    assert worker._session_hold_ttl_message() is None
+
+
+def test_only_rank_zero_decides_an_expiry():
+    worker, _, _ = _held_worker(rank=1)
+    worker._session_hold.get("s1").held_at = time.monotonic() - 10_000.0
+    assert worker._session_hold_ttl_message() is None
+
+
+def test_the_poll_broadcasts_a_ttl_release_with_the_queue_messages():
+    worker, _, _ = _held_worker()
+    worker._session_hold.get("s1").held_at = time.monotonic() - 10_000.0
+    worker._admission_queue = queue.Queue()
+    worker._admission_queue.put({"type": "admit", "entries": ["a"]})
+    assert worker._poll_admissions() is True
+    assert worker._session_hold.get("s1") is None
+    assert worker._session_hold.snapshot()["releases"] == {"idle_ttl": 1}
+    assert [m["entries"] for m in worker.admitted_messages] == [["a"]]
+
+
+def test_lru_drop_hook_frees_the_oldest_idle_holds_on_every_rank():
+    for rank in (0, 1):
+        worker = _Worker(rank=rank)
+        for index, (uuid, session) in enumerate(
+                [("t1", "s1"), ("t2", "s2"), ("t3", "s3")]):
+            seq = worker.add_seq(uuid, 10 + index, list(range(100)),
+                                 session=session, status=(
+                SequenceStatus.IN_PREFILL, SequenceStatus.PREFILLED,
+                SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED))
+            seq.current_context_length = 130                 # 129 KV -> 3 pages
+            if rank == 0:
+                worker.host.allocate(10 + index, 3)
+            _hold(worker, seq)
+        worker.add_seq("next1", 20, list(range(10)), session="s1")  # s1 is live
+        dropped = worker.drop_lru_session_holds(4)
+        assert dropped == ["s2", "s3"]
+        assert set(worker._session_hold.sessions) == {"s1"}
+        assert worker._session_hold.snapshot()["drops"] == {"pressure_lru": 2}
+        if rank == 0:
+            assert len(worker.host.resident()) == 3

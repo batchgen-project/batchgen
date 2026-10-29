@@ -42,6 +42,7 @@ from batchgen.server.restart_coordinator import RestartCoordinator
 from batchgen.server.server_args import (
     ServerArgs,
     parse_host_port,
+    resolve_session_hold_idle_ttl_s,
     validate_shared_runtime_capability,
 )
 from batchgen.utils import config_torch_module_initializer
@@ -1597,6 +1598,7 @@ class WorkerManager:
             enable_prefix_cache=self.args.enable_prefix_cache,
             prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
             enable_session_kv_hold=self.args.enable_session_kv_hold,
+            session_hold_idle_ttl_s=resolve_session_hold_idle_ttl_s(self.args),
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,

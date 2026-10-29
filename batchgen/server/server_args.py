@@ -102,6 +102,14 @@ def _launch_converted_ckpt_dir(args: "ServerArgs") -> Optional[Path]:
     return None
 
 
+def resolve_session_hold_idle_ttl_s(args: "ServerArgs") -> float:
+    """The idle TTL the worker uses: the flag, or the default when unset."""
+    from batchgen.worker.session_hold import DEFAULT_IDLE_TTL_S
+
+    ttl = getattr(args, "session_hold_idle_ttl_s", None)
+    return DEFAULT_IDLE_TTL_S if ttl is None else float(ttl)
+
+
 def validate_session_kv_hold_args(args: "ServerArgs") -> None:
     """Refuse --enable-session-kv-hold where the worker cannot serve it.
 
@@ -112,6 +120,9 @@ def validate_session_kv_hold_args(args: "ServerArgs") -> None:
     from batchgen.prefix_reuse.config import require_session_hold_model_support
 
     reasons = []
+    ttl = args.session_hold_idle_ttl_s
+    if ttl is not None and not float(ttl) >= 0:
+        reasons.append(f"--session-hold-idle-ttl-s={ttl} must be >= 0")
     if args.enable_prefix_cache:
         reasons.append("--enable-prefix-cache is also set")
     try:
@@ -240,6 +251,10 @@ class ServerArgs:
     # /v1/turns: a finished turn of an open session keeps its Host KV for the
     # session's next turn (GPT-OSS, one node, prefix cache off).
     enable_session_kv_hold: bool = False
+    # Held KV idle this long (no turn of its session in the worker) is
+    # released; 0 = never. None = the default (session_hold.DEFAULT_IDLE_TTL_S)
+    # when the hold is on; refused without it.
+    session_hold_idle_ttl_s: Optional[float] = None
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -483,6 +498,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "turn, close or abort; the next turn prefills only the suffix past "
             "its longest common prefix with the held tokens (GPT-OSS, one "
             "node, not with --enable-prefix-cache)"
+        ),
+    )
+    parser.add_argument(
+        "--session-hold-idle-ttl-s",
+        type=float,
+        default=None,
+        help=(
+            "With --enable-session-kv-hold: release a session's held KV once "
+            "it has been idle this many seconds (no turn of the session queued "
+            "or running), for sessions that are never closed. 0 = never. "
+            "Default 900 s, 1.5x the longest tool wait measured on agent eval "
+            "workloads (a 600 s fetch timeout)"
         ),
     )
     parser.add_argument(
@@ -854,6 +881,10 @@ def validate_server_args(args: ServerArgs) -> None:
     )
     if args.enable_session_kv_hold:
         validate_session_kv_hold_args(args)
+    elif args.session_hold_idle_ttl_s is not None:
+        raise ValueError(
+            "--session-hold-idle-ttl-s needs --enable-session-kv-hold"
+        )
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         _validate_distributed_weight_source(args)
@@ -1025,6 +1056,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
         enable_session_kv_hold=parsed.enable_session_kv_hold,
+        session_hold_idle_ttl_s=parsed.session_hold_idle_ttl_s,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,

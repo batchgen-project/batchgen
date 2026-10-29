@@ -15,7 +15,13 @@ does not free its KV:
              KV is reused: the held pages up to the LCP become the new turn's
              attached prefix pages, the pages past it are freed, and only the
              suffix is prefilled (the GPT-OSS prefix-hit path);
-* release -- close_session / abort frees the held pages and the slot.
+* release -- close_session / abort frees the held pages and the slot;
+* expire  -- a hold idle longer than ``--session-hold-idle-ttl-s`` (no turn
+             of its session queued or running) is released by rank 0's
+             decision, broadcast like a close (abandoned sessions);
+* LRU drop -- ``lru_hold_victims`` picks the least recently held sessions to
+             free under pressure; the worker exposes it as a hook for the
+             admission / tool-gap policies and calls it on no policy itself.
 
 Held KV is never a sequence in ``global_batch``, so no victim selector (ON_HOLD,
 EVICTED, Host growth eviction) can see it, and the prefix cache does not index
@@ -41,6 +47,20 @@ DROP_LCP_BELOW_PAGE = "lcp_below_page"
 DROP_SUPERSEDED = "superseded"
 DROP_EVICTED_AFTER_RESUME = "evicted_after_resume"
 DROP_CANCELLED = "cancelled"
+# Freed by the LRU drop hook under memory pressure (caller-named reason).
+DROP_PRESSURE_LRU = "pressure_lru"
+
+# Release reason of a hold idle longer than the TTL.
+RELEASE_IDLE_TTL = "idle_ttl"
+
+# Default --session-hold-idle-ttl-s. The 2026-10-26 eval-workload census
+# measured agent tool gaps (a turn's end to the session's next turn): over
+# all tools p50 0.9-4.2 s, p90 20-30 s, p99 106-423 s; the slowest tool,
+# WebFetch, has p90 308-337 s and p99 ~600 s, which is its timeout cap -- the
+# longest wait a live session showed. 900 s is 1.5x that cap, so a live
+# session is not expired in practice, while an abandoned one (a client that
+# never closes) frees its KV within 15 minutes.
+DEFAULT_IDLE_TTL_S = 900.0
 
 # Upper bounds (tokens) of the LCP histogram buckets; the last bucket is open.
 LCP_BUCKET_BOUNDS = (64, 1024, 4096, 16384, 32768, 65536, 131072)
@@ -75,6 +95,12 @@ class HeldSession:
     page_tokens: int
     # Owner rank only: the resident Host pages, in token order.
     page_ids: Optional[Tuple[int, ...]] = None
+    # Order of the hold among all holds (SessionHoldBook.add); rank-uniform,
+    # so it orders LRU victims identically on every rank.
+    hold_seq: int = 0
+    # time.monotonic() when the hold was recorded. Rank-local: only rank 0
+    # reads it, to decide an idle-TTL release it then broadcasts.
+    held_at: float = 0.0
 
     @property
     def pages(self) -> int:
@@ -208,6 +234,8 @@ class SessionHoldBook:
     )
     admission_waits: int = 0
     evictions_while_held: int = 0
+    # --session-hold-idle-ttl-s; 0 = holds never expire.
+    idle_ttl_s: float = DEFAULT_IDLE_TTL_S
 
     def get(self, session_id: Optional[str]) -> Optional[HeldSession]:
         if session_id is None:
@@ -223,6 +251,7 @@ class SessionHoldBook:
         previous = self.sessions.get(record.session_id)
         self.sessions[record.session_id] = record
         self.holds += 1
+        record.hold_seq = self.holds
         return previous
 
     def pop(self, session_id: str) -> Optional[HeldSession]:
@@ -273,7 +302,61 @@ class SessionHoldBook:
             "releases": dict(sorted(self.releases.items())),
             "admission_waits_on_held_kv": self.admission_waits,
             "evictions_while_held": self.evictions_while_held,
+            "idle_ttl_s": self.idle_ttl_s,
         }
+
+
+def expired_holds(
+    sessions: Mapping[str, HeldSession],
+    *,
+    now: float,
+    idle_ttl_s: float,
+    busy_sessions,
+) -> List[Tuple[str, float]]:
+    """(session, idle seconds) of holds idle longer than the TTL, oldest first.
+
+    A session with a turn queued or running in the worker is not idle (that
+    turn resumes the hold). ``idle_ttl_s <= 0`` disables expiry.
+    """
+    if idle_ttl_s <= 0:
+        return []
+    expired = [
+        (session_id, now - record.held_at)
+        for session_id, record in sessions.items()
+        if session_id not in busy_sessions
+        and now - record.held_at >= idle_ttl_s
+    ]
+    expired.sort(key=lambda item: (-item[1], item[0]))
+    return expired
+
+
+def lru_hold_victims(
+    sessions: Mapping[str, HeldSession],
+    *,
+    pages_needed: int,
+    exclude=(),
+) -> List[str]:
+    """Least recently held sessions whose pages together cover ``pages_needed``.
+
+    Ordered by ``hold_seq`` (rank-uniform), so every rank picks the same
+    victims. Returns every candidate when they cannot cover the need, and
+    nothing for a need <= 0.
+    """
+    if pages_needed <= 0:
+        return []
+    candidates = sorted(
+        (record for record in sessions.values()
+         if record.session_id not in exclude),
+        key=lambda record: record.hold_seq,
+    )
+    victims: List[str] = []
+    freed = 0
+    for record in candidates:
+        if freed >= pages_needed:
+            break
+        victims.append(record.session_id)
+        freed += record.pages
+    return victims
 
 
 def _lcp_bucket(lcp_tokens: int) -> int:
