@@ -1831,21 +1831,33 @@ class GPUPagedKVCacheManager:
 							print(f"[GPU KV WRITE L0] V head0 MISMATCH at dim {i}: written={w}, read={r}")
 							break
 
+	def get_layer_kv_cache(
+		self, layer_idx: int
+	) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+		"""Return one layer's K/V cache tensors, without the active page table.
+
+		The cache tensors exist from ``initialize`` on, at fixed addresses,
+		whether or not this rank holds any sequence. A CUDA graph that brings
+		its own static page table (the GPT-OSS whole-model decode graph) needs
+		only these, and must capture on a rank that has never built an active
+		page table.
+		"""
+		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		return (
+			self._k_cache[layer_idx],
+			None if self._v_cache is None else self._v_cache[layer_idx],
+		)
+
 	def get_layer_kv_with_page_table(
 		self, layer_idx: int
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
 		"""Returns layer tensors alongside a placeholder for the page table."""
 		self._ensure_initialized()
-		layer_idx = self.resolve_physical_layer(layer_idx)
-		gpu_table = None
-		mgr = self._gpu_page_table_manager
-		gpu_table = mgr.gpu_table
+		gpu_table = self._gpu_page_table_manager.gpu_table
 		if gpu_table is not None:
-			return (
-				self._k_cache[layer_idx],
-				None if self._v_cache is None else self._v_cache[layer_idx],
-				gpu_table,
-			)
+			k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+			return (k_cache, v_cache, gpu_table)
 		else:
 			raise RuntimeError(
 				"get_layer_kv_with_page_table: GPU page table is not initialized; "

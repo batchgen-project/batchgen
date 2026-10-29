@@ -206,6 +206,10 @@ from batchgen.query_book import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.cuda_graph_flag_policy import (
+	cli_enables_whole_model_graph,
+	require_cuda_graph_flag_supported,
+)
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
 	glm5_dsa_cuda_graph_requested_for_model,
@@ -4781,7 +4785,13 @@ class BatchGenWorker:
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
 
-		# Set CUDA graph config from command-line args
+		# Set CUDA graph config from command-line args. --enable-cuda-graph on a
+		# model with no flag-driven graph path raises (validate_server_args
+		# rejects it first, before any worker starts).
+		require_cuda_graph_flag_supported(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
 		if self.args.disable_cuda_graphs:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
@@ -4795,13 +4805,13 @@ class BatchGenWorker:
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
-		elif (
-			is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
-			and getattr(self.args, "enable_cuda_graph", False)
+		elif cli_enables_whole_model_graph(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 		):
-			# K2.5 whole-model decode graph (cuda-graph adapter). The config flag
-			# defaults off; --enable-cuda-graph flips it on (mirrors GLM-5's
-			# force-enable) so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
+			# K2.5 (cuda-graph adapter) and GPT-OSS-120B whole-model decode
+			# graphs. The config flag defaults off; --enable-cuda-graph flips it
+			# on so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
@@ -19681,31 +19691,27 @@ class BatchGenWorker:
 								time.perf_counter() - _glm5_replay_start
 							) * 1000.0
 					else:
-						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
-						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
-						if slot_indices_tensor is None:
-							# Rebuild may have cleared it; reconstruct as simple arange
-							slot_indices_tensor = torch.arange(
-								page_table_tensor.shape[0], dtype=torch.int32,
-								device=self.torch_device,
-							)
-						# Page table may have fewer columns than the static buffer
-						# (gpu_table gets rebuilt with varying max_pages_per_sequence).
-						# Pad to match the captured spec width.
-						wm_max_pages = self._whole_model_segment.max_pages_per_seq
-						pt_slice = page_table_tensor[:batch_size]
-						if pt_slice.shape[1] < wm_max_pages:
-							pt_slice = torch.nn.functional.pad(
-								pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
-							)
-						elif pt_slice.shape[1] > wm_max_pages:
-							pt_slice = pt_slice[:, :wm_max_pages]
+						# A rank with no decode rows (it may never have built an
+						# active page table) passes zero-row inputs and replays
+						# the same bucket as an all-padding batch, so the in-graph
+						# MoE collectives still line up across ranks.
+						from batchgen.models.openai.gpt_oss_120b.whole_model_graph_inputs import (
+							whole_model_replay_page_inputs,
+						)
+						_pt_mgr = gpu_manager._gpu_page_table_manager
+						pt_slice, slot_slice = whole_model_replay_page_inputs(
+							active_page_table=_pt_mgr.gpu_table,
+							slot_index_tensor=_pt_mgr._slot_index_tensor,
+							batch_size=batch_size,
+							max_pages_per_seq=self._whole_model_segment.max_pages_per_seq,
+							device=self.torch_device,
+						)
 						graph_out = self._cuda_graph_manager.replay(
 							"whole_model", bucket,
 							input_ids=new_tokens,
 							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
 							page_table=pt_slice,
-							slot_indices=slot_indices_tensor[:batch_size],
+							slot_indices=slot_slice,
 						)
 
 					logits = graph_out["logits"][:batch_size]
