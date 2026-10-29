@@ -75,57 +75,6 @@ namespace fs = std::filesystem;
 // as a parameter.
 constexpr char kShmLoggerName[] = "Server";
 
-bool check_hugepage_availability(
-    const std::shared_ptr<spdlog::logger>& logger, int64_t required_size) {
-    std::ifstream meminfo("/proc/meminfo");
-    if (!meminfo) {
-        logger->error("Failed to open /proc/meminfo");
-        return false;
-    }
-    
-    std::string line;
-    long hugepage_size = 0, hugepages_free = 0, hugepages_total = 0;
-    
-    while (std::getline(meminfo, line)) {
-        if (line.find("Hugepagesize:") == 0) {
-            std::istringstream iss(line);
-            std::string key, value, unit;
-            iss >> key >> value >> unit;
-            hugepage_size = std::stol(value) * 1024; // Convert KB to bytes
-        } else if (line.find("HugePages_Free:") == 0) {
-            std::istringstream iss(line);
-            std::string key, value;
-            iss >> key >> value;
-            hugepages_free = std::stol(value);
-        } else if (line.find("HugePages_Total:") == 0) {
-            std::istringstream iss(line);
-            std::string key, value;
-            iss >> key >> value;
-            hugepages_total = std::stol(value);
-        }
-    }
-    
-    long available_bytes = hugepages_free * hugepage_size;
-    long total_bytes = hugepages_total * hugepage_size;
-    
-    logger->info("Huge page status: size={}MB, total={} ({}GB), free={} ({}GB), required={}GB",
-                 hugepage_size / (1024*1024),
-                 hugepages_total, total_bytes / (1024*1024*1024),
-                 hugepages_free, available_bytes / (1024*1024*1024),
-                 required_size / (1024*1024*1024));
-    
-    if (available_bytes < required_size) {
-        long required_pages = (required_size + hugepage_size - 1) / hugepage_size;
-        logger->warn("Insufficient huge pages: need {} pages, only {} available. "
-                     "Consider: echo {} > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages",
-                     required_pages, hugepages_free, 
-                     hugepages_total + required_pages - hugepages_free);
-        return false;
-    }
-    
-    return true;
-}
-
 // Global for signal handling during page touch
 thread_local sigjmp_buf g_page_touch_jmpbuf;
 thread_local volatile bool g_in_page_touch = false;
@@ -194,17 +143,6 @@ static void advise_transparent_huge_pages(
             "system THP setting",
             strerror(errno));
     }
-}
-
-// Helper function to execute system command
-int execute_command(const std::shared_ptr<spdlog::logger>& logger,
-                    const std::string& cmd) {
-    int ret = system(cmd.c_str());
-    if (ret == -1) {
-        logger->error("Failed to execute command: {}", cmd);
-        return -1;
-    }
-    return WEXITSTATUS(ret);
 }
 
 // Helper function for page touching with signal handling
@@ -616,34 +554,6 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
     if (out_mapped_size) *out_mapped_size = allocated_size;
 
     return ptr;
-}
-
-
-// Helper function to verify NUMA allocation
-void verify_numa_allocation(const std::shared_ptr<spdlog::logger>& logger, void* ptr, size_t size) {
-    if (numa_available() < 0) {
-        logger->warn("NUMA not available for verification");
-        return;
-    }
-
-    // Check a few sample pages
-    long page_size = sysconf(_SC_PAGESIZE);
-    int num_samples = std::min(10L, (long)(size / page_size));
-    
-    logger->debug("Verifying NUMA allocation for {} sample pages", num_samples);
-    
-    for (int i = 0; i < num_samples; i++) {
-        void* page_addr = (char*)ptr + (i * size / num_samples);
-        int node = -1;
-        
-        if (get_mempolicy(&node, nullptr, 0, page_addr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
-            logger->debug("Page at offset {} is on NUMA node {}",
-                          i * size / num_samples, node);
-        } else {
-            logger->error("get_mempolicy failed at offset {}: {}",
-                          i * size / num_samples, strerror(errno));
-        }
-    }
 }
 
 
