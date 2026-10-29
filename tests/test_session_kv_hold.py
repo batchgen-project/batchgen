@@ -613,3 +613,11 @@ def test_poll_applies_control_messages_without_using_up_the_admit():
     worker._admission_queue.put({"type": "session_control", "cancel": [], "release": []})
     assert worker._poll_admissions() is False
     assert len(applied) == 3
+
+
+def test_session_hold_model_support_is_decided_by_the_prefix_reuse_config():
+    from batchgen.prefix_reuse.config import require_session_hold_model_support
+
+    assert require_session_hold_model_support("openai/gpt-oss-120b")
+    with pytest.raises(ValueError, match="GPT-OSS only"):
+        require_session_hold_model_support("moonshotai/Kimi-K2-Instruct")

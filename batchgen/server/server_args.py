@@ -109,14 +109,15 @@ def validate_session_kv_hold_args(args: "ServerArgs") -> None:
     keeps them in one node's Host region, and cannot share pages with the
     prefix cache yet (the worker re-checks the rest at startup).
     """
-    from batchgen.config.model_registry import _detect_model_type_from_identifier
+    from batchgen.prefix_reuse.config import require_session_hold_model_support
 
     reasons = []
     if args.enable_prefix_cache:
         reasons.append("--enable-prefix-cache is also set")
-    model_type = _detect_model_type_from_identifier(str(args.model).strip())
-    if model_type != "gpt_oss":
-        reasons.append(f"model type {model_type!r} is not GPT-OSS")
+    try:
+        require_session_hold_model_support(args.model)
+    except ValueError as exc:
+        reasons.append(str(exc))
     if int(args.nnodes) != 1:
         reasons.append(f"--nnodes={args.nnodes}; held KV lives in one node's Host region")
     if reasons:

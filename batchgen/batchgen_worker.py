@@ -3283,8 +3283,10 @@ class BatchGenWorker:
 
 	def _init_session_hold(self, args, host_kv_config) -> None:
 		"""Refuse an unsupported configuration by name, then create the book."""
-		from batchgen.config.model_registry import _detect_model_type_from_identifier
-		from batchgen.prefix_reuse.config import _host_page_bytes_all_layers
+		from batchgen.prefix_reuse.config import (
+			_host_page_bytes_all_layers,
+			require_session_hold_model_support,
+		)
 
 		reasons = []
 		if self.enable_prefix_cache:
@@ -3292,12 +3294,10 @@ class BatchGenWorker:
 				"--enable-prefix-cache is on: the prefix cache takes ownership of "
 				"committed prompt pages, which a hold cannot keep yet"
 			)
-		model_type = _detect_model_type_from_identifier(str(args.model_name).strip())
-		if model_type != "gpt_oss":
-			reasons.append(
-				f"model type {model_type!r} has no suffix prefill over held "
-				"pages (GPT-OSS only)"
-			)
+		try:
+			require_session_hold_model_support(args.model_name)
+		except ValueError as exc:
+			reasons.append(str(exc))
 		if not self.enable_prepack:
 			reasons.append("prepacked prefill is off")
 		if int(self.world_size) != int(self.local_world_size):
