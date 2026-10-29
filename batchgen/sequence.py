@@ -111,6 +111,12 @@ class SequenceEntry:
         'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
         'sampling_params',       # Per-request sampling params for this sequence
         'ignore_eos',            # Per-request: EOS/stop tokens do not end the sequence
+        # Agent-session identity of a /v1/turns request (None for batch work)
+        'traj_id',
+        'session_id',
+        'parent_session_id',
+        'admitted_at',           # Wall-clock time the worker admitted the request
+        'prefix_cached_tokens',  # Prompt tokens the last prefill took from cache
         # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
         '_lifespan_log',   # List[SeqEventRecord], ring buffer
         '_lifespan_idx',   # int, next write position
@@ -189,6 +195,11 @@ class SequenceEntry:
         self.priority: int = 0  # 0=NORMAL, 1=HIGH
         self.sampling_params: Optional[Dict] = None
         self.ignore_eos: bool = False
+        self.traj_id: Optional[str] = None
+        self.session_id: Optional[str] = None
+        self.parent_session_id: Optional[str] = None
+        self.admitted_at: Optional[float] = None
+        self.prefix_cached_tokens: int = 0
 
         # Lifespan monitoring
         self._lifespan_log: list = []

@@ -20,7 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / "batchgen" / "server" / "batch_scheduler.py"
 
 
-WRITER_METHODS = ("_write_pool_completion", "_append_pool_result_item")
+WRITER_METHODS = (
+    "_write_pool_completion", "_append_pool_result_item", "_chat_completion_body",
+)
 
 
 def _isolated_write_pool_completion():
