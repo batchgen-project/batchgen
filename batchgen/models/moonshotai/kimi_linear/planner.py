@@ -118,20 +118,19 @@ _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
 # world32 + replicated latent projections 9.5 GiB + vocab 3.84 GiB +
 # dense/KDA/skeleton ~15 GiB), which funded only the fail-safe 4-slot plan
 # and degraded a 512-request batch into 16-wide decode waves with a phase
-# switch per wave. TP8-sharded latent (-8.3 GiB) plus vocab-parallel
-# (-3.84 GiB) bring residency to ~59.6 GiB, leaving ~23 GiB; minus ~2 GiB of
-# graph scratch, the same KV-funded solve as the H200 constants (full length
+# switch per wave. TP8-sharded latent projections (-8.3 GiB) bring the
+# residency to ~63 GiB, leaving ~21 GiB of headroom; minus ~2 GiB of graph
+# scratch, the same KV-funded solve as the H200 constants (full length
 # 4096 tok ~ 110 MB/seq KV + 53.57 MiB/slot = 163.6 MB per sustained
-# sequence) gives S ~= 21/0.164 ~= 128 per node — also an existing decode
-# graph bucket — i.e. 512 sequences resident on a 4-node cluster.
+# sequence) funds S = 128 per node — an existing decode graph bucket —
+# i.e. 512 sequences resident on a 4-node cluster.
 _K3_H20_MIN_MEMORY_BYTES = 80 * _GIB
-_K3_H20_KDA_STATE_SLOTS_VOCAB_SHARDED = 128
-# Latent-only (replicated vocab costs ~3.8 GiB of the headroom back): the
-# same solve gives ~96, which is also the H200 base-tier value and a decode
-# graph bucket. MEASURED 2026-10-29 on the 4-node diagnostic: a 512-request
-# batch prefills in one wave, decode configures once and runs its 1024 steps
-# in a single resident phase.
-_K3_H20_KDA_STATE_SLOTS_SHARDED = 96
+# MEASURED 2026-10-29 on a 4-node deployment, latent-only (replicated vocab):
+# a 512-request batch prefills in one wave, decode configures once and runs a
+# single resident phase at 128 rows/node with 15.5 GiB of driver headroom
+# after configure (PHASE_MEM), so the solve's reserve absorbs the ~3.8 GiB
+# the replicated vocab keeps resident.
+_K3_H20_KDA_STATE_SLOTS_SHARDED = 128
 
 
 def k3_shard_latent_projections(
@@ -226,15 +225,12 @@ def k3_kda_state_slots(
         and memory_bytes >= _K3_H20_MIN_MEMORY_BYTES
         and sharded_latent
     ):
-        # H20 tier: funded only by the sharded layout (see the _K3_H20_*
-        # derivation above); the unsharded H20 footprint cannot hold more
-        # than the fail-safe plan. Latent-only keeps the replicated vocab
-        # (~3.8 GiB back on the residency), so its KV-funded solve lands on
-        # 96 — the same bucket-aligned value as the H200 base tier. The 128
-        # tier engages once vocab-parallel returns to H20
-        # (batchgen-k3-vocab-parallel-h20-corruption).
-        if sharded_vocab:
-            return _K3_H20_KDA_STATE_SLOTS_VOCAB_SHARDED
+        # H20 tier: funded only by the sharded latent layout (see the
+        # _K3_H20_* derivation above); the unsharded H20 footprint cannot
+        # hold more than the fail-safe plan. The measured plan ships
+        # latent-only (vocab-parallel is gated off on H20 until
+        # batchgen-k3-vocab-parallel-h20-corruption is fixed) and the same
+        # slot count holds either way.
         return _K3_H20_KDA_STATE_SLOTS_SHARDED
     return 4
 

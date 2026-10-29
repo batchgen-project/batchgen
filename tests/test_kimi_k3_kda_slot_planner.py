@@ -37,16 +37,16 @@ def test_h20_tp8_unsharded_keeps_four_user_slots():
     ) == 4
 
 
-def test_h20_tp8_sharded_layout_funds_the_wide_tiers():
-    """H20 tier (measured 2026-10-29, 4x8 H20 world32): the sharded layout
-    funds a wide decode plan — 96 slots latent-only (the shipping H20 plan;
-    vocab-parallel corrupts outputs there, sub-project
-    batchgen-k3-vocab-parallel-h20-corruption), 128 once vocab-parallel
-    returns."""
+def test_h20_tp8_sharded_layout_funds_the_wide_tier():
+    """H20 tier (measured 2026-10-29, 4x8 H20 world32): the sharded latent
+    layout funds 128 slots/node, latent-only (vocab-parallel corrupts
+    outputs on this tier — sub-project
+    batchgen-k3-vocab-parallel-h20-corruption — and the slot count holds
+    either way)."""
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=96 * GIB, attention_group_size=8,
         sharded_latent=True,
-    ) == 96
+    ) == 128
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=96 * GIB, attention_group_size=8,
         sharded_latent=True, sharded_vocab=True,
@@ -63,6 +63,29 @@ def test_h20_tp8_sharded_layout_funds_the_wide_tiers():
         gpu_total_memory_bytes=79 * GIB, attention_group_size=8,
         sharded_latent=True, sharded_vocab=True,
     ) == 4
+    # the tier is a memory contract, keyed like the H200 tier: exactly
+    # 80 GiB enters the H20 tier, exactly 120 GiB enters the H200 tier
+    assert k3_kda_state_slots(
+        gpu_total_memory_bytes=80 * GIB, attention_group_size=8,
+        sharded_latent=True,
+    ) == 128
+    assert k3_kda_state_slots(
+        gpu_total_memory_bytes=119 * GIB, attention_group_size=8,
+        sharded_latent=True,
+    ) == 128
+    assert k3_kda_state_slots(
+        gpu_total_memory_bytes=120 * GIB, attention_group_size=8,
+        sharded_latent=True,
+    ) == 160
+
+
+def test_sub_h20_plan_keeps_failsafe_and_eager_decode():
+    config = _plan_k3(79 * GIB)
+    # 4 fail-safe user slots + 1 graph scratch (no prefix-pool reserve)
+    assert config.GPU_Buffer_Config.kda_state_slots == 5
+    assert config.Module_Batching_Config.k3_shard_latent_projections is False
+    assert config.Module_Batching_Config.k3_shard_vocab_parallel is False
+    assert config.Basic_Config.decode_graph_mode != "graph"
 
 
 def test_h200_tp8_sharded_latent_uses_160_user_slots():
@@ -209,18 +232,18 @@ def _plan_k3(gpu_memory_bytes):
     return planner.generate_config(config)
 
 
-def test_h20_plan_funds_96_slots_latent_only_with_graphs():
+def test_h20_plan_funds_128_slots_latent_only_with_graphs():
     config = _plan_k3(96 * GIB)
 
-    # 96 user slots + 1 graph scratch + the prefix-pool segment reserve,
-    # which prefill_sequence_limits holds back so admission sees exactly 96.
+    # 128 user slots + 1 graph scratch + the prefix-pool segment reserve,
+    # which prefill_sequence_limits holds back so admission sees exactly 128.
     assert config.GPU_Buffer_Config.kda_prefix_segment_slots == 16
-    assert config.GPU_Buffer_Config.kda_state_slots == 97 + 16
-    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 96
+    assert config.GPU_Buffer_Config.kda_state_slots == 129 + 16
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 128
     assert config.Basic_Config.decode_graph_buckets == [
-        1, 2, 4, 8, 16, 24, 32, 64, 96,
+        1, 2, 4, 8, 16, 24, 32, 64, 96, 128,
     ]
-    # the 96-row plan takes the whole-model decode graph like H200 (eager
+    # the 128-row plan takes the whole-model decode graph like H200 (eager
     # decode at this width is launch-latency-bound)
     assert config.Basic_Config.decode_graph_mode == "graph"
     # H20 keeps the release-and-stream admission cycle (resident handoff off)
