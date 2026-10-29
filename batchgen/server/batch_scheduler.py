@@ -342,7 +342,8 @@ class BatchScheduler:
     def _mark_generation_live(self) -> None:
         """The current worker generation got its "init": control may flow."""
         with self._control_lock:
-            self._control_queue = self.worker.request_queue
+            # None only if the channels were abandoned meanwhile: not live.
+            self._control_queue = getattr(self.worker, "request_queue", None)
 
     def _mark_generation_down(self) -> None:
         """No generation is serving: session_control is dropped until ready.
@@ -1033,13 +1034,15 @@ class BatchScheduler:
             outcome = "cancelled"
         else:
             outcome = "detached"
-        if not removed:
-            self._detached_turns.add(turn_id)
-            self._send_session_control(cancel=[turn_id], reason=reason)
+        # The waiter is already out of _turn_waiters, so nothing else will
+        # ever resolve it: fail it before anything below can raise.
         if not waiter.future.done():
             waiter.future.set_exception(TurnError(
                 409, "turn_aborted", f"turn {turn_id} was aborted: {reason}",
             ))
+        if not removed:
+            self._detached_turns.add(turn_id)
+            self._send_session_control(cancel=[turn_id], reason=reason)
         logger.info("[TURN] %s cancelled (%s): %s", turn_id, outcome, reason)
         return outcome
 
@@ -1083,12 +1086,22 @@ class BatchScheduler:
         with self._control_lock:
             control_queue = self._control_queue
             if control_queue is not None:
-                control_queue.put({
-                    "type": "session_control",
-                    "cancel": cancel_ids,
-                    "release": list(release or ()),
-                    "reason": reason,
-                })
+                try:
+                    control_queue.put({
+                        "type": "session_control",
+                        "cancel": cancel_ids,
+                        "release": list(release or ()),
+                        "reason": reason,
+                    })
+                except (ValueError, OSError) as exc:
+                    # A closed channel: its generation is being torn down,
+                    # and the restart reconciles what this message asked.
+                    logger.error(
+                        "[TURN] session_control could not be sent (%s: %s): "
+                        "cancel=%s release=%s reason=%s",
+                        type(exc).__name__, exc, cancel_ids, released, reason,
+                    )
+                    return
         if control_queue is None:
             logger.warning(
                 "[TURN] session_control dropped (no live worker generation; "

@@ -480,6 +480,42 @@ def test_worker_main_loop_skips_session_control_before_init():
     assert isinstance(loop.body[guard].body[-1], ast.Continue)
 
 
+class _ClosedQueue:
+    def put(self, item):
+        raise ValueError("Queue is closed")
+
+
+def test_cancel_fails_the_waiter_even_when_the_worker_send_fails(tmp_path):
+    """L1: the waiter leaves _turn_waiters first, so a send that raises must
+    not leave its future pending forever."""
+    async def run():
+        worker = _ns_worker(request_queue=queue.Queue())
+        scheduler = _scheduler(tmp_path, worker, session_hold=True)
+        waiter = scheduler.submit_turn(
+            "turn_a", io_struct.TurnRequest(**_turn_body("s1")), time.time())
+        # Admitted: the drain took it out of the IntakePool.
+        scheduler._intake_pool.remove_batch_entries("turn_a")
+        # The generation's channel closed under the cancel (restart window).
+        scheduler._control_queue = _ClosedQueue()
+        outcome = scheduler.cancel_turn("turn_a", "test")
+        with pytest.raises(TurnError) as info:
+            await asyncio.wait_for(waiter.future, timeout=1.0)
+        return outcome, info.value, scheduler
+
+    outcome, error, scheduler = asyncio.run(run())
+    assert outcome == "cancelled"
+    assert (error.status_code, error.code) == (409, "turn_aborted")
+    assert scheduler._detached_turns == {"turn_a"}
+
+
+def test_a_generation_without_a_request_queue_is_not_live(tmp_path):
+    worker = _ns_worker(request_queue=None)
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler._mark_generation_live()
+    scheduler.release_sessions(["s1"], "closed")   # no AttributeError
+    assert scheduler._control_queue is None
+
+
 def test_cancel_dequeues_a_turn_that_never_reached_a_worker(tmp_path):
     async def run():
         scheduler = _scheduler(tmp_path, _ns_worker())
