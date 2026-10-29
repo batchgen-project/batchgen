@@ -17501,6 +17501,40 @@ class BatchGenWorker:
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
+	# DIAGNOSTIC (knee sweep A0b, branch tairan/gptoss-decode-heartbeat-diag):
+	# period in seconds of the rank-0 ``[DECODE]`` heartbeat, whose fields are
+	# all windowed (tok/s, the CPU step split, the GPU forward-event summary).
+	# The default is the production 30 s. A positive
+	# ``batchgen_debug.decode_heartbeat_s`` or BATCHGEN_DECODE_HEARTBEAT_S
+	# overrides it; a non-positive or unparseable value is a hard error, never
+	# a silent fallback to 30 s, because a measurement would then be recorded
+	# at the wrong window.
+	DECODE_HEARTBEAT_DEFAULT_S = 30.0
+
+	def _decode_heartbeat_interval_s(self) -> float:
+		raw = os.environ.get("BATCHGEN_DECODE_HEARTBEAT_S")
+		source = "BATCHGEN_DECODE_HEARTBEAT_S"
+		if raw is None:
+			debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+			if isinstance(debug, dict):
+				raw = debug.get("decode_heartbeat_s")
+			source = "batchgen_debug.decode_heartbeat_s"
+		if raw is None:
+			return self.DECODE_HEARTBEAT_DEFAULT_S
+		try:
+			seconds = float(raw)
+		except (TypeError, ValueError):
+			raise ValueError(
+				f"{source}={raw!r} is not a number; the decode heartbeat period "
+				"must be a positive number of seconds"
+			)
+		if not seconds > 0.0:
+			raise ValueError(
+				f"{source}={raw!r} must be > 0; the decode heartbeat period "
+				"must be a positive number of seconds"
+			)
+		return seconds
+
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
 			return True
@@ -18916,6 +18950,14 @@ class BatchGenWorker:
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
+		# DIAGNOSTIC (knee sweep A0b): the heartbeat window is also the only
+		# windowed timing record of a decode round, so a short batch produces
+		# no sample at the 30 s default. ``batchgen_debug.decode_heartbeat_s``
+		# (or BATCHGEN_DECODE_HEARTBEAT_S) shortens the window; nothing else
+		# about the heartbeat changes. Resolved once per decode round, never
+		# per step. Not for production: finer windows log more and drain the
+		# sampling-fallback counter more often.
+		_hb_interval = self._decode_heartbeat_interval_s()
 
 		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
 		# this decode round: a hot reload rebinds methods on the live worker,
@@ -18959,7 +19001,7 @@ class BatchGenWorker:
 			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
 			# monitor sees liveness during long decode phases
 			_hb_tokens += len(decode_uuids)
-			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
+			if self.rank == 0 and time.perf_counter() - _hb_last_time >= _hb_interval:
 				_hb_elapsed = time.perf_counter() - _hb_last_time
 				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
 				_split_txt = ""
