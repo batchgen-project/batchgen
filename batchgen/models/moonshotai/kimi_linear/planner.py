@@ -111,21 +111,43 @@ _K3_H200_KDA_STATE_SLOTS_SHARDED = 160
 # funds 256 persistent slots per node: every D512 request in flight from
 # wave 1 (no mid-run waves, long requests admitted at t=0). Slot cost ~36 MB.
 _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
+# H20 tier (MEASURED on the 4x8 H20 world32 diagnostic run, 2026-10-29,
+# sub-project batchgen-k3-h20-decode-residency). H20 is 95.6 GB (~89.0 GiB);
+# at gpu-memory-frac 0.95 the budget is ~84.6 GiB. The unsharded resident
+# decode footprint measured 71.7 GiB/rank (resident expert shard ~42 GiB at
+# world32 + replicated latent projections 9.5 GiB + vocab 3.84 GiB +
+# dense/KDA/skeleton ~15 GiB), which funded only the fail-safe 4-slot plan
+# and degraded a 512-request batch into 16-wide decode waves with a phase
+# switch per wave. TP8-sharded latent projections (-8.3 GiB) bring the
+# residency to ~63 GiB, leaving ~21 GiB of headroom; minus ~2 GiB of graph
+# scratch, the same KV-funded solve as the H200 constants (full length
+# 4096 tok ~ 110 MB/seq KV + 53.57 MiB/slot = 163.6 MB per sustained
+# sequence) funds S = 128 per node — an existing decode graph bucket —
+# i.e. 512 sequences resident on a 4-node cluster.
+_K3_H20_MIN_MEMORY_BYTES = 80 * _GIB
+# MEASURED 2026-10-29 on a 4-node deployment, latent-only (replicated vocab):
+# a 512-request batch prefills in one wave, decode configures once and runs a
+# single resident phase at 128 rows/node with 15.5 GiB of driver headroom
+# after configure (PHASE_MEM), so the solve's reserve absorbs the ~3.8 GiB
+# the replicated vocab keeps resident.
+_K3_H20_KDA_STATE_SLOTS_SHARDED = 128
 
 
 def k3_shard_latent_projections(
     *, gpu_total_memory_bytes: int | None, attention_group_size: int
 ) -> bool:
     """TP-shard routed_expert_down/up_proj across the attention TP group on
-    H200 TP8 (the replicated pair is 9.5 GiB/rank of the 27.6 GiB that
-    competes with the KV pool and KDA slots)."""
+    TP8 topologies (H200 and H20): the replicated pair is 9.5 GiB/rank of
+    the residency that competes with the KV pool and KDA slots. The sharded
+    paths are topology-based (group_size == 8) and H200-validated; on H20
+    they are what funds a usable KDA slot budget at all."""
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")
     return bool(
         group_size == 8
         and gpu_total_memory_bytes is not None
-        and int(gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
+        and int(gpu_total_memory_bytes) >= _K3_H20_MIN_MEMORY_BYTES
     )
 
 
@@ -155,9 +177,11 @@ def k3_kda_state_slots(
     """Return K3's user-visible KDA sequence capacity for this GPU class.
 
     The distributed K3 topology uses TP8 KDA, so each rank stores only 1/8
-    of every sequence's recurrent/conv state (53.57 MiB per slot). H20 keeps
-    the validated four-slot plan. The planner allocates one additional
-    physical item for CUDA-graph scratch.
+    of every sequence's recurrent/conv state (53.57 MiB per slot). H20 with
+    the sharded latent+vocab layout funds 128 slots per node (see the
+    _K3_H20_* constants); unsharded H20 keeps the fail-safe four-slot plan.
+    The planner allocates one additional physical item for CUDA-graph
+    scratch.
 
     H200 budget (2026-09-04). This value IS the per-node decode admission cap,
     so it sets decode concurrency and therefore decode throughput: every step
@@ -196,6 +220,18 @@ def k3_kda_state_slots(
         if sharded_latent:
             return _K3_H200_KDA_STATE_SLOTS_SHARDED
         return _K3_H200_KDA_STATE_SLOTS
+    if (
+        group_size == 8
+        and memory_bytes >= _K3_H20_MIN_MEMORY_BYTES
+        and sharded_latent
+    ):
+        # H20 tier: funded only by the sharded latent layout (see the
+        # _K3_H20_* derivation above); the unsharded H20 footprint cannot
+        # hold more than the fail-safe plan. The measured plan ships
+        # latent-only (vocab-parallel is gated off on H20 until
+        # batchgen-k3-vocab-parallel-h20-corruption is fixed) and the same
+        # slot count holds either way.
+        return _K3_H20_KDA_STATE_SLOTS_SHARDED
     return 4
 
 
@@ -564,8 +600,17 @@ class KimiLinearPlanner(BasePlanner):
             attention_group_size=self.attention_group_size,
         )
         self.config.Module_Batching_Config.k3_shard_latent_projections = shard_latent
-        # slice 2 rides the same gate: vocab-parallel embed_tokens / lm_head
-        self.config.Module_Batching_Config.k3_shard_vocab_parallel = shard_latent
+        # Vocab-parallel embed_tokens / lm_head stays behind the H200 gate:
+        # on the H20 world32 tier it corrupts decode outputs (token soup with
+        # malformed XTML markers; measured 2026-10-29, sub-project
+        # batchgen-k3-vocab-parallel-h20-corruption). The H20 tier therefore
+        # runs latent-only until that seam is fixed.
+        shard_vocab = (
+            shard_latent
+            and self.gpu_total_memory_bytes is not None
+            and int(self.gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
+        )
+        self.config.Module_Batching_Config.k3_shard_vocab_parallel = shard_vocab
         self.config.Module_Batching_Config.k3_deepep_ll = k3_deepep_low_latency(
             sharded_latent=shard_latent, enable_deepep=self.enable_deepep,
         )
@@ -573,7 +618,7 @@ class KimiLinearPlanner(BasePlanner):
             gpu_total_memory_bytes=self.gpu_total_memory_bytes,
             attention_group_size=self.attention_group_size,
             sharded_latent=shard_latent,
-            sharded_vocab=shard_latent,
+            sharded_vocab=shard_vocab,
         )
         self.config.GPU_Buffer_Config.kda_state_slots = (
             sequence_slots + 1
@@ -602,12 +647,14 @@ class KimiLinearPlanner(BasePlanner):
         # of launches + per-layer NCCL), so the long-generation tail of a
         # 512x4096 run cost r20 ~20 min at 72/192 occupancy. Falls back to
         # eager per step when any EP rank is empty. Batch-level override:
-        # batchgen_debug.kimi_decode_graph_mode. H200 TP8 only: the H20
-        # four-slot plan keeps its validated eager path.
+        # batchgen_debug.kimi_decode_graph_mode. TP8 tiers only (H200 and the
+        # sharded H20 plan): the unsharded four-slot plan keeps its validated
+        # eager path, but a 128-row H20 decode would be launch-latency-bound
+        # eager exactly like the H200 measurement above.
         if (
             self.attention_group_size == 8
             and self.gpu_total_memory_bytes is not None
-            and int(self.gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
+            and int(self.gpu_total_memory_bytes) >= _K3_H20_MIN_MEMORY_BYTES
         ):
             self.config.Basic_Config.decode_graph_mode = "graph"
 
