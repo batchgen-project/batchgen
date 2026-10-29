@@ -5,7 +5,7 @@ import uuid
 import pytest
 import torch
 
-from batchgen.models.engine_loader import core_engine as bg
+from batchgen.native_loader import core_engine as bg
 
 
 pytestmark = pytest.mark.skipif(

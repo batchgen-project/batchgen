@@ -25,7 +25,7 @@ import pytest
 
 def _core_engine():
     try:
-        from batchgen.models.engine_loader import core_engine
+        from batchgen.native_loader import core_engine
     except Exception as exc:  # pragma: no cover - depends on the build
         pytest.skip(f"core_engine extension unavailable: {exc}")
     if not hasattr(core_engine, "describe_host_kv_page_geometry"):

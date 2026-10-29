@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
 from batchgen.eventlog.process import native_log_level
-from batchgen.models.engine_loader import core_engine as bg_lib
+from batchgen.native_loader import core_engine as bg_lib
 
 logger = logging.getLogger(__name__)
 

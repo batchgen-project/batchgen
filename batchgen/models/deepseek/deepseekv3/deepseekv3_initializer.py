@@ -38,7 +38,7 @@ try:
 except ImportError:
     # jit compile
     # from core_engine import batchgen as core_engine
-    from batchgen.models.engine_loader import core_engine as loader_module
+    from batchgen.native_loader import core_engine as loader_module
     core_engine = loader_module.batchgen
 
 from typing import Tuple

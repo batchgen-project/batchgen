@@ -1,7 +1,17 @@
-# Preload the pip libucx-cu12 UCX libraries so core_engine's distributed-weight
-# daemon resolves libucp/libuct/libucs/libucm at load time.  A missing or broken
-# UCX runtime is a deployment error; do not silently continue and let a worker
-# discover it after startup.
+"""Native extension load gate for the BatchGen runtime.
+
+Every component that needs ``batchgen.core_engine`` (server, worker, KV cache
+and model packages) imports it through this module, so the native runtime is
+validated once, before any caller touches it:
+
+* the pip ``libucx-cu12`` UCX libraries are preloaded so core_engine's
+  distributed-weight daemon resolves libucp/libuct/libucs/libucm at load time.
+  A missing or broken UCX runtime is a deployment error; do not silently
+  continue and let a worker discover it after startup.
+* ``core_engine`` must be an ahead-of-time built native module; implicit JIT
+  compilation during server startup is refused.
+"""
+
 try:
     import libucx
 

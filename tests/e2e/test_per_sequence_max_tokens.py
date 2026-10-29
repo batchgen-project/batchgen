@@ -26,7 +26,7 @@ _heavy_mods = [
     "batchgen.server.worker_manager",
     "batchgen.core_engine",
     "batchgen.op_builder", "batchgen.op_builder.builder",
-    "batchgen.models.engine_loader",
+    "batchgen.native_loader",
 ]
 for mod in _heavy_mods:
     sys.modules.setdefault(mod, _mock)

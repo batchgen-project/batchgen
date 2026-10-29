@@ -33,7 +33,7 @@ from batchgen.eventlog.process import native_log_level
 try:
     from batchgen.core_engine import Parameter_Server
 except ImportError:
-    from batchgen.models.engine_loader import core_engine  # noqa
+    from batchgen.native_loader import core_engine  # noqa
 
     Parameter_Server = core_engine.Parameter_Server  # noqa
 

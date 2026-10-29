@@ -21,19 +21,15 @@ def _load_coordinator_type():
         name: sys.modules.get(name)
         for name in (
             "batchgen.kv_cache",
-            "batchgen.models",
-            "batchgen.models.engine_loader",
+            "batchgen.native_loader",
         )
     }
     fake_kv = ModuleType("batchgen.kv_cache")
     fake_kv.__path__ = []
-    fake_models = ModuleType("batchgen.models")
-    fake_models.__path__ = []
-    fake_loader = ModuleType("batchgen.models.engine_loader")
+    fake_loader = ModuleType("batchgen.native_loader")
     fake_loader.core_engine = SimpleNamespace()
     sys.modules["batchgen.kv_cache"] = fake_kv
-    sys.modules["batchgen.models"] = fake_models
-    sys.modules["batchgen.models.engine_loader"] = fake_loader
+    sys.modules["batchgen.native_loader"] = fake_loader
     try:
         spec = importlib.util.spec_from_file_location(module_name, source)
         module = importlib.util.module_from_spec(spec)

@@ -18,7 +18,7 @@ if sys.platform != "linux":
     )
 
 try:
-    from batchgen.models.engine_loader import core_engine as bg
+    from batchgen.native_loader import core_engine as bg
 except ImportError:  # compiled extension not built in this environment
     pytest.skip("core_engine extension is unavailable", allow_module_level=True)
 
