@@ -5,7 +5,7 @@ This guide provides step-by-step instructions for deploying OpenAI's GPT-OSS-120
 ## Table of Contents
 
 1. [Download Model Checkpoints](#1-download-model-checkpoints)
-2. [Convert Checkpoints to BatchGen Format](#2-convert-checkpoints-to-batchgen-format)
+2. [Checkpoint Conversion (Automatic on First Launch)](#2-checkpoint-conversion-automatic-on-first-launch)
 3. [Build Docker Container or Install BatchGen](#3-build-docker-container-or-install-batchgen)
 4. [Start BatchGen Server](#4-start-batchgen-server)
 5. [Submit Jobs with Python APIs](#5-submit-jobs-with-python-apis)
@@ -32,25 +32,25 @@ huggingface-cli download openai/gpt-oss-120b \
 
 ---
 
-## 2. Convert Checkpoints to BatchGen Format
+## 2. Checkpoint Conversion (Automatic on First Launch)
 
-BatchGen uses a custom checkpoint format optimized for peak SSD read performance.
+GPT-OSS needs no offline conversion step. On its first launch the server converts
+`original/*.safetensors` into the converted checkpoint directory: `--converted-ckpt-dir`
+if given, else `<--cache-dir>/converted_ckpt`. It writes `layer_0.bin` … `layer_35.bin`,
+`non_layer.bin` (each with a `.json` metadata file) and the marker `.gpt_oss_converted`,
+about 65 GB in total. Later launches find the marker, skip the conversion and load that set.
+To convert again, empty the directory.
 
-```bash
-# Convert all checkpoint files
-python -m batchgen.tools.convert_checkpoint \
-    --input-dir /path/to/models/gpt-oss-120b/original
+The directory must be writable on first launch. The container in step 3 mounts `/models`
+read-only, so step 4 points `--converted-ckpt-dir` at the writable `/storage` mount.
 
-# This creates /path/to/models/gpt-oss-120b/original/converted_ckpt/
-```
-
-### Validate Conversion
-
-```bash
-python -m batchgen.tools.convert_checkpoint \
-    --input-dir /path/to/models/gpt-oss-120b/original \
-    --validate-only
-```
+**Do not run `python -m batchgen.tools.convert_checkpoint` for GPT-OSS.** Its output (one
+`model--0000N-of-00007.bin/.json` pair per source shard, default `<input-dir>/converted_ckpt`)
+is never loaded by GPT-OSS. In the same directory as the server's set it would double the load
+past the weight buffer, so the server refuses such a directory with
+`MixedCheckpointFormatError` before converting or reading anything. If you already ran the
+tool there, move its `model--*-of-*.bin` and `model--*-of-*.json` files out of the directory and
+keep the `layer_*`/`non_layer` set.
 
 ---
 
@@ -111,6 +111,7 @@ too small for them: start the container with `--ipc=host` or a `--shm-size` such
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m batchgen.launch_http_server \
     --model openai/gpt-oss-120b \
     --cache-dir /models/gpt-oss-120b/original \
+    --converted-ckpt-dir /storage/gpt-oss-120b/converted_ckpt \
     --dist-init-addr "localhost:33001" \
     --nnodes 1 \
     --node-rank 0 \
@@ -134,6 +135,7 @@ For other GPU configurations, adjust `CUDA_VISIBLE_DEVICES` and `--world-size`:
 |----------|-------------|
 | `--model` | Model identifier (`openai/gpt-oss-120b`) |
 | `--cache-dir` | Path to downloaded model checkpoints |
+| `--converted-ckpt-dir` | Writable directory the server converts into on first launch (default `<--cache-dir>/converted_ckpt`) |
 | `--world-size` | Number of GPUs |
 | `--dist-init-addr` | Distributed init address (e.g., `localhost:33001`) |
 | `--nnodes` | Number of nodes (always 1 for single-node) |

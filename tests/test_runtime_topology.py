@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 import gc
+import json
 import logging
 import os
 import pickle
@@ -19,6 +20,11 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Optional
 import pytest
+
+from batchgen.models.openai.gpt_oss_120b.converted_ckpt_plan import (
+    check_converted_ckpt_format,
+    plan_converted_ckpt_load,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -167,7 +173,7 @@ def _isolated_class(path: Path, class_name: str, method_names, globals_=None):
     return namespace["Isolated"]
 
 
-def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
+def _gpt_oss_parameter_server(convert_hook, cpp_init_calls, converted_ckpt_dir="/tmp/converted"):
     fake_cpp = SimpleNamespace(
         Init=lambda *args: cpp_init_calls.append(args),
         get_skeleton_state_dict=lambda: {"model.norm.weight": 1},
@@ -189,6 +195,9 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
             ),
             "uuid": uuid,
             "Parameter_Server": lambda *args: fake_cpp,
+            # The load-plan checks Init runs before the C++ loader.
+            "check_converted_ckpt_format": check_converted_ckpt_format,
+            "plan_converted_ckpt_load": plan_converted_ckpt_load,
         },
     )
     server = server_type()
@@ -196,15 +205,32 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     server.tensor_meta_shm_name = None
     server.enable_hugetlbfs = False
     server.enable_thp = False
-    server.converted_ckpt_dir = "/tmp/converted"
+    server.converted_ckpt_dir = converted_ckpt_dir
+    server.num_layers = 36
     server.state_dict_name_map = {}
     server._parse_state_dict = lambda: None
     server._convert_checkpoint = convert_hook
     return server
 
 
-def test_gpt_oss_init_generates_its_own_model_labels():
+def test_gpt_oss_init_generates_its_own_model_labels(tmp_path):
     """Nothing reserves a name any more: both regions are anonymous memfds."""
+    (tmp_path / "non_layer.json").write_text(
+        json.dumps(
+            {
+                "file_name": "non_layer.bin",
+                "state_dict": {
+                    "model.norm.weight": {
+                        "dtype": "bfloat16",
+                        "shape": [8],
+                        "offset": 0,
+                        "byte_size": 16,
+                    }
+                },
+                "total_byte_size": 16,
+            }
+        )
+    )
     converted_with = []
     cpp_init_calls = []
     server = _gpt_oss_parameter_server(
@@ -212,6 +238,7 @@ def test_gpt_oss_init_generates_its_own_model_labels():
             (server.shm_name, server.tensor_meta_shm_name)
         ),
         cpp_init_calls,
+        converted_ckpt_dir=str(tmp_path),
     )
 
     shm_name, tensor_meta_shm_name = server.Init()

@@ -99,5 +99,6 @@ class Parameter_Server {
     void _load_cus_format_file_to_host_mem(
         const std::string& model_weights_path,
         void* weight_ptr,
+        int64_t buffer_bytes,
         std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map);
 };
