@@ -334,6 +334,10 @@ struct Chunk {
     int layer = -1;
     int first_expert = -1;
     int target_worker = -1;
+    // Ring census taken under ring_mutex at the moment this get was posted.
+    int occupied_slots = -1;
+    int ready_unacquired_slots = -1;
+    int leased_slots = -1;
 };
 
 // One ucp_get_nbx, start to publication. POD and fixed size: the fetch path
@@ -362,6 +366,12 @@ struct GetRecord {
     std::int32_t first_expert = -1;
     std::int32_t count = 0;
     std::int32_t target_worker = -1;
+    // Who held the staging ring when this get was posted. With
+    // depth == outstanding * superchunk, in-flight equals the free-slot count,
+    // so these three decide whether posting is gated or the ring is held.
+    std::int32_t occupied_slots = -1;
+    std::int32_t ready_unacquired_slots = -1;
+    std::int32_t leased_slots = -1;
 };
 
 // A worker cohort is one generation of the server's worker pool. The daemon
@@ -565,6 +575,10 @@ struct DistributedWeightDaemon::Impl {
     std::string fetch_trace_path;
     std::vector<GetRecord> fetch_trace;
     std::atomic<std::uint64_t> fetch_trace_next{0};
+    // Posting stalls on the positional slot gate, and how many of those had a
+    // free group elsewhere in the ring. Trace-only; reported in its header.
+    std::atomic<std::uint64_t> gate_stalls{0};
+    std::atomic<std::uint64_t> gate_stalls_free_elsewhere{0};
     Clock::time_point trace_epoch = Clock::now();
     int workers = kDefaultWorkers;
     bool worker_sharded = false;
@@ -1664,6 +1678,9 @@ struct DistributedWeightDaemon::Impl {
         record.first_expert = chunk.first_expert;
         record.count = chunk.count;
         record.target_worker = chunk.target_worker;
+        record.occupied_slots = chunk.occupied_slots;
+        record.ready_unacquired_slots = chunk.ready_unacquired_slots;
+        record.leased_slots = chunk.leased_slots;
         const std::uint64_t index =
             fetch_trace_next.fetch_add(1, std::memory_order_relaxed);
         fetch_trace[index % fetch_trace.size()] = record;
@@ -1691,10 +1708,16 @@ struct DistributedWeightDaemon::Impl {
             << " outstanding=" << outstanding
             << " module_bytes=" << module_bytes
             << " records=" << (written - start)
-            << " dropped_by_wrap=" << start << "\n";
+            << " dropped_by_wrap=" << start
+            << " gate_stalls="
+            << gate_stalls.load(std::memory_order_relaxed)
+            << " gate_stalls_free_elsewhere="
+            << gate_stalls_free_elsewhere.load(std::memory_order_relaxed)
+            << "\n";
         out << "post_ns,submit_ns,done_ns,publish_ns,prev_scan_ns,"
                "first_wait_ns,bytes,rail,owner,layer,first_expert,count,"
-               "target_worker\n";
+               "target_worker,occupied_slots,ready_unacquired_slots,"
+               "leased_slots\n";
         for (std::uint64_t index = start; index < written; ++index) {
             const GetRecord& record = fetch_trace[index % capacity];
             out << record.post_ns << ',' << record.submit_ns << ','
@@ -1702,7 +1725,10 @@ struct DistributedWeightDaemon::Impl {
                 << record.prev_scan_ns << ',' << record.first_wait_ns << ','
                 << record.bytes << ',' << record.rail << ',' << record.owner
                 << ',' << record.layer << ',' << record.first_expert << ','
-                << record.count << ',' << record.target_worker << '\n';
+                << record.count << ',' << record.target_worker << ','
+                << record.occupied_slots << ','
+                << record.ready_unacquired_slots << ','
+                << record.leased_slots << '\n';
         }
         out.flush();
         if (!out) {
@@ -1910,6 +1936,29 @@ struct DistributedWeightDaemon::Impl {
                 {
                     std::lock_guard<std::mutex> lock(ring_mutex);
                     if (!SlotsFree(tail, superchunk)) {
+                        // Posting stops here. Record whether it stopped with a
+                        // free group sitting elsewhere in the ring: that is the
+                        // difference between the positional gate costing
+                        // concurrency and the ring simply being full. Only on
+                        // the break path, so it costs one O(depth) scan per
+                        // stall, never per post.
+                        if (!fetch_trace.empty()) {
+                            bool free_elsewhere = false;
+                            for (int group = 0; group + superchunk <= depth;
+                                 group += superchunk) {
+                                if (group != tail &&
+                                    SlotsFree(group, superchunk)) {
+                                    free_elsewhere = true;
+                                    break;
+                                }
+                            }
+                            gate_stalls.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                            if (free_elsewhere) {
+                                gate_stalls_free_elsewhere.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
                         break;
                     }
                 }
@@ -1951,10 +2000,28 @@ struct DistributedWeightDaemon::Impl {
                         slot.module_key = schedule[next + index];
                         slot.generation = next_generation++;
                     }
+                    // One scan serves three purposes: the staging high-water
+                    // mark, and the trace's split of who holds the ring. The
+                    // split is what decides whether in-flight is low because
+                    // posting is gated or because consumers hold the slots:
+                    // with depth == outstanding * superchunk the two are
+                    // strictly complementary, so the counts are the evidence.
                     int occupied = 0;
+                    int ready_unacquired = 0;
+                    int leased = 0;
                     for (const Slot& slot : slots) {
                         occupied += slot.state != SlotState::kFree;
+                        if (slot.state == SlotState::kReady &&
+                            slot.acquired_mask == 0) {
+                            ++ready_unacquired;
+                        }
+                        if ((slot.acquired_mask & ~slot.released_mask) != 0) {
+                            ++leased;
+                        }
                     }
+                    chunk.occupied_slots = occupied;
+                    chunk.ready_unacquired_slots = ready_unacquired;
+                    chunk.leased_slots = leased;
                     {
                         std::lock_guard<std::mutex> stats_lock(
                             stats_mutex);
