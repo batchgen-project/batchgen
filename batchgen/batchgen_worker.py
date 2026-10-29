@@ -3290,6 +3290,9 @@ class BatchGenWorker:
 		"""
 		from batchgen.sampling import sample_tokens
 
+		if self._any_sequence_batchgen_debug and batch_sequences:
+			self._debug_dump_logit_topk(logits, batch_sequences)
+
 		if residency is not None:
 			if batch_rows is None:
 				raise ValueError(
@@ -3330,6 +3333,62 @@ class BatchGenWorker:
 
 		# No sequence in the batch carries sampling params — greedy decoding.
 		return torch.argmax(logits, dim=-1, keepdim=True)
+
+	def _debug_dump_logit_topk(self, logits: torch.Tensor, batch_sequences: list) -> None:
+		"""Diagnostic: append each selected row's top-k logits to a per-rank file.
+
+		Enabled per request by ``batchgen_debug.logit_topk_dump``:
+		``{"dir": <existing dir>, "k": <int, default 8>, "custom_ids": [..] | omitted for all}``.
+		One JSON line per row per token selection: uuid, per-uuid call index
+		``n`` (0 = the token chosen from the prefill logits), top-k ids and values.
+		Synchronizes the device every call; for diagnosis only.
+		"""
+		rows = []
+		spec = None
+		for row, seq in enumerate(batch_sequences):
+			debug = getattr(seq, "batchgen_debug", None)
+			if not isinstance(debug, dict):
+				continue
+			cfg = debug.get("logit_topk_dump")
+			if not cfg:
+				continue
+			if not isinstance(cfg, dict) or not isinstance(cfg.get("dir"), str):
+				raise ValueError(
+					"batchgen_debug.logit_topk_dump must be "
+					'{"dir": <str>, "k": <int>, "custom_ids": [<str>, ...]}, '
+					f"got {cfg!r}"
+				)
+			wanted = cfg.get("custom_ids")
+			custom_id = str(seq.uuid).split("@", 1)[0]
+			if wanted is not None and custom_id not in wanted:
+				continue
+			rows.append(row)
+			spec = cfg
+		if not rows:
+			return
+		k = int(spec.get("k", 8))
+		row_index = torch.tensor(rows, dtype=torch.long, device=logits.device)
+		selected = logits.index_select(0, row_index)
+		top_vals, top_ids = torch.topk(selected.float(), k, dim=-1)
+		top_vals = top_vals.cpu().tolist()
+		top_ids = top_ids.cpu().tolist()
+		counters = self.__dict__.setdefault("_logit_topk_dump_counts", {})
+		path = os.path.join(spec["dir"], f"logit_topk_rank{self.rank}.jsonl")
+		with open(path, "a", encoding="utf-8") as handle:
+			for j, row in enumerate(rows):
+				seq = batch_sequences[row]
+				n = counters.get(seq.uuid, 0)
+				counters[seq.uuid] = n + 1
+				handle.write(json.dumps({
+					"uuid": seq.uuid,
+					"n": n,
+					"decoded": int(getattr(seq, "decoded_length", -1)),
+					"ctx": int(getattr(seq, "current_context_length", -1)),
+					"rows": len(batch_sequences),
+					"dtype": str(logits.dtype),
+					"ids": top_ids[j],
+					"vals": top_vals[j],
+				}) + "\n")
 
 	def _select_tokens_resident(
 		self,
