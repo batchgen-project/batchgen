@@ -4831,13 +4831,30 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
-		# Phase B: pull the cuda-graph adapter from the initializer (None if not implemented).
-		# Worker uses `_cuda_graph_adapter` only when `BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1`
-		# (dual-path migration gate). Legacy `_glm5_*` path is the default until Phase C.
+		# Pull the cuda-graph adapter from the initializer (None if the model
+		# does not implement one).
 		self._cuda_graph_adapter = getattr(
 			self.initializer, "get_cuda_graph_adapter", lambda: None
 		)()
 		if self._cuda_graph_adapter is not None:
+			# Every model's graph behavior must come through the
+			# ModelCudaGraphAdapter ABC. An object that merely happens to carry
+			# the right method names would pass every call site here and then
+			# fail mid-decode on the first hook it does not implement, so the
+			# type is asserted once, at startup, on the fetch itself.
+			from batchgen.cuda_graph.adapter import ModelCudaGraphAdapter
+
+			if not isinstance(self._cuda_graph_adapter, ModelCudaGraphAdapter):
+				adapter_type = type(self._cuda_graph_adapter)
+				raise RuntimeError(
+					"get_cuda_graph_adapter() for model "
+					f"{getattr(self, 'model_name', None)!r} returned "
+					f"{adapter_type.__module__}.{adapter_type.__qualname__}, "
+					"which is not a ModelCudaGraphAdapter. Every model's "
+					"graph behavior must come through this ABC: subclass "
+					"batchgen.cuda_graph.adapter.ModelCudaGraphAdapter "
+					"instead of duck-typing it."
+				)
 			logging.info(
 				"Cuda-graph adapter discovered: %s (advertises %s)",
 				type(self._cuda_graph_adapter).__name__,
