@@ -318,3 +318,44 @@ def test_reused_rebuild_refreshes_cuda_graph_page_table_after_extension():
     assert manager._gpu_page_table_manager.gpu_table.data_ptr() == active.data_ptr()
     torch.testing.assert_close(graph[1, :2], manager._sequences[20].pages)
     torch.testing.assert_close(graph[:2, : active.shape[1]], active)
+
+
+def test_layer_kv_cache_is_available_before_any_page_table():
+    # A rank that holds no sequence never builds an active page table, yet the
+    # GPT-OSS whole-model decode graph still captures on it and needs only the
+    # fixed-address cache tensors.
+    config = GPUPagedKVConfig(
+        num_layers=2,
+        num_pages=8,
+        page_size_tokens=4,
+        num_k_heads=1,
+        k_head_dim=8,
+        num_v_heads=1,
+        v_head_dim=8,
+        kv_dtype=torch.bfloat16,
+    )
+    manager = GPUPagedKVCacheManager(config=config, device="cpu")
+    manager.initialize()
+    assert manager._gpu_page_table_manager.gpu_table is None
+
+    with pytest.raises(RuntimeError, match="GPU page table is not initialized"):
+        manager.get_layer_kv_with_page_table(1)
+
+    k_cache, v_cache = manager.get_layer_kv_cache(1)
+    assert k_cache.data_ptr() == manager._k_cache[1].data_ptr()
+    assert v_cache.data_ptr() == manager._v_cache[1].data_ptr()
+
+    # Once a page table exists, both accessors return the same tensors.
+    manager.allocate_pages_for_sequences([7], [4])
+    manager.rebuild_page_table([7])
+    k_with_table, v_with_table, table = manager.get_layer_kv_with_page_table(1)
+    assert k_with_table.data_ptr() == k_cache.data_ptr()
+    assert v_with_table.data_ptr() == v_cache.data_ptr()
+    assert table is manager._gpu_page_table_manager.gpu_table
+
+
+def test_layer_kv_cache_without_v_cache_returns_none():
+    manager = _make_manager()
+    k_cache, v_cache = manager.get_layer_kv_cache(0)
+    assert k_cache.data_ptr() == manager._k_cache[0].data_ptr()
+    assert v_cache is None
