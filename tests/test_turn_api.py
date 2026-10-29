@@ -1403,3 +1403,35 @@ def test_e2e_held_turn_keeps_its_slot_until_close_and_status_reports_admission(t
     assert held == 1 and free == 3
     assert after == 0 and free_after == 4
     assert info == {"deferred": {"host_footprint": 2}, "overcommit_active": False}
+
+
+def test_h2_held_slots_keep_the_scheduler_within_the_worker_trajectory_pool():
+    """A2 audit H2: the worker keeps a held turn's full-context reservation.
+
+    The server must count that slot, or it admits a turn the worker's
+    trajectory pool cannot bind (QueryBookCapacityError, a worker fatal).
+    """
+    from batchgen.query_book import QueryBook, QueryBookCapacityError
+
+    context = 256
+    book = QueryBook(capacity_bytes=2 * context * QueryBook.TOKEN_BYTES, page_tokens=64)
+    pool = _M["scheduling_pool"].SchedulingPool(
+        capacity=book.reservation_total_capacity(context))
+    scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler._scheduling_pool = pool
+    assert pool.capacity == 2
+    # Turn 1 of s1 is admitted, bound, completes and is held by the worker.
+    pool.allocate_slot("t1")
+    book.bind("t1", context)
+    scheduler._account_completion_slot(
+        "t1", {"session_id": "s1", "session_hold": {"held": True}})
+    # The server now offers exactly what the worker can still bind.
+    assert pool.num_free_slots() == book.reservation_free_count(context) == 1
+    pool.allocate_slot("b1")
+    book.bind("b1", context)
+    assert pool.num_free_slots() == 0
+    # The pre-fix accounting (free the slot at completion) offered one more
+    # admission, which the worker's bind refuses.
+    with pytest.raises(QueryBookCapacityError):
+        book.bind("b2", context)
+

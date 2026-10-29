@@ -270,7 +270,7 @@ _METHOD_NAMES = [
     "_session_hold_eligible", "_session_host_view", "_retain_session_pages_for_hold",
     "_record_session_hold", "_free_held_session", "_apply_session_control",
     "_cancel_request", "_pin_session_hold_ranks", "_plan_session_resumes",
-    "_session_resume_plan",
+    "_session_resume_plan", "_release_held_kv_for_admission",
     "_commit_session_resumes", "_release_session_prefix_states",
     "_publish_session_hold_metrics", "_note_session_evictions", "_owns_host_kv",
     "_decode_attn_tp_size", "_drop_unstarted_request", "_prefix_states_in_use",

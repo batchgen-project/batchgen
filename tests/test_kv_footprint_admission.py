@@ -22,7 +22,11 @@ import torch
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker import kv_admission as ka
 from batchgen.worker import session_hold as session_hold_lib
-from batchgen.worker.prefill import PrefillCandidate, PrefillSelectionRequest
+from batchgen.worker.prefill import (
+    PrefillCandidate,
+    PrefillScheduler,
+    PrefillSelectionRequest,
+)
 from batchgen.worker.session_hold import HeldSession, SessionHoldBook
 from tests.worker_method_source import load_worker_methods
 
@@ -342,7 +346,7 @@ _METHODS = load_worker_methods(
         "_kv_admission_would_admit", "_note_kv_footprint_sample",
         "_note_kv_footprint_completion", "_publish_kv_admission_metrics",
         "_session_resume_plan", "_note_admission_wait_on_held_kv",
-        "_publish_session_hold_metrics",
+        "_publish_session_hold_metrics", "_release_held_kv_for_admission",
     ],
     {
         "kv_admission_lib": ka,
@@ -376,6 +380,7 @@ class _Worker:
         self._kv_admission_last_publish = 0.0
         self._kv_resume_keep_cache = {}
         self._prefill_admission_live = False
+        self._prefill_admission_selection = None
         self._response_queue = None
         self.dropped = []
 
@@ -521,3 +526,79 @@ def test_completion_records_projected_against_actual_footprint():
     worker._note_kv_footprint_completion(seq)
     error = worker._kv_admission.snapshot()["footprint_error"]
     assert error["projected_pages_sum"] == 74 and error["actual_pages_sum"] == 15
+
+
+# --------------------------------------------------------------------------- #
+#  A2 audit H4: a resumed turn is charged only what its hold does not cover
+# --------------------------------------------------------------------------- #
+
+
+def test_h4_a_session_holding_more_than_half_the_pool_can_resume():
+    # 100-page Host pool; the session holds 60 pages (3840 tokens). Its next
+    # turn appends 64 tokens and may decode 64: budget 62 pages. Charged in
+    # full (the A2 behaviour) it needs 62 > 40 physically free pages and waits
+    # forever behind its own hold; charged its suffix + output it needs 2.
+    worker = _Worker(host_total=100)
+    held = list(range(1, 64 * 60 + 1))
+    worker.hold("s1", held)
+    worker.add("resumed", 1, held + [7] * 64, max_decode=64, session="s1")
+    selection, changed = worker._apply_footprint_admission(
+        _selection(worker, ["resumed"]), [40], [100], [-1, -1],
+    )
+    assert not changed
+    assert [c.uuid for c in selection.candidates] == ["resumed"]
+    assert selection.candidates[0].cached_prefix_pages == 60
+    physical = replace(selection, per_node_host_free=(40,))
+    assert PrefillScheduler.select_prefill_batch(physical) == ["resumed"]
+    # Without the discount the same physical selection admits nothing.
+    undiscounted = replace(physical, candidates=tuple(
+        replace(c, cached_prefix_pages=0) for c in physical.candidates))
+    assert PrefillScheduler.select_prefill_batch(undiscounted) == []
+
+
+def test_h4_a_resumed_turn_is_charged_its_suffix_not_unreused_held_pages():
+    # The new prompt diverges from the held tokens after 2 pages: only those
+    # 2 pages are reused, so the turn is charged budget - 2 (held pages past
+    # the LCP are freed only at commit and are not credited).
+    worker = _Worker(host_total=1000)
+    held = list(range(1, 64 * 10 + 1))
+    worker.hold("s1", held)
+    prompt = held[: 64 * 2] + [5] * (64 * 3)
+    worker.add("resumed", 1, prompt, max_decode=64, session="s1")
+    candidates, kinds, keep = worker._kv_footprint_candidates(["resumed"])
+    assert kinds == {"resumed": ka.KIND_RESUMED} and keep == {"resumed": 2}
+    assert candidates[0].budget_pages == 6 and candidates[0].host_pages == 4
+
+
+def test_h4_an_empty_wave_not_caused_by_held_kv_keeps_the_guard_state():
+    # Holds exist and nothing runs, but footprint admission deferred nothing:
+    # the wave was emptied elsewhere (physical reservation, slot limits). The
+    # no-progress guard must keep its state so such a stall fails by name.
+    worker = _Worker(host_total=1000)
+    worker.hold("s1", list(range(64 * 10)))
+    worker.add("new", 1, [1] * 64, max_decode=64)
+    worker._apply_footprint_admission(
+        _selection(worker, ["new"]), [990], [1000], [-1, -1],
+    )
+    assert worker._kv_admission_plan.admitted == ("new",)
+    assert worker._note_admission_wait_on_held_kv(0) is False
+    # No plan at all (admission did not run this pass): not a hold wait.
+    worker._kv_admission_plan = None
+    assert worker._note_admission_wait_on_held_kv(0) is False
+
+
+def test_h4_an_empty_wave_deferred_by_held_kv_is_a_paced_wait(monkeypatch):
+    worker = _Worker(host_total=100)
+    worker.hold("s1", list(range(64 * 85)))  # 85 held + 10 margin: 5 free
+    worker.add("new", 1, [1] * 64 * 8, max_decode=64)  # 9 pages
+    worker._apply_footprint_admission(
+        _selection(worker, ["new"]), [15], [100], [-1, -1],
+    )
+    assert worker._kv_admission_plan.deferred == {"new": ka.DEFER_HOST}
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    assert worker._note_admission_wait_on_held_kv(0) is True
+    assert slept == [0.2]
+    assert worker._session_hold.admission_waits == 1
+    assert set(worker._session_hold.sessions) == {"s1"}  # nothing dropped
+

@@ -14,10 +14,12 @@ server. Every admission candidate is charged its *projected* KV footprint:
 
 * a new turn (or a batch request, or an evicted sequence) needs its whole
   KV budget, ``ceil((prompt + max_decode) / page)`` pages;
-* a resumed turn of a held session needs that budget minus the pages its
-  session already holds: the LCP pages are reused in place and the held
-  pages past the LCP are freed when it commits, so the net change is
-  ``budget_pages - held_pages`` ("suffix + output budget").
+* a resumed turn of a held session needs that budget minus the held pages
+  it reuses in place (the pages up to its LCP with the held tokens), i.e.
+  its suffix plus its output budget. The physical Host reservation discounts
+  the same pages, so a footprint that fits always has the physical pages.
+  Held pages past the LCP are not credited: they are freed only when the
+  wave commits, after its reservation.
 
 and is admitted only if the footprint fits the free capacity of its pools:
 
@@ -122,7 +124,7 @@ class FootprintCandidate:
     node_id: int
     rank: int
     global_idx: int
-    # Net Host pages admission adds on its node (resumed: budget - held).
+    # Host pages admission adds on its node (resumed: budget - reused pages).
     host_pages: int
     # GPU pages on its rank: the whole budget (held KV has no GPU pages).
     gpu_pages: int

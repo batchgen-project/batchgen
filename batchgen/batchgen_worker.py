@@ -3907,27 +3907,42 @@ class BatchGenWorker:
 		"""Every rank: a wave admitted nothing because held KV fills Host KV.
 
 		True only when nothing was admitted, nothing is live, and held KV is
-		the blocker: a slot-admissible candidate would fit if the held pages
-		were free (``admission_blocked_by_held_kv``, over the wave's
-		rank-uniform selection snapshot). The queued turns then wait for a
-		close, an abort or an idle-TTL release (footprint admission is a later
-		step); counted, logged loudly, and paced so the scheduler does not
-		spin, and the no-progress guard is reset for it. Any other stall
-		returns False, so the guard sees its real state.
+		the blocker; the queued turns then wait for a close, an abort or an
+		idle-TTL release, counted, logged loudly, and paced so the scheduler
+		does not spin, and the no-progress guard is reset for it. Held KV is
+		the blocker when this pass's footprint admission deferred work (with
+		nothing running and never-fitting requests already failed, only held
+		KV can defer it), or, without a footprint decision, when a
+		slot-admissible candidate would fit if the held pages were free
+		(``admission_blocked_by_held_kv``). Any other empty wave (the physical
+		reservation or a slot limit refused it) returns False, so the guard
+		sees its real state and fails such a stall by name.
+
+		A resumed turn that cannot fit with nothing running is a genuine
+		overcommit: every free page is held by other sessions. It is counted
+		as such and new work stays refused; held KV is never dropped for it
+		here (``_release_held_kv_for_admission`` is the hook for a victim
+		policy).
 		"""
 		book = self._session_hold
+		plan = getattr(self, "_kv_admission_plan", None)
 		if (
 			book is None or not book.sessions or admitted
 			or self._prefill_admission_live or not self.global_batch.has_queueing()
 		):
 			return False
-		if not session_hold_lib.admission_blocked_by_held_kv(
+		if plan is not None:
+			if not plan.deferred:
+				return False
+		elif not session_hold_lib.admission_blocked_by_held_kv(
 			self._prefill_admission_selection, book.held_pages
 		):
 			return False
+		if self._release_held_kv_for_admission(plan):
+			# Held KV was released for the waiting work: the next wave retries.
+			return True
 		book.admission_waits += 1
-		plan = self._kv_admission_plan
-		stats = self._kv_admission
+		stats = getattr(self, "_kv_admission", None)
 		if stats is not None and plan is not None and plan.overcommit:
 			started = stats.note_overcommit(True)
 			if self.rank == 0 and (started or stats.overcommit_waits % 50 == 0):
@@ -3964,6 +3979,20 @@ class BatchGenWorker:
 			self._publish_session_hold_metrics("admission_wait")
 		time.sleep(0.2)
 		return True
+
+	def _release_held_kv_for_admission(self, plan) -> bool:
+		"""Hook: free held KV for work that waits on it. Returns True if any.
+
+		Called on every rank when an empty wave waits only on held KV, with
+		the rank-uniform footprint plan (``plan.blocked_resumed`` names the
+		resumed turns that cannot fit, ``plan.deferred`` every waiting
+		candidate; None without a footprint decision). A hold-victim policy
+		frees holds here through ``drop_lru_session_holds`` (rank-uniform, and
+		counted as drops); the idle-session TTL already releases holds on its
+		own. No victim policy is chosen yet: held KV is never dropped for
+		admission, so this returns False.
+		"""
+		return False
 
 	def _publish_session_hold_metrics(self, event: str) -> None:
 		"""Rank 0: send the (rank-uniform) hold metrics for /v1/pool/status."""
@@ -4029,13 +4058,16 @@ class BatchGenWorker:
 			gpu_running_by_rank=tuple(gpu_running),
 		)
 
-	def _kv_footprint_candidates(self, uuids: List[str], *, with_keep: bool):
-		"""Every rank: projected footprints, kinds and (optionally) kept held pages.
+	def _kv_footprint_candidates(self, uuids: List[str]):
+		"""Every rank: projected footprints, kinds and kept held pages.
 
-		A queued turn whose session holds KV is a resumed turn: it is charged
-		its budget minus the pages its session holds. ``with_keep`` also
-		computes the held pages the wave will attach (its LCP), which the
-		physical Host reservation discounts.
+		A queued turn whose session holds KV is a resumed turn: it reuses the
+		held pages up to its LCP with the held tokens (``keep``), so it is
+		charged its budget minus those pages -- its suffix plus its output
+		budget. The physical Host reservation discounts the same ``keep``
+		pages, so a footprint that fits always has the physical pages too.
+		Held pages past the LCP are not credited: they are freed only when
+		the wave commits, after its reservation.
 		"""
 		candidates, kinds, keep = [], {}, {}
 		book = self._session_hold
@@ -4054,17 +4086,14 @@ class BatchGenWorker:
 				kind, host, held = kv_admission_lib.KIND_EVICTED, budget, 0
 			elif record is not None:
 				kind, held = kv_admission_lib.KIND_RESUMED, record.pages
-				# Net change at commit: the turn's budget joins "running", its
-				# whole hold leaves "held" (LCP pages reused, the rest freed).
-				host = max(0, budget - held)
-				if with_keep:
-					key = (uuid, record.request_id)
-					if key not in self._kv_resume_keep_cache:
-						plan = self._session_resume_plan(seq, record)
-						self._kv_resume_keep_cache[key] = (
-							plan.keep_pages if plan.resumes else 0
-						)
-					keep[uuid] = self._kv_resume_keep_cache[key]
+				key = (uuid, record.request_id)
+				if key not in self._kv_resume_keep_cache:
+					plan = self._session_resume_plan(seq, record)
+					self._kv_resume_keep_cache[key] = (
+						plan.keep_pages if plan.resumes else 0
+					)
+				keep[uuid] = self._kv_resume_keep_cache[key]
+				host = max(0, budget - keep[uuid])
 			else:
 				kind, host, held = kv_admission_lib.KIND_NEW, budget, 0
 			kinds[uuid] = kind
@@ -4135,7 +4164,7 @@ class BatchGenWorker:
 		host_running, gpu_running = self._kv_running_footprint()
 		state = self._kv_footprint_state(host_running, gpu_running)
 		uuids = [candidate.uuid for candidate in selection.candidates]
-		candidates, kinds, keep = self._kv_footprint_candidates(uuids, with_keep=True)
+		candidates, kinds, keep = self._kv_footprint_candidates(uuids)
 		plan = kv_admission_lib.plan_footprint_admission(
 			candidates, state, live=self._prefill_admission_live,
 		)
@@ -4237,7 +4266,7 @@ class BatchGenWorker:
 		if not uuids:
 			return False
 		host_running, gpu_running = self._kv_running_footprint()
-		candidates, _, _ = self._kv_footprint_candidates(uuids, with_keep=False)
+		candidates, _, _ = self._kv_footprint_candidates(uuids)
 		plan = kv_admission_lib.plan_footprint_admission(
 			candidates, self._kv_footprint_state(host_running, gpu_running), live=True,
 		)
@@ -8633,6 +8662,9 @@ class BatchGenWorker:
 		# that selects nothing reports "not attempted" rather than carrying the
 		# previous iteration's verdict into the guard.
 		self._prefill_reservation_outcome = None
+		# This pass's footprint decision only: a stale plan must never excuse
+		# a later empty wave as a wait on held KV.
+		self._kv_admission_plan = None
 		if not all_candidates:
 			return []
 
