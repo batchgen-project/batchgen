@@ -324,6 +324,44 @@ struct Chunk {
     int rail = -1;
     void* request = nullptr;
     Clock::time_point posted;
+    // When ucp_get_nbx was actually issued. `posted` is taken before the ring
+    // bookkeeping (a ring_mutex acquisition and an O(depth) occupancy scan)
+    // that precedes the call, so posted..submitted is daemon overhead, not
+    // transport. Separating them keeps the achieved-bandwidth figure honest.
+    Clock::time_point submitted;
+    // Identity of the chunk's first module, carried so the trace can attribute
+    // a get to a layer and to the worker that will acquire it.
+    int layer = -1;
+    int first_expert = -1;
+    int target_worker = -1;
+};
+
+// One ucp_get_nbx, start to publication. POD and fixed size: the fetch path
+// appends with one relaxed fetch_add into a preallocated ring, so tracing adds
+// no allocation, no lock and no I/O to the hot path. All times are ns since the
+// daemon's trace epoch.
+//
+// done_ns is when the polling loop OBSERVED completion, not when the NIC
+// finished; prev_scan_ns is the start of the preceding completion scan, so the
+// analysis can bound how much of (done - post) is detection delay rather than
+// transport. Without that bound a slow single-threaded poll loop is
+// indistinguishable from a slow rail.
+struct GetRecord {
+    std::int64_t post_ns = 0;
+    std::int64_t submit_ns = 0;
+    std::int64_t done_ns = 0;
+    std::int64_t publish_ns = 0;
+    std::int64_t prev_scan_ns = 0;
+    // Earliest moment a worker was observed blocked on any module of this
+    // chunk; 0 when no worker ever blocked on it.
+    std::int64_t first_wait_ns = 0;
+    std::uint64_t bytes = 0;
+    std::int32_t rail = -1;
+    std::int32_t owner = -1;
+    std::int32_t layer = -1;
+    std::int32_t first_expert = -1;
+    std::int32_t count = 0;
+    std::int32_t target_worker = -1;
 };
 
 // A worker cohort is one generation of the server's worker pool. The daemon
@@ -433,6 +471,18 @@ struct DistributedWeightDaemon::Impl {
         depth = config.value("depth", 32);
         superchunk = config.value("superchunk", 8);
         outstanding = config.value("outstanding", 8);
+        // Per-get fetch trace. Off unless a path is configured, so an ordinary
+        // run carries no buffer and no extra work on the fetch path.
+        fetch_trace_path = config.value("fetch_trace_path", std::string());
+        if (!fetch_trace_path.empty()) {
+            const std::int64_t capacity =
+                config.value("fetch_trace_capacity",
+                             static_cast<std::int64_t>(2000000));
+            if (capacity <= 0) {
+                fail("fetch_trace_capacity must be positive");
+            }
+            fetch_trace.assign(static_cast<size_t>(capacity), GetRecord{});
+        }
         workers = config.value("workers", kDefaultWorkers);
         worker_sharded = config.value("worker_sharded", false);
         transport = config.value("transport", "host_rdma");
@@ -510,6 +560,12 @@ struct DistributedWeightDaemon::Impl {
     int depth = 32;
     int superchunk = 8;
     int outstanding = 8;
+    // Per-get trace. Empty path disables it; the ring is sized once at config
+    // time and only ever written through fetch_trace_next.
+    std::string fetch_trace_path;
+    std::vector<GetRecord> fetch_trace;
+    std::atomic<std::uint64_t> fetch_trace_next{0};
+    Clock::time_point trace_epoch = Clock::now();
     int workers = kDefaultWorkers;
     bool worker_sharded = false;
     std::string transport = "host_rdma";
@@ -592,6 +648,11 @@ struct DistributedWeightDaemon::Impl {
     // Per worker id; a cohort admits one connection per worker. Under
     // ring_mutex.
     std::array<PendingAcquire, kDefaultWorkers> pending_acquires;
+    // Trace only: when a worker first blocked on a module key, so a get can be
+    // split into "waited to be posted" and "in flight". Written on the acquire
+    // retry path, which already holds ring_mutex, and erased when the module
+    // publishes, so it holds at most the keys workers are blocked on now.
+    std::unordered_map<std::string, Clock::time_point> wait_begin;
     // Ring reset handshake. Once prefetch_owns_ring is set, only the prefetch
     // thread resets slots, at a point where it has no fetch in flight. All
     // under ring_mutex.
@@ -1363,6 +1424,13 @@ struct DistributedWeightDaemon::Impl {
             no_wait ? ready() : ring_cv.wait_for(lock, kAcquireSlice, ready);
         pending.last_poll = Clock::now();
         if (!available && pending.last_poll - pending.begin < kAcquireTimeout) {
+            if (!fetch_trace.empty()) {
+                // This worker is blocked on the module. Keep only the first
+                // block for the key (emplace is a no-op once present); the
+                // publish erases it. Already under ring_mutex, so the trace
+                // adds no lock to this path.
+                wait_begin.emplace(module_key, pending.begin);
+            }
             response->status = kStatusRetry;
             return;
         }
@@ -1564,14 +1632,111 @@ struct DistributedWeightDaemon::Impl {
         return true;
     }
 
+    std::int64_t TraceNs(Clock::time_point when) const {
+        if (when == Clock::time_point{}) {
+            return 0;
+        }
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   when - trace_epoch)
+            .count();
+    }
+
+    // Lock-free append into the preallocated ring: one relaxed fetch_add and
+    // one POD store, so the fetch path never allocates, waits or does I/O for
+    // the trace.
+    void RecordGet(const Chunk& chunk,
+                   Clock::time_point completed,
+                   Clock::time_point published,
+                   Clock::time_point prev_scan,
+                   Clock::time_point first_wait) {
+        GetRecord record;
+        record.post_ns = TraceNs(chunk.posted);
+        record.submit_ns = TraceNs(chunk.submitted);
+        record.done_ns = TraceNs(completed);
+        record.publish_ns = TraceNs(published);
+        record.prev_scan_ns = TraceNs(prev_scan);
+        record.first_wait_ns = TraceNs(first_wait);
+        record.bytes =
+            static_cast<std::uint64_t>(chunk.count) * module_bytes;
+        record.rail = chunk.rail;
+        record.owner = chunk.owner;
+        record.layer = chunk.layer;
+        record.first_expert = chunk.first_expert;
+        record.count = chunk.count;
+        record.target_worker = chunk.target_worker;
+        const std::uint64_t index =
+            fetch_trace_next.fetch_add(1, std::memory_order_relaxed);
+        fetch_trace[index % fetch_trace.size()] = record;
+    }
+
+    // Dumped once, after the prefetch loop stops. CSV because a run produces
+    // >100k rows and every consumer of it is columnar. A wrap is reported as a
+    // count in the header, never passed off as a complete trace.
+    void WriteFetchTrace() {
+        if (fetch_trace.empty() || fetch_trace_path.empty()) {
+            return;
+        }
+        const std::uint64_t written =
+            fetch_trace_next.load(std::memory_order_relaxed);
+        const std::uint64_t capacity = fetch_trace.size();
+        const std::uint64_t start =
+            written > capacity ? written - capacity : 0;
+        const std::string temporary = fetch_trace_path + ".tmp";
+        std::ofstream out(temporary, std::ios::trunc);
+        if (!out) {
+            fail("cannot open fetch trace for write: " + temporary);
+        }
+        out << "# node_rank=" << node_rank << " depth=" << depth
+            << " superchunk=" << superchunk
+            << " outstanding=" << outstanding
+            << " module_bytes=" << module_bytes
+            << " records=" << (written - start)
+            << " dropped_by_wrap=" << start << "\n";
+        out << "post_ns,submit_ns,done_ns,publish_ns,prev_scan_ns,"
+               "first_wait_ns,bytes,rail,owner,layer,first_expert,count,"
+               "target_worker\n";
+        for (std::uint64_t index = start; index < written; ++index) {
+            const GetRecord& record = fetch_trace[index % capacity];
+            out << record.post_ns << ',' << record.submit_ns << ','
+                << record.done_ns << ',' << record.publish_ns << ','
+                << record.prev_scan_ns << ',' << record.first_wait_ns << ','
+                << record.bytes << ',' << record.rail << ',' << record.owner
+                << ',' << record.layer << ',' << record.first_expert << ','
+                << record.count << ',' << record.target_worker << '\n';
+        }
+        out.flush();
+        if (!out) {
+            fail("fetch trace write failed: " + temporary);
+        }
+        out.close();
+        if (rename(temporary.c_str(), fetch_trace_path.c_str()) != 0) {
+            fail("cannot publish fetch trace: " + fetch_trace_path);
+        }
+    }
+
     void MarkReady(const Chunk& chunk,
-                   Clock::time_point completed) {
+                   Clock::time_point completed,
+                   Clock::time_point prev_scan = Clock::time_point{}) {
         const double latency_ms =
             elapsed_seconds(chunk.posted, completed) * 1000.0;
+        const bool tracing = !fetch_trace.empty();
+        Clock::time_point first_wait{};
         {
             std::lock_guard<std::mutex> lock(ring_mutex);
             for (int index = 0; index < chunk.count; ++index) {
                 Slot& slot = slots[chunk.slot_start + index];
+                if (tracing) {
+                    // Earliest block across the chunk's modules, then forget
+                    // the key so the map cannot grow with the schedule.
+                    const auto waited = wait_begin.find(slot.module_key);
+                    if (waited != wait_begin.end()) {
+                        if (first_wait == Clock::time_point{} ||
+                            waited->second < first_wait) {
+                            first_wait = waited->second;
+                        }
+                        wait_begin.erase(waited);
+                    }
+                }
                 if (slot.state != SlotState::kFetching) {
                     fail("fetch completed into a non-fetching slot");
                 }
@@ -1590,6 +1755,12 @@ struct DistributedWeightDaemon::Impl {
             }
             ring_completions += chunk.count;
             ring_cv.notify_all();
+        }
+        if (tracing) {
+            // Taken after the publish, so completion..publication (the
+            // ring_mutex wait behind acquire handlers plus the slot work) is a
+            // segment of its own rather than hidden inside the transfer.
+            RecordGet(chunk, completed, Clock::now(), prev_scan, first_wait);
         }
         std::lock_guard<std::mutex> stats_lock(stats_mutex);
         stats.fetched_modules += chunk.count;
@@ -1619,6 +1790,9 @@ struct DistributedWeightDaemon::Impl {
         }
         module_to_slot.clear();
         pending_acquires.fill(PendingAcquire{});
+        // The retired cohort's blocked keys will never publish, so drop them
+        // rather than let them attach to a later cohort's get.
+        wait_begin.clear();
         return report;
     }
 
@@ -1659,6 +1833,7 @@ struct DistributedWeightDaemon::Impl {
         size_t next = 0;
         int tail = 0;
         std::deque<Chunk> chunks;
+        Clock::time_point prev_scan{};
 
         while (!stop.load()) {
             // A cohort swap rewinds the ring to its start-of-day state: the
@@ -1694,10 +1869,15 @@ struct DistributedWeightDaemon::Impl {
                 continue;
             }
 
+            // This thread both polls completions and posts new gets, so a
+            // completion can only be noticed when the scan comes round again.
+            // Carrying the previous scan's start lets the trace bound how much
+            // of submit..done is detection delay rather than transport.
+            const Clock::time_point scan_start = Clock::now();
             for (auto iterator = chunks.begin();
                  iterator != chunks.end();) {
                 if (iterator->request == nullptr) {
-                    MarkReady(*iterator, Clock::now());
+                    MarkReady(*iterator, Clock::now(), prev_scan);
                     iterator = chunks.erase(iterator);
                     continue;
                 }
@@ -1714,9 +1894,10 @@ struct DistributedWeightDaemon::Impl {
                 check_ucs(status, "ucp_get_nbx completion");
                 ucp_request_free(iterator->request);
                 iterator->request = nullptr;
-                MarkReady(*iterator, Clock::now());
+                MarkReady(*iterator, Clock::now(), prev_scan);
                 iterator = chunks.erase(iterator);
             }
+            prev_scan = scan_start;
 
             bool posted = false;
             while (static_cast<int>(chunks.size()) < outstanding) {
@@ -1757,6 +1938,9 @@ struct DistributedWeightDaemon::Impl {
                 chunk.rail =
                     available[owner_rail_cursor[owner]++ %
                               available.size()];
+                chunk.layer = layer;
+                chunk.first_expert = first_expert;
+                chunk.target_worker = OwningWorker(schedule[next]);
                 chunk.posted = Clock::now();
 
                 {
@@ -1790,6 +1974,7 @@ struct DistributedWeightDaemon::Impl {
                 ucp_request_param_t params{};
                 params.op_attr_mask = UCP_OP_ATTR_FIELD_MEMH;
                 params.memh = rails[chunk.rail].staging_memh;
+                chunk.submitted = Clock::now();
                 chunk.request = ucp_get_nbx(
                     remote.endpoint, destination,
                     static_cast<size_t>(superchunk) * module_bytes,
@@ -1812,6 +1997,7 @@ struct DistributedWeightDaemon::Impl {
             }
         }
         WriteSummary();
+        WriteFetchTrace();
     }
 
     // The summary's snapshots. Each takes one mutex and only copies, so a
