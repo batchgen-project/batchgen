@@ -3853,16 +3853,25 @@ class BatchGenWorker:
 			self._publish_session_hold_metrics("eviction")
 
 	def _note_admission_wait_on_held_kv(self, admitted: int) -> bool:
-		"""Every rank: a wave admitted nothing, nothing is live, and KV is held.
+		"""Every rank: a wave admitted nothing because held KV fills Host KV.
 
-		The queued turns wait for Host pages held sessions occupy (proper
-		footprint admission is a later step); counted and logged loudly, and
-		paced so the scheduler does not spin. Held KV is never dropped for it.
+		True only when nothing was admitted, nothing is live, and held KV is
+		the blocker: a slot-admissible candidate would fit if the held pages
+		were free (``admission_blocked_by_held_kv``, over the wave's
+		rank-uniform selection snapshot). The queued turns then wait for a
+		close, an abort or an idle-TTL release (footprint admission is a later
+		step); counted, logged loudly, and paced so the scheduler does not
+		spin, and the no-progress guard is reset for it. Any other stall
+		returns False, so the guard sees its real state.
 		"""
 		book = self._session_hold
 		if (
 			book is None or not book.sessions or admitted
 			or self._prefill_admission_live or not self.global_batch.has_queueing()
+		):
+			return False
+		if not session_hold_lib.admission_blocked_by_held_kv(
+			self._prefill_admission_selection, book.held_pages
 		):
 			return False
 		book.admission_waits += 1

@@ -845,3 +845,74 @@ def test_lru_drop_hook_frees_the_oldest_idle_holds_on_every_rank():
         assert worker._session_hold.snapshot()["drops"] == {"pressure_lru": 2}
         if rank == 0:
             assert len(worker.host.resident()) == 3
+
+
+# --------------------------------------------------------------------------- #
+#  No-progress guard: held KV resets it only when held KV is the blocker
+# --------------------------------------------------------------------------- #
+
+
+def _selection(*, free, prompt=640, slot_free=None):
+    from batchgen.worker.prefill import PrefillCandidate, PrefillSelectionRequest
+
+    candidate = PrefillCandidate(
+        uuid="q1", assigned_rank=0, node_id=0, is_evicted=False, global_idx=5,
+        total_decoded_before_eviction=0, prompt_length=prompt,
+        kv_token_budget=4096, page_size=PAGE,
+    )
+    return PrefillSelectionRequest(
+        candidates=(candidate,), per_node_host_free=(free,), chunk_size=0,
+        num_nodes=1, gpus_per_node=8, initial_gpu_page_buffer=0,
+        per_node_sequence_free=None if slot_free is None else (slot_free,),
+    )
+
+
+def test_blocked_by_held_kv_only_when_freeing_held_pages_would_admit():
+    from batchgen.worker.prefill import PrefillScheduler
+
+    blocked = session_hold_lib.admission_blocked_by_held_kv
+    needed = PrefillScheduler.required_host_pages(
+        _selection(free=0).candidates[0], _selection(free=0))
+    # Short by 3 pages, 5 held: held KV is the blocker.
+    assert blocked(_selection(free=needed - 3), held_pages=5)
+    # Short by 10 pages, 5 held: it would not fit even without the holds.
+    assert not blocked(_selection(free=needed - 10), held_pages=5)
+    # It fits: the wave selects it, nothing is blocked.
+    assert not blocked(_selection(free=needed), held_pages=5)
+    # No sequence slot: a slot limit, not held KV.
+    assert not blocked(_selection(free=needed - 3, slot_free=0), held_pages=5)
+    assert not blocked(None, held_pages=5)
+    assert not blocked(_selection(free=needed - 3), held_pages=0)
+
+
+def _guard_worker(selection):
+    note = load_worker_methods(
+        ["_note_admission_wait_on_held_kv"],
+        {"session_hold_lib": session_hold_lib, "logging": logging,
+         "SequenceStatus": SequenceStatus,
+         "time": SimpleNamespace(sleep=lambda seconds: None)},
+    )["_note_admission_wait_on_held_kv"]
+    worker, prompt, _ = _held_worker()          # one hold of 3 pages
+    worker.add_seq("q1", 30, list(range(640)), session="s9")
+    worker._prefill_admission_live = False
+    worker._prefill_admission_selection = selection
+    return lambda: note(worker, 0), worker
+
+
+def test_guard_state_passes_through_unless_held_kv_blocks_admission():
+    """H4: with any session held, every empty wave used to reset the
+    no-progress guard (state None), masking unrelated stalls."""
+    from batchgen.worker.prefill import PrefillScheduler
+
+    probe = _selection(free=0)
+    needed = PrefillScheduler.required_host_pages(probe.candidates[0], probe)
+    waits_on_held, worker = _guard_worker(_selection(free=needed - 2))
+    assert waits_on_held() is True
+    assert worker._session_hold.admission_waits == 1
+    # A slot stall while a session is held: the guard must see it.
+    stalled, worker = _guard_worker(_selection(free=needed - 2, slot_free=0))
+    assert stalled() is False
+    assert worker._session_hold.admission_waits == 0
+    # A request too large even with the held pages freed: not a held-KV wait.
+    too_big, _ = _guard_worker(_selection(free=needed - 50))
+    assert too_big() is False

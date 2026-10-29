@@ -359,6 +359,31 @@ def lru_hold_victims(
     return victims
 
 
+def admission_blocked_by_held_kv(selection, held_pages: int) -> bool:
+    """Whether held KV is what keeps a prefill wave from admitting anything.
+
+    True when the wave selects nothing and some candidate that has a sequence
+    slot needs more Host pages than are free but would fit if the held pages
+    were free too. Anything else -- a slot limit, a candidate too large even
+    with the held pages, a wave that did select -- is not a wait on held KV,
+    and the no-progress guard must see it. ``selection`` is the wave's
+    ``PrefillSelectionRequest`` (None when there were no candidates).
+    """
+    from batchgen.worker.prefill import PrefillScheduler
+
+    if selection is None or int(held_pages) <= 0:
+        return False
+    if PrefillScheduler.select_prefill_batch(selection):
+        return False
+    slot_admissible = PrefillScheduler.slot_admissible_candidates(selection)
+    for candidate in slot_admissible:
+        needed = PrefillScheduler.required_host_pages(candidate, selection)
+        free = int(selection.per_node_host_free[candidate.node_id])
+        if free < needed <= free + int(held_pages):
+            return True
+    return False
+
+
 def _lcp_bucket(lcp_tokens: int) -> int:
     for index, bound in enumerate(LCP_BUCKET_BOUNDS):
         if lcp_tokens < bound:
