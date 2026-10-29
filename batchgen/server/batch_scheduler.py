@@ -1009,19 +1009,30 @@ class BatchScheduler:
         """Cancel a submitted turn; its waiter fails with 409 turn_aborted.
 
         Returns "dequeued" when the turn was still in the IntakePool (it never
-        reaches a worker), "cancelled" when it was already admitted, or None
-        for a turn that is not pending. An admitted turn is cancelled on the
-        worker (a session_control message, handled at the worker's next
-        admission poll): it is dropped if it has not started, or finishes at
-        the next completion check and is never held; its one completion is
-        discarded here. Runs on the scheduler loop.
+        reaches a worker), or None for a turn that is not pending. A turn
+        already admitted to a worker returns:
+
+        * "detached" without --enable-session-kv-hold: the turn runs to
+          completion on the worker -- there is no worker-side cancel, the same
+          as /v1/batches/{id}/cancel -- and its completion is discarded;
+        * "cancelled" with it: the worker is told to cancel the turn (a
+          session_control message, handled at its next admission poll), which
+          drops it if it has not started or finishes it at the next completion
+          check, never held; its one completion is discarded here.
+
+        Runs on the scheduler loop.
         """
         waiter = self._turn_waiters.pop(turn_id, None)
         if waiter is None:
             return None
         removed = self._intake_pool.remove_batch_entries(turn_id)
         self._intake_pool.remove_batch_info(turn_id)
-        outcome = "dequeued" if removed else "cancelled"
+        if removed:
+            outcome = "dequeued"
+        elif self._session_kv_hold:
+            outcome = "cancelled"
+        else:
+            outcome = "detached"
         if not removed:
             self._detached_turns.add(turn_id)
             self._send_session_control(cancel=[turn_id], reason=reason)
@@ -1210,12 +1221,13 @@ class BatchScheduler:
             },
             "cached_tokens": cached,
             "computed_tokens": result.get("computed_tokens"),
-            # --enable-session-kv-hold: the hold this turn resumed from (LCP,
-            # reused tokens) and the KV it now holds for the next turn.
-            "session_resume": result.get("session_resume"),
-            "session_hold": result.get("session_hold"),
             "timing": timing,
         }
+        if self._session_kv_hold:
+            # The hold this turn resumed from (LCP, reused tokens) and the KV
+            # it now holds for the next turn. Absent without the flag.
+            body["batchgen"]["session_resume"] = result.get("session_resume")
+            body["batchgen"]["session_hold"] = result.get("session_hold")
         logger.info(
             "[TURN] %s done traj=%s session=%s parent=%s prompt=%s cached=%s "
             "computed=%s decoded=%s finish=%s receipt_to_submit_ms=%s "

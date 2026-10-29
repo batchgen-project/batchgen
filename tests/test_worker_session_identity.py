@@ -185,6 +185,8 @@ def test_completion_reports_cached_computed_and_stamps(caplog):
     assert (item["cached_tokens"], item["computed_tokens"]) == (32, 8)
     assert item["admitted_at"] == seq.admitted_at
     assert item["admitted_at"] <= item["completed_at"] <= time.time()
+    # Without --enable-session-kv-hold the item is main's: no hold fields.
+    assert "session_resume" not in item and "session_hold" not in item
     done = [r.getMessage() for r in caplog.records if "[SESSION] complete" in r.getMessage()]
     assert done == [
         "[SESSION] complete request=turn_abc traj=traj-1 session=sess-sub "

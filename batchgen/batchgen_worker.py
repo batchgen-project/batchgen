@@ -3269,14 +3269,17 @@ class BatchGenWorker:
 			"admitted_at": seq.admitted_at,
 			"completed_at": time.time(),
 			# Agent-session KV hold: what this turn reused and what it holds.
-			"session_resume": (
-				None if session_resume is None else {
-					"lcp_tokens": session_resume.lcp_tokens,
-					"cached_tokens": session_resume.cached_tokens,
-					"dropped": session_resume.drop_reason,
-				}
-			),
-			"session_hold": session_hold,
+			# Only with --enable-session-kv-hold; the item is unchanged without.
+			**({} if getattr(self, "_session_hold", None) is None else {
+				"session_resume": (
+					None if session_resume is None else {
+						"lcp_tokens": session_resume.lcp_tokens,
+						"cached_tokens": session_resume.cached_tokens,
+						"dropped": session_resume.drop_reason,
+					}
+				),
+				"session_hold": session_hold,
+			}),
 		})
 
 	# ============ Agent session KV hold (batchgen.worker.session_hold) ============

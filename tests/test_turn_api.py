@@ -95,6 +95,8 @@ class _FakeWorker:
         self.admitted = []
         self.admit_messages = []
         self.control_messages = []
+        # Every message the server put on request_queue, in order.
+        self.messages = []
         self.release = threading.Event()
         self.fatals = []
         self._capacity = capacity
@@ -125,6 +127,8 @@ class _FakeWorker:
                 msg = "idle"
             if msg is None:
                 return
+            if msg != "idle":
+                self.messages.append(msg)
             if self.release.is_set():
                 for entry, admitted_at in held:
                     self._answer(entry, admitted_at)
@@ -805,6 +809,309 @@ def test_e2e_turn_reports_its_session_hold_and_pool_status_metrics(tmp_path):
                                       "dropped": None}
     assert meta["session_hold"] == {"held": True, "kv_tokens": 12, "pages": 1}
     assert metrics == {"held_sessions": 1, "held_kv_tokens": 12, "held_kv_pages": 1}
+
+
+_TURN_ID = __import__("re").compile(r"turn_[0-9a-f]{24}")
+_VOLATILE_KEYS = {"created", "opened_at", "updated_at", "timing", "id",
+                  "admitted_at", "completed_at"}
+
+
+def _normalize_flag_off_record(record):
+    """Replace ids and wall-clock values so two runs compare equal."""
+    names = {}
+
+    def turn_name(match):
+        return names.setdefault(match.group(0), f"turn_{len(names)}")
+
+    def walk(value):
+        if isinstance(value, dict):
+            return {key: ("<volatile>" if key in _VOLATILE_KEYS else walk(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, str):
+            return _TURN_ID.sub(turn_name, value)
+        return value
+
+    return walk(record)
+
+
+def record_flag_off_turn_traffic(tmp_path):
+    """Turns, an abort of an admitted turn, a close and the server -> worker
+    request_queue traffic they cause, without --enable-session-kv-hold.
+
+    Also run against the server modules of main (merge base 686d8e78) to
+    produce FLAG_OFF_MAIN_RECORD below.
+    """
+    async def scenario(client, scheduler, worker, app):
+        out = []
+
+        async def call(label, method, path, body=None):
+            response = await getattr(client, method)(path, json=body)
+            out.append([label, response.status_code, response.json()])
+
+        await call("open s1", "post", "/v1/sessions",
+                   {"traj_id": "traj-1", "session_id": "s1"})
+        await call("turn s1", "post", "/v1/turns", _turn_body("s1", "first"))
+        held = asyncio.ensure_future(
+            client.post("/v1/turns", json=_turn_body("s1", "HOLD")))
+        await _until(lambda: len(worker.admitted) == 2)
+        await call("abort s1", "post", "/v1/sessions/s1/abort",
+                   {"reason": "tool_crash"})
+        aborted = await held
+        out.append(["aborted turn", aborted.status_code, aborted.json()])
+        worker.release.set()
+        await _until(lambda: not scheduler._detached_turns)
+        await call("open s2", "post", "/v1/sessions",
+                   {"traj_id": "traj-2", "session_id": "s2"})
+        await call("turn s2", "post", "/v1/turns",
+                   _turn_body("s2", "second", traj_id="traj-2"))
+        await call("close s2", "post", "/v1/sessions/s2/close",
+                   {"reason": "end_of_trajectory"})
+        await asyncio.sleep(0.1)
+        return {"http": out, "request_queue": list(worker.messages)}
+
+    return _normalize_flag_off_record(asyncio.run(_serve(tmp_path, scenario)))
+
+
+# record_flag_off_turn_traffic() run against the server modules of main at
+# 686d8e78 (the merge base of this branch), normalized.
+FLAG_OFF_MAIN_RECORD = json.loads(r"""
+{
+ "http": [
+  [
+   "open s1",
+   200,
+   {
+    "end_reason": null,
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s1",
+    "state": "open",
+    "traj_id": "traj-1",
+    "turns": 0
+   }
+  ],
+  [
+   "turn s1",
+   200,
+   {
+    "batchgen": {
+     "cached_tokens": 7,
+     "computed_tokens": 37,
+     "session": {
+      "parent_session_id": null,
+      "session_id": "s1",
+      "traj_id": "traj-1"
+     },
+     "timing": "<volatile>",
+     "turn_id": "turn_0"
+    },
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+       "content": "reply to turn_0",
+       "role": "assistant"
+      }
+     }
+    ],
+    "created": "<volatile>",
+    "id": "<volatile>",
+    "model": "gpt-oss-120b",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 44,
+     "prompt_tokens_details": {
+      "cached_tokens": 7
+     },
+     "total_tokens": 47
+    }
+   }
+  ],
+  [
+   "abort s1",
+   200,
+   {
+    "cancelled_turn": "detached",
+    "cancelled_turn_id": "turn_1",
+    "end_reason": "tool_crash",
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s1",
+    "state": "aborted",
+    "traj_id": "traj-1",
+    "turns": 2
+   }
+  ],
+  [
+   "aborted turn",
+   409,
+   {
+    "detail": {
+     "code": "turn_aborted",
+     "message": "turn turn_1 was aborted: session s1 aborted (tool_crash)"
+    }
+   }
+  ],
+  [
+   "open s2",
+   200,
+   {
+    "end_reason": null,
+    "in_flight_turn_id": null,
+    "object": "session",
+    "parent_session_id": null,
+    "session_id": "s2",
+    "state": "open",
+    "traj_id": "traj-2",
+    "turns": 0
+   }
+  ],
+  [
+   "turn s2",
+   200,
+   {
+    "batchgen": {
+     "cached_tokens": 7,
+     "computed_tokens": 38,
+     "session": {
+      "parent_session_id": null,
+      "session_id": "s2",
+      "traj_id": "traj-2"
+     },
+     "timing": "<volatile>",
+     "turn_id": "turn_2"
+    },
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+       "content": "reply to turn_2",
+       "role": "assistant"
+      }
+     }
+    ],
+    "created": "<volatile>",
+    "id": "<volatile>",
+    "model": "gpt-oss-120b",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 45,
+     "prompt_tokens_details": {
+      "cached_tokens": 7
+     },
+     "total_tokens": 48
+    }
+   }
+  ],
+  [
+   "close s2",
+   200,
+   {
+    "closed": [
+     {
+      "end_reason": "end_of_trajectory",
+      "in_flight_turn_id": null,
+      "object": "session",
+      "parent_session_id": null,
+      "session_id": "s2",
+      "state": "closed",
+      "traj_id": "traj-2",
+      "turns": 1
+     }
+    ],
+    "object": "session.close",
+    "reason": "end_of_trajectory"
+   }
+  ]
+ ],
+ "request_queue": [
+  {
+   "entries": [
+    {
+     "batch_id": "turn_0",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_0",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s1",
+     "text": "<system>Reasoning: low<user>first<assistant>",
+     "traj_id": "traj-1"
+    }
+   ],
+   "type": "admit"
+  },
+  {
+   "entries": [
+    {
+     "batch_id": "turn_1",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_1",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s1",
+     "text": "<system>Reasoning: low<user>HOLD<assistant>",
+     "traj_id": "traj-1"
+    }
+   ],
+   "type": "admit"
+  },
+  {
+   "entries": [
+    {
+     "batch_id": "turn_2",
+     "batchgen_debug": {},
+     "ignore_eos": false,
+     "max_tokens": 16,
+     "parent_session_id": null,
+     "priority": 0,
+     "request_id": "turn_2",
+     "sampling_params": {
+      "temperature": 0.5,
+      "top_k": null,
+      "top_p": 1.0
+     },
+     "session_id": "s2",
+     "text": "<system>Reasoning: low<user>second<assistant>",
+     "traj_id": "traj-2"
+    }
+   ],
+   "type": "admit"
+  }
+ ]
+}
+""")
+
+
+def test_flag_off_turn_responses_and_worker_traffic_match_main(tmp_path):
+    """M2: without --enable-session-kv-hold, /v1/turns, abort and close
+    answer exactly as on main and put exactly main's messages on the worker
+    queue (no session_control, abort leaves the turn "detached")."""
+    record = record_flag_off_turn_traffic(tmp_path)
+    assert json.loads(json.dumps(record)) == FLAG_OFF_MAIN_RECORD
 
 
 def test_e2e_turns_coexist_with_a_running_batch(tmp_path):

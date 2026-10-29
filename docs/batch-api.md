@@ -307,11 +307,14 @@ them has a turn running. **Response:** `{"object": "session.close", "reason": �
 
 Optional body `{"reason": "tool_crash"}`. Marks the session `aborted` and
 cancels its in-flight turn, whose caller gets `409 turn_aborted`. A turn still
-queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`); a
-turn already on a worker is cancelled there (`cancelled_turn: "cancelled"`): at
-the worker's next admission poll it is dropped if it has not started, or it
-stops at its next completion check (within one decode interval) and its result
-is discarded. Abort also frees any KV the session holds (see session KV hold).
+queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`). A
+turn already running on a worker runs to completion there and its result is
+discarded (`cancelled_turn: "detached"`) — the same limit as batch cancel.
+With `--enable-session-kv-hold` such a turn is cancelled on the worker instead
+(`cancelled_turn: "cancelled"`): at the worker's next admission poll it is
+dropped if it has not started, or it stops at its next completion check
+(within one decode interval) and its result is discarded; abort then also
+frees any KV the session holds (see session KV hold).
 
 A turn is finished once the server routes its worker completion, even before
 its HTTP response is written. An abort that arrives in that window gets
@@ -369,7 +372,7 @@ rendered exactly as for a `/v1/batches` chat request. `n` must be 1.
 
 `cached_tokens` / `computed_tokens` are the prompt tokens the sequence's last
 prefill took from cache (the prefix cache, or the session's held KV) /
-computed. With session KV hold on, `batchgen` also carries `session_resume`
+computed. Only with session KV hold on, `batchgen` also carries `session_resume`
 (`{"lcp_tokens", "cached_tokens", "dropped"}` when the turn met a held
 session, else `null`) and `session_hold` (`{"held": true, "kv_tokens",
 "pages"}` when the turn's KV is now held, else `null`). Timestamps are wall-clock seconds
@@ -400,7 +403,11 @@ its KV in Host memory until the session's next turn, `close` or `abort`:
   room. Queued turns that wait only because held sessions occupy Host KV are
   counted and logged (`[SESSION_HOLD] admission waits on held KV`).
 
-Metrics (`GET /v1/pool/status` → `session_hold`, and `[SESSION_HOLD] metrics`
+Without the flag the server sends the worker no session messages and the turn,
+abort and pool-status responses are unchanged.
+
+Metrics (`GET /v1/pool/status` → `session_hold`, present only with the flag,
+and `[SESSION_HOLD] metrics`
 log lines): `held_sessions`, `held_kv_tokens`, `held_kv_pages`, `holds`,
 `resumes`, `reload_tokens`, `reload_ms`, `lcp_histogram`, `drops` (held KV not
 reused, by reason: `lcp_below_page`, `superseded`, `evicted_after_resume`,
