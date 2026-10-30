@@ -46,6 +46,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using batchgen::distributed_weights::kAcquireNoWait;
+using batchgen::distributed_weights::kHelloReleaseChannel;
+using batchgen::distributed_weights::kMaxLeasesWhileAcquiring;
 using batchgen::distributed_weights::kStatusRetry;
 using batchgen::distributed_weights::Operation;
 using batchgen::distributed_weights::Request;
@@ -390,13 +392,16 @@ const char* cohort_state_name(CohortState state) {
 // One worker control connection. The accept thread creates it and starts its
 // thread; only FinishCohortSwap or Stop joins that thread. They also close the
 // fd, unless CloseUnadmitted already did and left fd == -1.
-// epoch/worker_id are written by the connection's own thread when its hello
-// is admitted, and read by others only after joining that thread.
+// epoch/worker_id/release_only are written by the connection's own thread
+// when its hello is admitted, and read by others only after joining that
+// thread. A worker has one primary connection and one release-only one; a
+// swap or Stop joins both like any other connection.
 struct ClientConnection {
     int fd = -1;
     std::thread thread;
     std::uint64_t epoch = 0;  // 0 until the hello is admitted
     int worker_id = -1;
+    bool release_only = false;  // kHelloReleaseChannel: carries kRelease only
 };
 
 // What a ring reset found and released. Built under ring_mutex.
@@ -539,6 +544,16 @@ struct DistributedWeightDaemon::Impl {
               (kExperts / workers) % superchunk != 0))) {
             fail("invalid distributed weight ring configuration");
         }
+        // Each worker keeps one waiting acquire outstanding while it holds
+        // up to kMaxLeasesWhileAcquiring leases. A ring every worker's leases
+        // can fill leaves no slot to ready any of the awaited modules.
+        if (static_cast<std::int64_t>(depth) <=
+            static_cast<std::int64_t>(workers) * kMaxLeasesWhileAcquiring) {
+            fail("distributed weight ring too small for receive-ahead: depth " +
+                 std::to_string(depth) + " must exceed workers (" +
+                 std::to_string(workers) + ") * kMaxLeasesWhileAcquiring (" +
+                 std::to_string(kMaxLeasesWhileAcquiring) + ")");
+        }
         staging_bytes =
             static_cast<std::uint64_t>(depth) * module_bytes;
         all_workers_mask =
@@ -641,6 +656,8 @@ struct DistributedWeightDaemon::Impl {
     std::uint64_t cohort_epoch = 1;
     CohortState cohort_state = CohortState::kAdmitting;
     std::uint32_t cohort_admitted_mask = 0;
+    // Admitted workers that also opened their release-only connection.
+    std::uint32_t cohort_release_mask = 0;
     bool cohort_faulted = false;
     std::string cohort_fault;
     std::uint64_t cohort_expected_disconnects = 0;
@@ -917,7 +934,8 @@ struct DistributedWeightDaemon::Impl {
                  std::string(strerror(errno)));
         }
         chmod(socket_path.c_str(), 0600);
-        if (listen(unix_listener, workers) != 0) {
+        // Two connections per worker: the primary and the release-only one.
+        if (listen(unix_listener, 2 * workers) != 0) {
             fail("unix listen failed: " +
                  std::string(strerror(errno)));
         }
@@ -1230,6 +1248,12 @@ struct DistributedWeightDaemon::Impl {
                        batchgen::distributed_weights::kProtocolVersion) +
                    ")";
         }
+        if ((request.flags & ~kHelloReleaseChannel) != 0) {
+            return "invalid distributed weights worker hello flags " +
+                   std::to_string(request.flags);
+        }
+        const bool release_only =
+            (request.flags & kHelloReleaseChannel) != 0;
         if (failed.load()) {
             return TransportFatalMessage();
         }
@@ -1257,11 +1281,28 @@ struct DistributedWeightDaemon::Impl {
         }
         const std::uint32_t bit = static_cast<std::uint32_t>(1)
                                   << request.worker_id;
-        if ((cohort_admitted_mask & bit) != 0) {
-            return worker + " is already connected in worker cohort " +
-                   std::to_string(cohort_epoch);
+        if (release_only) {
+            // The second connection of a worker this epoch already admitted:
+            // it sets no admitted bit and is sent no staging memfd.
+            if ((cohort_admitted_mask & bit) == 0) {
+                return worker + " release connection refused: the worker is "
+                                "not admitted in worker cohort " +
+                       std::to_string(cohort_epoch);
+            }
+            if ((cohort_release_mask & bit) != 0) {
+                return worker + " already has a release connection in worker "
+                                "cohort " +
+                       std::to_string(cohort_epoch);
+            }
+            cohort_release_mask |= bit;
+            connection->release_only = true;
+        } else {
+            if ((cohort_admitted_mask & bit) != 0) {
+                return worker + " is already connected in worker cohort " +
+                       std::to_string(cohort_epoch);
+            }
+            cohort_admitted_mask |= bit;
         }
-        cohort_admitted_mask |= bit;
         connection->epoch = cohort_epoch;
         connection->worker_id = static_cast<int>(request.worker_id);
         return "";
@@ -1314,12 +1355,19 @@ struct DistributedWeightDaemon::Impl {
             admitted = true;
             epoch = connection->epoch;
             worker_id = connection->worker_id;
-            WaitReadyForWorker(600.0);
+            const bool release_only = connection->release_only;
             Response hello;
             hello.staging_bytes = staging_bytes;
             hello.module_bytes = module_bytes;
             hello.generation = epoch;
-            send_response_with_fd(fd, hello, staging_fd);
+            if (release_only) {
+                // The worker's primary connection already waited for the
+                // network and holds the staging memfd.
+                send_exact(fd, &hello, sizeof(hello));
+            } else {
+                WaitReadyForWorker(600.0);
+                send_response_with_fd(fd, hello, staging_fd);
+            }
 
             while (!stop.load()) {
                 Request operation{};
@@ -1333,6 +1381,15 @@ struct DistributedWeightDaemon::Impl {
                         operation.worker_id != request.worker_id ||
                         (operation.flags & ~kAcquireNoWait) != 0) {
                         fail("invalid distributed weight request");
+                    }
+                    if (release_only &&
+                        operation.operation !=
+                            static_cast<std::uint32_t>(Operation::kRelease)) {
+                        fail("distributed weights protocol error: the release "
+                             "connection of worker " +
+                             std::to_string(worker_id) +
+                             " carries kRelease only, got operation " +
+                             std::to_string(operation.operation));
                     }
                     const std::string module_key(
                         operation.module_key,
@@ -2325,6 +2382,7 @@ struct DistributedWeightDaemon::Impl {
             cohort_faulted = false;
             cohort_fault.clear();
             cohort_admitted_mask = 0;
+            cohort_release_mask = 0;
             cohort_expected_disconnects = 0;
             cohort_epoch = retiring + 1;
             cohort_state = CohortState::kAdmitting;

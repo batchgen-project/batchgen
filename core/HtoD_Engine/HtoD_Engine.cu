@@ -319,9 +319,16 @@ void HtoD_Engine::set_producer_state_(ProducerState state) {
 }
 
 void HtoD_Engine::set_copying_or_idle_() {
-    this->set_producer_state_(this->in_flight_.empty()
-                                  ? ProducerState::kIdle
-                                  : ProducerState::kCopying);
+    // An outstanding acquire alone is no copy in flight: it shows as
+    // acquiring, so a stall names the daemon rather than the copy engine.
+    if (this->in_flight_.empty()) {
+        this->set_producer_state_(ProducerState::kIdle);
+    } else if (this->in_flight_.size() == 1 &&
+               this->in_flight_.front().acquiring) {
+        this->set_producer_state_(ProducerState::kAcquiring);
+    } else {
+        this->set_producer_state_(ProducerState::kCopying);
+    }
 }
 
 namespace {
@@ -333,12 +340,20 @@ std::string HtoD_Engine::describe_producer_locked_() const {
     std::string description =
         std::string("state=") + kProducerStates[this->producer_state_.load()];
     if (!this->in_flight_.empty()) {
-        const InFlightCopy& oldest = this->in_flight_.front();
-        description += " module=" + oldest.module_name +
-                       " pass=" + std::to_string(oldest.pass);
+        // The front entry: an acquired-ahead entry moves to the back as its
+        // copies are queued, so this is the first in stream order, not
+        // necessarily the first started.
+        const InFlightCopy& front = this->in_flight_.front();
+        description += " module=" + front.module_name +
+                       " pass=" + std::to_string(front.pass);
         if (this->in_flight_.size() > 1) {
             description +=
                 " in_flight=" + std::to_string(this->in_flight_.size());
+        }
+        for (const InFlightCopy& copy : this->in_flight_) {
+            if (copy.acquiring) {
+                description += " acquiring=" + copy.module_name;
+            }
         }
     }
     return description;
@@ -351,24 +366,34 @@ std::string HtoD_Engine::describe_producer() {
 
 void HtoD_Engine::begin_in_flight_(const std::string& module_type,
                                    const std::string& module_name,
-                                   int64_t buffer_idx, int64_t pass) {
+                                   int64_t buffer_idx,
+                                   module_weight_tensor_map* buffer,
+                                   int64_t pass) {
     const cudaEvent_t event = this->take_copy_event_();
+    InFlightCopy copy;
+    copy.module_type = module_type;
+    copy.module_name = module_name;
+    copy.buffer_idx = buffer_idx;
+    copy.buffer = buffer;
+    copy.pass = pass;
+    copy.event = event;
     std::lock_guard<std::mutex> lock(this->status_mutex_);
-    this->in_flight_.push_back(
-        InFlightCopy{module_type, module_name, buffer_idx, pass, false, event});
+    this->in_flight_.push_back(std::move(copy));
 }
 
 void HtoD_Engine::end_in_flight_(bool oldest) {
+    this->end_in_flight_at_(oldest ? 0 : this->in_flight_.size() - 1);
+}
+
+// The entry of an outstanding acquire need not be the newest: modules of
+// this node's store may start behind it.
+void HtoD_Engine::end_in_flight_at_(size_t index) {
     cudaEvent_t event = nullptr;
     {
         std::lock_guard<std::mutex> lock(this->status_mutex_);
-        if (oldest) {
-            event = this->in_flight_.front().event;
-            this->in_flight_.pop_front();
-        } else {
-            event = this->in_flight_.back().event;
-            this->in_flight_.pop_back();
-        }
+        event = this->in_flight_[index].event;
+        this->in_flight_.erase(this->in_flight_.begin() +
+                               static_cast<std::ptrdiff_t>(index));
     }
     // Reserved for kCopyEvents: never reallocates.
     this->free_copy_events_.push_back(event);
@@ -426,8 +451,9 @@ void HtoD_Engine::count_module_(
 
 // Called from the producer's catch: must not throw. The copy stream is
 // synchronized first, so no copy still writes into a slot about to be
-// abandoned. Every daemon lease in flight is released and every slot in
-// flight abandoned before waiters see the failure.
+// abandoned. An outstanding acquire is drained, and every daemon lease in
+// flight is released and every slot in flight abandoned before waiters see
+// the failure.
 void HtoD_Engine::fail_producer_(const std::string& module_type,
                                  int64_t buffer_idx,
                                  const std::string& module_name,
@@ -440,6 +466,8 @@ void HtoD_Engine::fail_producer_(const std::string& module_type,
         failure += "; synchronizing the copy stream also failed: " +
                    std::string(cudaGetErrorString(synchronized));
     }
+    // Before the walk: a lease in the reply is released with the others.
+    this->drain_acquire_on_failure_(&failure);
     std::vector<std::pair<std::string, int64_t>> filling;
     if (buffer_idx >= 0) {
         filling.emplace_back(module_type, buffer_idx);
@@ -479,8 +507,32 @@ void HtoD_Engine::fail_producer_(const std::string& module_type,
 
 size_t HtoD_Engine::land_copies_(bool wait) {
     size_t landed = 0;
-    while (!this->in_flight_.empty()) {
-        InFlightCopy& copy = this->in_flight_.front();
+    size_t index = 0;
+    while (index < this->in_flight_.size()) {
+        InFlightCopy& copy = this->in_flight_[index];
+        // No copy recorded yet: its acquire's reply is outstanding. Its
+        // pooled event keeps the state of its last use, so it is never
+        // queried or waited on: that would land an uncopied slot. Landing
+        // steps over it instead of stopping. While it is outstanding no
+        // module of its type and no remote module starts, so every entry
+        // behind it is a module of another type read from this node's
+        // store; claim_module_ moves an entry to the back as it records its
+        // copies, so the recorded entries stay in stream order and each
+        // type still lands in its cursor order.
+        if (!copy.recorded) {
+            if (copy.acquiring) {
+                ++index;
+                continue;
+            }
+            // Only an outstanding acquire's entry is unrecorded between
+            // producer steps.
+            if (wait && landed == 0) {
+                throw std::runtime_error(
+                    "HtoD: module in flight " + copy.module_name +
+                    " has no copy recorded");
+            }
+            break;
+        }
         if (wait && landed == 0) {
             // Bounded by the copies queued up to and including this module.
             const auto wait_start = std::chrono::steady_clock::now();
@@ -523,8 +575,8 @@ size_t HtoD_Engine::land_copies_(bool wait) {
                                 copy.module_type);
         }
         // Dropped only after the landing: until then a failure abandons the
-        // slot.
-        this->end_in_flight_(true);
+        // slot. The next entry shifts into index.
+        this->end_in_flight_at_(index);
         ++landed;
     }
     if (landed > 0) {
@@ -538,7 +590,8 @@ py::dict HtoD_Engine::weight_stream_status() {
     result["producer_state"] = kProducerStates[this->producer_state_.load()];
     {
         std::lock_guard<std::mutex> lock(this->status_mutex_);
-        // The oldest module in flight, then every one, oldest first.
+        // The front module in flight, then every one in stream order; an
+        // entry whose acquire is outstanding is marked acquiring.
         result["module_in_flight"] =
             this->in_flight_.empty()
                 ? py::object(py::none())
@@ -552,6 +605,8 @@ py::dict HtoD_Engine::weight_stream_status() {
             entry["module"] = copy.module_name;
             entry["pass"] = copy.pass;
             entry["index"] = copy.buffer_idx;
+            entry["acquiring"] = copy.acquiring;
+            entry["leased"] = copy.leased;
             in_flight.append(entry);
         }
         result["in_flight"] = in_flight;
@@ -643,6 +698,215 @@ py::dict HtoD_Engine::weight_stream_status() {
     return result;
 }
 
+size_t HtoD_Engine::acquiring_index_() const {
+    for (size_t index = 0; index < this->in_flight_.size(); ++index) {
+        if (this->in_flight_[index].acquiring) {
+            return index;
+        }
+    }
+    return this->in_flight_.size();
+}
+
+void HtoD_Engine::claim_module_(
+    size_t index, const std::unordered_map<std::string, tensor_buffer>& src) {
+    // Copied: a skip drops the entry.
+    const std::string module_type = this->in_flight_[index].module_type;
+    const std::string module_name = this->in_flight_[index].module_name;
+    const int64_t buffer_idx = this->in_flight_[index].buffer_idx;
+    auto& queue = this->weights_copy_task_queue_.at(module_type);
+    const auto claim = this->gpu_weight_buffer_.claim_for_copy(
+        module_type, buffer_idx, module_name);
+    // Only this thread pops: the head is still module_name. It goes back to
+    // the tail, so the next pass reads the list in the same order.
+    std::string head;
+    queue.try_pop(head);
+    queue.push(module_name);
+    if (claim == WeightProduction::kSkip) {
+        // No copy, but the daemon lease is still released so the node FIFO
+        // advances. The cursor moves past the module only after that, so its
+        // pass cannot end while the lease is held.
+        this->in_flight_[index].leased = false;
+        this->weights_storage_.release_module(module_name);
+        this->gpu_weight_buffer_.retire_skip(module_type, module_name);
+        this->count_module_(this->skipped_modules_, module_type);
+        this->end_in_flight_at_(index);
+        this->set_copying_or_idle_();
+        return;
+    }
+    if (this->in_flight_[index].buffer == nullptr) {
+        throw std::runtime_error("HtoD: " + module_name +
+                                 " was claimed for a copy without a slot");
+    }
+    // An acquired-ahead entry may have local modules' copies queued behind
+    // it. Its copies go to the stream after theirs, so it moves to the back:
+    // the recorded entries of in_flight_ are always in stream order, which
+    // land_copies_ relies on.
+    if (index + 1 != this->in_flight_.size()) {
+        std::lock_guard<std::mutex> lock(this->status_mutex_);
+        InFlightCopy moved = std::move(this->in_flight_[index]);
+        this->in_flight_.erase(this->in_flight_.begin() +
+                               static_cast<std::ptrdiff_t>(index));
+        this->in_flight_.push_back(std::move(moved));
+        index = this->in_flight_.size() - 1;
+    }
+    this->set_producer_state_(ProducerState::kCopying);
+    auto dst = *this->in_flight_[index].buffer;
+    void* src_ptr;
+    int64_t src_byte_size;
+    uint64_t submitted_tensors = 0;
+    uint64_t submitted_bytes = 0;
+    const auto submit_start = std::chrono::steady_clock::now();
+    for (auto& [tensor_name, host_tensor_storage] : src) {
+        src_ptr = host_tensor_storage.data_ptr;
+        src_byte_size = host_tensor_storage.byte_size;
+        // find(), not operator[]: dst is an unordered_map and operator[]
+        // DEFAULT-INSERTS an undefined torch::Tensor on every miss,
+        // permanently growing a buffer map that is reused across ring slots.
+        auto slot = dst.find(tensor_name);
+        if (slot == dst.end() || !slot->second.defined() ||
+            !slot->second.has_storage()) {
+            // The host map carries a tensor module_shapes declares no slot
+            // for. Continuing drops it silently and the consumer reads
+            // whatever the slot last held.
+            this->logger_->error(
+                "Module {}: host tensor {} has no GPU slot -- module_shapes "
+                "declares no such key",
+                module_name, tensor_name);
+            throw std::runtime_error("HtoD: host tensor has no GPU slot: " +
+                                     tensor_name);
+        }
+        int64_t dst_byte_size = slot->second.nbytes();
+        if (src_byte_size != dst_byte_size) {
+            // The copy writes src_byte_size bytes with no bound check: a
+            // short slot is overrun into its neighbour, a long one keeps a
+            // stale tail. Both are silent and both produce wrong weights.
+            this->logger_->error(
+                "Module {}: tensor {} size mismatch -- host {} B, GPU slot {} "
+                "B (module_shapes/dtype disagrees with the checkpoint)",
+                module_name, tensor_name, src_byte_size, dst_byte_size);
+            throw std::runtime_error(
+                "HtoD: host/GPU byte size mismatch for " + tensor_name);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(slot->second.data_ptr(), src_ptr,
+                                   src_byte_size, cudaMemcpyHostToDevice,
+                                   this->HtoD_stream));
+        submitted_tensors += 1;
+        submitted_bytes += static_cast<uint64_t>(src_byte_size);
+    }
+    // One event after the module's last copy. The stream runs its copies in
+    // order; land_copies_ observes the event, releases the lease and lands
+    // the slot, oldest entry first.
+    CUDA_CHECK(cudaEventRecord(this->in_flight_[index].event,
+                               this->HtoD_stream));
+    this->in_flight_[index].recorded = true;
+    const auto submit_end = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+        if (this->weight_profile_enabled_) {
+            this->weight_profile_tensors_[module_type] += submitted_tensors;
+            this->weight_profile_bytes_[module_type] += submitted_bytes;
+            this->weight_profile_copy_seconds_[module_type] +=
+                std::chrono::duration<double>(submit_end - submit_start)
+                    .count();
+        }
+    }
+    this->logger_->debug("Submitted module: {} to buffer: {}", module_name,
+                         buffer_idx);
+}
+
+bool HtoD_Engine::poll_acquire_(bool block) {
+    const size_t index = this->acquiring_index_();
+    if (index == this->in_flight_.size()) {
+        return false;
+    }
+    // A retry was re-sent at once, so the acquire stays outstanding.
+    acquire_poll polled = this->weights_storage_.poll_acquire(block);
+    if (polled.status != acquire_poll::Status::kReady) {
+        return false;
+    }
+    // release_module() is owed for the module from here.
+    this->in_flight_[index].acquiring = false;
+    this->in_flight_[index].leased = true;
+    this->claim_module_(index, polled.tensors);
+    return true;
+}
+
+// Stopping with an acquire outstanding. Its reply comes within one daemon
+// slice. A lease is claimed like any other: released at its cursor, the
+// daemon would free the slot and never ready the module again.
+void HtoD_Engine::drain_acquire_on_stop_() {
+    const size_t index = this->acquiring_index_();
+    if (index == this->in_flight_.size()) {
+        return;
+    }
+    this->in_flight_[index].acquiring = false;
+    acquire_drain drained = this->weights_storage_.drain_acquire();
+    if (!drained.error.empty()) {
+        throw std::runtime_error("draining the daemon acquire of " +
+                                 this->in_flight_[index].module_name +
+                                 " failed: " + drained.error);
+    }
+    if (!drained.leased) {
+        // A retry: nothing was acquired, and the module stays at its cursor
+        // and the head of its queue, as for a cancelled acquire.
+        const InFlightCopy& copy = this->in_flight_[index];
+        if (copy.buffer_idx >= 0) {
+            this->gpu_weight_buffer_.abandon(copy.module_type,
+                                             copy.buffer_idx);
+        }
+        this->end_in_flight_at_(index);
+        return;
+    }
+    this->in_flight_[index].leased = true;
+    this->claim_module_(index, drained.tensors);
+}
+
+void HtoD_Engine::drain_acquire_on_failure_(std::string* failure) noexcept {
+    const size_t index = this->acquiring_index_();
+    if (index == this->in_flight_.size()) {
+        return;
+    }
+    InFlightCopy& copy = this->in_flight_[index];
+    copy.acquiring = false;
+    const acquire_drain drained = this->weights_storage_.drain_acquire();
+    if (!drained.error.empty()) {
+        *failure += "; draining the daemon acquire of " + copy.module_name +
+                    " also failed: " + drained.error;
+        return;
+    }
+    if (!drained.leased) {
+        // A retry acquired nothing; the module stays at its cursor.
+        return;
+    }
+    copy.leased = true;
+    // The claim moves the cursor and the queue head past the module. No
+    // copy is queued: the slot is abandoned and the lease released with
+    // every other entry by the caller, or now for a pending skip.
+    try {
+        auto& queue = this->weights_copy_task_queue_.at(copy.module_type);
+        const auto claim = this->gpu_weight_buffer_.claim_for_copy(
+            copy.module_type, copy.buffer_idx, copy.module_name);
+        std::string head;
+        queue.try_pop(head);
+        queue.push(copy.module_name);
+        if (claim == WeightProduction::kSkip) {
+            // The claim abandoned the slot.
+            copy.buffer_idx = -1;
+            copy.leased = false;
+            this->weights_storage_.release_module(copy.module_name);
+            this->gpu_weight_buffer_.retire_skip(copy.module_type,
+                                                 copy.module_name);
+            this->count_module_(this->skipped_modules_, copy.module_type);
+        }
+    } catch (const std::exception& error) {
+        *failure += "; claiming the drained acquire of " + copy.module_name +
+                    " also failed: " + std::string(error.what());
+    } catch (...) {
+        *failure += "; claiming the drained acquire of " + copy.module_name +
+                    " also failed";
+    }
+}
+
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     while (!terminate_flag_) {
@@ -665,11 +929,15 @@ void HtoD_Engine::HtoD_Worker() {
         // The first type whose ring had no FREE slot this iteration.
         std::string full_ring_type;
         // Land every copy that completed, oldest first, before anything
-        // else: the consumer may be waiting for one of them.
+        // else: the consumer may be waiting for one of them. The reply of an
+        // acquire outstanding is polled before and after: a lease queues its
+        // module's copies at once, a retry is re-sent at once.
         try {
+            progressed |= this->poll_acquire_(false);
             if (this->land_copies_(false) > 0) {
                 progressed = true;
             }
+            progressed |= this->poll_acquire_(false);
         } catch (const std::exception& error) {
             // Never rethrow: waiters see the failure instead.
             this->fail_producer_("", -1, "", error.what());
@@ -826,20 +1094,36 @@ void HtoD_Engine::HtoD_Worker() {
                 continue;
             }
             weights_parked = false;
-            // A fetch may wait for the node daemon only with no module in
-            // flight, hence no lease held. Blocked in that acquire, the
-            // producer can neither release a lease (the daemon socket carries
-            // one request at a time) nor land a copy its consumer may be
-            // waiting for, while the daemon readies the module only once
-            // other ranks consumed theirs. With copies in flight a remote
-            // module is only tried: one request the daemon answers at once. A
-            // module of this node's registered store holds no lease and is
-            // read at once, so it pipelines freely.
+            // The primary daemon connection carries one request at a time,
+            // so at most one acquire is outstanding, issued in cursor order.
+            const size_t acquiring = this->acquiring_index_();
+            const bool acquire_outstanding =
+                acquiring < this->in_flight_.size();
+            if (acquire_outstanding &&
+                this->in_flight_[acquiring].module_type == module_type) {
+                // The type's cursor module waits for its reply: nothing past
+                // it starts.
+                continue;
+            }
+            // A module of this node's registered store holds no lease and is
+            // read at once, so it pipelines freely, even behind an acquire.
+            const bool remote =
+                this->weights_storage_.is_remote_module(next.module_name);
+            if (remote && acquire_outstanding) {
+                // No other request, not even a try, goes out before the
+                // outstanding acquire's reply.
+                continue;
+            }
+            // With no module in flight, hence no lease held, a remote fetch
+            // blocks in the daemon acquire. With copies in flight it is
+            // acquired ahead instead: one waiting request whose reply is
+            // polled while the copies land, so the copy engine never drains
+            // to idle for it; meanwhile the landings release their leases on
+            // the daemon's release-only connection.
             const bool may_wait = this->in_flight_.empty();
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
-            std::optional<std::reference_wrapper<module_weight_tensor_map>>
-                buffer;
+            module_weight_tensor_map* buffer = nullptr;
             int64_t buffer_idx = -1;
             if (next.kind == WeightProduction::kCopy) {
                 auto optional_buffer =
@@ -850,7 +1134,7 @@ void HtoD_Engine::HtoD_Worker() {
                     }
                     continue;
                 }
-                buffer = optional_buffer->first;
+                buffer = &optional_buffer->first.get();
                 buffer_idx = optional_buffer->second;
             }
             std::string module_name;
@@ -870,15 +1154,24 @@ void HtoD_Engine::HtoD_Worker() {
                 // Named before the fetch and dropped only after its daemon
                 // lease is released: any lease is of a module in flight.
                 this->begin_in_flight_(module_type, module_name, buffer_idx,
-                                       next.pass);
+                                       buffer, next.pass);
+                if (remote && !may_wait) {
+                    // Acquired ahead: the entry holds the reserved slot and
+                    // lands nothing until its reply's copies are queued. An
+                    // acquire issued is no progress, and changes no state.
+                    this->in_flight_.back().acquiring = true;
+                    this->weights_storage_.begin_acquire(module_name);
+                    continue;
+                }
                 if (may_wait) {
-                    // Only a fetch that may wait shows as acquiring: a try
-                    // that finds its module not ready counts no progress.
+                    // Only a fetch that may wait shows as acquiring.
                     this->set_producer_state_(ProducerState::kAcquiring);
                 }
+                // Waits only for a remote module, hence only with nothing in
+                // flight; a local one is ready at once.
                 auto fetched =
                     this->weights_storage_.get_module_weights_storage(
-                        module_name, &this->terminate_flag_, may_wait);
+                        module_name, &this->terminate_flag_);
                 if (fetched.status == module_fetch::Status::kCancelled) {
                     // Stop requested before the daemon readied the module:
                     // nothing is leased, and the module stays at the head of
@@ -891,119 +1184,12 @@ void HtoD_Engine::HtoD_Worker() {
                     this->set_producer_state_(ProducerState::kParked);
                     break;
                 }
-                if (fetched.status == module_fetch::Status::kNotReady) {
-                    // Tried with copies in flight and not ready yet: nothing
-                    // is leased, the module stays at the head of its queue
-                    // and at its cursor, and nothing progressed for this
-                    // type. It is tried again once a copy lands, and fetched
-                    // with a wait once none is in flight.
-                    if (buffer_idx >= 0) {
-                        this->gpu_weight_buffer_.abandon(module_type,
-                                                         buffer_idx);
-                    }
-                    this->end_in_flight_(false);
-                    continue;
-                }
                 progressed = true;
                 // release_module() is owed for module_name: a remote module
                 // holds a daemon lease from its fetch until then.
                 this->in_flight_.back().leased = true;
-                const auto src = std::move(fetched.tensors);
-                const auto claim = this->gpu_weight_buffer_.claim_for_copy(
-                    module_type, buffer_idx, module_name);
-                // Only this thread pops: the head is still module_name. It
-                // goes back to the tail, so the next pass reads the list in
-                // the same order.
-                queue.try_pop(module_name);
-                queue.push(module_name);
-                if (claim == WeightProduction::kSkip) {
-                    // No copy, but the daemon lease is still released so the
-                    // node FIFO advances. The cursor moves past the module
-                    // only after that, so its pass cannot end while the lease
-                    // is held.
-                    this->in_flight_.back().leased = false;
-                    this->weights_storage_.release_module(module_name);
-                    this->gpu_weight_buffer_.retire_skip(module_type,
-                                                         module_name);
-                    this->count_module_(this->skipped_modules_, module_type);
-                    this->end_in_flight_(false);
-                    this->set_copying_or_idle_();
-                    continue;
-                }
-                this->set_producer_state_(ProducerState::kCopying);
-                auto dst = buffer->get();
-                void* src_ptr;
-                int64_t src_byte_size;
-                uint64_t submitted_tensors = 0;
-                uint64_t submitted_bytes = 0;
-                const auto submit_start = std::chrono::steady_clock::now();
-                for (auto& [tensor_name, host_tensor_storage] : src) {
-                    src_ptr = host_tensor_storage.data_ptr;
-                    src_byte_size = host_tensor_storage.byte_size;
-                    // find(), not operator[]: dst is an unordered_map and
-                    // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
-                    // every miss, permanently growing a buffer map that is
-                    // reused across ring slots.
-                    auto slot = dst.find(tensor_name);
-                    if (slot == dst.end() || !slot->second.defined() ||
-                        !slot->second.has_storage()) {
-                        // The host map carries a tensor module_shapes declares
-                        // no slot for. Continuing drops it silently and the
-                        // consumer reads whatever the slot last held.
-                        this->logger_->error(
-                            "Module {}: host tensor {} has no GPU slot -- "
-                            "module_shapes declares no such key",
-                            module_name, tensor_name);
-                        throw std::runtime_error(
-                            "HtoD: host tensor has no GPU slot: " +
-                            tensor_name);
-                    }
-                    int64_t dst_byte_size = slot->second.nbytes();
-                    if (src_byte_size != dst_byte_size) {
-                        // The copy writes src_byte_size bytes with no bound
-                        // check: a short slot is overrun into its
-                        // neighbour, a long one keeps a stale tail. Both are
-                        // silent and both produce wrong weights.
-                        this->logger_->error(
-                            "Module {}: tensor {} size mismatch -- host {} B, "
-                            "GPU slot {} B (module_shapes/dtype disagrees with "
-                            "the checkpoint)",
-                            module_name, tensor_name, src_byte_size,
-                            dst_byte_size);
-                        throw std::runtime_error(
-                            "HtoD: host/GPU byte size mismatch for " +
-                            tensor_name);
-                    }
-                    CUDA_CHECK(cudaMemcpyAsync(slot->second.data_ptr(),
-                                               src_ptr, src_byte_size,
-                                               cudaMemcpyHostToDevice,
-                                               this->HtoD_stream));
-                    submitted_tensors += 1;
-                    submitted_bytes += static_cast<uint64_t>(src_byte_size);
-                }
-                // One event after the module's last copy. The stream runs
-                // its copies in order, so modules complete in submit order;
-                // land_copies_ observes the event, releases the lease and
-                // lands the slot.
-                CUDA_CHECK(cudaEventRecord(this->in_flight_.back().event,
-                                           this->HtoD_stream));
-                const auto submit_end = std::chrono::steady_clock::now();
-                {
-                    std::lock_guard<std::mutex> lock(
-                        this->weight_profile_mutex_);
-                    if (this->weight_profile_enabled_) {
-                        this->weight_profile_tensors_[module_type] +=
-                            submitted_tensors;
-                        this->weight_profile_bytes_[module_type] +=
-                            submitted_bytes;
-                        this->weight_profile_copy_seconds_[module_type] +=
-                            std::chrono::duration<double>(submit_end -
-                                                          submit_start)
-                                .count();
-                    }
-                }
-                this->logger_->debug("Submitted module: {} to buffer: {}",
-                                     module_name, buffer_idx);
+                this->claim_module_(this->in_flight_.size() - 1,
+                                    fetched.tensors);
             } catch (const std::exception& error) {
                 // Never rethrow: an exception leaving this thread is
                 // std::terminate. Waiters see the failure instead.
@@ -1019,11 +1205,21 @@ void HtoD_Engine::HtoD_Worker() {
         if (!progressed) {
             if (!this->in_flight_.empty()) {
                 // Nothing else to do: wait for the oldest copy and land it.
-                // Never park or wait for a slot with a copy un-landed: the
-                // consumer may be waiting for it while it holds every other
-                // slot. Bounded by the copies already queued.
+                // Never park or wait for a slot with a copy un-landed or an
+                // acquire outstanding: the consumer may be waiting for it
+                // while it holds every other slot. Bounded by the copies
+                // already queued. Only when the outstanding acquire is the
+                // sole entry is its reply waited for instead, at most one
+                // daemon slice, and a lease queues its copies; with any copy
+                // recorded, the oldest copy is waited for, so a landing is
+                // never held behind the daemon.
                 try {
-                    this->land_copies_(true);
+                    if (this->in_flight_.size() == 1 &&
+                        this->in_flight_.front().acquiring) {
+                        this->poll_acquire_(true);
+                    } else {
+                        this->land_copies_(true);
+                    }
                 } catch (const std::exception& error) {
                     this->fail_producer_("", -1, "", error.what());
                 } catch (...) {
@@ -1072,9 +1268,18 @@ void HtoD_Engine::HtoD_Worker() {
             }
         }
     }
-    // Stopping: nothing more is submitted, and every copy in flight lands
-    // before the thread exits, bounded by the copies already queued. A
-    // failure abandons the rest.
+    // Stopping: an acquire outstanding is drained first, bounded by one
+    // daemon slice; a lease in its reply is copied or retired as a skip.
+    // Then nothing more is submitted, and every copy in flight lands before
+    // the thread exits, bounded by the copies already queued. A failure
+    // abandons the rest.
+    try {
+        this->drain_acquire_on_stop_();
+    } catch (const std::exception& error) {
+        this->fail_producer_("", -1, "", error.what());
+    } catch (...) {
+        this->fail_producer_("", -1, "", "unknown exception");
+    }
     while (!this->in_flight_.empty()) {
         try {
             this->land_copies_(true);

@@ -212,6 +212,30 @@ bool is_retry_response(const Response& response) {
            response.status == batchgen::distributed_weights::kStatusRetry;
 }
 
+// Connects *socket_fd to the node daemon. The descriptor is stored before
+// connect, so the destructor closes it on any failure.
+void connect_daemon(int* socket_fd, const std::string& socket_path) {
+    *socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (*socket_fd < 0) {
+        throw std::runtime_error(
+            "cannot create distributed weights unix socket");
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (socket_path.size() >= sizeof(address.sun_path)) {
+        throw std::runtime_error(
+            "distributed weights socket path is too long");
+    }
+    std::strncpy(address.sun_path, socket_path.c_str(),
+                 sizeof(address.sun_path) - 1);
+    if (connect(*socket_fd, reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) != 0) {
+        throw std::runtime_error(
+            "cannot connect distributed weights daemon: " +
+            std::string(strerror(errno)));
+    }
+}
+
 }  // namespace
 #include <torch/torch.h>
 #include <unordered_map>
@@ -271,6 +295,9 @@ Weights_Storage::~Weights_Storage() {
     }
     if (this->daemon_socket_ >= 0) {
         close(this->daemon_socket_);
+    }
+    if (this->release_socket_ >= 0) {
+        close(this->release_socket_);
     }
     if(this->logger) {
         this->logger->info("Weights_Storage Destroyed.");
@@ -527,26 +554,7 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         }
     }
 
-    this->daemon_socket_ = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (this->daemon_socket_ < 0) {
-        throw std::runtime_error(
-            "cannot create distributed weights unix socket");
-    }
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    if (socket_path.size() >= sizeof(address.sun_path)) {
-        throw std::runtime_error(
-            "distributed weights socket path is too long");
-    }
-    std::strncpy(address.sun_path, socket_path.c_str(),
-                 sizeof(address.sun_path) - 1);
-    if (connect(this->daemon_socket_,
-                reinterpret_cast<sockaddr*>(&address),
-                sizeof(address)) != 0) {
-        throw std::runtime_error(
-            "cannot connect distributed weights daemon: " +
-            std::string(strerror(errno)));
-    }
+    connect_daemon(&this->daemon_socket_, socket_path);
     Request hello{};
     hello.operation =
         static_cast<uint32_t>(Operation::kHello);
@@ -569,6 +577,34 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         static_cast<uint64_t>(this->distributed_module_bytes_)) {
         throw std::runtime_error(
             "distributed staging module byte mismatch");
+    }
+    // The primary hello is admitted: open the release-only connection, so a
+    // release never waits behind an acquire outstanding on the primary one.
+    connect_daemon(&this->release_socket_, socket_path);
+    Request release_hello{};
+    release_hello.operation = static_cast<uint32_t>(Operation::kHello);
+    release_hello.worker_id = static_cast<uint32_t>(this->device_id_);
+    release_hello.flags =
+        batchgen::distributed_weights::kHelloReleaseChannel;
+    release_hello.generation = cohort_epoch;
+    send_exact(this->release_socket_, &release_hello, sizeof(release_hello));
+    Response release_response{};
+    recv_exact(this->release_socket_, &release_response,
+               sizeof(release_response));
+    if (release_response.status != 0) {
+        throw std::runtime_error(
+            "distributed weights daemon refused the release connection: " +
+            std::string(release_response.error,
+                        strnlen(release_response.error,
+                                sizeof(release_response.error))));
+    }
+    validate_response(release_response);
+    if (release_response.generation != cohort_epoch) {
+        throw std::runtime_error(
+            "distributed weights daemon admitted the release connection "
+            "into cohort " +
+            std::to_string(release_response.generation) + ", expected " +
+            std::to_string(cohort_epoch));
     }
     this->staging_ptr_ =
         mmap(nullptr, this->staging_bytes_, PROT_READ | PROT_WRITE,
@@ -605,15 +641,22 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         pinned_compact_bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
-std::optional<Weights_Storage::active_lease>
-Weights_Storage::acquire_remote_module(
-    const std::string& module_key,
-    const std::atomic<bool>* stop_requested, bool wait) {
-    std::lock_guard<std::mutex> lock(this->daemon_mutex_);
-    if (this->active_leases_.count(module_key) != 0) {
+void Weights_Storage::begin_acquire_locked_(const std::string& module_key,
+                                            bool wait) {
+    // The primary connection carries one request at a time.
+    if (!this->acquire_key_.empty()) {
         throw std::runtime_error(
-            "duplicate remote module acquire in one worker: " +
-            module_key);
+            "an acquire of " + this->acquire_key_ +
+            " is outstanding on the daemon connection; cannot send one "
+            "for " + module_key);
+    }
+    {
+        std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
+        if (this->active_leases_.count(module_key) != 0) {
+            throw std::runtime_error(
+                "duplicate remote module acquire in one worker: " +
+                module_key);
+        }
     }
     Request request{};
     request.operation =
@@ -623,25 +666,64 @@ Weights_Storage::acquire_remote_module(
         wait ? 0 : batchgen::distributed_weights::kAcquireNoWait;
     std::strncpy(request.module_key, module_key.c_str(),
                  sizeof(request.module_key) - 1);
-    Response response{};
-    while (true) {
-        send_exact(this->daemon_socket_, &request, sizeof(request));
-        response = Response{};
-        recv_exact(this->daemon_socket_, &response, sizeof(response));
-        // The daemon waits one bounded slice per request, or none without
-        // wait; a retry means the module is not ready yet and nothing was
-        // acquired.
-        if (!is_retry_response(response)) {
-            break;
-        }
-        // Without wait, one round trip.
-        if (!wait) {
-            return std::nullopt;
-        }
-        if (stop_requested != nullptr && stop_requested->load()) {
-            return std::nullopt;
-        }
+    this->acquire_request_ = request;
+    this->acquire_key_ = module_key;
+    this->acquire_reply_bytes_ = 0;
+    this->resend_acquire_locked_();
+}
+
+void Weights_Storage::resend_acquire_locked_() {
+    try {
+        send_exact(this->daemon_socket_, &this->acquire_request_,
+                   sizeof(this->acquire_request_));
+    } catch (...) {
+        this->acquire_key_.clear();
+        throw;
     }
+}
+
+Weights_Storage::AcquireReply Weights_Storage::receive_acquire_reply_locked_(
+    bool block, active_lease* lease) {
+    try {
+        while (this->acquire_reply_bytes_ < this->acquire_reply_.size()) {
+            const ssize_t received =
+                recv(this->daemon_socket_,
+                     this->acquire_reply_.data() + this->acquire_reply_bytes_,
+                     this->acquire_reply_.size() - this->acquire_reply_bytes_,
+                     block ? MSG_WAITALL : MSG_DONTWAIT);
+            if (received < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (!block && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    return AcquireReply::kPending;
+                }
+                throw std::runtime_error(
+                    "distributed weights recv failed: " +
+                    std::string(strerror(errno)));
+            }
+            if (received == 0) {
+                throw std::runtime_error(
+                    "distributed weights daemon closed the socket");
+            }
+            this->acquire_reply_bytes_ += static_cast<size_t>(received);
+        }
+    } catch (...) {
+        this->acquire_key_.clear();
+        this->acquire_reply_bytes_ = 0;
+        throw;
+    }
+    Response response{};
+    std::memcpy(&response, this->acquire_reply_.data(), sizeof(response));
+    this->acquire_reply_bytes_ = 0;
+    // The daemon waits one bounded slice per request, or none without
+    // wait; a retry means the module is not ready yet and nothing was
+    // acquired.
+    if (is_retry_response(response)) {
+        return AcquireReply::kRetry;
+    }
+    const std::string module_key = std::move(this->acquire_key_);
+    this->acquire_key_.clear();
     validate_response(response);
     if (response.slot < 0 ||
         (static_cast<uint64_t>(response.slot) + 1) *
@@ -651,12 +733,106 @@ Weights_Storage::acquire_remote_module(
         throw std::runtime_error(
             "distributed weights daemon returned invalid slot");
     }
-    active_lease lease{response.slot, response.generation};
+    *lease = active_lease{response.slot, response.generation};
     {
         std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
-        this->active_leases_[module_key] = lease;
+        this->active_leases_[module_key] = *lease;
     }
-    return lease;
+    return AcquireReply::kLeased;
+}
+
+std::optional<Weights_Storage::active_lease>
+Weights_Storage::acquire_remote_module(
+    const std::string& module_key,
+    const std::atomic<bool>* stop_requested, bool wait) {
+    std::lock_guard<std::mutex> lock(this->daemon_mutex_);
+    this->begin_acquire_locked_(module_key, wait);
+    while (true) {
+        active_lease lease;
+        if (this->receive_acquire_reply_locked_(true, &lease) ==
+            AcquireReply::kLeased) {
+            return lease;
+        }
+        // Without wait, one round trip.
+        if (!wait) {
+            this->acquire_key_.clear();
+            return std::nullopt;
+        }
+        if (stop_requested != nullptr && stop_requested->load()) {
+            this->acquire_key_.clear();
+            return std::nullopt;
+        }
+        this->resend_acquire_locked_();
+    }
+}
+
+bool Weights_Storage::is_remote_module(const std::string& module_key) const {
+    return this->module_weights_storage_.count(module_key) == 0 &&
+           this->remote_module_weights_.count(module_key) != 0;
+}
+
+void Weights_Storage::begin_acquire(const std::string& module_key) {
+    if (this->hierarchical_gdr_) {
+        throw std::runtime_error(
+            "hierarchical_gdr rank requested non-local host module: " +
+            module_key);
+    }
+    if (!this->is_remote_module(module_key)) {
+        throw std::runtime_error(
+            "begin_acquire of a module that is not remote: " + module_key);
+    }
+    std::lock_guard<std::mutex> lock(this->daemon_mutex_);
+    this->begin_acquire_locked_(module_key, true);
+}
+
+acquire_poll Weights_Storage::poll_acquire(bool block) {
+    std::lock_guard<std::mutex> lock(this->daemon_mutex_);
+    if (this->acquire_key_.empty()) {
+        throw std::runtime_error("poll_acquire with no acquire outstanding");
+    }
+    const std::string module_key = this->acquire_key_;
+    acquire_poll result;
+    active_lease lease;
+    switch (this->receive_acquire_reply_locked_(block, &lease)) {
+        case AcquireReply::kPending:
+            break;
+        case AcquireReply::kRetry:
+            // Not ready within one slice: the same request goes out again.
+            this->resend_acquire_locked_();
+            result.status = acquire_poll::Status::kRetrySent;
+            break;
+        case AcquireReply::kLeased:
+            result.status = acquire_poll::Status::kReady;
+            result.tensors = this->staging_views_(module_key, lease);
+            break;
+    }
+    return result;
+}
+
+acquire_drain Weights_Storage::drain_acquire() noexcept {
+    acquire_drain result;
+    try {
+        std::lock_guard<std::mutex> lock(this->daemon_mutex_);
+        if (this->acquire_key_.empty()) {
+            return result;
+        }
+        const std::string module_key = this->acquire_key_;
+        active_lease lease;
+        // Bounded: the daemon answers every request within one slice.
+        if (this->receive_acquire_reply_locked_(true, &lease) ==
+            AcquireReply::kRetry) {
+            // Nothing was acquired, and nothing is re-sent.
+            this->acquire_key_.clear();
+            return result;
+        }
+        result.tensors = this->staging_views_(module_key, lease);
+        result.leased = true;
+    } catch (const std::exception& error) {
+        result.error = error.what();
+    } catch (...) {
+        result.error = "unknown exception";
+    }
+    return result;
 }
 
 std::vector<std::string> Weights_Storage::leased_modules() const {
@@ -674,24 +850,46 @@ void Weights_Storage::release_module(
     if (!this->distributed_) {
         return;
     }
-    std::lock_guard<std::mutex> lock(this->daemon_mutex_);
-    auto found = this->active_leases_.find(module_key);
-    if (found == this->active_leases_.end()) {
-        return;
+    // Only the release-only connection: a waiting acquire may be
+    // outstanding on the primary one.
+    std::lock_guard<std::mutex> lock(this->release_mutex_);
+    active_lease lease;
+    {
+        std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
+        auto found = this->active_leases_.find(module_key);
+        if (found == this->active_leases_.end()) {
+            return;
+        }
+        lease = found->second;
     }
     Request request{};
     request.operation =
         static_cast<uint32_t>(Operation::kRelease);
     request.worker_id = static_cast<uint32_t>(this->device_id_);
-    request.generation = found->second.generation;
+    request.generation = lease.generation;
     std::strncpy(request.module_key, module_key.c_str(),
                  sizeof(request.module_key) - 1);
-    send_exact(this->daemon_socket_, &request, sizeof(request));
+    send_exact(this->release_socket_, &request, sizeof(request));
     Response response{};
-    recv_exact(this->daemon_socket_, &response, sizeof(response));
+    recv_exact(this->release_socket_, &response, sizeof(response));
     validate_response(response);
     std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
-    this->active_leases_.erase(found);
+    this->active_leases_.erase(module_key);
+}
+
+std::unordered_map<std::string, tensor_buffer> Weights_Storage::staging_views_(
+    const std::string& module_key, const active_lease& lease) const {
+    const auto& remote = this->remote_module_weights_.at(module_key);
+    std::unordered_map<std::string, tensor_buffer> tensors;
+    char* base =
+        static_cast<char*>(this->staging_ptr_) +
+        static_cast<int64_t>(lease.slot) * this->distributed_module_bytes_;
+    for (const auto& [tensor_key, tensor] : remote) {
+        tensors[tensor_key] = tensor_buffer(
+            base + tensor.module_offset,
+            tensor.tensor_shape, tensor.byte_size, tensor.dtype);
+    }
+    return tensors;
 }
 
 void Weights_Storage::Init(
@@ -839,17 +1037,8 @@ module_fetch Weights_Storage::get_module_weights_storage(
                                      : module_fetch::Status::kNotReady,
                                 {}};
         }
-        module_fetch result{module_fetch::Status::kReady, {}};
-        char* base =
-            static_cast<char*>(this->staging_ptr_) +
-            static_cast<int64_t>(lease->slot) *
-                this->distributed_module_bytes_;
-        for (const auto& [tensor_key, tensor] : remote->second) {
-            result.tensors[tensor_key] = tensor_buffer(
-                base + tensor.module_offset,
-                tensor.tensor_shape, tensor.byte_size, tensor.dtype);
-        }
-        return result;
+        return module_fetch{module_fetch::Status::kReady,
+                            this->staging_views_(module_key, *lease)};
     }
     {
         this->logger->error("Module key not found in storage: {}", module_key);

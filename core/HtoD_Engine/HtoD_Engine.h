@@ -38,6 +38,7 @@
 #include "../GPU_Weight_Buffer/GPU_Weight_Buffer.h"
 #include "../KV_Storage/KV_Storage.h"
 #include "../Weights_Storage/Weights_Storage.h"
+#include "../Weights_Storage/distributed_weights_protocol.h"
 #include "../data_structures.h"
 #include "../threadsafe_queue.h"
 #include "../utils.h"
@@ -111,7 +112,8 @@ class HtoD_Engine {
    private:
     // idle: running, nothing in flight. acquiring: fetching a module's host
     // storage with nothing in flight (a remote module waits for the node
-    // daemon). copying: copies are in flight; a remote module is only tried. parked: the thread is not running. failed: a copy
+    // daemon). copying: copies are in flight; a remote module is acquired
+    // ahead of them. parked: the thread is not running. failed: a copy
     // failed; nothing is copied until set_weight_copy_queue.
     enum class ProducerState : int {
         kIdle = 0,
@@ -131,14 +133,28 @@ class HtoD_Engine {
         std::string module_type;
         std::string module_name;
         int64_t buffer_idx = -1;  // -1: a skip, which holds no slot
+        // The reserved slot's tensors; null for a skip.
+        module_weight_tensor_map* buffer = nullptr;
         int64_t pass = 0;
         bool leased = false;  // release_module() is still owed
+        // Its waiting daemon acquire is outstanding: nothing is leased or
+        // copied yet. At most one entry.
+        bool acquiring = false;
+        // event was recorded after its last copy. A pooled event keeps the
+        // state of its last use, so only a recorded entry can land.
+        bool recorded = false;
         cudaEvent_t event = nullptr;
     };
     // Enough to keep the copy engine busy behind the producer's per-module
     // host work; more only holds more slots and leases.
     static constexpr size_t kMaxCopiesInFlight = 4;
     static constexpr size_t kCopyEvents = kMaxCopiesInFlight + 1;
+    // While its one acquire waits, the producer leases at most every other
+    // entry; the node daemon sizes its staging ring for that bound.
+    static_assert(
+        batchgen::distributed_weights::kMaxLeasesWhileAcquiring ==
+            kMaxCopiesInFlight - 1,
+        "the daemon's ring bound must match the producer's copy pipeline");
 
     void set_producer_state_(ProducerState state);
     // copying while a copy is in flight, else idle.
@@ -151,18 +167,43 @@ class HtoD_Engine {
     // and takes or returns the entry's event.
     void begin_in_flight_(const std::string& module_type,
                           const std::string& module_name, int64_t buffer_idx,
-                          int64_t pass);
+                          module_weight_tensor_map* buffer, int64_t pass);
     void end_in_flight_(bool oldest);
+    void end_in_flight_at_(size_t index);
     cudaEvent_t take_copy_event_();
     // Lands the copies whose event completed, oldest first, and stops at
-    // the first that has not. wait: first waits for the oldest, so at least
-    // one lands. Returns how many landed.
+    // the first that has not. The entry of an outstanding acquire has no
+    // copy recorded and is stepped over: every entry behind it is another
+    // type's local module. wait: first waits for the oldest recorded copy,
+    // so at least one lands. Returns how many landed.
     size_t land_copies_(bool wait);
     // (module_type, buffer_idx): a slot reserved for module_name that may
     // not be in flight yet (-1: none).
     void fail_producer_(const std::string& module_type, int64_t buffer_idx,
                         const std::string& module_name,
                         const std::string& message);
+    // The index of the entry whose acquire is outstanding, else
+    // in_flight_.size().
+    size_t acquiring_index_() const;
+    // The claim path of in_flight_[index], whose host storage is in hand:
+    // claims it at its type's cursor and moves its queue head to the tail,
+    // then queues its copies behind its event or, for a pending skip,
+    // releases its lease and retires it.
+    void claim_module_(
+        size_t index,
+        const std::unordered_map<std::string, tensor_buffer>& src);
+    // Polls the outstanding acquire's reply, if any; block waits for one
+    // whole reply, at most one daemon slice. A lease runs the claim path.
+    // Returns whether it did.
+    bool poll_acquire_(bool block);
+    // On stop: drains the outstanding acquire's reply. A lease runs the
+    // claim path; a retry drops the entry and leaves its module at its
+    // cursor and the head of its queue.
+    void drain_acquire_on_stop_();
+    // From fail_producer_: drains the outstanding acquire's reply and
+    // claims a lease in it, so its release below moves past the module.
+    // Never throws; what fails is appended to failure.
+    void drain_acquire_on_failure_(std::string* failure) noexcept;
 
     /* Template */
     std::atomic<bool> terminate_flag_{false};
