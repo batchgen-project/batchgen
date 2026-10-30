@@ -279,6 +279,7 @@ _METHOD_NAMES = [
     "_sync_session_hold_owner_errors", "_session_hold_ttl_message",
     "_sessions_with_live_turns", "drop_lru_session_holds",
     "_session_pool_resume_enabled", "_apply_session_pool_declines",
+    "_rollback_session_retain",
 ]
 
 
@@ -1033,6 +1034,50 @@ def test_dual_region_hold_refuses_a_region_whose_copy_is_incomplete():
     assert worker.host.resident() == [] and worker.aux.resident() == []
     with pytest.raises(SessionHoldInvariantError, match="incomplete"):
         worker._record_session_hold(seq, worker._trajectory_book.slot_for("turn1"))
+
+
+class _FailingRetainView(_HostView):
+    """An aux region whose retain fails after the primary one succeeded."""
+
+    def retain_sequence_pages(self, gid, pages):
+        raise RuntimeError("aux retain failed")
+
+
+def test_a_failed_aux_retain_rolls_back_the_primary_retain():
+    worker = _DualWorker()
+    worker.aux = _FailingRetainView(free_pages=range(300, 400))
+    seq = _finish_dual_turn(worker, "turn1", 7, list(range(1, 101)),
+                            [500 + i for i in range(30)], own_pages=5)
+    worker._retain_session_pages_for_hold(["turn1"])
+    assert worker._session_hold_owner_errors  # raised on every rank at record
+    # The primary retain is undone: no page left resident in either region.
+    assert worker.host.resident() == [] and worker.aux.resident() == []
+    # The sequence's normal release then frees every page it had.
+    worker.host.release_sequence_pages([seq.global_idx])
+    worker.aux.release_sequence_pages([seq.global_idx])
+    assert sorted(worker.host.free) == list(range(100, 200))
+    assert sorted(worker.aux.free) == list(range(300, 400))
+
+
+def test_a_failed_aux_retain_gives_a_resumed_turn_its_attached_pages_back():
+    worker = _DualWorker()
+    worker.aux = _FailingRetainView(free_pages=range(300, 400))
+    for view, pages in ((worker.host, (90, 91)), (worker.aux, (290, 291))):
+        for page in pages:
+            view.owner[page] = "resident"
+    _finish_dual_turn(worker, "turn1", 7, list(range(1, 101)),
+                      [500 + i for i in range(30)], own_pages=2,
+                      shared={0: (90, 91), 1: (290, 291)})
+    attached = {0: (90, 91), 1: (290, 291)}
+    worker._session_attached_pages[7] = dict(attached)
+    worker._retain_session_pages_for_hold(["turn1"])
+    assert worker._session_hold_owner_errors
+    # Only the previously held pages stay resident, and the turn owns them
+    # again, so its release frees them.
+    assert worker.host.resident() == [90, 91]
+    assert worker._session_attached_pages[7] == attached
+    worker._release_session_prefix_states([7])
+    assert worker.host.resident() == [] and worker.aux.resident() == []
 
 
 def test_glm53_holds_through_the_pool_and_glm52_is_refused_by_name():

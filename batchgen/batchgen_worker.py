@@ -3562,17 +3562,33 @@ class BatchGenWorker:
 					)
 				# Every group's pages cover the same tokens, so the split is
 				# checked in full before any page changes owner.
-				for group_id, view in views.items():
-					own = split[group_id][1]
-					retained = (
-						[int(page) for page in view.retain_sequence_pages(global_id, own)]
-						if own else []
-					)
-					if retained != own:
-						raise session_hold_lib.SessionHoldInvariantError(
-							f"Host KV group {group_id} retained {len(retained)} "
-							f"pages for held turn {uuid}, asked for {len(own)}"
+				done = []
+				try:
+					for group_id, view in views.items():
+						own = split[group_id][1]
+						retained = (
+							[
+								int(page)
+								for page in view.retain_sequence_pages(global_id, own)
+							]
+							if own else []
 						)
+						if retained:
+							done.append((group_id, view, retained))
+						if retained != own:
+							raise session_hold_lib.SessionHoldInvariantError(
+								f"Host KV group {group_id} retained "
+								f"{len(retained)} pages for held turn {uuid}, "
+								f"asked for {len(own)}"
+							)
+				except Exception:
+					# A region retained and a later one failed: give the
+					# retained pages back here, so the sequence's normal
+					# release and the attached pages' owner free exactly what
+					# they would have without the hold -- none leaks as a
+					# resident page nobody names.
+					self._rollback_session_retain(global_id, done, attached)
+					raise
 				self._session_retained_pages[uuid] = {
 					group_id: tuple(pages) for group_id, (pages, _) in split.items()
 				}
@@ -3582,6 +3598,26 @@ class BatchGenWorker:
 				"rank raises at the hold record", self.rank,
 			)
 			errors.append(f"{type(exc).__name__}: {exc}")
+
+	def _rollback_session_retain(self, global_id, done, attached) -> None:
+		"""Owner rank: undo a held turn's partial retain before its error leaves.
+
+		``done`` is ``[(group, view, pages)]`` retained so far: those pages
+		became resident, so they are released as resident pages (the
+		sequence's own release frees only pages it still owns). The pages
+		the turn had attached from its previous hold go back to it, so they
+		are freed with the turn.
+		"""
+		for group_id, view, pages in reversed(done):
+			try:
+				view.release_resident_pages(list(pages))
+			except Exception:
+				logging.exception(
+					"[SESSION_HOLD] rank %s: rolling back %d retained page(s) "
+					"of Host KV group %s failed", self.rank, len(pages), group_id,
+				)
+		if attached:
+			self._session_attached_pages[global_id] = attached
 
 	def _sync_session_hold_owner_errors(self) -> None:
 		"""Every rank: raise an owner rank's deferred hold failure everywhere.
