@@ -11,11 +11,11 @@ import pytest
 import torch
 from unittest.mock import MagicMock, patch
 
+import batchgen.sequence as sequence_module
 from batchgen.sequence import (
     SequenceEntry,
     SequenceStatus,
     SequenceBatch,
-    EXTENSION_GPU_PAGE_BUFFER,
     configure_page_buffers,
 )
 from batchgen.continuous_batching import (
@@ -91,7 +91,7 @@ class TestHostKVGrowth:
 
     def test_needs_host_kv_growth_at_exact_boundary(self):
         """Sequence at exactly extension buffer threshold."""
-        extension_tokens = EXTENSION_GPU_PAGE_BUFFER * 64  # 256
+        extension_tokens = sequence_module.EXTENSION_GPU_PAGE_BUFFER * 64  # 256
         cap = 10000
         # current_context_length + extension_tokens = cap -> needs growth
         decoded = cap - 512 - extension_tokens  # exactly at threshold
