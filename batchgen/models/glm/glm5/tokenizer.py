@@ -33,6 +33,77 @@ GLM5_STOP_TOKEN_IDS = [154820, 154827, 154829]
 GLM5_VOCAB_SIZE = 154880
 
 
+def _hf_tojson(value, ensure_ascii=False, indent=None, separators=None,
+               sort_keys=False):
+    """The ``tojson`` filter of HF chat templates (transformers' signature).
+
+    No HTML escaping, unlike Jinja2's builtin: the result is prompt text.
+    """
+    return json.dumps(
+        value, ensure_ascii=ensure_ascii, indent=indent,
+        separators=separators, sort_keys=sort_keys,
+    )
+
+
+def _tool_call_arguments_as_mappings(messages):
+    """Messages whose assistant ``tool_calls`` carry arguments as mappings.
+
+    OpenAI clients send ``function.arguments`` as a JSON string; the GLM-5.x
+    templates iterate ``arguments.items()``. A string that is not a JSON
+    object is refused by name (it cannot be rendered as arg_key/arg_value
+    pairs). The caller's messages are not modified.
+    """
+    converted = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or not message.get("tool_calls"):
+            continue
+        calls = []
+        changed = False
+        for call in message["tool_calls"]:
+            function = call.get("function") if isinstance(call, dict) else None
+            arguments = None if function is None else function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments) if arguments.strip() else {}
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"message {index}: tool call "
+                        f"{function.get('name')!r} has arguments that are not "
+                        f"JSON: {exc}"
+                    ) from exc
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"message {index}: tool call "
+                        f"{function.get('name')!r} arguments must be a JSON "
+                        f"object, got {type(parsed).__name__}"
+                    )
+                call = {**call, "function": {**function, "arguments": parsed}}
+                changed = True
+            calls.append(call)
+        if changed:
+            if converted is None:
+                converted = list(messages)
+            converted[index] = {**message, "tool_calls": calls}
+    return messages if converted is None else converted
+
+
+def _string_parameters_by_tool(tools):
+    """{function name: parameter names whose schema type is string}."""
+    result = {}
+    for tool in tools or ():
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function", tool)
+        if not isinstance(function, dict) or "name" not in function:
+            continue
+        properties = (function.get("parameters") or {}).get("properties") or {}
+        result[function["name"]] = frozenset(
+            name for name, schema in properties.items()
+            if isinstance(schema, dict) and schema.get("type") == "string"
+        )
+    return result
+
+
 @register_tokenizer("glm_moe_dsa")
 class GLM5Tokenizer(FastTokenizer):
     """GLM-5 tokenizer.
@@ -96,11 +167,18 @@ class GLM5Tokenizer(FastTokenizer):
             # compilation behavior identical apart from the newly supported
             # control tag.
             from jinja2 import Environment
-            self._jinja_template = Environment(
+            environment = Environment(
                 extensions=["jinja2.ext.loopcontrols"],
                 trim_blocks=True,
                 lstrip_blocks=True,
-            ).from_string(self.chat_template)
+            )
+            # Every GLM-5.x template renders tools and non-string tool-call
+            # arguments with ``tojson(ensure_ascii=False)``: the HF chat
+            # template filter. Jinja2's builtin ``tojson`` takes no
+            # ``ensure_ascii`` and raises TypeError on the first request
+            # that carries ``tools``.
+            environment.filters["tojson"] = _hf_tojson
+            self._jinja_template = environment.from_string(self.chat_template)
         else:
             self._jinja_template = None
 
@@ -127,7 +205,7 @@ class GLM5Tokenizer(FastTokenizer):
             raise ValueError("No chat template available for GLM-5 tokenizer.")
 
         rendered = self._jinja_template.render(
-            messages=messages,
+            messages=_tool_call_arguments_as_mappings(messages),
             bos_token="",
             eos_token=self.eos_token or "",
             add_generation_prompt=add_generation_prompt,
@@ -168,9 +246,26 @@ class GLM5Tokenizer(FastTokenizer):
         return None, text
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        return self.parse_tool_calls_with_schema(text, None)
+
+    def parse_tool_calls_with_schema(
+        self, text: str, tools: Optional[List[Dict]]
+    ) -> tuple[Optional[list], str]:
+        """Tool calls in ``text``, typed by the request's tool schemas.
+
+        The template renders a string argument raw and anything else as JSON
+        (``<arg_value>{{ v | tojson if v is not string else v }}``), so a raw
+        value is ambiguous on its own: ``"30"`` may be the string or the
+        number. With the request's ``tools`` a parameter whose schema type is
+        ``string`` keeps its raw text; every other value is read as JSON when
+        it parses and kept as text when it does not. Without ``tools`` (the
+        batch path keeps none per request) every value is read as JSON when
+        it parses.
+        """
         matches = self._TOOL_CALL_RE.findall(text)
         if not matches:
             return None, text
+        string_params = _string_parameters_by_tool(tools)
         tool_calls = []
         for raw in matches:
             raw = raw.strip()
@@ -182,9 +277,13 @@ class GLM5Tokenizer(FastTokenizer):
             else:
                 name = raw[:arg_start].strip()
                 arguments = {}
+                strings = string_params.get(name, frozenset())
                 for am in self._ARG_RE.finditer(raw):
                     key = am.group(1).strip()
                     val = am.group(2).strip()
+                    if key in strings:
+                        arguments[key] = val
+                        continue
                     # Try to parse JSON values (numbers, booleans, objects)
                     try:
                         arguments[key] = json.loads(val)

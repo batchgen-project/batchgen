@@ -73,6 +73,16 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Preserve prior assistant reasoning_content in Kimi-style chat templates",
     )
+    # Request extension (OpenAI SDK ``extra_body``). Only keys naming a
+    # field above are accepted; they are folded into that field at render
+    # time and an unknown key or a conflicting value is refused.
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Chat-template switches: reasoning_effort, enable_thinking, "
+            "thinking, clear_thinking, preserve_thinking"
+        ),
+    )
     # Vendor extension, as in vLLM/SGLang: pass via the OpenAI SDK `extra_body`
     # (or as a top-level body key in a Batch JSONL line). Per request.
     ignore_eos: bool = Field(

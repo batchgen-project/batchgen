@@ -83,7 +83,7 @@ def test_pool_completion_separates_k3_reasoning(tmp_path):
         "<|open|>response<|sep|>The answer is (D)."
         "<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"
     )
-    scheduler._parse_output = lambda model, text: (
+    scheduler._parse_output = lambda model, text, tools=None: (
         "The answer is (D).",
         "private reasoning",
         None,

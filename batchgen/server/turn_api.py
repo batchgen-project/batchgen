@@ -14,6 +14,8 @@ With --enable-session-kv-hold, a finished turn keeps its Host KV until the
 session's next turn (which prefills only the suffix past the longest common
 prefix with the held tokens), close or abort; close and abort free it.
     POST /v1/turns                          one chat-completions turn
+    POST /v1/chat/completions               the same turn for OpenAI clients
+                                            (the body must carry ``session``)
 
 A turn is rendered exactly as a /v1/batches chat request, submitted to the
 shared IntakePool as one entry, and answered when the completion listener
@@ -192,6 +194,18 @@ def register_turn_routes(app: FastAPI) -> None:
 
     @app.post("/v1/turns")
     async def create_turn(request: Request):
+        return await _serve_turn(request, require_session_field=False)
+
+    # The OpenAI chat-completions path, for clients (OpenAI SDK, agent
+    # harnesses) that cannot post to /v1/turns: the same turn, which must
+    # name its session in the body (SDK ``extra_body={"session": {...}}``).
+    # BatchGen serves no sessionless synchronous completion; batches go
+    # through /v1/batches.
+    @app.post("/v1/chat/completions")
+    async def create_chat_completion_turn(request: Request):
+        return await _serve_turn(request, require_session_field=True)
+
+    async def _serve_turn(request: Request, *, require_session_field: bool):
         # Stamped before the body is read: the receipt -> submit leg includes
         # body parsing, validation and prompt rendering.
         received_at = time.time()
@@ -233,6 +247,15 @@ def register_turn_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=400, detail="request body must be a JSON object"
             )
+        if require_session_field and not isinstance(payload.get("session"), dict):
+            raise _http_error(TurnError(
+                400, "session_required",
+                "POST /v1/chat/completions serves agent-session turns only: "
+                "the body needs a 'session' object {traj_id, session_id} of a "
+                "session opened with POST /v1/sessions (OpenAI SDK: "
+                "extra_body={'session': {...}}); submit batches through "
+                "/v1/batches",
+            ))
         try:
             body = TurnRequest(**payload)
         except ValidationError as exc:

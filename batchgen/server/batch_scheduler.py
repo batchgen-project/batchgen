@@ -165,16 +165,61 @@ def turn_timing_summary(timing: Dict[str, Optional[float]]) -> Dict[str, Any]:
     return summary
 
 
+# ``chat_template_kwargs`` keys (a common OpenAI-API request extension) that map
+# onto a ChatCompletionRequest field of the same name. Any other key is
+# refused: BatchGen renders its own templates and would otherwise drop it.
+_CHAT_TEMPLATE_KWARG_FIELDS = (
+    "reasoning_effort", "enable_thinking", "thinking", "clear_thinking",
+    "preserve_thinking",
+)
+
+
+def _apply_chat_template_kwargs(body):
+    """``body`` with its ``chat_template_kwargs`` folded into the named fields.
+
+    A key that is also set as a top-level field must agree with it; an
+    unknown key or a conflict raises ValueError naming it. The folded value
+    goes through the field's own validation (e.g. reasoning_effort's
+    allowed levels).
+    """
+    kwargs = getattr(body, "chat_template_kwargs", None)
+    if not kwargs:
+        return body
+    unknown = sorted(set(kwargs) - set(_CHAT_TEMPLATE_KWARG_FIELDS))
+    if unknown:
+        raise ValueError(
+            f"chat_template_kwargs keys {unknown} are not supported; "
+            f"supported: {list(_CHAT_TEMPLATE_KWARG_FIELDS)}"
+        )
+    update = {}
+    for key, value in kwargs.items():
+        current = getattr(body, key)
+        if current is not None and current != value:
+            raise ValueError(
+                f"chat_template_kwargs.{key}={value!r} conflicts with "
+                f"{key}={current!r}"
+            )
+        update[key] = value
+    data = body.model_dump()
+    data.update(update)
+    data["chat_template_kwargs"] = None
+    return type(body).model_validate(data)
+
+
 class _TurnWaiter:
     """One submitted turn waiting for its completion (scheduler-loop only)."""
 
-    __slots__ = ("turn_id", "model", "session", "future", "timing", "on_routed")
+    __slots__ = (
+        "turn_id", "model", "session", "future", "timing", "on_routed", "tools",
+    )
 
     def __init__(self, turn_id, model, session, future, received_at,
-                 on_routed=None) -> None:
+                 on_routed=None, tools=None) -> None:
         self.turn_id = turn_id
         self.model = model
         self.session = session
+        # The request's tool schemas: they type the parsed call arguments.
+        self.tools = tools
         self.future = future
         # Called on the loop when the completion is routed, before the future
         # resolves (the session registry marks the turn finished).
@@ -703,6 +748,7 @@ class BatchScheduler:
         for request in requests:
             body = request.body
             if isinstance(body, ChatCompletionRequest):
+                body = _apply_chat_template_kwargs(body)
                 model_lower = body.model.lower()
                 if "glm-5.3" in model_lower:
                     if body.enable_thinking is False or body.thinking is False:
@@ -839,8 +885,13 @@ class BatchScheduler:
         self,
         model: str,
         decoded_text: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[str, Optional[str], Optional[List[ToolCall]]]:
         """Apply thinking/tool-call parsing if flags are enabled.
+
+        ``tools`` is the request's tool list when the caller kept it (the
+        turn path); a tokenizer with ``parse_tool_calls_with_schema`` types
+        the call arguments by it.
 
         Returns:
             (content, reasoning_content, tool_calls)
@@ -861,7 +912,13 @@ class BatchScheduler:
 
         if self.server_args.parse_tool_call:
             try:
-                raw_calls, content = tokenizer.parse_tool_calls(content)
+                with_schema = getattr(
+                    tokenizer, "parse_tool_calls_with_schema", None
+                )
+                if with_schema is not None:
+                    raw_calls, content = with_schema(content, tools)
+                else:
+                    raw_calls, content = tokenizer.parse_tool_calls(content)
                 if raw_calls:
                     tool_calls = [
                         ToolCall(
@@ -990,6 +1047,7 @@ class BatchScheduler:
             asyncio.get_running_loop().create_future(),
             received_at,
             on_routed,
+            tools=body.tools,
         )
         # Registered before the submit: the drain discards an intake entry that
         # belongs to neither a live batch nor a live turn.
@@ -1226,7 +1284,9 @@ class BatchScheduler:
                 error.get("message", ""),
             )
             raise TurnError(status, code, error.get("message", ""))
-        body = self._chat_completion_body(waiter.model, result, int(time.time()))
+        body = self._chat_completion_body(
+            waiter.model, result, int(time.time()), waiter.tools
+        )
         cached = result.get("cached_tokens")
         body["usage"]["prompt_tokens_details"] = {"cached_tokens": cached}
         waiter.timing["http_responded_at"] = time.time()
@@ -1875,15 +1935,24 @@ class BatchScheduler:
         })
 
     def _chat_completion_body(
-        self, model: str, result: dict, created_at: int
+        self, model: str, result: dict, created_at: int,
+        tools: "Optional[List[Dict[str, Any]]]" = None,
     ) -> dict:
-        """The chat.completion body for one worker completion item."""
+        """The chat.completion body for one worker completion item.
+
+        A completion that stopped on a stop token and carries parsed tool
+        calls reports ``finish_reason="tool_calls"`` (OpenAI semantics);
+        a length stop keeps ``length``.
+        """
         decoded_text = result.get("text", "")
         prompt_length = result.get("prompt_length", 0)
         decoded_length = result.get("decoded_length", 0)
         content, reasoning_content, tool_calls = self._parse_output(
-            model, decoded_text
+            model, decoded_text, tools
         )
+        finish_reason = result.get("finish_reason", "stop")
+        if tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         message = {
             "role": "assistant",
             "content": content,
@@ -1903,7 +1972,7 @@ class BatchScheduler:
                 "index": 0,
                 "message": message,
                 "logprobs": None,
-                "finish_reason": result.get("finish_reason", "stop"),
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": prompt_length,
