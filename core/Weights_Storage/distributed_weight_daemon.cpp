@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <sched.h>
 #include "../numa_compat.h"
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -526,6 +528,35 @@ struct DistributedWeightDaemon::Impl {
                 rail_devices.push_back(std::move(value));
             }
         }
+        if (config.contains("progress_thread_cores")) {
+            const nlohmann::json& cores = config.at("progress_thread_cores");
+            if (!cores.is_array() ||
+                cores.size() != static_cast<size_t>(kRails)) {
+                fail("distributed weight progress_thread_cores must contain "
+                     "exactly " + std::to_string(kRails) +
+                     " distinct core ids");
+            }
+            for (const nlohmann::json& entry : cores) {
+                if (!entry.is_number_integer()) {
+                    fail("distributed weight progress_thread_cores must "
+                         "contain exactly " + std::to_string(kRails) +
+                         " distinct core ids");
+                }
+                const std::int64_t core = entry.get<std::int64_t>();
+                if (core < 0 || core >= CPU_SETSIZE) {
+                    fail("distributed weight progress_thread_cores entry " +
+                         std::to_string(core) + " is not a valid core id");
+                }
+                if (std::find(progress_thread_cores.begin(),
+                              progress_thread_cores.end(),
+                              static_cast<int>(core)) !=
+                    progress_thread_cores.end()) {
+                    fail("distributed weight progress_thread_cores entry " +
+                         std::to_string(core) + " is repeated");
+                }
+                progress_thread_cores.push_back(static_cast<int>(core));
+            }
+        }
 
         // Eight TP8 workers per node: two nodes are world16, four are world32.
         if ((num_nodes != 2 && num_nodes != 4) || node_rank < 0 ||
@@ -634,6 +665,28 @@ struct DistributedWeightDaemon::Impl {
     std::thread prefetch_thread;
     std::thread summary_thread;
     std::array<std::thread, kRails> progress_threads;
+    // Gap accounting for each rail's progress loop: the time between two
+    // consecutive iterations. The loop otherwise spins, so a large gap means
+    // the thread was off the CPU or one progress call ran long (a burst of
+    // completions, an endpoint teardown) — never that the rail was idle; a
+    // starved thread shows up as rare large gaps while the loop count stays
+    // high. Each counter is written by its own progress thread and read by
+    // the summary thread, so plain relaxed atomics suffice; the alignment
+    // keeps neighbouring rails off each other's cache line, since every
+    // iteration writes `loops`.
+    struct alignas(64) ProgressGaps {
+        std::atomic<std::uint64_t> loops{0};
+        std::atomic<std::uint64_t> gap_ge_1ms{0};
+        std::atomic<std::uint64_t> gap_ge_10ms{0};
+        std::atomic<std::uint64_t> gap_ge_50ms{0};
+        std::atomic<std::uint64_t> max_gap_us{0};
+    };
+    std::array<ProgressGaps, kRails> progress_gaps;
+    // One core id per rail when `progress_thread_cores` is configured; empty
+    // (the default) leaves every progress thread unpinned. A core the kernel
+    // rejects at pin time records a daemon failure and stops the daemon: a
+    // configured pin is a correctness condition, not a hint.
+    std::vector<int> progress_thread_cores;
     std::vector<std::unique_ptr<ClientConnection>> clients;
     std::mutex client_mutex;
 
@@ -1163,9 +1216,53 @@ struct DistributedWeightDaemon::Impl {
         }
         for (int rail = 0; rail < kRails; ++rail) {
             progress_threads[rail] = std::thread([this, rail]() {
+                if (!progress_thread_cores.empty()) {
+                    cpu_set_t cores;
+                    CPU_ZERO(&cores);
+                    CPU_SET(progress_thread_cores[rail], &cores);
+                    const int rc = pthread_setaffinity_np(
+                        pthread_self(), sizeof(cores), &cores);
+                    if (rc != 0) {
+                        // A configured pin that cannot be applied must not
+                        // degrade silently into the unpinned behaviour the
+                        // operator asked to leave.
+                        RecordFailure(
+                            "distributed weight progress thread for rail " +
+                            std::to_string(rail) +
+                            " could not be pinned to core " +
+                            std::to_string(progress_thread_cores[rail]) +
+                            ": " + std::string(std::strerror(rc)));
+                        return;
+                    }
+                }
+                ProgressGaps& gaps = progress_gaps[rail];
+                Clock::time_point previous = Clock::now();
                 while (!stop.load()) {
                     if (ucp_worker_progress(rails[rail].worker) == 0) {
                         std::this_thread::yield();
+                    }
+                    const Clock::time_point now = Clock::now();
+                    const std::uint64_t gap_us = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - previous).count());
+                    previous = now;
+                    gaps.loops.fetch_add(1, std::memory_order_relaxed);
+                    if (gap_us >= 1000) {
+                        gaps.gap_ge_1ms.fetch_add(1, std::memory_order_relaxed);
+                        if (gap_us >= 10000) {
+                            gaps.gap_ge_10ms.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                        if (gap_us >= 50000) {
+                            gaps.gap_ge_50ms.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                    }
+                    std::uint64_t seen =
+                        gaps.max_gap_us.load(std::memory_order_relaxed);
+                    while (gap_us > seen &&
+                           !gaps.max_gap_us.compare_exchange_weak(
+                               seen, gap_us, std::memory_order_relaxed)) {
                     }
                 }
             });
@@ -2294,6 +2391,23 @@ struct DistributedWeightDaemon::Impl {
         summary["ready_unacquired_by_worker"] = ready_unacquired;
         summary["pending_acquire_by_worker"] = pending_by_worker;
         summary["staging_hwm_modules"] = counters.staging_hwm;
+        // One entry per rail. The counters are monotonic over the daemon's
+        // life, so two summaries subtract to the gaps of the interval.
+        nlohmann::json progress_by_rail = nlohmann::json::array();
+        for (int rail = 0; rail < kRails; ++rail) {
+            const ProgressGaps& gaps = progress_gaps[rail];
+            progress_by_rail.push_back({
+                {"loops", gaps.loops.load(std::memory_order_relaxed)},
+                {"gap_ge_1ms", gaps.gap_ge_1ms.load(std::memory_order_relaxed)},
+                {"gap_ge_10ms",
+                 gaps.gap_ge_10ms.load(std::memory_order_relaxed)},
+                {"gap_ge_50ms",
+                 gaps.gap_ge_50ms.load(std::memory_order_relaxed)},
+                {"max_gap_us", gaps.max_gap_us.load(std::memory_order_relaxed)},
+            });
+        }
+        summary["progress_gaps_by_rail"] = progress_by_rail;
+        summary["progress_thread_cores"] = progress_thread_cores;
         const LatencyHistogram& latency = counters.ready_latency;
         summary["ready_latency_ms"] = {
             {"p50", latency.percentile(50)},
