@@ -162,8 +162,23 @@ def test_glm53_parse_thinking_handles_template_primed_completion():
         "First reason.\n</think>\nThe answer is (C)."
     )
 
-    assert reasoning == "First reason."
+    # Reasoning is byte-exact (the template re-renders it raw); the answer
+    # is stripped as the template strips it.
+    assert reasoning == "First reason.\n"
     assert visible == "The answer is (C)."
+    assert tokenizer.parse_thinking("\nR\n</think><tool_call>x</tool_call>") == (
+        "\nR\n", "<tool_call>x</tool_call>"
+    )
+    assert tokenizer.parse_thinking("<think>\nr </think> a ") == ("\nr ", "a")
+    assert tokenizer.parse_thinking("</think>answer") == (None, "answer")
+    assert tokenizer.parse_thinking("plain answer") == (None, "plain answer")
+
+
+def test_glm5_and_glm52_parse_thinking_still_strip_reasoning():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    for cls in (tokenizer_module.GLM5Tokenizer, tokenizer_module.GLM52Tokenizer):
+        tokenizer = object.__new__(cls)
+        assert tokenizer.parse_thinking("\nR\n</think>answer") == ("R", "answer")
 
 
 def test_glm5_parse_thinking_preserves_paired_and_plain_outputs():

@@ -156,6 +156,54 @@ def test_the_next_prompt_extends_the_held_tokens(glm53):
     assert lcp == len(first)
 
 
+@pytest.mark.parametrize("reasoning_text", [
+    "I will list the files.",          # canonical
+    "\nI will list the files.\n",      # newlines around the reasoning
+    "\n\nI will list\nthe files. ",     # inner and trailing whitespace
+])
+def test_turn2_strictly_extends_turn1_through_parsed_reasoning(glm53, reasoning_text):
+    """Round trip: turn-1 output -> parse -> resend -> render turn 2.
+
+    The held tokens are the turn-1 prompt ids followed by the generated ids;
+    turn 2's prompt, rendered from the PARSED turn-1 message as an OpenAI
+    client resends it, must start with every one of them, then the stop
+    token. A stripped reasoning breaks this at the first output token.
+    """
+    prompt = glm53.apply_chat_template(
+        _base(), tokenize=False, add_generation_prompt=True, tools=TOOLS)
+    generated = (
+        reasoning_text + "</think>"
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>ls -la</arg_value>"
+        "</tool_call>"
+    )
+    reasoning, visible = glm53.parse_thinking(generated)
+    assert reasoning == reasoning_text
+    calls, content = glm53.parse_tool_calls_with_schema(visible, TOOLS)
+    assistant = {"role": "assistant", "content": content,
+                 "reasoning_content": reasoning,
+                 "tool_calls": [{"id": calls[0]["id"], "type": "function",
+                                 "function": calls[0]["function"]}]}
+    tool = {"role": "tool", "tool_call_id": calls[0]["id"], "content": "out"}
+    held = (glm53.encode(prompt, add_special_tokens=False)
+            + glm53.encode(generated, add_special_tokens=False))
+    following = glm53.encode(glm53.apply_chat_template(
+        _base() + [assistant, tool], tokenize=False,
+        add_generation_prompt=True, tools=TOOLS), add_special_tokens=False)
+    assert following[:len(held)] == held
+    assert following[len(held)] == 154829  # <|observation|>, the stop token
+
+    if reasoning_text != reasoning_text.strip():
+        # What the stripped parse used to send back: diverges inside the
+        # turn-1 output, so the held output tokens would be recomputed.
+        stripped = dict(assistant, reasoning_content=reasoning_text.strip())
+        diverged = glm53.encode(glm53.apply_chat_template(
+            _base() + [stripped, tool], tokenize=False,
+            add_generation_prompt=True, tools=TOOLS), add_special_tokens=False)
+        first = len(glm53.encode(prompt, add_special_tokens=False))
+        lcp = next(i for i, (a, b) in enumerate(zip(held, diverged)) if a != b)
+        assert first <= lcp < len(held)
+
+
 # ----------------------------------------------------------- server paths
 
 from tests import test_turn_api as turn_tests  # noqa: E402

@@ -382,3 +382,27 @@ class GLM53Tokenizer(GLM5Tokenizer):
                 "Ensure chat_template_5_3.jinja is bundled with the GLM-5 package."
             )
         super().__init__()
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        """Split reasoning from the answer, keeping reasoning byte-exact.
+
+        The GLM-5.3 template re-renders a resent ``reasoning_content`` raw
+        (``'<think>' + reasoning_content + '</think>'``). A stripped
+        reasoning drops the model's own leading or trailing newline, so the
+        next turn's prompt diverges from the generated tokens at the first
+        output token and an agent session reuses none of that output. The
+        answer part is still stripped: the template renders
+        ``content.strip()`` itself.
+        """
+        m = self._THINK_RE.search(text)
+        if m:
+            visible = self._THINK_RE.sub("", text, count=1).strip()
+            return m.group(1), visible
+        # The template primes the assistant turn with ``<think>``, so a
+        # completion carries only the closing marker.
+        close = text.find(self._THINK_CLOSE)
+        if close >= 0:
+            reasoning = text[:close]
+            visible = text[close + len(self._THINK_CLOSE):].strip()
+            return reasoning or None, visible
+        return None, text
