@@ -307,18 +307,183 @@ def test_worker_only_calls_worker_methods_that_exist():
     assert not missing
 
 
-def test_prefill_nsys_profile_is_inert_without_batch_debug():
+def _isolated_prefill_nsys_methods(calls, seam_debug=None, world_size=8):
+    """``begin``/``end`` with torch, dist, logging and the wrapper seam faked.
+
+    ``seam_debug`` stands in for ``AttnWrapperBase.batchgen_debug``, which is
+    where ``_config_prefill_for_batch`` leaves the per-batch debug dict.
+    """
     begin = _isolated_worker_method("_nsys_prefill_profile_begin")
     end = _isolated_worker_method("_nsys_prefill_profile_end")
-    worker = SimpleNamespace(
-        _batchgen_debug={},
-        _debug_flag_enabled=lambda value: False,
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            synchronize=lambda device: calls.append(("synchronize",)),
+            nvtx=SimpleNamespace(
+                range_push=lambda name: calls.append(("nvtx_push", name)),
+                range_pop=lambda: calls.append(("nvtx_pop",)),
+            ),
+            cudart=lambda: SimpleNamespace(
+                cudaProfilerStart=lambda: calls.append(("profiler_start",)),
+                cudaProfilerStop=lambda: calls.append(("profiler_stop",)),
+            ),
+        )
     )
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda: world_size,
+        barrier=lambda: calls.append(("barrier",)),
+    )
+    for method in (begin, end):
+        method.__globals__.update(
+            torch=fake_torch,
+            dist=fake_dist,
+            logging=SimpleNamespace(info=lambda *args, **kwargs: None),
+            AttnWrapperBase=SimpleNamespace(batchgen_debug=seam_debug),
+        )
+    return begin, end
+
+
+def _prefill_nsys_worker(rank, debug=None):
+    parse = _isolated_worker_method("_nsys_prefill_profile_controller_ranks")
+    worker = SimpleNamespace(
+        rank=rank,
+        torch_device=f"cuda:{rank}",
+        _batchgen_debug=debug,
+        _debug_flag_enabled=lambda value: value is True,
+        _nsys_prefill_profile_controller=False,
+    )
+    worker._nsys_prefill_profile_controller_ranks = lambda value: parse(worker, value)
+    return worker
+
+
+def test_prefill_nsys_profile_is_inert_without_batch_debug():
+    calls = []
+    begin, end = _isolated_prefill_nsys_methods(calls, seam_debug=None)
+    worker = _prefill_nsys_worker(0, debug={})
 
     active = begin(worker, local_bsz=42, global_bsz=336)
     end(worker, active)
 
     assert active is False
+    assert calls == []
+
+
+def test_prefill_nsys_profile_reads_the_batch_debug_from_the_wrapper_seam():
+    """``self._batchgen_debug`` is never populated per batch.
+
+    ``_config_prefill_for_batch`` leaves the batch's dict on
+    ``AttnWrapperBase.batchgen_debug`` immediately before the hook runs, so
+    reading only ``self._batchgen_debug`` makes the capture unreachable.
+    """
+    seam = {
+        "glm5_prefill_nsys_profile": True,
+        "glm5_prefill_nsys_profile_ranks": [6],
+    }
+    calls = []
+    begin, end = _isolated_prefill_nsys_methods(calls, seam_debug=seam)
+    worker = _prefill_nsys_worker(6, debug=None)
+
+    active = begin(worker, local_bsz=42, global_bsz=336)
+    end(worker, active)
+
+    assert active is True
+    assert worker._nsys_prefill_profile_controller is True
+    assert ("profiler_start",) in calls
+
+
+def test_prefill_nsys_profile_rejects_ranks_outside_the_world():
+    """A rank no process owns would capture nothing; fail loudly instead."""
+    seam = {
+        "glm5_prefill_nsys_profile": True,
+        "glm5_prefill_nsys_profile_ranks": [99],
+    }
+    calls = []
+    begin, _ = _isolated_prefill_nsys_methods(calls, seam_debug=seam, world_size=8)
+    worker = _prefill_nsys_worker(0)
+
+    with pytest.raises(ValueError, match="outside world size 8"):
+        begin(worker, local_bsz=42, global_bsz=336)
+    # It must raise before any collective, so the ranks cannot desync.
+    assert ("barrier",) not in calls
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, {0}),
+        (6, {6}),
+        ([6], {6}),
+        ((0, 6), {0, 6}),
+        ([6, 6], {6}),
+    ],
+)
+def test_prefill_nsys_profile_ranks_parses_valid_entries(value, expected):
+    parse = _isolated_worker_method("_nsys_prefill_profile_controller_ranks")
+    assert parse(SimpleNamespace(), value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], (), "6", "0,6", [-1], [True], [1.5], {"rank": 6}, 0.0, True],
+)
+def test_prefill_nsys_profile_ranks_rejects_malformed_entries(value):
+    parse = _isolated_worker_method("_nsys_prefill_profile_controller_ranks")
+    with pytest.raises(ValueError, match="glm5_prefill_nsys_profile_ranks"):
+        parse(SimpleNamespace(), value)
+
+
+@pytest.mark.parametrize(
+    "ranks_entry, expected_controllers",
+    [
+        (None, {0}),
+        ([6], {6}),
+        ([0, 6], {0, 6}),
+    ],
+)
+def test_prefill_nsys_profile_gates_only_the_profiler_on_controller_ranks(
+    ranks_entry, expected_controllers
+):
+    debug = {"glm5_prefill_nsys_profile": True}
+    if ranks_entry is not None:
+        debug["glm5_prefill_nsys_profile_ranks"] = ranks_entry
+
+    for rank in (0, 6):
+        calls = []
+        begin, end = _isolated_prefill_nsys_methods(calls, seam_debug=debug)
+        worker = _prefill_nsys_worker(rank)
+
+        active = begin(worker, local_bsz=42, global_bsz=336)
+        end(worker, active)
+
+        assert active is True
+        # The capture window stays collective on EVERY rank: one NVTX range
+        # and four barriers (two in begin, two in end). Gating these would
+        # desync the ranks at the barrier. The exact sequence is asserted so a
+        # regression cannot move the profiler call outside the barrier pair.
+        gated = (
+            [("profiler_start",)] if rank in expected_controllers else []
+        )
+        ungated = (
+            [("profiler_stop",)] if rank in expected_controllers else []
+        )
+        assert calls == (
+            [("synchronize",), ("barrier",)]
+            + gated
+            + [
+                ("barrier",),
+                (
+                    "nvtx_push",
+                    f"BatchGen_prefill_rank_{rank}_local_bsz_42_global_bsz_336",
+                ),
+                ("nvtx_pop",),
+                ("synchronize",),
+                ("barrier",),
+            ]
+            + ungated
+            + [("barrier",)]
+        )
 
 
 def test_cuda_python_runtime_dependency_is_declared():

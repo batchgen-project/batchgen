@@ -1247,6 +1247,7 @@ class BatchGenWorker:
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
+		self._nsys_prefill_profile_controller = False
 		self._decode_local_count_tensor = None
 		self._decode_all_rank_counts = None
 		self._decode_cache_seqlens_i32 = None
@@ -8935,25 +8936,87 @@ class BatchGenWorker:
 		# Enter the persistent generate loop
 		self.generate()
 
+	def _nsys_prefill_profile_controller_ranks(self, value) -> set[int]:
+		"""Global ranks that drive ``cudaProfilerStart/Stop`` for a capture.
+
+		``value`` is the batch-level ``glm5_prefill_nsys_profile_ranks`` entry:
+		a non-empty list of non-negative global ranks. ``None`` keeps the
+		historical rank-0 controller, mirroring the decode path's
+		``BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS`` default.
+
+		Only the profiler start/stop pair is restricted to this set. The NVTX
+		range and both barriers stay collective on EVERY rank, so the capture
+		window remains a global window and ranks cannot desync at the barrier.
+		"""
+		if value is None:
+			return {0}
+		if isinstance(value, int) and not isinstance(value, bool):
+			value = (value,)
+		if (
+			not isinstance(value, (list, tuple, set, frozenset))
+			or not value
+			or any(
+				not isinstance(rank, int)
+				or isinstance(rank, bool)
+				or rank < 0
+				for rank in value
+			)
+		):
+			raise ValueError(
+				"batchgen_debug.glm5_prefill_nsys_profile_ranks must be a "
+				"non-empty list of non-negative global ranks, "
+				f"got {value!r}"
+			)
+		return {int(rank) for rank in value}
+
 	def _nsys_prefill_profile_begin(
 		self,
 		*,
 		local_bsz: int,
 		global_bsz: int,
 	) -> bool:
-		"""Start a batch-debug-gated nsys prefill capture window."""
-		debug = self._batchgen_debug or {}
+		"""Start a batch-debug-gated nsys prefill capture window.
+
+		``self._batchgen_debug`` only ever holds a server-wide override, so the
+		per-batch dict has to come from the ``AttnWrapperBase`` seam that
+		``_config_prefill_for_batch`` fills in immediately before this call —
+		the same fallback every other batch-debug reader uses.
+		"""
+		debug = (
+			self._batchgen_debug
+			or getattr(AttnWrapperBase, "batchgen_debug", None)
+			or {}
+		)
+		if not isinstance(debug, dict):
+			return False
 		if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
 			return False
 
+		controller_ranks = self._nsys_prefill_profile_controller_ranks(
+			debug.get("glm5_prefill_nsys_profile_ranks")
+		)
+		if dist.is_available() and dist.is_initialized():
+			world_size = dist.get_world_size()
+			out_of_range = sorted(
+				rank for rank in controller_ranks if rank >= world_size
+			)
+			if out_of_range:
+				raise ValueError(
+					"batchgen_debug.glm5_prefill_nsys_profile_ranks holds "
+					f"rank(s) {out_of_range} outside world size {world_size}; "
+					"no rank would start the capture"
+				)
+		self._nsys_prefill_profile_controller = self.rank in controller_ranks
 		torch.cuda.synchronize(self.torch_device)
 		if dist.is_available() and dist.is_initialized():
 			dist.barrier()
-		if self.rank == 0:
+		if self._nsys_prefill_profile_controller:
 			logging.info(
-				"[NSYS_PREFILL_PROFILE] starting cuda profiler capture "
-				"global_bsz=%s",
+				"[NSYS_PREFILL_PROFILE] rank=%s starting cuda profiler capture "
+				"global_bsz=%s controller_ranks=%s",
+				self.rank,
 				global_bsz,
+				sorted(controller_ranks),
 			)
 			torch.cuda.cudart().cudaProfilerStart()
 		if dist.is_available() and dist.is_initialized():
@@ -8972,8 +9035,11 @@ class BatchGenWorker:
 		torch.cuda.synchronize(self.torch_device)
 		if dist.is_available() and dist.is_initialized():
 			dist.barrier()
-		if self.rank == 0:
-			logging.info("[NSYS_PREFILL_PROFILE] stopping cuda profiler capture")
+		if self._nsys_prefill_profile_controller:
+			logging.info(
+				"[NSYS_PREFILL_PROFILE] rank=%s stopping cuda profiler capture",
+				self.rank,
+			)
 			torch.cuda.cudart().cudaProfilerStop()
 		if dist.is_available() and dist.is_initialized():
 			dist.barrier()
