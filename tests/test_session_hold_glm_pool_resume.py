@@ -360,12 +360,54 @@ def _host_span(host, layer, pages):
     return torch.cat([host[layer, page] for page in pages], dim=0)
 
 
-def test_a_hold_wave_finishes_without_publishing():
+class _NoCoordinator:
+    """Any prefix-cache call from a hold wave's finish is a publish: refuse."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"a session-hold wave touched the coordinator: {name}")
+
+
+class _RecordingRegion(hold_tests._HostView):
+    def __init__(self, base):
+        self.__dict__.update(base.__dict__)
+        self.calls = []
+
+    def unregister_sequences(self, gids):
+        self.calls.append(("unregister", list(gids)))
+
+    def release_sequence_pages(self, gids):
+        self.calls.append(("release", list(gids)))
+        super().release_sequence_pages(gids)
+
+
+def test_a_hold_wave_finishes_without_publishing_or_freeing_pages():
     worker = _PoolWorker()
     _held(worker)
     _resume(worker)
+    worker._commit_session_resumes()
+    worker.prefix_cache_coordinator = _NoCoordinator()
+    worker.host, worker.aux = _RecordingRegion(worker.host), _RecordingRegion(worker.aux)
+    before = (worker.host.resident(), list(worker.host.free),
+              worker.aux.resident(), list(worker.aux.free))
     worker._finish_prefill_pool_wave()
-    assert worker._prefill_pool_wave is None
+    # Nothing published, no pseudo sequence dropped, no Host page moved: the
+    # kept pages stay the resumed turn's, the freed one stays free.
+    assert worker.host.calls == [] and worker.aux.calls == []
+    assert (worker.host.resident(), list(worker.host.free),
+            worker.aux.resident(), list(worker.aux.free)) == before
+    assert worker.host.resident() == [100, 101] == worker.aux.resident()
+    assert 102 in worker.host.free and 102 in worker.aux.free
+    assert worker._session_attached_pages == {8: {0: (100, 101), 1: (100, 101)}}
+
+
+def test_a_hold_wave_that_computed_a_segment_is_refused_at_finish():
+    worker = _PoolWorker()
+    _held(worker)
+    _resume(worker)
+    worker._prefill_pool_wave.segment_sids = {0: -5}
+    worker.prefix_cache_coordinator = _NoCoordinator()
+    with pytest.raises(RuntimeError, match="may only load held spans"):
+        worker._finish_prefill_pool_wave()
 
 
 # --------------------------------------------------------------------------- #
