@@ -204,6 +204,54 @@ def test_turn2_strictly_extends_turn1_through_parsed_reasoning(glm53, reasoning_
         assert first <= lcp < len(held)
 
 
+def test_string_tool_arguments_are_byte_exact_on_glm53_only(glm53):
+    from tests.test_glm52_tokenizer import _bootstrap_glm52_tokenizer as boot
+
+    text = ("<tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>  cd /repo && ls\n</arg_value>"
+            "<arg_key>timeout</arg_key><arg_value> 30 </arg_value></tool_call>")
+    calls, _ = glm53.parse_tool_calls_with_schema(text, TOOLS)
+    arguments = json.loads(calls[0]["function"]["arguments"])
+    assert arguments == {"command": "  cd /repo && ls\n", "timeout": 30}
+    # Without a schema (the batch path) a non-JSON value is kept raw too.
+    calls, _ = glm53.parse_tool_calls(text)
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == (
+        "  cd /repo && ls\n"
+    )
+    # Earlier GLM templates share the parser and keep their trimming.
+    _, module = boot()
+    for cls in (module.GLM5Tokenizer, module.GLM52Tokenizer):
+        older = object.__new__(cls)
+        calls, _ = older.parse_tool_calls_with_schema(text, TOOLS)
+        assert json.loads(calls[0]["function"]["arguments"])["command"] == (
+            "cd /repo && ls"
+        )
+
+
+def test_turn2_strictly_extends_turn1_through_a_whitespace_string_argument(glm53):
+    prompt = glm53.apply_chat_template(
+        _base(), tokenize=False, add_generation_prompt=True, tools=TOOLS)
+    generated = (
+        "I will look.</think>"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>  cd /repo && ls\n</arg_value></tool_call>"
+    )
+    reasoning, visible = glm53.parse_thinking(generated)
+    calls, content = glm53.parse_tool_calls_with_schema(visible, TOOLS)
+    assistant = {"role": "assistant", "content": content,
+                 "reasoning_content": reasoning,
+                 "tool_calls": [{"id": calls[0]["id"], "type": "function",
+                                 "function": calls[0]["function"]}]}
+    tool = {"role": "tool", "tool_call_id": calls[0]["id"], "content": "out"}
+    held = (glm53.encode(prompt, add_special_tokens=False)
+            + glm53.encode(generated, add_special_tokens=False))
+    following = glm53.encode(glm53.apply_chat_template(
+        _base() + [assistant, tool], tokenize=False,
+        add_generation_prompt=True, tools=TOOLS), add_special_tokens=False)
+    assert following[:len(held)] == held
+    assert following[len(held)] == 154829
+
+
 # ----------------------------------------------------------- server paths
 
 from tests import test_turn_api as turn_tests  # noqa: E402

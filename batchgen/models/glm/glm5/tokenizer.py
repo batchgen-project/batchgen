@@ -122,6 +122,11 @@ class GLM5Tokenizer(FastTokenizer):
     # at init time. Subclasses override this to swap templates while reusing
     # everything else (tokenizer.json, vocab, special tokens).
     CHAT_TEMPLATE_FILENAME = "chat_template.jinja"
+    # Whether a parsed tool-call argument value keeps its exact text. The
+    # GLM-5.3 template re-renders a string value raw between <arg_value>
+    # tags, so a trimmed value alters the API value AND the next turn's
+    # prompt; earlier GLM templates keep the historical trimming.
+    RAW_TOOL_ARGUMENT_VALUES = False
 
     def __init__(self):
         super().__init__(str(TOKENIZER_DIR))
@@ -280,7 +285,9 @@ class GLM5Tokenizer(FastTokenizer):
                 strings = string_params.get(name, frozenset())
                 for am in self._ARG_RE.finditer(raw):
                     key = am.group(1).strip()
-                    val = am.group(2).strip()
+                    val = am.group(2)
+                    if not self.RAW_TOOL_ARGUMENT_VALUES:
+                        val = val.strip()
                     if key in strings:
                         arguments[key] = val
                         continue
@@ -373,6 +380,10 @@ class GLM53Tokenizer(GLM5Tokenizer):
     """
 
     CHAT_TEMPLATE_FILENAME = "chat_template_5_3.jinja"
+    # String arguments round-trip byte-exactly (a shell command's leading
+    # spaces or trailing newline is part of the value); a JSON value is
+    # parsed as before, whitespace being insignificant to json.loads.
+    RAW_TOOL_ARGUMENT_VALUES = True
 
     def __init__(self):
         template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
