@@ -842,3 +842,22 @@ def test_gpu_greedy_output_equal_with_and_without_hold():
     the same token ids as turn 2 with hold OFF (full recompute), given a
     hold-off repeat that is itself deterministic."""
     pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
+
+
+@requires_cuda
+def test_gpu_dual_region_loader_real_h2d_is_byte_exact():
+    """The real CUDA H2D (audit item 2; the CPU tests fake it with memmove).
+
+    On the GLM-5.3 node, with the live DualHostKVCoordinator views and a
+    held span of N >= 3 pages (so >= 2 slabs at 2 pages/slab):
+    for every slab yielded by DualRegionSegmentLoader.slabs(...):
+        torch.equal(slab.latent[l].cpu(),  primary_host_rows(l, window))
+        torch.equal(slab.indexer[l].cpu(), aux_host_rows(l, window))
+    for every layer l in 0..77 and the slab's page window, where
+    *_host_rows reads the pinned Host region directly (KPagePtr view).
+    After _load_dual_region_segments, for every layer l and every slot s of
+    the segment: pool.k[l].view(-1, 576)[s] and
+    pool.indexer[indexer_row[l]].view(-1, 128)[s] equal those Host rows,
+    and every pool slot outside the segment is unchanged.
+    """
+    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
