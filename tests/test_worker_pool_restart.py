@@ -4270,3 +4270,23 @@ def test_session_hold_reconcile_needs_the_resident_sweep_primitive(monkeypatch):
     manager.args.enable_session_kv_hold = True
     with pytest.raises(RuntimeError, match="release_all_sequences_and_resident_pages"):
         manager._release_host_kv_sequences()
+
+
+def test_restart_with_session_hold_frees_held_pages_in_both_dsa_regions(
+    monkeypatch, caplog,
+):
+    """A DSA model holds the indexer keys of the held tokens in the aux
+    region: the reconcile sweeps the resident pages of both regions."""
+    manager = _manager(monkeypatch)
+    primary, aux = _HostRegion(), _HostRegion()
+    manager.host_kv_manager = primary
+    manager.host_kv_aux_manager = aux
+    manager.args.enable_session_kv_hold = True
+    manager.args.enable_prefix_cache = False
+
+    with caplog.at_level(logging.WARNING):
+        manager.restart_workers(timeout_s=1)
+
+    for region in (primary, aux):
+        assert (region.sequence_pages, region.resident_pages) == (0, 0)
+    assert caplog.text.count("reconcile freed 3 held Host KV page(s)") == 2

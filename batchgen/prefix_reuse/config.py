@@ -110,12 +110,24 @@ def require_session_hold_model_support(model_name: str) -> str:
 
     A resumed turn prefills only its suffix over held Host pages through the
     full-K/V prefix materialization path, which exists for GPT-OSS only.
+    The hold bookkeeping itself covers every Host-KV region (a DSA model's
+    indexer keys are held, resumed and freed with its MLA latent), but a DSA
+    model (GLM-5.2/5.3) reuses a prefix only through the in-wave prefill
+    pool, and the pool's cross-wave load of committed pages refuses a second
+    Host region: its resumed turn has no suffix prefill yet.
     """
 
     try:
         model_type = require_prefix_cache_model_support(model_name)
     except ValueError:
         model_type = None
+    if model_type in _DSA_MODEL_TYPES:
+        raise ValueError(
+            f"model {model_name!r} (type {model_type!r}) has no suffix "
+            "prefill over held pages: DSA prefix reuse runs only in the "
+            "in-wave prefill pool, whose load of committed Host pages "
+            "fills one Host region (session KV hold supports GPT-OSS only)"
+        )
     if model_type not in _FULL_KV_MODEL_TYPES:
         raise ValueError(
             f"model {model_name!r} has no suffix prefill over held pages "

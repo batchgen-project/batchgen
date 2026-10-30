@@ -1405,7 +1405,9 @@ class BatchGenWorker:
 		# Owner rank: Host pages a resumed turn attached from its session's
 		# hold, keyed by global_idx (freed with the turn unless held again);
 		# pages retained at completion, keyed by uuid, until the hold record
-		# is written; per-sequence reload seconds until its completion.
+		# is written; per-sequence reload seconds until its completion. Page
+		# values are {Host-KV group: page ids}: one group per Host region
+		# (a DSA model keeps the indexer keys in a second region).
 		self._session_attached_pages = {}
 		self._session_retained_pages = {}
 		self._session_reload_seconds = {}
@@ -1546,7 +1548,7 @@ class BatchGenWorker:
 			prefix_host_config, prefix_aux_config = worker_kv_config, None
 
 		if self.enable_session_kv_hold:
-			self._init_session_hold(args, prefix_host_config)
+			self._init_session_hold(args, prefix_host_config, prefix_aux_config)
 
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
@@ -3325,8 +3327,12 @@ class BatchGenWorker:
 
 	# ============ Agent session KV hold (batchgen.worker.session_hold) ============
 
-	def _init_session_hold(self, args, host_kv_config) -> None:
-		"""Refuse an unsupported configuration by name, then create the book."""
+	def _init_session_hold(self, args, host_kv_config, aux_host_kv_config=None) -> None:
+		"""Refuse an unsupported configuration by name, then create the book.
+
+		``aux_host_kv_config`` is the second Host region of a dual-region
+		model (the DSA indexer keys); a held page costs both regions.
+		"""
 		from batchgen.prefix_reuse.config import (
 			_host_page_bytes_all_layers,
 			require_session_hold_model_support,
@@ -3369,7 +3375,11 @@ class BatchGenWorker:
 		self._session_hold = session_hold_lib.SessionHoldBook(
 			page_tokens=page_tokens, idle_ttl_s=idle_ttl_s,
 		)
-		self._session_hold_page_bytes = int(_host_page_bytes_all_layers(host_kv_config))
+		self._session_hold_page_bytes = sum(
+			int(_host_page_bytes_all_layers(config))
+			for config in (host_kv_config, aux_host_kv_config)
+			if config is not None
+		)
 		# Held KV joins every admission decision (invariant I-A).
 		margin = kv_admission_lib.validate_margin_percent(
 			self._kv_admission_margin_percent,
@@ -3425,6 +3435,22 @@ class BatchGenWorker:
 	def _session_host_view(self):
 		return self._host_views_by_group()[0]
 
+	def _session_host_views(self) -> dict:
+		"""Every Host-KV region's view by group; a hold keeps pages in each.
+
+		A DSA model keeps the MLA latent in group 0 and the indexer keys in
+		group 1 (``_host_views_by_group``): a held page must be retained,
+		attached and released in both, or the indexer keys of the held
+		tokens are freed while their latent is still reused.
+		"""
+		return dict(sorted(self._host_views_by_group().items()))
+
+	def _release_resident_pages_by_group(self, pages_by_group) -> None:
+		views = self._session_host_views()
+		for group_id, pages in sorted(pages_by_group.items()):
+			if pages:
+				views[group_id].release_resident_pages(list(pages))
+
 	def _retain_session_pages_for_hold(self, uuids: List[str]) -> None:
 		"""Owner rank: move the Host pages covering a held turn's KV to resident.
 
@@ -3467,31 +3493,42 @@ class BatchGenWorker:
 				# The Host copy is incomplete: hold nothing.
 				return
 		try:
-			view = self._session_host_view()
+			views = self._session_host_views()
 			global_ids = [
 				self.global_batch.get_sequence(uuid).global_idx for uuid in held
 			]
-			tables = view.build_page_table(global_ids)
-			for uuid, global_id, table in zip(held, global_ids, tables):
+			tables_by_group = {
+				group_id: view.build_page_table(global_ids)
+				for group_id, view in views.items()
+			}
+			for index, (uuid, global_id) in enumerate(zip(held, global_ids)):
 				seq = self.global_batch.get_sequence(uuid)
 				kv_tokens = int(seq.current_context_length) - 1
-				attached = self._session_attached_pages.pop(global_id, ())
-				pages, own = session_hold_lib.split_turn_pages_for_hold(
-					page_table=table,
-					attached_pages=attached,
-					kv_tokens=kv_tokens,
-					page_tokens=self._session_hold.page_tokens,
-				)
-				retained = (
-					[int(page) for page in view.retain_sequence_pages(global_id, own)]
-					if own else []
-				)
-				if retained != own:
-					raise session_hold_lib.SessionHoldInvariantError(
-						f"Host KV retained {len(retained)} pages for held turn "
-						f"{uuid}, asked for {len(own)}"
+				attached = self._session_attached_pages.pop(global_id, {})
+				split = {}
+				for group_id in views:
+					split[group_id] = session_hold_lib.split_turn_pages_for_hold(
+						page_table=tables_by_group[group_id][index],
+						attached_pages=attached.get(group_id, ()),
+						kv_tokens=kv_tokens,
+						page_tokens=self._session_hold.page_tokens,
 					)
-				self._session_retained_pages[uuid] = tuple(pages)
+				# Every group's pages cover the same tokens, so the split is
+				# checked in full before any page changes owner.
+				for group_id, view in views.items():
+					own = split[group_id][1]
+					retained = (
+						[int(page) for page in view.retain_sequence_pages(global_id, own)]
+						if own else []
+					)
+					if retained != own:
+						raise session_hold_lib.SessionHoldInvariantError(
+							f"Host KV group {group_id} retained {len(retained)} "
+							f"pages for held turn {uuid}, asked for {len(own)}"
+						)
+				self._session_retained_pages[uuid] = {
+					group_id: tuple(pages) for group_id, (pages, _) in split.items()
+				}
 		except Exception as exc:
 			logging.exception(
 				"[SESSION_HOLD] rank %s: retaining held pages failed; every "
@@ -3532,11 +3569,16 @@ class BatchGenWorker:
 			)
 		kv_tokens = int(seq.current_context_length) - 1
 		owner = self._owns_host_kv(seq)
-		page_ids = self._session_retained_pages.pop(seq.uuid, None)
-		if owner and page_ids is None:
+		retained = self._session_retained_pages.pop(seq.uuid, None)
+		if owner and retained is None:
 			raise session_hold_lib.SessionHoldInvariantError(
 				f"the owner rank retained no Host pages for held turn {seq.uuid}"
 			)
+		page_ids = None if retained is None else retained[0]
+		aux_page_ids = (
+			None if retained is None
+			else {group: pages for group, pages in retained.items() if group != 0}
+		)
 		record = session_hold_lib.HeldSession(
 			session_id=seq.session_id,
 			traj_id=seq.traj_id,
@@ -3546,12 +3588,16 @@ class BatchGenWorker:
 			kv_tokens=kv_tokens,
 			page_tokens=book.page_tokens,
 			page_ids=page_ids if owner else None,
+			aux_page_ids=aux_page_ids if owner and aux_page_ids else None,
 			held_at=time.monotonic(),
 		)
-		if owner and len(page_ids) != record.pages:
-			raise session_hold_lib.SessionHoldInvariantError(
-				f"held turn {seq.uuid}: {len(page_ids)} pages for {kv_tokens} tokens"
-			)
+		if owner:
+			for group, pages in retained.items():
+				if len(pages) != record.pages:
+					raise session_hold_lib.SessionHoldInvariantError(
+						f"held turn {seq.uuid}: Host KV group {group} holds "
+						f"{len(pages)} pages for {kv_tokens} tokens"
+					)
 		self._session_resumed_uuids.discard(seq.uuid)
 		previous = book.add(record)
 		if previous is not None:
@@ -3572,8 +3618,7 @@ class BatchGenWorker:
 	def _free_held_session(self, record) -> None:
 		"""Every rank: free a hold's slot; the owner also frees its Host pages."""
 		if record.page_ids is not None:
-			if record.page_ids:
-				self._session_host_view().release_resident_pages(list(record.page_ids))
+			self._release_resident_pages_by_group(record.pages_by_group())
 		self._trajectory_book.release(record.trajectory_slot)
 		self._publish_trajectory_pool_capacity()
 
@@ -3796,6 +3841,10 @@ class BatchGenWorker:
 						session_id=seq.session_id,
 						page_ids=pages,
 						cached_tokens=plan.cached_tokens,
+						aux_page_ids={
+							group: tuple(aux[: plan.keep_pages])
+							for group, aux in (record.aux_page_ids or {}).items()
+						},
 					),
 					attached_tokens=plan.keep_pages * record.page_tokens,
 					compute_cached_tokens=plan.cached_tokens,
@@ -3842,12 +3891,19 @@ class BatchGenWorker:
 					f"{uuid} committed"
 				)
 			if record.page_ids is not None:
-				pages = list(record.page_ids)
-				keep, release = pages[: plan.keep_pages], pages[plan.keep_pages:]
-				if release:
-					self._session_host_view().release_resident_pages(release)
-				if keep:
-					self._session_attached_pages[seq.global_idx] = tuple(keep)
+				by_group = record.pages_by_group()
+				keep_by_group = {
+					group: tuple(pages[: plan.keep_pages])
+					for group, pages in by_group.items()
+				}
+				self._release_resident_pages_by_group({
+					group: pages[plan.keep_pages:]
+					for group, pages in by_group.items()
+				})
+				if plan.keep_pages:
+					self._session_attached_pages[seq.global_idx] = keep_by_group
+				keep = keep_by_group[0]
+				release = by_group[0][plan.keep_pages:]
 				logging.info(
 					"[SESSION_HOLD] resume request=%s session=%s held_kv_tokens=%d "
 					"prompt_tokens=%d lcp_tokens=%d cached_tokens=%d "
@@ -3878,7 +3934,7 @@ class BatchGenWorker:
 				self._prefix_sequence_states.pop(int(sequence_id))
 			pages = self._session_attached_pages.pop(int(sequence_id), None)
 			if pages:
-				self._session_host_view().release_resident_pages(list(pages))
+				self._release_resident_pages_by_group(pages)
 
 	def _note_session_evictions(self, evicted_uuids) -> None:
 		"""Every rank: Host-growth eviction chose running sequences (never a hold).

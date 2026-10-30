@@ -267,7 +267,8 @@ class _Book:
 
 
 _METHOD_NAMES = [
-    "_session_hold_eligible", "_session_host_view", "_retain_session_pages_for_hold",
+    "_session_hold_eligible", "_session_host_view", "_session_host_views",
+    "_release_resident_pages_by_group", "_retain_session_pages_for_hold",
     "_record_session_hold", "_free_held_session", "_apply_session_control",
     "_cancel_request", "_pin_session_hold_ranks", "_plan_session_resumes",
     "_session_resume_plan", "_release_held_kv_for_admission",
@@ -456,7 +457,7 @@ def test_resume_reuses_the_lcp_and_frees_held_pages_past_it():
     assert worker.host.resident() == [100, 101, 102]
     worker._commit_session_resumes()
     assert worker.host.resident() == [100, 101]
-    assert worker._session_attached_pages == {8: (100, 101)}
+    assert worker._session_attached_pages == {8: {0: (100, 101)}}
     assert worker._session_hold.get("s1") is None
     assert "turn2" in worker._session_resumed_uuids
     snap = worker._session_hold.snapshot()
@@ -917,3 +918,125 @@ def test_guard_state_passes_through_unless_held_kv_blocks_admission():
     # A request too large even with the held pages freed: not a held-KV wait.
     too_big, _ = _guard_worker(_selection(free=needed - 50))
     assert too_big() is False
+
+
+# --------------------------------------------------------------------------- #
+#  Dual Host-KV regions (DSA: group 0 MLA latent, group 1 indexer keys)
+# --------------------------------------------------------------------------- #
+
+
+class _DualWorker(_Worker):
+    """Two Host regions whose page ids differ, as two allocators can."""
+
+    def __init__(self, rank=0):
+        super().__init__(rank=rank)
+        self.aux = _HostView(free_pages=range(300, 400))
+
+    def _host_views_by_group(self):
+        return {0: self.host, 1: self.aux}
+
+
+def _finish_dual_turn(worker, uuid, gid, prompt, decoded, *, own_pages, shared=None):
+    seq = _finish_turn(worker, uuid, gid, prompt, decoded, own_pages=own_pages,
+                       shared=(shared or {}).get(0, ()))
+    if worker.rank == 0:
+        worker.aux.allocate(gid, own_pages, shared=(shared or {}).get(1, ()))
+    return seq
+
+
+def _dual_hold(worker, seq):
+    worker._retain_session_pages_for_hold([seq.uuid] if worker.rank == 0 else [])
+    if worker.rank == 0:
+        worker.host.release_sequence_pages([seq.global_idx])
+        worker.aux.release_sequence_pages([seq.global_idx])
+    slot = worker._trajectory_book.slot_for(seq.uuid)
+    return worker._record_session_hold(seq, slot)
+
+
+def _dual_held_worker():
+    worker = _DualWorker()
+    prompt, decoded = list(range(1, 101)), [500 + i for i in range(30)]
+    _dual_hold(worker, _finish_dual_turn(worker, "turn1", 7, prompt, decoded,
+                                         own_pages=5))
+    return worker, prompt, decoded
+
+
+def test_dual_region_hold_keeps_the_same_tokens_in_both_regions():
+    worker, _, _ = _dual_held_worker()
+    record = worker._session_hold.get("s1")
+    assert record.page_ids == (100, 101, 102)
+    assert record.aux_page_ids == {1: (300, 301, 302)}
+    assert record.pages_by_group() == {0: (100, 101, 102), 1: (300, 301, 302)}
+    assert worker.host.resident() == [100, 101, 102]
+    assert worker.aux.resident() == [300, 301, 302]
+    assert {103, 104} <= set(worker.host.free)
+    assert {303, 304} <= set(worker.aux.free)
+
+
+def test_dual_region_resume_attaches_and_frees_per_region():
+    worker, prompt, decoded = _dual_held_worker()
+    worker.add_seq("turn2", 8, prompt + decoded[:10] + [900 + i for i in range(40)])
+    worker._plan_session_resumes(["turn2"])
+    state = worker._prefix_sequence_states[8]
+    assert state.shared_page_ids_for_group(0) == (100, 101)
+    assert state.shared_page_ids_for_group(1) == (300, 301)
+    worker._commit_session_resumes()
+    assert worker.host.resident() == [100, 101]
+    assert worker.aux.resident() == [300, 301]
+    assert worker._session_attached_pages == {8: {0: (100, 101), 1: (300, 301)}}
+    # A resumed turn that ends without a hold frees its pages in both.
+    worker._release_session_prefix_states([8])
+    assert worker.host.resident() == [] and worker.aux.resident() == []
+
+
+def test_dual_region_hold_of_a_resumed_turn_carries_both_regions_forward():
+    worker, prompt, decoded = _dual_held_worker()
+    new_prompt = prompt + decoded[:10] + [900 + i for i in range(40)]
+    worker.add_seq("turn2", 8, new_prompt)
+    worker._plan_session_resumes(["turn2"])
+    worker._commit_session_resumes()
+    turn2 = worker.global_batch.get_sequence("turn2")
+    for status in (SequenceStatus.IN_PREFILL, SequenceStatus.PREFILLED,
+                   SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED):
+        worker.global_batch.update_status("turn2", status)
+    turn2.decoded_length = 20
+    turn2.original_prompt_length = len(new_prompt)
+    turn2.current_context_length = len(new_prompt) + 20  # KV 169 tokens
+    own = worker.host.allocate(8, 4, shared=(100, 101))
+    aux_own = worker.aux.allocate(8, 4, shared=(300, 301))
+    worker._trajectory_book.tokens[worker._trajectory_book.slot_for("turn2")] += [3] * 20
+    _dual_hold(worker, turn2)
+    record = worker._session_hold.get("s1")
+    assert record.page_ids == (100, 101, own[0])
+    assert record.aux_page_ids == {1: (300, 301, aux_own[0])}
+    assert worker.aux.resident() == sorted([300, 301, aux_own[0]])
+
+
+def test_dual_region_close_frees_both_regions():
+    worker, _, _ = _dual_held_worker()
+    worker._apply_session_control({
+        "type": "session_control", "cancel": [],
+        "release": [{"session_id": "s1", "reason": "closed"}],
+    })
+    assert worker.host.resident() == [] and worker.aux.resident() == []
+    assert worker._session_hold.snapshot()["held_kv_pages"] == 0
+
+
+def test_dual_region_hold_refuses_a_region_whose_copy_is_incomplete():
+    worker = _DualWorker()
+    prompt, decoded = list(range(1, 101)), [500 + i for i in range(30)]
+    seq = _finish_turn(worker, "turn1", 7, prompt, decoded, own_pages=5)
+    worker.aux.allocate(7, 2)  # the aux region covers 128 of 129 KV tokens
+    worker._retain_session_pages_for_hold(["turn1"])
+    # No page changed owner in either region; every rank raises at the record.
+    assert worker.host.resident() == [] and worker.aux.resident() == []
+    with pytest.raises(SessionHoldInvariantError, match="incomplete"):
+        worker._record_session_hold(seq, worker._trajectory_book.slot_for("turn1"))
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3-FP8", "zai-org/GLM-5.2-FP8"])
+def test_dsa_models_are_refused_with_the_missing_resume_path_named(model):
+    from batchgen.prefix_reuse.config import require_session_hold_model_support
+
+    with pytest.raises(ValueError, match="in-wave prefill pool"):
+        require_session_hold_model_support(model)

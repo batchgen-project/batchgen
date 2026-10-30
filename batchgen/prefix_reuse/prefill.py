@@ -32,6 +32,9 @@ class SessionHeldPrefixPages:
     page_ids: tuple[int, ...]
     cached_tokens: int
     attachment_handle: int = 0
+    # The same tokens' held pages in every other Host-KV group (DSA indexer
+    # keys in group 1), by group; empty for a single-region model.
+    aux_page_ids: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,9 @@ class PrefixCacheSequenceState:
         if self.attached_tokens == 0:
             return ()
         if isinstance(self.lookup_result, SessionHeldPrefixPages):
-            return self.lookup_result.page_ids if int(group_id) == 0 else ()
+            if int(group_id) == 0:
+                return self.lookup_result.page_ids
+            return tuple(self.lookup_result.aux_page_ids.get(int(group_id), ()))
         if self.lookup_result is None:
             return tuple(self.planned_shared_page_ids.get(int(group_id), ()))
         spans = [

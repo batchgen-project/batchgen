@@ -1058,12 +1058,13 @@ class WorkerManager:
         # server-owned memfd that survives the restart, so the new cohort
         # could never free them. With holds on, the prefix cache (the other
         # resident-page owner) is refused at startup, so every resident page
-        # of the primary region belongs to a hold: sweep them all.
+        # belongs to a hold: sweep them all, in every region (a DSA model
+        # holds the indexer keys of the same tokens in the aux region).
         sweep_held = bool(getattr(self.args, "enable_session_kv_hold", False))
         for manager in (self.host_kv_manager, self.host_kv_aux_manager):
             if manager is None:
                 continue
-            if sweep_held and manager is self.host_kv_manager:
+            if sweep_held:
                 if getattr(self.args, "enable_prefix_cache", False):
                     raise RuntimeError(
                         "session KV hold reconcile refuses to sweep resident "

@@ -95,6 +95,9 @@ class HeldSession:
     page_tokens: int
     # Owner rank only: the resident Host pages, in token order.
     page_ids: Optional[Tuple[int, ...]] = None
+    # Owner rank only, dual-region models (DSA: group 1 = indexer keys): the
+    # same tokens' resident pages in every other Host-KV group, by group.
+    aux_page_ids: Optional[Dict[int, Tuple[int, ...]]] = None
     # Order of the hold among all holds (SessionHoldBook.add); rank-uniform,
     # so it orders LRU victims identically on every rank.
     hold_seq: int = 0
@@ -105,6 +108,15 @@ class HeldSession:
     @property
     def pages(self) -> int:
         return ceil_div(self.kv_tokens, self.page_tokens)
+
+    def pages_by_group(self) -> Dict[int, Tuple[int, ...]]:
+        """Owner rank: {Host-KV group: resident pages}; group 0 is page_ids."""
+        if self.page_ids is None:
+            raise SessionHoldInvariantError(
+                f"session {self.session_id}: pages_by_group on a rank that "
+                "does not own the held Host KV"
+            )
+        return {0: tuple(self.page_ids), **dict(self.aux_page_ids or {})}
 
 
 @dataclass(frozen=True)
