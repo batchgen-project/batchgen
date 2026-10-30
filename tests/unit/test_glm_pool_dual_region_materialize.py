@@ -773,23 +773,24 @@ def test_a_single_region_wave_keeps_the_latent_expansion_loader(monkeypatch):
 
 def test_gpt_oss_session_hold_path_is_untouched_by_this_change():
     """The GPT-OSS resume loads held pages straight into GPU paged KV
-    (``materialize_gpt_oss_prefixes``), not through the pool; this change
-    touches neither that module nor the full-K/V support gate."""
+    (``materialize_gpt_oss_prefixes``), not through the pool; GLM-5.3 is
+    the one model that resumes through the pool load."""
     from batchgen.prefix_reuse.config import require_session_hold_model_support
 
-    assert require_session_hold_model_support("openai/gpt-oss-120b")
-    with pytest.raises(ValueError, match="does not yet plan a held span"):
-        require_session_hold_model_support("zai-org/GLM-5.3-FP8")
+    assert require_session_hold_model_support("openai/gpt-oss-120b") == "gpt_oss"
+    assert require_session_hold_model_support("zai-org/GLM-5.3-FP8") == (
+        "glm_moe_dsa_5_3"
+    )
 
 
 # --------------------------------------------------------------------------- #
 #  8. GPU validation (8xH200, GLM-5.3) -- skipped without CUDA
 # --------------------------------------------------------------------------- #
 #
-# These cannot run on CPU: they need a live GLM-5.3 server with the session
-# hold enabled on the pool path (R1b + R1c, not implemented by this change).
-# Each names the exact assertion the GPU validation must make; the runner is
-# the 4b checklist in the GLM-5.3 adaptation spec.
+# These cannot run on CPU: they need a live GLM-5.3 server launched with
+# --enable-session-kv-hold (pool resume, no --enable-prefix-cache). Each names
+# the exact assertion the GPU validation must make; the runner is the 4b
+# checklist in the GLM-5.3 adaptation spec.
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -803,11 +804,12 @@ def test_gpu_turn2_cached_tokens_equal_turn1_context_across_waves():
 
     assert usage.prompt_tokens_details.cached_tokens(turn 2)
         == (turn1_kv_tokens // 64) * 64   # turn1_kv = prompt + output - 1
-    assert the [SESSION_HOLD] resume line's cached_tokens equals it, and the
-        [PREFIX_POOL] 'loaded materialized segment' line names the same token
-        count over the same Host page count in both regions.
-    NOTE: equality with the UNROUNDED turn-1 context needs a partial-page
-    pool segment; a pool segment is whole pages (see design R1c).
+    (accepted granularity: whole pages; the partial last page is recomputed)
+    assert the [SESSION_HOLD] resume line's cached_tokens and kept_pages
+        equal it and it // 64, the [SESSION_HOLD] 'pool wave' line names one
+        loaded segment of that many tokens, and the [PREFIX_POOL] 'loaded
+        materialized segment' line names the same tokens over it // 64 Host
+        page(s) per region; no 'pool declines' line for the turn.
     """
     pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
 

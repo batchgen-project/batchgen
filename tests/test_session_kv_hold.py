@@ -278,6 +278,7 @@ _METHOD_NAMES = [
     "_select_sequences_for_onhold", "_apply_worker_messages", "_poll_admissions",
     "_sync_session_hold_owner_errors", "_session_hold_ttl_message",
     "_sessions_with_live_turns", "drop_lru_session_holds",
+    "_session_pool_resume_enabled", "_apply_session_pool_declines",
 ]
 
 
@@ -641,7 +642,7 @@ def test_session_hold_model_support_is_decided_by_the_prefix_reuse_config():
     from batchgen.prefix_reuse.config import require_session_hold_model_support
 
     assert require_session_hold_model_support("openai/gpt-oss-120b")
-    with pytest.raises(ValueError, match="GPT-OSS only"):
+    with pytest.raises(ValueError, match="full-K/V models and DSA models"):
         require_session_hold_model_support("moonshotai/Kimi-K2-Instruct")
 
 
@@ -1034,9 +1035,16 @@ def test_dual_region_hold_refuses_a_region_whose_copy_is_incomplete():
         worker._record_session_hold(seq, worker._trajectory_book.slot_for("turn1"))
 
 
-@pytest.mark.parametrize("model", ["zai-org/GLM-5.3-FP8", "zai-org/GLM-5.2-FP8"])
-def test_dsa_models_are_refused_with_the_missing_resume_path_named(model):
-    from batchgen.prefix_reuse.config import require_session_hold_model_support
+def test_glm53_holds_through_the_pool_and_glm52_is_refused_by_name():
+    from batchgen.prefix_reuse.config import (
+        require_session_hold_model_support,
+        session_hold_resumes_through_pool,
+    )
 
-    with pytest.raises(ValueError, match="in-wave prefill pool"):
-        require_session_hold_model_support(model)
+    model_type = require_session_hold_model_support("zai-org/GLM-5.3-FP8")
+    assert session_hold_resumes_through_pool(model_type)
+    assert not session_hold_resumes_through_pool(
+        require_session_hold_model_support("openai/gpt-oss-120b")
+    )
+    with pytest.raises(ValueError, match="page-split FP8"):
+        require_session_hold_model_support("zai-org/GLM-5.2-FP8")

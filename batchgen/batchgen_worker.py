@@ -1425,6 +1425,11 @@ class BatchGenWorker:
 		# each resumed turn's decision (until its completion is reported).
 		self._session_resume_wave = {}
 		self._session_resume_plans = {}
+		# A pool-only model (DSA) resumes a held span through the in-wave
+		# prefill pool (set by _init_session_hold); this rank's resumed turns
+		# whose pool declined the current wave, until the wave commits.
+		self._session_hold_pool_resume = False
+		self._session_pool_declined = []
 		# Footprint admission (I-A) on a hold server; None when hold is off.
 		# See batchgen.worker.kv_admission. Every rank keeps the same stats.
 		self._kv_admission = None
@@ -3336,6 +3341,7 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.config import (
 			_host_page_bytes_all_layers,
 			require_session_hold_model_support,
+			session_hold_resumes_through_pool,
 		)
 
 		reasons = []
@@ -3344,8 +3350,11 @@ class BatchGenWorker:
 				"--enable-prefix-cache is on: the prefix cache takes ownership of "
 				"committed prompt pages, which a hold cannot keep yet"
 			)
+		pool_resume = False
 		try:
-			require_session_hold_model_support(args.model_name)
+			pool_resume = session_hold_resumes_through_pool(
+				require_session_hold_model_support(args.model_name)
+			)
 		except ValueError as exc:
 			reasons.append(str(exc))
 		if not self.enable_prepack:
@@ -3375,6 +3384,9 @@ class BatchGenWorker:
 		self._session_hold = session_hold_lib.SessionHoldBook(
 			page_tokens=page_tokens, idle_ttl_s=idle_ttl_s,
 		)
+		# GLM-5.3: a resumed turn's held span is loaded by the prefill pool,
+		# whole pages only (_plan_session_pool_wave).
+		self._session_hold_pool_resume = bool(pool_resume)
 		self._session_hold_page_bytes = sum(
 			int(_host_page_bytes_all_layers(config))
 			for config in (host_kv_config, aux_host_kv_config)
@@ -3427,6 +3439,41 @@ class BatchGenWorker:
 				"session KV hold cannot run here: it supports pure DP "
 				f"attention (attn_tp_size == 1) only, got attn_tp_size={attn_tp}"
 			)
+
+	def _require_session_hold_pool_resume(self) -> None:
+		"""Refuse a pool-resume hold (DSA) the prefill pool cannot serve, at Init.
+
+		Such a model reuses held KV only through the in-wave prefill pool, so
+		a planner without a pool workspace, the integrity check, or a prefill
+		that joins cross-rank collectives would leave every resumed turn
+		recomputed in full; refused by name instead of served that way.
+		"""
+		if not self._session_pool_resume_enabled():
+			return
+		reasons = []
+		workspace = int(
+			self.engine_config.Module_Batching_Config
+			.prefill_prefix_pool_workspace_bytes
+		)
+		if workspace <= 0:
+			reasons.append("the planner sets no prefill prefix pool workspace")
+		if getattr(self, "_prefix_integrity", False):
+			reasons.append("the prefix integrity check is on")
+		resident = getattr(self.parallel_manager, "prefill_uses_resident_ep", None)
+		if resident is not None and resident():
+			reasons.append("prefill joins resident-EP collectives")
+		if reasons:
+			raise session_hold_lib.SessionHoldUnsupported(
+				"session KV hold resumes this model through the prefill prefix "
+				"pool, which cannot run here: " + "; ".join(reasons)
+			)
+
+	def _session_pool_resume_enabled(self) -> bool:
+		"""A hold server whose resumed turns load their span in the pool."""
+		return (
+			getattr(self, "_session_hold", None) is not None
+			and bool(getattr(self, "_session_hold_pool_resume", False))
+		)
 
 	def _prefix_states_in_use(self) -> bool:
 		"""Prefix states exist: prefix-cache hits, or resumed session holds."""
@@ -3817,6 +3864,7 @@ class BatchGenWorker:
 		)
 
 		self._session_resume_wave = {}
+		self._session_pool_declined = []
 		book = self._session_hold
 		if not book.sessions:
 			return
@@ -3850,6 +3898,186 @@ class BatchGenWorker:
 					compute_cached_tokens=plan.cached_tokens,
 				)
 
+	def _plan_session_pool_wave(self, prefill_uuids: List[str]) -> None:
+		"""This rank: a pool wave that LOADS each resumed turn's held span (DSA).
+
+		A pool-only model (GLM-5.3) has no other suffix-prefill path: the held
+		span becomes a materialized segment (both Host regions, whole pages;
+		``session_hold.pool_segment_for_resume``) and the turn's suffix its
+		tail, which attends over the loaded segment in the same chunk. No
+		computed segment is planned (``share_computed=False``): without a
+		prefix cache nothing would own its pages. A wave with no resumed turn
+		on this rank plans nothing and takes the ordinary prefill.
+
+		When the pool cannot take the wave (budget not yet measured, scratch
+		does not fit, the spans do not schedule), each resumed turn is declined
+		here -- its prefix state dropped, so it reserves and prefills in full --
+		and ``_commit_session_resumes`` settles the decline on every rank.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		from batchgen.prefix_reuse.pool import scratch_pages_bound
+		from batchgen.prefix_reuse.wave_plan import (
+			MaterializedPrefix,
+			PoolMaterializationDoesNotFit,
+			plan_wave_prefix_sharing,
+			validate_wave_prefix_plan,
+		)
+		from batchgen.prefix_reuse.wave_runtime import PoolWave
+
+		self._session_pool_declined = []
+		served = [
+			uuid for uuid in prefill_uuids
+			if self._owns_local_sequence(self.global_batch.get_sequence(uuid))
+		]
+		resumed = [
+			uuid for uuid in served
+			if uuid in self._session_resume_wave
+			and self._session_resume_wave[uuid].resumes
+		]
+		if not resumed:
+			return
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in served]
+		prompts = [
+			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+			for seq in seqs
+		]
+		page_tokens = int(self._session_hold.page_tokens)
+		hits = []
+		sources = {}
+		for index, (uuid, seq) in enumerate(zip(served, seqs)):
+			plan = self._session_resume_wave.get(uuid)
+			if plan is None or not plan.resumes:
+				continue
+			state = self._prefix_sequence_states.get(seq.global_idx)
+			if state is None or not state.is_session_hold:
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"resumed turn {uuid} of session {plan.session_id} has no "
+					"held prefix state on the rank that prefills it"
+				)
+			held = state.lookup_result
+			tokens, span = session_hold_lib.pool_segment_for_resume(
+				plan=plan,
+				pages_by_group={0: held.page_ids, **dict(held.aux_page_ids)},
+				page_tokens=page_tokens,
+			)
+			if tokens != int(plan.cached_tokens):
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"resumed turn {uuid}: the pool loads {tokens} token(s) but "
+					f"the resume reports {plan.cached_tokens}; a pool resume "
+					"is planned on whole pages"
+				)
+			hits.append(MaterializedPrefix(index=index, tokens=tokens))
+			sources[index] = span
+		wave = None
+		reason = None
+		total_pages = self._prefill_pool_page_budget
+		chunk_tokens = int(
+			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		)
+		scratch = scratch_pages_bound(
+			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts),
+			page_tokens,
+		)
+		if total_pages is None:
+			reason = "the prefill-phase pool budget is not measured yet"
+		elif total_pages <= scratch:
+			reason = f"pool {total_pages} page(s) <= scratch {scratch}"
+		else:
+			geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+			with_v, _, _ = self._prefill_pool_layout(geometry)
+			if with_v:
+				raise RuntimeError(
+					"a session-hold pool resume needs a latent-only (DSA) pool"
+				)
+			try:
+				wave_plan = plan_wave_prefix_sharing(
+					prompts,
+					block_tokens=page_tokens,
+					pool_pages=total_pages - scratch,
+					chunk_tokens=chunk_tokens,
+					same_chunk_ancestors=True,
+					# As _plan_prefill_pool_wave: DSA pool attention gathers
+					# every row's prefix indexer keys; bound them per chunk.
+					chunk_keys=8 * 1024 * 1024,
+					materialized=hits,
+					share_computed=False,
+				)
+			except PoolMaterializationDoesNotFit as exc:
+				reason = str(exc)
+			else:
+				validate_wave_prefix_plan(wave_plan, prompts)
+				wave = PoolWave(
+					plan=wave_plan,
+					prompts=prompts,
+					uuids=list(served),
+					global_ids=[seq.global_idx for seq in seqs],
+					page_tokens=page_tokens,
+					total_pages=total_pages,
+					scratch_pages=scratch,
+				)
+				for segment_id in sorted(wave.materialized):
+					# Identical held spans fold into one segment: it is loaded
+					# once, from its first member's pages (same tokens, same
+					# bytes); every member keeps its own pages attached.
+					members = wave_plan.segments[segment_id].members
+					wave.bind_materialized_host_pages(
+						segment_id, sources[min(members)]
+					)
+		if wave is None:
+			for uuid in resumed:
+				seq = self.global_batch.get_sequence(uuid)
+				self._prefix_sequence_states.pop(seq.global_idx, None)
+				self._session_pool_declined.append(uuid)
+			logging.warning(
+				"[SESSION_HOLD] Rank %s: the prefill pool declines %d resumed "
+				"turn(s) (%s); they are prefilled in full and their holds freed",
+				self.rank, len(resumed), reason,
+			)
+			return
+		self._prefill_pool_wave = wave
+		logging.info(
+			"[SESSION_HOLD] Rank %s pool wave: %d prompt(s), %d resumed, %d "
+			"loaded segment(s) of %d token(s), %d chunk(s), compute %d of %d "
+			"prompt token(s)",
+			self.rank, len(prompts), len(resumed), len(wave.materialized),
+			sum(wave.plan.segments[seg].tokens for seg in wave.materialized),
+			len(wave.plan.chunks), wave.plan.computed_tokens,
+			wave.plan.prompt_tokens,
+		)
+
+	def _apply_session_pool_declines(self, wave):
+		"""Every rank: turn each declined resume into a drop, identically.
+
+		A decline is one rank's pool decision, but the hold book and the
+		resume plans are replicated, so the declined set is gathered once per
+		wave that resumes anything -- a wave-level collective, reached by every
+		rank because the resume decisions are identical everywhere.
+		"""
+		declined = list(self._session_pool_declined)
+		self._session_pool_declined = []
+		if not any(plan.resumes for plan in wave.values()):
+			if declined:
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"declined resumes {declined} in a wave that resumes nothing"
+				)
+			return wave
+		if self.world_size > 1:
+			gathered = [None] * self.world_size
+			dist.all_gather_object(gathered, declined)
+			declined = sorted({uuid for part in gathered for uuid in part})
+		if not declined:
+			return wave
+		settled = dict(wave)
+		for uuid in declined:
+			plan = settled.get(uuid)
+			if plan is None or not plan.resumes:
+				raise session_hold_lib.SessionHoldInvariantError(
+					f"turn {uuid} was declined by the pool but does not resume "
+					"in this wave"
+				)
+			settled[uuid] = session_hold_lib.declined_resume(plan)
+		return settled
+
 	def _session_resume_plan(self, seq, record):
 		"""Every rank: how a queued turn reuses its session's hold (from the LCP).
 
@@ -3868,6 +4096,7 @@ class BatchGenWorker:
 			kv_tokens=record.kv_tokens,
 			prompt_tokens=int(seq.prompt_length),
 			page_tokens=record.page_tokens,
+			whole_pages=bool(getattr(self, "_session_hold_pool_resume", False)),
 		)
 
 	def _commit_session_resumes(self) -> None:
@@ -3881,6 +4110,8 @@ class BatchGenWorker:
 		self._session_resume_wave = {}
 		if not wave:
 			return
+		if self._session_pool_resume_enabled():
+			wave = self._apply_session_pool_declines(wave)
 		book = self._session_hold
 		for uuid, plan in wave.items():
 			seq = self.global_batch.get_sequence(uuid)
@@ -6119,6 +6350,7 @@ class BatchGenWorker:
 		# Session hold needs pure DP attention; refused here, before anything
 		# is admitted, instead of at the first held completion.
 		self._require_session_hold_pure_dp()
+		self._require_session_hold_pool_resume()
 
 		# The token pool is fixed for the lifetime of the worker. Its byte budget
 		# is explicit, while the number of admitted trajectories is derived from
@@ -8394,6 +8626,8 @@ class BatchGenWorker:
 				self._attach_prefix_cache_for_prefill(prefill_uuids)
 			if self._session_hold is not None:
 				self._plan_session_resumes(prefill_uuids)
+				if self._session_pool_resume_enabled():
+					self._plan_session_pool_wave(prefill_uuids)
 			reservations, owner_requests = self._prefill_host_reservation_plan(
 				prefill_uuids
 			)
@@ -8471,7 +8705,12 @@ class BatchGenWorker:
 		try:
 			if owner_requests:
 				host_view.register_sequences(global_ids)
-				if self._prefill_pool_wave is not None:
+				if (
+					self._prefill_pool_wave is not None
+					and self._session_hold is None
+				):
+					# A session-hold wave loads its held spans and computes no
+					# segment, so it allocates no segment Host pages.
 					# One Host copy per pooled segment and per KV group;
 					# members reference the segment chains. Segment
 					# pseudo-sids join this rollback.
@@ -11968,7 +12207,10 @@ class BatchGenWorker:
 
 		# Prefill-phase device layout is settled here: seed/refresh the pool
 		# page budget the NEXT wave's planner reads at reservation time.
-		if self._prefill_prefix_pool_enabled():
+		if (
+			self._prefill_prefix_pool_enabled()
+			or self._session_pool_resume_enabled()
+		):
 			self._measure_prefill_pool_budget()
 
 		if not reuse_startup_prefill:
@@ -14202,10 +14444,19 @@ class BatchGenWorker:
 			geometry.k_head_dim,
 		)
 
+	def _prefill_pool_page_tokens(self) -> int:
+		"""The pool's page size: the prefix cache's, or the session hold's."""
+		runtime = self.prefix_cache_runtime_config
+		if runtime is not None:
+			return int(runtime.group_specs[0].raw_page_tokens)
+		if self._session_pool_resume_enabled():
+			return int(self._session_hold.page_tokens)
+		raise RuntimeError("the prefill prefix pool has no page size source")
+
 	def _prefill_pool_page_bytes(self) -> int:
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
-		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		page_tokens = self._prefill_pool_page_tokens()
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
 		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
@@ -15363,6 +15614,17 @@ class BatchGenWorker:
 		if wave is None:
 			return
 		self._prefill_pool_wave = None
+		if getattr(self, "_session_hold", None) is not None:
+			# A session-hold wave loaded held spans and computed no segment:
+			# nothing to publish, no pseudo sequence to drop. The held pages
+			# are the turns' own attached pages, freed with them.
+			if wave.computed_segments() or wave.segment_sids:
+				raise RuntimeError(
+					f"Rank {self.rank}: a session-hold pool wave computed "
+					f"{len(wave.computed_segments())} segment(s); it may only "
+					"load held spans"
+				)
+			return
 		if not all(
 			self._owns_host_kv(self.global_batch.get_sequence(uuid))
 			for uuid in wave.uuids
@@ -16865,6 +17127,14 @@ class BatchGenWorker:
 					):
 						raise RuntimeError(
 							"prefix-hit microbatch is missing lookup results"
+						)
+					if self._session_pool_resume_enabled():
+						# A pool-resume model's held span is loaded only by
+						# the prefill pool (_plan_session_pool_wave); the
+						# full-K/V materialization below would misread it.
+						raise RuntimeError(
+							"a resumed session turn of a pool-resume model "
+							"reached the full-K/V prefix materialization path"
 						)
 					from batchgen.kv_cache.host_kv_mananger_config import (
 						build_gpu_kv_config,

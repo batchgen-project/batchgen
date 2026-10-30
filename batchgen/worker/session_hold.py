@@ -49,6 +49,9 @@ DROP_EVICTED_AFTER_RESUME = "evicted_after_resume"
 DROP_CANCELLED = "cancelled"
 # Freed by the LRU drop hook under memory pressure (caller-named reason).
 DROP_PRESSURE_LRU = "pressure_lru"
+# A pool-only model (DSA) resumes through the in-wave prefill pool; when the
+# rank's pool declines the wave, the turn is prefilled in full instead.
+DROP_POOL_DECLINED = "pool_declined"
 
 # Release reason of a hold idle longer than the TTL.
 RELEASE_IDLE_TTL = "idle_ttl"
@@ -153,6 +156,7 @@ def plan_resume(
     kv_tokens: int,
     prompt_tokens: int,
     page_tokens: int,
+    whole_pages: bool = False,
 ) -> ResumePlan:
     """Decide how much held KV a new turn reuses.
 
@@ -163,6 +167,11 @@ def plan_resume(
     is kept even when partial: its tokens past ``cached`` are overwritten by
     the suffix prefill before anything reads them, since the hold is consumed
     by this turn and nothing else references those pages.
+
+    ``whole_pages`` (a pool-only model, DSA): the reused span is rounded DOWN
+    to the page grid, because the in-wave prefill pool loads whole pages.
+    The partial last page is released and its tokens are recomputed by the
+    turn's tail into a page of its own.
     """
     if page_tokens <= 0:
         raise ValueError(f"page_tokens must be positive, got {page_tokens}")
@@ -170,6 +179,8 @@ def plan_resume(
         raise ValueError(f"prompt_tokens must be positive, got {prompt_tokens}")
     held_pages = ceil_div(kv_tokens, page_tokens)
     usable = min(int(lcp_tokens), int(kv_tokens), int(prompt_tokens) - 1)
+    if whole_pages:
+        usable -= usable % int(page_tokens)
     if usable < page_tokens:
         return ResumePlan(
             session_id=session_id,
@@ -187,6 +198,20 @@ def plan_resume(
         keep_pages=keep,
         release_pages=held_pages - keep,
         drop_reason=None,
+    )
+
+
+def declined_resume(plan: ResumePlan) -> ResumePlan:
+    """The same turn, prefilled in full: its pool declined the held span."""
+    if not plan.resumes:
+        return plan
+    return ResumePlan(
+        session_id=plan.session_id,
+        lcp_tokens=plan.lcp_tokens,
+        cached_tokens=0,
+        keep_pages=0,
+        release_pages=int(plan.keep_pages) + int(plan.release_pages),
+        drop_reason=DROP_POOL_DECLINED,
     )
 
 

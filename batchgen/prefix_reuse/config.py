@@ -14,7 +14,10 @@ from typing import Any
 _FULL_KV_MODEL_TYPES = frozenset({"gpt_oss"})
 # GLM-5.2 sparse DSA prefill: MLA latent in the primary Host-KV region and the
 # indexer keys in the auxiliary one. GLM-5/5.1 (glm_moe_dsa) prefill is dense.
-_DSA_MODEL_TYPES = frozenset({"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"})
+# GLM-5.2 keeps its Host indexer keys page-split FP8; GLM-5.3 keeps them bf16.
+_DSA_PAGE_SPLIT_INDEXER_TYPES = frozenset({"glm_moe_dsa_5_2"})
+_DSA_BF16_INDEXER_TYPES = frozenset({"glm_moe_dsa_5_3"})
+_DSA_MODEL_TYPES = _DSA_PAGE_SPLIT_INDEXER_TYPES | _DSA_BF16_INDEXER_TYPES
 # Kimi-K3 and Kimi-Linear-48B dense MLA prefill: one Host-KV region holding
 # the latent -- the kimi_k3_mla profile (24 physical layers of 1 head x 576
 # bf16, page 64) over 93 engine layers, or kimi_linear_mla over 27. No indexer,
@@ -25,6 +28,9 @@ _MLA_LATENT_MODEL_TYPES = frozenset({"kimi_k3", "kimi_linear"})
 # have no cross-wave materialization path, so prefix caching without a planner
 # pool workspace must be refused rather than silently served the other way.
 _POOL_ONLY_MODEL_TYPES = _DSA_MODEL_TYPES | _MLA_LATENT_MODEL_TYPES
+# Session hold resumes these through the prefill pool's dual-region load: a
+# DSA model whose Host indexer keys are bf16 (the pool's own dtype).
+_SESSION_HOLD_POOL_MODEL_TYPES = _DSA_BF16_INDEXER_TYPES
 
 
 class PrefixKVGroupSemantic(str, Enum):
@@ -108,35 +114,46 @@ def require_prefix_cache_model_support(model_name: str) -> str:
 def require_session_hold_model_support(model_name: str) -> str:
     """Return the model type, or refuse a model session KV hold cannot serve.
 
-    A resumed turn prefills only its suffix over held Host pages through the
-    full-K/V prefix materialization path, which exists for GPT-OSS only.
-    The hold bookkeeping itself covers every Host-KV region (a DSA model's
-    indexer keys are held, resumed and freed with its MLA latent), but a DSA
-    model (GLM-5.2/5.3) reuses a prefix only through the in-wave prefill
-    pool. The pool can load both Host regions of a committed prefix
-    (``DualRegionSegmentLoader``), but it runs only with the prefix cache,
-    which a hold refuses, and no wave plans a resumed turn's held span as a
-    loaded segment yet: its resumed turn has no suffix prefill.
+    A resumed turn prefills only its suffix over held Host pages:
+
+    * GPT-OSS (full K/V) through the prefix materialization path, which
+      loads the held pages straight into the prefill's GPU paged KV;
+    * GLM-5.3 (DSA) through the in-wave prefill pool, which loads BOTH Host
+      regions of the held span (MLA latent and bf16 indexer keys) as a
+      materialized segment (``DualRegionSegmentLoader``), whole pages only.
+
+    GLM-5.2 is refused: its Host indexer keys are page-split FP8, a lossy
+    copy of the bf16 keys the pool scores, so a loaded span would not be
+    what a recompute writes.
     """
 
     try:
         model_type = require_prefix_cache_model_support(model_name)
     except ValueError:
         model_type = None
+    if model_type in _SESSION_HOLD_POOL_MODEL_TYPES:
+        return model_type
     if model_type in _DSA_MODEL_TYPES:
         raise ValueError(
-            f"model {model_name!r} (type {model_type!r}) has no suffix "
-            "prefill over held pages: DSA prefix reuse runs only in the "
-            "in-wave prefill pool, which runs only with the prefix cache "
-            "and does not yet plan a held span as a loaded segment "
-            "(session KV hold supports GPT-OSS only)"
+            f"model {model_name!r} (type {model_type!r}) has no lossless "
+            "suffix prefill over held pages: the in-wave prefill pool would "
+            "load its page-split FP8 Host indexer keys into bf16 pool rows "
+            "(session KV hold supports full-K/V models and DSA models with "
+            "bf16 indexer keys)"
         )
     if model_type not in _FULL_KV_MODEL_TYPES:
         raise ValueError(
             f"model {model_name!r} has no suffix prefill over held pages "
-            "(session KV hold supports GPT-OSS only)"
+            "(session KV hold supports full-K/V models and DSA models with "
+            "bf16 indexer keys)"
         )
     return model_type
+
+
+def session_hold_resumes_through_pool(model_type: str) -> bool:
+    """True when a resumed turn's held span is LOADED by the prefill pool."""
+
+    return model_type in _SESSION_HOLD_POOL_MODEL_TYPES
 
 
 def prefix_reuse_requires_prefill_pool(model_type: str) -> bool:

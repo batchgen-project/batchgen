@@ -320,6 +320,7 @@ def _plan_worker(
             "_decode_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
+            "_prefill_pool_page_tokens",
             # The executor and the pool are built with the batch-level probes,
             # read ONCE per wave through the shared batchgen_debug seam.
             "_pool_pad_poison_enabled",

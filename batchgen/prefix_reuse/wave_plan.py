@@ -573,6 +573,7 @@ def plan_wave_prefix_sharing(
     same_chunk_ancestors: bool = False,
     chunk_keys: Optional[int] = None,
     materialized: Sequence[MaterializedPrefix] = (),
+    share_computed: bool = True,
 ) -> WavePrefixPlan:
     """Plan one wave; pools the most segments whose schedule fits the pool.
 
@@ -585,6 +586,11 @@ def plan_wave_prefix_sharing(
     frontier. When no threshold schedules the wave with them,
     ``PoolMaterializationDoesNotFit`` is raised: the caller then plans the
     same wave without them, which is the recompute fallback.
+
+    ``share_computed=False`` pools no computed segment: only the
+    materialized ones are segments, every other prompt is one tail. A
+    session-hold wave plans this way -- it has no prefix cache to publish a
+    computed segment into, so in-wave sharing would leave pages nobody owns.
     """
 
     if block_tokens <= 0 or chunk_tokens <= 0 or pool_pages < 0:
@@ -610,7 +616,10 @@ def plan_wave_prefix_sharing(
     )
     tree = _build_tree(prompts, block_tokens, skip)
     # 2 means every shared segment; higher values only where counts exist.
-    for threshold in sorted({2} | {c for c in tree.count if c > 2}):
+    thresholds = (
+        sorted({2} | {c for c in tree.count if c > 2}) if share_computed else ()
+    )
+    for threshold in thresholds:
         plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
                          threshold, same_chunk_ancestors, chunk_keys, groups)
         if plan is not None:

@@ -79,6 +79,7 @@ METHODS = (
     "_replace_prefix_lookup_hits",
     "_decode_attn_tp_size",
     "_prefill_pool_page_bytes",
+    "_prefill_pool_page_tokens",
     "_pool_pad_poison_enabled",
     "_new_pool_kernel_dump_recorder",
     "_active_batchgen_debug_for_sequences",
