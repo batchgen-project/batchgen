@@ -691,6 +691,15 @@ def create_app(
                 },
             )
 
+        # A node that cannot reach node 0's control store can neither join a
+        # restart nor hear of a peer's failure, whatever its own ranks say.
+        coordinator_error = worker_manager.coordinator_error
+        if coordinator_error is not None:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unhealthy", "reason": coordinator_error},
+            )
+
         healthy, reason = health.is_healthy()
         if not healthy:
             return JSONResponse(

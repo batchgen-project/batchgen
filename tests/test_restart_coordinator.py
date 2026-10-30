@@ -231,7 +231,7 @@ def test_a_single_node_coordinator_opens_no_store_and_every_call_is_a_no_op():
         state=lambda: "serving",
         generation=lambda: 1,
         on_peer_restart=lambda request: pytest.fail("no follower may run"),
-        on_peer_down=lambda node, reason: pytest.fail("no follower may run"),
+        on_peer_down=lambda *args: pytest.fail("no follower may run"),
     )
     assert not [
         thread for thread in threading.enumerate()
@@ -480,7 +480,9 @@ def _follower(node, *, state="serving", generation=1):
         state=lambda: state() if callable(state) else state,
         generation=lambda: generation() if callable(generation) else generation,
         on_peer_restart=seen_requests.append,
-        on_peer_down=lambda failed, reason: seen_down.append((failed, reason)),
+        on_peer_down=lambda failed, reason, _generation: seen_down.append(
+            (failed, reason)
+        ),
     )
     return seen_requests, seen_down
 
@@ -532,18 +534,15 @@ def test_a_follower_started_after_a_restart_does_not_replay_it():
     node1.close()
 
 
-def test_the_follower_reports_a_peer_down_key_once_and_only_while_serving():
+@pytest.mark.parametrize("state", ["serving", "restarting", "workers_down"])
+def test_the_follower_reports_a_peer_down_key_once_in_every_state(state):
+    """A peer's failure is reported whatever this node is doing -- start-up
+    included -- and the manager decides what it means there; a key reported
+    only while serving was never seen by a node still starting."""
     _store, (node0, node1) = _cluster()
-    state = {"value": "restarting"}
-    _requests, down = _follower(node1, state=lambda: state["value"], generation=7)
+    _requests, down = _follower(node1, state=state, generation=7)
 
     node0.publish_down(7, "Detected worker process exit")
-    time.sleep(0.1)
-    # A node that is already restarting or down owns its own recovery; the
-    # peer's failure must not be handed to it again.
-    assert down == []
-
-    state["value"] = "serving"
     assert _wait_until(lambda: len(down) == 1)
     assert down[0] == (0, "Detected worker process exit")
     time.sleep(0.1)
@@ -601,7 +600,7 @@ def test_the_follower_outlives_a_failed_restart_so_the_next_epoch_is_seen():
         state=lambda: "serving",
         generation=lambda: 1,
         on_peer_restart=failing_restart,
-        on_peer_down=lambda failed, reason: None,
+        on_peer_down=lambda failed, reason, generation: None,
     )
     node0.begin_restart(5.0)
     assert _wait_until(lambda: attempts == [1])

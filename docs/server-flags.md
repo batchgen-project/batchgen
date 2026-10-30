@@ -57,6 +57,7 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 | `--node-rank` | `0` | Rank of this node (0-indexed, master node is 0) |
 | `--dist-init-addr` | `localhost:12355` | Address for torch.distributed initialization (`host:port`) |
 | `--restart-control-addr` | `--dist-init-addr` host, port + 1 | Address (`host:port`) of the restart control store node 0 hosts for coordinated worker-pool restarts. Only used with `--nnodes > 1`; pass the same value on every node. |
+| `--cluster-fail-fast` / `--no-cluster-fail-fast` | On when `--nnodes > 1` | One node's fatal error, a node that stops beating, or the loss of node 0 makes every node tear down and exit nonzero. Off keeps the survivors up in `workers_down`. A single-node launch rejects `--cluster-fail-fast`. |
 | `--pynccl-port-base` | `20003` | First port in this runtime's bounded PyNccl range |
 | `--pynccl-port-span` | `100` | Number of ports reserved for PyNccl initialization and recovery |
 
@@ -86,13 +87,37 @@ end in the retryable `workers_down` state. `GET /v1/workers/status` reports
 from `--listen-port`, the `--dist-init-addr` port, and the PyNccl range. A
 single-node server opens no control store and never binds this port.
 
-A worker cohort that fails after it was ready on any node takes every node to
-`workers_down`, and `/health` on each node names the node that failed; one
-restart sent to node 0 then brings every node back. Each node other than node 0
+With `--no-cluster-fail-fast`, a worker cohort that fails after it was ready on
+any node takes every node to `workers_down`, and `/health` on each node names
+the node that failed; one restart sent to node 0 then brings every node back.
+With fail-fast on (the multi-node default) every node instead exits; see below.
+Each node other than node 0
 waits a bounded time at startup for node 0's control store, so start node 0
 first or together with the others. The control store
 lives as long as node 0's server: if node 0 is relaunched, relaunch every node
 (a fresh node 0 cannot form a cohort with the old peers' workers anyway).
+
+### Cluster fail-fast
+
+From the moment it reaches node 0's control store, every node beats a heartbeat
+into it every 2 s and watches the other nodes: their cohort-down keys, their
+heartbeats, and the store itself. With `--cluster-fail-fast` (the default for
+`--nnodes > 1`), each of these ends the node with exit code 1 after the same
+ordered teardown a shutdown runs, and its last log record is a CRITICAL
+`process.exit` naming the cause:
+
+| Cause | `process.exit` reason |
+|-------|------------------------|
+| This node's cohort failed after readiness | `worker fatal: <reason>` |
+| Another node published its cohort as down | `peer node <n> fatal: <reason>` |
+| Another node's heartbeat stopped for 15 s, or never appeared within 600 s | `peer node <n> heartbeat lost (<age>s)` |
+| Node 0's control store answered no call for 10 s -- failing or hung (not on node 0) | `control store unreachable (node 0 down?)` |
+
+Before readiness, the same causes abort start-up on every node, flag on or
+off, through the normal shutdown path after the same `process.exit` record.
+With `--no-cluster-fail-fast` a node that loses a peer or node 0 after
+readiness enters `workers_down` instead, and `/health` answers `503` while the
+pool is down or the control store is unreachable.
 
 ### Shared-host admission
 

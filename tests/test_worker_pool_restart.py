@@ -54,6 +54,10 @@ def load_restart_coordinator():
 restart_coordinator = load_restart_coordinator()
 
 
+def _unexpected_exit(code, reason, **kwargs):
+    raise AssertionError(f"unexpected process exit {code}: {reason}")
+
+
 def _worker_manager_tree() -> ast.Module:
     return ast.parse(WORKER_MANAGER_PATH.read_text())
 
@@ -95,6 +99,12 @@ def _load_worker_manager_class():
         # Named in a method annotation, which this lifted module evaluates
         # (the real module defers annotations through __future__).
         "RestartCoordinator": restart_coordinator.RestartCoordinator,
+        # The start-up abort leaves its exit record here; a fail-fast exit
+        # is never expected unless a test installs its own.
+        "eventlog_process": SimpleNamespace(
+            record_exit=lambda code, reason, **kwargs: None,
+            exit_process=_unexpected_exit,
+        ),
     }
     module = ast.Module(body=constants + [node], type_ignores=[])
     exec(compile(module, str(WORKER_MANAGER_PATH), "exec"), namespace)
@@ -202,6 +212,7 @@ def _manager(monkeypatch):
     manager._restart_coordinator = _single_node_coordinator()
     manager._last_restart_error = None
     manager._coordinated_phase = None
+    manager._cluster_fail_fast = False
     manager._monitor_stop_event = threading.Event()
     manager._stopping = False
     manager._teardown_lock = threading.Lock()

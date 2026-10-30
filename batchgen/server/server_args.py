@@ -202,6 +202,10 @@ class ServerArgs:
     # host:port of the server-level restart control store node 0 hosts. Only
     # meaningful with --nnodes > 1; derived from dist_init_addr when unset.
     restart_control_addr: Optional[str] = None
+    # Whether one node's fatal error, or its loss, makes every node exit
+    # nonzero instead of leaving the survivors in workers_down. None until
+    # validate_server_args resolves it: on for nnodes > 1, off on one node.
+    cluster_fail_fast: Optional[bool] = None
     pynccl_port_base: int = 20003
     pynccl_port_span: int = 100
     kv_dtype: str = "bfloat16"
@@ -419,6 +423,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Address (host:port) of the restart control store node 0 hosts "
              "for coordinated worker-pool restarts; only used with "
              "--nnodes > 1. Default: --dist-init-addr host, port + 1",
+    )
+    parser.add_argument(
+        "--cluster-fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="With --nnodes > 1, a fatal worker error on any node, a node "
+             "whose heartbeat stops, or the loss of node 0 makes every node "
+             "tear down and exit nonzero. --no-cluster-fail-fast keeps the "
+             "survivors up in workers_down instead. Default: on when "
+             "--nnodes > 1; a single-node launch rejects the flag",
     )
     parser.add_argument(
         "--pynccl-port-base",
@@ -733,6 +747,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cluster_fail_fast_enabled(args: ServerArgs) -> bool:
+    """``--cluster-fail-fast`` as given, or its default for this node count."""
+    if args.cluster_fail_fast is None:
+        return args.nnodes > 1
+    return bool(args.cluster_fail_fast)
+
+
 def validate_server_args(args: ServerArgs) -> None:
     """Validate parsed arguments."""
     # Checked first: naming both weight sources is a contradiction whatever
@@ -783,6 +804,13 @@ def validate_server_args(args: ServerArgs) -> None:
                 "restart_control_addr port must not fall inside "
                 "[pynccl_port_base, pynccl_port_base + pynccl_port_span)"
             )
+
+    if args.cluster_fail_fast and args.nnodes == 1:
+        raise ValueError(
+            "--cluster-fail-fast needs --nnodes > 1: a single node has no "
+            "peer to fail together with"
+        )
+    args.cluster_fail_fast = cluster_fail_fast_enabled(args)
 
     if args.nnodes > 1 and args.node_rank == 0:
         _ensure_local_port_free(dist_port, "dist_init_addr")
@@ -977,6 +1005,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
         restart_control_addr=parsed.restart_control_addr,
+        cluster_fail_fast=parsed.cluster_fail_fast,
         pynccl_port_base=parsed.pynccl_port_base,
         pynccl_port_span=parsed.pynccl_port_span,
         kv_dtype=parsed.kv_dtype,

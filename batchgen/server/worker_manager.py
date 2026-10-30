@@ -41,6 +41,7 @@ from batchgen.server.runtime_lease import LaneLease
 from batchgen.server.restart_coordinator import RestartCoordinator
 from batchgen.server.server_args import (
     ServerArgs,
+    cluster_fail_fast_enabled,
     parse_host_port,
     validate_shared_runtime_capability,
 )
@@ -255,7 +256,17 @@ class WorkerManager:
         # (epoch, phase) of the coordinated restart this node is inside, so a
         # shutdown can tell the peers before it drops the control store.
         self._coordinated_phase: Optional[Tuple[int, str]] = None
+        # Multi-node only: a fatal error on any node, or a node lost, ends
+        # this process after the ordered teardown instead of in workers_down.
+        self._cluster_fail_fast = cluster_fail_fast_enabled(server_args)
         self._restart_coordinator = self._build_restart_coordinator()
+        if self.args.nnodes > 1:
+            logger.info(
+                "Cluster fail-fast is %s on node %d of %d",
+                "on" if self._cluster_fail_fast else "off",
+                self.args.node_rank,
+                self.args.nnodes,
+            )
 
     def _build_restart_coordinator(self) -> RestartCoordinator:
         """One coordinator per server, inert on a single-node launch.
@@ -341,6 +352,12 @@ class WorkerManager:
         with self._lock:
             return self._generation
 
+    @property
+    def coordinator_error(self) -> Optional[str]:
+        """Why the restart control store is unreachable now, if it is."""
+        coordinator = self._restart_coordinator
+        return coordinator.control_error if coordinator is not None else None
+
     def set_lifecycle_hooks(
         self,
         *,
@@ -418,7 +435,18 @@ class WorkerManager:
             return
         try:
             self._start_impl()
-        except BaseException:
+        except BaseException as exc:
+            # The peers' ranks wait in the same rendezvous, so they hear why
+            # this node failed rather than only that its heartbeat stopped. A
+            # failure the exit state already holds was published where it was
+            # set, or came from a peer and needs no echo.
+            if (
+                isinstance(exc, Exception)
+                and not self._worker_exit_state.is_failed()
+            ):
+                self._restart_coordinator.publish_down(
+                    self.generation, f"startup failed: {exc}"
+                )
             try:
                 self.stop()
             except BaseException:
@@ -485,6 +513,10 @@ class WorkerManager:
         # minutes loading weights before it would otherwise be reachable.
         self._restart_coordinator.start()
         self._exchange_run_identity()
+        # Watched from here on, not from readiness: a peer that fails or
+        # vanishes during the minutes of loading below must abort this
+        # start-up too, and this node's heartbeat must cover those minutes.
+        self._start_restart_follower()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -583,9 +615,6 @@ class WorkerManager:
             self._state = "serving"
             self._first_ready = True
             self._reconciled_failure = False
-        # Only now: the follower may start a coordinated restart or react to a
-        # peer's cohort failure, and both need a pool that is already serving.
-        self._start_restart_follower()
         logger.info(
             "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
             _time.monotonic() - startup_start,
@@ -1104,11 +1133,16 @@ class WorkerManager:
         self._spawn_workers()
 
     def _start_restart_follower(self) -> None:
+        # A restart epoch needs a pool that is already serving; until then the
+        # follower only watches the peers.
         self._restart_coordinator.start_follower(
             state=lambda: self.state,
             generation=lambda: self.generation,
+            ready=lambda: self._first_ready,
             on_peer_restart=self._run_followed_restart,
             on_peer_down=self._handle_peer_cohort_down,
+            on_peer_lost=self._handle_peer_lost,
+            on_control_lost=self._handle_control_lost,
         )
 
     def _run_followed_restart(self, request: Any) -> None:
@@ -1124,17 +1158,92 @@ class WorkerManager:
             deadline=request.deadline,
         )
 
-    def _handle_peer_cohort_down(self, node: int, reason: str) -> None:
+    def _handle_peer_cohort_down(
+        self, node: int, reason: str, generation: Optional[int] = None
+    ) -> None:
         """A peer's cohort is gone, so this node's ranks cannot serve either.
 
         Publishing this node's own down key here would only echo a failure the
         store already names, so the reaction stays silent on the store.
         """
-        self._handle_worker_failure(
+        self._handle_cluster_failure(
             f"peer node {node} worker cohort failed: {reason}",
-            None,
-            publish_down=False,
+            exit_reason=f"peer node {node} fatal: {reason}",
+            generation=generation,
         )
+
+    def _handle_peer_lost(self, node: int, age_s: float) -> None:
+        """A peer stopped beating: killed hard, or never started at all."""
+        reason = f"peer node {node} heartbeat lost ({age_s:.0f}s)"
+        self._handle_cluster_failure(reason, exit_reason=reason)
+
+    def _handle_control_lost(self, failing_for_s: float) -> None:
+        """Node 0's store has failed without a break: node 0 is gone."""
+        reason = "control store unreachable (node 0 down?)"
+        logger.error("%s: failing for %.0fs", reason, failing_for_s)
+        self._handle_cluster_failure(reason, exit_reason=reason)
+
+    def _handle_cluster_failure(
+        self,
+        reason: str,
+        *,
+        exit_reason: str,
+        generation: Optional[int] = None,
+    ) -> None:
+        """React to a failure another node caused, in whatever state this is.
+
+        Before readiness it aborts start-up; afterwards a serving pool goes
+        down like a local cohort failure, and with fail-fast on the process
+        then exits whatever state the pool was already in. ``generation`` is
+        the cohort a down key named, so one read before a restart never takes
+        down the cohort that restart brought up.
+
+        Runs on the coordinator's follower. Only node 0 restarts off that
+        thread, so only there can this find a restart in flight; it waits the
+        restart out, which its own shared deadline bounds.
+        """
+        while self.state == "restarting":
+            if self._stopping:
+                return
+            time.sleep(self._monitor_interval_s)
+        if generation is not None and generation != self.generation:
+            logger.info(
+                "Ignoring a failure of cohort generation %d; generation %d "
+                "is current: %s",
+                generation, self.generation, reason,
+            )
+            return
+        self._handle_worker_failure(
+            reason, None, publish_down=False, exit_reason=exit_reason
+        )
+        if not self._cluster_fail_fast or not self._first_ready or self._stopping:
+            return
+        # The pool was already down -- a failed restart left it so, or a
+        # concurrent failure owns the teardown and exits when it is done.
+        # Waiting for the teardown also keeps any restart from starting.
+        self._teardown_lock.acquire()
+        self._exit_cluster(exit_reason)
+
+    def _exit_cluster(self, reason: str) -> None:
+        """Fail-fast end of this node: the ordered teardown, then exit 1.
+
+        ``stop()`` is the same teardown a server shutdown runs -- the cohort
+        through its sentinel and grace, then the daemon, SHM namespace, run
+        directory and admission locks -- so nothing is left behind for the
+        next start to reclaim. Whatever it raises, the process still exits,
+        and the exit names the node and reason that caused it.
+        """
+        logging.getLogger("uvicorn.error").error(
+            "[shutdown] cluster fail-fast: %s", reason
+        )
+        if self._monitor_thread is threading.current_thread():
+            # stop() joins the monitor, which cannot join itself.
+            self._monitor_thread = None
+        try:
+            self.stop()
+        except BaseException:
+            logger.exception("Teardown before the cluster fail-fast exit failed")
+        eventlog_process.exit_process(1, reason, logger=logger)
 
     def restart_workers(
         self,
@@ -1372,6 +1481,12 @@ class WorkerManager:
                         epoch,
                         exc_info=True,
                     )
+            # A failed restart leaves the pool down like any local fatal, so
+            # with fail-fast it ends the node too -- after the peers were told
+            # above. A shutdown that aborted the restart is already ending it.
+            if self._cluster_fail_fast and self.started and not self._stopping:
+                self._teardown_lock.acquire()
+                self._exit_cluster(f"restart failed: {reason}")
             raise
         self._coordinated_phase = None
         with self._lock:
@@ -1816,9 +1931,11 @@ class WorkerManager:
         exc: Optional[BaseException],
         *,
         publish_down: bool = True,
+        exit_reason: Optional[str] = None,
     ) -> None:
         if self._stopping:
             return
+        exit_reason = exit_reason or f"worker fatal: {reason}"
         # Teardown and reconciliation of a cohort have exactly one owner.  The
         # ownership check and the transition that claims it share one critical
         # section, so an explicit restart cannot take the cohort between them:
@@ -1858,6 +1975,15 @@ class WorkerManager:
                     time.time(),
                     reason,
                 )
+                # The peers are starting the same cohort and cannot finish
+                # without this node; tell them before this node goes.
+                if publish_down and self._restart_coordinator is not None:
+                    self._restart_coordinator.publish_down(
+                        failed_generation, reason
+                    )
+                # The shutdown below ends the process through uvicorn, which
+                # knows nothing of why; the record names it first.
+                eventlog_process.record_exit(1, exit_reason, logger=logger)
                 self._request_server_shutdown()
             return
         logging.getLogger("uvicorn.error").error(
@@ -1907,6 +2033,10 @@ class WorkerManager:
                         "failure did not complete; the next restart retries it"
                     )
         finally:
+            if self._cluster_fail_fast:
+                # Still holding the teardown, so no restart can begin between
+                # it and the exit.
+                self._exit_cluster(exit_reason)
             self._teardown_lock.release()
 
     @staticmethod
