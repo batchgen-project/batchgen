@@ -32,7 +32,7 @@ PINS = {
             "fields": [],
             "members": {
                 "PAGE_SIZE": "64",
-                "DECISION_INTERVAL": "DECISION_FREQUENCY_PAGES * 64",
+                "DECISION_INTERVAL": "_sequence_module.DECISION_FREQUENCY_PAGES * 64",
             },
             "public_methods": [
                 "Init",

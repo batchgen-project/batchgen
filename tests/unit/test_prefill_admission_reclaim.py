@@ -38,6 +38,7 @@ from batchgen.prefix_reuse.trajectory_commit import (
     TrajectoryFrontierCommitter,
 )
 from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
+import batchgen.sequence as sequence_module
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.prefill import (
     PREFILL_NO_PROGRESS_LIMIT,
@@ -114,6 +115,7 @@ def _worker_methods(dist):
         "prefill_host_reserve_page_deficit": prefill_host_reserve_page_deficit,
         "release_local_query_slot": release_local_query_slot,
         "SequenceStatus": SequenceStatus,
+        "_sequence_module": sequence_module,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in METHODS}

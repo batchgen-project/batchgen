@@ -454,7 +454,7 @@ class SequenceEntry:
         """
         Get GPU pages needed for INITIAL load (first time loading to GPU).
         
-        Uses INITIAL_GPU_PAGE_BUFFER (default 64 pages = 4096 tokens) to give
+        Uses INITIAL_GPU_PAGE_BUFFER (default 32 pages = 2048 tokens) to give
         sequences a larger runway and reduce load/on-hold churning.
         
         This is used when:

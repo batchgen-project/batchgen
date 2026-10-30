@@ -288,7 +288,11 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
-from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
+from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
+# The page-buffer sizes are module globals that configure_page_buffers()
+# rebinds at worker init; read them through the module at use time, never
+# import them by value (that binds the import-time defaults).
+import batchgen.sequence as _sequence_module
 from batchgen.prefill.prepack import (
 	prepack_sequences,
 	unpack_last_token_logits,
@@ -1126,8 +1130,9 @@ class BatchGenWorker:
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
 	"""
 	PAGE_SIZE = 64  # Tokens per page (fixed)
-	# Decision frequency: check boundaries every N pages (configurable via DECISION_FREQUENCY_PAGES)
-	DECISION_INTERVAL = DECISION_FREQUENCY_PAGES * 64  # Tokens between boundary checks
+	# Decision frequency: check boundaries every N pages. Import-time default
+	# only; __init__ rebinds it after configure_page_buffers().
+	DECISION_INTERVAL = _sequence_module.DECISION_FREQUENCY_PAGES * 64  # Tokens between boundary checks
 
 
 	def __init__(self, args: BatchGenWorkerArgs):
@@ -6817,7 +6822,7 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
 				chunk_size=chunk_size,
-				initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+				initial_gpu_page_buffer=_sequence_module.INITIAL_GPU_PAGE_BUFFER,
 			)
 			reservations[uuid] = (pages, tokens)
 			if self._owns_host_kv(seq):
@@ -8340,7 +8345,6 @@ class BatchGenWorker:
 		per_node_host_reclaimable=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
-		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8383,7 +8387,7 @@ class BatchGenWorker:
 			chunk_size=chunk_size,
 			num_nodes=num_nodes,
 			gpus_per_node=self.local_world_size,
-			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+			initial_gpu_page_buffer=_sequence_module.INITIAL_GPU_PAGE_BUFFER,
 			per_rank_sequence_free=(
 				tuple(per_rank_sequence_free)
 				if per_rank_sequence_free is not None else None

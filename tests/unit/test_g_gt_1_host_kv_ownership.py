@@ -477,10 +477,6 @@ def test_mirror_is_reached_outside_the_leader_gate():
 
 def _selection_request(attn_tp_size, monkeypatch):
     monkeypatch.setitem(
-        sys.modules, "batchgen.sequence",
-        SimpleNamespace(INITIAL_GPU_PAGE_BUFFER=2),
-    )
-    monkeypatch.setitem(
         sys.modules, "batchgen.decode_dp_group",
         SimpleNamespace(host_kv_owner_rank=lambda group, size: int(group) * size),
     )
@@ -490,6 +486,7 @@ def _selection_request(attn_tp_size, monkeypatch):
             "PrefillCandidate": lambda **kw: SimpleNamespace(**kw),
             "PrefillSelectionRequest": lambda **kw: SimpleNamespace(**kw),
             "SequenceStatus": SimpleNamespace(EVICTED="EVICTED"),
+            "_sequence_module": SimpleNamespace(INITIAL_GPU_PAGE_BUFFER=2),
         },
     )
     seq = SimpleNamespace(
