@@ -560,7 +560,6 @@ struct DistributedWeightDaemon::Impl {
             (static_cast<std::uint32_t>(1) << workers) - 1;
         slots.resize(depth);
         owner_rails.resize(num_nodes);
-        owner_rail_cursor.assign(num_nodes, 0);
         for (std::vector<RemoteEndpoint>& rail_remotes : remotes) {
             rail_remotes.resize(num_nodes);
         }
@@ -620,7 +619,6 @@ struct DistributedWeightDaemon::Impl {
     std::array<std::vector<ucp_ep_h>, kRails> incoming_endpoints;
     std::array<std::vector<int>, kRails> incoming_controls;
     std::vector<std::vector<int>> owner_rails;
-    std::vector<int> owner_rail_cursor;
 
     std::atomic<bool> started{false};
     std::atomic<bool> stop{false};
@@ -1911,6 +1909,79 @@ struct DistributedWeightDaemon::Impl {
         return drained;
     }
 
+    // Which rail carries the next get for `owner`. The rails that reach an
+    // owner do not have equal throughput, so handing them equal numbers of
+    // gets makes the group run near the rate of its slowest rail; and when an
+    // owner is reached over an even number of rails, a rotating cursor against
+    // a schedule that alternates that owner's workers pins each worker to one
+    // rail for the life of the daemon. Choosing the rail that holds the fewest
+    // bytes in flight instead lets a slow rail accumulate outstanding bytes
+    // and be passed over until it drains, so the byte split follows capacity
+    // without any measured bandwidth table or configuration.
+    //
+    // The load is derived from `in_flight`, the prefetch thread's own deque of
+    // posted-but-unfinished gets, because that deque is the only account of
+    // what is outstanding: a separate per-rail counter would have to be kept
+    // in step with the post, both completion branches and the drain, and one
+    // missed site would leave a rail permanently unselectable. A get that
+    // completed immediately (its request is already nullptr) still counts here
+    // until the next completion scan removes it, exactly as it still counts
+    // against `outstanding`.
+    //
+    // Equal loads take the lowest rail index: `owner_rails[owner]` is filled
+    // in ascending rail order during bootstrap and the scan only moves on a
+    // strict improvement, so an empty ring assigns the same rails on every
+    // run, as a zeroed cursor did. Only the prefetch thread runs this, and
+    // `owner_rails` is immutable once that thread exists, so it takes no lock.
+    int LeastLoadedRail(int owner, const std::deque<Chunk>& in_flight) const {
+        if (owner < 0 || owner >= num_nodes) {
+            fail("distributed weight rail requested for owner " +
+                 std::to_string(owner) + " outside the " +
+                 std::to_string(num_nodes) + " nodes of node " +
+                 std::to_string(node_rank));
+        }
+        const std::vector<int>& available = owner_rails[owner];
+        if (available.empty()) {
+            // The bootstrap rail-count check rejects an owner that no rail
+            // reaches, so this cannot fire in a valid topology; the rotation
+            // this replaced would have divided by zero here instead.
+            fail("no distributed weight rail reaches owner " +
+                 std::to_string(owner) + " from node " +
+                 std::to_string(node_rank));
+        }
+        for (const int rail : available) {
+            if (rail < 0 || rail >= kRails) {
+                fail("distributed weight owner " + std::to_string(owner) +
+                     " offers rail " + std::to_string(rail) +
+                     " outside the rails of node " +
+                     std::to_string(node_rank));
+            }
+        }
+        std::array<std::uint64_t, kRails> rail_bytes{};
+        for (const Chunk& chunk : in_flight) {
+            // Every posted get carries a rail this function chose, so a chunk
+            // without one is a bookkeeping error, never a case to absorb.
+            if (chunk.rail < 0 || chunk.rail >= kRails) {
+                fail("in-flight distributed weight fetch has no rail");
+            }
+            rail_bytes[chunk.rail] +=
+                static_cast<std::uint64_t>(chunk.count) * module_bytes;
+        }
+        // Compare (load, rail index) so the tie-break is the lowest rail
+        // index by construction rather than by the order the bootstrap
+        // happened to fill this owner's candidates in.
+        int chosen = available.front();
+        std::uint64_t chosen_bytes = rail_bytes[chosen];
+        for (const int rail : available) {
+            if (rail_bytes[rail] < chosen_bytes ||
+                (rail_bytes[rail] == chosen_bytes && rail < chosen)) {
+                chosen = rail;
+                chosen_bytes = rail_bytes[rail];
+            }
+        }
+        return chosen;
+    }
+
     void PrefetchLoop() {
         const std::vector<std::string> schedule = BuildSchedule();
         size_t next = 0;
@@ -1947,8 +2018,10 @@ struct DistributedWeightDaemon::Impl {
                 ring_cv.notify_all();
                 next = 0;
                 tail = 0;
-                std::fill(owner_rail_cursor.begin(),
-                          owner_rail_cursor.end(), 0);
+                // Rail selection needs no rewind of its own: the drain above
+                // emptied the in-flight deque, so every rail reads as unloaded
+                // and the next cohort's first get per owner takes that owner's
+                // lowest rail, exactly as the first cohort's did.
                 continue;
             }
 
@@ -2039,11 +2112,7 @@ struct DistributedWeightDaemon::Impl {
                 chunk.slot_start = tail;
                 chunk.count = superchunk;
                 chunk.owner = owner;
-                const std::vector<int>& available =
-                    owner_rails[owner];
-                chunk.rail =
-                    available[owner_rail_cursor[owner]++ %
-                              available.size()];
+                chunk.rail = LeastLoadedRail(owner, chunks);
                 chunk.layer = layer;
                 chunk.first_expert = first_expert;
                 chunk.target_worker = OwningWorker(schedule[next]);
