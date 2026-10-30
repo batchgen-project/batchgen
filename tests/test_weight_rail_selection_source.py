@@ -449,3 +449,158 @@ def test_rotation_pins_each_worker_of_a_two_rail_owner_to_one_rail():
     assert pinned == {0: {2}, 1: {5}}
     spread = rails_per_worker(lambda o, a, l: least_loaded(a, l))
     assert spread[0] == {2, 5} and spread[1] == {2, 5}
+
+
+def _config_block():
+    return _section(
+        DAEMON.read_text(),
+        'if (config.contains("deprioritized_rails")) {',
+        "\n        // Eight TP8 workers per node",
+    )
+
+
+def _bias_validation():
+    return _section(
+        DAEMON.read_text(),
+        "// In-flight load moves in whole superchunks",
+        "staging_bytes =",
+    )
+
+
+def test_the_bias_is_config_gated_and_absent_config_changes_nothing():
+    daemon = DAEMON.read_text()
+    helper = _selection_helper()
+    block = _config_block()
+    assert "rail_deprioritized[static_cast<size_t>(rail)] = true;" in block
+    # The bias defaults to one superchunk, the unit the in-flight load moves
+    # in: any smaller value could only flip exact ties.
+    assert "std::int64_t bias_modules = superchunk;" in block
+    # The only assignment beyond the zero member default follows validation.
+    assignments = re.findall(r"rail_bias_bytes =[^=]", daemon)
+    assert len(assignments) == 2
+    assert daemon.count("std::uint64_t rail_bias_bytes = 0;") == 1
+    assert "rail_bias_bytes =" in _bias_validation()
+    # The members default to no bias: every flag false, zero phantom bytes.
+    assert "std::array<bool, kRails> rail_deprioritized{};" in daemon
+    # The helper charges the phantom load only to flagged rails, after the
+    # real in-flight sum and before the comparison scan.
+    summed = helper.index("rail_bytes[chunk.rail] +=")
+    biased = helper.index("rail_bytes[rail] += rail_bias_bytes;", summed)
+    compared = helper.index("int chosen = available.front();", biased)
+    assert summed < biased < compared
+    assert "if (rail_deprioritized[static_cast<size_t>(rail)]) {" in helper
+
+
+def test_bias_config_validation_fails_by_name():
+    block = _config_block()
+    assert ('fail("distributed weight deprioritized_rails must be an "\n'
+            '                     "array of distinct rail indices");') in block
+    # Out-of-range and repeated entries are told apart in the diagnostic.
+    assert '" is outside the "' in block
+    assert '" is repeated"' in block
+    # The bias is parsed even when no rail is deprioritized, so a config that
+    # names only the bias is validated instead of silently ignored; its type
+    # is checked before the value is read.
+    assert 'if (config.contains("rail_bias_modules")) {' in block
+    type_check = block.index("if (!bias.is_number_integer()) {")
+    value_read = block.index("bias.get<std::int64_t>();")
+    assert type_check < value_read
+    assert ('fail("distributed weight rail_bias_modules must be an "\n'
+            '                     "integer count of modules");') in block
+    # The entry type of the rail list is checked before its value is read.
+    assert block.index("if (!entry.is_number_integer()) {") < block.index(
+        "entry.get<std::int64_t>();")
+
+
+def test_the_bias_is_a_whole_superchunk_count_bounded_by_the_ring():
+    daemon = DAEMON.read_text()
+    validation = _bias_validation()
+    # Negative, sub-superchunk, non-multiple, and ring-dwarfing values all
+    # fail by name, with the limits in the diagnostic; the byte product is
+    # computed only after the check, so it cannot wrap.
+    assert re.search(
+        r"bias_modules < 0 \|\| bias_modules % superchunk != 0 \|\|\s*"
+        r"bias_modules > depth",
+        validation,
+    )
+    assert '"non-negative multiple of superchunk ("' in validation
+    checked = daemon.index("bias_modules % superchunk != 0")
+    converted = daemon.index(
+        "static_cast<std::uint64_t>(bias_modules) * module_bytes;")
+    assert checked < converted
+    # The validation sits after the ring checks that pin superchunk > 0, so
+    # the modulo cannot divide by zero on a bad ring config.
+    ring_checked = daemon.index('fail("invalid distributed weight ring configuration");')
+    assert ring_checked < checked
+
+
+# --- The bias rule, modelled -------------------------------------------------
+#
+# Same rule as `least_loaded`, with the phantom load added: effective load is
+# the real in-flight bytes plus `bias` on the deprioritized rails. The bias
+# shifts load rather than partitioning it: a deprioritized rail wins as soon
+# as every other candidate is at least `bias` deeper in real bytes.
+
+
+def biased_least_loaded(available, load, deprioritized=(), bias=0):
+    effective = {
+        rail: load[rail] + (bias if rail in deprioritized else 0)
+        for rail in load
+    }
+    return least_loaded(available, effective)
+
+
+def test_an_empty_set_or_zero_bias_reduces_to_the_unbiased_rule():
+    import itertools
+
+    for loads in itertools.product(range(4), repeat=3):
+        load = dict(zip([1, 4, 7], loads))
+        unbiased = least_loaded([1, 4, 7], load)
+        assert biased_least_loaded([1, 4, 7], load) == unbiased
+        assert biased_least_loaded([1, 4, 7], load, deprioritized={4}, bias=0) == unbiased
+
+
+def test_a_deprioritized_rail_is_passed_over_until_the_gap_reaches_the_bias():
+    # Rail 3 is deprioritized with bias 4; rail 2 is preferred.
+    pick = lambda load: biased_least_loaded([2, 3], load, deprioritized={3}, bias=4)
+    assert pick({2: 0, 3: 0}) == 2  # cold ring: preferred rail
+    assert pick({2: 3, 3: 0}) == 2  # gap below the bias: still preferred
+    assert pick({2: 4, 3: 0}) == 2  # equal effective load: lowest index
+    assert pick({2: 5, 3: 0}) == 3  # preferred rail backed up past the bias
+    assert pick({2: 5, 3: 2}) == 2  # ... and spills back as rail 3 fills
+
+
+def test_the_tie_break_on_effective_load_is_still_the_lowest_index():
+    # The deprioritized rail has the LOWER index: an effective-load tie must
+    # take it, exactly as a real-load tie would.
+    assert biased_least_loaded([2, 5], {2: 0, 5: 4}, deprioritized={2}, bias=4) == 2
+    # Mutation check: a rule that compared real load would pick 2 here, and a
+    # rule that always shunned deprioritized rails would pick 5.
+    assert biased_least_loaded([2, 5], {2: 1, 5: 6}, deprioritized={2}, bias=4) == 2
+    assert biased_least_loaded([2, 5], {2: 1, 5: 4}, deprioritized={2}, bias=4) == 5
+
+
+def test_the_byte_split_shifts_toward_preferred_rails_but_never_starves_one():
+    # Two equal-speed rails reach the owner; rail 5 is deprioritized. The
+    # preferred rail carries more bytes, the deprioritized rail still works
+    # once the preferred backlog exceeds the bias, and nothing deadlocks.
+    owner_rails = {1: [2, 5]}
+    posted, choices, load, elapsed = run_model(
+        [1] * 256,
+        owner_rails,
+        {2: 1.0, 5: 1.0},
+        outstanding=8,
+        rule=lambda o, a, l: biased_least_loaded(a, l, deprioritized={5}, bias=3),
+    )
+    assert posted[2] > posted[5] > 0
+    # Mutation check against a hard partition: with the bias larger than the
+    # in-flight cap the deprioritized rail is NEVER reachable, so a run that
+    # keeps the cap below the bias must use rail 2 alone.
+    posted_hard, _, _, _ = run_model(
+        [1] * 64,
+        owner_rails,
+        {2: 1.0, 5: 1.0},
+        outstanding=4,
+        rule=lambda o, a, l: biased_least_loaded(a, l, deprioritized={5}, bias=64),
+    )
+    assert posted_hard[5] == 0 and posted_hard[2] == 64

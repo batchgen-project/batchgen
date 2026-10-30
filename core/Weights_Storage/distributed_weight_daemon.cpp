@@ -526,6 +526,43 @@ struct DistributedWeightDaemon::Impl {
                 rail_devices.push_back(std::move(value));
             }
         }
+        if (config.contains("deprioritized_rails")) {
+            const nlohmann::json& biased = config.at("deprioritized_rails");
+            if (!biased.is_array()) {
+                fail("distributed weight deprioritized_rails must be an "
+                     "array of distinct rail indices");
+            }
+            for (const nlohmann::json& entry : biased) {
+                if (!entry.is_number_integer()) {
+                    fail("distributed weight deprioritized_rails must be an "
+                         "array of distinct rail indices");
+                }
+                const std::int64_t rail = entry.get<std::int64_t>();
+                if (rail < 0 || rail >= kRails) {
+                    fail("distributed weight deprioritized_rails entry " +
+                         std::to_string(rail) + " is outside the " +
+                         std::to_string(kRails) + " rails of a node");
+                }
+                if (rail_deprioritized[static_cast<size_t>(rail)]) {
+                    fail("distributed weight deprioritized_rails entry " +
+                         std::to_string(rail) + " is repeated");
+                }
+                rail_deprioritized[static_cast<size_t>(rail)] = true;
+            }
+        }
+        // Parsed whether or not any rail is deprioritized, so a config that
+        // names only the bias is still validated instead of ignored. The
+        // value is checked below, after the ring configuration that defines
+        // the superchunk it must be a multiple of.
+        std::int64_t bias_modules = superchunk;
+        if (config.contains("rail_bias_modules")) {
+            const nlohmann::json& bias = config.at("rail_bias_modules");
+            if (!bias.is_number_integer()) {
+                fail("distributed weight rail_bias_modules must be an "
+                     "integer count of modules");
+            }
+            bias_modules = bias.get<std::int64_t>();
+        }
 
         // Eight TP8 workers per node: two nodes are world16, four are world32.
         if ((num_nodes != 2 && num_nodes != 4) || node_rank < 0 ||
@@ -554,6 +591,20 @@ struct DistributedWeightDaemon::Impl {
                  std::to_string(workers) + ") * kMaxLeasesWhileAcquiring (" +
                  std::to_string(kMaxLeasesWhileAcquiring) + ")");
         }
+        // In-flight load moves in whole superchunks, so a bias below one
+        // superchunk could only flip exact ties. Demand whole superchunks,
+        // and keep the phantom load within the ring so it can never dwarf
+        // the real load (or wrap the byte product).
+        if (bias_modules < 0 || bias_modules % superchunk != 0 ||
+            bias_modules > depth) {
+            fail("distributed weight rail_bias_modules must be a "
+                 "non-negative multiple of superchunk (" +
+                 std::to_string(superchunk) + ") no larger than depth (" +
+                 std::to_string(depth) + "), got " +
+                 std::to_string(bias_modules));
+        }
+        rail_bias_bytes =
+            static_cast<std::uint64_t>(bias_modules) * module_bytes;
         staging_bytes =
             static_cast<std::uint64_t>(depth) * module_bytes;
         all_workers_mask =
@@ -602,6 +653,10 @@ struct DistributedWeightDaemon::Impl {
         "mlx5_bond_1:1", "mlx5_bond_2:1", "mlx5_bond_3:1",
         "mlx5_bond_4:1", "mlx5_bond_5:1", "mlx5_bond_6:1",
         "mlx5_bond_7:1", "mlx5_bond_8:1"};
+    // Filled once at config time, read only by the prefetch thread's rail
+    // selection. All false (the default) leaves the selection unbiased.
+    std::array<bool, kRails> rail_deprioritized{};
+    std::uint64_t rail_bias_bytes = 0;
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -1933,6 +1988,15 @@ struct DistributedWeightDaemon::Impl {
     // strict improvement, so an empty ring assigns the same rails on every
     // run, as a zeroed cursor did. Only the prefetch thread runs this, and
     // `owner_rails` is immutable once that thread exists, so it takes no lock.
+    //
+    // A rail named in `deprioritized_rails` is charged `rail_bias_bytes` of
+    // phantom load on top of its real in-flight bytes, so it is chosen only
+    // once every other candidate of this owner is at least that much deeper
+    // in real bytes (the bias is a whole number of superchunks, the unit the
+    // load moves in, with the index tie-break still deciding exact equality).
+    // The bias shifts load rather than partitioning it: when the preferred
+    // rails back up by the bias, gets spill back. An empty set (the default)
+    // leaves every comparison exactly as it was.
     int LeastLoadedRail(int owner, const std::deque<Chunk>& in_flight) const {
         if (owner < 0 || owner >= num_nodes) {
             fail("distributed weight rail requested for owner " +
@@ -1966,6 +2030,11 @@ struct DistributedWeightDaemon::Impl {
             }
             rail_bytes[chunk.rail] +=
                 static_cast<std::uint64_t>(chunk.count) * module_bytes;
+        }
+        for (int rail = 0; rail < kRails; ++rail) {
+            if (rail_deprioritized[static_cast<size_t>(rail)]) {
+                rail_bytes[rail] += rail_bias_bytes;
+            }
         }
         // Compare (load, rail index) so the tie-break is the lowest rail
         // index by construction rather than by the order the bootstrap
