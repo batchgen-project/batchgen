@@ -3911,8 +3911,10 @@ class BatchGenWorker:
 
 		When the pool cannot take the wave (budget not yet measured, scratch
 		does not fit, the spans do not schedule), each resumed turn is declined
-		here -- its prefix state dropped, so it reserves and prefills in full --
-		and ``_commit_session_resumes`` settles the decline on every rank.
+		here: it keeps its kept pages attached (the reservation footprint
+		admission charged) but caches nothing, so the ordinary prefill
+		recomputes it from token 0 into them; ``_commit_session_resumes``
+		settles the decline on every rank.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
@@ -4026,11 +4028,18 @@ class BatchGenWorker:
 		if wave is None:
 			for uuid in resumed:
 				seq = self.global_batch.get_sequence(uuid)
-				self._prefix_sequence_states.pop(seq.global_idx, None)
+				# Recompute from token 0 INTO the kept pages: they stay
+				# attached, so the reservation is still budget - kept pages,
+				# exactly what footprint admission charged. Dropping them
+				# would need the full budget the admission never checked.
+				state = self._prefix_sequence_states[seq.global_idx]
+				self._prefix_sequence_states[seq.global_idx] = replace(
+					state, compute_cached_tokens=0
+				)
 				self._session_pool_declined.append(uuid)
 			logging.warning(
 				"[SESSION_HOLD] Rank %s: the prefill pool declines %d resumed "
-				"turn(s) (%s); they are prefilled in full and their holds freed",
+				"turn(s) (%s); they are prefilled in full into their kept pages",
 				self.rank, len(resumed), reason,
 			)
 			return

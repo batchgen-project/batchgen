@@ -10,8 +10,10 @@ pool, so a resumed turn's held span becomes a LOADED pool segment:
   segment over its held pages in BOTH Host regions (strict page-id
   equality), computes no shared segment, and the turn's tail starts at the
   boundary, writing into the turn's own first private page;
-* a wave the pool cannot take declines its resumes, which then prefill in
-  full; the decline is settled on every rank at commit;
+* a wave the pool cannot take declines its resumes: each keeps its kept
+  pages attached (so it reserves exactly what footprint admission charged)
+  and is recomputed from token 0 into them; the decline is settled on every
+  rank at commit;
 * the loaded segment lands byte-exactly in the pool (both regions);
 * close frees every held page in both regions;
 * GPT-OSS (one region) keeps its partial-page resume and never plans a pool
@@ -23,6 +25,7 @@ Worker methods are compiled from the real source onto the fakes of
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import time
@@ -44,7 +47,13 @@ from batchgen.prefix_reuse.wave_plan import (  # noqa: E402
     MaterializedPrefix,
     plan_wave_prefix_sharing,
 )
-from batchgen.sequence import SequenceEntry, SequenceStatus  # noqa: E402
+from batchgen.sequence import (  # noqa: E402
+    INITIAL_GPU_PAGE_BUFFER,
+    SequenceEntry,
+    SequenceStatus,
+)
+from batchgen.worker import kv_admission as kv_admission_lib  # noqa: E402
+from batchgen.worker.prefill import compute_prefill_host_reservation  # noqa: E402
 from batchgen.worker import session_hold as session_hold_lib  # noqa: E402
 from tests import test_session_kv_hold as hold_tests  # noqa: E402
 from tests.worker_method_source import load_worker_methods  # noqa: E402
@@ -65,6 +74,9 @@ _POOL_METHODS = (
     "_load_dual_region_segments",
     "_load_materialized_segments",
     "_prefill_pool_page_tokens",
+    "_kv_budget_pages",
+    "_kv_footprint_candidates",
+    "_prefill_host_reservation_plan",
 )
 
 
@@ -83,7 +95,13 @@ class _GatherDist(hold_tests._Dist):
 
 
 _EXTRA = load_worker_methods(_POOL_METHODS, {
+    "replace": dataclasses.replace,
     "session_hold_lib": session_hold_lib,
+    "kv_admission_lib": kv_admission_lib,
+    "compute_prefill_host_reservation": compute_prefill_host_reservation,
+    "INITIAL_GPU_PAGE_BUFFER": INITIAL_GPU_PAGE_BUFFER,
+    "SequenceEntry": SequenceEntry,
+    "SequenceStatus": SequenceStatus,
     "logging": logging,
     "torch": torch,
     "time": time,
@@ -107,6 +125,8 @@ class _PoolWorker(hold_tests._DualWorker):
         self._session_pool_declined = []
         self._prefill_pool_wave = None
         self._prefill_pool_page_budget = budget
+        self._kv_resume_keep_cache = {}
+        self.local_world_size = 8
         self.prefix_cache_runtime_config = None
         self.huggingface_ckpt_name = "zai-org/GLM-5.3-FP8"
         self.engine_config = SimpleNamespace(Module_Batching_Config=SimpleNamespace(
@@ -118,6 +138,11 @@ class _PoolWorker(hold_tests._DualWorker):
         if name in _EXTRA:
             return _EXTRA[name].__get__(self)
         return super().__getattr__(name)
+
+    _kv_resume_keep_cache: dict
+
+    def _get_effective_chunk_size(self):
+        return 8192
 
     def _owns_local_sequence(self, seq):
         return seq is not None and int(seq.assigned_rank) == self.rank
@@ -363,20 +388,52 @@ def test_held_regions_with_different_page_ids_are_refused():
 # --------------------------------------------------------------------------- #
 
 
-def test_a_declined_resume_prefills_in_full_and_frees_the_hold():
+def test_a_declined_resume_is_recomputed_into_its_kept_pages():
     worker = _PoolWorker(budget=None)  # budget not measured yet
     _held(worker)
     _resume(worker, fresh=False)
     assert worker._prefill_pool_wave is None
-    assert 8 not in worker._prefix_sequence_states  # full reservation, cached 0
+    state = worker._prefix_sequence_states[8]
+    # Nothing cached (the ordinary prefill recomputes from token 0 and never
+    # reaches the full-K/V materialization) but the kept pages stay attached.
+    assert state.compute_cached_tokens == 0
+    assert state.attached_tokens == 2 * PAGE
+    assert state.shared_page_ids_for_group(1) == (100, 101)
     assert worker._session_pool_declined == ["turn2"]
     worker._commit_session_resumes()
     plan = worker._session_resume_plans["turn2"]
     assert plan.drop_reason == session_hold_lib.DROP_POOL_DECLINED
-    assert plan.cached_tokens == 0
-    assert worker.host.resident() == [] and worker.aux.resident() == []
+    assert (plan.cached_tokens, plan.keep_pages, plan.release_pages) == (0, 2, 1)
+    # The partial page is freed; the kept ones are the turn's, freed with it.
+    assert worker.host.resident() == [100, 101] == worker.aux.resident()
     assert worker._session_hold.snapshot()["drops"] == {"pool_declined": 1}
+    assert worker._session_hold.snapshot()["held_sessions"] == 0
     assert "turn2" not in worker._session_resumed_uuids
+    worker._release_session_prefix_states([8])
+    assert worker.host.resident() == [] and worker.aux.resident() == []
+
+
+def test_a_declined_resume_reserves_exactly_what_admission_charged():
+    """3 held pages, 2 kept: admission charges budget - 2; so must the
+    reservation after the pool declines, or the wave is rejected on every
+    pass while admission keeps saying it fits."""
+    worker = _PoolWorker(budget=None)
+    _held(worker)
+    assert worker._session_hold.get("s1").pages == 3
+    worker.add_seq("turn2", 8, TURN2)
+    candidates, _, keep = worker._kv_footprint_candidates(["turn2"])
+    (candidate,) = candidates
+    assert keep == {"turn2": 2}
+    assert candidate.host_pages == candidate.budget_pages - 2
+    worker._plan_session_resumes(["turn2"])
+    worker._plan_session_pool_wave(["turn2"])
+    assert worker._session_pool_declined == ["turn2"]
+    reservations, owner_requests = worker._prefill_host_reservation_plan(["turn2"])
+    reserved_pages, _ = reservations["turn2"]
+    ((uuid, private_tokens),) = owner_requests
+    assert uuid == "turn2"
+    # The same discount admission applied: exactly the kept pages.
+    assert reserved_pages - private_tokens // PAGE == keep["turn2"]
 
 
 def test_a_scratch_that_does_not_fit_declines():

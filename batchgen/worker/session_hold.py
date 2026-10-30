@@ -202,15 +202,23 @@ def plan_resume(
 
 
 def declined_resume(plan: ResumePlan) -> ResumePlan:
-    """The same turn, prefilled in full: its pool declined the held span."""
+    """The same turn, recomputed: its pool declined to load the held span.
+
+    The turn still takes its kept pages -- as the Host pages its prompt is
+    written into, not as cached KV -- so its physical reservation stays
+    exactly what footprint admission charged (budget - kept pages). The
+    prefill recomputes from token 0 and overwrites those pages with the
+    same positions' KV. Nothing is reused: ``cached_tokens`` is 0 and the
+    decline is counted as a drop.
+    """
     if not plan.resumes:
         return plan
     return ResumePlan(
         session_id=plan.session_id,
         lcp_tokens=plan.lcp_tokens,
         cached_tokens=0,
-        keep_pages=0,
-        release_pages=int(plan.keep_pages) + int(plan.release_pages),
+        keep_pages=int(plan.keep_pages),
+        release_pages=int(plan.release_pages),
         drop_reason=DROP_POOL_DECLINED,
     )
 
