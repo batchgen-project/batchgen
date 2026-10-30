@@ -113,8 +113,10 @@ def require_session_hold_model_support(model_name: str) -> str:
     The hold bookkeeping itself covers every Host-KV region (a DSA model's
     indexer keys are held, resumed and freed with its MLA latent), but a DSA
     model (GLM-5.2/5.3) reuses a prefix only through the in-wave prefill
-    pool, and the pool's cross-wave load of committed pages refuses a second
-    Host region: its resumed turn has no suffix prefill yet.
+    pool. The pool can load both Host regions of a committed prefix
+    (``DualRegionSegmentLoader``), but it runs only with the prefix cache,
+    which a hold refuses, and no wave plans a resumed turn's held span as a
+    loaded segment yet: its resumed turn has no suffix prefill.
     """
 
     try:
@@ -125,8 +127,9 @@ def require_session_hold_model_support(model_name: str) -> str:
         raise ValueError(
             f"model {model_name!r} (type {model_type!r}) has no suffix "
             "prefill over held pages: DSA prefix reuse runs only in the "
-            "in-wave prefill pool, whose load of committed Host pages "
-            "fills one Host region (session KV hold supports GPT-OSS only)"
+            "in-wave prefill pool, which runs only with the prefix cache "
+            "and does not yet plan a held span as a loaded segment "
+            "(session KV hold supports GPT-OSS only)"
         )
     if model_type not in _FULL_KV_MODEL_TYPES:
         raise ValueError(

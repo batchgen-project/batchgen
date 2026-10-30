@@ -14524,6 +14524,9 @@ class BatchGenWorker:
 		if not wave.materialized:
 			return None
 		views = self._host_views_by_group()
+		if len(views) == 2:
+			# A DSA model: the MLA latent and the indexer keys, both copied.
+			return self._dual_region_segment_loader(wave, views)
 		if len(views) != 1:
 			# A dual-region model keeps a second Host KV region (the DSA
 			# indexer keys), which a latent expansion does not reconstruct.
@@ -14568,6 +14571,10 @@ class BatchGenWorker:
 				f"{len(rows.materialized)} materialized segment(s) with no "
 				"staging; the wave was built without a loader"
 			)
+		from batchgen.prefix_reuse.pool_materialize import DualRegionSegmentLoader
+
+		if isinstance(loader, DualRegionSegmentLoader):
+			return self._load_dual_region_segments(wave, rows, loader)
 		layers = self._materialized_pool_layers()
 		loaded = 0
 		for stage in rows.materialized:
@@ -14600,6 +14607,157 @@ class BatchGenWorker:
 				"token(s) over %d Host page(s) into %d pool page(s)",
 				self.rank, stage.segment_id, int(stage.tokens), len(pages),
 				len(stage.pages),
+			)
+		return loaded
+
+	def _dual_region_segment_loader(self, wave, views):
+		"""Staging for a DSA wave's loads: the latent AND the indexer region.
+
+		Refused by name where a copy would not reproduce what the forward
+		writes to the pool: a region that is not exactly the DSA pair, or an
+		indexer region stored in another dtype than the pool's (GLM-5.2's
+		page-split FP8 keys are a lossy quantization of the bf16 row the pool
+		scores, so loading them would not be the bytes a recompute writes).
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			build_gpu_kv_config,
+			build_gpu_kv_config_aux,
+		)
+		from batchgen.prefix_reuse.pool_materialize import (
+			AUX_GROUP,
+			DEFAULT_SLAB_BYTES,
+			PRIMARY_GROUP,
+			DualRegionSegmentLoader,
+			RegionGeometry,
+		)
+
+		if sorted(views) != [PRIMARY_GROUP, AUX_GROUP]:
+			raise RuntimeError(
+				f"a dual-region prefix load needs Host KV groups "
+				f"{[PRIMARY_GROUP, AUX_GROUP]}, this model has {sorted(views)}"
+			)
+		page_tokens = int(wave.page_tokens)
+		primary = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		aux = build_gpu_kv_config_aux(self.huggingface_ckpt_name, [page_tokens])
+		if aux is None:
+			raise RuntimeError(
+				f"model {self.huggingface_ckpt_name!r} has two Host KV regions "
+				"but no DSA indexer-key geometry; its second region cannot be "
+				"loaded into the pool"
+			)
+		if (
+			bool(getattr(views[AUX_GROUP], "is_page_split", False))
+			or aux.kv_dtype != primary.kv_dtype
+		):
+			raise RuntimeError(
+				"materializing a DSA prefix copies the Host indexer keys into "
+				f"the pool's {primary.kv_dtype} rows, but this model stores "
+				f"them as {aux.kv_dtype} (page-split FP8 is a lossy copy of "
+				"what prefill scores); the prefix must be recomputed"
+			)
+		for name, geometry in (("latent", primary), ("indexer", aux)):
+			if int(geometry.num_k_heads) != 1 or int(geometry.num_v_heads) != 0:
+				raise RuntimeError(
+					f"a DSA {name} region holds one K head and no V, got "
+					f"{geometry.num_k_heads} K / {geometry.num_v_heads} V heads"
+				)
+		loader = DualRegionSegmentLoader(
+			primary_view=views[PRIMARY_GROUP],
+			aux_view=views[AUX_GROUP],
+			page_tokens=page_tokens,
+			# Engine layer -> physical Host layer of each region (None = the
+			# identity: every GLM-5.x latent profile and the 5.3 indexer).
+			primary=RegionGeometry(
+				num_layers=int(primary.num_layers),
+				dim=int(primary.k_head_dim),
+				dtype=primary.kv_dtype,
+				layer_map=primary.logical_to_physical_layer,
+			),
+			aux=RegionGeometry(
+				num_layers=int(aux.num_layers),
+				dim=int(aux.k_head_dim),
+				dtype=aux.kv_dtype,
+				layer_map=aux.logical_to_physical_layer,
+			),
+			device=self.torch_device,
+			max_slab_bytes=DEFAULT_SLAB_BYTES,
+		)
+		logging.info(
+			"[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
+			"%d B of device staging (%d Host page(s) per slab, groups %s)",
+			self.rank, len(wave.materialized), loader.staging_bytes,
+			loader.slab_pages, [PRIMARY_GROUP, AUX_GROUP],
+		)
+		return loader
+
+	def _materialized_dual_region_layers(self, wave, loader):
+		"""``[(attn, latent_layer, indexer_layer | None)]`` in engine order.
+
+		A DSA pool keeps one latent row per ENGINE layer (``pool.k[layer]``)
+		and an indexer row for each layer with an indexer
+		(``pool.indexer_row``). Each is fed from its own region's physical
+		layer; every mapping is resolved and checked here, before any copy.
+		"""
+		pool = wave.pool
+		layers = list(self.model.model.layers)
+		if pool is None or int(pool.k.shape[0]) != len(layers):
+			raise RuntimeError(
+				f"a DSA pool holds one latent row per engine layer: "
+				f"{len(layers)} layer(s), pool rows "
+				f"{None if pool is None else int(pool.k.shape[0])}"
+			)
+		indexer_rows = dict(getattr(pool, "indexer_row", {}) or {})
+		plan = []
+		for engine_layer, decoder_layer in enumerate(layers):
+			attn = decoder_layer.self_attn
+			if not hasattr(attn, "materialize_pool_segment"):
+				raise RuntimeError(
+					f"engine layer {engine_layer} cannot materialize a pool "
+					"segment; a DSA load fills every layer's latent row"
+				)
+			latent_layer = loader.primary.physical_layer(engine_layer, "latent")
+			indexer_layer = None
+			if engine_layer in indexer_rows:
+				indexer_layer = loader.aux.physical_layer(
+					engine_layer, "indexer-key"
+				)
+			plan.append((attn, latent_layer, indexer_layer))
+		return plan
+
+	def _load_dual_region_segments(self, wave, rows, loader) -> int:
+		"""The DSA load: per slab, both regions' H2D (one wait), then every
+		layer copies its latent row and, where it has one, its indexer row
+		into the segment's pool slots. Returns the tokens loaded."""
+		layers = self._materialized_dual_region_layers(wave, loader)
+		loaded = 0
+		for stage in rows.materialized:
+			pages_by_group = wave.segment_host_pages.get(stage.segment_id)
+			if not pages_by_group:
+				raise RuntimeError(
+					f"Rank {self.rank}: materialized segment "
+					f"{stage.segment_id} names no Host page to load from"
+				)
+			for slab in loader.slabs(
+				pages_by_group=pages_by_group, tokens=int(stage.tokens)
+			):
+				window = stage.slots[
+					slab.token_start:slab.token_start + slab.tokens
+				]
+				for attn, latent_layer, indexer_layer in layers:
+					attn.materialize_pool_segment(
+						latent=slab.latent[latent_layer],
+						indexer=(
+							None if indexer_layer is None
+							else slab.indexer[indexer_layer]
+						),
+						slots=window,
+					)
+				loaded += int(slab.tokens)
+			logging.info(
+				"[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
+				"token(s) over %d Host page(s) per region into %d pool page(s)",
+				self.rank, stage.segment_id, int(stage.tokens),
+				len(next(iter(pages_by_group.values()))), len(stage.pages),
 			)
 		return loaded
 

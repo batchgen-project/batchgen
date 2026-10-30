@@ -1414,6 +1414,34 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "boundaries"
             )
 
+    def materialize_pool_segment(self, *, latent, slots, indexer=None):
+        """Worker seam: copy one loaded slab into THIS layer's pool rows.
+
+        The DSA counterpart of the K3 MLA expansion. Host holds exactly what
+        ``_offload_prefill_pool_rows`` wrote -- this layer's latent row and,
+        on a layer with an indexer, its indexer-key row -- so a loaded
+        segment is a direct copy into ``prefill_pool.k[layer]`` and
+        ``prefill_pool.indexer[indexer_row[layer]]`` at the same slots a
+        computed segment's forward fills. Both regions or neither: a layer
+        with an indexer refuses a latent-only load.
+        """
+        from .pool_segment import copy_dsa_pool_segment
+
+        pool = AttnWrapperBase.prefill_pool
+        if pool is None or AttnWrapperBase.prefill_pool_batch is None:
+            raise RuntimeError(
+                f"GLM-5 layer {self.layer_idx} was asked to materialize a "
+                "segment outside a prefix-pool wave"
+            )
+        return copy_dsa_pool_segment(
+            pool,
+            layer=self.layer_idx,
+            latent=latent,
+            indexer=indexer,
+            slots=slots,
+            has_indexer=getattr(self.module, "indexer", None) is not None,
+        )
+
     def _offload_prefill_pool_rows(
         self, primary_kv: torch.Tensor, indexer_kv: Optional[torch.Tensor]
     ) -> None:

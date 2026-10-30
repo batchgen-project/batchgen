@@ -212,10 +212,14 @@ def _stub_geometry(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "batchgen.kv_cache.host_kv_mananger_config",
-        SimpleNamespace(build_gpu_kv_config=lambda *a, **k: SimpleNamespace(
-            num_layers=LAYERS, num_k_heads=1, k_head_dim=LATENT,
-            kv_dtype=torch.float32,
-        )),
+        SimpleNamespace(
+            build_gpu_kv_config=lambda *a, **k: SimpleNamespace(
+                num_layers=LAYERS, num_k_heads=1, k_head_dim=LATENT,
+                kv_dtype=torch.float32,
+            ),
+            # Kimi-K3 keeps no DSA indexer region.
+            build_gpu_kv_config_aux=lambda *a, **k: None,
+        ),
     )
 
 
@@ -273,11 +277,26 @@ def test_a_wave_that_materializes_gets_staging_for_every_layer(monkeypatch):
     )
 
 
-def test_a_second_host_kv_region_is_refused_by_name(monkeypatch):
+def test_a_second_host_kv_region_without_dsa_geometry_is_refused(monkeypatch):
+    """Two regions take the DSA load, which needs the indexer-key geometry;
+    a model without one (K3 here) is refused by name, never loaded as one."""
     _stub_geometry(monkeypatch)
     pool = _pool()
     worker, _ = _worker(
         pool, views={0: _FakeHostView(), 1: _FakeHostView()}
+    )
+    worker = _bind(worker, _worker_methods(
+        ("_dual_region_segment_loader",), {"logging": __import__("logging")}
+    ))
+    with pytest.raises(RuntimeError, match="no DSA indexer-key geometry"):
+        worker._materialized_segment_loader(_wave(pool))
+
+
+def test_more_than_two_host_kv_regions_are_refused_by_name(monkeypatch):
+    _stub_geometry(monkeypatch)
+    pool = _pool()
+    worker, _ = _worker(
+        pool, views={0: _FakeHostView(), 1: _FakeHostView(), 2: _FakeHostView()}
     )
     with pytest.raises(RuntimeError, match="exactly one Host KV region"):
         worker._materialized_segment_loader(_wave(pool))

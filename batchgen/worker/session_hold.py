@@ -190,6 +190,58 @@ def plan_resume(
     )
 
 
+def pool_segment_for_resume(
+    *,
+    plan: ResumePlan,
+    pages_by_group: Mapping[int, Sequence[int]],
+    page_tokens: int,
+) -> Optional[Tuple[int, Dict[int, Tuple[int, ...]]]]:
+    """(tokens, pages by Host-KV group) a pool wave LOADS for a resumed turn.
+
+    A model whose prefix reuse runs only in the in-wave prefill pool (DSA:
+    GLM-5.x) resumes a held session by loading the held span as a
+    materialized pool segment. A pool segment is whole pages, so the loaded
+    span is ``cached_tokens`` rounded DOWN to the page grid; the rest of the
+    kept partial page is recomputed by the turn's tail, which writes from
+    that boundary into the same (attached, consumed) page -- the overwrite
+    ``plan_resume`` already allows. None when the turn does not resume.
+
+    Every group must name the same pages in the same order (the dual Host
+    coordinator mirrors allocation); a disagreement is refused by name.
+    """
+    if not plan.resumes:
+        return None
+    page_tokens = int(page_tokens)
+    pages = int(plan.cached_tokens) // page_tokens
+    if pages < 1 or pages > int(plan.keep_pages):
+        raise SessionHoldInvariantError(
+            f"session {plan.session_id}: a resume of {plan.cached_tokens} "
+            f"cached token(s) keeps {plan.keep_pages} page(s), so it cannot "
+            f"load {pages} whole page(s)"
+        )
+    if not pages_by_group or 0 not in pages_by_group:
+        raise SessionHoldInvariantError(
+            f"session {plan.session_id}: the held pages name no group 0"
+        )
+    span = {}
+    for group, held in sorted(pages_by_group.items()):
+        held = tuple(int(page) for page in held)
+        if len(held) < int(plan.keep_pages):
+            raise SessionHoldInvariantError(
+                f"session {plan.session_id}: Host KV group {group} holds "
+                f"{len(held)} page(s), the resume keeps {plan.keep_pages}"
+            )
+        span[int(group)] = held[:pages]
+    if len(span) > 1:
+        from batchgen.prefix_reuse.pool_materialize import aligned_region_pages
+
+        aligned_region_pages(
+            span, groups=tuple(sorted(span)), page_tokens=page_tokens,
+            tokens=pages * page_tokens,
+        )
+    return pages * page_tokens, span
+
+
 def split_turn_pages_for_hold(
     *,
     page_table: Sequence[int],
