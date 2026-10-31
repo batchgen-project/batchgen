@@ -39,6 +39,12 @@ STORE_RESIDENCIES = ("run", "resident")
 #: store as residue of a dead run.
 DEFAULT_STORE_STAGING_DIR = "/dev/shm/batchgen-weight-stores"
 
+#: Per-peer connect budget of the daemon bootstrap when a node config omits
+#: ``bootstrap_timeout_s``. Must equal ``kDefaultBootstrapTimeoutS`` in
+#: core/Weights_Storage/distributed_weight_daemon.cpp, which reads the config
+#: file itself.
+DEFAULT_BOOTSTRAP_TIMEOUT_S = 600
+
 
 def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     """Validate a node config AND the published store it describes.
@@ -102,8 +108,10 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     config["num_nodes"] = num_nodes
     # Optional peer-connect budget for the daemon bootstrap; the daemon and
     # the server-side readiness wait must share one deadline, so both read
-    # this field. Default matches the daemon's built-in 180 s.
-    bootstrap_timeout_s = config.get("bootstrap_timeout_s", 180)
+    # this field.
+    bootstrap_timeout_s = config.get(
+        "bootstrap_timeout_s", DEFAULT_BOOTSTRAP_TIMEOUT_S
+    )
     if not isinstance(bootstrap_timeout_s, int) or bootstrap_timeout_s <= 0:
         raise ValueError(
             "distributed weight bootstrap_timeout_s must be a positive "

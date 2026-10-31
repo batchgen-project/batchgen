@@ -166,6 +166,12 @@ int create_listener(const std::string& ip, int port) {
     return fd;
 }
 
+// Per-peer connect budget when the node config omits bootstrap_timeout_s.
+// Node startup is asymmetric (host store populate, THP compaction, slow
+// imports), so the default must cover the slowest peer's listener opening.
+// DEFAULT_BOOTSTRAP_TIMEOUT_S in distributed_weight_store.py must agree.
+constexpr int kDefaultBootstrapTimeoutS = 600;
+
 int connect_retry(const std::string& ip, int port, int timeout_s,
                   const std::atomic<bool>& stop) {
     sockaddr_in address{};
@@ -176,8 +182,7 @@ int connect_retry(const std::string& ip, int port, int timeout_s,
     }
     // One attempt per 100 ms; the budget comes from the config's
     // bootstrap_timeout_s so slow-starting peers (a long host store
-    // populate before the listener opens) can be given more than the
-    // former hard-coded 180 s.
+    // populate before the listener opens) are waited for.
     const int max_attempts = timeout_s * 10;
     for (int attempt = 0; attempt < max_attempts && !stop.load(); ++attempt) {
         const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -424,7 +429,8 @@ struct DistributedWeightDaemon::Impl {
         replicated_bytes =
             config.at("replicated_bytes").get<std::uint64_t>();
         base_port = config.value("base_port", 26000);
-        bootstrap_timeout_s = config.value("bootstrap_timeout_s", 180);
+        bootstrap_timeout_s = config.value("bootstrap_timeout_s",
+                                            kDefaultBootstrapTimeoutS);
         if (bootstrap_timeout_s <= 0) {
             fail("distributed weight bootstrap_timeout_s must be positive");
         }
@@ -504,7 +510,7 @@ struct DistributedWeightDaemon::Impl {
     std::uint64_t replicated_bytes = 0;
     std::uint64_t staging_bytes = 0;
     int base_port = 26000;
-    int bootstrap_timeout_s = 180;
+    int bootstrap_timeout_s = kDefaultBootstrapTimeoutS;
     int depth = 32;
     int superchunk = 8;
     int outstanding = 8;
