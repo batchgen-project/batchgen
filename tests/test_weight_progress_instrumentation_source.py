@@ -12,6 +12,12 @@ An operator can also pin the eight progress threads to named cores with
 `progress_thread_cores`. The default (key absent) pins nothing and keeps the
 old loop behaviour; a configured pin that cannot be applied records a daemon
 failure rather than silently running unpinned.
+
+The accounting itself perturbs the loop it measures (one clock read and
+several relaxed atomic writes per iteration of a busy-spin), so it is gated
+behind `progress_gap_counters`. Off — the default — every progress thread
+runs the bare progress+yield spin of the pre-instrumentation daemon, and the
+summary omits the per-rail entries while still stating the gate.
 """
 
 import re
@@ -45,7 +51,7 @@ def _config_block():
 
 def test_every_iteration_is_counted_and_bucketed_inside_the_loop():
     spawn = _progress_spawn()
-    loop = _section(spawn, "while (!stop.load()) {", "});")
+    loop = _section(spawn, "ProgressGaps& gaps = progress_gaps[rail];", "});")
     # The gap is measured across the whole iteration, including the
     # ucp_worker_progress call and the yield, from one monotonic clock.
     progressed = loop.index("ucp_worker_progress(rails[rail].worker)")
@@ -104,8 +110,13 @@ def test_pinning_is_config_gated_and_absent_config_pins_nothing():
     assert "std::vector<int> progress_thread_cores;" in daemon
     guard = spawn.index("if (!progress_thread_cores.empty()) {")
     pinned = spawn.index("pthread_setaffinity_np(")
+    # First loop in the lambda = the gated-off bare spin; the pin must
+    # precede even that, so it covers both gate states.
     loop = spawn.index("while (!stop.load()) {")
     assert guard < pinned < loop
+    # Pinning is independent of the gap gate: the pin happens before the
+    # gate chooses which loop to run.
+    assert pinned < spawn.index("if (!progress_gap_counters) {")
     # The affinity call is the only one in the daemon and targets the thread
     # itself with exactly one core.
     assert daemon.count("pthread_setaffinity_np(") == 1
@@ -137,3 +148,60 @@ def test_core_list_validation_fails_by_name():
     # The type check precedes the value read.
     assert block.index("is_number_integer") < block.index(
         "entry.get<std::int64_t>();")
+
+
+def test_the_gap_accounting_is_gated_and_off_runs_the_bare_spin():
+    daemon = DAEMON.read_text()
+    spawn = _progress_spawn()
+    # Off by default.
+    assert "bool progress_gap_counters = false;" in daemon
+    # The gated-off path runs before any accounting state is touched and
+    # never returns into the instrumented loop.
+    gate = spawn.index("if (!progress_gap_counters) {")
+    instrumented = spawn.index("ProgressGaps& gaps = progress_gaps[rail];")
+    assert gate < instrumented
+    bare = _section(spawn, "if (!progress_gap_counters) {",
+                    "ProgressGaps& gaps = progress_gaps[rail];")
+    # The bare spin is, token for token, the pre-instrumentation loop: no
+    # clock, no accounting state, no extra branch, and the only atomic read
+    # is the loop's own stop flag.
+    spin = _section(bare, "while (!stop.load()) {", "return;")
+    assert re.sub(r"\s+", " ", spin).strip() == (
+        "while (!stop.load()) { "
+        "if (ucp_worker_progress(rails[rail].worker) == 0) { "
+        "std::this_thread::yield(); } }")
+    assert "return;" in bare
+    assert "Clock::now()" not in bare
+    assert "fetch_add" not in bare
+    assert "compare_exchange" not in bare
+    assert "progress_gaps" not in bare
+    assert bare.count("load(") == 1
+
+
+def test_the_gate_is_config_parsed_as_a_named_boolean():
+    daemon = DAEMON.read_text()
+    block = _section(daemon, 'if (config.contains("progress_gap_counters")) {',
+                     'if (config.contains("progress_thread_cores")) {')
+    assert "is_boolean()" in block
+    # The diagnostic names the key.
+    assert '"distributed weight progress_gap_counters must be a "' in block
+    assert "progress_gap_counters = gapped.get<bool>();" in block
+
+
+def test_the_summary_states_the_gate_and_gates_the_per_rail_entries():
+    daemon = DAEMON.read_text()
+    summary = _section(daemon, "void WriteSummary() {",
+                       "const std::string temporary")
+    # The gate is always stated, so "accounting off" is never read as
+    # "no gaps happened".
+    stated = summary.index(
+        'summary["progress_gap_counters"] = progress_gap_counters;')
+    gated = summary.index("if (progress_gap_counters) {")
+    emitted = summary.index('summary["progress_gaps_by_rail"]')
+    assert stated < gated < emitted
+    # The pin list is always emitted: it must sit after the gated block
+    # closes, not inside it.
+    gated_block = _section(summary, "if (progress_gap_counters) {",
+                           'summary["progress_thread_cores"]')
+    assert gated_block.rstrip().endswith("}")
+    assert 'summary["progress_thread_cores"]' not in gated_block

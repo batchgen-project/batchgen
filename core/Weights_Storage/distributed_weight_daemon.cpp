@@ -565,6 +565,14 @@ struct DistributedWeightDaemon::Impl {
             }
             bias_modules = bias.get<std::int64_t>();
         }
+        if (config.contains("progress_gap_counters")) {
+            const nlohmann::json& gapped = config.at("progress_gap_counters");
+            if (!gapped.is_boolean()) {
+                fail("distributed weight progress_gap_counters must be a "
+                     "boolean");
+            }
+            progress_gap_counters = gapped.get<bool>();
+        }
         if (config.contains("progress_thread_cores")) {
             const nlohmann::json& cores = config.at("progress_thread_cores");
             if (!cores.is_array() ||
@@ -742,6 +750,12 @@ struct DistributedWeightDaemon::Impl {
     // rejects at pin time records a daemon failure and stops the daemon: a
     // configured pin is a correctness condition, not a hint.
     std::vector<int> progress_thread_cores;
+    // `progress_gap_counters` gates the per-iteration gap accounting above.
+    // Off (the default), each progress thread runs the bare progress+yield
+    // spin with no clock read and no atomic write, so a default config is
+    // behaviourally identical to the pre-instrumentation daemon; the gate
+    // exists because the accounting itself perturbs the loop it measures.
+    bool progress_gap_counters = false;
     std::vector<std::unique_ptr<ClientConnection>> clients;
     std::mutex client_mutex;
 
@@ -1289,6 +1303,16 @@ struct DistributedWeightDaemon::Impl {
                             ": " + std::string(std::strerror(rc)));
                         return;
                     }
+                }
+                if (!progress_gap_counters) {
+                    // The bare spin, unchanged from the daemon before the
+                    // gap accounting existed: progress, yield, nothing else.
+                    while (!stop.load()) {
+                        if (ucp_worker_progress(rails[rail].worker) == 0) {
+                            std::this_thread::yield();
+                        }
+                    }
+                    return;
                 }
                 ProgressGaps& gaps = progress_gaps[rail];
                 Clock::time_point previous = Clock::now();
@@ -2460,22 +2484,31 @@ struct DistributedWeightDaemon::Impl {
         summary["ready_unacquired_by_worker"] = ready_unacquired;
         summary["pending_acquire_by_worker"] = pending_by_worker;
         summary["staging_hwm_modules"] = counters.staging_hwm;
-        // One entry per rail. The counters are monotonic over the daemon's
-        // life, so two summaries subtract to the gaps of the interval.
-        nlohmann::json progress_by_rail = nlohmann::json::array();
-        for (int rail = 0; rail < kRails; ++rail) {
-            const ProgressGaps& gaps = progress_gaps[rail];
-            progress_by_rail.push_back({
-                {"loops", gaps.loops.load(std::memory_order_relaxed)},
-                {"gap_ge_1ms", gaps.gap_ge_1ms.load(std::memory_order_relaxed)},
-                {"gap_ge_10ms",
-                 gaps.gap_ge_10ms.load(std::memory_order_relaxed)},
-                {"gap_ge_50ms",
-                 gaps.gap_ge_50ms.load(std::memory_order_relaxed)},
-                {"max_gap_us", gaps.max_gap_us.load(std::memory_order_relaxed)},
-            });
+        // The gate is always stated so a reader of the summary never
+        // mistakes "accounting off" for "no gaps happened"; the per-rail
+        // entries exist only when the loops actually count.
+        summary["progress_gap_counters"] = progress_gap_counters;
+        if (progress_gap_counters) {
+            // One entry per rail. The counters are monotonic over the
+            // daemon's life, so two summaries subtract to the gaps of the
+            // interval.
+            nlohmann::json progress_by_rail = nlohmann::json::array();
+            for (int rail = 0; rail < kRails; ++rail) {
+                const ProgressGaps& gaps = progress_gaps[rail];
+                progress_by_rail.push_back({
+                    {"loops", gaps.loops.load(std::memory_order_relaxed)},
+                    {"gap_ge_1ms",
+                     gaps.gap_ge_1ms.load(std::memory_order_relaxed)},
+                    {"gap_ge_10ms",
+                     gaps.gap_ge_10ms.load(std::memory_order_relaxed)},
+                    {"gap_ge_50ms",
+                     gaps.gap_ge_50ms.load(std::memory_order_relaxed)},
+                    {"max_gap_us",
+                     gaps.max_gap_us.load(std::memory_order_relaxed)},
+                });
+            }
+            summary["progress_gaps_by_rail"] = progress_by_rail;
         }
-        summary["progress_gaps_by_rail"] = progress_by_rail;
         summary["progress_thread_cores"] = progress_thread_cores;
         const LatencyHistogram& latency = counters.ready_latency;
         summary["ready_latency_ms"] = {
