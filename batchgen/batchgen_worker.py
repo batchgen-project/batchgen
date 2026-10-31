@@ -192,6 +192,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
+
+# Diagnostic top-k dump (see BatchGenWorker._debug_topk_dump). Off unless the
+# directory is set; a prefix is then mandatory so the dump never syncs on
+# unrelated rows (CUDA-graph capture, prime turns, other sessions).
+_DEBUG_TOPK_DUMP_DIR = os.environ.get("BATCHGEN_DEBUG_TOPK_DUMP_DIR", "")
+_DEBUG_TOPK_DUMP_SESSION_PREFIX = os.environ.get("BATCHGEN_DEBUG_TOPK_DUMP_SESSION_PREFIX", "")
+_DEBUG_TOPK_DUMP_K = int(os.environ.get("BATCHGEN_DEBUG_TOPK_DUMP_K", "5"))
+if _DEBUG_TOPK_DUMP_DIR and not _DEBUG_TOPK_DUMP_SESSION_PREFIX:
+	raise ValueError(
+		"BATCHGEN_DEBUG_TOPK_DUMP_DIR requires BATCHGEN_DEBUG_TOPK_DUMP_SESSION_PREFIX"
+	)
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
@@ -4808,6 +4819,48 @@ class BatchGenWorker:
 				return False
 		return True
 
+	def _debug_topk_dump(self, logits: torch.Tensor, batch_sequences: Optional[list]) -> None:
+		"""Diagnostic only (BATCHGEN_DEBUG_TOPK_DUMP_DIR): append the top-k
+		candidates of every selected row whose session_id starts with
+		BATCHGEN_DEBUG_TOPK_DUMP_SESSION_PREFIX to
+		<dir>/topk_rank<R>_pid<P>.jsonl. Rows of other sessions are skipped
+		without a device sync. Never enabled in production."""
+		if not batch_sequences:
+			return
+		rows = [
+			i for i, seq in enumerate(batch_sequences)
+			if seq is not None
+			and str(getattr(seq, "session_id", None) or "").startswith(_DEBUG_TOPK_DUMP_SESSION_PREFIX)
+		]
+		if not rows:
+			return
+		if len(batch_sequences) != int(logits.shape[0]):
+			raise ValueError(
+				f"_debug_topk_dump: {len(batch_sequences)} sequences for "
+				f"{int(logits.shape[0])} logits rows"
+			)
+		k = _DEBUG_TOPK_DUMP_K
+		sel = logits[rows]
+		top_raw, top_ids = torch.topk(sel, k, dim=-1)
+		logprobs = torch.log_softmax(sel.float(), dim=-1)
+		top_lp = torch.gather(logprobs, -1, top_ids)
+		argmax = sel.argmax(dim=-1)
+		top_ids_h = top_ids.cpu().tolist()
+		top_raw_h = top_raw.float().cpu().tolist()
+		top_lp_h = top_lp.cpu().tolist()
+		argmax_h = argmax.cpu().tolist()
+		path = os.path.join(_DEBUG_TOPK_DUMP_DIR, f"topk_rank{self.rank}_pid{os.getpid()}.jsonl")
+		with open(path, "a") as f:
+			for j, i in enumerate(rows):
+				seq = batch_sequences[i]
+				f.write(json.dumps({
+					"ts": time.time(), "rank": self.rank, "uuid": str(seq.uuid),
+					"session_id": seq.session_id, "decoded_length": int(seq.decoded_length),
+					"prompt_length": int(seq.prompt_length), "vocab": int(logits.shape[-1]),
+					"dtype": str(logits.dtype), "argmax": int(argmax_h[j]),
+					"top_ids": top_ids_h[j], "top_logit": top_raw_h[j], "top_logprob": top_lp_h[j],
+				}) + "\n")
+
 	def _select_tokens(
 		self,
 		logits: torch.Tensor,
@@ -4838,6 +4891,9 @@ class BatchGenWorker:
 			[batch_size, 1] selected token indices
 		"""
 		from batchgen.sampling import sample_tokens
+
+		if _DEBUG_TOPK_DUMP_DIR:
+			self._debug_topk_dump(logits, batch_sequences)
 
 		if residency is not None:
 			if batch_rows is None:
