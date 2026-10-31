@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -291,16 +292,15 @@ def test_bootstrap_timeout_defaults_and_accepts_an_override(tmp_path):
         read_distributed_weight_config,
     )
 
-    # Backward compatibility: configs written before the key exists keep the
-    # daemon's historical 180 s budget, normalized in so the server-side
-    # readiness wait can always read it.
-    legacy = read_distributed_weight_config(_write_store_config(tmp_path))
-    assert legacy["bootstrap_timeout_s"] == 180
+    # A config without the key gets the shared default, normalized in so the
+    # server-side readiness wait can always read it.
+    default = read_distributed_weight_config(_write_store_config(tmp_path))
+    assert default["bootstrap_timeout_s"] == 600
 
     widened = read_distributed_weight_config(
-        _write_store_config(tmp_path / "wide", bootstrap_timeout_s=600)
+        _write_store_config(tmp_path / "wide", bootstrap_timeout_s=900)
     )
-    assert widened["bootstrap_timeout_s"] == 600
+    assert widened["bootstrap_timeout_s"] == 900
 
 
 @pytest.mark.parametrize("bad", [0, -5, "180", 1.5, None])
@@ -321,5 +321,29 @@ def test_server_readiness_wait_derives_from_the_bootstrap_timeout():
     manager_path = ROOT / "batchgen" / "server" / "worker_manager.py"
     source = manager_path.read_text()
     assert "wait_ready(600.0)" not in source
-    assert 'get(\n                    "bootstrap_timeout_s", 180' in source
+    assert 'self.distributed_weight_config["bootstrap_timeout_s"]' in source
     assert "float(bootstrap_timeout_s + 420)" in source
+
+
+def test_bootstrap_timeout_default_agrees_between_daemon_and_python():
+    """The daemon reads the config file itself, so a key-less config is
+    timed by the C++ default; the Python default sizes wait_ready. Both
+    must be the same value, and neither may fall back to the old 180 s."""
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        DEFAULT_BOOTSTRAP_TIMEOUT_S,
+    )
+
+    daemon = (
+        ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.cpp"
+    ).read_text()
+    match = re.search(r"constexpr int kDefaultBootstrapTimeoutS = (\d+);", daemon)
+    assert match is not None
+    assert int(match.group(1)) == DEFAULT_BOOTSTRAP_TIMEOUT_S == 600
+    assert 'config.value("bootstrap_timeout_s",\n' in daemon
+    assert "kDefaultBootstrapTimeoutS);" in daemon
+    assert "int bootstrap_timeout_s = kDefaultBootstrapTimeoutS;" in daemon
+    store = (
+        ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear"
+        / "distributed_weight_store.py"
+    ).read_text()
+    assert '"bootstrap_timeout_s", 180' not in store

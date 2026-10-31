@@ -583,12 +583,10 @@ class WorkerManager:
         if self.distributed_weight_daemon is not None:
             _diag(">>> distributed_weight_daemon.wait_ready")
             # Shared deadline with the daemon's peer-connect budget: the
-            # Python wait must outlast bootstrap_timeout_s by the same margin
-            # the former constants had (600 = 180 + 420).
+            # Python wait outlasts bootstrap_timeout_s by a 420 s margin.
+            # load_distributed_weight_config always normalizes the key in.
             bootstrap_timeout_s = int(
-                (self.distributed_weight_config or {}).get(
-                    "bootstrap_timeout_s", 180
-                )
+                self.distributed_weight_config["bootstrap_timeout_s"]
             )
             self.distributed_weight_daemon.wait_ready(
                 float(bootstrap_timeout_s + 420)
