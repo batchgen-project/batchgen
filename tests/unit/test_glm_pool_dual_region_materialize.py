@@ -20,8 +20,8 @@ error). These CPU tests hold the bookkeeping to that:
 * the resume helper turns a held session into a page-aligned pool segment;
 * GPT-OSS / single-region behaviour is unchanged.
 
-GPU-only checks are at the end, skipped without CUDA; they name the exact
-assertions the 8xH200 validation must make.
+The GPU validation is not a unit test; the note at the end says where each
+of its assertions is checked.
 """
 
 from __future__ import annotations
@@ -784,80 +784,32 @@ def test_gpt_oss_session_hold_path_is_untouched_by_this_change():
 
 
 # --------------------------------------------------------------------------- #
-#  8. GPU validation (8xH200, GLM-5.3) -- skipped without CUDA
+#  8. GPU validation (8xH200, GLM-5.3) -- not unit tests
 # --------------------------------------------------------------------------- #
 #
-# These cannot run on CPU: they need a live GLM-5.3 server launched with
-# --enable-session-kv-hold (pool resume, no --enable-prefix-cache). Each names
-# the exact assertion the GPU validation must make; the runner is the 4b
-# checklist in the GLM-5.3 adaptation spec.
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="GPU validation: needs a GLM-5.3 server on 8xH200",
-)
-
-
-@requires_cuda
-def test_gpu_turn2_cached_tokens_equal_turn1_context_across_waves():
-    """Two-turn greedy session; turn 2 is admitted in a LATER wave.
-
-    assert usage.prompt_tokens_details.cached_tokens(turn 2)
-        == (turn1_kv_tokens // 64) * 64   # turn1_kv = prompt + output - 1
-    (accepted granularity: whole pages; the partial last page is recomputed)
-    assert the [SESSION_HOLD] resume line's cached_tokens and kept_pages
-        equal it and it // 64, the [SESSION_HOLD] 'pool wave' line names one
-        loaded segment of that many tokens, and the [PREFIX_POOL] 'loaded
-        materialized segment' line names the same tokens over it // 64 Host
-        page(s) per region; no 'pool declines' line for the turn.
-    """
-    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
-
-
-@requires_cuda
-def test_gpu_both_host_regions_byte_equal_to_recompute():
-    """For every held page p and every layer l, after turn 1:
-    torch.equal(primary_host[l, p], primary_host_recompute[l, p]) and
-    torch.equal(aux_host[l, p], aux_host_recompute[l, p]) where *_recompute
-    is the same prompt prefilled from scratch with the hold off (same
-    deterministic baseline; DSA top-k order nondeterminism must first be
-    shown absent on a hold-off repeat). Then, inside the turn-2 wave, the
-    pool rows of the loaded segment equal those Host pages byte for byte.
-    """
-    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
-
-
-@requires_cuda
-def test_gpu_held_pages_zero_after_close():
-    """After POST /v1/sessions/{id}/close:
-    assert /v1/pool/status held_kv_pages == 0 and, on the owner rank,
-    num_free_pages == baseline in BOTH the primary and auxiliary region.
-    """
-    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
-
-
-@requires_cuda
-def test_gpu_greedy_output_equal_with_and_without_hold():
-    """Greedy (temperature 0) turn 2 with hold ON (cross-wave load) produces
-    the same token ids as turn 2 with hold OFF (full recompute), given a
-    hold-off repeat that is itself deterministic."""
-    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
-
-
-@requires_cuda
-def test_gpu_dual_region_loader_real_h2d_is_byte_exact():
-    """The real CUDA H2D (audit item 2; the CPU tests fake it with memmove).
-
-    On the GLM-5.3 node, with the live DualHostKVCoordinator views and a
-    held span of N >= 3 pages (so >= 2 slabs at 2 pages/slab):
-    for every slab yielded by DualRegionSegmentLoader.slabs(...):
-        torch.equal(slab.latent[l].cpu(),  primary_host_rows(l, window))
-        torch.equal(slab.indexer[l].cpu(), aux_host_rows(l, window))
-    for every layer l in 0..77 and the slab's page window, where
-    *_host_rows reads the pinned Host region directly (KPagePtr view).
-    After _load_dual_region_segments, for every layer l and every slot s of
-    the segment: pool.k[l].view(-1, 576)[s] and
-    pool.indexer[indexer_row[l]].view(-1, 128)[s] equal those Host rows,
-    and every pool slot outside the segment is unchanged.
-    """
-    pytest.skip("run on the GPU node: see glm53-adaptation-spec 4b")
+# The five CUDA tests that stood here were docstring stubs: each passed the
+# CUDA gate and then called pytest.skip unconditionally, so a GPU run
+# reported them as skipped and asserted nothing. They are removed; where each
+# assertion is checked now:
+#
+# * turn-2 cached_tokens == (turn1_kv // 64) * 64 across waves, one loaded
+#   segment of that many tokens per region, no pool decline -- a live-server
+#   probe (two-turn session, then four sessions x two turns); it needs the
+#   HTTP server, not a unit test.
+# * held_kv_pages == 0 after close, and the restart reclaim frees the held
+#   pages of BOTH Host regions -- the same live-server probe.
+# * both Host regions of a held turn byte-equal to a recompute's -- the
+#   env-gated Host KV dump (batchgen/worker/hostkv_debug_dump.py, wired at
+#   the hold retain): BATCHGEN_DEBUG_HOSTKV_DUMP_DIR + _SESSION_PREFIX dump
+#   every matching held turn's pages of every region, and
+#   ``python -m batchgen.worker.hostkv_debug_dump compare A B`` compares two
+#   dumps page by page. Its writer and comparer are CPU-tested in
+#   tests/unit/test_hostkv_debug_dump.py; the live compare runs on the node.
+# * greedy turn-2 output with the hold == without it -- dropped as a gate: at
+#   ~27K tokens the full-recompute path is not itself greedy-reproducible on
+#   GLM-5.3 (identical requests diverge at a near-tied position), so token
+#   equality cannot decide the hold's correctness.
+# * the real CUDA H2D of DualRegionSegmentLoader (and the pool rows after
+#   _load_dual_region_segments) byte-equal to the Host pages -- NOT covered by
+#   any test yet. The CPU tests above exercise the pointer arithmetic with a
+#   memmove fake; the device copy itself is unverified.

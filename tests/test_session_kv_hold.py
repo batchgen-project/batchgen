@@ -318,6 +318,8 @@ _METHODS = load_worker_methods(_METHOD_NAMES, {
     "SequenceEntry": SequenceEntry,
     "release_local_query_slot": release_local_query_slot,
     "_NO_MESSAGE": object(),
+    # The Host KV debug dump at the hold retain: off, as in production.
+    "_DEBUG_HOSTKV_DUMP_DIR": "",
     "List": List, "Optional": Optional, "Sequence": Sequence,
     "Dict": Dict, "Tuple": Tuple,
 })

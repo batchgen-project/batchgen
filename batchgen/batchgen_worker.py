@@ -203,6 +203,12 @@ if _DEBUG_TOPK_DUMP_DIR and not _DEBUG_TOPK_DUMP_SESSION_PREFIX:
 	raise ValueError(
 		"BATCHGEN_DEBUG_TOPK_DUMP_DIR requires BATCHGEN_DEBUG_TOPK_DUMP_SESSION_PREFIX"
 	)
+# Diagnostic Host KV page dump at hold time (see _debug_hostkv_dump); same
+# contract: off unless the directory is set, then the prefix is mandatory.
+from batchgen.worker import hostkv_debug_dump as hostkv_debug_dump_lib
+_DEBUG_HOSTKV_DUMP_DIR, _DEBUG_HOSTKV_DUMP_SESSION_PREFIX = (
+	hostkv_debug_dump_lib.config_from_env(os.environ)
+)
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
@@ -3603,12 +3609,68 @@ class BatchGenWorker:
 				self._session_retained_pages[uuid] = {
 					group_id: tuple(pages) for group_id, (pages, _) in split.items()
 				}
+				if _DEBUG_HOSTKV_DUMP_DIR:
+					self._debug_hostkv_dump(
+						seq, views, self._session_retained_pages[uuid], kv_tokens
+					)
 		except Exception as exc:
 			logging.exception(
 				"[SESSION_HOLD] rank %s: retaining held pages failed; every "
 				"rank raises at the hold record", self.rank,
 			)
 			errors.append(f"{type(exc).__name__}: {exc}")
+
+	def _debug_hostkv_dump(self, seq, views, pages_by_group, kv_tokens) -> None:
+		"""Diagnostic only (BATCHGEN_DEBUG_HOSTKV_DUMP_DIR): write the pages a
+		held turn just retained, every Host region, raw, for a byte compare
+		against another session's dump (hostkv_debug_dump.compare_dumps).
+
+		Owner rank, inside the retain: the decode appends were retired above,
+		so these are the bytes a resume would load. A session outside
+		BATCHGEN_DEBUG_HOSTKV_DUMP_SESSION_PREFIX is skipped; a failure is the
+		retain's failure (deferred, raised on every rank). Never enabled in
+		production.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			build_gpu_kv_config,
+			build_gpu_kv_config_aux,
+		)
+
+		session_id = str(getattr(seq, "session_id", None) or "")
+		if not session_id.startswith(_DEBUG_HOSTKV_DUMP_SESSION_PREFIX):
+			return
+		page_tokens = int(self._session_hold.page_tokens)
+		builders = {0: build_gpu_kv_config, 1: build_gpu_kv_config_aux}
+		regions = []
+		for group_id, view in sorted(views.items()):
+			builder = builders.get(int(group_id))
+			geometry = (
+				None if builder is None
+				else builder(self.huggingface_ckpt_name, [page_tokens])
+			)
+			if geometry is None:
+				raise RuntimeError(
+					f"Host KV dump: no GPU KV geometry for Host KV group {group_id}"
+				)
+			regions.append(hostkv_debug_dump_lib.region_spec(
+				group=group_id, view=view, geometry=geometry,
+				page_tokens=page_tokens, page_ids=pages_by_group[group_id],
+			))
+		path = hostkv_debug_dump_lib.dump_held_pages(
+			_DEBUG_HOSTKV_DUMP_DIR,
+			session_id=session_id,
+			request_id=str(seq.uuid),
+			rank=self.rank,
+			kv_tokens=int(kv_tokens),
+			page_tokens=page_tokens,
+			regions=regions,
+		)
+		logging.info(
+			"[SESSION_HOLD] debug Host KV dump session=%s request=%s "
+			"kv_tokens=%d pages=%d groups=%s rank=%s -> %s",
+			session_id, seq.uuid, int(kv_tokens), len(regions[0].page_ids),
+			[spec.group for spec in regions], self.rank, path,
+		)
 
 	def _rollback_session_retain(self, global_id, done, attached) -> None:
 		"""Owner rank: undo a held turn's partial retain before its error leaves.
