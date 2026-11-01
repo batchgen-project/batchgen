@@ -56,7 +56,11 @@ __device__ float block_sum(float value, float* scratch) {
         }
     }
     __syncthreads();
-    return scratch[0];
+    result = scratch[0];
+    // Every warp must read the total before any warp can enter the next
+    // block_sum and overwrite scratch[0] with its own partial sum.
+    __syncthreads();
+    return result;
 }
 
 // The BatchGen KDA manager stores recurrent state in FLA's default [K,V]

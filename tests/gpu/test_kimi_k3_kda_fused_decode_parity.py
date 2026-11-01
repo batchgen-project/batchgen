@@ -194,8 +194,7 @@ def test_version_two_matches_version_one_at_the_decode_bucket():
     state0 = torch.randn(slots_total, heads, head_dim, head_dim,
                          device=device) * 0.1
 
-    results = {}
-    for version in (1, 2):
+    def run(version):
         conv = [pool.clone() for pool in conv0]
         state = state0.clone()
         out = kda_fused_decode(
@@ -205,7 +204,17 @@ def test_version_two_matches_version_one_at_the_decode_bucket():
             scale=head_dim ** -0.5, onorm_eps=1e-5, lower_bound=-5.0,
             version=version,
         )
-        results[version] = (out, state, conv)
+        return out, state, conv
+
+    results = {}
+    for version in (1, 2):
+        results[version] = run(version)
+        # Bit-identical across launches: a shared-scratch race between the
+        # q and k norm reductions once made some warps scale q by k's norm.
+        for _ in range(4):
+            again = run(version)
+            assert torch.equal(again[0], results[version][0]), version
+            assert torch.equal(again[1], results[version][1]), version
 
     out1, state1, conv1 = results[1]
     out2, state2, conv2 = results[2]
