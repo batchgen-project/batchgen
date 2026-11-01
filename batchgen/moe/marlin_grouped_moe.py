@@ -283,7 +283,7 @@ _warned_mxfp4_v2 = False
 _warned_mxfp4_v3 = False
 
 # v2 variant -> (TM 16-row m-blocks per CTA, TN 16-column n-blocks per CTA).
-MXFP4_V2_VARIANTS = {0: (1, 16), 1: (2, 16), 2: (2, 8), 3: (1, 8)}
+MXFP4_V2_VARIANTS = {0: (1, 16), 1: (2, 16), 2: (2, 8)}
 # The v2 kernels fold the E2M1 2^126 rebias into the scale (bf16 2^(e-1));
 # byte 129 would reach the bf16 Inf/NaN exponent.
 MXFP4_V2_MAX_SCALE_BYTE = 128

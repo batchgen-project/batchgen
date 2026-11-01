@@ -68,7 +68,7 @@ asserted — fp32 summation-order noise on cancelled outputs):
                 Reports the catch count — must be N/N.
 
 Version 2 ladder (grouped_marlin_gemm_m16{,_s1}_mxfp4{,_situ}_v2), run for
-each variant 0..3 = (TM, TN) (1,16) (2,16) (2,8) (1,8):
+each variant 0..2 = (TM, TN) (1,16) (2,16) (2,8):
 
   T1v2 DECODE   T1 through the v2 entry (64 one-hot rows => several
                 super-tiles per CTA). Scale bytes span 100..128 so the

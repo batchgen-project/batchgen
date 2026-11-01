@@ -1709,15 +1709,14 @@ void grouped_marlin_gemm_m16_mxfp4(
 // (prob_n / 256) and max_m_tiles is validated but does not shape the grid:
 // each CTA walks every row of its expert. Scale bytes must be <= 128 (see the
 // header); that is a weight-build-time check, not a per-launch one.
-// variant: 0 = (TM=1, TN=16), 1 = (TM=2, TN=16), 2 = (TM=2, TN=8),
-//          3 = (TM=1, TN=8).
+// variant: 0 = (TM=1, TN=16), 1 = (TM=2, TN=16), 2 = (TM=2, TN=8).
 // ----------------------------------------------------------------------------
 #include <c10/cuda/CUDAException.h>
 #include <tuple>
 
 static int mxfp4_v2_tn(int variant) {
-    TORCH_CHECK(variant >= 0 && variant <= 3,
-        "mxfp4 v2 launch: variant must be in [0, 3], got ", variant);
+    TORCH_CHECK(variant >= 0 && variant <= 2,
+        "mxfp4 v2 launch: variant must be in [0, 2], got ", variant);
     return variant <= 1 ? 16 : 8;
 }
 
@@ -1806,8 +1805,7 @@ void grouped_marlin_gemm_m16_s1_mxfp4_situ_v2(
     switch (variant) {
         case 0: launch_mxfp4_v2_s1<1, 16>(MXFP4_V2_S1_ARGS); break;
         case 1: launch_mxfp4_v2_s1<2, 16>(MXFP4_V2_S1_ARGS); break;
-        case 2: launch_mxfp4_v2_s1<2, 8>(MXFP4_V2_S1_ARGS); break;
-        default: launch_mxfp4_v2_s1<1, 8>(MXFP4_V2_S1_ARGS); break;
+        default: launch_mxfp4_v2_s1<2, 8>(MXFP4_V2_S1_ARGS); break;
     }
 #undef MXFP4_V2_S1_ARGS
 }
@@ -1834,8 +1832,7 @@ void grouped_marlin_gemm_m16_mxfp4_v2(
     switch (variant) {
         case 0: launch_mxfp4_v2<1, 16>(MXFP4_V2_ARGS); break;
         case 1: launch_mxfp4_v2<2, 16>(MXFP4_V2_ARGS); break;
-        case 2: launch_mxfp4_v2<2, 8>(MXFP4_V2_ARGS); break;
-        default: launch_mxfp4_v2<1, 8>(MXFP4_V2_ARGS); break;
+        default: launch_mxfp4_v2<2, 8>(MXFP4_V2_ARGS); break;
     }
 #undef MXFP4_V2_ARGS
 }
@@ -1860,8 +1857,7 @@ std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool
     switch (variant) {
         case 0: return mxfp4_v2_cfg<1, 16>(fused);
         case 1: return mxfp4_v2_cfg<2, 16>(fused);
-        case 2: return mxfp4_v2_cfg<2, 8>(fused);
-        default: return mxfp4_v2_cfg<1, 8>(fused);
+        default: return mxfp4_v2_cfg<2, 8>(fused);
     }
 }
 
