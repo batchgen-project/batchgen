@@ -513,6 +513,8 @@ __device__ __forceinline__ void grouped_body(
   const int rank = item / max_chunks;
   const int chunk = item % max_chunks;
   const int matrix = order ? order[rank] : rank;
+  // An order is only accepted when num_matrices == num_experts.
+  if (order && (matrix < 0 || matrix >= num_experts)) __trap();
   const int expert = matrix % num_experts;
   const int count = expert_counts[expert];
   const int row0 = NCAP * chunk;
@@ -568,6 +570,8 @@ __global__ void __launch_bounds__(THREADS, 2) GroupedS1(
       A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
+#elif defined(__CUDA_ARCH__)
+  __trap();  // built without sm_90a features: never return silently
 #endif
 }
 
@@ -588,6 +592,8 @@ __global__ void __launch_bounds__(THREADS, 2) Grouped(
       A, B_ptrs, nullptr, C_ptrs, scales_ptrs, nullptr,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
+#elif defined(__CUDA_ARCH__)
+  __trap();  // built without sm_90a features: never return silently
 #endif
 }
 

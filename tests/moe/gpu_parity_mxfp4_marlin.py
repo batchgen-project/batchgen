@@ -1371,7 +1371,7 @@ def do_build():
             ok = False
 
     # v2 gate: two CTAs per SM need <= 128 registers at 256 threads, and the
-    # instantiations must not spill. 4 variants x {GroupedS1, Grouped}.
+    # instantiations must not spill. Each variant x {GroupedS1, Grouped}.
     v2 = [(dem, r, sp) for dem, mangled, r, sp in marlin if "marlin_v2" in mangled]
     if len(v2) != 2 * len(V2_VARIANTS):
         print(f"    marlin_v2: expected {2 * len(V2_VARIANTS)} instantiations, "

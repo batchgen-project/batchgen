@@ -27,12 +27,13 @@ reproduces the expert PATH; the caller adds the DP-local shared expert):
     y = routed_expert_norm(y)               # ONCE, post-combine, pre-up
     y = routed_expert_up_proj(y)            # 3584 -> 7168
 
-Because the grouped S1/S3 kernel entries are the SAME ones the streamed
-single-expert path drives at E=1, and both sides repack with the identical
-``repack_mxfp4_to_marlin_device``, the resident marlin weights are bit-identical
-to the streamed path's per-forward repack — so resident == streamed to within
-combine-order noise, and resident gates against the M3.0 fp32-dequant oracle at
-the same err_ratio the streamed path already clears.
+Both sides repack with the identical ``repack_mxfp4_to_marlin_device``, so the
+resident marlin weights are bit-identical to the streamed path's per-forward
+repack. The resident shard binds its grouped kernel version at build time
+(``_bind_grouped_kernels``); the v1 entries match the streamed path, and v3
+feeds the same MMA inputs, so resident == streamed to within summation-order
+noise and resident gates against the M3.0 fp32-dequant oracle at the same
+err_ratio the streamed path already clears.
 
 THE FP32 COMBINE (A13's flagged risk — read this before touching it)
 --------------------------------------------------------------------
@@ -377,18 +378,23 @@ def _bind_grouped_kernels(shard, kernel_version):
     """Bind the shard's grouped S1/S3 callables.
 
     Version 3 folds the E2M1 rebias into the E8M0 scale and needs every scale
-    byte <= MXFP4_V2_MAX_SCALE_BYTE; it also orders its CTAs by a per-layer
-    expert order computed in ``s1_fn`` from the S1 row counts, which ``s3_fn``
-    reuses, so ``s3_fn`` must follow ``s1_fn`` with the same counts.
+    byte in [1, MXFP4_V2_MAX_SCALE_BYTE]; it also orders its CTAs by a
+    per-layer expert order computed in ``s1_fn`` from the S1 row counts, which
+    ``s3_fn`` reuses, so ``s3_fn`` must follow ``s1_fn`` with the same counts.
     """
+    if kernel_version not in (None, 1, 3):
+        raise ValueError(
+            f"MXFP4 resident kernel_version must be 1 or 3, got {kernel_version}")
     if kernel_version is None or kernel_version == 3:
-        max_byte = int(torch.stack(
-            [s.max() for t in shard._tensors for _, s in t.values()]).max())
-        scales_ok = max_byte <= MXFP4_V2_MAX_SCALE_BYTE
+        scales = [s for t in shard._tensors for _, s in t.values()]
+        lo_hi = torch.stack([torch.stack([s.min(), s.max()]) for s in scales])
+        min_byte, max_byte = (int(v) for v in
+                              torch.stack([lo_hi[:, 0].min(), lo_hi[:, 1].max()]).tolist())
+        scales_ok = 1 <= min_byte and max_byte <= MXFP4_V2_MAX_SCALE_BYTE
         if kernel_version == 3 and not scales_ok:
             raise ValueError(
-                f"MXFP4 kernel v3 needs E8M0 scale bytes <= "
-                f"{MXFP4_V2_MAX_SCALE_BYTE}, shard has {max_byte}")
+                f"MXFP4 kernel v3 needs E8M0 scale bytes in "
+                f"[1, {MXFP4_V2_MAX_SCALE_BYTE}], shard has [{min_byte}, {max_byte}]")
         if kernel_version is None:
             kernel_version = (
                 3 if scales_ok and torch.cuda.get_device_capability(shard.device)[0] == 9
@@ -398,7 +404,7 @@ def _bind_grouped_kernels(shard, kernel_version):
     if kernel_version != 3:
         shard.s1_fn, shard.s3_fn = s1, s3
         return
-    order = torch.empty(shard.num_local, dtype=torch.int32, device=shard.device)
+    order = torch.arange(shard.num_local, dtype=torch.int32, device=shard.device)
 
     def s1_fn(*args):
         compute_mxfp4_v3_expert_order(args[2], order)
