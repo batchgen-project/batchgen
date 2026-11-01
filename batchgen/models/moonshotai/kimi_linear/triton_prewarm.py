@@ -601,7 +601,7 @@ def _run_kda_decode(module, template, rows: int) -> None:
 
 def kda_prefill_entries(module, template, segment_tokens: int,
                         shapes=KDA_PREFILL_SHAPES) -> List[PrewarmEntry]:
-    return [
+    entries = [
         PrewarmEntry(
             f"kda_prefill/{shape.name}",
             partial(_run_kda_prefill, module, template, shape,
@@ -609,6 +609,10 @@ def kda_prefill_entries(module, template, segment_tokens: int,
         )
         for shape in shapes
     ]
+    weight = module.q_proj.weight
+    entries.extend(beta_sigmoid_entries(module.num_heads, weight.dtype,
+                                        weight.device))
+    return entries
 
 
 def kda_decode_entries(module, template, buckets) -> List[PrewarmEntry]:
@@ -791,8 +795,6 @@ def build_prewarm_entries(model, config, decode_buckets) -> List[PrewarmEntry]:
                                                segment_tokens))
             entries.extend(kda_decode_entries(module, template,
                                               decode_buckets))
-            entries.extend(beta_sigmoid_entries(module.num_heads, act_dtype,
-                                                device))
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     entries.extend(attn_residual_entries(model))
