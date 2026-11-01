@@ -56,7 +56,11 @@ __device__ float block_sum(float value, float* scratch) {
         }
     }
     __syncthreads();
-    return scratch[0];
+    result = scratch[0];
+    // Every warp must read the total before any warp can enter the next
+    // block_sum and overwrite scratch[0] with its own partial sum.
+    __syncthreads();
+    return result;
 }
 
 // The BatchGen KDA manager stores recurrent state in FLA's default [K,V]
@@ -411,6 +415,253 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
     }
 }
 
+// Version 2: the [K,V] state tile stays in registers.  Lanes span V (one
+// float4 of values each, so a warp reads one 512-byte key row) and warp w owns
+// key rows w, w + 8, ..., w + 120.  Every state load is issued before the
+// convolution math, so a CTA keeps its whole 64 KiB tile in flight instead of
+// staging four 16 KiB chunks through shared memory one at a time.  The two
+// reductions over K (k.h before the update, q.h after it) go through a small
+// shared [warps, V] scratch.  Same math as version 1; only the fp32 summation
+// order over K differs.
+constexpr int kV2RowsPerWarp = kHeadDim / kWarps;
+
+template <bool kUseLowerBound>
+__global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_v2_kernel(
+    const __nv_bfloat16* __restrict__ mixed_qkv,
+    const __nv_bfloat16* __restrict__ forget_gate,
+    const __nv_bfloat16* __restrict__ beta,
+    __nv_bfloat16* __restrict__ conv_q,
+    __nv_bfloat16* __restrict__ conv_k,
+    __nv_bfloat16* __restrict__ conv_v,
+    const float* __restrict__ weight_q,
+    const float* __restrict__ weight_k,
+    const float* __restrict__ weight_v,
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const __nv_bfloat16* __restrict__ onorm_gate,
+    const float* __restrict__ onorm_weight,
+    float* __restrict__ state,
+    const int32_t* __restrict__ state_indices,
+    __nv_bfloat16* __restrict__ output,
+    int batch,
+    int heads,
+    float scale,
+    float onorm_eps,
+    float lower_bound,
+    int64_t mixed_stride,
+    int64_t forget_stride,
+    int64_t beta_stride,
+    int64_t conv_slot_stride,
+    int64_t conv_channel_stride,
+    int64_t conv_tap_stride,
+    int64_t weight_channel_stride,
+    int64_t weight_tap_stride,
+    int64_t state_slot_stride,
+    int64_t onorm_gate_stride) {
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (token >= batch || head >= heads) {
+        return;
+    }
+
+    const int segment = heads * kHeadDim;
+    const int channel_base = head * kHeadDim;
+    const int32_t slot = state_indices[token];
+    __shared__ float q[kHeadDim];
+    __shared__ float k[kHeadDim];
+    __shared__ float decay[kHeadDim];
+    __shared__ float value[kHeadDim];
+    // Read and written as float4, so the alignment must not depend on the
+    // declaration order.
+    __shared__ __align__(16) float update[kHeadDim];
+    __shared__ __align__(16) float partial[kWarps][kHeadDim];
+    __shared__ float reduce[kWarps];
+    __shared__ float beta_value;
+
+    if (slot < 0) {
+        if (tid < kHeadDim) {
+            output[token * segment + channel_base + tid] =
+                float_to_bf16(0.0f);
+        }
+        return;
+    }
+
+    // Issue the whole tile's loads first; nothing below depends on them until
+    // the decay step.
+    const int value_base = lane * 4;
+    float* tile = state + static_cast<int64_t>(slot) * state_slot_stride
+                + static_cast<int64_t>(head) * kHeadDim * kHeadDim
+                + value_base;
+    float4 h[kV2RowsPerWarp];
+#pragma unroll
+    for (int i = 0; i < kV2RowsPerWarp; ++i) {
+        const int key = warp + i * kWarps;
+        h[i] = *reinterpret_cast<const float4*>(tile + key * kHeadDim);
+    }
+
+    const int64_t mixed_base = static_cast<int64_t>(token) * mixed_stride;
+    const int64_t forget_base = static_cast<int64_t>(token) * forget_stride;
+    const int64_t beta_base = static_cast<int64_t>(token) * beta_stride;
+    const int64_t conv_base = static_cast<int64_t>(slot) * conv_slot_stride;
+
+    if (tid < kHeadDim) {
+        const int channel = channel_base + tid;
+        float q_acc = bias_q == nullptr ? 0.0f : bias_q[channel];
+        float k_acc = bias_k == nullptr ? 0.0f : bias_k[channel];
+        float v_acc = bias_v == nullptr ? 0.0f : bias_v[channel];
+
+#pragma unroll
+        for (int tap = 0; tap < kConvStateWidth; ++tap) {
+            const int64_t conv_offset = conv_base
+                                      + channel * conv_channel_stride
+                                      + tap * conv_tap_stride;
+            q_acc += bf16_to_float(conv_q, conv_offset) * load_weight(
+                weight_q, channel, tap, weight_channel_stride, weight_tap_stride);
+            k_acc += bf16_to_float(conv_k, conv_offset) * load_weight(
+                weight_k, channel, tap, weight_channel_stride, weight_tap_stride);
+            v_acc += bf16_to_float(conv_v, conv_offset) * load_weight(
+                weight_v, channel, tap, weight_channel_stride, weight_tap_stride);
+        }
+
+        const __nv_bfloat16 q_new = mixed_qkv[mixed_base + channel];
+        const __nv_bfloat16 k_new = mixed_qkv[mixed_base + segment + channel];
+        const __nv_bfloat16 v_new = mixed_qkv[mixed_base + 2 * segment + channel];
+        q_acc += __bfloat162float(q_new) * load_weight(
+            weight_q, channel, kKernelWidth - 1,
+            weight_channel_stride, weight_tap_stride);
+        k_acc += __bfloat162float(k_new) * load_weight(
+            weight_k, channel, kKernelWidth - 1,
+            weight_channel_stride, weight_tap_stride);
+        v_acc += __bfloat162float(v_new) * load_weight(
+            weight_v, channel, kKernelWidth - 1,
+            weight_channel_stride, weight_tap_stride);
+
+        // Same ShortConvolution shift-register order as version 1.
+        const int64_t conv_tap0 = conv_base + channel * conv_channel_stride;
+        const int64_t conv_tap1 = conv_tap0 + conv_tap_stride;
+        const int64_t conv_tap2 = conv_tap1 + conv_tap_stride;
+        const __nv_bfloat16 q_shift1 = conv_q[conv_tap1];
+        const __nv_bfloat16 q_shift2 = conv_q[conv_tap2];
+        const __nv_bfloat16 k_shift1 = conv_k[conv_tap1];
+        const __nv_bfloat16 k_shift2 = conv_k[conv_tap2];
+        const __nv_bfloat16 v_shift1 = conv_v[conv_tap1];
+        const __nv_bfloat16 v_shift2 = conv_v[conv_tap2];
+        conv_q[conv_tap0] = q_shift1;
+        conv_q[conv_tap1] = q_shift2;
+        conv_q[conv_tap2] = q_new;
+        conv_k[conv_tap0] = k_shift1;
+        conv_k[conv_tap1] = k_shift2;
+        conv_k[conv_tap2] = k_new;
+        conv_v[conv_tap0] = v_shift1;
+        conv_v[conv_tap1] = v_shift2;
+        conv_v[conv_tap2] = v_new;
+
+        q[tid] = q_acc / (1.0f + __expf(-q_acc));
+        k[tid] = k_acc / (1.0f + __expf(-k_acc));
+        value[tid] = v_acc / (1.0f + __expf(-v_acc));
+
+        const float gate = bf16_to_float(
+            forget_gate, forget_base + channel) + dt_bias[channel];
+        const float exp_a = __expf(a_log[head]);
+        if constexpr (kUseLowerBound) {
+            const float sigmoid = 1.0f / (1.0f + __expf(-exp_a * gate));
+            decay[tid] = __expf(lower_bound * sigmoid);
+        } else {
+            const float softplus = gate > 20.0f
+                ? gate : log1pf(__expf(gate));
+            decay[tid] = __expf(-exp_a * softplus);
+        }
+    }
+
+    if (tid == 0) {
+        const float raw_beta = bf16_to_float(beta, beta_base + head);
+        beta_value = 1.0f / (1.0f + __expf(-raw_beta));
+    }
+
+    const float q_sq = tid < kHeadDim ? q[tid] * q[tid] : 0.0f;
+    const float k_sq = tid < kHeadDim ? k[tid] * k[tid] : 0.0f;
+    const float q_norm = rsqrtf(block_sum(q_sq, reduce) + 1.0e-6f);
+    const float k_norm = rsqrtf(block_sum(k_sq, reduce) + 1.0e-6f);
+    if (tid < kHeadDim) {
+        q[tid] *= q_norm * scale;
+        k[tid] *= k_norm;
+    }
+    __syncthreads();
+
+    // Decay, then this warp's share of k.h over its key rows.
+    float4 dot_k = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int i = 0; i < kV2RowsPerWarp; ++i) {
+        const int key = warp + i * kWarps;
+        const float d = decay[key];
+        const float kk = k[key];
+        h[i].x *= d;
+        h[i].y *= d;
+        h[i].z *= d;
+        h[i].w *= d;
+        dot_k.x += h[i].x * kk;
+        dot_k.y += h[i].y * kk;
+        dot_k.z += h[i].z * kk;
+        dot_k.w += h[i].w * kk;
+    }
+    *reinterpret_cast<float4*>(&partial[warp][value_base]) = dot_k;
+    __syncthreads();
+    if (tid < kHeadDim) {
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            total += partial[w][tid];
+        }
+        update[tid] = (value[tid] - total) * beta_value;
+    }
+    __syncthreads();
+
+    // Rank-one update, write the tile back, and this warp's share of q.h.
+    const float4 u = *reinterpret_cast<const float4*>(&update[value_base]);
+    float4 dot_q = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int i = 0; i < kV2RowsPerWarp; ++i) {
+        const int key = warp + i * kWarps;
+        const float kk = k[key];
+        const float qq = q[key];
+        h[i].x += kk * u.x;
+        h[i].y += kk * u.y;
+        h[i].z += kk * u.z;
+        h[i].w += kk * u.w;
+        *reinterpret_cast<float4*>(tile + key * kHeadDim) = h[i];
+        dot_q.x += h[i].x * qq;
+        dot_q.y += h[i].y * qq;
+        dot_q.z += h[i].z * qq;
+        dot_q.w += h[i].w * qq;
+    }
+    *reinterpret_cast<float4*>(&partial[warp][value_base]) = dot_q;
+    __syncthreads();
+    float out = 0.0f;
+    if (tid < kHeadDim) {
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            out += partial[w][tid];
+        }
+    }
+
+    const float sumsq = block_sum(tid < kHeadDim ? out * out : 0.0f, reduce);
+    if (tid < kHeadDim) {
+        const float norm = rsqrtf(sumsq / static_cast<float>(kHeadDim)
+                                  + onorm_eps);
+        const float gate = 1.0f / (1.0f + __expf(-bf16_to_float(
+            onorm_gate, static_cast<int64_t>(token) * onorm_gate_stride
+                + channel_base + tid)));
+        const float y = out * norm * onorm_weight[tid] * gate;
+        output[token * segment + channel_base + tid] = float_to_bf16(y);
+    }
+}
+
 template <bool kUseLowerBound>
 void launch_kda_fused_decode(
     const torch::Tensor& mixed_qkv,
@@ -434,19 +685,26 @@ void launch_kda_fused_decode(
     torch::Tensor& output,
     float scale,
     float onorm_eps,
-    float lower_bound) {
+    float lower_bound,
+    int version) {
     const int batch = static_cast<int>(mixed_qkv.size(0));
     const int heads = static_cast<int>(state.size(1));
     const int segment = heads * kHeadDim;
-    const size_t shared_bytes = static_cast<size_t>(2)
-        * kStateChunkElements * sizeof(float);
+    // Version 1 stages two [32 values, K] state chunks in dynamic shared
+    // memory; version 2 keeps the tile in registers and needs none.
+    const size_t shared_bytes = version == 1
+        ? static_cast<size_t>(2) * kStateChunkElements * sizeof(float)
+        : 0;
+    const auto kernel = version == 1
+        ? kda_fused_decode_kernel<kUseLowerBound>
+        : kda_fused_decode_v2_kernel<kUseLowerBound>;
     auto stream = at::cuda::getCurrentCUDAStream(mixed_qkv.device().index());
 
     const float* bq = bias_q.has_value() ? bias_q->data_ptr<float>() : nullptr;
     const float* bk = bias_k.has_value() ? bias_k->data_ptr<float>() : nullptr;
     const float* bv = bias_v.has_value() ? bias_v->data_ptr<float>() : nullptr;
 
-    kda_fused_decode_kernel<kUseLowerBound><<<
+    kernel<<<
         dim3(batch, heads), dim3(kThreads), shared_bytes, stream.stream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(forget_gate.data_ptr()),
@@ -495,7 +753,10 @@ torch::Tensor kda_fused_decode_forward(
     double scale,
     double onorm_eps,
     double lower_bound,
-    bool use_lower_bound) {
+    bool use_lower_bound,
+    int64_t version) {
+    TORCH_CHECK(version == 1 || version == 2,
+                "kda_fused_decode version must be 1 or 2, got ", version);
     check_common(mixed_qkv, "mixed_qkv");
     check_common(forget_gate, "forget_gate");
     check_common(beta, "beta");
@@ -577,6 +838,10 @@ torch::Tensor kda_fused_decode_forward(
                 && weight_v.stride(1) == 1);
     TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == kHeadDim
                 && state.stride(1) == kHeadDim * kHeadDim);
+    // Both versions move the state in float4 units.
+    TORCH_CHECK(state.stride(0) % 4 == 0
+                && reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
+                "state slots must be 16-byte aligned");
     TORCH_CHECK(state_indices.is_contiguous());
 
     auto output = torch::empty(
@@ -592,14 +857,14 @@ torch::Tensor kda_fused_decode_forward(
             weight_q, weight_k, weight_v, bias_q, bias_k, bias_v,
             a_log, dt_bias, onorm_gate, onorm_weight, state, state_indices,
             output, static_cast<float>(scale), static_cast<float>(onorm_eps),
-            static_cast<float>(lower_bound));
+            static_cast<float>(lower_bound), static_cast<int>(version));
     } else {
         launch_kda_fused_decode<false>(
             mixed_qkv, forget_gate, beta, conv_q, conv_k, conv_v,
             weight_q, weight_k, weight_v, bias_q, bias_k, bias_v,
             a_log, dt_bias, onorm_gate, onorm_weight, state, state_indices,
             output, static_cast<float>(scale), static_cast<float>(onorm_eps),
-            static_cast<float>(lower_bound));
+            static_cast<float>(lower_bound), static_cast<int>(version));
     }
     return output;
 }

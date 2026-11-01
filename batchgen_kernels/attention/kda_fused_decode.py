@@ -21,6 +21,9 @@ from batchgen_kernels import load_extension
 
 _ext = None
 
+KERNEL_VERSIONS = (1, 2)
+DEFAULT_VERSION = 2
+
 _SUPPORTED_HEADS = {3, 6, 12}
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
@@ -132,6 +135,9 @@ def covered(
         return False
     if state.stride(-3) != _HEAD_DIM * _HEAD_DIM:
         return False
+    # The kernel moves the state in float4 units.
+    if state.stride(0) % 4 or state.data_ptr() % 16:
+        return False
     if not state_indices.is_contiguous():
         return False
     return all(
@@ -171,13 +177,18 @@ def kda_fused_decode(
     scale: float,
     onorm_eps: float,
     lower_bound: Optional[float],
+    version: int = DEFAULT_VERSION,
 ) -> torch.Tensor:
     """Run the fused decode step and return flattened BF16 head output.
 
     ``conv_*`` and ``state`` are updated in place.  Negative state indices are
     treated as CUDA-graph padding rows and produce zero output without
-    touching either pool.
+    touching either pool.  ``version`` 1 stages the recurrent state through
+    shared memory in four chunks; version 2 keeps it in registers with every
+    load issued up front.  Both compute the same recurrence.
     """
+    if version not in KERNEL_VERSIONS:
+        raise ValueError(f"unknown fused KDA decode version {version}")
     if not covered(
         mixed_qkv, forget_gate, beta, conv_q, conv_k, conv_v,
         weight_q, weight_k, weight_v, bias_q, bias_k, bias_v,
@@ -194,6 +205,7 @@ def kda_fused_decode(
         float(scale), float(onorm_eps),
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
+        int(version),
     )
 
 

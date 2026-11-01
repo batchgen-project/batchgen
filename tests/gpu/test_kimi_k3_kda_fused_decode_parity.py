@@ -26,8 +26,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("heads", [3, 6, 12])
-def test_fused_kda_matches_fla_and_preserves_padding(heads: int):
+def test_fused_kda_matches_fla_and_preserves_padding(heads: int, version: int):
     from batchgen_kernels.attention.kda_fused_decode import kda_fused_decode
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 
@@ -90,6 +91,7 @@ def test_fused_kda_matches_fla_and_preserves_padding(heads: int):
         scale=head_dim ** -0.5,
         onorm_eps=1e-5,
         lower_bound=-5.0,
+        version=version,
     )
 
     valid = torch.tensor([0, 2], dtype=torch.long, device=device)
@@ -158,3 +160,74 @@ def test_fused_kda_matches_fla_and_preserves_padding(heads: int):
         expected[valid, :, 2] = raw[valid].to(torch.bfloat16)
         assert torch.equal(pool, expected)
         assert torch.equal(pool[1], before[1])
+
+
+def test_version_two_matches_version_one_at_the_decode_bucket():
+    """Bucket 128, 12 local heads, real-looking conv taps and a permuted slot
+    map with padding rows: version 2 differs from version 1 only by the fp32
+    summation order over K."""
+    from batchgen_kernels.attention.kda_fused_decode import kda_fused_decode
+
+    torch.manual_seed(20261101)
+    device = torch.device("cuda")
+    heads, head_dim, batch, slots_total = 12, 128, 128, 160
+    segment = heads * head_dim
+    slots = torch.randperm(slots_total, device=device)[:batch].to(torch.int32)
+    slots[torch.tensor([5, 77, 127], device=device)] = -1
+
+    inputs = dict(
+        mixed_qkv=torch.randn(batch, 3 * segment, dtype=torch.bfloat16,
+                              device=device),
+        forget_gate=torch.randn(batch, segment, dtype=torch.bfloat16,
+                                device=device),
+        beta=torch.randn(batch, heads, dtype=torch.bfloat16, device=device),
+    )
+    weights = [torch.randn(segment, 4, device=device) * 0.5 for _ in range(3)]
+    biases = [torch.randn(segment, device=device) * 0.1 for _ in range(3)]
+    a_log = torch.randn(heads, device=device)
+    dt_bias = torch.randn(segment, device=device)
+    onorm_gate = torch.randn(batch, segment, dtype=torch.bfloat16,
+                             device=device)
+    onorm_weight = torch.randn(head_dim, device=device)
+    conv0 = [torch.randn(slots_total, segment, 3, dtype=torch.bfloat16,
+                         device=device) for _ in range(3)]
+    state0 = torch.randn(slots_total, heads, head_dim, head_dim,
+                         device=device) * 0.1
+
+    def run(version):
+        conv = [pool.clone() for pool in conv0]
+        state = state0.clone()
+        out = kda_fused_decode(
+            inputs["mixed_qkv"], inputs["forget_gate"], inputs["beta"],
+            *conv, *weights, *biases, a_log, dt_bias, onorm_gate,
+            onorm_weight, state, slots,
+            scale=head_dim ** -0.5, onorm_eps=1e-5, lower_bound=-5.0,
+            version=version,
+        )
+        return out, state, conv
+
+    results = {}
+    for version in (1, 2):
+        results[version] = run(version)
+        # Bit-identical across launches: a shared-scratch race between the
+        # q and k norm reductions once made some warps scale q by k's norm.
+        for _ in range(4):
+            again = run(version)
+            assert torch.equal(again[0], results[version][0]), version
+            assert torch.equal(again[1], results[version][1]), version
+
+    out1, state1, conv1 = results[1]
+    out2, state2, conv2 = results[2]
+    for a, b in zip(conv1, conv2):
+        assert torch.equal(a, b)
+    state_delta = (state2 - state1).abs()
+    assert state_delta.max().item() <= 1e-5
+    out_delta = (out2.float() - out1.float()).abs()
+    # One BF16 ulp at the output's magnitude, from fp32 reordering upstream.
+    assert out_delta.max().item() <= 2e-2
+    assert (out_delta > 0).float().mean().item() <= 0.02
+    padding = slots < 0
+    assert torch.equal(out2[padding], torch.zeros_like(out2[padding]))
+    untouched = torch.ones(slots_total, dtype=torch.bool, device=device)
+    untouched[slots[slots >= 0].long()] = False
+    assert torch.equal(state2[untouched], state0[untouched])
