@@ -35,6 +35,7 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, HEADS, HEAD_DIM, CONV = 7168, 12, 128, 4
 SEGMENT_TOKENS = 4096
+MAX_PREFILL_TOKENS = 131_072  # ModuleBatchingConfig.prefill_micro_batch_token_cap default
 
 
 def _layer():
@@ -86,6 +87,17 @@ def _random_lengths(rng):
     return [rng.randint(*rng.choice(ranges)) for _ in range(count)]
 
 
+def _capped_lengths(rng):
+    """A micro-batch never exceeds the prefill micro-batch token cap."""
+    lengths, total = [], 0
+    for n in _random_lengths(rng):
+        if total + n > MAX_PREFILL_TOKENS:
+            break
+        lengths.append(n)
+        total += n
+    return lengths or [1]
+
+
 def test_random_prefill_shapes_compile_nothing_after_prewarm():
     from batchgen.models.moonshotai.kimi_linear import triton_prewarm as tp
 
@@ -93,7 +105,8 @@ def test_random_prefill_shapes_compile_nothing_after_prewarm():
     if not recorder.install():
         pytest.skip("this Triton exposes no compile hooks")
     layer, template = _layer(), _template()
-    entries = tp.kda_prefill_entries(layer, template, SEGMENT_TOKENS)
+    entries = tp.kda_prefill_entries(layer, template, SEGMENT_TOKENS,
+                                     max_prefill_tokens=MAX_PREFILL_TOKENS)
     with torch.inference_mode():
         reports = tp.run_prewarm(entries, recorder=recorder)
     assert reports[0].failed == 0
@@ -103,7 +116,7 @@ def test_random_prefill_shapes_compile_nothing_after_prewarm():
     try:
         with torch.inference_mode():
             for _ in range(32):
-                lengths = _random_lengths(rng)
+                lengths = _capped_lengths(rng)
                 shape = tp.KDAPrefillShape(
                     "random", tuple((0, n) for n in lengths),
                     slot_offset=rng.choice((0, 0, 1)),

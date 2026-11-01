@@ -132,6 +132,23 @@ def test_table_witnesses_every_reachable_class(cap):
         assert not missing, (lengths, missing)
 
 
+@pytest.mark.parametrize("heads,cap", [(12, 131_072), (12, 16_384), (8, 4_096)])
+def test_o_norm_counts_reach_every_block_count_in_both_row_classes(heads, cap):
+    counts = TP.o_norm_token_counts(heads, cap)
+    per_block = TP.O_NORM_ROWS_PER_BLOCK
+    max_blocks = -(-cap * heads // per_block)
+    seen = {}
+    for tokens in counts:
+        assert 1 <= tokens <= cap
+        blocks = -(-tokens * heads // per_block)
+        seen.setdefault(blocks, set()).add(TP.int_class(tokens * heads) == "d16")
+    assert set(seen) == set(range(1, max_blocks + 1))
+    # The last block count may be reachable only by the cap itself.
+    for blocks, classes in seen.items():
+        if blocks < max_blocks:
+            assert classes == {True, False}
+
+
 def test_partition_covers_each_entry_once_and_is_deterministic():
     items = list(range(23))
     for count in (1, 2, 3, 8):
