@@ -18,7 +18,9 @@ Under test: ``batchgen/models/moonshotai/kimi_linear/triton_prewarm.py``.
   * the module imports with neither Triton nor fla installed.
 
 Loaded by file path (no ``import batchgen``); ``_kda_segment_plan`` is lifted
-out of ``serving_modules.py`` by AST so its heavy imports never run.
+out of ``serving_modules.py`` by AST so its heavy imports never run. The
+module imports its recorder and runner from ``batchgen_kernels``, which the
+repository root on ``sys.path`` resolves to this checkout.
 
 Run: python -m pytest tests/unit/test_k3_triton_prewarm.py -q
 """
@@ -33,9 +35,12 @@ from types import SimpleNamespace
 
 import pytest
 
-_KL_DIR = (Path(__file__).resolve().parents[2] / "batchgen" / "models"
-           / "moonshotai" / "kimi_linear")
+_ROOT = Path(__file__).resolve().parents[2]
+_KL_DIR = _ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear"
 _SERVING_CAPS = (4096, 16384)
+
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 
 def _load_prewarm(name="_k3_triton_prewarm_under_test"):
