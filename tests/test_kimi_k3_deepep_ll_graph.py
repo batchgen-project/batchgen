@@ -135,11 +135,12 @@ def _build(monkeypatch, *, tp_size=4, tp_rank=1, world=8, bucket=8, latent=128,
     slice_rows = torch.arange(tp_size * lt, dtype=torch.float32).unsqueeze(1)
     slice_cols = torch.arange(cols, dtype=torch.float32).unsqueeze(0) * 100
     latent_slice_value = (slice_rows + slice_cols).to(torch.bfloat16)
+    shard = SimpleNamespace(
+        gate_B_ptrs=None, gate_scales_ptrs=None, up_B_ptrs=None,
+        up_scales_ptrs=None, down_B_ptrs=None, down_scales_ptrs=None,
+    )
     segment.resident = SimpleNamespace(
-        shard=SimpleNamespace(
-            gate_B_ptrs=None, gate_scales_ptrs=None, up_B_ptrs=None,
-            up_scales_ptrs=None, down_B_ptrs=None, down_scales_ptrs=None,
-        ),
+        shard=shard,
         down_proj=lambda x: latent_slice_value.clone(),
         norm=None,
         up_proj=lambda x: x[:, :hidden].clone(),
@@ -157,8 +158,7 @@ def _build(monkeypatch, *, tp_size=4, tp_rank=1, world=8, bucket=8, latent=128,
         # identity experts: the received rows come back unchanged
         pool.ll_expert_output.copy_(calls["s1"][0])
 
-    monkeypatch.setattr(k3_moe_graph, "marlin_grouped_stage1_fused_mxfp4_situ", fake_s1)
-    monkeypatch.setattr(k3_moe_graph, "marlin_grouped_m16_mxfp4", fake_s3)
+    shard.s1_fn, shard.s3_fn = fake_s1, fake_s3
     monkeypatch.setattr(k3_moe_graph.torch.cuda, "device",
                         lambda device: contextlib.nullcontext())
 
