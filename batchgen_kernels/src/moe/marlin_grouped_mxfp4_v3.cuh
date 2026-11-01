@@ -43,8 +43,25 @@
  * along K) = 128 B and SBO (next 8-row group along M) = 256 B. Lane
  * (g, t) of warp w stores a0/a1/a2/a3 at 512*w + 4*lane + 0/256/128/384;
  * each of these four stores covers 128 contiguous bytes per warp.
+ *
+ * MBAR (variants 4 and 5): variant 0's tiling, MMA inputs and K order with
+ * the ring filled by the async proxy and synchronised by mbarriers instead of
+ * cp.async and a CTA barrier per stage. Thread 0 is the producer: per stage
+ * one arrive.expect_tx on the slot's full barrier, 8 weight and 4 scale bulk
+ * copies (one contiguous Marlin row segment per warpgroup and 16-K row or
+ * scale group) and NB/8 TMA boxes of 8 activation rows x 64 K. The tensor map
+ * uses SWIZZLE_128B, which writes the same layout the cp.async path builds by
+ * hand; rows past the activation tensor are zero filled, rows of the next
+ * expert are loaded and never stored. Each warpgroup releases a slot through
+ * one lane after the wgmma group that last read it has retired, so the slot
+ * arithmetic of the cp.async pipeline is kept and only the barrier type
+ * changes. Variant 5 additionally pins the live range of the A register set
+ * around its rewrite (empty asm "+r" fences after the wait and before
+ * wgmma.fence).
  */
 #pragma once
+
+#include <cuda.h>  // CUtensorMap
 
 namespace marlin_v3 {
 
@@ -62,6 +79,13 @@ __host__ __device__ constexpr int cmax(int a, int b) { return a > b ? a : b; }
 // Named barriers 1 and 2 (warpgroup 0 / 1, 128 threads) publish the A tiles
 // of the ASMEM path; barrier 0 is __syncthreads.
 constexpr int A_BAR_ID0 = 1;
+
+// MBAR: activation TMA box (64 K x 8 rows of bf16 = one 1024 B swizzle atom)
+// and the refill lag: stage s refills the slot of stage s - REFILL_LAG with
+// stage s + STAGES - REFILL_LAG.
+constexpr int ACT_BOX_K = 16 * KR;
+constexpr int ACT_BOX_ROWS = 8;
+constexpr int REFILL_LAG = 2;
 
 template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
 struct Cfg {
@@ -112,16 +136,24 @@ struct Cfg {
   static_assert(STAGE_BYTES % 128 == 0, "A ring must start on a core-matrix boundary");
 };
 
+// Bytes from the aligned base to the end of the region the output staging
+// aliases (rings, then staging); MBAR keeps its barriers after it.
 template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
-__host__ __device__ constexpr int smem_bytes(int stages) {
+__host__ __device__ constexpr int aliased_bytes(int stages) {
   using C = Cfg<JW, NCAP, FUSED, ASMEM>;
-  return SMEM_ALIGN + cmax(stages * C::STAGE_BYTES + C::A_RING, C::C_BYTES);
+  return cmax(stages * C::STAGE_BYTES + C::A_RING, C::C_BYTES);
 }
 
-template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
+// MBAR: one full and one empty 8-byte mbarrier per ring slot.
+template <int JW, int NCAP, bool FUSED, bool ASMEM = false, bool MBAR = false>
+__host__ __device__ constexpr int smem_bytes(int stages) {
+  return SMEM_ALIGN + aliased_bytes<JW, NCAP, FUSED, ASMEM>(stages) + (MBAR ? 16 * stages : 0);
+}
+
+template <int JW, int NCAP, bool FUSED, bool ASMEM = false, bool MBAR = false>
 __host__ __device__ constexpr int pick_stages() {
   int s = MAX_STAGES;
-  while (s > MIN_STAGES && smem_bytes<JW, NCAP, FUSED, ASMEM>(s) > SMEM_BUDGET_BYTES) --s;
+  while (s > MIN_STAGES && smem_bytes<JW, NCAP, FUSED, ASMEM, MBAR>(s) > SMEM_BUDGET_BYTES) --s;
   return s;
 }
 
@@ -196,6 +228,70 @@ __device__ __forceinline__ void st_shared_b32(uint32_t addr, uint32_t v) {
 template <int THREADS_>
 __device__ __forceinline__ void named_bar_sync(int id) {
   asm volatile("bar.sync %0, %1;\n" :: "r"(id), "n"(THREADS_) : "memory");
+}
+
+// ---- mbarrier / bulk-copy primitives (MBAR path); addresses are shared::cta.
+
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count) : "memory");
+}
+
+// Makes the initialised barriers visible to the async proxy (complete_tx).
+__device__ __forceinline__ void fence_mbarrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+
+// Release arrive (default .release.cta semantics).
+__device__ __forceinline__ void mbar_arrive(uint32_t bar) {
+  asm volatile(
+      "{\n.reg .b64 state;\n"
+      "mbarrier.arrive.shared::cta.b64 state, [%0];\n}\n"
+      :: "r"(bar) : "memory");
+}
+
+__device__ __forceinline__ void mbar_arrive_expect_tx(uint32_t bar, uint32_t tx_bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+               :: "r"(bar), "r"(tx_bytes) : "memory");
+}
+
+// Acquire wait until the phase with parity `parity` has completed (a fresh
+// barrier counts the phase before phase 0, parity 1, as completed).
+__device__ __forceinline__ bool mbar_try_wait(uint32_t bar, uint32_t parity) {
+  uint32_t done;
+  asm volatile(
+      "{\n.reg .pred p;\n"
+      "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+      "selp.u32 %0, 1, 0, p;\n}\n"
+      : "=r"(done) : "r"(bar), "r"(parity) : "memory");
+  return done != 0;
+}
+
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+  while (!mbar_try_wait(bar, parity)) {
+  }
+}
+
+// Contiguous global -> shared bulk copy; bytes, src and dst 16 B aligned.
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes,
+                                         uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1], %2, [%3];\n"
+      :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+
+// 2D TMA tile load: c0 = innermost (K element), c1 = row.
+__device__ __forceinline__ void tma_load_2d(uint32_t dst, const CUtensorMap* map, int c0, int c1,
+                                            uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {%2, %3}], [%4];\n"
+      :: "r"(dst), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(bar)
+      : "memory");
+}
+
+__device__ __forceinline__ void prefetch_tensormap(const CUtensorMap* map) {
+  asm volatile("prefetch.tensormap [%0];\n" :: "l"(reinterpret_cast<uint64_t>(map)) : "memory");
 }
 
 #define V3_D4(i) "+f"(d[i]), "+f"(d[i + 1]), "+f"(d[i + 2]), "+f"(d[i + 3])
@@ -326,12 +422,17 @@ struct TileArgs {
   int row0;            // first row of this chunk within the expert
   int rows_c;          // rows in this chunk, 1..NCAP
   int colbase;         // first output column of the CTA
+  const CUtensorMap* act_map;  // MBAR only: activation [rows, K] bf16 tensor map
 };
 
-template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM, int NB>
+template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM, bool MBAR, bool LFENCE, int NB>
 __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   using C = Cfg<JW, NCAP, FUSED, ASMEM>;
   static_assert(NB == 8 || (NB % 16 == 0 && NB <= NCAP), "N width");
+  static_assert(!(ASMEM && (MBAR || LFENCE)), "MBAR and LFENCE build on the RS form");
+  static_assert(!MBAR || (REFILL_LAG >= 2 && REFILL_LAG <= STAGES - 2),
+                "refill lag: the stage after the current one must already be in flight");
+  static_assert(!MBAR || NB % ACT_BOX_ROWS == 0, "whole activation boxes");
   constexpr int NACC = NB / 2;                       // accumulators per thread per wgmma
   constexpr int ASETS = C::ASETS;
   constexpr int UNROLL = C::UNROLL;
@@ -351,8 +452,13 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   const uint32_t a_ring_u32 = s_u32 + STAGES * C::S_STAGE;  // ASMEM only
   const uint8_t* w_ring = smem + STAGES * C::ACT_STAGE;
   const uint8_t* s_ring = w_ring + STAGES * C::W_STAGE;
+  // MBAR: full barrier of slot b at bar_u32 + 8*b, empty at + 8*(STAGES + b),
+  // after the region the epilogue staging aliases.
+  const uint32_t bar_u32 = act_u32 + aliased_bytes<JW, NCAP, FUSED, ASMEM>(STAGES);
+  static_assert(aliased_bytes<JW, NCAP, FUSED, ASMEM>(STAGES) % 8 == 0, "mbarrier alignment");
 
-  // ---- Global -> shared copy assignment, fixed per thread ----
+  // ---- Global -> shared copy assignment, fixed per thread (cp.async path;
+  // unused, hence eliminated, under MBAR) ----
   // Weights: smem [wg][kr][WG_COLS/2 int4] filled linearly; global int4
   // (16*s + kr) row of the Marlin tensor, columns wg_col/2 + q.
   const int w_row_int4 = ta.prob_n / 2;
@@ -415,6 +521,36 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
         if (a_on[i]) cp_async16_zfill(adst + a_dst[i], a_src[i] + 8 * s, a_bytes[i]);
     }
     cp_async_fence();
+  };
+
+  // MBAR producer (thread 0 only): stage f into slot b, every copy completing
+  // on full[b]. Per warpgroup: KR weight segments of W_ROW bytes (Marlin row
+  // KR*f + kr, byte offset 8*wg_col) and two scale segments of S_ROW bytes
+  // (scale row 2*f + gi, offset wg_col); smem layout as the cp.async path.
+  // The TMA box count is fixed by NB, so the transaction byte count is too.
+  constexpr uint32_t TX_BYTES = C::W_STAGE + C::S_STAGE + NB * 128;
+  auto issue = [&](int f, int b) {
+    const uint32_t full_b = bar_u32 + 8 * b;
+    mbar_arrive_expect_tx(full_b, TX_BYTES);
+#pragma unroll
+    for (int wgi = 0; wgi < 2; wgi++) {
+      const int wg_col = ta.colbase + (FUSED ? 0 : C::WG_COLS * wgi);
+      const int4* wsrc = (wgi ? ta.W1 : ta.W0) + KR * f * w_row_int4 + wg_col / 2;
+      const uint32_t wdst = w_u32 + b * C::W_STAGE + wgi * C::W_WG;
+#pragma unroll
+      for (int kr = 0; kr < KR; kr++)
+        bulk_g2s(wdst + kr * C::W_ROW, wsrc + kr * w_row_int4, C::W_ROW, full_b);
+      const uint8_t* ssrc = (wgi ? ta.S1 : ta.S0) + 2 * f * ta.prob_n + wg_col;
+      const uint32_t sdst = s_u32 + b * C::S_STAGE + wgi * C::S_WG;
+#pragma unroll
+      for (int gi = 0; gi < 2; gi++)
+        bulk_g2s(sdst + gi * C::S_ROW, ssrc + gi * ta.prob_n, C::S_ROW, full_b);
+    }
+    const uint32_t adst = act_u32 + b * C::ACT_STAGE;
+#pragma unroll
+    for (int i = 0; i < NB / ACT_BOX_ROWS; i++)
+      tma_load_2d(adst + ACT_BOX_ROWS * 128 * i, ta.act_map, ACT_BOX_K * f,
+                  ta.token0 + ACT_BOX_ROWS * i, full_b);
   };
 
   // ---- Shared -> register reads of this lane ----
@@ -493,11 +629,28 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
       for (int r = 0; r < NACC; r++) fence_operand(acc[i][r]);
   };
 
+  // LFENCE: liveness fence on A register set `set` (compile-time index).
+  auto fence_aset = [&](int set) {
+#pragma unroll
+    for (int i = 0; i < JW; i++)
+#pragma unroll
+      for (int j = 0; j < 4; j++) asm volatile("" : "+r"(afr[set][i][j]) :: "memory");
+  };
+
 #pragma unroll
   for (int i = 0; i < JW; i++)
 #pragma unroll
     for (int r = 0; r < NACC; r++) acc[i][r] = 0.0f;
   fence_acc();
+  if constexpr (LFENCE) {
+    // The fences read every set before its first definition.
+#pragma unroll
+    for (int a = 0; a < ASETS; a++)
+#pragma unroll
+      for (int i = 0; i < JW; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) afr[a][i][j] = 0u;
+  }
 
   const uint64_t desc0 = make_desc_sw128(act_u32);
   const uint64_t desc_a0 = make_desc_kmajor_none(a_ring_u32 + wg * C::A_WG);  // ASMEM only
@@ -508,11 +661,43 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   // every thread's wgmma groups on that slot finished at its wait before the
   // barrier of stage s - 1, so no warpgroup can still read it. The barrier
   // of stage s publishes stage s + 1, which step t == 3 starts reading.
+  //
+  // MBAR keeps the slot arithmetic with per-slot barriers. full[b] (count 1:
+  // the producer's arrive.expect_tx) completes phase j when stage j*STAGES + b
+  // has landed; consumers wait parity (s / STAGES) & 1. empty[b] (count 2: one
+  // lane per warpgroup) completes phase j when both warpgroups released stage
+  // j*STAGES + b; the fill of stage f waits parity ((f / STAGES) & 1) ^ 1,
+  // which passes at once on a fresh barrier for the first fill of a slot. At
+  // step 2 of stage s >= 1 each warpgroup releases stage s - 1 (its last
+  // wgmma group retired at the wait just above, its last ld.shared fed that
+  // group), and the producer refills the slot of stage s - REFILL_LAG with
+  // stage s + STAGES - REFILL_LAG. The empty wait also bounds the skew: no
+  // warpgroup can release a slot's next phase before the other released the
+  // current one, because the stage in between is not issued until then.
+  if constexpr (MBAR) {
+    if (tid == 0) {
 #pragma unroll
-  for (int p = 0; p < STAGES - 2; p++) fetch(p, p);
-  cp_async_wait<STAGES - 3>();
-  fence_proxy_async();
-  __syncthreads();
+      for (int b = 0; b < STAGES; b++) {
+        mbar_init(bar_u32 + 8 * b, 1);
+        mbar_init(bar_u32 + 8 * (STAGES + b), 2);
+      }
+      fence_mbarrier_init();
+      prefetch_tensormap(ta.act_map);
+    }
+    __syncthreads();
+    if (tid == 0) {
+#pragma unroll 1
+      for (int p = 0; p < STAGES - REFILL_LAG && p < k_tiles; p++) issue(p, p);
+    }
+    __syncwarp();
+    if (k_tiles > 0) mbar_wait(bar_u32, 0);
+  } else {
+#pragma unroll
+    for (int p = 0; p < STAGES - 2; p++) fetch(p, p);
+    cp_async_wait<STAGES - 3>();
+    fence_proxy_async();
+    __syncthreads();
+  }
   load_w(wq[0], 0, 0);
   load_s(sw[0], 0, 0);
 
@@ -539,13 +724,30 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
         // its own 16 rows) and, at the stage barrier, the ring slot
         // refilled below.
         wgmma_wait<ASETS - 1>();
+        if constexpr (LFENCE) fence_aset(set);
         if (t == 2) {
-          int fb = buf + STAGES - 2;
-          if (fb >= STAGES) fb -= STAGES;
-          fetch(s + STAGES - 2, fb);
-          cp_async_wait<STAGES - 3>();
-          fence_proxy_async();
-          __syncthreads();
+          if constexpr (MBAR) {
+            if (s >= 1 && tid % 128 == 0)
+              mbar_arrive(bar_u32 + 8 * (STAGES + (buf == 0 ? STAGES - 1 : buf - 1)));
+            if (tid == 0) {
+              const int f = s + STAGES - REFILL_LAG;
+              if (f < k_tiles) {
+                int fb = buf + STAGES - REFILL_LAG;
+                if (fb >= STAGES) fb -= STAGES;
+                mbar_wait(bar_u32 + 8 * (STAGES + fb), ((f / STAGES) & 1) ^ 1);
+                issue(f, fb);
+              }
+            }
+            __syncwarp();
+            if (s + 1 < k_tiles) mbar_wait(bar_u32 + 8 * nbuf, ((s + 1) / STAGES) & 1);
+          } else {
+            int fb = buf + STAGES - 2;
+            if (fb >= STAGES) fb -= STAGES;
+            fetch(s + STAGES - 2, fb);
+            cp_async_wait<STAGES - 3>();
+            fence_proxy_async();
+            __syncthreads();
+          }
         }
 
         dequant(set, t & 1, t >> 1);
@@ -556,6 +758,7 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
           fence_proxy_async();
           named_bar_sync<128>(A_BAR_ID0 + wg);
         }
+        if constexpr (LFENCE) fence_aset(set);
         // No accumulator fence inside the loop: touching acc while groups are
         // in flight makes ptxas serialise every wgmma.
         wgmma_fence();
@@ -575,7 +778,10 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   }
   wgmma_wait<0>();
   fence_acc();
-  cp_async_wait<0>();
+  // MBAR: every issued stage was waited on by every thread, so no async-proxy
+  // write is outstanding. The CTA barrier keeps the other warpgroup's wgmma
+  // reads of the activation ring ahead of the staging stores below.
+  if constexpr (!MBAR) cp_async_wait<0>();
   __syncthreads();
 
   // ---- Epilogue: bf16 staging (v1's rounding point), then row write-back ----
@@ -621,9 +827,11 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   }
 }
 
-template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM>
+template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM, bool MBAR = false,
+          bool LFENCE = false>
 __device__ __forceinline__ void grouped_body(
     const int4* __restrict__ A,
+    const CUtensorMap* act_map,                 // MBAR only (else nullptr)
     const int4* const* __restrict__ B_ptrs,     // FUSED: gate (w1)
     const int4* const* __restrict__ B2_ptrs,    // FUSED: up (w3); else unused
     int4* const* __restrict__ C_ptrs,
@@ -635,7 +843,7 @@ __device__ __forceinline__ void grouped_body(
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
   using C = Cfg<JW, NCAP, FUSED, ASMEM>;
   static_assert(STAGES >= MIN_STAGES, "pipeline depth");
-  static_assert(smem_bytes<JW, NCAP, FUSED, ASMEM>(STAGES) <= SMEM_BUDGET_BYTES,
+  static_assert(smem_bytes<JW, NCAP, FUSED, ASMEM, MBAR>(STAGES) <= SMEM_BUDGET_BYTES,
                 "shared memory exceeds the two-CTA budget");
 
   const int tile = blockIdx.x % n_col_tiles;
@@ -665,18 +873,19 @@ __device__ __forceinline__ void grouped_body(
   ta.row0 = row0;
   ta.rows_c = min(NCAP, count - row0);
   ta.colbase = C::CTA_COLS * tile;
+  ta.act_map = act_map;
 
   const int rows_c = ta.rows_c;
   if (rows_c <= 8) {
-    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 8>(ta, smem);
+    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, MBAR, LFENCE, 8>(ta, smem);
   } else if (rows_c <= 16) {
-    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 16>(ta, smem);
+    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, MBAR, LFENCE, 16>(ta, smem);
   } else if (rows_c <= 32) {
-    if constexpr (NCAP >= 32) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 32>(ta, smem);
+    if constexpr (NCAP >= 32) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, MBAR, LFENCE, 32>(ta, smem);
   } else if (rows_c <= 48) {
-    if constexpr (NCAP >= 48) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 48>(ta, smem);
+    if constexpr (NCAP >= 48) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, MBAR, LFENCE, 48>(ta, smem);
   } else {
-    if constexpr (NCAP >= 64) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 64>(ta, smem);
+    if constexpr (NCAP >= 64) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, MBAR, LFENCE, 64>(ta, smem);
   }
 }
 
@@ -695,7 +904,7 @@ __global__ void __launch_bounds__(THREADS, 2) GroupedS1(
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   grouped_body<JW, NCAP, STAGES, true, ASMEM>(
-      A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
+      A, nullptr, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
 #endif
@@ -715,7 +924,50 @@ __global__ void __launch_bounds__(THREADS, 2) Grouped(
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   grouped_body<JW, NCAP, STAGES, false, ASMEM>(
-      A, B_ptrs, nullptr, C_ptrs, scales_ptrs, nullptr,
+      A, nullptr, B_ptrs, nullptr, C_ptrs, scales_ptrs, nullptr,
+      expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
+      n_col_tiles, max_chunks);
+#endif
+}
+
+// MBAR variants of GroupedS1 / Grouped (variant 4: LFENCE = false, variant 5:
+// LFENCE = true). act_map: 2D bf16 tensor map over the activation tensor
+// {K, rows}, box {ACT_BOX_K, ACT_BOX_ROWS}, SWIZZLE_128B, zero OOB fill.
+template <int JW, int NCAP, int STAGES, bool LFENCE>
+__global__ void __launch_bounds__(THREADS, 2) GroupedS1Mbar(
+    const __grid_constant__ CUtensorMap act_map,
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ gate_B_ptrs,
+    const int4* const* __restrict__ up_B_ptrs,
+    int4* const* __restrict__ C_ptrs,
+    const int4* const* __restrict__ gate_scales_ptrs,
+    const int4* const* __restrict__ up_scales_ptrs,
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    const int* __restrict__ order,
+    int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  grouped_body<JW, NCAP, STAGES, true, false, true, LFENCE>(
+      A, &act_map, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
+      expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
+      n_col_tiles, max_chunks);
+#endif
+}
+
+template <int JW, int NCAP, int STAGES, bool LFENCE>
+__global__ void __launch_bounds__(THREADS, 2) GroupedMbar(
+    const __grid_constant__ CUtensorMap act_map,
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ B_ptrs,
+    int4* const* __restrict__ C_ptrs,
+    const int4* const* __restrict__ scales_ptrs,
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    const int* __restrict__ order,
+    int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  grouped_body<JW, NCAP, STAGES, false, false, true, LFENCE>(
+      A, &act_map, B_ptrs, nullptr, C_ptrs, scales_ptrs, nullptr,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
 #endif

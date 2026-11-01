@@ -292,8 +292,12 @@ MXFP4_V2_MAX_SCALE_BYTE = 128
 # MXFP4_V2_MAX_SCALE_BYTE applies to it as well. Variant 3 has variant 0's
 # tiling but stages the dequantised A operand in shared memory (wgmma reads
 # both operands from shared memory) with the same MMA inputs and K order, so
-# its outputs must be bit-identical to variant 0's.
-MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32), 3: (2, 64)}
+# its outputs must be bit-identical to variant 0's. Variant 4 has variant 0's
+# MMA inputs and K order with the shared-memory ring filled by TMA and bulk
+# copies under mbarriers; variant 5 is variant 4 with liveness fences on the
+# A register sets. Both must be bit-identical to variant 0 as well.
+MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32), 3: (2, 64), 4: (2, 64),
+                     5: (2, 64)}
 
 
 def is_marlin_mxfp4_available() -> bool:

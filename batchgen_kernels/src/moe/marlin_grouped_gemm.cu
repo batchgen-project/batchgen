@@ -1873,13 +1873,60 @@ std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool
 // max_m_tiles shapes the grid as in v1 (rows beyond 16 * max_m_tiles rounded
 // up to the row chunk are not computed). Scale bytes must be <= 128, as v2.
 // variant: 0 = (JW=2, NCAP=64), 1 = (JW=2, NCAP=48), 2 = (JW=4, NCAP=32),
-// 3 = variant 0 with the dequantised A operand in shared memory (wgmma SS).
+// 3 = variant 0 with the dequantised A operand in shared memory (wgmma SS),
+// 4 = variant 0 with a TMA / bulk-copy ring synchronised by mbarriers,
+// 5 = variant 4 with liveness fences on the A register sets.
 // ----------------------------------------------------------------------------
 #include <cstdint>
+#include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled_v12000
 
 static void check_mxfp4_v3_variant(int variant) {
-    TORCH_CHECK(variant >= 0 && variant <= 3,
-        "mxfp4 v3 launch: variant must be in [0, 3], got ", variant);
+    TORCH_CHECK(variant >= 0 && variant <= 5,
+        "mxfp4 v3 launch: variant must be in [0, 5], got ", variant);
+}
+
+// cuTensorMapEncodeTiled through the runtime's driver entry point (no -lcuda).
+static PFN_cuTensorMapEncodeTiled_v12000 mxfp4_v3_tensor_map_encoder() {
+    static const PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
+        void* fn = nullptr;
+        cudaDriverEntryPointQueryResult status;
+#if CUDA_VERSION >= 12050
+        C10_CUDA_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fn, 12000,
+                                                        cudaEnableDefault, &status));
+#else
+        C10_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn,
+                                               cudaEnableDefault, &status));
+#endif
+        TORCH_CHECK(status == cudaDriverEntryPointSuccess && fn != nullptr,
+            "mxfp4 v3 launch: cuTensorMapEncodeTiled entry point unavailable");
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn);
+    }();
+    return encode;
+}
+
+// Activation tensor map of the MBAR variants: A viewed as bf16 [rows, prob_k]
+// (rows = numel / prob_k), box ACT_BOX_K x ACT_BOX_ROWS, 128B swizzle (the
+// layout the wgmma B descriptor expects), zero fill past the last row. The
+// map is a by-value kernel argument, so a captured graph replays it with the
+// activation address of capture time, like the pointer arguments.
+static CUtensorMap mxfp4_v3_act_tensor_map(const torch::Tensor& A, int prob_k) {
+    TORCH_CHECK(prob_k > 0 && A.numel() % prob_k == 0,
+        "mxfp4 v3 launch: activation numel ", A.numel(), " is not a multiple of prob_k=", prob_k);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(A.data_ptr()) % 16 == 0,
+        "mxfp4 v3 launch: activation base address must be 16 B aligned");
+    const cuuint64_t dims[2] = {static_cast<cuuint64_t>(prob_k),
+                                static_cast<cuuint64_t>(A.numel() / prob_k)};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(prob_k) * sizeof(__nv_bfloat16)};
+    const cuuint32_t box[2] = {marlin_v3::ACT_BOX_K, marlin_v3::ACT_BOX_ROWS};
+    const cuuint32_t elem_strides[2] = {1, 1};
+    CUtensorMap map;
+    const CUresult res = mxfp4_v3_tensor_map_encoder()(
+        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, A.data_ptr(), dims, strides, box,
+        elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS,
+        "mxfp4 v3 launch: cuTensorMapEncodeTiled failed with CUresult ", static_cast<int>(res));
+    return map;
 }
 
 static int mxfp4_v3_cta_cols(int variant, bool fused) {
@@ -1916,7 +1963,10 @@ static int mxfp4_v3_grid(int n_col_tiles, int num_matrices, int max_chunks) {
     return static_cast<int>(total);
 }
 
-template <int JW, int NCAP, bool ASMEM = false>
+// MBAR (variants 4, 5): with no activation row every valid expert count is
+// zero, so no CTA has work and the launch is skipped (a tensor map cannot
+// describe an empty tensor).
+template <int JW, int NCAP, bool ASMEM = false, bool MBAR = false, bool LFENCE = false>
 static void launch_mxfp4_v3_s1(
     torch::Tensor& A,
     torch::Tensor& gate_B_ptrs, torch::Tensor& up_B_ptrs,
@@ -1925,30 +1975,47 @@ static void launch_mxfp4_v3_s1(
     torch::Tensor& expert_starts, torch::Tensor& expert_counts,
     const int* order, int num_experts, int prob_n, int prob_k, int max_m_tiles)
 {
-    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM>();
-    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, true, ASMEM>(stages);
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM, MBAR>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, true, ASMEM, MBAR>(stages);
+    if constexpr (MBAR) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            (void*)marlin_v3::GroupedS1Mbar<JW, NCAP, stages, LFENCE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    } else {
+        C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
 
     const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, true, ASMEM>::CTA_COLS;
     const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
     const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_experts, max_chunks);
     auto stream = at::cuda::getCurrentCUDAStream();
-    marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>
-        <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
-        reinterpret_cast<const int4*>(A.data_ptr()),
-        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
-        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
-        expert_starts.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks);
+#define MXFP4_V3_S1_KERNEL_ARGS \
+        reinterpret_cast<const int4*>(A.data_ptr()), \
+        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()), \
+        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()), \
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()), \
+        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()), \
+        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()), \
+        expert_starts.data_ptr<int>(), \
+        expert_counts.data_ptr<int>(), \
+        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks
+    if constexpr (MBAR) {
+        if (A.numel() == 0) return;
+        const CUtensorMap act_map = mxfp4_v3_act_tensor_map(A, prob_k);
+        marlin_v3::GroupedS1Mbar<JW, NCAP, stages, LFENCE>
+            <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+            act_map, MXFP4_V3_S1_KERNEL_ARGS);
+    } else {
+        marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>
+            <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+            MXFP4_V3_S1_KERNEL_ARGS);
+    }
+#undef MXFP4_V3_S1_KERNEL_ARGS
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int JW, int NCAP, bool ASMEM = false>
+template <int JW, int NCAP, bool ASMEM = false, bool MBAR = false, bool LFENCE = false>
 static void launch_mxfp4_v3(
     torch::Tensor& A, torch::Tensor& B_ptrs, torch::Tensor& C_ptrs,
     torch::Tensor& scales_ptrs,
@@ -1956,24 +2023,41 @@ static void launch_mxfp4_v3(
     const int* order, int num_experts, int prob_n, int prob_k,
     int num_matrices, int max_m_tiles)
 {
-    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM>();
-    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, false, ASMEM>(stages);
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::Grouped<JW, NCAP, stages, ASMEM>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM, MBAR>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, false, ASMEM, MBAR>(stages);
+    if constexpr (MBAR) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            (void*)marlin_v3::GroupedMbar<JW, NCAP, stages, LFENCE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    } else {
+        C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::Grouped<JW, NCAP, stages, ASMEM>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
 
     const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, false, ASMEM>::CTA_COLS;
     const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
     const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_matrices, max_chunks);
     auto stream = at::cuda::getCurrentCUDAStream();
-    marlin_v3::Grouped<JW, NCAP, stages, ASMEM>
-        <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
-        reinterpret_cast<const int4*>(A.data_ptr()),
-        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
-        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
-        expert_starts.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks);
+#define MXFP4_V3_KERNEL_ARGS \
+        reinterpret_cast<const int4*>(A.data_ptr()), \
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()), \
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()), \
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()), \
+        expert_starts.data_ptr<int>(), \
+        expert_counts.data_ptr<int>(), \
+        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks
+    if constexpr (MBAR) {
+        if (A.numel() == 0) return;
+        const CUtensorMap act_map = mxfp4_v3_act_tensor_map(A, prob_k);
+        marlin_v3::GroupedMbar<JW, NCAP, stages, LFENCE>
+            <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+            act_map, MXFP4_V3_KERNEL_ARGS);
+    } else {
+        marlin_v3::Grouped<JW, NCAP, stages, ASMEM>
+            <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+            MXFP4_V3_KERNEL_ARGS);
+    }
+#undef MXFP4_V3_KERNEL_ARGS
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2004,7 +2088,10 @@ void grouped_marlin_gemm_m16_s1_mxfp4_situ_v3(
         case 0: launch_mxfp4_v3_s1<2, 64>(MXFP4_V3_S1_ARGS); break;
         case 1: launch_mxfp4_v3_s1<2, 48>(MXFP4_V3_S1_ARGS); break;
         case 2: launch_mxfp4_v3_s1<4, 32>(MXFP4_V3_S1_ARGS); break;
-        default: launch_mxfp4_v3_s1<2, 64, true>(MXFP4_V3_S1_ARGS); break;
+        case 3: launch_mxfp4_v3_s1<2, 64, true>(MXFP4_V3_S1_ARGS); break;
+        case 4: launch_mxfp4_v3_s1<2, 64, false, true>(MXFP4_V3_S1_ARGS); break;
+        case 5: launch_mxfp4_v3_s1<2, 64, false, true, true>(MXFP4_V3_S1_ARGS); break;
+        default: TORCH_CHECK(false, "mxfp4 v3 launch: unhandled variant ", variant);
     }
 #undef MXFP4_V3_S1_ARGS
 }
@@ -2037,7 +2124,10 @@ void grouped_marlin_gemm_m16_mxfp4_v3(
         case 0: launch_mxfp4_v3<2, 64>(MXFP4_V3_ARGS); break;
         case 1: launch_mxfp4_v3<2, 48>(MXFP4_V3_ARGS); break;
         case 2: launch_mxfp4_v3<4, 32>(MXFP4_V3_ARGS); break;
-        default: launch_mxfp4_v3<2, 64, true>(MXFP4_V3_ARGS); break;
+        case 3: launch_mxfp4_v3<2, 64, true>(MXFP4_V3_ARGS); break;
+        case 4: launch_mxfp4_v3<2, 64, false, true>(MXFP4_V3_ARGS); break;
+        case 5: launch_mxfp4_v3<2, 64, false, true, true>(MXFP4_V3_ARGS); break;
+        default: TORCH_CHECK(false, "mxfp4 v3 launch: unhandled variant ", variant);
     }
 #undef MXFP4_V3_ARGS
 }
@@ -2060,17 +2150,17 @@ void marlin_mxfp4_v3_expert_order(torch::Tensor expert_counts, torch::Tensor out
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int JW, int NCAP, bool ASMEM = false>
+template <int JW, int NCAP, bool ASMEM = false, bool MBAR = false>
 static std::tuple<int64_t, int64_t, int64_t> mxfp4_v3_cfg(bool fused) {
-    constexpr int s1_stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM>();
-    constexpr int gr_stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM>();
+    constexpr int s1_stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM, MBAR>();
+    constexpr int gr_stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM, MBAR>();
     if (fused) {
         return std::make_tuple(static_cast<int64_t>(s1_stages),
-            static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, true, ASMEM>(s1_stages)),
+            static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, true, ASMEM, MBAR>(s1_stages)),
             static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, true, ASMEM>::CTA_COLS));
     }
     return std::make_tuple(static_cast<int64_t>(gr_stages),
-        static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, false, ASMEM>(gr_stages)),
+        static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, false, ASMEM, MBAR>(gr_stages)),
         static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, false, ASMEM>::CTA_COLS));
 }
 
@@ -2083,7 +2173,12 @@ std::tuple<int64_t, int64_t, int64_t> marlin_mxfp4_v3_launch_config(int64_t vari
         case 0: return mxfp4_v3_cfg<2, 64>(fused);
         case 1: return mxfp4_v3_cfg<2, 48>(fused);
         case 2: return mxfp4_v3_cfg<4, 32>(fused);
-        default: return mxfp4_v3_cfg<2, 64, true>(fused);
+        case 3: return mxfp4_v3_cfg<2, 64, true>(fused);
+        case 4:
+        case 5: return mxfp4_v3_cfg<2, 64, false, true>(fused);
+        default:
+            TORCH_CHECK(false, "mxfp4 v3 launch config: unhandled variant ", variant);
+            return std::make_tuple(int64_t{0}, int64_t{0}, int64_t{0});
     }
 }
 

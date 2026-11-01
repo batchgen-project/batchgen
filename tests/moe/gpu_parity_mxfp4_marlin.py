@@ -92,10 +92,14 @@ each variant 0..3 = (TM, TN) (1,16) (2,16) (2,8) (1,8):
                 wrapper and the raw-pybind seam.
 
 Version 3 ladder (grouped_marlin_gemm_m16{,_s1}_mxfp4{,_situ}_v3, swap-AB
-wgmma, sm_90a), run for each variant 0..3 = (JW, NCAP) (2,64) (2,48) (4,32)
-(2,64); variant 3 is variant 0 with the A operand staged in shared memory
-(wgmma SS form). The --build gate also reports, per v3 instantiation, how many
-wgmma serialisation warnings (C7513/C7514/C7515) ptxas emitted (report only):
+wgmma, sm_90a), run for each variant 0..5 = (JW, NCAP) (2,64) (2,48) (4,32)
+(2,64) (2,64) (2,64); variant 3 is variant 0 with the A operand staged in
+shared memory (wgmma SS form), variant 4 is variant 0 with the ring filled by
+TMA and bulk copies under mbarriers, variant 5 is variant 4 with liveness
+fences on the A register sets. Variants 3, 4 and 5 must be bit-identical to
+variant 0 wherever they are checked. The --build gate also reports, per v3
+instantiation, how many wgmma serialisation warnings (C7513/C7514/C7515) ptxas
+emitted (report only):
 
   T1v3 DECODE   one-hot bit-exact at 64 and 72 rows (one and two row chunks
                 for NCAP=64) on 512x512, uniform and half-heavy codes. Pins
@@ -105,18 +109,25 @@ wgmma serialisation warnings (C7513/C7514/C7515) ptxas emitted (report only):
                 N width 8/16/32/48/64 and chunk boundary), both K3 shapes, two
                 experts with nonzero expert_starts, tight AND production-like
                 max_m_tiles grids (bit-identical), NaN canaries, v1 agreement;
-                variant 3 bit-identical to variant 0 (variant 0 is run as the
-                reference if it is not among the tested variants).
+                variants 3, 4, 5 bit-identical to variant 0 (variant 0 is run
+                as the reference if it is not among the tested variants).
   T3v3 S1+SiTU  same as T2v3 for the fused S1 entry on the stacked w13 layout.
   T4v3 GROUPED  E=28 skewed counts incl. 0, 1, 8, 9, 64, 65 and 70 rows, fused
                 S1 and S3, with and without expert_order (bit-identical), NaN
-                canaries, all-empty launch writes nothing; variant 3 S1 and S3
-                bit-identical to variant 0.
+                canaries, all-empty launch writes nothing; variants 3, 4, 5 S1
+                and S3 bit-identical to variant 0.
   T5v3 MUTATIONS gate/up swap and rolled scale groups must FAIL the gate
                 (control must PASS); the first variant past the table must
                 raise at the wrapper and the raw-pybind seam.
   T6v3 GRAPH    expert order + S1 + S3 captured in one CUDA graph, replayed
                 twice; both replays bit-identical to the eager launches.
+  T7v3 K SWEEP  mbarrier variants (4, 5) only: prob_k in {128, 256, 384, 512,
+                896} (4 to 14 ring stages of 64 K, i.e. fewer than, equal to
+                and more than the ring slots, wrapping both barrier parities),
+                N=512, two experts, M in {1, 9, 33, 65}, S3 and fused S1: oracle
+                gate, NaN canaries, bit identity to variant 0. Runs in a child
+                process under a wall-clock timeout, so a barrier phase error
+                fails as a timeout instead of hanging the ladder.
 """
 
 import argparse
@@ -953,24 +964,34 @@ def t5v2_mutations(variants):
 V3_VARIANTS = sorted(mgm.MXFP4_V3_VARIANTS)
 V3_M_SWEEP = [1, 4, 8, 9, 16, 17, 24, 32, 33, 40, 64, 65]
 V3_SMEM_LIMIT = 113 * 1024   # two CTAs per SM
-# Variant 3 = variant 0's tiling with the A operand in shared memory: same MMA
-# inputs in the same K order, so its outputs must equal variant 0's bit for bit.
-V3_ASMEM_VARIANT, V3_ASMEM_BASE = 3, 0
+# Variants 3 (A operand in shared memory), 4 (mbarrier/TMA ring) and 5 (4 plus
+# A-register liveness fences) keep variant 0's MMA inputs in the same K order,
+# so their outputs must equal variant 0's bit for bit.
+V3_IDENTICAL_VARIANTS, V3_IDENTITY_BASE = (3, 4, 5), 0
+V3_MBAR_VARIANTS = (4, 5)
+V3_KSWEEP_KS = (128, 256, 384, 512, 896)
+V3_KSWEEP_M = (1, 9, 33, 65)
+V3_KSWEEP_TIMEOUT_S = 300
 
 
-def _v3_asmem_identity(tag, outs_by_variant, run_base):
-    """Strict bit identity of variant 3 against variant 0. outs_by_variant maps
-    a tested variant to a tuple of bf16 tensors; run_base() produces variant
-    0's tuple when variant 0 itself is not among the tested variants."""
-    if V3_ASMEM_VARIANT not in outs_by_variant:
+def _v3_identity(tag, outs_by_variant, run_base):
+    """Strict bit identity of every tested variant in V3_IDENTICAL_VARIANTS
+    against variant 0. outs_by_variant maps a tested variant to a tuple of
+    bf16 tensors; run_base() produces variant 0's tuple when variant 0 itself
+    is not among the tested variants."""
+    checked = [v for v in V3_IDENTICAL_VARIANTS if v in outs_by_variant]
+    if not checked:
         return True
-    base = outs_by_variant.get(V3_ASMEM_BASE)
+    base = outs_by_variant.get(V3_IDENTITY_BASE)
     if base is None:
         base = run_base()
-    same = all(torch.equal(a.view(torch.int16), b.view(torch.int16))
-               for a, b in zip(base, outs_by_variant[V3_ASMEM_VARIANT]))
-    print(f"    {tag}: v{V3_ASMEM_VARIANT} vs v{V3_ASMEM_BASE} bit-identical={same}")
-    return same
+    ok = True
+    for v in checked:
+        same = all(torch.equal(a.view(torch.int16), b.view(torch.int16))
+                   for a, b in zip(base, outs_by_variant[v]))
+        print(f"    {tag}: v{v} vs v{V3_IDENTITY_BASE} bit-identical={same}")
+        ok = ok and same
+    return ok
 
 
 def print_v3_launch_configs(variants):
@@ -1066,9 +1087,9 @@ def t2v3_m16_parity(variants):
                     canary,
                     torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)),
                     _agree(v1_rows, by_variant[v][0])) and ok
-            ok = _v3_asmem_identity(
+            ok = _v3_identity(
                 f"T2v3[{shape_tag}] M={M}", by_variant,
-                lambda: (_expert_rows(run_v3(V3_ASMEM_BASE, tight), counts_host, V2_MTP),)
+                lambda: (_expert_rows(run_v3(V3_IDENTITY_BASE, tight), counts_host, V2_MTP),)
             ) and ok
     report("T2v3 M16 MXFP4 v3 parity (K3 shapes, M sweep, both grids, v1 agreement, "
            "v3 == v0 bits)", ok)
@@ -1223,8 +1244,8 @@ def t4v3_grouped_skewed(variants):
         print(f"    T4v3 v{v}: canary S1={c1} S3={c3}; order bit-identical={same}; "
               f"all-empty wrote nothing S1={e1} S3={e3}")
         ok = ok and g1 and c1 and g3 and c3 and same and e1 and e3
-    ok = _v3_asmem_identity("T4v3 S1+S3", by_variant,
-                            lambda: rows_of(run_v3(V3_ASMEM_BASE, None))) and ok
+    ok = _v3_identity("T4v3 S1+S3", by_variant,
+                      lambda: rows_of(run_v3(V3_IDENTITY_BASE, None))) and ok
     report("T4v3 grouped v3 with skewed and zero-token experts (E=28), expert order, "
            "v3 == v0 bits", ok)
 
@@ -1337,6 +1358,94 @@ def t6v3_graph_replay(variants):
         ok = ok and same and canary
         del graph
     report("T6v3 CUDA graph capture of order + S1 + S3, replay bit-identical", ok)
+
+
+def _v3_k_sweep_child(variants):
+    """T7v3 body, run in the child process. Returns True iff every case passes."""
+    N, E, mtp = 512, 2, V2_MTP
+    starts = (torch.arange(E, dtype=torch.int32) * mtp).to(DEV)
+    ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
+    ok = True
+    for K in V3_KSWEEP_KS:
+        raw = [rand_expert(K, N, seed=7100 + K + e) for e in range(E)]
+        mar = [marlinize(p, s, K, N) for p, s in raw]
+        for _, ms in mar:
+            mgm.check_mxfp4_scales_v2_compatible(ms)
+        w_ref = [dense_expert_bf16(p, s) for p, s in raw]
+        B, S = _ptrs([q for q, _ in mar]), _ptrs([s for _, s in mar])
+        weights, gB, gS, uB, uS = _w13_experts(E, K, N, seed0=7300 + K)
+        C = torch.empty(E * mtp, N, dtype=torch.bfloat16, device=DEV)
+        inter = torch.empty(E * mtp, N, dtype=torch.bfloat16, device=DEV)
+        Cp, Ip = _row_ptrs(C, E, mtp), _row_ptrs(inter, E, mtp)
+        for M in V3_KSWEEP_M:
+            torch.manual_seed(7500 + K + M)
+            A = torch.randn(E * mtp, K, dtype=torch.bfloat16, device=DEV)
+            counts_host = [M] * E
+            counts = torch.tensor(counts_host, dtype=torch.int32, device=DEV)
+            grid = (M + 15) // 16
+            rows = lambda x, e: x[e * mtp:e * mtp + M]
+            s3_refs = [rows(A, e).float() @ w_ref[e].float().t() for e in range(E)]
+            s1_refs = [_s1_ref(rows(A, e), weights[e][2], weights[e][3]) for e in range(E)]
+
+            def run(v):
+                C.fill_(NAN)
+                mgm.marlin_grouped_m16_mxfp4_v3(
+                    A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256, grid,
+                    variant=v)
+                inter.fill_(NAN)
+                mgm.marlin_grouped_stage1_fused_mxfp4_situ_v3(
+                    A, inter, counts, starts, gB, gS, uB, uS, Ip, N, K, ws,
+                    max_m_tiles=grid, mtp=M, num_experts=E, total_rows=E * M,
+                    variant=v)
+                torch.cuda.synchronize()
+                return C.clone(), inter.clone()
+
+            base = run(V3_IDENTITY_BASE)
+            for v in variants:
+                out3, out1 = run(v)
+                tag = f"T7v3 v{v} K={K} M={M}"
+                g3 = _gate_rows(out3, s3_refs, counts_host, mtp, f"{tag} S3", verbose=False)
+                g1 = _gate_rows(out1, s1_refs, counts_host, mtp, f"{tag} S1", verbose=False)
+                canary = (_canary_ok(out3, counts_host, mtp)
+                          and _canary_ok(out1, counts_host, mtp))
+                same = all(
+                    torch.equal(_expert_rows(a, counts_host, mtp).view(torch.int16),
+                                _expert_rows(b, counts_host, mtp).view(torch.int16))
+                    for a, b in zip(base, (out3, out1)))
+                print(f"    {tag}: gate S3={'ok' if g3 else 'FAIL'} "
+                      f"S1={'ok' if g1 else 'FAIL'} canary={'ok' if canary else 'FAIL'} "
+                      f"v{V3_IDENTITY_BASE} bit-identical={same}", flush=True)
+                ok = ok and g3 and g1 and canary and same
+        del weights, mar
+    return ok
+
+
+def t7v3_k_sweep(variants):
+    """Small-K sweep of the mbarrier variants in a child process with a
+    wall-clock timeout: a barrier phase or transaction-count error hangs the
+    CTA, which a blocking synchronize in this process could never report."""
+    mbar = [v for v in variants if v in V3_MBAR_VARIANTS]
+    if not mbar:
+        print("    T7v3: no mbarrier variant among the tested variants, skipped")
+        return
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--v3-k-sweep-child",
+           "--v3-variants", ",".join(map(str, mbar))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=V3_KSWEEP_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        print(out.rstrip())
+        report("T7v3 mbarrier variants small-K sweep", False,
+               f"TIMED OUT after {V3_KSWEEP_TIMEOUT_S} s (suspect a barrier hang)")
+        return
+    print(proc.stdout.rstrip())
+    if proc.returncode != 0 and proc.stderr:
+        print(proc.stderr[-4000:])
+    report("T7v3 mbarrier variants small-K sweep (K 128..896, S1 + S3, v0 bits)",
+           proc.returncode == 0, f"child exit code {proc.returncode}")
 
 
 def do_build():
@@ -1508,6 +1617,8 @@ def main():
                     help="run T0 and the v3 ladder only")
     ap.add_argument("--v3-variants", default=",".join(map(str, V3_VARIANTS)),
                     help="comma-separated v3 variants to test (default: all)")
+    # Internal: the T7v3 child process (runs under the parent's timeout).
+    ap.add_argument("--v3-k-sweep-child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     variants = [int(v) for v in args.v2_variants.split(",")]
     unknown = [v for v in variants if v not in V2_VARIANTS]
@@ -1528,6 +1639,8 @@ def main():
         sys.exit(2)
 
     torch.cuda.init()
+    if args.v3_k_sweep_child:
+        sys.exit(0 if _v3_k_sweep_child(v3_variants) else 1)
     print(f"device: {torch.cuda.get_device_name()}")
 
     t0_smoke()
@@ -1559,6 +1672,7 @@ def main():
             t4v3_grouped_skewed(v3_variants)
             t5v3_mutations(v3_variants)
             t6v3_graph_replay(v3_variants)
+            t7v3_k_sweep(v3_variants)
 
     failed = [n for n, ok in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} ladder stages passed")
