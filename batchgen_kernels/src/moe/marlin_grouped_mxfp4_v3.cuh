@@ -433,12 +433,12 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
 
         dequant(set, t & 1, t >> 1);
         const uint64_t desc = desc0 + static_cast<uint64_t>((buf * C::ACT_STAGE + 32 * t) >> 4);
-        fence_acc();
+        // No accumulator fence inside the loop: touching acc while groups are
+        // in flight makes ptxas serialise every wgmma.
         wgmma_fence();
 #pragma unroll
         for (int i = 0; i < JW; i++) wgmma_rs<NB>(afr[set][i], desc, acc[i]);
         wgmma_commit();
-        fence_acc();
       }
       buf = nbuf;
     }
