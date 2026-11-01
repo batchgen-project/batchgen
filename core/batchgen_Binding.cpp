@@ -85,7 +85,11 @@ void BindHostPagedManager(py::module& m, const char* name) {
     py::class_<Manager>(m, name)
         .def(py::init<EngineConfig, ModelConfig>())
         .def(py::init<kv::HostPagedKVConfig>())
-        .def("initialize", &Manager::Initialize, py::arg("create_region"))
+        // Creating the region maps and populates the whole Host-KV budget,
+        // tens of seconds for a large one; the server process's cluster
+        // heartbeat thread must keep running meanwhile.
+        .def("initialize", &Manager::Initialize, py::arg("create_region"),
+             py::call_guard<py::gil_scoped_release>())
         .def("allocate_pages",
              [](Manager& self, std::int64_t sequence_id,
                 std::size_t num_tokens) {
@@ -709,8 +713,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<DistributedWeightDaemon>(m, "DistributedWeightDaemon")
         .def(py::init<const std::string&>(), py::arg("config_path"))
         .def("start", &DistributedWeightDaemon::Start)
+        // Waits minutes for the cross-node bootstrap in the server process,
+        // whose cluster heartbeat thread needs the GIL to keep beating.
         .def("wait_ready", &DistributedWeightDaemon::WaitReady,
-             py::arg("timeout_seconds"))
+             py::arg("timeout_seconds"),
+             py::call_guard<py::gil_scoped_release>())
         .def("cohort_epoch", &DistributedWeightDaemon::CohortEpoch)
         .def("begin_cohort_swap", &DistributedWeightDaemon::BeginCohortSwap,
              py::call_guard<py::gil_scoped_release>())
@@ -953,7 +960,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "HostPrefixCacheCoordinator")
         .def(py::init<kv::HostPrefixCacheConfig>(), py::arg("config"))
         .def("initialize", &kv::HostPrefixCacheCoordinator::Initialize,
-             py::arg("create_region"))
+             py::arg("create_region"),
+             py::call_guard<py::gil_scoped_release>())
         .def("memfd_fd", &kv::HostPrefixCacheCoordinator::memfd_fd)
         .def("commit_prefix_pages",
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,

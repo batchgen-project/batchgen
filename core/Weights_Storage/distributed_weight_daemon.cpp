@@ -1105,7 +1105,9 @@ struct DistributedWeightDaemon::Impl {
         const bool done = ready_cv.wait_for(
             lock, std::chrono::duration<double>(timeout_seconds),
             [this]() {
-                return network_ready.load() || failed.load();
+                // The binding releases the GIL here, so a shutdown can stop
+                // the daemon while start-up still waits; end the wait then.
+                return network_ready.load() || failed.load() || stop.load();
             });
         if (!done) {
             fail("timed out waiting for distributed weights network");
@@ -1113,6 +1115,10 @@ struct DistributedWeightDaemon::Impl {
         if (failed.load()) {
             fail("distributed weights daemon failed: " +
                  FailureMessage());
+        }
+        if (!network_ready.load()) {
+            fail("distributed weights daemon stopped before its network "
+                 "was ready");
         }
     }
 
