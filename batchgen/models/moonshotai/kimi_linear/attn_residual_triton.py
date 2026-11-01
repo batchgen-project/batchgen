@@ -249,33 +249,3 @@ def mix_attn_residual_triton(
     )
 
     return output
-
-
-def warmup_attn_residual_triton(model) -> int:
-    """Compile both kernels and enumerate every depth-mix site at startup."""
-    pairs = []
-    for layer in model.layers:
-        pairs.extend(
-            (
-                (layer.self_attention_res_proj, layer.self_attention_res_norm),
-                (layer.mlp_res_proj, layer.mlp_res_norm),
-            )
-        )
-    pairs.append((model.output_attn_res_proj, model.output_attn_res_norm))
-
-    with torch.inference_mode():
-        proj, norm = pairs[0]
-        hidden = proj.weight.shape[1]
-        prefix = torch.zeros(
-            (1, hidden),
-            dtype=proj.weight.dtype,
-            device=proj.weight.device,
-        )
-        bank = torch.zeros(
-            (1, 1, hidden),
-            dtype=prefix.dtype,
-            device=prefix.device,
-        )
-        mix_attn_residual_triton(prefix, bank, proj, norm)
-        torch.cuda.synchronize(prefix.device)
-    return len(pairs)
