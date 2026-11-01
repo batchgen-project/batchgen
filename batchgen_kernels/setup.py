@@ -322,6 +322,20 @@ _sm90a_extensions = [
                      "--threads", _nvcc_threads],
         },
     ),
+    # DSA indexer KV projection: FP8 WGMMA GEMM (TMA A+B) + RMSNorm. Only the
+    # 4-stage pipeline is built; the wrapper rejects any other depth.
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_indexer_kv_proj_wgmma",
+        sources=["src/attention/indexer_kv_proj_wgmma.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "--ptxas-options=-v", "-lineinfo",
+                     "-DNUM_STAGES=4",
+                     "--threads", _nvcc_threads],
+        },
+    ),
 ]
 
 _sm80_extensions = [
@@ -449,6 +463,60 @@ _sm80_extensions = [
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
+
+    # ── AOT DSA indexer kernels (SM80+, no WGMMA) ──
+
+    # Radix top-2048 selector over indexer scores
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_dsa_fast_topk",
+        sources=["src/attention/dsa_fast_topk.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
+    # Fast Hadamard transform (Tri Dao, power-of-2 path)
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fast_hadamard_transform",
+        sources=[
+            "src/attention/hadamard/hadamard_binding.cpp",
+            "src/attention/hadamard/fast_hadamard_transform_cuda.cu",
+        ],
+        include_dirs=[os.path.join(_this_dir, "src/attention/hadamard")],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": ["-O3", "-std=c++17", "--use_fast_math",
+                     "-U__CUDA_NO_HALF_OPERATORS__",
+                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+                     "-U__CUDA_NO_HALF2_OPERATORS__",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--expt-relaxed-constexpr",
+                     "--expt-extended-lambda",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
+    # Fused interleaved RoPE + optional Hadamard (dim=128, bf16) with the
+    # saturating e4m3 epilogue and the strided-source entry point
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_rope_hadamard",
+        sources=[
+            "src/attention/hadamard/fused_rope_hadamard_binding.cpp",
+            "src/attention/hadamard/fused_rope_hadamard.cu",
+        ],
+        include_dirs=[os.path.join(_this_dir, "src/attention/hadamard")],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": ["-O3", "-std=c++17", "--use_fast_math",
+                     "-U__CUDA_NO_HALF_OPERATORS__",
+                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+                     "-U__CUDA_NO_HALF2_OPERATORS__",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--expt-relaxed-constexpr",
+                     "--expt-extended-lambda",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
 ]
 
 # Assemble final extension list based on build flags
@@ -498,11 +566,6 @@ setup(
               "batchgen_kernels.conv1d", "batchgen_kernels.triton"],
     package_data={
         "batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"],
-        "batchgen_kernels.attention.dsa.indexer": [
-            "csrc/*.cpp",
-            "csrc/*.cu",
-            "csrc/*.h",
-        ],
     },
     ext_modules=_ext_modules,
     cmdclass={"build_ext": IsolatedBuildExtension},

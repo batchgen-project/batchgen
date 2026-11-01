@@ -7,7 +7,9 @@ placeholder tripped ``num_valid_tokens must contain one element`` for B>1. This 
 reachable in production whenever decode bsz > cuda-graph-max-bucket-size and rows cross
 2048 context.
 
-Runs on a matching CUDA host. The CUDA module JIT-compiles on first use.
+Runs on a matching CUDA host with ``batchgen_kernels`` built: the kernel is the
+AOT extension ``batchgen_kernels.attention._C_dsa_fast_topk``, imported on
+first use and never compiled at runtime.
 """
 
 import pytest

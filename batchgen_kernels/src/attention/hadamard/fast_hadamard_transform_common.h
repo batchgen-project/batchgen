@@ -107,7 +107,7 @@ __device__ __forceinline__ void hadamard_mult_thread(float x[kNChunks][1 << kLog
 // kActiveMask names the physically active lanes of the warp (not the within-warp
 // group size). Defaults to FULL_MASK for the common case where blockDim.x >= 32
 // so the whole warp is populated. Callers that launch with blockDim.x < 32 (e.g.
-// fused_rope_hadamard with 16 threads) must override to e.g. 0x0000FFFFu —
+// fused_rope_hadamard with 16 threads) must override to e.g. 0x0000FFFFu;
 // naming phantom lanes in the sync mask is UB per the CUDA programming guide.
 template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems,
          uint32_t kActiveMask = FULL_MASK>

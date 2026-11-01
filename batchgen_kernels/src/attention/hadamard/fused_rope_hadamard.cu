@@ -158,7 +158,7 @@ void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
     float store_scale = 1.0f;
     if constexpr (kApplyHadamard) {
         hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
-        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts, 0x0000FFFFu>(x_vals);
         // kNWarps=1, kNChunks=1: no smem exchange, no transposed stage
         store_scale = params.scale;
     }
@@ -237,7 +237,7 @@ void fused_rope_hadamard_strided_kernel(FusedRopeHadamardParams params,
     float store_scale = 1.0f;
     if constexpr (kApplyHadamard) {
         hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
-        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts, 0x0000FFFFu>(x_vals);
         store_scale = params.scale;
     }
 

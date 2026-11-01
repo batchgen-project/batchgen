@@ -1,49 +1,61 @@
-import torch
-from torch.utils.cpp_extension import load
+"""DSA indexer kernels: Hadamard transform, fused RoPE + Hadamard, K writers.
+
+Every native kernel here is an AOT CUDA extension declared in ``setup.py`` and
+mirrored in ``_jit_registry.py``; the Hadamard sources live in
+``batchgen_kernels/src/attention/hadamard/``. Each extension is imported on
+first use, so importing this package neither builds nor loads native code.
+"""
+
 from typing import Optional
-import os
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_csrc_dir = os.path.join(_current_dir, "csrc")
+import torch
 
-_cuda_flags = [
-    '-O3',
-    '-std=c++17',
-    '--use_fast_math',
-    '-U__CUDA_NO_HALF_OPERATORS__',
-    '-U__CUDA_NO_HALF_CONVERSIONS__',
-    '-U__CUDA_NO_HALF2_OPERATORS__',
-    '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-    '--expt-relaxed-constexpr',
-    '--expt-extended-lambda',
-]
 
-_hadamard_cuda = load(
-    name="fast_hadamard_transform_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fast_hadamard_transform_cuda.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
+class _AotExtension:
+    """Imports one AOT extension on first attribute access, then forwards.
+
+    Call sites keep the ``_module.function(...)`` shape while the import (and
+    its failure, on a host without the built extension) moves to first use.
+    """
+
+    def __init__(self, module_name: str):
+        self._module_name = module_name
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            # Resolved at call time so tests can substitute the loader.
+            from batchgen_kernels import load_extension
+
+            self._module = load_extension(self._module_name, allow_dev_jit=False)
+        return self._module
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._load(), name)
+
+
+_hadamard_cuda = _AotExtension(
+    "batchgen_kernels.attention._C_fast_hadamard_transform"
 )
-
-_fused_rope_hadamard_cuda = load(
-    name="fused_rope_hadamard_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "fused_rope_hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fused_rope_hadamard.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
+_fused_rope_hadamard_cuda = _AotExtension(
+    "batchgen_kernels.attention._C_fused_rope_hadamard"
 )
 
 
-# Fused indexer-K quantize + page-split write. Unlike the two kernels above it
+def load_hadamard_extensions() -> None:
+    """Import both Hadamard extensions now instead of at first call.
+
+    Raises ``ImportError`` when either is not built, for callers whose
+    availability check runs at import time.
+    """
+
+    _hadamard_cuda._load()
+    _fused_rope_hadamard_cuda._load()
+
+
+# Fused indexer-K quantize + page-split write. Like the two kernels above it
 # is an AOT CUDA extension (setup.py + _jit_registry), and its wrapper loads
 # that extension lazily, so importing this package does not build it.
 from batchgen_kernels.attention.dsa.indexer.indexer_k_write_fp8 import (  # noqa: E402

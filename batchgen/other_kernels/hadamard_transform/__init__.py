@@ -1,75 +1,21 @@
-import torch
-from torch.utils.cpp_extension import load
-import os
+"""Compatibility re-export of the AOT Hadamard kernels.
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_csrc_dir = os.path.join(_current_dir, "csrc")
+The kernels, their sources and their extensions live in ``batchgen_kernels``
+(``batchgen_kernels.attention.dsa.indexer``); this module keeps the historical
+import path.
 
-_cuda_flags = [
-    '-O3',
-    '-std=c++17',
-    '--use_fast_math',
-    '-U__CUDA_NO_HALF_OPERATORS__',
-    '-U__CUDA_NO_HALF_CONVERSIONS__',
-    '-U__CUDA_NO_HALF2_OPERATORS__',
-    '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-    '--expt-relaxed-constexpr',
-    '--expt-extended-lambda',
-]
+Importing it imports both AOT extensions (no compilation). Callers such as the
+DSA model module treat a failed import here as "kernel unavailable" and report
+it from their startup gate, so the failure has to surface at import time, as
+it did when this module compiled the kernels itself.
+"""
 
-_hadamard_cuda = load(
-    name="batchgen_glm5_fast_hadamard_transform_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fast_hadamard_transform_cuda.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
+from batchgen_kernels.attention.dsa.indexer import (
+    fused_rope_hadamard,
+    hadamard_transform,
+    load_hadamard_extensions,
 )
 
-_fused_rope_hadamard_cuda = load(
-    name="batchgen_glm5_fused_rope_hadamard_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "fused_rope_hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fused_rope_hadamard.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
-)
+load_hadamard_extensions()
 
-
-def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    return _hadamard_cuda.fast_hadamard_transform(x, scale)
-
-
-def fused_rope_hadamard(
-    x: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    scale: float = 128 ** -0.5,
-    apply_hadamard: bool = True,
-) -> torch.Tensor:
-    """Fused interleaved RoPE + optional Hadamard transform for dim=128 bf16.
-
-    Args:
-        x: [batch, 128] bf16 tensor (after LayerNorm)
-        cos_cache: [max_seq, 64] float32 cos cache from rotary embedding
-        sin_cache: [max_seq, 64] float32 sin cache from rotary embedding
-        positions: [batch] int64 position indices
-        scale: Hadamard scale factor (default 1/sqrt(128)); applied only
-            when ``apply_hadamard`` is True, because it normalizes H.
-        apply_hadamard: run the 128-point Hadamard rotation. True is the bf16
-            AoS indexer's semantics; the page-split FP8 route follows upstream
-            V3.2 and passes False on BOTH q and k.
-
-    Returns:
-        [batch, 128] bf16 tensor
-    """
-    return _fused_rope_hadamard_cuda.fused_rope_hadamard(
-        x, cos_cache, sin_cache, positions, scale, apply_hadamard
-    )
+__all__ = ["fused_rope_hadamard", "hadamard_transform"]

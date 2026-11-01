@@ -42,7 +42,7 @@ import pytest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_CSRC = _REPO_ROOT / "batchgen_kernels/attention/dsa/indexer/csrc"
+_CSRC = _REPO_ROOT / "batchgen_kernels/src/attention/hadamard"
 _KERNEL_SRC = _CSRC / "fused_rope_hadamard.cu"
 _BINDING_SRC = _CSRC / "fused_rope_hadamard_binding.cpp"
 _INDEXER_INIT = _REPO_ROOT / "batchgen_kernels/attention/dsa/indexer/__init__.py"
