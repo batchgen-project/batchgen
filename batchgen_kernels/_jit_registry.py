@@ -127,6 +127,24 @@ def get_registry():
                 "--threads", "4",
             ],
         },
+        # Only the 4-stage pipeline is built (see setup.py).
+        "batchgen_kernels.moe._C_fp8_wgmma_grouped_gemm": {
+            "sources": ["src/moe/fp8_wgmma_grouped_gemm.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "--ptxas-options=-v", "-lineinfo",
+                "-DNUM_STAGES=4",
+                "--threads", "4",
+            ],
+        },
+        "batchgen_kernels.moe._C_fp8_wgmma_quant_ops": {
+            "sources": ["src/moe/fp8_wgmma_quant_ops.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "--ptxas-options=-v", "-lineinfo",
+                "--threads", "4",
+            ],
+        },
 
         # ── SM80+ universal kernels ──
 
