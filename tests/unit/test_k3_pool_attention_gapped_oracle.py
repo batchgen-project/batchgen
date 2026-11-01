@@ -242,6 +242,11 @@ def _load_kimi_linear():
     base.AttnWrapperBase = FakeAttnWrapperBase
     expert = types.ModuleType("batchgen.models.wrappers.expert")
     expert.ExpertWrapperBase = type("ExpertWrapperBase", (), {})
+    # serving_modules imports it at module level; the attention paths under
+    # test never route experts, so nothing is idle.
+    expert.skip_idle_streamed_experts = (
+        lambda experts, expert_ids, token_counts: []
+    )
     previous = {
         name: sys.modules.get(name) for name in (base.__name__, expert.__name__)
     }

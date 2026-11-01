@@ -21,7 +21,9 @@ import pytest
 # which pulls in the full server stack (torch, CUDA, etc.)
 import importlib.util
 
-_io_struct_path = str(Path(__file__).parent.parent / "batchgen" / "server" / "io_struct.py")
+_io_struct_path = str(
+    Path(__file__).resolve().parents[2] / "batchgen" / "server" / "io_struct.py"
+)
 _spec = importlib.util.spec_from_file_location("batchgen.server.io_struct", _io_struct_path)
 _io_struct = importlib.util.module_from_spec(_spec)
 sys.modules["batchgen.server.io_struct"] = _io_struct
