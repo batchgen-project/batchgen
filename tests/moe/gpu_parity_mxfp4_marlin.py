@@ -92,7 +92,10 @@ each variant 0..3 = (TM, TN) (1,16) (2,16) (2,8) (1,8):
                 wrapper and the raw-pybind seam.
 
 Version 3 ladder (grouped_marlin_gemm_m16{,_s1}_mxfp4{,_situ}_v3, swap-AB
-wgmma, sm_90a), run for each variant 0..2 = (JW, NCAP) (2,64) (2,48) (4,32):
+wgmma, sm_90a), run for each variant 0..3 = (JW, NCAP) (2,64) (2,48) (4,32)
+(2,64); variant 3 is variant 0 with the A operand staged in shared memory
+(wgmma SS form). The --build gate also reports, per v3 instantiation, how many
+wgmma serialisation warnings (C7513/C7514/C7515) ptxas emitted (report only):
 
   T1v3 DECODE   one-hot bit-exact at 64 and 72 rows (one and two row chunks
                 for NCAP=64) on 512x512, uniform and half-heavy codes. Pins
@@ -101,14 +104,17 @@ wgmma, sm_90a), run for each variant 0..2 = (JW, NCAP) (2,64) (2,48) (4,32):
   T2v3 M16      oracle gate at M in {1,4,8,9,16,17,24,32,33,40,64,65} (every
                 N width 8/16/32/48/64 and chunk boundary), both K3 shapes, two
                 experts with nonzero expert_starts, tight AND production-like
-                max_m_tiles grids (bit-identical), NaN canaries, v1 agreement.
+                max_m_tiles grids (bit-identical), NaN canaries, v1 agreement;
+                variant 3 bit-identical to variant 0 (variant 0 is run as the
+                reference if it is not among the tested variants).
   T3v3 S1+SiTU  same as T2v3 for the fused S1 entry on the stacked w13 layout.
   T4v3 GROUPED  E=28 skewed counts incl. 0, 1, 8, 9, 64, 65 and 70 rows, fused
                 S1 and S3, with and without expert_order (bit-identical), NaN
-                canaries, all-empty launch writes nothing.
+                canaries, all-empty launch writes nothing; variant 3 S1 and S3
+                bit-identical to variant 0.
   T5v3 MUTATIONS gate/up swap and rolled scale groups must FAIL the gate
-                (control must PASS); variant 3 must raise at the wrapper and
-                the raw-pybind seam.
+                (control must PASS); the first variant past the table must
+                raise at the wrapper and the raw-pybind seam.
   T6v3 GRAPH    expert order + S1 + S3 captured in one CUDA graph, replayed
                 twice; both replays bit-identical to the eager launches.
 """
@@ -947,6 +953,24 @@ def t5v2_mutations(variants):
 V3_VARIANTS = sorted(mgm.MXFP4_V3_VARIANTS)
 V3_M_SWEEP = [1, 4, 8, 9, 16, 17, 24, 32, 33, 40, 64, 65]
 V3_SMEM_LIMIT = 113 * 1024   # two CTAs per SM
+# Variant 3 = variant 0's tiling with the A operand in shared memory: same MMA
+# inputs in the same K order, so its outputs must equal variant 0's bit for bit.
+V3_ASMEM_VARIANT, V3_ASMEM_BASE = 3, 0
+
+
+def _v3_asmem_identity(tag, outs_by_variant, run_base):
+    """Strict bit identity of variant 3 against variant 0. outs_by_variant maps
+    a tested variant to a tuple of bf16 tensors; run_base() produces variant
+    0's tuple when variant 0 itself is not among the tested variants."""
+    if V3_ASMEM_VARIANT not in outs_by_variant:
+        return True
+    base = outs_by_variant.get(V3_ASMEM_BASE)
+    if base is None:
+        base = run_base()
+    same = all(torch.equal(a.view(torch.int16), b.view(torch.int16))
+               for a, b in zip(base, outs_by_variant[V3_ASMEM_VARIANT]))
+    print(f"    {tag}: v{V3_ASMEM_VARIANT} vs v{V3_ASMEM_BASE} bit-identical={same}")
+    return same
 
 
 def print_v3_launch_configs(variants):
@@ -1019,24 +1043,35 @@ def t2v3_m16_parity(variants):
                 A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256, tight)
             torch.cuda.synchronize()
             v1_rows = _expert_rows(C, counts_host, V2_MTP).clone()
+
+            def run_v3(v, grid):
+                C.fill_(NAN)
+                mgm.marlin_grouped_m16_mxfp4_v3(
+                    A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256,
+                    grid, variant=v)
+                torch.cuda.synchronize()
+                return C.clone()
+
+            by_variant = {}
             for v in variants:
                 outs, canary = [], True
                 for grid in (tight, V2_BIG_MAX_M_TILES):
-                    C.fill_(NAN)
-                    mgm.marlin_grouped_m16_mxfp4_v3(
-                        A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256,
-                        grid, variant=v)
-                    torch.cuda.synchronize()
-                    canary = _canary_ok(C, counts_host, V2_MTP) and canary
-                    outs.append(C.clone())
+                    outs.append(run_v3(v, grid))
+                    canary = _canary_ok(outs[-1], counts_host, V2_MTP) and canary
+                by_variant[v] = (_expert_rows(outs[0], counts_host, V2_MTP),)
                 tag = f"T2v3[{shape_tag}] v{v} M={M}"
                 ok = _v2_case_line(
                     tag,
                     _gate_rows(outs[0], refs, counts_host, V2_MTP, tag, verbose=False),
                     canary,
                     torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)),
-                    _agree(v1_rows, _expert_rows(outs[0], counts_host, V2_MTP))) and ok
-    report("T2v3 M16 MXFP4 v3 parity (K3 shapes, M sweep, both grids, v1 agreement)", ok)
+                    _agree(v1_rows, by_variant[v][0])) and ok
+            ok = _v3_asmem_identity(
+                f"T2v3[{shape_tag}] M={M}", by_variant,
+                lambda: (_expert_rows(run_v3(V3_ASMEM_BASE, tight), counts_host, V2_MTP),)
+            ) and ok
+    report("T2v3 M16 MXFP4 v3 parity (K3 shapes, M sweep, both grids, v1 agreement, "
+           "v3 == v0 bits)", ok)
 
 
 def t3v3_s1_situ_parity(variants):
@@ -1155,15 +1190,22 @@ def t4v3_grouped_skewed(variants):
     zero = torch.zeros(P["E"], dtype=torch.int32, device=DEV)
     zero_order = mgm.compute_mxfp4_v3_expert_order(zero)
     ok = order_ok
+
+    def run_v3(v, o):
+        P["inter"].fill_(NAN)
+        _v3_s1(P, P["counts"], total, v, o)
+        P["out"].fill_(NAN)
+        _v3_s3(P, P["counts"], v, o)
+        torch.cuda.synchronize()
+        return P["inter"].clone(), P["out"].clone()
+
+    def rows_of(pair):
+        return tuple(_expert_rows(x, counts_host, mtp) for x in pair)
+
+    by_variant = {}
     for v in variants:
-        res = {}
-        for tag, o in (("identity", None), ("ordered", order)):
-            P["inter"].fill_(NAN)
-            _v3_s1(P, P["counts"], total, v, o)
-            P["out"].fill_(NAN)
-            _v3_s3(P, P["counts"], v, o)
-            torch.cuda.synchronize()
-            res[tag] = (P["inter"].clone(), P["out"].clone())
+        res = {tag: run_v3(v, o) for tag, o in (("identity", None), ("ordered", order))}
+        by_variant[v] = rows_of(res["identity"])
         inter, out = res["identity"]
         g1 = _gate_rows(inter, P["s1_refs"], counts_host, mtp, f"T4v3 S1 v{v}")
         c1 = _canary_ok(inter, counts_host, mtp)
@@ -1181,7 +1223,10 @@ def t4v3_grouped_skewed(variants):
         print(f"    T4v3 v{v}: canary S1={c1} S3={c3}; order bit-identical={same}; "
               f"all-empty wrote nothing S1={e1} S3={e3}")
         ok = ok and g1 and c1 and g3 and c3 and same and e1 and e3
-    report("T4v3 grouped v3 with skewed and zero-token experts (E=28), expert order", ok)
+    ok = _v3_asmem_identity("T4v3 S1+S3", by_variant,
+                            lambda: rows_of(run_v3(V3_ASMEM_BASE, None))) and ok
+    report("T4v3 grouped v3 with skewed and zero-token experts (E=28), expert order, "
+           "v3 == v0 bits", ok)
 
 
 def t5v3_mutations(variants):
@@ -1317,12 +1362,22 @@ def do_build():
         sys.exit(2)
 
     # pair each 'Compiling entry function' with the next 'Used N registers'
-    # and the spill line ptxas prints between them
-    entries, cur, spill = [], None, None
+    # and the spill line ptxas prints between them. wgmma serialisation
+    # warnings (C7513/C7514/C7515) are counted per function: the name quoted
+    # in the warning, else the entry function compiled last.
+    entries, cur, spill, last = [], None, None, None
+    wgmma_warn = {}
     for line in log.splitlines():
+        m = re.search(r"\((C751[345])\)", line)
+        if m:
+            fn = re.search(r"function '([^']+)'", line)
+            key = fn.group(1) if fn else (cur or last or "<unattributed>")
+            per_fn = wgmma_warn.setdefault(key, {})
+            per_fn[m.group(1)] = per_fn.get(m.group(1), 0) + 1
+            continue
         m = re.search(r"Compiling entry function '([^']+)'", line)
         if m:
-            cur, spill = m.group(1), None
+            cur, last, spill = m.group(1), m.group(1), None
             continue
         m = re.search(r"(\d+) bytes spill stores, (\d+) bytes spill loads", line)
         if m and cur is not None:
@@ -1385,17 +1440,32 @@ def do_build():
 
     # v3 gate: same register and spill bounds; the wgmma kernels are one
     # symbol per (variant, S1/grouped), all N widths inside.
-    v3 = [(dem, r, sp) for dem, mangled, r, sp in marlin
+    v3 = [(dem, mangled, r, sp) for dem, mangled, r, sp in marlin
           if "marlin_v3" in mangled and "Grouped" in mangled]
     if len(v3) != 2 * len(V3_VARIANTS):
         print(f"    marlin_v3: expected {2 * len(V3_VARIANTS)} instantiations, "
               f"found {len(v3)} — inspect {log_path} manually")
         ok = False
-    for dem, r, sp in v3:
+    for dem, _, r, sp in v3:
         v3_ok = r <= 128 and sp == (0, 0)
         print(f"    marlin_v3 {'OK  ' if v3_ok else 'FAIL'} regs={r} "
               f"spill(st,ld)={sp}  {dem}")
         ok = ok and v3_ok
+
+    # Report only (does not fail the gate): wgmma serialisation warnings per
+    # v3 instantiation. A ptxas compile per target arch can repeat a warning,
+    # so counts are per log, not per kernel binary.
+    codes = ("C7513", "C7514", "C7515")
+    for dem, mangled, _, _ in v3:
+        per_fn = wgmma_warn.get(mangled, {})
+        counts = " ".join(f"{c}={per_fn.get(c, 0)}" for c in codes)
+        tag = "serialised" if per_fn else "clean     "
+        print(f"    marlin_v3 wgmma {tag} {counts}  {dem}")
+    v3_names = {mangled for _, mangled, _, _ in v3}
+    for fn, per_fn in sorted(wgmma_warn.items()):
+        if fn not in v3_names:
+            counts = " ".join(f"{c}={per_fn.get(c, 0)}" for c in codes)
+            print(f"    wgmma warnings outside the v3 kernels: {counts}  {demangle(fn)}")
 
     # Dynamic shared memory is not in the ptxas report; ask the freshly built
     # extension (a subprocess, because this process imported the old one).

@@ -1872,13 +1872,14 @@ std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool
 // marlin_mxfp4_v3_expert_order. n_tiles keeps its v1 meaning (prob_n / 256);
 // max_m_tiles shapes the grid as in v1 (rows beyond 16 * max_m_tiles rounded
 // up to the row chunk are not computed). Scale bytes must be <= 128, as v2.
-// variant: 0 = (JW=2, NCAP=64), 1 = (JW=2, NCAP=48), 2 = (JW=4, NCAP=32).
+// variant: 0 = (JW=2, NCAP=64), 1 = (JW=2, NCAP=48), 2 = (JW=4, NCAP=32),
+// 3 = variant 0 with the dequantised A operand in shared memory (wgmma SS).
 // ----------------------------------------------------------------------------
 #include <cstdint>
 
 static void check_mxfp4_v3_variant(int variant) {
-    TORCH_CHECK(variant >= 0 && variant <= 2,
-        "mxfp4 v3 launch: variant must be in [0, 2], got ", variant);
+    TORCH_CHECK(variant >= 0 && variant <= 3,
+        "mxfp4 v3 launch: variant must be in [0, 3], got ", variant);
 }
 
 static int mxfp4_v3_cta_cols(int variant, bool fused) {
@@ -1915,7 +1916,7 @@ static int mxfp4_v3_grid(int n_col_tiles, int num_matrices, int max_chunks) {
     return static_cast<int>(total);
 }
 
-template <int JW, int NCAP>
+template <int JW, int NCAP, bool ASMEM = false>
 static void launch_mxfp4_v3_s1(
     torch::Tensor& A,
     torch::Tensor& gate_B_ptrs, torch::Tensor& up_B_ptrs,
@@ -1924,16 +1925,16 @@ static void launch_mxfp4_v3_s1(
     torch::Tensor& expert_starts, torch::Tensor& expert_counts,
     const int* order, int num_experts, int prob_n, int prob_k, int max_m_tiles)
 {
-    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, true>();
-    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, true>(stages);
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::GroupedS1<JW, NCAP, stages>,
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, true, ASMEM>(stages);
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
-    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, true>::CTA_COLS;
+    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, true, ASMEM>::CTA_COLS;
     const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
     const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_experts, max_chunks);
     auto stream = at::cuda::getCurrentCUDAStream();
-    marlin_v3::GroupedS1<JW, NCAP, stages>
+    marlin_v3::GroupedS1<JW, NCAP, stages, ASMEM>
         <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
         reinterpret_cast<const int4*>(A.data_ptr()),
         reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
@@ -1947,7 +1948,7 @@ static void launch_mxfp4_v3_s1(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int JW, int NCAP>
+template <int JW, int NCAP, bool ASMEM = false>
 static void launch_mxfp4_v3(
     torch::Tensor& A, torch::Tensor& B_ptrs, torch::Tensor& C_ptrs,
     torch::Tensor& scales_ptrs,
@@ -1955,16 +1956,16 @@ static void launch_mxfp4_v3(
     const int* order, int num_experts, int prob_n, int prob_k,
     int num_matrices, int max_m_tiles)
 {
-    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, false>();
-    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, false>(stages);
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::Grouped<JW, NCAP, stages>,
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, false, ASMEM>(stages);
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::Grouped<JW, NCAP, stages, ASMEM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
-    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, false>::CTA_COLS;
+    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, false, ASMEM>::CTA_COLS;
     const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
     const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_matrices, max_chunks);
     auto stream = at::cuda::getCurrentCUDAStream();
-    marlin_v3::Grouped<JW, NCAP, stages>
+    marlin_v3::Grouped<JW, NCAP, stages, ASMEM>
         <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
         reinterpret_cast<const int4*>(A.data_ptr()),
         reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
@@ -2002,7 +2003,8 @@ void grouped_marlin_gemm_m16_s1_mxfp4_situ_v3(
     switch (variant) {
         case 0: launch_mxfp4_v3_s1<2, 64>(MXFP4_V3_S1_ARGS); break;
         case 1: launch_mxfp4_v3_s1<2, 48>(MXFP4_V3_S1_ARGS); break;
-        default: launch_mxfp4_v3_s1<4, 32>(MXFP4_V3_S1_ARGS); break;
+        case 2: launch_mxfp4_v3_s1<4, 32>(MXFP4_V3_S1_ARGS); break;
+        default: launch_mxfp4_v3_s1<2, 64, true>(MXFP4_V3_S1_ARGS); break;
     }
 #undef MXFP4_V3_S1_ARGS
 }
@@ -2034,7 +2036,8 @@ void grouped_marlin_gemm_m16_mxfp4_v3(
     switch (variant) {
         case 0: launch_mxfp4_v3<2, 64>(MXFP4_V3_ARGS); break;
         case 1: launch_mxfp4_v3<2, 48>(MXFP4_V3_ARGS); break;
-        default: launch_mxfp4_v3<4, 32>(MXFP4_V3_ARGS); break;
+        case 2: launch_mxfp4_v3<4, 32>(MXFP4_V3_ARGS); break;
+        default: launch_mxfp4_v3<2, 64, true>(MXFP4_V3_ARGS); break;
     }
 #undef MXFP4_V3_ARGS
 }
@@ -2057,18 +2060,18 @@ void marlin_mxfp4_v3_expert_order(torch::Tensor expert_counts, torch::Tensor out
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int JW, int NCAP>
+template <int JW, int NCAP, bool ASMEM = false>
 static std::tuple<int64_t, int64_t, int64_t> mxfp4_v3_cfg(bool fused) {
-    constexpr int s1_stages = marlin_v3::pick_stages<JW, NCAP, true>();
-    constexpr int gr_stages = marlin_v3::pick_stages<JW, NCAP, false>();
+    constexpr int s1_stages = marlin_v3::pick_stages<JW, NCAP, true, ASMEM>();
+    constexpr int gr_stages = marlin_v3::pick_stages<JW, NCAP, false, ASMEM>();
     if (fused) {
         return std::make_tuple(static_cast<int64_t>(s1_stages),
-            static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, true>(s1_stages)),
-            static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, true>::CTA_COLS));
+            static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, true, ASMEM>(s1_stages)),
+            static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, true, ASMEM>::CTA_COLS));
     }
     return std::make_tuple(static_cast<int64_t>(gr_stages),
-        static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, false>(gr_stages)),
-        static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, false>::CTA_COLS));
+        static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, false, ASMEM>(gr_stages)),
+        static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, false, ASMEM>::CTA_COLS));
 }
 
 // (stages, dynamic shared-memory bytes, output columns per CTA) of a v3
@@ -2079,7 +2082,8 @@ std::tuple<int64_t, int64_t, int64_t> marlin_mxfp4_v3_launch_config(int64_t vari
     switch (variant) {
         case 0: return mxfp4_v3_cfg<2, 64>(fused);
         case 1: return mxfp4_v3_cfg<2, 48>(fused);
-        default: return mxfp4_v3_cfg<4, 32>(fused);
+        case 2: return mxfp4_v3_cfg<4, 32>(fused);
+        default: return mxfp4_v3_cfg<2, 64, true>(fused);
     }
 }
 

@@ -289,8 +289,11 @@ MXFP4_V2_VARIANTS = {0: (1, 16), 1: (2, 16), 2: (2, 8), 3: (1, 8)}
 MXFP4_V2_MAX_SCALE_BYTE = 128
 # v3 variant -> (JW A fragments per warp per 16-K step, NCAP rows per CTA
 # chunk). A warpgroup covers 64*JW output columns; v3 reuses the v2 decode, so
-# MXFP4_V2_MAX_SCALE_BYTE applies to it as well.
-MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32)}
+# MXFP4_V2_MAX_SCALE_BYTE applies to it as well. Variant 3 has variant 0's
+# tiling but stages the dequantised A operand in shared memory (wgmma reads
+# both operands from shared memory) with the same MMA inputs and K order, so
+# its outputs must be bit-identical to variant 0's.
+MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32), 3: (2, 64)}
 
 
 def is_marlin_mxfp4_available() -> bool:

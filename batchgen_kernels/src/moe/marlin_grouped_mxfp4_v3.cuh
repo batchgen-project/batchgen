@@ -31,6 +31,18 @@
  * grid = column tiles x matrices x chunks; chunk CTAs past the expert's row
  * count exit before touching shared memory. An optional expert order
  * (ExpertOrder, descending row count) puts the heavy experts' CTAs first.
+ *
+ * ASMEM (variant 3): the same fragments are stored to a per-warpgroup ring of
+ * A tiles in shared memory and wgmma reads A through a descriptor (SS form).
+ * In the RS form the dequant defines wgmma input registers while earlier
+ * groups are in flight, which makes ptxas serialise the wgmma pipeline; in
+ * the SS form no register operand of an in-flight wgmma is written. Tile
+ * layout (64 rows x 16 K bf16, K-major, no swizzle, 8x8 core matrices of
+ * 8 rows x 16 B stored contiguously): element (m, k) at byte
+ * 256*(m/8) + 128*(k/8) + 16*(m%8) + 2*(k%8), i.e. LBO (next core matrix
+ * along K) = 128 B and SBO (next 8-row group along M) = 256 B. Lane
+ * (g, t) of warp w stores a0/a1/a2/a3 at 512*w + 4*lane + 0/256/128/384;
+ * each of these four stores covers 128 contiguous bytes per warp.
  */
 #pragma once
 
@@ -47,7 +59,11 @@ constexpr int SMEM_ALIGN = 1024;
 
 __host__ __device__ constexpr int cmax(int a, int b) { return a > b ? a : b; }
 
-template <int JW, int NCAP, bool FUSED>
+// Named barriers 1 and 2 (warpgroup 0 / 1, 128 threads) publish the A tiles
+// of the ASMEM path; barrier 0 is __syncthreads.
+constexpr int A_BAR_ID0 = 1;
+
+template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
 struct Cfg {
   static_assert(JW == 2 || JW == 4, "JW must be 2 or 4");
   static_assert(NCAP % 16 == 0 && NCAP >= 16 && NCAP <= 64, "NCAP in {16..64}, multiple of 16");
@@ -76,6 +92,14 @@ struct Cfg {
   static constexpr int W_COPIES = W_STAGE / (16 * THREADS);  // int4 copies per thread
   static constexpr int S_VECS = S_STAGE / 16;
 
+  // ASMEM A ring after the cp.async ring: per warpgroup ASETS sets of JW
+  // tiles (one per wgmma), each 64 rows x 16 K bf16 in the no-swizzle
+  // K-major layout described at the top of the file.
+  static constexpr int A_TILE = 64 * 16 * 2;
+  static constexpr int A_SET = JW * A_TILE;
+  static constexpr int A_WG = ASMEM ? ASETS * A_SET : 0;
+  static constexpr int A_RING = 2 * A_WG;
+
   // Output staging (aliases the ring after the main loop): bf16 rows of
   // CTA_COLS + 8; fused S1 keeps a gate tile and an up tile.
   static constexpr int C_STRIDE = CTA_COLS + 8;
@@ -85,18 +109,19 @@ struct Cfg {
   static_assert(W_STAGE % (16 * THREADS) == 0, "whole weight copies per thread");
   static_assert(S_VECS <= THREADS, "one scale copy per thread");
   static_assert((4 * UNROLL) % ASETS == 0, "register-set index must repeat per loop body");
+  static_assert(STAGE_BYTES % 128 == 0, "A ring must start on a core-matrix boundary");
 };
 
-template <int JW, int NCAP, bool FUSED>
+template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
 __host__ __device__ constexpr int smem_bytes(int stages) {
-  using C = Cfg<JW, NCAP, FUSED>;
-  return SMEM_ALIGN + cmax(stages * C::STAGE_BYTES, C::C_BYTES);
+  using C = Cfg<JW, NCAP, FUSED, ASMEM>;
+  return SMEM_ALIGN + cmax(stages * C::STAGE_BYTES + C::A_RING, C::C_BYTES);
 }
 
-template <int JW, int NCAP, bool FUSED>
+template <int JW, int NCAP, bool FUSED, bool ASMEM = false>
 __host__ __device__ constexpr int pick_stages() {
   int s = MAX_STAGES;
-  while (s > MIN_STAGES && smem_bytes<JW, NCAP, FUSED>(s) > SMEM_BUDGET_BYTES) --s;
+  while (s > MIN_STAGES && smem_bytes<JW, NCAP, FUSED, ASMEM>(s) > SMEM_BUDGET_BYTES) --s;
   return s;
 }
 
@@ -150,6 +175,27 @@ __device__ __forceinline__ uint64_t make_desc_sw128(uint32_t addr) {
   return static_cast<uint64_t>((addr & 0x3FFFF) >> 4) |
          (static_cast<uint64_t>(1024 >> 4) << 32) |
          (static_cast<uint64_t>(1) << 62);
+}
+
+// Shared-memory matrix descriptor, no swizzle (layout type 0 in bits
+// 62..63), K-major: start address >> 4 in bits 0..13, leading byte offset
+// (next 8x16 B core matrix along K) 128 >> 4 in bits 16..29, stride byte
+// offset (next 8-row group along M) 256 >> 4 in bits 32..45, base offset 0
+// (only swizzled layouts use it).
+__device__ __forceinline__ uint64_t make_desc_kmajor_none(uint32_t addr) {
+  return static_cast<uint64_t>((addr & 0x3FFFF) >> 4) |
+         (static_cast<uint64_t>(128 >> 4) << 16) |
+         (static_cast<uint64_t>(256 >> 4) << 32);
+}
+
+__device__ __forceinline__ void st_shared_b32(uint32_t addr, uint32_t v) {
+  asm volatile("st.shared.b32 [%0], %1;\n" :: "r"(addr), "r"(v) : "memory");
+}
+
+// Named barrier over `threads` threads (a multiple of 32); id != 0.
+template <int THREADS_>
+__device__ __forceinline__ void named_bar_sync(int id) {
+  asm volatile("bar.sync %0, %1;\n" :: "r"(id), "n"(THREADS_) : "memory");
 }
 
 #define V3_D4(i) "+f"(d[i]), "+f"(d[i + 1]), "+f"(d[i + 2]), "+f"(d[i + 3])
@@ -207,6 +253,61 @@ __device__ __forceinline__ void wgmma_rs(const uint32_t* a, uint64_t desc, float
   }
 }
 
+// D[64 x NB] += A[64 x 16] (shared, K-major) * B[16 x NB] (shared, K-major).
+// Operands: d, a-desc, b-desc, scale-d, imm-scale-a, imm-scale-b,
+// imm-trans-a, imm-trans-b.
+template <int NB>
+__device__ __forceinline__ void wgmma_ss(uint64_t desc_a, uint64_t desc_b, float* d) {
+  if constexpr (NB == 8) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %6, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3}, %4, %5, p, 1, 1, 0, 0;\n}\n"
+        : V3_D4(0)
+        : "l"(desc_a), "l"(desc_b), "r"(1));
+  } else if constexpr (NB == 16) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %10, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7}, "
+        "%8, %9, p, 1, 1, 0, 0;\n}\n"
+        : V3_D4(0), V3_D4(4)
+        : "l"(desc_a), "l"(desc_b), "r"(1));
+  } else if constexpr (NB == 32) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %18, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15}, "
+        "%16, %17, p, 1, 1, 0, 0;\n}\n"
+        : V3_D4(0), V3_D4(4), V3_D4(8), V3_D4(12)
+        : "l"(desc_a), "l"(desc_b), "r"(1));
+  } else if constexpr (NB == 48) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %26, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23}, "
+        "%24, %25, p, 1, 1, 0, 0;\n}\n"
+        : V3_D4(0), V3_D4(4), V3_D4(8), V3_D4(12), V3_D4(16), V3_D4(20)
+        : "l"(desc_a), "l"(desc_b), "r"(1));
+  } else {
+    static_assert(NB == 64, "wgmma N width");
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31}, "
+        "%32, %33, p, 1, 1, 0, 0;\n}\n"
+        : V3_D4(0), V3_D4(4), V3_D4(8), V3_D4(12),
+          V3_D4(16), V3_D4(20), V3_D4(24), V3_D4(28)
+        : "l"(desc_a), "l"(desc_b), "r"(1));
+  }
+}
+
 #undef V3_D4
 
 // ---------------------------------------------------------------------------
@@ -227,9 +328,9 @@ struct TileArgs {
   int colbase;         // first output column of the CTA
 };
 
-template <int JW, int NCAP, int STAGES, bool FUSED, int NB>
+template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM, int NB>
 __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
-  using C = Cfg<JW, NCAP, FUSED>;
+  using C = Cfg<JW, NCAP, FUSED, ASMEM>;
   static_assert(NB == 8 || (NB % 16 == 0 && NB <= NCAP), "N width");
   constexpr int NACC = NB / 2;                       // accumulators per thread per wgmma
   constexpr int ASETS = C::ASETS;
@@ -247,6 +348,7 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   const uint32_t act_u32 = smem_u32(smem);
   const uint32_t w_u32 = act_u32 + STAGES * C::ACT_STAGE;
   const uint32_t s_u32 = w_u32 + STAGES * C::W_STAGE;
+  const uint32_t a_ring_u32 = s_u32 + STAGES * C::S_STAGE;  // ASMEM only
   const uint8_t* w_ring = smem + STAGES * C::ACT_STAGE;
   const uint8_t* s_ring = w_ring + STAGES * C::W_STAGE;
 
@@ -349,8 +451,12 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
 
   uint32_t wq[2][JW];          // weight words of the current / next 16-K step
   uint32_t sw[2][JW / 2];      // folded scales of scale group 0 / 1 of a stage
-  uint32_t afr[ASETS][JW][4];  // A fragments, one set per in-flight wgmma group
+  uint32_t afr[ASETS][JW][4];  // RS only: A fragments, one set per in-flight wgmma group
   float acc[JW][NACC];
+
+  // ASMEM: this lane's a0 address in tile 0 of set 0 of the warpgroup's A
+  // ring (warp rows 16*warp.., see the layout at the top of the file).
+  const uint32_t a_st = a_ring_u32 + wg * C::A_WG + 512 * warp + 4 * lane;
 
   auto dequant = [&](int set, int wsel, int ssel) {
 #pragma unroll
@@ -365,10 +471,18 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
       scale_op(b1, fs, 1);
       const uint32_t* r0 = reinterpret_cast<const uint32_t*>(&b0);
       const uint32_t* r1 = reinterpret_cast<const uint32_t*>(&b1);
-      afr[set][i][0] = r0[0];
-      afr[set][i][1] = r1[0];
-      afr[set][i][2] = r0[1];
-      afr[set][i][3] = r1[1];
+      if constexpr (ASMEM) {
+        const uint32_t p = a_st + set * C::A_SET + i * C::A_TILE;
+        st_shared_b32(p, r0[0]);        // a0: row g,     k 2t..2t+1
+        st_shared_b32(p + 256, r1[0]);  // a1: row g + 8, k 2t..2t+1
+        st_shared_b32(p + 128, r0[1]);  // a2: row g,     k 2t+8..2t+9
+        st_shared_b32(p + 384, r1[1]);  // a3: row g + 8, k 2t+8..2t+9
+      } else {
+        afr[set][i][0] = r0[0];
+        afr[set][i][1] = r1[0];
+        afr[set][i][2] = r0[1];
+        afr[set][i][3] = r1[1];
+      }
     }
   };
 
@@ -386,6 +500,7 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   fence_acc();
 
   const uint64_t desc0 = make_desc_sw128(act_u32);
+  const uint64_t desc_a0 = make_desc_kmajor_none(a_ring_u32 + wg * C::A_WG);  // ASMEM only
 
   // ---- Pipeline ----
   // Stage s lives in ring slot s % STAGES. The refill issued at step t == 2
@@ -419,8 +534,10 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
         if (t == 1) load_s(sw[1], buf, 1);
         if (t == KR - 1) load_s(sw[0], nbuf, 0);
 
-        // Frees A set `set` (read by the group of step - ASETS) and, at the
-        // stage barrier, the ring slot refilled below.
+        // Frees A set `set` (read by the group of step - ASETS; registers,
+        // or for ASMEM the shared tiles, of which each warp rewrites only
+        // its own 16 rows) and, at the stage barrier, the ring slot
+        // refilled below.
         wgmma_wait<ASETS - 1>();
         if (t == 2) {
           int fb = buf + STAGES - 2;
@@ -433,11 +550,24 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
 
         dequant(set, t & 1, t >> 1);
         const uint64_t desc = desc0 + static_cast<uint64_t>((buf * C::ACT_STAGE + 32 * t) >> 4);
+        if constexpr (ASMEM) {
+          // Generic-proxy stores -> async-proxy wgmma reads: proxy fence,
+          // then all four warps' rows of the tiles before any warp issues.
+          fence_proxy_async();
+          named_bar_sync<128>(A_BAR_ID0 + wg);
+        }
         // No accumulator fence inside the loop: touching acc while groups are
         // in flight makes ptxas serialise every wgmma.
         wgmma_fence();
+        if constexpr (ASMEM) {
 #pragma unroll
-        for (int i = 0; i < JW; i++) wgmma_rs<NB>(afr[set][i], desc, acc[i]);
+          for (int i = 0; i < JW; i++)
+            wgmma_ss<NB>(desc_a0 + static_cast<uint64_t>((set * C::A_SET + i * C::A_TILE) >> 4),
+                         desc, acc[i]);
+        } else {
+#pragma unroll
+          for (int i = 0; i < JW; i++) wgmma_rs<NB>(afr[set][i], desc, acc[i]);
+        }
         wgmma_commit();
       }
       buf = nbuf;
@@ -491,7 +621,7 @@ __device__ __forceinline__ void run_tile(const TileArgs& ta, uint8_t* smem) {
   }
 }
 
-template <int JW, int NCAP, int STAGES, bool FUSED>
+template <int JW, int NCAP, int STAGES, bool FUSED, bool ASMEM>
 __device__ __forceinline__ void grouped_body(
     const int4* __restrict__ A,
     const int4* const* __restrict__ B_ptrs,     // FUSED: gate (w1)
@@ -503,9 +633,9 @@ __device__ __forceinline__ void grouped_body(
     const int* __restrict__ expert_counts,
     const int* __restrict__ order,              // optional matrix order
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
-  using C = Cfg<JW, NCAP, FUSED>;
+  using C = Cfg<JW, NCAP, FUSED, ASMEM>;
   static_assert(STAGES >= MIN_STAGES, "pipeline depth");
-  static_assert(smem_bytes<JW, NCAP, FUSED>(STAGES) <= SMEM_BUDGET_BYTES,
+  static_assert(smem_bytes<JW, NCAP, FUSED, ASMEM>(STAGES) <= SMEM_BUDGET_BYTES,
                 "shared memory exceeds the two-CTA budget");
 
   const int tile = blockIdx.x % n_col_tiles;
@@ -538,20 +668,20 @@ __device__ __forceinline__ void grouped_body(
 
   const int rows_c = ta.rows_c;
   if (rows_c <= 8) {
-    run_tile<JW, NCAP, STAGES, FUSED, 8>(ta, smem);
+    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 8>(ta, smem);
   } else if (rows_c <= 16) {
-    run_tile<JW, NCAP, STAGES, FUSED, 16>(ta, smem);
+    run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 16>(ta, smem);
   } else if (rows_c <= 32) {
-    if constexpr (NCAP >= 32) run_tile<JW, NCAP, STAGES, FUSED, 32>(ta, smem);
+    if constexpr (NCAP >= 32) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 32>(ta, smem);
   } else if (rows_c <= 48) {
-    if constexpr (NCAP >= 48) run_tile<JW, NCAP, STAGES, FUSED, 48>(ta, smem);
+    if constexpr (NCAP >= 48) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 48>(ta, smem);
   } else {
-    if constexpr (NCAP >= 64) run_tile<JW, NCAP, STAGES, FUSED, 64>(ta, smem);
+    if constexpr (NCAP >= 64) run_tile<JW, NCAP, STAGES, FUSED, ASMEM, 64>(ta, smem);
   }
 }
 
 // Fused S1: SiTU(x @ gate^T, x @ up^T), each branch rounded to bf16 first.
-template <int JW, int NCAP, int STAGES>
+template <int JW, int NCAP, int STAGES, bool ASMEM>
 __global__ void __launch_bounds__(THREADS, 2) GroupedS1(
     const int4* __restrict__ A,
     const int4* const* __restrict__ gate_B_ptrs,
@@ -564,7 +694,7 @@ __global__ void __launch_bounds__(THREADS, 2) GroupedS1(
     const int* __restrict__ order,
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-  grouped_body<JW, NCAP, STAGES, true>(
+  grouped_body<JW, NCAP, STAGES, true, ASMEM>(
       A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
@@ -573,7 +703,7 @@ __global__ void __launch_bounds__(THREADS, 2) GroupedS1(
 
 // S3 / standalone grouped GEMM. Pointer arrays are indexed by matrix
 // (num_matrices >= num_experts); rows come from expert matrix % num_experts.
-template <int JW, int NCAP, int STAGES>
+template <int JW, int NCAP, int STAGES, bool ASMEM>
 __global__ void __launch_bounds__(THREADS, 2) Grouped(
     const int4* __restrict__ A,
     const int4* const* __restrict__ B_ptrs,
@@ -584,7 +714,7 @@ __global__ void __launch_bounds__(THREADS, 2) Grouped(
     const int* __restrict__ order,
     int num_experts, int prob_n, int prob_k, int n_col_tiles, int max_chunks) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-  grouped_body<JW, NCAP, STAGES, false>(
+  grouped_body<JW, NCAP, STAGES, false, ASMEM>(
       A, B_ptrs, nullptr, C_ptrs, scales_ptrs, nullptr,
       expert_starts, expert_counts, order, num_experts, prob_n, prob_k,
       n_col_tiles, max_chunks);
