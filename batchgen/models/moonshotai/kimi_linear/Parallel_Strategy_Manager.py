@@ -1142,6 +1142,9 @@ class KimiLinearParallelStrategyManager:
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
+            max_prefill_tokens=int(getattr(
+                self.engine_config.Module_Batching_Config,
+                "prefill_micro_batch_token_cap", 0) or 0),
             part_index=part_index,
             part_count=part_count,
             barrier=barrier,

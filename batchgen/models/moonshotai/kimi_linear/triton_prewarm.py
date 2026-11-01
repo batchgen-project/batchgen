@@ -599,8 +599,40 @@ def _run_kda_decode(module, template, rows: int) -> None:
     module.kda_decode_serving(hidden, state, reduce_output=False)
 
 
+# fla's gated norm sizes its constexpr block count as ceil(rows / this), with
+# rows = tokens x heads of the whole prefill micro-batch.
+O_NORM_ROWS_PER_BLOCK = 2048 * 32
+
+
+def o_norm_token_counts(heads: int, max_tokens: int) -> List[int]:
+    """Token counts that reach every o_norm block count up to
+    ``max_tokens``, each with a row count divisible by 16 and one that is not."""
+    max_blocks = -(-int(max_tokens) * int(heads) // O_NORM_ROWS_PER_BLOCK)
+    counts = []
+    for blocks in range(1, max_blocks + 1):
+        tokens = min(blocks * O_NORM_ROWS_PER_BLOCK // heads, int(max_tokens))
+        wanted = {True, False}
+        while wanted and tokens >= 1 and (
+                (blocks - 1) * O_NORM_ROWS_PER_BLOCK < tokens * heads):
+            aligned = (tokens * heads) % 16 == 0
+            if aligned in wanted:
+                wanted.discard(aligned)
+                counts.append(tokens)
+            tokens -= 1
+    return sorted(counts)
+
+
+def _run_o_norm(o_norm, heads: int, head_dim: int, tokens_list, dtype,
+                device) -> None:
+    for tokens in tokens_list:
+        o = torch.empty(tokens, heads, head_dim, dtype=dtype, device=device)
+        o_norm(o, torch.empty_like(o))
+        del o
+
+
 def kda_prefill_entries(module, template, segment_tokens: int,
-                        shapes=KDA_PREFILL_SHAPES) -> List[PrewarmEntry]:
+                        shapes=KDA_PREFILL_SHAPES,
+                        max_prefill_tokens: int = 0) -> List[PrewarmEntry]:
     entries = [
         PrewarmEntry(
             f"kda_prefill/{shape.name}",
@@ -612,6 +644,14 @@ def kda_prefill_entries(module, template, segment_tokens: int,
     weight = module.q_proj.weight
     entries.extend(beta_sigmoid_entries(module.num_heads, weight.dtype,
                                         weight.device))
+    if max_prefill_tokens > 0:
+        heads, head_dim = int(module.num_heads), int(module.head_dim)
+        tokens_list = o_norm_token_counts(heads, max_prefill_tokens)
+        entries.append(PrewarmEntry(
+            f"kda_o_norm/max{int(max_prefill_tokens)}",
+            partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
+                    weight.dtype, weight.device),
+        ))
     return entries
 
 
@@ -760,7 +800,8 @@ def row_kernel_entries(model, config, act_dtype, device) -> List[PrewarmEntry]:
     return entries
 
 
-def build_prewarm_entries(model, config, decode_buckets) -> List[PrewarmEntry]:
+def build_prewarm_entries(model, config, decode_buckets,
+                          max_prefill_tokens: int = 0) -> List[PrewarmEntry]:
     """The deterministic entry list; identical on every rank of a node."""
     from .serving_modules import KDA_PREFILL_SEGMENT_TOKENS
     from .wrappers import KimiLinearKDAWrapper
@@ -791,8 +832,9 @@ def build_prewarm_entries(model, config, decode_buckets) -> List[PrewarmEntry]:
                 getattr(wrapper, "_resident_prefill_segment_tokens", None)
                 or KDA_PREFILL_SEGMENT_TOKENS
             )
-            entries.extend(kda_prefill_entries(module, template,
-                                               segment_tokens))
+            entries.extend(kda_prefill_entries(
+                module, template, segment_tokens,
+                max_prefill_tokens=max_prefill_tokens))
             entries.extend(kda_decode_entries(module, template,
                                               decode_buckets))
     if device is None:
@@ -881,8 +923,8 @@ _PREWARM_DONE = False
 
 
 def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
-                              part_index=0, part_count=1, barrier=None,
-                              rank=0) -> bool:
+                              max_prefill_tokens=0, part_index=0,
+                              part_count=1, barrier=None, rank=0) -> bool:
     """Compile every planned K3 Triton key, then arm the late-compile guard.
 
     Once per process: the in-memory kernel caches outlive model rebuilds,
@@ -895,7 +937,8 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
     recorder = get_recorder()
     active = recorder if recorder.install() else None
     with torch.inference_mode():
-        entries = build_prewarm_entries(model, config, decode_buckets)
+        entries = build_prewarm_entries(model, config, decode_buckets,
+                                        max_prefill_tokens=max_prefill_tokens)
         run_prewarm(
             entries, recorder=active, part_index=part_index,
             part_count=part_count, barrier=barrier, rank=rank,
