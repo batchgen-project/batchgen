@@ -16,7 +16,7 @@ def _head_gates_out_kernel(
     hidden_stride_b,
     weight_stride_h,
     out_stride_b,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
     K: tl.constexpr,
     SCALE: tl.constexpr,
