@@ -135,6 +135,9 @@ def covered(
         return False
     if state.stride(-3) != _HEAD_DIM * _HEAD_DIM:
         return False
+    # The kernel moves the state in float4 units.
+    if state.stride(0) % 4 or state.data_ptr() % 16:
+        return False
     if not state_indices.is_contiguous():
         return False
     return all(

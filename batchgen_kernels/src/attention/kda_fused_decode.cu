@@ -477,8 +477,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_v2_kernel(
     __shared__ float k[kHeadDim];
     __shared__ float decay[kHeadDim];
     __shared__ float value[kHeadDim];
-    __shared__ float update[kHeadDim];
-    __shared__ float partial[kWarps][kHeadDim];
+    // Read and written as float4, so the alignment must not depend on the
+    // declaration order.
+    __shared__ __align__(16) float update[kHeadDim];
+    __shared__ __align__(16) float partial[kWarps][kHeadDim];
     __shared__ float reduce[kWarps];
     __shared__ float beta_value;
 
@@ -836,6 +838,10 @@ torch::Tensor kda_fused_decode_forward(
                 && weight_v.stride(1) == 1);
     TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == kHeadDim
                 && state.stride(1) == kHeadDim * kHeadDim);
+    // Both versions move the state in float4 units.
+    TORCH_CHECK(state.stride(0) % 4 == 0
+                && reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
+                "state slots must be 16-byte aligned");
     TORCH_CHECK(state_indices.is_contiguous());
 
     auto output = torch::empty(
