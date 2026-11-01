@@ -1401,7 +1401,7 @@ def do_build():
     # extension (a subprocess, because this process imported the old one).
     probe = ("from batchgen_kernels import load_extension as L\n"
              "m = L('batchgen_kernels.moe._C_marlin_grouped_gemm')\n"
-             "for v in range(4):\n"
+             f"for v in {V2_VARIANTS!r}:\n"
              "    for f in (True, False):\n"
              "        s, b = m.marlin_mxfp4_v2_launch_config(v, f)\n"
              "        print(f'    marlin_v2 variant {v} {\"S1\" if f else \"grouped\"}: '\n"
