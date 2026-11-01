@@ -1463,6 +1463,9 @@ __global__ void silu_mul_dual_stride_kernel(
   gate_inplace[gate_idx] = float2num(g / (1.0f + __expf(-g)) * u);
 }
 
+// K3 MXFP4 version 2 kernels (namespace marlin_v2); needs the helpers above.
+#include "marlin_grouped_mxfp4_v2.cuh"
+
 // ============================================================================
 // Launchers
 // ============================================================================
@@ -1697,6 +1700,169 @@ void grouped_marlin_gemm_m16_mxfp4(
         num_experts, prob_n, prob_k, num_matrices, n_tiles, max_m_tiles);
 }
 
+// ----------------------------------------------------------------------------
+// K3 MXFP4 version 2 entries (marlin_grouped_mxfp4_v2.cuh). Same arguments
+// and checks as the v1 MXFP4 entries plus `variant`, so call sites can swap
+// entries without changing arguments. n_tiles keeps its v1 meaning
+// (prob_n / 256) and max_m_tiles is validated but does not shape the grid:
+// each CTA walks every row of its expert. Scale bytes must be <= 128 (see the
+// header); that is a weight-build-time check, not a per-launch one.
+// variant: 0 = (TM=1, TN=16), 1 = (TM=2, TN=16), 2 = (TM=2, TN=8),
+//          3 = (TM=1, TN=8).
+// ----------------------------------------------------------------------------
+#include <c10/cuda/CUDAException.h>
+#include <tuple>
+
+static int mxfp4_v2_tn(int variant) {
+    TORCH_CHECK(variant >= 0 && variant <= 3,
+        "mxfp4 v2 launch: variant must be in [0, 3], got ", variant);
+    return variant <= 1 ? 16 : 8;
+}
+
+static void check_mxfp4_v2_tile(int variant, int prob_n) {
+    const int tn = mxfp4_v2_tn(variant);
+    TORCH_CHECK(prob_n % (16 * tn) == 0,
+        "mxfp4 v2 launch: prob_n=", prob_n, " not a multiple of ", 16 * tn,
+        " (variant ", variant, ")");
+}
+
+template <int TM, int TN>
+static void launch_mxfp4_v2_s1(
+    torch::Tensor& A,
+    torch::Tensor& gate_B_ptrs, torch::Tensor& up_B_ptrs,
+    torch::Tensor& C_ptrs,
+    torch::Tensor& gate_scales_ptrs, torch::Tensor& up_scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    int num_experts, int prob_n, int prob_k)
+{
+    constexpr int stages = marlin_v2::pick_stages<TM, TN, true>();
+    constexpr int smem_bytes = marlin_v2::smem_bytes<TM, TN, true>(stages);
+    cudaFuncSetAttribute((void*)marlin_v2::GroupedS1<TM, TN, stages>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int total_ctas = num_experts * (prob_n / (16 * TN));
+    marlin_v2::GroupedS1<TM, TN, stages>
+        <<<total_ctas, marlin_v2::THREADS, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int TM, int TN>
+static void launch_mxfp4_v2(
+    torch::Tensor& A, torch::Tensor& B_ptrs, torch::Tensor& C_ptrs,
+    torch::Tensor& scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    int num_experts, int prob_n, int prob_k, int num_matrices)
+{
+    constexpr int stages = marlin_v2::pick_stages<TM, TN, false>();
+    constexpr int smem_bytes = marlin_v2::smem_bytes<TM, TN, false>(stages);
+    cudaFuncSetAttribute((void*)marlin_v2::Grouped<TM, TN, stages>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int total_ctas = num_matrices * (prob_n / (16 * TN));
+    marlin_v2::Grouped<TM, TN, stages>
+        <<<total_ctas, marlin_v2::THREADS, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void grouped_marlin_gemm_m16_s1_mxfp4_situ_v2(
+    torch::Tensor A,
+    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
+    torch::Tensor C_ptrs,
+    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int n_tiles, int max_m_tiles, int variant)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    check_mxfp4_ptr_array(gate_B_ptrs, "gate_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_B_ptrs, "up_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_experts);
+    check_mxfp4_ptr_array(gate_scales_ptrs, "gate_scales_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_scales_ptrs, "up_scales_ptrs", num_experts);
+    check_mxfp4_v2_tile(variant, prob_n);
+#define MXFP4_V2_S1_ARGS A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, \
+    up_scales_ptrs, expert_starts, expert_counts, num_experts, prob_n, prob_k
+    switch (variant) {
+        case 0: launch_mxfp4_v2_s1<1, 16>(MXFP4_V2_S1_ARGS); break;
+        case 1: launch_mxfp4_v2_s1<2, 16>(MXFP4_V2_S1_ARGS); break;
+        case 2: launch_mxfp4_v2_s1<2, 8>(MXFP4_V2_S1_ARGS); break;
+        default: launch_mxfp4_v2_s1<1, 8>(MXFP4_V2_S1_ARGS); break;
+    }
+#undef MXFP4_V2_S1_ARGS
+}
+
+void grouped_marlin_gemm_m16_mxfp4_v2(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles, int variant)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    TORCH_CHECK(num_matrices >= num_experts,
+        "mxfp4 launch: num_matrices=", num_matrices, " < num_experts=",
+        num_experts);
+    check_mxfp4_ptr_array(B_ptrs, "B_ptrs", num_matrices);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_matrices);
+    check_mxfp4_ptr_array(scales_ptrs, "scales_ptrs", num_matrices);
+    check_mxfp4_v2_tile(variant, prob_n);
+#define MXFP4_V2_ARGS A, B_ptrs, C_ptrs, scales_ptrs, expert_starts, \
+    expert_counts, num_experts, prob_n, prob_k, num_matrices
+    switch (variant) {
+        case 0: launch_mxfp4_v2<1, 16>(MXFP4_V2_ARGS); break;
+        case 1: launch_mxfp4_v2<2, 16>(MXFP4_V2_ARGS); break;
+        case 2: launch_mxfp4_v2<2, 8>(MXFP4_V2_ARGS); break;
+        default: launch_mxfp4_v2<1, 8>(MXFP4_V2_ARGS); break;
+    }
+#undef MXFP4_V2_ARGS
+}
+
+template <int TM, int TN>
+static std::tuple<int64_t, int64_t> mxfp4_v2_cfg(bool fused) {
+    constexpr int s1_stages = marlin_v2::pick_stages<TM, TN, true>();
+    constexpr int gr_stages = marlin_v2::pick_stages<TM, TN, false>();
+    if (fused) {
+        return std::make_tuple(static_cast<int64_t>(s1_stages),
+            static_cast<int64_t>(marlin_v2::smem_bytes<TM, TN, true>(s1_stages)));
+    }
+    return std::make_tuple(static_cast<int64_t>(gr_stages),
+        static_cast<int64_t>(marlin_v2::smem_bytes<TM, TN, false>(gr_stages)));
+}
+
+// (stages, dynamic shared-memory bytes) of a v2 instantiation; lets the
+// parity ladder report the layout the launcher actually uses.
+std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool fused)
+{
+    mxfp4_v2_tn(static_cast<int>(variant));
+    switch (variant) {
+        case 0: return mxfp4_v2_cfg<1, 16>(fused);
+        case 1: return mxfp4_v2_cfg<2, 16>(fused);
+        case 2: return mxfp4_v2_cfg<2, 8>(fused);
+        default: return mxfp4_v2_cfg<1, 8>(fused);
+    }
+}
+
 void silu_mul_dual_stride(
     torch::Tensor gate_inplace, torch::Tensor up,
     torch::Tensor expert_counts,
@@ -1723,6 +1889,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Marlin M16 grouped GEMM, MXFP4 (E2M1) weights — Kimi-K3");
     m.def("grouped_marlin_gemm_m16_s1_mxfp4_situ", &grouped_marlin_gemm_m16_s1_mxfp4_situ,
           "Marlin M16 fused S1, MXFP4 (E2M1) weights + SiTU epilogue — Kimi-K3");
+    m.def("grouped_marlin_gemm_m16_mxfp4_v2", &grouped_marlin_gemm_m16_mxfp4_v2,
+          "Marlin grouped GEMM v2, MXFP4 (E2M1) weights, per-CTA expert row walk");
+    m.def("grouped_marlin_gemm_m16_s1_mxfp4_situ_v2", &grouped_marlin_gemm_m16_s1_mxfp4_situ_v2,
+          "Marlin fused S1 v2, MXFP4 (E2M1) weights + SiTU, per-CTA expert row walk");
+    m.def("marlin_mxfp4_v2_launch_config", &marlin_mxfp4_v2_launch_config,
+          "(stages, dynamic smem bytes) of a Marlin MXFP4 v2 variant");
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");
