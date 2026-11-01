@@ -69,6 +69,14 @@ ROW_COUNTS = (1, 17)
 # always below 16, so its classes are "== 1" and "other".
 ATTN_RESIDUAL_BANK_ROWS = (1, 2)
 
+# Width classes of the decode graph's static page table (max pages per
+# sequence), which the paged KV write takes as a runtime int.
+PAGE_TABLE_COLS = (16, 17)
+
+# Page size when no paged-KV manager exists yet at prewarm time; the serving
+# page sizes are powers of two from 16 up, so all share this int class.
+DEFAULT_PAGE_SIZE_TOKENS = 64
+
 DISARMED = "disarmed"
 LOG = "log"
 STRICT = "strict"
@@ -737,6 +745,86 @@ def beta_sigmoid_entries(heads: int, dtype, device) -> List[PrewarmEntry]:
     )]
 
 
+def _run_marlin_dequant(dequant_marlin_bf16, device) -> None:
+    # Marlin packs K in 16-row blocks and N in 64-column tiles, so every
+    # routed weight has N and K divisible by 16: a single key.
+    n, k = 64, 32
+    qw = torch.zeros(k // 16, n * 2, dtype=torch.int32, device=device)
+    scales = torch.full((k // 32, n), 127, dtype=torch.uint8, device=device)
+    out = torch.empty(n, k, dtype=torch.bfloat16, device=device)
+    dequant_marlin_bf16(qw, scales, out)
+
+
+def _run_mla_kv_write(update, elements: int, page_size: int, rows_list,
+                      dtype, device) -> None:
+    """The decode graph's paged write of each new MLA latent, captured with
+    ``num_valid_tokens``; the eager fused write passes none."""
+    for rows in rows_list:
+        tokens = torch.zeros(rows, elements, dtype=dtype, device=device)
+        index = torch.zeros(rows, dtype=torch.int32, device=device)
+        valid = torch.full((1,), rows, dtype=torch.int32, device=device)
+        for cols in PAGE_TABLE_COLS:
+            cache = torch.zeros(1, page_size, elements, dtype=dtype,
+                                device=device)
+            page_table = torch.zeros(rows, cols, dtype=torch.int32,
+                                     device=device)
+            for num_valid in (valid, None):
+                update(
+                    k_cache=cache, k_tokens=tokens, page_table=page_table,
+                    slot_indices=index, token_indices=index,
+                    page_size_tokens=page_size, num_valid_tokens=num_valid,
+                )
+
+
+def class_representatives(values) -> List[int]:
+    """The smallest value of each ``int_class`` present in ``values``."""
+    chosen: Dict[str, int] = {}
+    for value in sorted({int(v) for v in values if int(v) > 0}):
+        chosen.setdefault(int_class(value), value)
+    return sorted(chosen.values())
+
+
+def _page_size_tokens() -> int:
+    from batchgen.models.wrappers import AttnWrapperBase
+
+    manager = getattr(AttnWrapperBase, "gpu_paged_kv_manager", None)
+    size = getattr(getattr(manager, "config", None), "page_size_tokens", None)
+    return int(size) if size else DEFAULT_PAGE_SIZE_TOKENS
+
+
+def mla_kv_write_entries(model, config, decode_buckets,
+                         device) -> List[PrewarmEntry]:
+    mla_index = next(
+        (i for i in range(int(config.num_hidden_layers))
+         if not config.is_kda_layer(i)),
+        None,
+    )
+    if mla_index is None:
+        return []
+    wrapper = model.model.layers[mla_index].self_attn
+    attn = getattr(wrapper, "module", wrapper)
+    weight = getattr(getattr(attn, "kv_a_proj_with_mqa", None), "weight",
+                     None)
+    rank = getattr(attn, "kv_lora_rank", None)
+    rope = getattr(attn, "qk_rope_head_dim", None)
+    if not _resident(weight) or rank is None or rope is None:
+        return []
+    try:
+        from batchgen_kernels.triton.kv_cache import (
+            run_paged_kv_token_update_fused,
+        )
+    except ImportError as exc:
+        logger.debug("%s MLA KV write not prewarmed: %s", LOG_TAG, exc)
+        return []
+    rows_list = class_representatives(decode_buckets)
+    elements = int(rank) + int(rope)
+    return [PrewarmEntry(
+        f"mla_kv_write/e{elements}",
+        partial(_run_mla_kv_write, run_paged_kv_token_update_fused, elements,
+                _page_size_tokens(), rows_list, weight.dtype, device),
+    )]
+
+
 def _resident(weight) -> bool:
     return weight is not None and not weight.is_meta and weight.numel() > 0
 
@@ -779,14 +867,22 @@ def row_kernel_entries(model, config, act_dtype, device) -> List[PrewarmEntry]:
     routed = getattr(config, "moe_intermediate_size", None)
     if routed and getattr(config, "routed_expert_hidden_size", None):
         try:
-            from batchgen.moe.k3_prefill_dequant_once import situ_gated
+            from batchgen.moe.k3_prefill_dequant_once import (
+                dequant_marlin_bf16,
+                situ_gated,
+            )
         except ImportError as exc:
-            logger.debug("%s situ_gated not prewarmed: %s", LOG_TAG, exc)
+            logger.debug("%s dequant-once prefill not prewarmed: %s",
+                         LOG_TAG, exc)
         else:
             entries.append(PrewarmEntry(
                 f"situ_gated/n{int(routed)}",
                 partial(_run_situ_gated, situ_gated, int(routed), act_dtype,
                         device),
+            ))
+            entries.append(PrewarmEntry(
+                "marlin_dequant",
+                partial(_run_marlin_dequant, dequant_marlin_bf16, device),
             ))
 
     from .row_gather_triton import row_gather_triton_available
@@ -841,6 +937,8 @@ def build_prewarm_entries(model, config, decode_buckets,
         device = torch.device("cuda", torch.cuda.current_device())
     entries.extend(attn_residual_entries(model))
     entries.extend(row_kernel_entries(model, config, act_dtype, device))
+    entries.extend(mla_kv_write_entries(model, config, decode_buckets,
+                                        device))
     return entries
 
 

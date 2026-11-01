@@ -149,6 +149,52 @@ def test_o_norm_counts_reach_every_block_count_in_both_row_classes(heads, cap):
             assert classes == {True, False}
 
 
+def test_class_representatives_pick_one_bucket_per_int_class():
+    buckets = [1, 2, 4, 8, 16, 24, 32, 64, 96, 128]
+    assert TP.class_representatives(buckets) == [1, 2, 16]
+    assert TP.class_representatives([0, 32, 64]) == [32]
+
+
+def test_mla_kv_write_covers_every_runtime_int_class():
+    """The paged write's runtime ints: rows (grid and ``num_tokens``), the
+    page-table width, and the page size, with and without the valid count."""
+    calls = []
+
+    def update(**kw):
+        calls.append(kw)
+
+    rows_list = TP.class_representatives([1, 2, 4, 8, 16, 128])
+    TP._run_mla_kv_write(update, 576, 64, rows_list, None, "cpu")
+    seen = {
+        (TP.int_class(kw["k_tokens"].shape[0]),
+         TP.int_class(kw["page_table"].shape[1]),
+         kw["num_valid_tokens"] is not None)
+        for kw in calls
+    }
+    assert seen == {
+        (rows, cols, valid)
+        for rows in ("1", "any", "d16")
+        for cols in ("any", "d16")
+        for valid in (True, False)
+    }
+    for kw in calls:
+        assert kw["k_cache"].stride()[:2] == (64 * 576, 576)
+        assert kw["page_size_tokens"] == 64
+        if kw["num_valid_tokens"] is not None:
+            assert int(kw["num_valid_tokens"]) == kw["k_tokens"].shape[0]
+
+
+def test_marlin_dequant_shapes_follow_the_marlin_layout():
+    calls = []
+    TP._run_marlin_dequant(lambda qw, s, out: calls.append((qw, s, out)),
+                           "cpu")
+    (qw, scales, out), = calls
+    n, k = out.shape
+    assert TP.int_class(n) == TP.int_class(k) == "d16"
+    assert tuple(qw.shape) == (k // 16, n * 2)
+    assert tuple(scales.shape) == (k // 32, n)
+
+
 def test_partition_covers_each_entry_once_and_is_deterministic():
     items = list(range(23))
     for count in (1, 2, 3, 8):
