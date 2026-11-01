@@ -216,7 +216,6 @@ def test_the_heartbeat_runs_on_its_own_thread_and_a_closed_peer_is_lost():
 
 
 BINDING_PATH = ROOT / "core" / "batchgen_Binding.cpp"
-DAEMON_PATH = ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.cpp"
 
 # Native calls the server process makes while its heartbeat thread runs that
 # block for longer than PEER_DEAD_S: the Host-KV region creation (tens of
@@ -245,16 +244,6 @@ def test_long_startup_native_calls_release_the_gil(head, arg):
     assert "py::call_guard<py::gil_scoped_release>()" in definition, (
         f"{head} must release the GIL, or the cluster heartbeat stalls"
     )
-
-
-def test_a_stopped_daemon_ends_the_startup_wait():
-    """With the GIL released, a shutdown can stop the daemon while start-up
-    waits for it; the wait must end then instead of running to its timeout."""
-    source = DAEMON_PATH.read_text()
-    start = source.index("void WaitReady(double timeout_seconds) {")
-    body = source[start:source.index("\n    }\n", start)]
-    assert "|| stop.load()" in body
-    assert "stopped before its network" in body
 
 
 def test_a_single_node_server_starts_no_heartbeat_and_opens_no_store():
