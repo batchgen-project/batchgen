@@ -248,9 +248,10 @@ void close_endpoint(ucp_worker_h worker, ucp_ep_h endpoint) {
     wait_request(worker, ucp_ep_close_nbx(endpoint, &params));
 }
 
-// Spread each owner's eight egress rails over the (num_nodes - 1) nodes that
-// pull from it. With four nodes this is the validated (rail - 1) % 3 walk;
-// with two nodes the single peer takes every rail.
+// The "partitioned" owner rail map: spread each owner's eight egress rails
+// over the (num_nodes - 1) nodes that pull from it. With four nodes this is
+// the (rail - 1) % 3 walk, which reaches one owner of every node over only two
+// rails; with two nodes the single peer takes every rail.
 int destination_for_owner_rail(int owner, int rail, int num_nodes) {
     return (owner + 1 + (rail - 1) % (num_nodes - 1)) % num_nodes;
 }
@@ -573,6 +574,25 @@ struct DistributedWeightDaemon::Impl {
             }
             progress_gap_counters = gapped.get<bool>();
         }
+        if (config.contains("owner_rail_map")) {
+            const nlohmann::json& map = config.at("owner_rail_map");
+            if (!map.is_string() ||
+                (map.get<std::string>() != "pooled" &&
+                 map.get<std::string>() != "partitioned")) {
+                fail("distributed weight owner_rail_map must be \"pooled\" "
+                     "or \"partitioned\"");
+            }
+            pooled_owner_rails = map.get<std::string>() == "pooled";
+        }
+        if (config.contains("rma_lanes")) {
+            const nlohmann::json& lanes = config.at("rma_lanes");
+            if (!lanes.is_number_integer() ||
+                lanes.get<std::int64_t>() < 1) {
+                fail("distributed weight rma_lanes must be a positive "
+                     "integer");
+            }
+            rma_lanes = static_cast<int>(lanes.get<std::int64_t>());
+        }
         if (config.contains("progress_thread_cores")) {
             const nlohmann::json& cores = config.at("progress_thread_cores");
             if (!cores.is_array() ||
@@ -696,6 +716,18 @@ struct DistributedWeightDaemon::Impl {
     // selection. All false (the default) leaves the selection unbiased.
     std::array<bool, kRails> rail_deprioritized{};
     std::uint64_t rail_bias_bytes = 0;
+    // `owner_rail_map`. Pooled (the default) connects every node to every
+    // owner over all eight rails, so the least-loaded selection can put any
+    // owner's bytes on any rail, and each rail carries one flow per owner.
+    // Partitioned keeps destination_for_owner_rail: each rail of a node then
+    // reaches exactly one owner, and an owner is reached over 2-3 rails.
+    bool pooled_owner_rails = true;
+    // `rma_lanes`: UCX MAX_RMA_RAILS for every rail context. Each lane of an
+    // endpoint is its own QP on its own path, and on a two-port bonded device
+    // the paths leave by different ports with different UDP source ports, so
+    // the switch can deliver them on different ports. With one lane a
+    // (puller, owner, rail) flow is pinned to a single port.
+    int rma_lanes = 2;
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -970,6 +1002,10 @@ struct DistributedWeightDaemon::Impl {
         check_ucs(
             ucp_config_modify(config, "NET_DEVICES", device.c_str()),
             "ucp_config_modify NET_DEVICES");
+        check_ucs(
+            ucp_config_modify(config, "MAX_RMA_RAILS",
+                              std::to_string(rma_lanes).c_str()),
+            "ucp_config_modify MAX_RMA_RAILS");
         ucp_params_t params{};
         params.field_mask = UCP_PARAM_FIELD_FEATURES;
         params.features = UCP_FEATURE_RMA;
@@ -1136,54 +1172,60 @@ struct DistributedWeightDaemon::Impl {
                 }
             }
         };
+        // Each rail of an owner serves every peer under the pooled map and
+        // exactly one peer under the partitioned walk.
+        const int pullers_per_rail = pooled_owner_rails ? num_nodes - 1 : 1;
         try {
             for (int rail = 0; rail < kRails; ++rail) {
-                accept_threads[rail] = std::thread([this, rail]() {
+                accept_threads[rail] = std::thread([this, rail,
+                                                    pullers_per_rail]() {
                     try {
-                        const int fd = accept(tcp_listeners[rail],
-                                              nullptr, nullptr);
-                        if (fd < 0) {
-                            if (stop.load()) {
-                                return;
+                        for (int peer = 0; peer < pullers_per_rail; ++peer) {
+                            const int fd = accept(tcp_listeners[rail],
+                                                  nullptr, nullptr);
+                            if (fd < 0) {
+                                if (stop.load()) {
+                                    return;
+                                }
+                                fail("owner accept failed: " +
+                                     std::string(strerror(errno)));
                             }
-                            fail("owner accept failed: " +
-                                 std::string(strerror(errno)));
-                        }
-                        std::uint64_t client_address_bytes = 0;
-                        recv_exact(fd, &client_address_bytes,
-                                   sizeof(client_address_bytes));
-                        std::vector<unsigned char> client_address(
-                            client_address_bytes);
-                        recv_exact(fd, client_address.data(),
-                                   client_address.size());
-                        ucp_ep_h endpoint = create_endpoint(
-                            rails[rail].worker, client_address.data());
-                        incoming_endpoints[rail].push_back(endpoint);
-                        incoming_controls[rail].push_back(fd);
+                            std::uint64_t client_address_bytes = 0;
+                            recv_exact(fd, &client_address_bytes,
+                                       sizeof(client_address_bytes));
+                            std::vector<unsigned char> client_address(
+                                client_address_bytes);
+                            recv_exact(fd, client_address.data(),
+                                       client_address.size());
+                            ucp_ep_h endpoint = create_endpoint(
+                                rails[rail].worker, client_address.data());
+                            incoming_endpoints[rail].push_back(endpoint);
+                            incoming_controls[rail].push_back(fd);
 
-                        void* packed_rkey = nullptr;
-                        size_t packed_rkey_bytes = 0;
+                            void* packed_rkey = nullptr;
+                            size_t packed_rkey_bytes = 0;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-                        check_ucs(
-                            ucp_rkey_pack(
-                                rails[rail].context,
-                                rails[rail].source_memh,
-                                &packed_rkey, &packed_rkey_bytes),
-                            "ucp_rkey_pack");
+                            check_ucs(
+                                ucp_rkey_pack(
+                                    rails[rail].context,
+                                    rails[rail].source_memh,
+                                    &packed_rkey, &packed_rkey_bytes),
+                                "ucp_rkey_pack");
 #pragma GCC diagnostic pop
-                        BootstrapHeader header;
-                        header.worker_address_bytes =
-                            rails[rail].address_bytes;
-                        header.rkey_bytes = packed_rkey_bytes;
-                        header.source_address =
-                            reinterpret_cast<std::uint64_t>(store);
-                        header.source_bytes = store_bytes;
-                        send_exact(fd, &header, sizeof(header));
-                        send_exact(fd, rails[rail].address,
-                                   rails[rail].address_bytes);
-                        send_exact(fd, packed_rkey, packed_rkey_bytes);
-                        ucp_rkey_buffer_release(packed_rkey);
+                            BootstrapHeader header;
+                            header.worker_address_bytes =
+                                rails[rail].address_bytes;
+                            header.rkey_bytes = packed_rkey_bytes;
+                            header.source_address =
+                                reinterpret_cast<std::uint64_t>(store);
+                            header.source_bytes = store_bytes;
+                            send_exact(fd, &header, sizeof(header));
+                            send_exact(fd, rails[rail].address,
+                                       rails[rail].address_bytes);
+                            send_exact(fd, packed_rkey, packed_rkey_bytes);
+                            ucp_rkey_buffer_release(packed_rkey);
+                        }
                     } catch (const std::exception& error) {
                         if (!stop.load()) {
                             RecordFailure(
@@ -1197,8 +1239,9 @@ struct DistributedWeightDaemon::Impl {
             for (int rail = 0; rail < kRails; ++rail) {
                 for (int owner = 0; owner < num_nodes; ++owner) {
                     if (owner == node_rank ||
-                        destination_for_owner_rail(owner, rail + 1,
-                                                   num_nodes) != node_rank) {
+                        (!pooled_owner_rails &&
+                         destination_for_owner_rail(owner, rail + 1,
+                                                    num_nodes) != node_rank)) {
                         continue;
                     }
                     const int fd = connect_retry(
@@ -1266,12 +1309,16 @@ struct DistributedWeightDaemon::Impl {
         if (stop.load()) {
             return;
         }
-        // kRails rails spread over the (num_nodes - 1) peers of each owner:
-        // 2/3 endpoints on four nodes, all 8 on two nodes.
-        const size_t min_rails =
-            static_cast<size_t>(kRails / (num_nodes - 1));
-        const size_t max_rails = static_cast<size_t>(
-            (kRails + num_nodes - 2) / (num_nodes - 1));
+        // Pooled: every owner over all kRails rails. Partitioned: kRails
+        // rails spread over the (num_nodes - 1) peers of each owner, 2/3
+        // endpoints on four nodes and all 8 on two nodes.
+        const size_t min_rails = pooled_owner_rails
+            ? static_cast<size_t>(kRails)
+            : static_cast<size_t>(kRails / (num_nodes - 1));
+        const size_t max_rails = pooled_owner_rails
+            ? static_cast<size_t>(kRails)
+            : static_cast<size_t>((kRails + num_nodes - 2) /
+                                  (num_nodes - 1));
         for (int owner = 0; owner < num_nodes; ++owner) {
             if (owner == node_rank) {
                 continue;
@@ -2093,7 +2140,10 @@ struct DistributedWeightDaemon::Impl {
     // rail for the life of the daemon. Choosing the rail that holds the fewest
     // bytes in flight instead lets a slow rail accumulate outstanding bytes
     // and be passed over until it drains, so the byte split follows capacity
-    // without any measured bandwidth table or configuration.
+    // without any measured bandwidth table or configuration. The load sums
+    // every owner's gets, so under the pooled owner rail map, where every
+    // owner offers all eight rails, the split is node-wide: a rail busy with
+    // one owner's bytes is passed over for the next owner's get as well.
     //
     // The load is derived from `in_flight`, the prefetch thread's own deque of
     // posted-but-unfinished gets, because that deque is the only account of
@@ -2487,6 +2537,9 @@ struct DistributedWeightDaemon::Impl {
         // The gate is always stated so a reader of the summary never
         // mistakes "accounting off" for "no gaps happened"; the per-rail
         // entries exist only when the loops actually count.
+        summary["owner_rail_map"] =
+            pooled_owner_rails ? "pooled" : "partitioned";
+        summary["rma_lanes"] = rma_lanes;
         summary["progress_gap_counters"] = progress_gap_counters;
         if (progress_gap_counters) {
             // One entry per rail. The counters are monotonic over the
