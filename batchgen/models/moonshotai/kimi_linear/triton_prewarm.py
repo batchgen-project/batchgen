@@ -668,6 +668,31 @@ def _run_row_gathers(hidden: int, dtype, device) -> None:
         add_gathered_rows_masked(src, src, idx, valid)
 
 
+def _run_beta_sigmoid(beta_sigmoid_fwd, heads: int, dtype, device) -> None:
+    # KDA prefill applies the beta sigmoid to ``beta[lo:hi]`` of a contiguous
+    # (tokens, heads) tensor, so the input address is 16-byte aligned only for
+    # some level offsets ``lo``; the element count is tokens * heads.
+    for element_offset in (0, 1):
+        for tokens in (1, 16):
+            count = tokens * heads
+            storage = torch.zeros(count + element_offset, dtype=dtype,
+                                  device=device)
+            beta_sigmoid_fwd(storage[element_offset:])
+
+
+def beta_sigmoid_entries(heads: int, dtype, device) -> List[PrewarmEntry]:
+    try:
+        from fla.ops.common.gate import fused_beta_sigmoid_fwd
+    except ImportError as exc:
+        logger.debug("%s beta sigmoid not prewarmed: %s", LOG_TAG, exc)
+        return []
+    return [PrewarmEntry(
+        f"beta_sigmoid/h{int(heads)}",
+        partial(_run_beta_sigmoid, fused_beta_sigmoid_fwd, int(heads), dtype,
+                device),
+    )]
+
+
 def _resident(weight) -> bool:
     return weight is not None and not weight.is_meta and weight.numel() > 0
 
@@ -766,6 +791,8 @@ def build_prewarm_entries(model, config, decode_buckets) -> List[PrewarmEntry]:
                                                segment_tokens))
             entries.extend(kda_decode_entries(module, template,
                                               decode_buckets))
+            entries.extend(beta_sigmoid_entries(module.num_heads, act_dtype,
+                                                device))
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     entries.extend(attn_residual_entries(model))
