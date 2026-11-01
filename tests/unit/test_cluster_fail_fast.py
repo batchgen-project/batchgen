@@ -215,6 +215,37 @@ def test_the_heartbeat_runs_on_its_own_thread_and_a_closed_peer_is_lost():
     node0.close()
 
 
+BINDING_PATH = ROOT / "core" / "batchgen_Binding.cpp"
+
+# Native calls the server process makes while its heartbeat thread runs that
+# block for longer than PEER_DEAD_S: the Host-KV region creation (tens of
+# seconds for a large budget) and the wait for the distributed weight store's
+# cross-node bootstrap (minutes). Holding the GIL there stops the heartbeat on
+# every node at once, and the peers declare each other lost.
+_LONG_STARTUP_BINDINGS = (
+    ('"initialize", &Manager::Initialize', 'py::arg("create_region")'),
+    ('"wait_ready", &DistributedWeightDaemon::WaitReady',
+     'py::arg("timeout_seconds")'),
+    ('"initialize", &kv::HostPrefixCacheCoordinator::Initialize',
+     'py::arg("create_region")'),
+)
+
+
+def _binding_def(source: str, head: str) -> str:
+    start = source.index(head)
+    end = source.find(".def(", start + 1)
+    return source[start:end if end != -1 else len(source)]
+
+
+@pytest.mark.parametrize("head,arg", _LONG_STARTUP_BINDINGS)
+def test_long_startup_native_calls_release_the_gil(head, arg):
+    definition = _binding_def(BINDING_PATH.read_text(), head)
+    assert arg in definition
+    assert "py::call_guard<py::gil_scoped_release>()" in definition, (
+        f"{head} must release the GIL, or the cluster heartbeat stalls"
+    )
+
+
 def test_a_single_node_server_starts_no_heartbeat_and_opens_no_store():
     def refuse(*_args, **_kwargs):
         raise AssertionError("a single-node server must not open a control store")
