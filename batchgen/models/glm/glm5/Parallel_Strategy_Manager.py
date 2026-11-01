@@ -31,6 +31,7 @@ from .model import (
     Glm5MoE,
     _required_dsa_model_kernel_import_failures,
 )
+from .triton_prewarm import PHASE_DECODE, PHASE_GEOMETRY, PHASE_PREFILL
 from .wrappers import (
     GLM5ExpertWrapper,
     GLM5AttnWrapper,
@@ -103,6 +104,10 @@ class GLM5ParallelStrategyManager:
         self._skeleton_uploaded_keys = frozenset()
         self._shared_skeleton_keys = None
         self._skeleton_bound_params = []
+        # The decode CUDA graph's capture bucket list, for the Triton prewarm's
+        # bucket-keyed entries. The worker derives it from its CUDA-graph
+        # arguments; None until something hands it over (see triton_prewarm).
+        self.decode_graph_buckets = None
 
     @property
     def _instances_are_reused(self) -> bool:
@@ -224,6 +229,7 @@ class GLM5ParallelStrategyManager:
             from .sparse_prefill import validate_glm52_sparse_prefill_runtime
 
             validate_glm52_sparse_prefill_runtime()
+        timings['triton_prewarm'] = self._prewarm_triton_kernels(PHASE_PREFILL)
         if self.is_fp8_experts:
             from batchgen.attention.fused_kernels import (
                 preload_fused_attention_kernels,
@@ -252,14 +258,17 @@ class GLM5ParallelStrategyManager:
                 moe._prefill_release_event = torch.cuda.Event()
                 moe._prefill_shared_release_event = torch.cuda.Event()
             _synchronize_prefill_preloads()
-        timings['to_device'] = time.perf_counter() - step_start
+        timings['to_device'] = (
+            time.perf_counter() - step_start - timings['triton_prewarm']
+        )
 
         total_time = time.perf_counter() - start_time
         if self.rank == 0:
             logging.info(
                 f"[PREFILL] Model configured in {total_time:.2f}s "
                 f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
-                f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
+                f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s, "
+                f"triton_prewarm={timings['triton_prewarm']:.1f}s)"
             )
         if self._instances_are_reused:
             self.prefill_instance = (self.model, self.weight_copy_task)
@@ -373,6 +382,7 @@ class GLM5ParallelStrategyManager:
         self._setup_fp8_scales()
         self._init_fused_kernels()
         self._assert_skeleton_still_shared("decode")
+        self._prewarm_triton_kernels(PHASE_DECODE)
 
         if self.rank == 0:
             used = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
@@ -388,6 +398,76 @@ class GLM5ParallelStrategyManager:
         if self._instances_are_reused:
             self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
+
+    def prewarm_decode_graphs(self, gpu_manager=None):
+        """Compile the decode kernels keyed on the KV page-table geometry.
+
+        The worker calls this with its GPU KV manager right before CUDA-graph
+        warmup on every decode configure. It runs the geometry phase of the
+        Triton prewarm the first time and again whenever the page-table
+        widths change, then arms the late-compile guard; any other call
+        returns at once.
+        """
+        if gpu_manager is None:
+            return 0.0
+        return self._prewarm_triton_kernels(PHASE_GEOMETRY,
+                                            gpu_manager=gpu_manager)
+
+    def _triton_prewarm_partition(self):
+        """``(part_index, part_count, barrier)`` for one prewarm phase.
+
+        Attention is pure DP and every rank of a node shares one Triton cache
+        directory, so the node-local ranks split each phase's compiles and
+        meet at a global barrier before every rank loads the full set.
+        """
+        count = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+        if count <= 0:
+            count = torch.cuda.device_count()
+        index = int(self.local_rank)
+        if count < 1 or not 0 <= index < count:
+            logging.warning(
+                "[GLM5_TRITON_WARMUP] rank=%s local rank %s outside a local "
+                "world of %s; this rank runs every prewarm entry itself",
+                self.global_rank, index, count,
+            )
+            return 0, 1, None
+        return index, count, _synchronize_prefill_preloads
+
+    def _prewarm_triton_kernels(self, phase, gpu_manager=None):
+        """Run one phase of the GLM-5 Triton prewarm; returns its wall time.
+
+        Each phase runs once per process (the geometry phase once per
+        geometry). The serving kernels' keys and the reasons for every
+        witness are in ``triton_prewarm``.
+        """
+        if not torch.cuda.is_available():
+            return 0.0
+        from .triton_prewarm import (
+            prewarm_glm5_decode,
+            prewarm_glm5_geometry,
+            prewarm_glm5_prefill,
+        )
+
+        part_index, part_count, barrier = self._triton_prewarm_partition()
+        common = dict(part_index=part_index, part_count=part_count,
+                      barrier=barrier, rank=self.global_rank)
+        start = time.perf_counter()
+        if phase == PHASE_PREFILL:
+            prewarm_glm5_prefill(self.loaded_model_config, **common)
+        elif phase == PHASE_DECODE:
+            prewarm_glm5_decode(
+                self.model, self.loaded_model_config,
+                decode_buckets=self.decode_graph_buckets,
+                world_size=self.world_size, **common,
+            )
+        elif phase == PHASE_GEOMETRY:
+            prewarm_glm5_geometry(
+                self.model, self.loaded_model_config, gpu_manager,
+                decode_buckets=self.decode_graph_buckets, **common,
+            )
+        else:
+            raise ValueError(f"unknown GLM-5 Triton prewarm phase {phase!r}")
+        return time.perf_counter() - start
 
     def activate_prefill(self):
         """Switch the already-built prefill instance in (persistent instances)."""
