@@ -27,12 +27,13 @@ reproduces the expert PATH; the caller adds the DP-local shared expert):
     y = routed_expert_norm(y)               # ONCE, post-combine, pre-up
     y = routed_expert_up_proj(y)            # 3584 -> 7168
 
-Because the grouped S1/S3 kernel entries are the SAME ones the streamed
-single-expert path drives at E=1, and both sides repack with the identical
-``repack_mxfp4_to_marlin_device``, the resident marlin weights are bit-identical
-to the streamed path's per-forward repack — so resident == streamed to within
-combine-order noise, and resident gates against the M3.0 fp32-dequant oracle at
-the same err_ratio the streamed path already clears.
+Both sides repack with the identical ``repack_mxfp4_to_marlin_device``, so the
+resident marlin weights are bit-identical to the streamed path's per-forward
+repack. The resident shard binds its grouped kernel version at build time
+(``_bind_grouped_kernels``); the v1 entries match the streamed path, and v3
+feeds the same MMA inputs, so resident == streamed to within summation-order
+noise and resident gates against the M3.0 fp32-dequant oracle at the same
+err_ratio the streamed path already clears.
 
 THE FP32 COMBINE (A13's flagged risk — read this before touching it)
 --------------------------------------------------------------------
@@ -73,8 +74,9 @@ from batchgen.moe.dispatch_scatter_3d import (
     reduce_weighted_scatter_fp32,
 )
 from batchgen.moe.marlin_grouped_moe import (
-    marlin_grouped_m16_mxfp4,
-    marlin_grouped_stage1_fused_mxfp4_situ,
+    MXFP4_V2_MAX_SCALE_BYTE,
+    compute_mxfp4_v3_expert_order,
+    select_mxfp4_kernel_version,
 )
 from batchgen.moe.routing import dispatch_count_gather_cuda
 
@@ -238,6 +240,10 @@ class MXFP4LayerShard:
         self.up_scales_ptrs = None
         self.down_B_ptrs = None
         self.down_scales_ptrs = None
+        # Grouped kernels bound by build_layer_shard (v1 argument lists).
+        self.kernel_version = None
+        self.s1_fn = None
+        self.s3_fn = None
 
     def nbytes(self):
         total = 0
@@ -305,7 +311,7 @@ def _repack_projection(packed, scale, device):
     )
 
 
-def build_layer_shard(expert_sources, device):
+def build_layer_shard(expert_sources, device, kernel_version=None):
     """Repack one layer's local experts into a resident marlin shard, ONCE.
 
     Args:
@@ -316,9 +322,12 @@ def build_layer_shard(expert_sources, device):
             uint8 E8M0 — exactly what ``K3MXFP4Projection`` holds and what
             ``core_engine.get_tensor`` serves (``w{1,3,2}.weight_{packed,scale}``).
         device: CUDA device for the resident tensors.
+        kernel_version: grouped MXFP4 kernel version (1 or 3) bound to the
+            shard's ``s1_fn``/``s3_fn``; None selects 3 on sm_90 when every
+            scale byte is within its range, else 1.
 
     Returns:
-        MXFP4LayerShard with the six int64 pointer arrays populated.
+        MXFP4LayerShard with the six int64 pointer arrays and kernels set.
     """
     num_local = len(expert_sources)
     if num_local == 0:
@@ -361,7 +370,50 @@ def build_layer_shard(expert_sources, device):
     shard.up_scales_ptrs = _ptrs(up_s)
     shard.down_B_ptrs = _ptrs(down_B)
     shard.down_scales_ptrs = _ptrs(down_s)
+    _bind_grouped_kernels(shard, kernel_version)
     return shard
+
+
+def _bind_grouped_kernels(shard, kernel_version):
+    """Bind the shard's grouped S1/S3 callables.
+
+    Version 3 folds the E2M1 rebias into the E8M0 scale and needs every scale
+    byte in [1, MXFP4_V2_MAX_SCALE_BYTE]; it also orders its CTAs by a
+    per-layer expert order computed in ``s1_fn`` from the S1 row counts, which
+    ``s3_fn`` reuses, so ``s3_fn`` must follow ``s1_fn`` with the same counts.
+    """
+    if kernel_version not in (None, 1, 3):
+        raise ValueError(
+            f"MXFP4 resident kernel_version must be 1 or 3, got {kernel_version}")
+    if kernel_version is None or kernel_version == 3:
+        scales = [s for t in shard._tensors for _, s in t.values()]
+        lo_hi = torch.stack([torch.stack([s.min(), s.max()]) for s in scales])
+        min_byte, max_byte = (int(v) for v in
+                              torch.stack([lo_hi[:, 0].min(), lo_hi[:, 1].max()]).tolist())
+        scales_ok = 1 <= min_byte and max_byte <= MXFP4_V2_MAX_SCALE_BYTE
+        if kernel_version == 3 and not scales_ok:
+            raise ValueError(
+                f"MXFP4 kernel v3 needs E8M0 scale bytes in "
+                f"[1, {MXFP4_V2_MAX_SCALE_BYTE}], shard has [{min_byte}, {max_byte}]")
+        if kernel_version is None:
+            kernel_version = (
+                3 if scales_ok and torch.cuda.get_device_capability(shard.device)[0] == 9
+                else 1)
+    s1, s3 = select_mxfp4_kernel_version(kernel_version)
+    shard.kernel_version = kernel_version
+    if kernel_version != 3:
+        shard.s1_fn, shard.s3_fn = s1, s3
+        return
+    order = torch.arange(shard.num_local, dtype=torch.int32, device=shard.device)
+
+    def s1_fn(*args):
+        compute_mxfp4_v3_expert_order(args[2], order)
+        s1(*args, expert_order=order)
+
+    def s3_fn(*args):
+        s3(*args, expert_order=order)
+
+    shard.s1_fn, shard.s3_fn = s1_fn, s3_fn
 
 
 class ResidentEPMXFP4MoELayer:
@@ -676,7 +728,7 @@ class ResidentEPMXFP4MoELayer:
                 device=device,
             )
         s1_ws = torch.zeros(E * (N // 256 + 17), dtype=torch.int32, device=device)
-        marlin_grouped_stage1_fused_mxfp4_situ(
+        shard.s1_fn(
             dispatched, intermediate, expert_counts, expert_starts,
             shard.gate_B_ptrs, shard.gate_scales_ptrs,
             shard.up_B_ptrs, shard.up_scales_ptrs, s1_C_ptrs,
@@ -704,7 +756,7 @@ class ResidentEPMXFP4MoELayer:
             )
         s3_ws = torch.zeros(E * (K_latent // 256 + 17), dtype=torch.int32,
                             device=device)
-        marlin_grouped_m16_mxfp4(
+        shard.s3_fn(
             intermediate, shard.down_B_ptrs, s3_C_ptrs, shard.down_scales_ptrs,
             expert_starts, expert_counts, E, K_latent, N, s3_ws, E,
             K_latent // 256, max_m_tiles,

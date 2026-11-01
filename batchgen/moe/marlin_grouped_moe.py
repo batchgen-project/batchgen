@@ -270,9 +270,27 @@ def marlin_grouped_stage1_unified(
 _MXFP4_KERNEL_ENTRIES = (
     "grouped_marlin_gemm_m16_mxfp4",
     "grouped_marlin_gemm_m16_s1_mxfp4_situ",
+    "grouped_marlin_gemm_m16_mxfp4_v2",
+    "grouped_marlin_gemm_m16_s1_mxfp4_situ_v2",
+    "grouped_marlin_gemm_m16_mxfp4_v3",
+    "grouped_marlin_gemm_m16_s1_mxfp4_situ_v3",
+    "marlin_mxfp4_v3_expert_order",
+    "marlin_mxfp4_v3_launch_config",
 )
 
 _warned_mxfp4 = False
+_warned_mxfp4_v2 = False
+_warned_mxfp4_v3 = False
+
+# v2 variant -> (TM 16-row m-blocks per CTA, TN 16-column n-blocks per CTA).
+MXFP4_V2_VARIANTS = {0: (1, 16), 1: (2, 16), 2: (2, 8)}
+# The v2 kernels fold the E2M1 2^126 rebias into the scale (bf16 2^(e-1));
+# byte 129 would reach the bf16 Inf/NaN exponent.
+MXFP4_V2_MAX_SCALE_BYTE = 128
+# v3 variant -> (JW A fragments per warp per 16-K step, NCAP rows per CTA
+# chunk). A warpgroup covers 64*JW output columns; v3 reuses the v2 decode, so
+# MXFP4_V2_MAX_SCALE_BYTE applies to it as well.
+MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32)}
 
 
 def is_marlin_mxfp4_available() -> bool:
@@ -473,6 +491,319 @@ def marlin_grouped_m16_mxfp4(
         expert_starts, expert_counts,
         E, prob_n, prob_k, workspace, num_matrices, n_tiles, max_m_tiles,
     )
+
+
+def check_mxfp4_scales_v2_compatible(scales: torch.Tensor) -> None:
+    """Raise ValueError unless every E8M0 scale byte is <= 128.
+
+    The v2 MXFP4 kernels expand byte e to bf16 2^(e-1) (the E2M1 rebias
+    folded into the scale), which is only finite for e <= 128. One device max
+    plus a host sync: call once per weight tensor at weight-build time, never
+    per launch.
+    """
+    if scales.dtype != torch.uint8:
+        raise ValueError(
+            f"mxfp4 v2 scale check: expected uint8 E8M0 scales, got {scales.dtype}")
+    if scales.numel() == 0:
+        return
+    hi = int(scales.max())
+    if hi > MXFP4_V2_MAX_SCALE_BYTE:
+        raise ValueError(
+            f"mxfp4 v2 scale check: max E8M0 byte {hi} > "
+            f"{MXFP4_V2_MAX_SCALE_BYTE}; the v2 kernels' folded scale 2^(e-1) "
+            f"would overflow bf16. Use the v1 entries for these weights.")
+
+
+def _check_v2_variant(variant: int, prob_n: int):
+    if variant not in MXFP4_V2_VARIANTS:
+        raise ValueError(
+            f"mxfp4 v2 variant must be one of {sorted(MXFP4_V2_VARIANTS)}, "
+            f"got {variant}")
+    tn = MXFP4_V2_VARIANTS[variant][1]
+    if prob_n % (16 * tn) != 0:
+        raise ValueError(
+            f"mxfp4 v2 variant {variant}: prob_n={prob_n} not a multiple of "
+            f"{16 * tn}")
+
+
+def marlin_grouped_stage1_fused_mxfp4_situ_v2(
+    dispatched_x_3d: torch.Tensor,
+    intermediate_3d: torch.Tensor,
+    expert_counts: torch.Tensor,
+    expert_starts: torch.Tensor,
+    gate_B_ptrs: torch.Tensor,
+    gate_scales_ptrs: torch.Tensor,
+    up_B_ptrs: torch.Tensor,
+    up_scales_ptrs: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    N: int,
+    K: int,
+    workspace: torch.Tensor,
+    max_m_tiles: int,
+    mtp: int,
+    num_experts: int,
+    total_rows: int,
+    *,
+    variant: int = 2,
+) -> None:
+    """K3 fused S1 v2: same contract and checks as
+    marlin_grouped_stage1_fused_mxfp4_situ, plus `variant` (see
+    MXFP4_V2_VARIANTS).
+
+    The grid is num_experts x (N / (16*TN)) and each CTA walks all rows of
+    its expert, so max_m_tiles does not limit the rows processed; it is still
+    validated (L5) so v1 and v2 stay drop-in interchangeable.
+
+    Precondition beyond v1: every E8M0 scale byte behind the pointer arrays
+    is <= 128 (check_mxfp4_scales_v2_compatible, at weight-build time).
+    """
+    global _warned_mxfp4_v2
+    _require_mxfp4_kernels()
+    _check_activation("dispatched_x_3d", dispatched_x_3d, K)
+    _check_activation("intermediate_3d", intermediate_3d, N)
+    E = int(num_experts)
+    _check_counts("expert_counts", expert_counts, E)
+    _check_counts("expert_starts", expert_starts, E)
+    for name, t in (("gate_B_ptrs", gate_B_ptrs), ("up_B_ptrs", up_B_ptrs),
+                    ("gate_scales_ptrs", gate_scales_ptrs),
+                    ("up_scales_ptrs", up_scales_ptrs), ("C_ptrs", C_ptrs)):
+        _check_ptr_array(name, t, E)
+    _check_m16_shapes(N, K)
+    _check_m_tile_bound(max_m_tiles, mtp, total_rows)
+    _check_v2_variant(variant, N)
+
+    if not _warned_mxfp4_v2:
+        logging.info("[Marlin] Using fused Marlin MXFP4 S1 v2 (gate+up+SiTU), "
+                     "variant %d", variant)
+        _warned_mxfp4_v2 = True
+
+    mod = _load_module()
+    n_tiles = N // 256
+    mod.grouped_marlin_gemm_m16_s1_mxfp4_situ_v2(
+        dispatched_x_3d,
+        gate_B_ptrs, up_B_ptrs, C_ptrs,
+        gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts,
+        E, N, K, workspace, n_tiles, max_m_tiles, variant,
+    )
+
+
+def marlin_grouped_m16_mxfp4_v2(
+    A: torch.Tensor,
+    B_ptrs: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    scales_ptrs: torch.Tensor,
+    expert_starts: torch.Tensor,
+    expert_counts: torch.Tensor,
+    num_experts: int,
+    prob_n: int,
+    prob_k: int,
+    workspace: torch.Tensor,
+    num_matrices: int,
+    n_tiles: int,
+    max_m_tiles: int,
+    *,
+    variant: int = 2,
+) -> None:
+    """K3 MXFP4 grouped GEMM v2 (S3 down projection / standalone): same
+    contract and checks as marlin_grouped_m16_mxfp4, plus `variant`.
+    max_m_tiles is accepted for interchangeability but does not limit rows.
+    Scale bytes must be <= 128 (check_mxfp4_scales_v2_compatible)."""
+    _require_mxfp4_kernels()
+    _check_activation("A", A, prob_k)
+    E = int(num_experts)
+    _check_counts("expert_counts", expert_counts, E)
+    _check_counts("expert_starts", expert_starts, E)
+    _check_ptr_array("B_ptrs", B_ptrs, num_matrices)
+    _check_ptr_array("C_ptrs", C_ptrs, num_matrices)
+    _check_ptr_array("scales_ptrs", scales_ptrs, num_matrices)
+    _check_m16_shapes(prob_n, prob_k)
+    if n_tiles != prob_n // 256:
+        raise ValueError(f"n_tiles={n_tiles} != prob_n//256={prob_n // 256}")
+    _check_v2_variant(variant, prob_n)
+
+    mod = _load_module()
+    mod.grouped_marlin_gemm_m16_mxfp4_v2(
+        A, B_ptrs, C_ptrs, scales_ptrs,
+        expert_starts, expert_counts,
+        E, prob_n, prob_k, workspace, num_matrices, n_tiles, max_m_tiles,
+        variant,
+    )
+
+
+def mxfp4_v3_cta_cols(variant: int, fused: bool) -> int:
+    """Output columns per CTA of a v3 variant (fused S1: one warpgroup tile;
+    grouped: two)."""
+    jw = MXFP4_V3_VARIANTS[variant][0]
+    return 64 * jw if fused else 128 * jw
+
+
+def _check_v3_variant(variant: int, prob_n: int, fused: bool):
+    if variant not in MXFP4_V3_VARIANTS:
+        raise ValueError(
+            f"mxfp4 v3 variant must be one of {sorted(MXFP4_V3_VARIANTS)}, "
+            f"got {variant}")
+    cols = mxfp4_v3_cta_cols(variant, fused)
+    if prob_n % cols != 0:
+        raise ValueError(
+            f"mxfp4 v3 variant {variant}: prob_n={prob_n} not a multiple of "
+            f"{cols}")
+
+
+def _check_v3_order(expert_order, num_experts: int):
+    if expert_order is not None:
+        _check_counts("expert_order", expert_order, num_experts)
+        if not expert_order.is_contiguous():
+            raise ValueError("group metadata contract violated: expert_order "
+                             "must be contiguous")
+
+
+def compute_mxfp4_v3_expert_order(
+    expert_counts: torch.Tensor,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    """Expert indices by descending row count (ties by index) for the v3
+    `expert_order` argument, computed on the device without a host sync.
+
+    Pass a preallocated int32 `out` of the same length when capturing a CUDA
+    graph; the kernel is capturable together with the v3 launches.
+    """
+    _require_mxfp4_kernels()
+    E = expert_counts.numel()
+    _check_counts("expert_counts", expert_counts, E)
+    if out is None:
+        out = torch.empty(E, dtype=torch.int32, device=expert_counts.device)
+    _check_counts("expert_order", out, E)
+    _load_module().marlin_mxfp4_v3_expert_order(expert_counts, out)
+    return out
+
+
+def marlin_grouped_stage1_fused_mxfp4_situ_v3(
+    dispatched_x_3d: torch.Tensor,
+    intermediate_3d: torch.Tensor,
+    expert_counts: torch.Tensor,
+    expert_starts: torch.Tensor,
+    gate_B_ptrs: torch.Tensor,
+    gate_scales_ptrs: torch.Tensor,
+    up_B_ptrs: torch.Tensor,
+    up_scales_ptrs: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    N: int,
+    K: int,
+    workspace: torch.Tensor,
+    max_m_tiles: int,
+    mtp: int,
+    num_experts: int,
+    total_rows: int,
+    *,
+    variant: int = 0,
+    expert_order: torch.Tensor = None,
+) -> None:
+    """Fused S1 v3 (swap-AB wgmma, sm_90a): same contract and checks as
+    marlin_grouped_stage1_fused_mxfp4_situ, plus `variant` (see
+    MXFP4_V3_VARIANTS) and an optional int32 [num_experts] `expert_order`
+    (compute_mxfp4_v3_expert_order; None = expert index order). The order only
+    changes CTA scheduling; outputs are bit-identical with and without it.
+
+    As in v1, the grid is shaped by max_m_tiles, so the L5 bound applies.
+    Precondition beyond v1: every E8M0 scale byte behind the pointer arrays
+    is <= 128 (check_mxfp4_scales_v2_compatible, at weight-build time).
+    """
+    global _warned_mxfp4_v3
+    _require_mxfp4_kernels()
+    _check_activation("dispatched_x_3d", dispatched_x_3d, K)
+    _check_activation("intermediate_3d", intermediate_3d, N)
+    E = int(num_experts)
+    _check_counts("expert_counts", expert_counts, E)
+    _check_counts("expert_starts", expert_starts, E)
+    for name, t in (("gate_B_ptrs", gate_B_ptrs), ("up_B_ptrs", up_B_ptrs),
+                    ("gate_scales_ptrs", gate_scales_ptrs),
+                    ("up_scales_ptrs", up_scales_ptrs), ("C_ptrs", C_ptrs)):
+        _check_ptr_array(name, t, E)
+    _check_m16_shapes(N, K)
+    _check_m_tile_bound(max_m_tiles, mtp, total_rows)
+    _check_v3_variant(variant, N, fused=True)
+    _check_v3_order(expert_order, E)
+
+    if not _warned_mxfp4_v3:
+        logging.info("[Marlin] Using fused Marlin MXFP4 S1 v3 (gate+up+SiTU, "
+                     "wgmma), variant %d", variant)
+        _warned_mxfp4_v3 = True
+
+    mod = _load_module()
+    n_tiles = N // 256
+    mod.grouped_marlin_gemm_m16_s1_mxfp4_situ_v3(
+        dispatched_x_3d,
+        gate_B_ptrs, up_B_ptrs, C_ptrs,
+        gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts,
+        E, N, K, workspace, n_tiles, max_m_tiles, variant, expert_order,
+    )
+
+
+def marlin_grouped_m16_mxfp4_v3(
+    A: torch.Tensor,
+    B_ptrs: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    scales_ptrs: torch.Tensor,
+    expert_starts: torch.Tensor,
+    expert_counts: torch.Tensor,
+    num_experts: int,
+    prob_n: int,
+    prob_k: int,
+    workspace: torch.Tensor,
+    num_matrices: int,
+    n_tiles: int,
+    max_m_tiles: int,
+    *,
+    variant: int = 0,
+    expert_order: torch.Tensor = None,
+) -> None:
+    """MXFP4 grouped GEMM v3 (S3 down projection / standalone, swap-AB
+    wgmma, sm_90a): same contract and checks as marlin_grouped_m16_mxfp4,
+    plus `variant` and an optional `expert_order` (requires num_matrices ==
+    num_experts). Rows per expert are bounded by max_m_tiles as in v1. Scale
+    bytes must be <= 128 (check_mxfp4_scales_v2_compatible)."""
+    _require_mxfp4_kernels()
+    _check_activation("A", A, prob_k)
+    E = int(num_experts)
+    _check_counts("expert_counts", expert_counts, E)
+    _check_counts("expert_starts", expert_starts, E)
+    _check_ptr_array("B_ptrs", B_ptrs, num_matrices)
+    _check_ptr_array("C_ptrs", C_ptrs, num_matrices)
+    _check_ptr_array("scales_ptrs", scales_ptrs, num_matrices)
+    _check_m16_shapes(prob_n, prob_k)
+    if n_tiles != prob_n // 256:
+        raise ValueError(f"n_tiles={n_tiles} != prob_n//256={prob_n // 256}")
+    _check_v3_variant(variant, prob_n, fused=False)
+    _check_v3_order(expert_order, E)
+    if expert_order is not None and num_matrices != E:
+        raise ValueError(
+            f"expert_order needs num_matrices == num_experts, got "
+            f"{num_matrices} vs {E}")
+
+    mod = _load_module()
+    mod.grouped_marlin_gemm_m16_mxfp4_v3(
+        A, B_ptrs, C_ptrs, scales_ptrs,
+        expert_starts, expert_counts,
+        E, prob_n, prob_k, workspace, num_matrices, n_tiles, max_m_tiles,
+        variant, expert_order,
+    )
+
+
+def select_mxfp4_kernel_version(version: int):
+    """(fused S1 wrapper, grouped S3 wrapper) of MXFP4 kernel version 1, 2
+    or 3. The pairs share the positional arguments of the v1 wrappers; v2 and
+    v3 add keyword-only arguments."""
+    pairs = {
+        1: (marlin_grouped_stage1_fused_mxfp4_situ, marlin_grouped_m16_mxfp4),
+        2: (marlin_grouped_stage1_fused_mxfp4_situ_v2, marlin_grouped_m16_mxfp4_v2),
+        3: (marlin_grouped_stage1_fused_mxfp4_situ_v3, marlin_grouped_m16_mxfp4_v3),
+    }
+    if version not in pairs:
+        raise ValueError(
+            f"mxfp4 kernel version must be one of {sorted(pairs)}, got {version}")
+    return pairs[version]
 
 
 def single_expert_marlin_mxfp4_decode(
