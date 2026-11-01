@@ -938,6 +938,23 @@ def _kda_prefill_conv(x, weight, bias, conv_pool, cu_seqlens, slot_ids,
     )
 
 
+def _kda_kernel_kwargs(self):
+    """The ``chunk_kda`` keyword arguments of one KDA layer.
+
+    Shared by the serving path and the startup Triton prewarm
+    (``triton_prewarm.py``): fla's constexpr flags and heuristics are part of
+    every compiled kernel's key, so the prewarm must pass exactly these.
+    """
+    return dict(
+        A_log=self.A_log, dt_bias=self.dt_bias,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        lower_bound=self.gate_lower_bound,
+        output_final_state=True,
+    )
+
+
 def _kda_prefill_levels(self, chunk_kda_fn, kda_state, pool_levels, q, k, v, f,
                         beta, conv_weights, kernel_kwargs, segment_tokens):
     """Run one KDA layer over a prefill-prefix-pool chunk, level by level.
@@ -993,7 +1010,7 @@ def _kda_prefill_levels(self, chunk_kda_fn, kda_state, pool_levels, q, k, v, f,
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
                         has_initial_state, kda_state,
                         segment_tokens=KDA_PREFILL_SEGMENT_TOKENS,
-                        pool_levels=None):
+                        pool_levels=None, *, reduce_output=True):
     """KDA prefill for PREPACKED (varlen) sequences.
 
     Args:
@@ -1007,6 +1024,10 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         pool_levels: the chunk's levels while a prefill prefix pool wave is
             running (``prefix_reuse/levels.state_levels``); None is the plain
             packed prefill, where no row continues a pooled segment.
+        reduce_output: False returns this rank's row-parallel ``o_proj``
+            partial without the attention-TP collective. Only the startup
+            Triton prewarm passes it, because its rank-partitioned phase must
+            not enter a collective the other ranks are not running.
 
     Returns:
         (total_tokens, hidden) attention output.
@@ -1057,14 +1078,7 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     kw, kb = _conv_weights(self.k_conv1d, k.dtype)
     vw, vb = _conv_weights(self.v_conv1d, v.dtype)
-    kernel_kwargs = dict(
-        A_log=self.A_log, dt_bias=self.dt_bias,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        lower_bound=self.gate_lower_bound,
-        output_final_state=True,
-    )
+    kernel_kwargs = _kda_kernel_kwargs(self)
     if pool_levels is not None:
         # The convs and the chunk sweep interleave per level, so they share one
         # span instead of reporting a conv phase this path does not have.
@@ -1112,17 +1126,22 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         hidden_states_2d,
     )
     _end_streamed_sp8_profile(profiler, "kda_output", span)
+    if not reduce_output:
+        return o
     # M2a head-parallel KDA: sum the row-parallel o_proj shards. Streamed-SP8
     # retains only this rank's token rows; every other phase all-reduces.
     return _reduce_mla_tp_output(self, o)
 
 
-def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
+def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None,
+                       reduce_output=True):
     """KDA single-token decode over pooled state.
 
     Args:
         hidden_states: (bsz, 1, hidden)
         kda_state: layer state (cur_decode_slots must be set by the wrapper).
+        reduce_output: False skips the attention-TP collective; see
+            ``kda_prefill_serving``. Only the startup Triton prewarm passes it.
 
     Returns:
         (bsz, 1, hidden) attention output.
@@ -1143,7 +1162,8 @@ def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
     )
     if fused_output is not None:
         o = self.o_proj(fused_output)
-        o = _reduce_mla_tp_output(self, o)
+        if reduce_output:
+            o = _reduce_mla_tp_output(self, o)
         return o.unsqueeze(1)
 
     # Established correctness fallback for Kimi-Linear-48B, old wheels, and
@@ -1196,7 +1216,8 @@ def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
 
     o = self.o_norm(o.reshape(bsz, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(bsz, num_heads * head_dim))
-    o = _reduce_mla_tp_output(self, o)
+    if reduce_output:
+        o = _reduce_mla_tp_output(self, o)
     return o.unsqueeze(1)
 
 
