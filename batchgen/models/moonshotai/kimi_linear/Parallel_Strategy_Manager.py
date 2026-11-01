@@ -1095,7 +1095,66 @@ class KimiLinearParallelStrategyManager:
         if self.model is None:
             self._build_model()
         self._enter_prefill()
+        if self._is_k3:
+            self._prewarm_triton_kernels()
         return self._publish_prefill_instance()
+
+    def _prewarm_triton_kernels(self):
+        """Compile K3's reachable Triton keys before the first request.
+
+        Startup reaches this from ``prepare_kimi_k3_startup`` on every rank,
+        before readiness. It runs after ``_enter_prefill`` because the prefill
+        mode sets the KDA segment cap, which is part of the planned shapes.
+        Once per process (``triton_prewarm.prewarm_k3_triton_kernels``); later
+        phase switches return at once. The node-local attention-TP ranks share
+        one Triton cache directory, so they split the compiles and meet at a
+        barrier on that group before every rank loads the full set.
+        """
+        if not torch.cuda.is_available():
+            return
+        from .triton_prewarm import prewarm_k3_triton_kernels
+
+        basic = self.engine_config.Basic_Config
+        buckets = list(getattr(basic, "decode_graph_buckets", None) or [])
+        if not buckets:
+            from .cuda_graph_segments import DEFAULT_DECODE_GRAPH_BUCKETS
+
+            buckets = list(DEFAULT_DECODE_GRAPH_BUCKETS)
+        part_index, part_count, barrier = 0, 1, None
+        group = self._attn_tp_group
+        if self._attn_tp_size > 1 and group is not None:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                part_index, part_count = self._attn_tp_rank, self._attn_tp_size
+                device = torch.device(basic.device_torch)
+                device_ids = (
+                    [device.index] if device.index is not None else None
+                )
+
+                def _group_barrier():
+                    dist.barrier(group=group, device_ids=device_ids)
+
+                barrier = _group_barrier
+
+        start = time.perf_counter()
+        if prewarm_k3_triton_kernels(
+            self.model,
+            self.loaded_model_config,
+            decode_buckets=buckets,
+            max_prefill_tokens=int(getattr(
+                self.engine_config.Module_Batching_Config,
+                "prefill_micro_batch_token_cap", 0) or 0),
+            part_index=part_index,
+            part_count=part_count,
+            barrier=barrier,
+            rank=self.global_rank,
+        ):
+            logging.info(
+                "[K3_TRITON_WARMUP] rank=%s total wall=%.1fs",
+                self.global_rank,
+                time.perf_counter() - start,
+            )
 
     def _enter_prefill(self):
         """Switch the built model to streamed, streamed-SP8 or resident-EP prefill.
@@ -1780,22 +1839,8 @@ class KimiLinearParallelStrategyManager:
 
         self.model.eval()
         self.model.to(device)
-        if self._is_k3 and torch.cuda.is_available():
-            # The service wall starts at request admission, so neither Triton
-            # compilation may be a first-request lazy cost.  Compile both
-            # kernels before startup completes; the tiny score fold is a
-            # deliberate per-forward read of the final Parameter contents.
-            from .attn_residual_triton import warmup_attn_residual_triton
-
-            warmup_start = time.perf_counter()
-            num_score_vectors = warmup_attn_residual_triton(self.model.model)
-            if self.rank == 0:
-                logging.info(
-                    "K3 attention-residual Triton mixer prewarmed: %s depth "
-                    "mix sites in %.1fs",
-                    num_score_vectors,
-                    time.perf_counter() - warmup_start,
-                )
+        # K3's Triton kernels (attention-residual mixer included) are
+        # prewarmed by configure_prefill, before readiness.
         if self.rank == 0:
             logging.info(
                 f"Kimi-Linear model configured in {time.perf_counter() - start:.1f}s "

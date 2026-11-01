@@ -13,6 +13,7 @@ submission and the client API, see the [Batch API Guide](batch-api-guide.md).
 4. [Start the Server (2 × 8 H200)](#4-start-the-server-2--8-h200)
 5. [Submit Jobs](#5-submit-jobs)
 6. [Optional: DeepEP and Distributed Weights](#6-optional-deepep-and-distributed-weights)
+7. [Startup Triton Prewarm](#7-startup-triton-prewarm)
 
 ---
 
@@ -280,3 +281,35 @@ commands in §4 reach the replicated parameter server only because they pass `--
   > ```
   >
   > Without `--fast-init` any tmpfs is accepted.
+
+## 7. Startup Triton Prewarm
+
+K3's KDA, norm, activation and attention-residual kernels are Triton kernels, and Triton compiles
+one binary per specialisation (constexprs, dtypes, and whether an integer argument equals 1 or is
+divisible by 16). Before the server reports ready, every worker runs these kernels over a table of
+shape classes (`KDA_PREFILL_SHAPES` in `kimi_linear/triton_prewarm.py`) through the serving code
+itself, so the first requests load compiled kernels instead of compiling them. The eight ranks of
+a node share one Triton cache directory: each compiles its share, they meet at a barrier, and every
+rank then loads the full set. A cold cache makes startup slower; a warm cache only loads.
+
+Each rank logs its two phases and, at the end, arms a late-compile guard:
+
+```text
+[K3_TRITON_WARMUP] rank=R phase1 compiled=N loaded=M entries=E failed=F wall=Xs
+[K3_TRITON_WARMUP] rank=R phase2 compiled=N loaded=M entries=E failed=F wall=Xs
+[K3_TRITON_WARMUP] rank=R late-compile guard armed: ...
+```
+
+Any Triton compilation after that is logged at WARNING with the kernel and its full key:
+
+```text
+[K3_TRITON_WARMUP] late compile kernel=<module.kernel> source=compile|load wall=Xs
+    options=... constexprs={...} signature={...} attrs={...}
+```
+
+A late-compile line means the shape table missed a class; add an entry for it. `source=load`
+means the key came from the on-disk cache (fast) but was still missed by the prewarm. To make a
+late compile raise instead (for acceptance runs only, never in production), submit the batch with
+`"batchgen_debug": {"k3_triton_strict": true}`. The error is raised inside the model forward, so
+it stops the worker pool, not only that batch, and it applies to every sequence decoded in the
+same step. Per-kernel variant counts are logged at DEBUG.
