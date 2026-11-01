@@ -307,6 +307,9 @@ Any Triton compilation after that is logged at WARNING with the kernel and its f
     options=... constexprs={...} signature={...} attrs={...}
 ```
 
-A late-compile line means the shape table missed a class; add an entry for it. To make a late
-compile fail the batch instead (for acceptance runs only, never in production), submit the batch
-with `"batchgen_debug": {"k3_triton_strict": true}`. Per-kernel variant counts are logged at DEBUG.
+A late-compile line means the shape table missed a class; add an entry for it. `source=load`
+means the key came from the on-disk cache (fast) but was still missed by the prewarm. To make a
+late compile raise instead (for acceptance runs only, never in production), submit the batch with
+`"batchgen_debug": {"k3_triton_strict": true}`. The error is raised inside the model forward, so
+it stops the worker pool, not only that batch, and it applies to every sequence decoded in the
+same step. Per-kernel variant counts are logged at DEBUG.

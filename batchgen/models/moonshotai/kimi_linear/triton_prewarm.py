@@ -259,8 +259,11 @@ class LateCompileGuard:
 
     Armed, each compilation is logged at WARNING, and raises instead when the
     current batch sets ``batchgen_debug.k3_triton_strict`` or the guard was
-    armed strict. Strict is never the default: an unforeseen key would turn a
-    slow request into a failed one.
+    armed strict. The raise happens inside the model forward, which has no
+    per-batch exception boundary, so it takes down the worker pool, and the
+    flags of every sequence in the step are merged, so a co-scheduled batch's
+    shape can trigger it. Strict is therefore for acceptance runs only, never
+    the default.
     """
 
     def __init__(self, debug_source: Optional[Callable[[], dict]] = None):
