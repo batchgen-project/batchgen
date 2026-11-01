@@ -164,7 +164,9 @@ int create_listener(const std::string& ip, int port) {
         fail("bind " + ip + ":" + std::to_string(port) + ": " +
              error);
     }
-    if (listen(fd, 1) != 0) {
+    // A pooled owner rail is dialled by every peer at once; a backlog of
+    // one would drop the third concurrent SYN until the client retries.
+    if (listen(fd, SOMAXCONN) != 0) {
         const std::string error = strerror(errno);
         close(fd);
         fail("listen: " + error);
@@ -1190,6 +1192,9 @@ struct DistributedWeightDaemon::Impl {
                                 fail("owner accept failed: " +
                                      std::string(strerror(errno)));
                             }
+                            // Owned from here on, so Stop closes it even
+                            // when the exchange below throws.
+                            incoming_controls[rail].push_back(fd);
                             std::uint64_t client_address_bytes = 0;
                             recv_exact(fd, &client_address_bytes,
                                        sizeof(client_address_bytes));
@@ -1200,7 +1205,6 @@ struct DistributedWeightDaemon::Impl {
                             ucp_ep_h endpoint = create_endpoint(
                                 rails[rail].worker, client_address.data());
                             incoming_endpoints[rail].push_back(endpoint);
-                            incoming_controls[rail].push_back(fd);
 
                             void* packed_rkey = nullptr;
                             size_t packed_rkey_bytes = 0;
