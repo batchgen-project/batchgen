@@ -586,6 +586,24 @@ struct DistributedWeightDaemon::Impl {
             }
             pooled_owner_rails = map.get<std::string>() == "pooled";
         }
+        if (config.contains("worker_numa_nodes")) {
+            const nlohmann::json& nodes = config.at("worker_numa_nodes");
+            if (!nodes.is_array()) {
+                fail("distributed weight worker_numa_nodes must be an array "
+                     "with one NUMA node per worker");
+            }
+            worker_numa_nodes.clear();
+            for (const nlohmann::json& entry : nodes) {
+                if (!entry.is_number_integer() ||
+                    entry.get<std::int64_t>() < 0 ||
+                    entry.get<std::int64_t>() > 63) {
+                    fail("distributed weight worker_numa_nodes entries must "
+                         "be NUMA node ids in 0..63");
+                }
+                worker_numa_nodes.push_back(
+                    static_cast<int>(entry.get<std::int64_t>()));
+            }
+        }
         if (config.contains("rma_lanes")) {
             const nlohmann::json& lanes = config.at("rma_lanes");
             if (!lanes.is_number_integer() ||
@@ -651,6 +669,9 @@ struct DistributedWeightDaemon::Impl {
                  std::to_string(depth) + " must exceed workers (" +
                  std::to_string(workers) + ") * kMaxLeasesWhileAcquiring (" +
                  std::to_string(kMaxLeasesWhileAcquiring) + ")");
+        }
+        if (!worker_numa_nodes.empty()) {
+            BuildSlotNumaLayout();
         }
         // In-flight load moves in whole superchunks, so a bias below one
         // superchunk could only flip exact ties. Demand whole superchunks,
@@ -730,6 +751,14 @@ struct DistributedWeightDaemon::Impl {
     // the switch can deliver them on different ports. With one lane a
     // (puller, owner, rail) flow is pinned to a single port.
     int rma_lanes = 2;
+    // `worker_numa_nodes`: the NUMA node of each worker's GPU. Absent (the
+    // default) first-touches the staging ring interleaved over all nodes.
+    // Present, every superchunk group of the ring is bound to the node of the
+    // worker that consumes it, so the NIC write into staging and the GPU's
+    // HtoD read from it stay on that socket. `slot_numa` holds the node of
+    // every slot; it is filled once at config time and never changes.
+    std::vector<int> worker_numa_nodes;
+    std::vector<int> slot_numa;
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -986,11 +1015,116 @@ struct DistributedWeightDaemon::Impl {
         if (numa_available() < 0) {
             fail("NUMA is unavailable for distributed staging");
         }
-        struct bitmask* previous = numa_get_interleave_mask();
-        numa_set_interleave_mask(numa_all_nodes_ptr);
+        if (slot_numa.empty()) {
+            struct bitmask* previous = numa_get_interleave_mask();
+            numa_set_interleave_mask(numa_all_nodes_ptr);
+            std::memset(staging, 0, staging_bytes);
+            numa_set_interleave_mask(previous);
+            numa_free_nodemask(previous);
+            return;
+        }
+        // Bind each run of slots that share a consumer node before the first
+        // touch, so the memset below allocates every page on that node. The
+        // policy is the memfd's shared policy, so the workers' own mappings
+        // of the same fd see the same pages.
+        auto* base = static_cast<unsigned char*>(staging);
+        std::vector<std::pair<int, int>> runs;
+        for (int start = 0; start < depth;) {
+            int end = start + 1;
+            while (end < depth && slot_numa[end] == slot_numa[start]) {
+                ++end;
+            }
+            unsigned long mask = 1UL << slot_numa[start];
+            if (syscall(SYS_mbind, base + start * module_bytes,
+                        static_cast<unsigned long>(end - start) *
+                            module_bytes,
+                        // maxnode counts one past the last usable bit.
+                        MPOL_BIND, &mask, sizeof(mask) * 8 + 1, 0) != 0) {
+                fail("staging mbind to NUMA node " +
+                     std::to_string(slot_numa[start]) + " failed: " +
+                     strerror(errno));
+            }
+            runs.emplace_back(start, end);
+            start = end;
+        }
         std::memset(staging, 0, staging_bytes);
-        numa_set_interleave_mask(previous);
-        numa_free_nodemask(previous);
+        // A run boundary need not fall on a huge-page boundary, and a huge
+        // page is placed whole, so up to one huge page at each boundary may
+        // sit on the neighbouring run's node. Verify every run on its interior
+        // only, every 1 MiB, clear of that page.
+        constexpr std::uint64_t kHugePage = 2ULL << 20;
+        constexpr std::uint64_t kStride = 1ULL << 20;
+        for (const auto& [start, end] : runs) {
+            const std::uint64_t first =
+                static_cast<std::uint64_t>(start) * module_bytes + kHugePage;
+            const std::uint64_t last =
+                static_cast<std::uint64_t>(end) * module_bytes - kHugePage;
+            for (std::uint64_t offset = first; offset < last;
+                 offset += kStride) {
+                int node = -1;
+                if (get_mempolicy(&node, nullptr, 0, base + offset,
+                                  MPOL_F_NODE | MPOL_F_ADDR) != 0 ||
+                    node != slot_numa[start]) {
+                    fail("staging byte " + std::to_string(offset) +
+                         " landed on NUMA node " + std::to_string(node) +
+                         ", expected " + std::to_string(slot_numa[start]));
+                }
+            }
+        }
+    }
+
+    // The schedule posts one superchunk per remote worker in ascending worker
+    // order, and the posting cursor and the ring tail advance together and
+    // rewind together, so ring group g always receives a chunk for remote
+    // worker g % R. That fixes the consumer of every slot, provided the ring
+    // holds whole rounds of remote workers and the schedule wraps exactly
+    // when the ring does; both are checked here, and PrefetchLoop re-checks
+    // the consumer of every posted chunk.
+    void BuildSlotNumaLayout() {
+        if (static_cast<int>(worker_numa_nodes.size()) != workers) {
+            fail("distributed weight worker_numa_nodes must name one NUMA "
+                 "node for each of the " + std::to_string(workers) +
+                 " workers");
+        }
+        const int experts_per_worker = kExperts / workers;
+        std::vector<int> remote_workers;
+        for (int worker = 0; worker < workers; ++worker) {
+            if ((worker * experts_per_worker) / experts_per_owner !=
+                node_rank) {
+                remote_workers.push_back(worker);
+            }
+        }
+        const int groups = depth / superchunk;
+        const int rounds = static_cast<int>(remote_workers.size());
+        bool one_node = true;
+        for (const int worker : remote_workers) {
+            one_node = one_node && worker_numa_nodes[worker] ==
+                                       worker_numa_nodes[remote_workers[0]];
+        }
+        slot_numa.assign(depth, worker_numa_nodes[remote_workers[0]]);
+        if (one_node) {
+            // Every consumer shares one node, so no position rule is needed.
+            return;
+        }
+        if (groups % rounds != 0) {
+            fail("staging NUMA layout needs the ring's " +
+                 std::to_string(groups) + " superchunk groups to be a "
+                 "multiple of the " + std::to_string(rounds) +
+                 " remote workers");
+        }
+        const std::int64_t schedule_groups =
+            static_cast<std::int64_t>(kLayers) *
+            (experts_per_worker / superchunk) * rounds;
+        if (schedule_groups % groups != 0) {
+            fail("staging NUMA layout needs the schedule's " +
+                 std::to_string(schedule_groups) + " superchunks to be a "
+                 "multiple of the ring's " + std::to_string(groups) +
+                 " groups");
+        }
+        for (int slot = 0; slot < depth; ++slot) {
+            slot_numa[slot] = worker_numa_nodes[remote_workers[
+                (slot / superchunk) % rounds]];
+        }
     }
 
     UcpRail CreateRail(int rail_index) {
@@ -1988,6 +2122,8 @@ struct DistributedWeightDaemon::Impl {
         out << "# node_rank=" << node_rank << " depth=" << depth
             << " superchunk=" << superchunk
             << " outstanding=" << outstanding
+            << " staging_numa="
+            << (slot_numa.empty() ? "interleave" : "by_consumer")
             << " module_bytes=" << module_bytes
             << " records=" << (written - start)
             << " dropped_by_wrap=" << start
@@ -2360,6 +2496,18 @@ struct DistributedWeightDaemon::Impl {
                 chunk.layer = layer;
                 chunk.first_expert = first_expert;
                 chunk.target_worker = OwningWorker(schedule[next]);
+                if (!slot_numa.empty() &&
+                    slot_numa[tail] !=
+                        worker_numa_nodes[chunk.target_worker]) {
+                    fail("staging slot " + std::to_string(tail) +
+                         " is bound to NUMA node " +
+                         std::to_string(slot_numa[tail]) +
+                         " but its consumer, worker " +
+                         std::to_string(chunk.target_worker) +
+                         ", is on node " +
+                         std::to_string(
+                             worker_numa_nodes[chunk.target_worker]));
+                }
                 chunk.posted = Clock::now();
 
                 {
@@ -2544,6 +2692,8 @@ struct DistributedWeightDaemon::Impl {
         summary["owner_rail_map"] =
             pooled_owner_rails ? "pooled" : "partitioned";
         summary["rma_lanes"] = rma_lanes;
+        summary["staging_numa"] =
+            slot_numa.empty() ? "interleave" : "by_consumer";
         summary["progress_gap_counters"] = progress_gap_counters;
         if (progress_gap_counters) {
             // One entry per rail. The counters are monotonic over the
