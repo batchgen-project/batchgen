@@ -21,6 +21,9 @@ How to run (<gpu-host>):
     # v2 kernels only (optionally a subset of variants):
     CUDA_VISIBLE_DEVICES=1 python tests/moe/gpu_parity_mxfp4_marlin.py --v2 \
         --v2-variants 0,2
+    # v3 kernels only (optionally a subset of variants):
+    CUDA_VISIBLE_DEVICES=1 python tests/moe/gpu_parity_mxfp4_marlin.py --v3 \
+        --v3-variants 0
 
 Ladder (tolerance gate per KERNEL_WORKUNIT.md: tol = 1e-5 + 1.6e-2*|ref|,
 PASS iff finite AND fail_frac < 1e-4, plus max relative error < 1.6e-2 on the
@@ -87,6 +90,27 @@ each variant 0..3 = (TM, TN) (1,16) (2,16) (2,8) (1,8):
                 must be rejected by check_mxfp4_scales_v2_compatible (byte
                 128 accepted); an out-of-range variant must raise at the
                 wrapper and the raw-pybind seam.
+
+Version 3 ladder (grouped_marlin_gemm_m16{,_s1}_mxfp4{,_situ}_v3, swap-AB
+wgmma, sm_90a), run for each variant 0..2 = (JW, NCAP) (2,64) (2,48) (4,32):
+
+  T1v3 DECODE   one-hot bit-exact at 64 and 72 rows (one and two row chunks
+                for NCAP=64) on 512x512, uniform and half-heavy codes. Pins
+                the A-fragment layout, the swizzled B descriptor and the
+                epilogue mapping at once.
+  T2v3 M16      oracle gate at M in {1,4,8,9,16,17,24,32,33,40,64,65} (every
+                N width 8/16/32/48/64 and chunk boundary), both K3 shapes, two
+                experts with nonzero expert_starts, tight AND production-like
+                max_m_tiles grids (bit-identical), NaN canaries, v1 agreement.
+  T3v3 S1+SiTU  same as T2v3 for the fused S1 entry on the stacked w13 layout.
+  T4v3 GROUPED  E=28 skewed counts incl. 0, 1, 8, 9, 64, 65 and 70 rows, fused
+                S1 and S3, with and without expert_order (bit-identical), NaN
+                canaries, all-empty launch writes nothing.
+  T5v3 MUTATIONS gate/up swap and rolled scale groups must FAIL the gate
+                (control must PASS); variant 3 must raise at the wrapper and
+                the raw-pybind seam.
+  T6v3 GRAPH    expert order + S1 + S3 captured in one CUDA graph, replayed
+                twice; both replays bit-identical to the eager launches.
 """
 
 import argparse
@@ -916,6 +940,357 @@ def t5v2_mutations(variants):
            f"catch count {caught}/{arms}")
 
 
+# ---------------------------------------------------------------------------
+# Version 3 ladder
+# ---------------------------------------------------------------------------
+
+V3_VARIANTS = sorted(mgm.MXFP4_V3_VARIANTS)
+V3_M_SWEEP = [1, 4, 8, 9, 16, 17, 24, 32, 33, 40, 64, 65]
+V3_SMEM_LIMIT = 113 * 1024   # two CTAs per SM
+
+
+def print_v3_launch_configs(variants):
+    mod = mgm._load_module()
+    for v in variants:
+        jw, ncap = mgm.MXFP4_V3_VARIANTS[v]
+        s1 = mod.marlin_mxfp4_v3_launch_config(v, True)
+        gr = mod.marlin_mxfp4_v3_launch_config(v, False)
+        print(f"    v3 variant {v} (JW={jw}, NCAP={ncap}): S1 stages={s1[0]} "
+              f"smem={s1[1]} B cols={s1[2]}; grouped stages={gr[0]} "
+              f"smem={gr[1]} B cols={gr[2]}")
+
+
+def t1v3_decode_bitexact(variants):
+    K, N = 512, 512
+    mod = mgm._load_module()
+    ok = True
+    for tag, heavy, lo, hi in (("uniform", False, 100, mgm.MXFP4_V2_MAX_SCALE_BYTE),
+                               ("half-heavy", True, SCALE_LO, SCALE_HI)):
+        p, s = rand_expert(K, N, seed=131, half_heavy=heavy,
+                           scale_lo=lo, scale_hi=hi)
+        qw, ms = marlinize(p, s, K, N)
+        mgm.check_mxfp4_scales_v2_compatible(ms)
+        w_ref = dense_expert_bf16(p, s)
+        starts = torch.zeros(1, dtype=torch.int32, device=DEV)
+        ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
+        for rows in (64, 72):
+            g = torch.Generator().manual_seed(1310 + rows)
+            k_idx = torch.randperm(K, generator=g)[:rows]
+            A = torch.zeros(rows, K, dtype=torch.bfloat16, device=DEV)
+            A[torch.arange(rows), k_idx] = 1.0
+            ref_bits = _canonical_bits(w_ref[:, k_idx].t().contiguous())
+            counts = torch.tensor([rows], dtype=torch.int32, device=DEV)
+            for v in variants:
+                C = torch.full((rows, N), NAN, dtype=torch.bfloat16, device=DEV)
+                mod.grouped_marlin_gemm_m16_mxfp4_v3(
+                    A, _ptrs([qw]), _ptrs([C]), _ptrs([ms]), starts, counts,
+                    1, N, K, ws, 1, N // 256, (rows + 15) // 16, v, None)
+                torch.cuda.synchronize()
+                exact = torch.equal(_canonical_bits(C), ref_bits)
+                ok = ok and exact
+                print(f"    T1v3[{tag}] v{v} rows={rows}: bit-exact={exact}")
+    report("T1v3 in-kernel E2M1 decode bit-exact, swap-AB wgmma", ok)
+
+
+def t2v3_m16_parity(variants):
+    ok = True
+    E = 2
+    for shape_tag, (K, N) in (("w13-branch", (K3_K, K3_N)), ("w2", (K3_N, K3_K))):
+        raw = [rand_expert(K, N, seed=232 + 7 * e) for e in range(E)]
+        mar = [marlinize(p, s, K, N) for p, s in raw]
+        for _, ms in mar:
+            mgm.check_mxfp4_scales_v2_compatible(ms)
+        w_ref = [dense_expert_bf16(p, s) for p, s in raw]
+        B, S = _ptrs([q for q, _ in mar]), _ptrs([s for _, s in mar])
+        starts = (torch.arange(E, dtype=torch.int32) * V2_MTP).to(DEV)
+        C = torch.empty(E * V2_MTP, N, dtype=torch.bfloat16, device=DEV)
+        Cp = _row_ptrs(C, E, V2_MTP)
+        ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
+        for M in V3_M_SWEEP:
+            torch.manual_seed(2300 + M)
+            A = torch.randn(E * V2_MTP, K, dtype=torch.bfloat16, device=DEV)
+            counts_host = [M] * E
+            counts = torch.tensor(counts_host, dtype=torch.int32, device=DEV)
+            refs = [A[e * V2_MTP:e * V2_MTP + M].float() @ w_ref[e].float().t()
+                    for e in range(E)]
+            tight = (M + 15) // 16
+            C.fill_(NAN)
+            mgm.marlin_grouped_m16_mxfp4(
+                A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256, tight)
+            torch.cuda.synchronize()
+            v1_rows = _expert_rows(C, counts_host, V2_MTP).clone()
+            for v in variants:
+                outs, canary = [], True
+                for grid in (tight, V2_BIG_MAX_M_TILES):
+                    C.fill_(NAN)
+                    mgm.marlin_grouped_m16_mxfp4_v3(
+                        A, B, Cp, S, starts, counts, E, N, K, ws, E, N // 256,
+                        grid, variant=v)
+                    torch.cuda.synchronize()
+                    canary = _canary_ok(C, counts_host, V2_MTP) and canary
+                    outs.append(C.clone())
+                tag = f"T2v3[{shape_tag}] v{v} M={M}"
+                ok = _v2_case_line(
+                    tag,
+                    _gate_rows(outs[0], refs, counts_host, V2_MTP, tag, verbose=False),
+                    canary,
+                    torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)),
+                    _agree(v1_rows, _expert_rows(outs[0], counts_host, V2_MTP))) and ok
+    report("T2v3 M16 MXFP4 v3 parity (K3 shapes, M sweep, both grids, v1 agreement)", ok)
+
+
+def t3v3_s1_situ_parity(variants):
+    K, N = K3_K, K3_N
+    E = 2
+    weights, gB, gS, uB, uS = _w13_experts(E, K, N, seed0=3500)
+    starts = (torch.arange(E, dtype=torch.int32) * V2_MTP).to(DEV)
+    inter = torch.empty(E * V2_MTP, N, dtype=torch.bfloat16, device=DEV)
+    Cp = _row_ptrs(inter, E, V2_MTP)
+    ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
+    ok = True
+    for M in V3_M_SWEEP:
+        torch.manual_seed(3700 + M)
+        A = torch.randn(E * V2_MTP, K, dtype=torch.bfloat16, device=DEV)
+        counts_host = [M] * E
+        counts = torch.tensor(counts_host, dtype=torch.int32, device=DEV)
+        refs = [_s1_ref(A[e * V2_MTP:e * V2_MTP + M], weights[e][2], weights[e][3])
+                for e in range(E)]
+        tight = (M + 15) // 16
+        common = dict(N=N, K=K, workspace=ws, mtp=M, num_experts=E,
+                      total_rows=E * M)
+        inter.fill_(NAN)
+        mgm.marlin_grouped_stage1_fused_mxfp4_situ(
+            A, inter, counts, starts, gB, gS, uB, uS, Cp,
+            max_m_tiles=tight, **common)
+        torch.cuda.synchronize()
+        v1_rows = _expert_rows(inter, counts_host, V2_MTP).clone()
+        for v in variants:
+            outs, canary = [], True
+            for grid in (tight, V2_BIG_MAX_M_TILES):
+                inter.fill_(NAN)
+                mgm.marlin_grouped_stage1_fused_mxfp4_situ_v3(
+                    A, inter, counts, starts, gB, gS, uB, uS, Cp,
+                    max_m_tiles=grid, variant=v, **common)
+                torch.cuda.synchronize()
+                canary = _canary_ok(inter, counts_host, V2_MTP) and canary
+                outs.append(inter.clone())
+            tag = f"T3v3 v{v} M={M}"
+            ok = _v2_case_line(
+                tag,
+                _gate_rows(outs[0], refs, counts_host, V2_MTP, tag, verbose=False),
+                canary,
+                torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)),
+                _agree(v1_rows, _expert_rows(outs[0], counts_host, V2_MTP))) and ok
+    report("T3v3 fused S1 SiTU v3 parity (M sweep, both grids, v1 agreement)", ok)
+
+
+def _v3_skewed_problem(E, seed):
+    """Skewed grouped problem shared by T4v3 and T6v3: fused-S1 w13 experts,
+    S3 down experts, inputs, outputs, row pointers and per-expert references."""
+    K, N, mtp = K3_K, K3_N, V2_MTP
+    g = torch.Generator().manual_seed(seed)
+    fixed = [0, 1, 8, 9, 16, 17, 33, 40, 64, 65, 70][:E]
+    rest = torch.randint(0, mtp + 1, (max(E - len(fixed), 0),), generator=g)
+    rest[::4] = 0
+    counts_all = fixed + [int(c) for c in rest]
+    counts_host = [counts_all[i] for i in torch.randperm(E, generator=g).tolist()]
+
+    weights, gB, gS, uB, uS = _w13_experts(E, K, N, seed0=seed + 100)
+    down = []
+    for e in range(E):
+        p, s = rand_expert(N, K, seed=seed + 300 + e)
+        q, sc = marlinize(p, s, N, K)
+        mgm.check_mxfp4_scales_v2_compatible(sc)
+        down.append((q, sc, dense_expert_bf16(p, s)))
+    torch.manual_seed(seed + 7)
+    A = torch.randn(E * mtp, K, dtype=torch.bfloat16, device=DEV)
+    H = torch.randn(E * mtp, N, dtype=torch.bfloat16, device=DEV)
+    inter = torch.empty(E * mtp, N, dtype=torch.bfloat16, device=DEV)
+    out = torch.empty(E * mtp, K, dtype=torch.bfloat16, device=DEV)
+    rows = lambda x, e: x[e * mtp:e * mtp + counts_host[e]]
+    return dict(
+        K=K, N=N, mtp=mtp, E=E, counts_host=counts_host,
+        counts=torch.tensor(counts_host, dtype=torch.int32, device=DEV),
+        starts=(torch.arange(E, dtype=torch.int32) * mtp).to(DEV),
+        gB=gB, gS=gS, uB=uB, uS=uS,
+        dB=_ptrs([d[0] for d in down]), dS=_ptrs([d[1] for d in down]),
+        A=A, H=H, inter=inter, out=out,
+        Ip=_row_ptrs(inter, E, mtp), Op=_row_ptrs(out, E, mtp),
+        ws1=torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV),
+        ws3=torch.zeros(K // 256 + 17, dtype=torch.int32, device=DEV),
+        mmt=(mtp + 15) // 16,
+        s1_refs=[_s1_ref(rows(A, e), weights[e][2], weights[e][3])
+                 if counts_host[e] else None for e in range(E)],
+        s3_refs=[rows(H, e).float() @ down[e][2].float().t()
+                 if counts_host[e] else None for e in range(E)],
+    )
+
+
+def _v3_s1(P, cnt, total_rows, v, order=None, s1_input=None):
+    mgm.marlin_grouped_stage1_fused_mxfp4_situ_v3(
+        P["A"] if s1_input is None else s1_input, P["inter"], cnt, P["starts"],
+        P["gB"], P["gS"], P["uB"], P["uS"], P["Ip"], P["N"], P["K"], P["ws1"],
+        max_m_tiles=P["mmt"], mtp=P["mtp"], num_experts=P["E"],
+        total_rows=total_rows, variant=v, expert_order=order)
+
+
+def _v3_s3(P, cnt, v, order=None, s3_input=None):
+    mgm.marlin_grouped_m16_mxfp4_v3(
+        P["H"] if s3_input is None else s3_input, P["dB"], P["Op"], P["dS"],
+        P["starts"], cnt, P["E"], P["K"], P["N"], P["ws3"], P["E"],
+        P["K"] // 256, P["mmt"], variant=v, expert_order=order)
+
+
+def t4v3_grouped_skewed(variants):
+    P = _v3_skewed_problem(28, seed=4800)
+    counts_host, mtp = P["counts_host"], P["mtp"]
+    total = sum(counts_host)
+    print(f"    T4v3 counts: {counts_host}")
+    order = mgm.compute_mxfp4_v3_expert_order(P["counts"])
+    order_host = order.tolist()
+    order_ok = order_host == sorted(range(P["E"]), key=lambda e: (-counts_host[e], e))
+    print(f"    T4v3 expert order matches host sort: {order_ok}")
+    zero = torch.zeros(P["E"], dtype=torch.int32, device=DEV)
+    zero_order = mgm.compute_mxfp4_v3_expert_order(zero)
+    ok = order_ok
+    for v in variants:
+        res = {}
+        for tag, o in (("identity", None), ("ordered", order)):
+            P["inter"].fill_(NAN)
+            _v3_s1(P, P["counts"], total, v, o)
+            P["out"].fill_(NAN)
+            _v3_s3(P, P["counts"], v, o)
+            torch.cuda.synchronize()
+            res[tag] = (P["inter"].clone(), P["out"].clone())
+        inter, out = res["identity"]
+        g1 = _gate_rows(inter, P["s1_refs"], counts_host, mtp, f"T4v3 S1 v{v}")
+        c1 = _canary_ok(inter, counts_host, mtp)
+        g3 = _gate_rows(out, P["s3_refs"], counts_host, mtp, f"T4v3 S3 v{v}")
+        c3 = _canary_ok(out, counts_host, mtp)
+        same = all(torch.equal(a.view(torch.int16), b.view(torch.int16))
+                   for a, b in zip(res["identity"], res["ordered"]))
+        P["inter"].fill_(NAN)
+        _v3_s1(P, zero, 0, v, zero_order)
+        P["out"].fill_(NAN)
+        _v3_s3(P, zero, v, zero_order)
+        torch.cuda.synchronize()
+        e1 = bool(torch.isnan(P["inter"]).all())
+        e3 = bool(torch.isnan(P["out"]).all())
+        print(f"    T4v3 v{v}: canary S1={c1} S3={c3}; order bit-identical={same}; "
+              f"all-empty wrote nothing S1={e1} S3={e3}")
+        ok = ok and g1 and c1 and g3 and c3 and same and e1 and e3
+    report("T4v3 grouped v3 with skewed and zero-token experts (E=28), expert order", ok)
+
+
+def t5v3_mutations(variants):
+    K, N = K3_K, K3_N
+    M = 40                       # N width 48 for NCAP >= 48, two chunks for NCAP=32
+    weights, gB, gS, uB, uS = _w13_experts(1, K, N, seed0=5500)
+    qw, sc, w1_ref, w3_ref = weights[0]
+    torch.manual_seed(5550)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    ref = _s1_ref(x, w1_ref, w3_ref)
+    inter = torch.empty(M, N, dtype=torch.bfloat16, device=DEV)
+    starts = torch.zeros(1, dtype=torch.int32, device=DEV)
+    counts = torch.tensor([M], dtype=torch.int32, device=DEV)
+    Cp = _ptrs([inter])
+    ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
+    gS_rolled = _ptrs([torch.roll(sc[0], 1, dims=0).contiguous()])
+
+    def run(gb, gs, ub, us, v):
+        inter.fill_(NAN)
+        mgm.marlin_grouped_stage1_fused_mxfp4_situ_v3(
+            x, inter, counts, starts, gb, gs, ub, us, Cp, N, K, ws,
+            max_m_tiles=(M + 15) // 16, mtp=M, num_experts=1, total_rows=M,
+            variant=v)
+        torch.cuda.synchronize()
+        return inter
+
+    caught, arms, control_ok = 0, 0, True
+    for v in variants:
+        control_ok = gate(run(gB, gS, uB, uS, v), ref, f"T5v3.control v{v}") and control_ok
+        arms += 2
+        if not gate(run(uB, uS, gB, gS, v), ref, f"T5v3.m2 v{v} gate/up-swap"):
+            caught += 1
+        if not gate(run(gB, gS_rolled, uB, uS, v), ref, f"T5v3.m3 v{v} off-by-one-scale"):
+            caught += 1
+
+    def must_raise(name, fn, exc):
+        nonlocal caught, arms
+        arms += 1
+        try:
+            fn()
+            torch.cuda.synchronize()
+            print(f"    T5v3[{name}]: NOT caught")
+        except exc as e:
+            caught += 1
+            print(f"    T5v3[{name}]: caught ({str(e).splitlines()[0][:64]})")
+
+    bad_variant = max(V3_VARIANTS) + 1
+    must_raise(f"m6 wrapper variant={bad_variant}",
+               lambda: run(gB, gS, uB, uS, bad_variant), ValueError)
+    mod = mgm._load_module()
+    must_raise(f"m6 raw variant={bad_variant}",
+               lambda: mod.grouped_marlin_gemm_m16_s1_mxfp4_situ_v3(
+                   x, gB, uB, Cp, gS, uS, starts, counts, 1, N, K, ws, N // 256,
+                   (M + 15) // 16, bad_variant, None),
+               RuntimeError)
+    must_raise("m7 wrapper expert_order wrong length",
+               lambda: mgm.marlin_grouped_stage1_fused_mxfp4_situ_v3(
+                   x, inter, counts, starts, gB, gS, uB, uS, Cp, N, K, ws,
+                   max_m_tiles=(M + 15) // 16, mtp=M, num_experts=1,
+                   total_rows=M, variant=V3_VARIANTS[0],
+                   expert_order=torch.zeros(2, dtype=torch.int32, device=DEV)),
+               ValueError)
+    report("T5v3 mutation arms caught (controls pass)",
+           caught == arms and control_ok, f"catch count {caught}/{arms}")
+
+
+def t6v3_graph_replay(variants):
+    """Expert order + fused S1 + S3 (consuming the S1 output) in one CUDA
+    graph; two replays must reproduce the eager launches bit for bit."""
+    P = _v3_skewed_problem(12, seed=6600)
+    total = sum(P["counts_host"])
+    order = torch.empty(P["E"], dtype=torch.int32, device=DEV)
+    ok = True
+    for v in variants:
+        def forward():
+            mgm.compute_mxfp4_v3_expert_order(P["counts"], order)
+            _v3_s1(P, P["counts"], total, v, order)
+            _v3_s3(P, P["counts"], v, order, s3_input=P["inter"])
+
+        P["inter"].fill_(NAN)
+        P["out"].fill_(NAN)
+        forward()
+        torch.cuda.synchronize()
+        eager = (P["inter"].clone(), P["out"].clone())
+
+        graph = torch.cuda.CUDAGraph()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            forward()                       # warm-up on the capture stream
+        torch.cuda.current_stream().wait_stream(side)
+        with torch.cuda.graph(graph):
+            forward()
+
+        same = True
+        for _ in range(2):
+            P["inter"].fill_(NAN)
+            P["out"].fill_(NAN)
+            graph.replay()
+            torch.cuda.synchronize()
+            same = same and all(
+                torch.equal(_canonical_bits(a), _canonical_bits(b))
+                for a, b in zip(eager, (P["inter"], P["out"])))
+        canary = (_canary_ok(P["inter"], P["counts_host"], P["mtp"])
+                  and _canary_ok(P["out"], P["counts_host"], P["mtp"]))
+        print(f"    T6v3 v{v}: replays bit-identical to eager={same} canary={canary}")
+        ok = ok and same and canary
+        del graph
+    report("T6v3 CUDA graph capture of order + S1 + S3, replay bit-identical", ok)
+
+
 def do_build():
     """Rebuild the marlin TU with `-Xptxas -v` captured; print per-kernel
     register counts and FAIL on an E2M1-vs-U4B8 register-tier jump (>16)."""
@@ -964,7 +1339,7 @@ def do_build():
             return n
 
     marlin = [(demangle(n), n, r, sp) for n, r, sp in entries
-              if "Marlin" in n or "marlin_v2" in n]
+              if "Marlin" in n or "marlin_v2" in n or "marlin_v3" in n]
     if not marlin:
         print("FATAL: no Marlin ptxas lines captured — object was not "
               "recompiled? Delete the build dir / .so and rerun --build.")
@@ -1005,6 +1380,20 @@ def do_build():
               f"spill(st,ld)={sp}  {dem}")
         ok = ok and v2_ok
 
+    # v3 gate: same register and spill bounds; the wgmma kernels are one
+    # symbol per (variant, S1/grouped), all N widths inside.
+    v3 = [(dem, r, sp) for dem, mangled, r, sp in marlin
+          if "marlin_v3" in mangled and "Grouped" in mangled]
+    if len(v3) != 2 * len(V3_VARIANTS):
+        print(f"    marlin_v3: expected {2 * len(V3_VARIANTS)} instantiations, "
+              f"found {len(v3)} — inspect {log_path} manually")
+        ok = False
+    for dem, r, sp in v3:
+        v3_ok = r <= 128 and sp == (0, 0)
+        print(f"    marlin_v3 {'OK  ' if v3_ok else 'FAIL'} regs={r} "
+              f"spill(st,ld)={sp}  {dem}")
+        ok = ok and v3_ok
+
     # Dynamic shared memory is not in the ptxas report; ask the freshly built
     # extension (a subprocess, because this process imported the old one).
     probe = ("from batchgen_kernels import load_extension as L\n"
@@ -1013,11 +1402,20 @@ def do_build():
              "    for f in (True, False):\n"
              "        s, b = m.marlin_mxfp4_v2_launch_config(v, f)\n"
              "        print(f'    marlin_v2 variant {v} {\"S1\" if f else \"grouped\"}: '\n"
-             "              f'stages={s} dynamic smem={b} B')\n")
+             "              f'stages={s} dynamic smem={b} B')\n"
+             f"for v in {V3_VARIANTS!r}:\n"
+             "    for f in (True, False):\n"
+             "        s, b, c = m.marlin_mxfp4_v3_launch_config(v, f)\n"
+             f"        tag = 'OK  ' if b <= {V3_SMEM_LIMIT} else 'FAIL'\n"
+             "        print(f'    marlin_v3 {tag} variant {v} {\"S1\" if f else \"grouped\"}: '\n"
+             "              f'stages={s} dynamic smem={b} B cols={c}')\n"
+             f"        assert b <= {V3_SMEM_LIMIT}\n")
     smem = subprocess.run([sys.executable, "-c", probe], cwd=repo,
                           capture_output=True, text=True)
     print(smem.stdout.rstrip() or smem.stderr[-2000:])
     if smem.returncode != 0:
+        if smem.stdout:
+            print(smem.stderr[-2000:])
         ok = False
     if not ok:
         sys.exit(2)
@@ -1033,11 +1431,19 @@ def main():
                     help="run T0 and the v2 ladder only")
     ap.add_argument("--v2-variants", default=",".join(map(str, V2_VARIANTS)),
                     help="comma-separated v2 variants to test (default: all)")
+    ap.add_argument("--v3", action="store_true",
+                    help="run T0 and the v3 ladder only")
+    ap.add_argument("--v3-variants", default=",".join(map(str, V3_VARIANTS)),
+                    help="comma-separated v3 variants to test (default: all)")
     args = ap.parse_args()
     variants = [int(v) for v in args.v2_variants.split(",")]
     unknown = [v for v in variants if v not in V2_VARIANTS]
     if unknown:
         ap.error(f"unknown v2 variants {unknown}; valid: {V2_VARIANTS}")
+    v3_variants = [int(v) for v in args.v3_variants.split(",")]
+    unknown = [v for v in v3_variants if v not in V3_VARIANTS]
+    if unknown:
+        ap.error(f"unknown v3 variants {unknown}; valid: {V3_VARIANTS}")
 
     if args.build:
         do_build()
@@ -1053,7 +1459,10 @@ def main():
 
     t0_smoke()
     if not args.smoke:
-        if not args.v2:
+        run_v1 = not (args.v2 or args.v3)
+        run_v2 = run_v1 or args.v2
+        run_v3 = run_v1 or args.v3
+        if run_v1:
             t1_decode_bitexact()
             t2_m16_parity()
             t3_tensors = t3_s1_situ_parity()
@@ -1062,12 +1471,21 @@ def main():
             t6_int4_regression()
             t6b_int4_s1_regression()
             t7_wrapper_hardfail_negatives()
-        print_v2_launch_configs(variants)
-        t1v2_decode_bitexact(variants)
-        t2v2_m16_parity(variants)
-        t3v2_s1_situ_parity(variants)
-        t4v2_grouped_skewed(variants)
-        t5v2_mutations(variants)
+        if run_v2:
+            print_v2_launch_configs(variants)
+            t1v2_decode_bitexact(variants)
+            t2v2_m16_parity(variants)
+            t3v2_s1_situ_parity(variants)
+            t4v2_grouped_skewed(variants)
+            t5v2_mutations(variants)
+        if run_v3:
+            print_v3_launch_configs(v3_variants)
+            t1v3_decode_bitexact(v3_variants)
+            t2v3_m16_parity(v3_variants)
+            t3v3_s1_situ_parity(v3_variants)
+            t4v3_grouped_skewed(v3_variants)
+            t5v3_mutations(v3_variants)
+            t6v3_graph_replay(v3_variants)
 
     failed = [n for n, ok in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} ladder stages passed")

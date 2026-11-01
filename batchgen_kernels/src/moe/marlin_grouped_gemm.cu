@@ -1465,6 +1465,8 @@ __global__ void silu_mul_dual_stride_kernel(
 
 // K3 MXFP4 version 2 kernels (namespace marlin_v2); needs the helpers above.
 #include "marlin_grouped_mxfp4_v2.cuh"
+// K3 MXFP4 version 3 kernels (namespace marlin_v3); reuses marlin_v2's decode.
+#include "marlin_grouped_mxfp4_v3.cuh"
 
 // ============================================================================
 // Launchers
@@ -1863,6 +1865,224 @@ std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool
     }
 }
 
+// ----------------------------------------------------------------------------
+// K3 MXFP4 version 3 entries (marlin_grouped_mxfp4_v3.cuh, sm_90a wgmma).
+// Same arguments and checks as the v1 MXFP4 entries plus `variant` and an
+// optional int32 [num_experts] `expert_order` (None = identity), e.g. from
+// marlin_mxfp4_v3_expert_order. n_tiles keeps its v1 meaning (prob_n / 256);
+// max_m_tiles shapes the grid as in v1 (rows beyond 16 * max_m_tiles rounded
+// up to the row chunk are not computed). Scale bytes must be <= 128, as v2.
+// variant: 0 = (JW=2, NCAP=64), 1 = (JW=2, NCAP=48), 2 = (JW=4, NCAP=32).
+// ----------------------------------------------------------------------------
+#include <cstdint>
+
+static void check_mxfp4_v3_variant(int variant) {
+    TORCH_CHECK(variant >= 0 && variant <= 2,
+        "mxfp4 v3 launch: variant must be in [0, 2], got ", variant);
+}
+
+static int mxfp4_v3_cta_cols(int variant, bool fused) {
+    check_mxfp4_v3_variant(variant);
+    const int wg_cols = variant == 2 ? 256 : 128;
+    return fused ? wg_cols : 2 * wg_cols;
+}
+
+static void check_mxfp4_v3_shape(int variant, bool fused, int prob_n, int prob_k) {
+    const int cols = mxfp4_v3_cta_cols(variant, fused);
+    TORCH_CHECK(prob_n % cols == 0 && prob_k % 64 == 0,
+        "mxfp4 v3 launch: prob_n=", prob_n, " not a multiple of ", cols,
+        " or prob_k=", prob_k, " not a multiple of 64 (variant ", variant, ")");
+}
+
+static void check_mxfp4_v3_device() {
+    const cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(prop->major == 9 && prop->minor == 0,
+        "mxfp4 v3 launch: the wgmma kernels are built for sm_90a only, device is sm_",
+        prop->major, prop->minor);
+}
+
+static const int* mxfp4_v3_order_ptr(const c10::optional<torch::Tensor>& order,
+                                     int64_t len) {
+    if (!order.has_value()) return nullptr;
+    check_mxfp4_counts(*order, "expert_order", len);
+    TORCH_CHECK(order->is_contiguous(), "mxfp4 v3 launch: expert_order must be contiguous");
+    return order->data_ptr<int>();
+}
+
+static int mxfp4_v3_grid(int n_col_tiles, int num_matrices, int max_chunks) {
+    const int64_t total = static_cast<int64_t>(n_col_tiles) * num_matrices * max_chunks;
+    TORCH_CHECK(total <= INT32_MAX, "mxfp4 v3 launch: grid of ", total, " CTAs too large");
+    return static_cast<int>(total);
+}
+
+template <int JW, int NCAP>
+static void launch_mxfp4_v3_s1(
+    torch::Tensor& A,
+    torch::Tensor& gate_B_ptrs, torch::Tensor& up_B_ptrs,
+    torch::Tensor& C_ptrs,
+    torch::Tensor& gate_scales_ptrs, torch::Tensor& up_scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    const int* order, int num_experts, int prob_n, int prob_k, int max_m_tiles)
+{
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, true>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, true>(stages);
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::GroupedS1<JW, NCAP, stages>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
+    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, true>::CTA_COLS;
+    const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
+    const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_experts, max_chunks);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    marlin_v3::GroupedS1<JW, NCAP, stages>
+        <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int JW, int NCAP>
+static void launch_mxfp4_v3(
+    torch::Tensor& A, torch::Tensor& B_ptrs, torch::Tensor& C_ptrs,
+    torch::Tensor& scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    const int* order, int num_experts, int prob_n, int prob_k,
+    int num_matrices, int max_m_tiles)
+{
+    constexpr int stages = marlin_v3::pick_stages<JW, NCAP, false>();
+    constexpr int smem_bytes = marlin_v3::smem_bytes<JW, NCAP, false>(stages);
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)marlin_v3::Grouped<JW, NCAP, stages>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
+    const int n_col_tiles = prob_n / marlin_v3::Cfg<JW, NCAP, false>::CTA_COLS;
+    const int max_chunks = (16 * max_m_tiles + NCAP - 1) / NCAP;
+    const int total_ctas = mxfp4_v3_grid(n_col_tiles, num_matrices, max_chunks);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    marlin_v3::Grouped<JW, NCAP, stages>
+        <<<total_ctas, marlin_v3::THREADS, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        order, num_experts, prob_n, prob_k, n_col_tiles, max_chunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void grouped_marlin_gemm_m16_s1_mxfp4_situ_v3(
+    torch::Tensor A,
+    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
+    torch::Tensor C_ptrs,
+    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int n_tiles, int max_m_tiles, int variant,
+    c10::optional<torch::Tensor> expert_order)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    check_mxfp4_ptr_array(gate_B_ptrs, "gate_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_B_ptrs, "up_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_experts);
+    check_mxfp4_ptr_array(gate_scales_ptrs, "gate_scales_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_scales_ptrs, "up_scales_ptrs", num_experts);
+    check_mxfp4_v3_shape(variant, true, prob_n, prob_k);
+    const int* order = mxfp4_v3_order_ptr(expert_order, num_experts);
+    check_mxfp4_v3_device();
+#define MXFP4_V3_S1_ARGS A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, \
+    up_scales_ptrs, expert_starts, expert_counts, order, num_experts, prob_n, \
+    prob_k, max_m_tiles
+    switch (variant) {
+        case 0: launch_mxfp4_v3_s1<2, 64>(MXFP4_V3_S1_ARGS); break;
+        case 1: launch_mxfp4_v3_s1<2, 48>(MXFP4_V3_S1_ARGS); break;
+        default: launch_mxfp4_v3_s1<4, 32>(MXFP4_V3_S1_ARGS); break;
+    }
+#undef MXFP4_V3_S1_ARGS
+}
+
+void grouped_marlin_gemm_m16_mxfp4_v3(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles, int variant, c10::optional<torch::Tensor> expert_order)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    TORCH_CHECK(num_matrices >= num_experts,
+        "mxfp4 launch: num_matrices=", num_matrices, " < num_experts=",
+        num_experts);
+    check_mxfp4_ptr_array(B_ptrs, "B_ptrs", num_matrices);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_matrices);
+    check_mxfp4_ptr_array(scales_ptrs, "scales_ptrs", num_matrices);
+    check_mxfp4_v3_shape(variant, false, prob_n, prob_k);
+    TORCH_CHECK(!expert_order.has_value() || num_matrices == num_experts,
+        "mxfp4 v3 launch: expert_order needs num_matrices == num_experts, got ",
+        num_matrices, " vs ", num_experts);
+    const int* order = mxfp4_v3_order_ptr(expert_order, num_experts);
+    check_mxfp4_v3_device();
+#define MXFP4_V3_ARGS A, B_ptrs, C_ptrs, scales_ptrs, expert_starts, \
+    expert_counts, order, num_experts, prob_n, prob_k, num_matrices, max_m_tiles
+    switch (variant) {
+        case 0: launch_mxfp4_v3<2, 64>(MXFP4_V3_ARGS); break;
+        case 1: launch_mxfp4_v3<2, 48>(MXFP4_V3_ARGS); break;
+        default: launch_mxfp4_v3<4, 32>(MXFP4_V3_ARGS); break;
+    }
+#undef MXFP4_V3_ARGS
+}
+
+// out[rank] = index of the expert with the rank-th largest count (ties by
+// index). Capturable in a CUDA graph together with the v3 launches.
+void marlin_mxfp4_v3_expert_order(torch::Tensor expert_counts, torch::Tensor out)
+{
+    const int64_t n = expert_counts.numel();
+    TORCH_CHECK(n >= 1 && n <= 12288,
+        "mxfp4 v3 expert order: need 1 <= num_experts <= 12288, got ", n);
+    check_mxfp4_counts(expert_counts, "expert_counts", n);
+    check_mxfp4_counts(out, "expert_order", n);
+    TORCH_CHECK(expert_counts.is_contiguous() && out.is_contiguous()
+                && expert_counts.device() == out.device(),
+        "mxfp4 v3 expert order: counts and out must be contiguous on one device");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    marlin_v3::ExpertOrder<<<1, marlin_v3::THREADS, n * sizeof(int), stream>>>(
+        expert_counts.data_ptr<int>(), out.data_ptr<int>(), static_cast<int>(n));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int JW, int NCAP>
+static std::tuple<int64_t, int64_t, int64_t> mxfp4_v3_cfg(bool fused) {
+    constexpr int s1_stages = marlin_v3::pick_stages<JW, NCAP, true>();
+    constexpr int gr_stages = marlin_v3::pick_stages<JW, NCAP, false>();
+    if (fused) {
+        return std::make_tuple(static_cast<int64_t>(s1_stages),
+            static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, true>(s1_stages)),
+            static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, true>::CTA_COLS));
+    }
+    return std::make_tuple(static_cast<int64_t>(gr_stages),
+        static_cast<int64_t>(marlin_v3::smem_bytes<JW, NCAP, false>(gr_stages)),
+        static_cast<int64_t>(marlin_v3::Cfg<JW, NCAP, false>::CTA_COLS));
+}
+
+// (stages, dynamic shared-memory bytes, output columns per CTA) of a v3
+// instantiation.
+std::tuple<int64_t, int64_t, int64_t> marlin_mxfp4_v3_launch_config(int64_t variant, bool fused)
+{
+    check_mxfp4_v3_variant(static_cast<int>(variant));
+    switch (variant) {
+        case 0: return mxfp4_v3_cfg<2, 64>(fused);
+        case 1: return mxfp4_v3_cfg<2, 48>(fused);
+        default: return mxfp4_v3_cfg<4, 32>(fused);
+    }
+}
+
 void silu_mul_dual_stride(
     torch::Tensor gate_inplace, torch::Tensor up,
     torch::Tensor expert_counts,
@@ -1895,6 +2115,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Marlin fused S1 v2, MXFP4 (E2M1) weights + SiTU, per-CTA expert row walk");
     m.def("marlin_mxfp4_v2_launch_config", &marlin_mxfp4_v2_launch_config,
           "(stages, dynamic smem bytes) of a Marlin MXFP4 v2 variant");
+    m.def("grouped_marlin_gemm_m16_mxfp4_v3", &grouped_marlin_gemm_m16_mxfp4_v3,
+          "Marlin grouped GEMM v3, MXFP4 (E2M1) weights, swap-AB wgmma (sm_90a)");
+    m.def("grouped_marlin_gemm_m16_s1_mxfp4_situ_v3", &grouped_marlin_gemm_m16_s1_mxfp4_situ_v3,
+          "Marlin fused S1 v3, MXFP4 (E2M1) weights + SiTU, swap-AB wgmma (sm_90a)");
+    m.def("marlin_mxfp4_v3_expert_order", &marlin_mxfp4_v3_expert_order,
+          "Expert order by descending row count for the Marlin MXFP4 v3 grid");
+    m.def("marlin_mxfp4_v3_launch_config", &marlin_mxfp4_v3_launch_config,
+          "(stages, dynamic smem bytes, CTA output columns) of a Marlin MXFP4 v3 variant");
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");
