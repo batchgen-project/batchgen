@@ -24,6 +24,7 @@
 #include <bitset>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +58,9 @@ using batchgen::distributed_weights::Response;
 
 constexpr std::uint64_t kBootstrapMagic = 0x4b33523452444d41ULL;
 constexpr int kRails = 8;
+// The topology check admits two or four nodes, so a per-owner table sized
+// for four covers every valid configuration without an allocation.
+constexpr int kMaxNodes = 4;
 constexpr int kLayers = 92;
 constexpr int kExperts = 896;
 constexpr int kDefaultWorkers = 8;
@@ -345,6 +349,21 @@ struct Chunk {
     int occupied_slots = -1;
     int ready_unacquired_slots = -1;
     int leased_slots = -1;
+    // What the rail selection saw: the bytes already in flight on the chosen
+    // rail (every owner's, plus any deprioritized_rails phantom load), and
+    // the completion time it predicted for this get. -1 means no prediction:
+    // the least_loaded rule makes none, and neither does expected_completion
+    // while the owner has no sampled path.
+    // The completion turns queue_bytes into this path's rate sample.
+    std::uint64_t queue_bytes = 0;
+    double predicted_s = -1.0;
+};
+
+// What ChooseRail returns: the rail, and the two Chunk fields above.
+struct RailChoice {
+    int rail = -1;
+    std::uint64_t queue_bytes = 0;
+    double predicted_s = -1.0;
 };
 
 // One ucp_get_nbx, start to publication. POD and fixed size: the fetch path
@@ -379,6 +398,9 @@ struct GetRecord {
     std::int32_t occupied_slots = -1;
     std::int32_t ready_unacquired_slots = -1;
     std::int32_t leased_slots = -1;
+    // The rail selection's view at post time; see Chunk.
+    std::uint64_t queue_bytes = 0;
+    double predicted_s = -1.0;
 };
 
 // A worker cohort is one generation of the server's worker pool. The daemon
@@ -420,6 +442,27 @@ struct RingResetReport {
     bool prefetch_handshake = false;    // reset done by the prefetch thread
 };
 
+// Bounds on one expected-completion rate sample, in bytes per second and
+// seconds. A get observed to finish in under a microsecond, or at a rate
+// outside 1 MB/s .. 100 GB/s, is a timing artefact rather than a measurement
+// of the path, and one such sample would dominate the estimate for many gets.
+// The ceiling sits above every path a rail can carry (two 200 Gb/s ports),
+// so an inline completion cannot lift an owner's best rate far past it.
+constexpr double kRailRateFloor = 1.0e6;
+constexpr double kRailRateCeiling = 1.0e11;
+constexpr double kRailRateMinSeconds = 1.0e-6;
+
+// One (owner, rail) path as the expected-completion rail selection sees it.
+// `rate` is an EWMA of observed drain rates in bytes per second, meaningful
+// only once `samples` is non-zero; `chosen` counts the gets posted on the
+// path under either rule, so a share shift is visible in the summary.
+struct RailRate {
+    double rate = 0.0;
+    std::uint64_t samples = 0;
+    Clock::time_point last_sample;
+    std::uint64_t chosen = 0;
+};
+
 // The counters the summary reports. Every update is a few scalar writes, and
 // the summary copies the whole struct, so stats_mutex is never held for long.
 struct Stats {
@@ -436,6 +479,11 @@ struct Stats {
     int staging_hwm = 0;
     // Post-to-ready latency of each fetched module, in milliseconds.
     LatencyHistogram ready_latency;
+    // Indexed [owner][rail]. Written only by the prefetch thread, under
+    // stats_mutex (samples in MarkReady, `chosen` beside staging_hwm), so
+    // that thread's own selection reads it without the lock and the summary
+    // copies it with the rest of the struct.
+    std::array<std::array<RailRate, kRails>, kMaxNodes> rail_rate{};
 };
 
 // What the summary reads of the cohort. Copied under cohort_mutex.
@@ -585,6 +633,39 @@ struct DistributedWeightDaemon::Impl {
                      "or \"partitioned\"");
             }
             pooled_owner_rails = map.get<std::string>() == "pooled";
+        }
+        if (config.contains("rail_selection")) {
+            const nlohmann::json& selection = config.at("rail_selection");
+            if (!selection.is_string() ||
+                (selection.get<std::string>() != "least_loaded" &&
+                 selection.get<std::string>() != "expected_completion")) {
+                fail("distributed weight rail_selection must be "
+                     "\"least_loaded\" or \"expected_completion\"");
+            }
+            expected_completion_selection =
+                selection.get<std::string>() == "expected_completion";
+        }
+        // The two estimator settings are validated whichever rule is
+        // selected, so a config that sets them under least_loaded is checked
+        // instead of silently carried.
+        if (config.contains("rail_rate_alpha")) {
+            const nlohmann::json& alpha = config.at("rail_rate_alpha");
+            if (!alpha.is_number() || !(alpha.get<double>() > 0.0 &&
+                                        alpha.get<double>() <= 1.0)) {
+                fail("distributed weight rail_rate_alpha must be a number "
+                     "in (0, 1]");
+            }
+            rail_rate_alpha = alpha.get<double>();
+        }
+        if (config.contains("rail_rate_recovery_s")) {
+            const nlohmann::json& recovery = config.at("rail_rate_recovery_s");
+            if (!recovery.is_number() ||
+                !std::isfinite(recovery.get<double>()) ||
+                !(recovery.get<double>() > 0.0)) {
+                fail("distributed weight rail_rate_recovery_s must be a "
+                     "positive finite number of seconds");
+            }
+            rail_rate_recovery_s = recovery.get<double>();
         }
         if (config.contains("worker_numa_nodes")) {
             const nlohmann::json& nodes = config.at("worker_numa_nodes");
@@ -745,6 +826,16 @@ struct DistributedWeightDaemon::Impl {
     // Partitioned keeps destination_for_owner_rail: each rail of a node then
     // reaches exactly one owner, and an owner is reached over 2-3 rails.
     bool pooled_owner_rails = true;
+    // `rail_selection`. least_loaded (the default) is the rule documented at
+    // ChooseRail and makes the same choices with or without the settings
+    // below. expected_completion divides each candidate's queued bytes by
+    // the measured drain rate of that (owner, rail) path, with
+    // `rail_rate_alpha` the EWMA weight of a new sample and
+    // `rail_rate_recovery_s` the half-life over which a path's estimate
+    // drifts back toward the owner's best one while it gets no new sample.
+    bool expected_completion_selection = false;
+    double rail_rate_alpha = 0.2;
+    double rail_rate_recovery_s = 2.0;
     // `rma_lanes`: UCX MAX_RMA_RAILS for every rail context. Each lane of an
     // endpoint is its own QP on its own path, and on a two-port bonded device
     // the paths leave by different ports with different UDP source ports, so
@@ -2097,6 +2188,8 @@ struct DistributedWeightDaemon::Impl {
         record.occupied_slots = chunk.occupied_slots;
         record.ready_unacquired_slots = chunk.ready_unacquired_slots;
         record.leased_slots = chunk.leased_slots;
+        record.queue_bytes = chunk.queue_bytes;
+        record.predicted_s = chunk.predicted_s;
         const std::uint64_t index =
             fetch_trace_next.fetch_add(1, std::memory_order_relaxed);
         fetch_trace[index % fetch_trace.size()] = record;
@@ -2131,11 +2224,16 @@ struct DistributedWeightDaemon::Impl {
             << gate_stalls.load(std::memory_order_relaxed)
             << " gate_stalls_free_elsewhere="
             << gate_stalls_free_elsewhere.load(std::memory_order_relaxed)
+            << " rail_selection="
+            << (expected_completion_selection ? "expected_completion"
+                                              : "least_loaded")
             << "\n";
+        // New columns are appended after the existing ones, so a reader
+        // that indexes the earlier columns by position still reads them.
         out << "post_ns,submit_ns,done_ns,publish_ns,prev_scan_ns,"
                "first_wait_ns,bytes,rail,owner,layer,first_expert,count,"
                "target_worker,occupied_slots,ready_unacquired_slots,"
-               "leased_slots\n";
+               "leased_slots,queue_bytes,predicted_s\n";
         for (std::uint64_t index = start; index < written; ++index) {
             const GetRecord& record = fetch_trace[index % capacity];
             out << record.post_ns << ',' << record.submit_ns << ','
@@ -2146,7 +2244,8 @@ struct DistributedWeightDaemon::Impl {
                 << record.count << ',' << record.target_worker << ','
                 << record.occupied_slots << ','
                 << record.ready_unacquired_slots << ','
-                << record.leased_slots << '\n';
+                << record.leased_slots << ',' << record.queue_bytes << ','
+                << record.predicted_s << '\n';
         }
         out.flush();
         if (!out) {
@@ -2212,6 +2311,46 @@ struct DistributedWeightDaemon::Impl {
             static_cast<std::uint64_t>(chunk.count) * module_bytes;
         stats.ready_latency.record(
             latency_ms, static_cast<std::uint64_t>(chunk.count));
+        if (expected_completion_selection) {
+            RecordRailRateLocked(chunk, completed);
+        }
+    }
+
+    // One expected-completion sample per published get: the bytes this get
+    // waited behind on its rail at post time plus its own, over its
+    // submitted..completed time. That is the drain rate of the rail as this
+    // owner's get experienced it, the same quantity ChooseRail divides by,
+    // so prediction and observation stay in one unit. Only MarkReady calls
+    // this: gets retired by DrainForReset complete during a quiescent drain
+    // and would bias every path upward. Caller holds stats_mutex.
+    void RecordRailRateLocked(const Chunk& chunk,
+                              Clock::time_point completed) {
+        if (chunk.owner < 0 || chunk.owner >= num_nodes ||
+            chunk.rail < 0 || chunk.rail >= kRails) {
+            fail("distributed weight rail rate sample for owner " +
+                 std::to_string(chunk.owner) + " on rail " +
+                 std::to_string(chunk.rail) + " is outside the topology "
+                 "of node " + std::to_string(node_rank));
+        }
+        const double seconds = std::max(
+            elapsed_seconds(chunk.submitted, completed), kRailRateMinSeconds);
+        const double bytes =
+            static_cast<double>(chunk.queue_bytes) +
+            static_cast<double>(static_cast<std::uint64_t>(chunk.count) *
+                                module_bytes);
+        const double observed = bytes / seconds;
+        if (!std::isfinite(observed)) {
+            return;
+        }
+        const double sample =
+            std::clamp(observed, kRailRateFloor, kRailRateCeiling);
+        RailRate& path = stats.rail_rate[chunk.owner][chunk.rail];
+        path.rate = path.samples == 0
+                        ? sample
+                        : rail_rate_alpha * sample +
+                              (1.0 - rail_rate_alpha) * path.rate;
+        ++path.samples;
+        path.last_sample = completed;
     }
 
     // Free every slot and forget every module, as at daemon start. Counts what
@@ -2308,7 +2447,14 @@ struct DistributedWeightDaemon::Impl {
     // The bias shifts load rather than partitioning it: when the preferred
     // rails back up by the bias, gets spill back. An empty set (the default)
     // leaves every comparison exactly as it was.
-    int LeastLoadedRail(int owner, const std::deque<Chunk>& in_flight) const {
+    //
+    // The byte sum and the checks are shared by both `rail_selection` rules.
+    // least_loaded (the default) compares the bytes alone, in
+    // LeastLoadedRail. expected_completion divides them by what each
+    // (owner, rail) path has been observed to drain, in
+    // ExpectedCompletionRail; the phantom load stays in the bytes there too.
+    RailChoice ChooseRail(int owner,
+                          const std::deque<Chunk>& in_flight) const {
         if (owner < 0 || owner >= num_nodes) {
             fail("distributed weight rail requested for owner " +
                  std::to_string(owner) + " outside the " +
@@ -2347,6 +2493,28 @@ struct DistributedWeightDaemon::Impl {
                 rail_bytes[rail] += rail_bias_bytes;
             }
         }
+        RailChoice choice;
+        if (!expected_completion_selection) {
+            const int chosen = LeastLoadedRail(available, rail_bytes);
+            choice = RailChoice{chosen, rail_bytes[chosen], -1.0};
+        } else {
+            choice = ExpectedCompletionRail(owner, available, rail_bytes,
+                                            Clock::now());
+        }
+        // The phantom bias steers the choice but is not traffic. The rate
+        // sample divides the queued bytes by the time they took to drain, so
+        // it must see only real bytes, or the bias would inflate the sample
+        // by exactly the amount it adds to the next prediction.
+        if (rail_deprioritized[static_cast<size_t>(choice.rail)]) {
+            choice.queue_bytes -= rail_bias_bytes;
+        }
+        return choice;
+    }
+
+    // Fewest bytes, lowest index on a tie. Every candidate is in range.
+    int LeastLoadedRail(
+        const std::vector<int>& available,
+        const std::array<std::uint64_t, kRails>& rail_bytes) const {
         // Compare (load, rail index) so the tie-break is the lowest rail
         // index by construction rather than by the order the bootstrap
         // happened to fill this owner's candidates in.
@@ -2360,6 +2528,82 @@ struct DistributedWeightDaemon::Impl {
             }
         }
         return chosen;
+    }
+
+    // Earliest predicted completion: (bytes queued on the rail + this get's
+    // bytes) / the path's effective rate, compared on (prediction, rail
+    // index) with a strict improvement, so ties keep the lowest index.
+    //
+    // A path with no sample yet is valued at `best`, the owner's highest
+    // sampled estimate: it competes on its queue like a healthy path, so a
+    // slow path's first gets are not piled onto it before it has reported,
+    // and its first completion corrects the estimate. While the owner has no
+    // sampled path at all, every candidate would be valued the same, and the
+    // choice is the least_loaded rule itself, so a cold start sweeps the
+    // owner's rails exactly as the control does.
+    //
+    // The rate table is written only by this thread (in MarkReady, under
+    // stats_mutex) and read here without the lock; no other thread writes it.
+    RailChoice ExpectedCompletionRail(
+        int owner, const std::vector<int>& available,
+        const std::array<std::uint64_t, kRails>& rail_bytes,
+        Clock::time_point now) const {
+        const std::array<RailRate, kRails>& paths = stats.rail_rate[owner];
+        bool sampled = false;
+        double best = 0.0;
+        for (const int rail : available) {
+            if (paths[rail].samples != 0) {
+                sampled = true;
+                best = std::max(best, paths[rail].rate);
+            }
+        }
+        if (!sampled) {
+            const int chosen = LeastLoadedRail(available, rail_bytes);
+            return RailChoice{chosen, rail_bytes[chosen], -1.0};
+        }
+        const std::uint64_t get_bytes =
+            static_cast<std::uint64_t>(superchunk) * module_bytes;
+        int chosen = -1;
+        double chosen_s = 0.0;
+        for (const int rail : available) {
+            const double effective =
+                paths[rail].samples == 0
+                    ? best
+                    : EffectiveRailRate(paths[rail], best, now);
+            const double predicted_s =
+                static_cast<double>(rail_bytes[rail] + get_bytes) /
+                effective;
+            if (!std::isfinite(predicted_s)) {
+                fail("distributed weight expected completion for owner " +
+                     std::to_string(owner) + " on rail " +
+                     std::to_string(rail) + " is not finite");
+            }
+            if (chosen < 0 || predicted_s < chosen_s ||
+                (predicted_s == chosen_s && rail < chosen)) {
+                chosen = rail;
+                chosen_s = predicted_s;
+            }
+        }
+        return RailChoice{chosen, rail_bytes[chosen], chosen_s};
+    }
+
+    // A path's estimate recovers toward `best`, the owner's highest current
+    // estimate, with half-life rail_rate_recovery_s since its last sample: a
+    // path that stopped receiving gets because it was slow is retried within
+    // a few half-lives, and knocked down again by that sample if it still is.
+    // A probe costs about one slow get per path per recovery period.
+    double EffectiveRailRate(const RailRate& path, double best,
+                             Clock::time_point now) const {
+        const double age =
+            std::max(elapsed_seconds(path.last_sample, now), 0.0);
+        const double recovered =
+            1.0 - std::exp2(-age / rail_rate_recovery_s);
+        const double effective = path.rate + (best - path.rate) * recovered;
+        if (!std::isfinite(effective) || effective <= 0.0) {
+            fail("distributed weight effective rail rate is not a positive "
+                 "finite number");
+        }
+        return effective;
     }
 
     void PrefetchLoop() {
@@ -2400,8 +2644,11 @@ struct DistributedWeightDaemon::Impl {
                 tail = 0;
                 // Rail selection needs no rewind of its own: the drain above
                 // emptied the in-flight deque, so every rail reads as unloaded
-                // and the next cohort's first get per owner takes that owner's
-                // lowest rail, exactly as the first cohort's did.
+                // and under least_loaded the next cohort's first get per
+                // owner takes that owner's lowest rail, exactly as the first
+                // cohort's did. The expected-completion rates describe the
+                // paths, not the cohort, so they carry over; the drain fed
+                // them nothing.
                 continue;
             }
 
@@ -2492,7 +2739,10 @@ struct DistributedWeightDaemon::Impl {
                 chunk.slot_start = tail;
                 chunk.count = superchunk;
                 chunk.owner = owner;
-                chunk.rail = LeastLoadedRail(owner, chunks);
+                const RailChoice choice = ChooseRail(owner, chunks);
+                chunk.rail = choice.rail;
+                chunk.queue_bytes = choice.queue_bytes;
+                chunk.predicted_s = choice.predicted_s;
                 chunk.layer = layer;
                 chunk.first_expert = first_expert;
                 chunk.target_worker = OwningWorker(schedule[next]);
@@ -2545,6 +2795,7 @@ struct DistributedWeightDaemon::Impl {
                             stats_mutex);
                         stats.staging_hwm =
                             std::max(stats.staging_hwm, occupied);
+                        ++stats.rail_rate[owner][chunk.rail].chosen;
                     }
                 }
 
@@ -2691,6 +2942,51 @@ struct DistributedWeightDaemon::Impl {
         // entries exist only when the loops actually count.
         summary["owner_rail_map"] =
             pooled_owner_rails ? "pooled" : "partitioned";
+        summary["rail_selection"] = expected_completion_selection
+                                        ? "expected_completion"
+                                        : "least_loaded";
+        summary["rail_rate_alpha"] = rail_rate_alpha;
+        summary["rail_rate_recovery_s"] = rail_rate_recovery_s;
+        // Indexed [owner][rail], under either rule: `chosen` counts posted
+        // gets, so the control arm's split is comparable; a path's own rate
+        // stays null until it has a sample, which only expected_completion
+        // takes. The effective rate is the one a choice made now would use:
+        // the owner's best for an unsampled path, null while it has none.
+        const Clock::time_point rates_taken = Clock::now();
+        nlohmann::json rail_rate_by_owner = nlohmann::json::array();
+        for (int owner = 0; owner < num_nodes; ++owner) {
+            const std::array<RailRate, kRails>& paths =
+                counters.rail_rate[owner];
+            double best = 0.0;
+            for (const RailRate& path : paths) {
+                if (path.samples != 0) {
+                    best = std::max(best, path.rate);
+                }
+            }
+            nlohmann::json by_rail = nlohmann::json::array();
+            for (const RailRate& path : paths) {
+                nlohmann::json entry = {
+                    {"rate_gb_per_s", nullptr},
+                    {"effective_rate_gb_per_s", nullptr},
+                    {"samples", path.samples},
+                    {"last_sample_age_s", nullptr},
+                    {"chosen", path.chosen},
+                };
+                if (path.samples == 0 && best > 0.0) {
+                    entry["effective_rate_gb_per_s"] = best / 1.0e9;
+                }
+                if (path.samples != 0) {
+                    entry["rate_gb_per_s"] = path.rate / 1.0e9;
+                    entry["effective_rate_gb_per_s"] =
+                        EffectiveRailRate(path, best, rates_taken) / 1.0e9;
+                    entry["last_sample_age_s"] = std::max(
+                        elapsed_seconds(path.last_sample, rates_taken), 0.0);
+                }
+                by_rail.push_back(entry);
+            }
+            rail_rate_by_owner.push_back(by_rail);
+        }
+        summary["rail_rate_by_owner"] = rail_rate_by_owner;
         summary["rma_lanes"] = rma_lanes;
         summary["staging_numa"] =
             slot_numa.empty() ? "interleave" : "by_consumer";
