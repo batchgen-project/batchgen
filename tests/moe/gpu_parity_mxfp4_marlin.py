@@ -1114,6 +1114,8 @@ def _v3_skewed_problem(E, seed):
         starts=(torch.arange(E, dtype=torch.int32) * mtp).to(DEV),
         gB=gB, gS=gS, uB=uB, uS=uS,
         dB=_ptrs([d[0] for d in down]), dS=_ptrs([d[1] for d in down]),
+        # The pointer arrays above do not own their tensors.
+        owners=(weights, down),
         A=A, H=H, inter=inter, out=out,
         Ip=_row_ptrs(inter, E, mtp), Op=_row_ptrs(out, E, mtp),
         ws1=torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV),
@@ -1195,7 +1197,8 @@ def t5v3_mutations(variants):
     counts = torch.tensor([M], dtype=torch.int32, device=DEV)
     Cp = _ptrs([inter])
     ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=DEV)
-    gS_rolled = _ptrs([torch.roll(sc[0], 1, dims=0).contiguous()])
+    g_s_rolled = torch.roll(sc[0], 1, dims=0).contiguous()
+    gS_rolled = _ptrs([g_s_rolled])
 
     def run(gb, gs, ub, us, v):
         inter.fill_(NAN)
