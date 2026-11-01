@@ -275,6 +275,8 @@ def _make_cpu_forward_segment(monkeypatch, *, tp_rank, shared_ffn, routed_value)
             gate_B_ptrs=None, gate_scales_ptrs=None,
             up_B_ptrs=None, up_scales_ptrs=None,
             down_B_ptrs=None, down_scales_ptrs=None,
+            s1_fn=lambda *args, **kwargs: None,
+            s3_fn=lambda *args, **kwargs: None,
         ),
         comm=_FakeEPComm(),
         down_proj=lambda x: torch.zeros(
@@ -288,13 +290,6 @@ def _make_cpu_forward_segment(monkeypatch, *, tp_rank, shared_ffn, routed_value)
 
     monkeypatch.setattr(
         k3_moe_graph, "dispatch_scatter_3d", lambda *args: (args[6], args[8])
-    )
-    monkeypatch.setattr(
-        k3_moe_graph, "marlin_grouped_stage1_fused_mxfp4_situ",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        k3_moe_graph, "marlin_grouped_m16_mxfp4", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         k3_moe_graph, "reduce_weighted_scatter_fp32",

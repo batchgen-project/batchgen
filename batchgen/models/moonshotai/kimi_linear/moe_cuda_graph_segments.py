@@ -39,10 +39,6 @@ from batchgen.moe.dispatch_scatter_3d import (
     dispatch_scatter_3d,
     reduce_weighted_scatter_fp32,
 )
-from batchgen.moe.marlin_grouped_moe import (
-    marlin_grouped_m16_mxfp4,
-    marlin_grouped_stage1_fused_mxfp4_situ,
-)
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
 
 logger = logging.getLogger(__name__)
@@ -685,7 +681,7 @@ class K3MoEGraphSegment:
         dispatched = recv_x.view(e * mtp, k)
         intermediate = self.pool.ll_intermediate
         expert_output = self.pool.ll_expert_output
-        marlin_grouped_stage1_fused_mxfp4_situ(
+        shard.s1_fn(
             dispatched,
             intermediate,
             recv_count,
@@ -703,7 +699,7 @@ class K3MoEGraphSegment:
             e,
             bufs.global_tokens,
         )
-        marlin_grouped_m16_mxfp4(
+        shard.s3_fn(
             intermediate,
             shard.down_B_ptrs,
             self.pool.ll_s3_C_ptrs,
@@ -806,7 +802,7 @@ class K3MoEGraphSegment:
         # The resident layer's weight pointers and K3 SiTU kernel are reused;
         # only the activation/metadata storage is graph-owned and static.
         shard = self.resident.shard
-        marlin_grouped_stage1_fused_mxfp4_situ(
+        shard.s1_fn(
             bufs.dispatched,
             bufs.intermediate,
             expert_counts,
@@ -824,7 +820,7 @@ class K3MoEGraphSegment:
             self.num_local_experts,
             global_tokens,
         )
-        marlin_grouped_m16_mxfp4(
+        shard.s3_fn(
             bufs.intermediate,
             shard.down_B_ptrs,
             bufs.s3_C_ptrs,
