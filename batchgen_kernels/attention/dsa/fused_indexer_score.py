@@ -189,7 +189,7 @@ def _fused_score_kernel(
     SEQLENS_ptr,       # [B] int32
     AGG_ptr,           # [B, max_seqlen] FP32
     max_seqlen,
-    B: tl.constexpr,
+    B,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -236,7 +236,7 @@ def _fused_paged_score_kernel(
     SEQLENS_ptr,       # [B] int32
     AGG_ptr,           # [B, max_seqlen] FP32
     max_seqlen,
-    B: tl.constexpr,
+    B,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
@@ -309,7 +309,7 @@ def _fused_paged_score_with_slots_kernel(
     max_seqlen,
     topk: tl.constexpr,
     skip_dense_prefix: tl.constexpr,
-    B: tl.constexpr,
+    B,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
