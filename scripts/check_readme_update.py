@@ -57,6 +57,7 @@ def main() -> int:
     parser.add_argument("--base-ref", help="Git ref whose News history must be retained")
     args = parser.parse_args()
 
+    missing: list[str] = []
     current = Path(args.readme).read_text()
     current_lines = news_lines(current)
     dates = entry_dates(current_lines)
@@ -65,18 +66,38 @@ def main() -> int:
 
     if args.base_ref:
         previous_lines = news_lines(git_text(args.base_ref, args.readme))
+        missing = []
         position = 0
         for line in previous_lines:
             try:
                 position = current_lines.index(line, position) + 1
-            except ValueError as exc:
+            except ValueError:
+                missing.append(line)
+        if missing:
+            # A deliberate rewrite (for example consolidating entries) must
+            # leave a fresh acknowledgement comment in the News section, so
+            # the rewrite is visible in the diff and cannot happen silently.
+            ack = re.compile(r"<!--\s*news-rewrite-ack\s+\d{4}/\d{2}:.+-->")
+            new_acks = [
+                line for line in current_lines
+                if ack.search(line) and line not in previous_lines
+            ]
+            if not new_acks:
                 raise SystemExit(
                     "README News dropped or changed a historical line; "
-                    "prepend the new item and preserve existing bullets"
-                ) from exc
+                    "prepend the new item and preserve existing bullets, or "
+                    "record a deliberate rewrite with a NEW comment line "
+                    "'<!-- news-rewrite-ack YYYY/MM: reason -->' in the News "
+                    "section. Dropped or changed lines:\n  "
+                    + "\n  ".join(missing)
+                )
+            print(
+                f"README News rewrite acknowledged by {new_acks[0].strip()}; "
+                f"{len(missing)} historical line(s) rewritten"
+            )
 
     print(f"README News OK: {len(dates)} entries, newest-first")
-    if args.base_ref:
+    if args.base_ref and not missing:
         print(f"README News history preserved from {args.base_ref}")
     return 0
 
