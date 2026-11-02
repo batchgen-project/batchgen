@@ -52,6 +52,14 @@ DSA_AOT_EXTENSIONS = {
 }
 KV_PROJ = "batchgen_kernels.attention._C_indexer_kv_proj_wgmma"
 
+# The FP8 WGMMA MoE pipeline kernels that used to be compiled at runtime.
+WGMMA_GROUPED_GEMM = "batchgen_kernels.moe._C_fp8_wgmma_grouped_gemm"
+WGMMA_QUANT_OPS = "batchgen_kernels.moe._C_fp8_wgmma_quant_ops"
+WGMMA_PIPELINE_AOT_EXTENSIONS = {
+    WGMMA_GROUPED_GEMM: ["src/moe/fp8_wgmma_grouped_gemm.cu"],
+    WGMMA_QUANT_OPS: ["src/moe/fp8_wgmma_quant_ops.cu"],
+}
+
 
 def _string_list(node: ast.AST) -> list[str]:
     if not isinstance(node, ast.List):
@@ -293,3 +301,34 @@ def test_indexer_kv_proj_is_built_with_four_stages_for_sm90a_only():
         assert _gencode_targets(nvcc) == ["arch=compute_90a,code=sm_90a"], nvcc
         stages = [flag for flag in nvcc if flag.startswith("-DNUM_STAGES")]
         assert stages == ["-DNUM_STAGES=4"], nvcc
+
+
+def test_wgmma_pipeline_extensions_are_registered_aot_for_sm90a():
+    setup_extensions = _setup_extensions()
+    registry = _registry_entries()
+    _, sm90a = _setup_nvcc_flags()
+    for name, sources in WGMMA_PIPELINE_AOT_EXTENSIONS.items():
+        assert setup_extensions.get(name) == sources, name
+        assert registry.get(name) == sources, name
+        assert name in sm90a, f"{name} must be built only with the SM90a kernels"
+        for source in sources:
+            assert (_KERNELS_ROOT / source).is_file(), f"{name}: missing {source}"
+
+
+def test_wgmma_pipeline_flags_match_between_setup_and_registry():
+    flags, _ = _setup_nvcc_flags()
+    registry = _registry()
+    expected_stages = {
+        WGMMA_GROUPED_GEMM: ["-DNUM_STAGES=4"],
+        WGMMA_QUANT_OPS: [],
+    }
+    for name, stages in expected_stages.items():
+        registry_flags = registry[name]["nvcc_flags"]
+        for nvcc in (flags[name], registry_flags):
+            assert _gencode_targets(nvcc) == ["arch=compute_90a,code=sm_90a"], nvcc
+            assert [f for f in nvcc if f.startswith("-DNUM_STAGES")] == stages, nvcc
+            assert "--use_fast_math" not in nvcc, nvcc
+        # Identical up to the NVCC_THREADS value, which setup.py reads from
+        # the environment and the registry pins to 4.
+        assert flags[name][:-1] == registry_flags[:-1], name
+        assert flags[name][-2] == "--threads", name

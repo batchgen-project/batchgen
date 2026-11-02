@@ -28,9 +28,6 @@ ALLOWED = frozenset(
         "batchgen_kernels/__init__.py",
         # Build-time only.
         "batchgen_kernels/setup.py",
-        # Still compiles its MoE kernels with load_inline; moved to AOT by
-        # kernel PR B of the runtime-JIT elimination. Remove this entry there.
-        "batchgen/moe/fp8_wgmma_pipeline.py",
     }
 )
 # Vendored trees, build tooling and in-tree build output (stale copies of
@@ -99,6 +96,7 @@ def test_scan_covers_the_serving_packages():
     assert "batchgen_kernels/attention/dsa/fast_topk_cuda.py" in files
     assert "batchgen_kernels/attention/dsa/fused_indexer_kv_proj_cuda.py" in files
     assert "batchgen/other_kernels/hadamard_transform/__init__.py" in files
+    assert "batchgen/moe/fp8_wgmma_pipeline.py" in files
 
 
 def test_detector_flags_every_jit_spelling():

@@ -246,6 +246,33 @@ _sm90a_extensions = [
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
+    # FP8 WGMMA grouped MoE GEMM: fused gate+up (v8c) and down (v8b) with TMA
+    # descriptor builders. Only the 4-stage pipeline is built.
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_fp8_wgmma_grouped_gemm",
+        sources=["src/moe/fp8_wgmma_grouped_gemm.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "--ptxas-options=-v", "-lineinfo",
+                     "-DNUM_STAGES=4",
+                     "--threads", _nvcc_threads],
+        },
+    ),
+    # FP8 quantization feeding the WGMMA grouped GEMM (act_quant_3d,
+    # fused_silu_quant_3d), scales written in transposed [nk, E*mtp] layout.
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_fp8_wgmma_quant_ops",
+        sources=["src/moe/fp8_wgmma_quant_ops.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "--ptxas-options=-v", "-lineinfo",
+                     "--threads", _nvcc_threads],
+        },
+    ),
     # ── AOT MLA attention kernels (SM90a, BF16-only) ──
 
     # Fused RMSNorm + RoPE + cache write (KV + Q)
