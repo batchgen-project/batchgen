@@ -28,7 +28,8 @@ Three phases, each once per process:
     weight dequant;
   * decode (``configure_decoding``): the decode graph's and eager decode's
     casts, the q_a norm (fused or not, per ``norm_quant_fuse_policy``), the
-    eager RMSNorm+RoPE, the head gates and the split-K router per bucket;
+    eager RMSNorm+RoPE, the head gates, the split-K router and, with
+    DeepEP, the masked SiLU*up cast;
   * geometry (``prewarm_decode_graphs``, right before CUDA-graph capture):
     the kernels whose keys depend on the page-table widths and the graph's
     score span. It re-runs when that geometry changes. The late-compile
@@ -75,6 +76,11 @@ STRICT_DEBUG_KEY = "glm5_triton_strict"
 # 17 -> ("any", "any"). align4(rows) is the row stride of the TMA-aligned
 # MN-major scales; 13 is the one row count below 16 whose align4 is 16.
 ROW_WITNESSES = (1, 13, 16, 17)
+
+# Per-expert row extents of the DeepEP receive buffers. The masked SiLU*up
+# cast reads its scales MN-major, so the extent is the scales' group stride:
+# a multiple of the 4-float TMA alignment, either divisible by 16 or not.
+MASKED_ROW_STRIDE_WITNESSES = (16, 20)
 
 # Widths of the ACTIVE page table (``_GPUPageTableManager.gpu_table``), which
 # eager decode hands the paged KV write as a runtime int.
@@ -133,6 +139,7 @@ class Glm5PrewarmShapes:
     num_heads: int
     intermediate_size: int
     shared_intermediate_size: int
+    expert_intermediate_size: int
     index_n_heads: int
     index_head_dim: int
     index_topk: int
@@ -154,6 +161,9 @@ class Glm5PrewarmShapes:
             shared_intermediate_size=(
                 int(_require(config, "moe_intermediate_size"))
                 * int(_require(config, "n_shared_experts"))
+            ),
+            expert_intermediate_size=int(
+                _require(config, "moe_intermediate_size")
             ),
             index_n_heads=int(_require(config, "index_n_heads")),
             index_head_dim=int(_require(config, "index_head_dim")),
@@ -284,22 +294,13 @@ def quant_combos(shapes: Glm5PrewarmShapes, phase: str) -> List[QuantCombo]:
     return combos
 
 
-def router_rows(bucket: int, world_size: int, deepep: bool) -> int:
-    """Rows the graphed router GEMM sees for one bucket: the all-gathered
-    rows on the NCCL path, this rank's rows on the DeepEP path."""
-    return int(bucket) if deepep else int(world_size) * int(bucket)
-
-
-def router_buckets(buckets: Sequence[int], world_size: int, deepep: bool,
-                   row_range: Tuple[int, int]) -> List[int]:
-    """Buckets whose router rows fall in the split-K range. The split-K
-    kernels bake the partials' split stride ``rows * n_experts`` as a
-    constexpr, so each of these buckets is its own key."""
-    lo, hi = int(row_range[0]), int(row_range[1])
-    return [
-        b for b in sorted({int(b) for b in buckets if int(b) > 0})
-        if lo <= router_rows(b, world_size, deepep) <= hi
-    ]
+def router_row_witnesses(row_range: Tuple[int, int]) -> Tuple[int, ...]:
+    """Row counts covering every split-K router key. The split count is one
+    value across the range and the rows and the partials' split stride
+    ``rows * n_experts`` are runtime ints, so the keys differ only in the
+    row count's class: the first row of each class the range contains."""
+    lo, hi = max(int(row_range[0]), 1), int(row_range[1])
+    return tuple(_core.class_representatives(range(lo, min(hi, lo + 16) + 1)))
 
 
 def gather_block_t(batch: int, num_tokens: int) -> int:
@@ -425,10 +426,10 @@ def describe_section_d(predicates: Dict[str, Any]) -> List[Tuple[int, str]]:
         lines.append((level, f"hidden_size={hidden}: _rmsnorm_kernel_large "
                       f"is {verdict}"))
     if predicates.get("enable_deepep"):
-        lines.append((logging.WARNING, "enable_deepep=True: "
+        lines.append((logging.INFO, "enable_deepep=True: "
                       "_silu_mul_masked_group_quant_kernel is keyed on the "
-                      "DeepEP exchange's expert stride, which exists only "
-                      "once the MoE graph pool is built; NOT prewarmed"))
+                      "DeepEP receive buffers' per-expert row extent; "
+                      f"prewarmed on extents {MASKED_ROW_STRIDE_WITNESSES}"))
     if "aux_page_split" in predicates:
         if predicates["aux_page_split"]:
             lines.append((logging.INFO, "aux cache page-split FP8: the "
@@ -698,6 +699,29 @@ def _run_router(shapes: Glm5PrewarmShapes, rows: int, device,
     )
 
 
+def _run_masked_act_quant(inter: int, row_stride: int, device,
+                          fn: Optional[Callable] = None) -> None:
+    """The DeepEP masked chain's SiLU*up cast, laid out as
+    ``run_deepgemm_masked_moe`` hands it: gate and up as the two column
+    halves of one ``[E, S, 2I]`` buffer and the scales as the (1, 2)
+    transpose of a contiguous ``[E, I/128, S]`` block. One expert with no
+    live rows: the launch compiles the key and touches no row."""
+    if fn is None:
+        from .moe_deepgemm_masked import masked_act_quant_fn
+        fn = masked_act_quant_fn()
+    gate_up = _zeros((1, row_stride, 2 * inter), torch.bfloat16, device)
+    fn(
+        gate_up[:, :, :inter],
+        gate_up[:, :, inter:],
+        torch.empty((1, row_stride, inter), dtype=torch.float8_e4m3fn,
+                    device=device),
+        torch.empty((1, inter // SCALE_BLOCK, row_stride), dtype=torch.float32,
+                    device=device).transpose(1, 2),
+        _zeros((1,), torch.int32, device),
+        group_size=SCALE_BLOCK,
+    )
+
+
 def _run_selected_positions(geometry: Glm5DecodeGeometry, topk: int, device,
                             fn: Optional[Callable] = None) -> None:
     """The decode graph's logical-to-physical top-k transform: slot indices
@@ -860,15 +884,17 @@ def prefill_entries(shapes: Glm5PrewarmShapes, device,
 
 
 def decode_entries(shapes: Glm5PrewarmShapes, weights: Glm5DecodeWeights, *,
-                   buckets: Optional[Sequence[int]], world_size: int,
-                   deepep: bool, router_row_range: Tuple[int, int],
+                   buckets: Optional[Sequence[int]], deepep: bool,
+                   router_row_range: Tuple[int, int],
                    fuse_q_a_norm_quant: bool, device) -> List[PrewarmEntry]:
     """Weight- and bucket-keyed decode entries.
 
     ``buckets`` is the decode graph's capture bucket list. The head gates
     take the row count as a runtime int, so without the list they are
-    covered by ``ROW_WITNESSES``; the split-K router bakes the row count
-    into a constexpr and is not prewarmed without it.
+    covered by ``ROW_WITNESSES``. The split-K router's keys do not depend
+    on the bucket at all (``router_row_witnesses``), and with DeepEP the
+    masked SiLU*up cast is keyed on the receive buffers' per-expert row
+    extent (``MASKED_ROW_STRIDE_WITNESSES``).
     """
     entries = [
         PrewarmEntry(combo.name, partial(_run_act_quant, combo, device))
@@ -900,14 +926,21 @@ def decode_entries(shapes: Glm5PrewarmShapes, weights: Glm5DecodeWeights, *,
                                  weights.indexer_weights_proj, rows, device))
             for rows in rows_list
         )
-    if buckets:
-        for bucket in router_buckets(buckets, world_size, deepep,
-                                     router_row_range):
-            rows = router_rows(bucket, world_size, deepep)
-            entries.append(PrewarmEntry(
-                f"router_split_k/b{bucket}",
-                partial(_run_router, shapes, rows, device),
-            ))
+    entries.extend(
+        PrewarmEntry(f"router_split_k/rows{rows}",
+                     partial(_run_router, shapes, rows, device))
+        for rows in router_row_witnesses(router_row_range)
+    )
+    if deepep:
+        entries.extend(
+            PrewarmEntry(
+                f"masked_act_quant/i{shapes.expert_intermediate_size}"
+                f"/s{stride}",
+                partial(_run_masked_act_quant, shapes.expert_intermediate_size,
+                        stride, device),
+            )
+            for stride in MASKED_ROW_STRIDE_WITNESSES
+        )
     return entries
 
 
@@ -1168,16 +1201,7 @@ def _router_row_range() -> Tuple[int, int]:
     return ROUTER_SPLIT_K_MIN_ROWS, ROUTER_SPLIT_K_MAX_ROWS
 
 
-def _warn_missing_buckets(rank, phase: str) -> None:
-    logger.warning(
-        "%s rank=%s %s: the decode graph's bucket list is not available to "
-        "the model layer; the split-K router keys are not prewarmed and the "
-        "head-gate/paged-score keys are covered by row classes %s",
-        LOG_TAG, rank, phase, ROW_WITNESSES,
-    )
-
-
-def prewarm_glm5_decode(model, config, *, decode_buckets, world_size,
+def prewarm_glm5_decode(model, config, *, decode_buckets,
                         part_index=0, part_count=1, barrier=None,
                         rank=0) -> bool:
     """Phase 2, once per process, after the decode model's fused kernels
@@ -1193,10 +1217,8 @@ def prewarm_glm5_decode(model, config, *, decode_buckets, world_size,
         logger.warning("%s rank=%s decode norm weights are not resident; the "
                        "decode phase is not prewarmed", LOG_TAG, rank)
         return False
-    if not decode_buckets:
-        _warn_missing_buckets(rank, PHASE_DECODE)
     entries = decode_entries(
-        shapes, weights, buckets=decode_buckets, world_size=world_size,
+        shapes, weights, buckets=decode_buckets,
         deepep=bool(getattr(config, "enable_deepep", False)),
         router_row_range=_router_row_range(),
         fuse_q_a_norm_quant=glm5_norm_quant_fuse_site_enabled("q_a"),
@@ -1247,8 +1269,6 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
     )
     log_section_d({"aux_page_split": geometry.aux_page_split,
                    "eager_width_constexpr": True}, rank)
-    if not decode_buckets:
-        _warn_missing_buckets(rank, PHASE_GEOMETRY)
     # q_b output row widths whose rope half the graph's RMSNorm+RoPE reads:
     # the separate q_b GEMM, and the merged [q_b | wq_b] GEMM of the indexer
     # layers when the merge is on.

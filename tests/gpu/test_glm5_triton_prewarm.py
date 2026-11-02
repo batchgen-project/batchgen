@@ -11,16 +11,16 @@ depend on shapes, dtypes and strides only). The late-compile guard is then
 armed strict and random shapes run through the same serving wrappers:
 decode rows 1..128 including non-bucket values, prefill token counts up to
 the micro-batch cap, eager page-table widths of any class, the graph's page
-widths, and both aux cache formats (page-split FP8 as on GLM-5.2, bf16 AoS
-as on GLM-5.3). A ``LateTritonCompileError`` names the kernel and the key
+widths, router row counts anywhere in the split-K range, the DeepEP masked
+SiLU*up cast at any 4-aligned per-expert row extent, and both aux cache
+formats (page-split FP8 as on GLM-5.2, bf16 AoS as on GLM-5.3). A ``LateTritonCompileError`` names the kernel and the key
 the witness sets missed. The test also asserts that the recorder saw no
 compile after the guard was armed and that the cache directory gained no
 file.
 
 Not covered here: the eager decode's constexpr page-table widths
 (``_transform_selected_positions_kernel`` and ``_dense_paged_gather_kernel``
-over the ACTIVE table) and the DeepEP masked activation, which the prewarm
-logs as unbounded / not prewarmed.
+over the ACTIVE table), which the prewarm logs as unbounded.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
-WORLD_SIZE = 8
 MAX_PREFILL_TOKENS = 131_072  # ModuleBatchingConfig.prefill_micro_batch_token_cap default
 # Keep one prefill cast under 2**30 elements (a 2 GiB bf16 input).
 MAX_PREFILL_ELEMENTS = 1 << 30
@@ -54,7 +53,7 @@ def _shapes():
         hidden_size=6144, q_lora_rank=2048, kv_lora_rank=512,
         qk_nope_head_dim=192, qk_rope_head_dim=64, v_head_dim=256,
         num_heads=64, intermediate_size=12288, shared_intermediate_size=2048,
-        index_n_heads=32, index_head_dim=128, index_topk=2048,
+        expert_intermediate_size=2048, index_n_heads=32, index_head_dim=128, index_topk=2048,
         num_routed_experts=256, max_position_embeddings=202752,
         sparse_prefill=True,
     )
@@ -114,7 +113,7 @@ def test_random_serving_shapes_compile_nothing_after_prewarm(
     entries = tp.prefill_entries(shapes, device,
                                  kv_b_dtype=torch.float8_e4m3fn)
     entries += tp.decode_entries(
-        shapes, weights, buckets=BUCKETS, world_size=WORLD_SIZE, deepep=False,
+        shapes, weights, buckets=BUCKETS, deepep=True,
         router_row_range=row_range, fuse_q_a_norm_quant=fuse_q_a,
         device=device,
     )
@@ -158,8 +157,11 @@ def test_random_serving_shapes_compile_nothing_after_prewarm(
                 bucket = rng.choice(BUCKETS)
                 tp._run_head_gates(shapes, weights.indexer_weights_proj,
                                    bucket, device)
-                if row_range[0] <= WORLD_SIZE * bucket <= row_range[1]:
-                    tp._run_router(shapes, WORLD_SIZE * bucket, device)
+                # The router at any row count of the split-K range: the
+                # all-gathered NCCL rows and the DeepEP local rows alike.
+                tp._run_router(shapes, rng.randint(*row_range), device)
+                tp._run_masked_act_quant(shapes.expert_intermediate_size,
+                                         4 * rng.randint(1, 512), device)
                 for width in (shapes.q_b_cols,
                               shapes.q_b_cols + shapes.wq_b_cols):
                     tp._run_rope_graph(

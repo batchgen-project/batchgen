@@ -9,7 +9,8 @@ Under test: ``batchgen/models/glm/glm5/triton_prewarm.py``.
 
   * the row witnesses {1, 13, 16, 17} reach every (rows, align4(rows)) class
     pair of the blocked FP8 casts, for every width and flag combination;
-  * one head-gate, paged-score and split-K router entry per bucket;
+  * one head-gate and paged-score entry per bucket; the split-K router and
+    the DeepEP masked SiLU*up cast on bucket-independent witnesses;
   * the geometry-to-key derivation (width classes, BLOCK_P, BLOCK_S, the
     dense gather's BLOCK_T thresholds, the router row range) against
     hand-computed values;
@@ -68,7 +69,7 @@ def _shapes(sparse_prefill=True):
         hidden_size=6144, q_lora_rank=2048, kv_lora_rank=512,
         qk_nope_head_dim=192, qk_rope_head_dim=64, v_head_dim=256,
         num_heads=64, intermediate_size=12288, shared_intermediate_size=2048,
-        index_n_heads=32, index_head_dim=128, index_topk=2048,
+        expert_intermediate_size=2048, index_n_heads=32, index_head_dim=128, index_topk=2048,
         num_routed_experts=256, max_position_embeddings=202752,
         sparse_prefill=sparse_prefill,
     )
@@ -195,9 +196,9 @@ def test_quant_combos_per_phase():
 # --------------------------------------------------------------------------- #
 #  Entries per bucket
 # --------------------------------------------------------------------------- #
-def _decode_names(buckets, world_size=8, deepep=False, fuse=True):
+def _decode_names(buckets, deepep=False, fuse=True):
     return [e.name for e in TP.decode_entries(
-        _shapes(), _weights(), buckets=buckets, world_size=world_size,
+        _shapes(), _weights(), buckets=buckets,
         deepep=deepep, router_row_range=ROUTER_RANGE,
         fuse_q_a_norm_quant=fuse, device="cpu",
     )]
@@ -211,17 +212,20 @@ def _geometry_names(buckets, aux_page_split=False):
     )]
 
 
-def test_one_head_gate_and_router_entry_per_bucket():
+def test_one_head_gate_entry_per_bucket_and_bucket_free_router():
     names = _decode_names(BUCKETS)
     assert [n for n in names if n.startswith("head_gates/")] == [
         f"head_gates/b{b}" for b in BUCKETS]
-    # 8 ranks: router rows 8 * bucket in [64, 512] -> buckets 8..64.
-    assert [n for n in names if n.startswith("router_split_k/")] == [
-        f"router_split_k/b{b}" for b in (8, 16, 32, 64)]
-    # DeepEP routes this rank's rows only: buckets 64 and 128.
+    # The router's keys do not depend on the bucket: one entry per row class
+    # of the split-K range, with or without the bucket list or DeepEP.
+    router = ["router_split_k/rows64", "router_split_k/rows65"]
+    assert [n for n in names if n.startswith("router_split_k/")] == router
+    for other in (_decode_names(None), _decode_names(BUCKETS, deepep=True)):
+        assert [n for n in other if n.startswith("router_split_k/")] == router
+    assert not [n for n in names if n.startswith("masked_act_quant/")]
     deepep = _decode_names(BUCKETS, deepep=True)
-    assert [n for n in deepep if n.startswith("router_split_k/")] == [
-        "router_split_k/b64", "router_split_k/b128"]
+    assert [n for n in deepep if n.startswith("masked_act_quant/")] == [
+        f"masked_act_quant/i2048/s{s}" for s in TP.MASKED_ROW_STRIDE_WITNESSES]
     assert "rmsnorm_fp8_quant/q_a" in names
     assert "rmsnorm/q_a" in _decode_names(BUCKETS, fuse=False)
 
@@ -244,7 +248,6 @@ def test_without_buckets_row_classes_cover_class_keyed_entries():
     names = _decode_names(None)
     assert [n for n in names if n.startswith("head_gates/")] == [
         f"head_gates/rows{r}" for r in TP.ROW_WITNESSES]
-    assert not [n for n in names if n.startswith("router_split_k/")]
     scores = [n for n in _geometry_names(None) if n.startswith("paged_score/")]
     assert scores == [f"paged_score/rows{r}/w3169/s202752"
                       for r in TP.ROW_WITNESSES]
@@ -266,11 +269,16 @@ def test_prefill_entries():
 # --------------------------------------------------------------------------- #
 def test_router_row_range_and_rows():
     assert ROUTER_RANGE == (64, 512)
-    assert TP.router_rows(8, 8, deepep=False) == 64
-    assert TP.router_rows(8, 8, deepep=True) == 8
-    assert TP.router_buckets([7, 8, 64, 65], 8, False, ROUTER_RANGE) == [8, 64]
-    assert TP.router_buckets([1, 63, 64, 512, 513], 1, True,
-                             ROUTER_RANGE) == [64, 512]
+    assert TP.router_row_witnesses(ROUTER_RANGE) == (64, 65)
+    # One witness per class the range contains, the first row of each.
+    assert TP.router_row_witnesses((1, 512)) == (1, 2, 16)
+    assert TP.router_row_witnesses((65, 70)) == (65,)
+    assert TP.router_row_witnesses((60, 64)) == (60, 64)
+    # The masked cast's row extents: multiples of the 4-float TMA alignment,
+    # one divisible by 16 and one not.
+    assert all(s % 4 == 0 for s in TP.MASKED_ROW_STRIDE_WITNESSES)
+    assert sorted(TP.int_class(s) for s in TP.MASKED_ROW_STRIDE_WITNESSES) == [
+        "any", "d16"]
 
 
 def test_geometry_derivation_matches_hand_computed_values():
@@ -438,6 +446,21 @@ def test_head_gates_router_and_eager_score_runners():
                                               (64, 256)]
     assert args[2].dtype == torch.float32
 
+    # The masked cast as run_deepgemm_masked_moe hands it: gate/up are the
+    # column halves of one [E, S, 2I] buffer, the scales the (1, 2)
+    # transpose of a contiguous [E, I/128, S] block.
+    rec = _Recorder()
+    TP._run_masked_act_quant(2048, 20, "cpu", fn=rec)
+    (args, kwargs), = rec.calls
+    gate, up, out, scales, masked_m = args
+    assert gate.shape == up.shape == out.shape == (1, 20, 2048)
+    assert gate.stride() == up.stride() == (20 * 4096, 4096, 1)
+    assert up.data_ptr() - gate.data_ptr() == 2048 * gate.element_size()
+    assert out.dtype == torch.float8_e4m3fn and out.stride() == (
+        20 * 2048, 2048, 1)
+    assert scales.shape == (1, 20, 16) and scales.stride() == (16 * 20, 1, 20)
+    assert masked_m.dtype == torch.int32 and kwargs == {"group_size": 128}
+
     rec = _Recorder()
     TP._run_eager_score(shapes, "cpu", rows_list=(1,), fn=rec)
     spans = [args[1].shape[1] for args, _ in rec.calls]
@@ -473,7 +496,7 @@ def _all_names(buckets):
     shapes = _shapes()
     entries = TP.prefill_entries(shapes, "cpu", kv_b_dtype=torch.float8_e4m3fn)
     entries += TP.decode_entries(
-        shapes, _weights(), buckets=buckets, world_size=8, deepep=False,
+        shapes, _weights(), buckets=buckets, deepep=True,
         router_row_range=ROUTER_RANGE, fuse_q_a_norm_quant=True, device="cpu")
     entries += TP.geometry_entries(
         shapes, _weights(), _geometry(), buckets=buckets,
@@ -566,8 +589,12 @@ def test_section_d_logging(caplog):
     warned = "\n".join(r.getMessage() for r in caplog.records
                        if r.levelno == logging.WARNING)
     for part in ("FP8AbsorbWeights", "_triton_compute", "use_dense_mla=True",
-                 "index_topk=1024", "_silu_mul_masked_group_quant_kernel"):
+                 "index_topk=1024"):
         assert part in warned
+    # DeepEP's masked cast is prewarmed: an INFO line, not a drift warning.
+    assert "_silu_mul_masked_group_quant_kernel" not in warned
+    assert "_silu_mul_masked_group_quant_kernel" in "\n".join(
+        r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- #
@@ -583,6 +610,21 @@ def test_offset_topk_kernel_takes_n_elements_at_runtime():
     assert annotations["n_elements"] is None
     assert annotations["topk"] == "tl.constexpr"
     assert annotations["block"] == "tl.constexpr"
+
+
+def test_router_split_k_kernels_take_the_split_stride_at_runtime():
+    """``stride_ps`` is ``rows * n_experts``; as a constexpr every row count
+    in the split-K range would be its own key."""
+    tree = ast.parse((_ROOT / "batchgen_kernels" / "triton"
+                      / "glm5_router_gemm.py").read_text())
+    for name in ("_glm5_router_gemm_split_k_kernel",
+                 "_glm5_router_split_k_reduce_kernel"):
+        kernel, = [node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == name]
+        annotations = {arg.arg: ast.unparse(arg.annotation) if arg.annotation
+                       else None for arg in kernel.args.args}
+        assert annotations["m"] is None and annotations["stride_ps"] is None
+        assert annotations["stride_pm"] == "tl.constexpr"
 
 
 def test_strict_key_is_glm5_specific():
