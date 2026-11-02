@@ -448,6 +448,10 @@ if ! (
 import importlib
 from pathlib import Path
 
+# core_engine links against Torch's libraries; the runtime always imports
+# torch before batchgen.native_loader, so the check must do the same.
+import torch  # noqa: F401
+
 module = importlib.import_module("batchgen.core_engine")
 path = Path(module.__file__)
 if path.suffix not in {".so", ".pyd", ".dylib"}:
