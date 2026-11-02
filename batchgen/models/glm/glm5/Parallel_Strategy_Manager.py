@@ -130,6 +130,7 @@ class GLM5ParallelStrategyManager:
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
+        self._check_late_deepgemm_compiles("configure_prefill")
         start_time = time.perf_counter()
         timings = {}
 
@@ -276,6 +277,7 @@ class GLM5ParallelStrategyManager:
 
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""
+        self._check_late_deepgemm_compiles("configure_decoding")
         Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
@@ -453,23 +455,50 @@ class GLM5ParallelStrategyManager:
                       barrier=barrier, rank=self.global_rank)
         start = time.perf_counter()
         if phase == PHASE_PREFILL:
-            prewarm_glm5_prefill(self.loaded_model_config, **common)
+            prewarm_glm5_prefill(self.loaded_model_config,
+                                 max_rows=self._deepgemm_max_rows(), **common)
         elif phase == PHASE_DECODE:
             prewarm_glm5_decode(
                 self.model, self.loaded_model_config,
-                decode_buckets=self.decode_graph_buckets, **common,
+                decode_buckets=self.decode_graph_buckets,
+                max_rows=self._deepgemm_max_rows(), **common,
             )
         elif phase == PHASE_GEOMETRY:
             prewarm_glm5_geometry(
                 self.model, self.loaded_model_config, gpu_manager,
-                decode_buckets=self.decode_graph_buckets, **common,
+                decode_buckets=self.decode_graph_buckets,
+                world_size=self.world_size, **common,
             )
         else:
             raise ValueError(f"unknown GLM-5 Triton prewarm phase {phase!r}")
         return time.perf_counter() - start
 
+    def _deepgemm_max_rows(self) -> int:
+        """Largest row count a DeepGEMM GEMM of the prewarm must cover.
+
+        A prefill micro-batch holds at most the token cap, except a prompt
+        longer than the cap, which is a micro-batch of its own. Eager decode
+        rows are assumed to stay below it. See ``deepgemm_prewarm``.
+        """
+        cap = int(self.engine_config.Module_Batching_Config
+                  .prefill_micro_batch_token_cap)
+        prompt = self.engine_config.Basic_Config.get_max_prompt_length()
+        return max(cap, int(prompt or 0))
+
+    def _check_late_deepgemm_compiles(self, where):
+        """Log the DeepGEMM kernels compiled since the last geometry
+        prewarm; ``batchgen_debug.glm5_triton_strict`` makes it raise."""
+        if not torch.cuda.is_available():
+            return
+        from .deepgemm_prewarm import check_late_compiles
+        from .triton_prewarm import _batch_debug, strict_requested
+
+        check_late_compiles(self.global_rank, where,
+                            strict=strict_requested(_batch_debug()))
+
     def activate_prefill(self):
         """Switch the already-built prefill instance in (persistent instances)."""
+        self._check_late_deepgemm_compiles("activate_prefill")
         Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "prefill"
         self.model, self.weight_copy_task = self.prefill_instance
@@ -482,6 +511,7 @@ class GLM5ParallelStrategyManager:
 
     def activate_decoding(self):
         """Switch the already-built decode instance in and refill its experts."""
+        self._check_late_deepgemm_compiles("activate_decoding")
         prep_start = time.perf_counter()
         Glm5MoE.reset_prefill_grouped_state()
         torch.cuda.empty_cache()
