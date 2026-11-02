@@ -457,8 +457,7 @@ class GLM5ParallelStrategyManager:
         elif phase == PHASE_DECODE:
             prewarm_glm5_decode(
                 self.model, self.loaded_model_config,
-                decode_buckets=self.decode_graph_buckets,
-                world_size=self.world_size, **common,
+                decode_buckets=self.decode_graph_buckets, **common,
             )
         elif phase == PHASE_GEOMETRY:
             prewarm_glm5_geometry(
