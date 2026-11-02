@@ -7,7 +7,8 @@
 
 """GLM-5 Triton prewarm: compile every reachable serving key before it is
 needed, then log (or, under ``batchgen_debug.glm5_triton_strict``, refuse)
-any later compilation.
+any later compilation. Each phase also carries the DeepGEMM entries of
+``deepgemm_prewarm``, which documents their site table.
 
 Triton specialises a ``@triton.jit`` function on its constexpr values, every
 argument's dtype, and the integer class of every runtime int ("== 1",
@@ -329,6 +330,9 @@ class Glm5DecodeGeometry:
     aux_page_size: int
     aux_page_split: bool
     max_position_embeddings: int = 0
+    # Slot capacity of the primary GPU page table: no captured bucket exceeds
+    # it, and it bounds the DeepGEMM geometry entries' row counts.
+    max_decode_rows: int = 0
 
     @property
     def graph_max_seqlen(self) -> int:
@@ -358,7 +362,7 @@ class Glm5DecodeGeometry:
     def key(self) -> tuple:
         return (self.primary_width, self.aux_width, self.primary_page_size,
                 self.aux_page_size, self.aux_page_split,
-                self.max_position_embeddings)
+                self.max_position_embeddings, self.max_decode_rows)
 
 
 # ============================================================================
@@ -1063,6 +1067,16 @@ def _graph_table_width(manager, role: str) -> int:
     return int(width)
 
 
+def _page_table_slots(manager, role: str) -> int:
+    table = getattr(manager, "_gpu_page_table_manager", None)
+    slots = getattr(table, "max_slots", None)
+    if slots is None:
+        raise Glm5PrewarmGeometryError(
+            f"the {role} GPU KV manager exposes no page-table slot capacity"
+        )
+    return int(slots)
+
+
 def _aux_is_page_split(aux_manager, index_head_dim: int) -> bool:
     """``aux_cache_is_page_split`` on a meta probe of the aux config, as
     ``aux_manager_applies_hadamard`` resolves the format."""
@@ -1094,6 +1108,7 @@ def decode_geometry(gpu_manager, shapes: Glm5PrewarmShapes
         aux_page_size=int(aux.config.page_size_tokens),
         aux_page_split=_aux_is_page_split(aux, shapes.index_head_dim),
         max_position_embeddings=shapes.max_position_embeddings,
+        max_decode_rows=_page_table_slots(primary, "primary"),
     )
     return geometry, primary.config.kv_dtype, aux.config.kv_dtype
 
@@ -1120,12 +1135,15 @@ def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
                barrier, rank, arm_after: bool) -> None:
     """Partitioned run with the guard disarmed, so the deliberate compiles
     of a phase are never reported as late."""
+    from .deepgemm_prewarm import cache_kernel_count
+
     recorder = get_recorder()
     active = recorder if recorder.install() else None
     previous = recorder.guard.armed_mode
     recorder.guard.disarm()
     start = time.perf_counter()
     mark = active.mark() if active is not None else 0
+    deepgemm_before = cache_kernel_count()
     try:
         with torch.inference_mode():
             _core.run_prewarm(
@@ -1146,8 +1164,10 @@ def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
                 "%s rank=%s %s variants kernel=%s compiled=%d loaded=%d",
                 LOG_TAG, rank, phase, kernel, compiled, loaded,
             )
-    logger.info("%s rank=%s %s entries=%d total wall=%.1fs", LOG_TAG, rank,
-                phase, len(entries), time.perf_counter() - start)
+    logger.info("%s rank=%s %s entries=%d total wall=%.1fs DeepGEMM cache "
+                "kernels %d -> %d", LOG_TAG, rank, phase, len(entries),
+                time.perf_counter() - start, deepgemm_before,
+                cache_kernel_count())
     if arm_after and active is not None:
         logger.info(
             "%s rank=%s late-compile guard armed: later compiles log at "
@@ -1171,12 +1191,16 @@ def checkpoint_fp8_dtype(config):
     return torch.float8_e4m3fn
 
 
-def prewarm_glm5_prefill(config, *, part_index=0, part_count=1,
-                         barrier=None, rank=0) -> bool:
+def prewarm_glm5_prefill(config, *, max_rows: int, part_index=0,
+                         part_count=1, barrier=None, rank=0) -> bool:
     """Phase 1, once per process. The prefill weights are streamed, so no
-    entry reads them: every tensor is a fresh scratch."""
+    entry reads them: every tensor is a fresh scratch. ``max_rows`` bounds
+    the DeepGEMM GEMMs' row count (``deepgemm_prewarm``)."""
     if PHASE_PREFILL in _DONE_PHASES:
         return False
+    from . import deepgemm_prewarm as dg
+
+    dg.check_version(rank)
     shapes = Glm5PrewarmShapes.from_config(config)
     device = torch.device("cuda", torch.cuda.current_device())
     kv_b_dtype = checkpoint_fp8_dtype(config) if shapes.sparse_prefill else None
@@ -1185,6 +1209,8 @@ def prewarm_glm5_prefill(config, *, part_index=0, part_count=1,
                        "the sparse prefill kv_b dequant is not prewarmed",
                        LOG_TAG, rank)
     entries = prefill_entries(shapes, device, kv_b_dtype=kv_b_dtype)
+    entries += dg.prefill_entries(shapes, device, max_rows=max_rows,
+                                  num_sms=dg.deepgemm_num_sms())
     _run_phase(PHASE_PREFILL, entries, part_index=part_index,
                part_count=part_count, barrier=barrier, rank=rank,
                arm_after=False)
@@ -1201,14 +1227,17 @@ def _router_row_range() -> Tuple[int, int]:
     return ROUTER_SPLIT_K_MIN_ROWS, ROUTER_SPLIT_K_MAX_ROWS
 
 
-def prewarm_glm5_decode(model, config, *, decode_buckets,
+def prewarm_glm5_decode(model, config, *, decode_buckets, max_rows: int,
                         part_index=0, part_count=1, barrier=None,
                         rank=0) -> bool:
     """Phase 2, once per process, after the decode model's fused kernels
-    are initialised."""
+    are initialised. ``max_rows`` bounds the DeepGEMM GEMMs' row count."""
     if PHASE_DECODE in _DONE_PHASES:
         return False
+    from . import deepgemm_prewarm as dg
+    from .indexer_wk_backend import glm5_indexer_wk_is_deepgemm
     from .norm_quant_fuse_policy import glm5_norm_quant_fuse_site_enabled
+    from .qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 
     shapes = Glm5PrewarmShapes.from_config(config)
     log_section_d(decode_section_d_predicates(model, config), rank)
@@ -1224,6 +1253,13 @@ def prewarm_glm5_decode(model, config, *, decode_buckets,
         fuse_q_a_norm_quant=glm5_norm_quant_fuse_site_enabled("q_a"),
         device=weights.q_a_norm_weight.device,
     )
+    dg.check_version(rank)
+    entries += dg.decode_entries(
+        shapes, weights.q_a_norm_weight.device, max_rows=max_rows,
+        num_sms=dg.deepgemm_num_sms(),
+        merge_q_b_wq_b=glm5_qb_wqb_merge_enabled(),
+        wk_deepgemm=glm5_indexer_wk_is_deepgemm(),
+    )
     _run_phase(PHASE_DECODE, entries, part_index=part_index,
                part_count=part_count, barrier=barrier, rank=rank,
                arm_after=False)
@@ -1232,14 +1268,17 @@ def prewarm_glm5_decode(model, config, *, decode_buckets,
 
 
 def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
-                          part_index=0, part_count=1, barrier=None,
-                          rank=0) -> bool:
-    """Phase 3: once per page-table geometry. Arms the late-compile guard.
+                          world_size: int = 1, part_index=0, part_count=1,
+                          barrier=None, rank=0) -> bool:
+    """Phase 3: once per page-table geometry. Arms the late-compile guard
+    and records the DeepGEMM cache's kernel count.
 
     Every rank must reach the same decision, or the phase barrier hangs;
     the geometry comes from the KV configuration, which all ranks share.
+    ``world_size`` is the EP world of the DeepEP MoE's ``expected_m``.
     """
     global _GEOMETRY_KEY
+    from . import deepgemm_prewarm as dg
     from .qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 
     shapes = Glm5PrewarmShapes.from_config(config)
@@ -1261,10 +1300,10 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
     previous = _GEOMETRY_KEY
     logger.info(
         "%s rank=%s geometry primary_width=%d aux_width=%d page_sizes=%d/%d "
-        "aux_page_split=%s graph_max_seqlen=%d%s",
+        "aux_page_split=%s graph_max_seqlen=%d max_decode_rows=%d%s",
         LOG_TAG, rank, geometry.primary_width, geometry.aux_width,
         geometry.primary_page_size, geometry.aux_page_size,
-        geometry.aux_page_split, capacity,
+        geometry.aux_page_split, capacity, geometry.max_decode_rows,
         "" if previous is None else f" (changed from {previous})",
     )
     log_section_d({"aux_page_split": geometry.aux_page_split,
@@ -1280,8 +1319,29 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
         q_row_widths=q_row_widths, primary_dtype=primary_dtype,
         aux_dtype=aux_dtype, device=weights.q_a_norm_weight.device,
     )
+    dg.check_version(rank)
+    stacks = None
+    if bool(getattr(config, "enable_deepep", False)):
+        stacks = dg.moe_stacks(model)
+        if stacks is None:
+            logger.warning(
+                "%s rank=%s enable_deepep is set but no MoE layer holds the "
+                "fused masked-GEMM stacks; the DeepEP masked GEMMs are NOT "
+                "prewarmed", LOG_TAG, rank,
+            )
+    entries += dg.geometry_entries(
+        shapes, weights.q_a_norm_weight.device,
+        max_decode_rows=geometry.max_decode_rows,
+        num_sms=dg.deepgemm_num_sms(),
+        merge_q_b_wq_b=glm5_qb_wqb_merge_enabled(),
+        page_split=geometry.aux_page_split, moe_stacks=stacks,
+        world_size=world_size,
+        topk=int(getattr(config, "num_experts_per_tok", 1) or 1),
+        page_size=geometry.aux_page_size,
+    )
     _run_phase(PHASE_GEOMETRY, entries, part_index=part_index,
                part_count=part_count, barrier=barrier, rank=rank,
                arm_after=True)
+    dg.record_baseline(rank)
     _GEOMETRY_KEY = geometry.key()
     return True

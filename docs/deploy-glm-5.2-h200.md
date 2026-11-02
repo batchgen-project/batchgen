@@ -18,6 +18,7 @@ For the complete client API, see the [Batch API Guide](batch-api-guide.md).
 5. [Start the Server](#5-start-the-server)
 6. [Submit Jobs](#6-submit-jobs)
 7. [Qualified Performance and Limits](#7-qualified-performance-and-limits)
+8. [Startup Kernel Prewarm](#8-startup-kernel-prewarm)
 
 ---
 
@@ -207,3 +208,42 @@ rank at a time to bound host-memory peaks; smaller jobs retain parallel
 tokenization. If a worker exits, inspect the first Python traceback from the
 failing rank. When no Python exception exists, check the host kernel log for an
 OOM kill before attributing later distributed-store or supervisor errors.
+
+## 8. Startup Kernel Prewarm
+
+Every worker compiles the Triton and DeepGEMM kernels the GLM-5 serving code
+can select before it needs them, in three phases: at the first prefill
+configuration, at the first decode configuration, and right before decode
+CUDA-graph capture. The eight ranks of the node split each phase's compiles,
+meet at a barrier, and then load the full set. Each phase logs:
+
+```text
+[GLM5_TRITON_WARMUP] rank=R <phase> entries=E total wall=Xs DeepGEMM cache kernels A -> B
+```
+
+DeepGEMM JIT-compiles one kernel per configuration it selects for a GEMM, and
+selects the configuration from the GEMM's row count with a cost model. The
+prewarm reproduces that selection
+(`batchgen_kernels/deepgemm_sm90_configs.py`, written for DeepGEMM
+0.1.5.post3; any other installed version logs a WARNING and may compile late)
+and launches one representative row count per configuration: the attention,
+indexer, dense-MLP and expert projections over every row count up to the
+larger of the prefill micro-batch token cap and the longest prompt; the decode
+graph's masked projections and, with `--enable-deepep`, the routed experts'
+masked GEMMs over every batch up to the decode page table's slot capacity; the
+indexer's paged scorer for every 32-row batch alignment up to that capacity;
+and the packed sparse prefill's indexer scorer. The kernels persist in
+`DG_JIT_CACHE_DIR` (default `~/.deep_gemm`), so a warm cache only loads them.
+After the graph phase each worker records the cache's kernel count and
+compares it at every later phase switch. A kernel compiled in between is
+reported as
+
+```text
+[GLM5_DEEPGEMM_WARMUP] rank=R DeepGEMM compiled N kernels after the prewarm (cache ...: A -> B, seen at ...)
+```
+
+and raises instead when the batch sets
+`"batchgen_debug": {"glm5_triton_strict": true}` (acceptance runs only). The
+cache is shared by the node's ranks, so the count covers all of them. An eager
+decode batch larger than the slot capacity can still compile the paged
+scorer's schedule kernel for its batch alignment.
