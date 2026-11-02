@@ -51,7 +51,7 @@ _WRAPPERS_SRC = _GLM5 / "wrappers.py"
 _MODEL_SRC = _GLM5 / "model.py"
 _SELECTOR_SRC = _ROOT / "batchgen" / "attention" / "dsa" / "glm5_decode_selector.py"
 _SCORE_SRC = _ROOT / "batchgen_kernels" / "attention" / "dsa" / "fused_indexer_score.py"
-_CSRC = _ROOT / "batchgen_kernels" / "attention" / "dsa" / "indexer" / "csrc"
+_CSRC = _ROOT / "batchgen_kernels" / "src" / "attention" / "hadamard"
 _INDEXER_INIT = _ROOT / "batchgen_kernels" / "attention" / "dsa" / "indexer" / "__init__.py"
 
 # GLM-5.2 (batchgen/models/glm/glm5/config.json): 64 heads x 256, 32 index

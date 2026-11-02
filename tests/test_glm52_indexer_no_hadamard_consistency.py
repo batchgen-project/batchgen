@@ -48,22 +48,12 @@ _SELECTOR_SRC = ROOT / "batchgen" / "attention" / "dsa" / "glm5_decode_selector.
 _MODEL_SRC = ROOT / "batchgen" / "models" / "glm" / "glm5" / "model.py"
 _WRAPPERS_SRC = ROOT / "batchgen" / "models" / "glm" / "glm5" / "wrappers.py"
 _PREFILL_SRC = ROOT / "batchgen" / "models" / "glm" / "glm5" / "sparse_prefill.py"
-_Q_KERNEL_SRC = (
-    ROOT / "batchgen_kernels" / "attention" / "dsa" / "indexer" / "csrc"
-    / "fused_rope_hadamard.cu"
-)
-_Q_KERNEL_BINDING = (
-    ROOT / "batchgen_kernels" / "attention" / "dsa" / "indexer" / "csrc"
-    / "fused_rope_hadamard_binding.cpp"
-)
-_MODEL_Q_KERNEL_SRC = (
-    ROOT / "batchgen" / "other_kernels" / "hadamard_transform" / "csrc"
-    / "fused_rope_hadamard.cu"
-)
-_MODEL_Q_KERNEL_BINDING = (
-    ROOT / "batchgen" / "other_kernels" / "hadamard_transform" / "csrc"
-    / "fused_rope_hadamard_binding.cpp"
-)
+# The only copy of the Q kernel: ``batchgen.other_kernels.hadamard_transform``
+# re-exports the AOT extension built from these sources.
+_HADAMARD_SRC_DIR = ROOT / "batchgen_kernels" / "src" / "attention" / "hadamard"
+_Q_KERNEL_SRC = _HADAMARD_SRC_DIR / "fused_rope_hadamard.cu"
+_Q_KERNEL_BINDING = _HADAMARD_SRC_DIR / "fused_rope_hadamard_binding.cpp"
+_HADAMARD_COMMON = _HADAMARD_SRC_DIR / "fast_hadamard_transform_common.h"
 _K_KERNEL_SRC = (
     ROOT / "batchgen_kernels" / "src" / "attention"
     / "fused_indexer_k_norm_rope_write_fp8.cu"
@@ -491,27 +481,41 @@ def test_no_call_site_hardcodes_the_rotation():
 # 5. Both kernel instantiations stay buildable (structural -- no nvcc here)
 # ──────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize(
-    "path", (_Q_KERNEL_SRC, _MODEL_Q_KERNEL_SRC), ids=("kernels", "model")
-)
-def test_the_q_kernel_keeps_both_rotation_instantiations(path):
+def test_the_q_kernel_keeps_both_rotation_instantiations():
     """Mirrors upstream's ``kHadamard`` template parameter: the rotation is a
     compile-time switch and NEITHER arm is deleted."""
 
-    text = path.read_text()
+    text = _Q_KERNEL_SRC.read_text()
     assert "template <bool kApplyHadamard>" in text
     assert "if constexpr (kApplyHadamard) {" in text
     assert "fused_rope_hadamard_kernel<true><<<" in text
     assert "fused_rope_hadamard_kernel<false><<<" in text
 
 
-@pytest.mark.parametrize(
-    "path", (_Q_KERNEL_SRC, _MODEL_Q_KERNEL_SRC), ids=("kernels", "model")
-)
-def test_the_q_kernel_scales_only_when_it_rotates(path):
+def test_the_q_kernel_shuffles_only_its_16_active_lanes():
+    """The kernel launches 16 threads, so a full-warp shuffle mask names lanes
+    that do not exist (undefined behaviour); both warp stages pass the
+    16-lane mask and the shared helper takes it as a template parameter."""
+
+    common = _HADAMARD_COMMON.read_text()
+    assert "uint32_t kActiveMask = FULL_MASK>" in common
+    assert "__shfl_xor_sync(kActiveMask, x[c][i], lane_mask)" in common
+    assert "__shfl_xor_sync(FULL_MASK" not in common
+
+    text = _Q_KERNEL_SRC.read_text()
+    assert "__launch_bounds__(16)" in text
+    warp_calls = [
+        line.strip() for line in text.splitlines() if "hadamard_mult_warp<" in line
+    ]
+    assert warp_calls == [
+        "hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts, 0x0000FFFFu>(x_vals);"
+    ] * 2, warp_calls
+
+
+def test_the_q_kernel_scales_only_when_it_rotates():
     """1/sqrt(128) normalizes H, so the no-rotation arm must not apply it."""
 
-    text = path.read_text()
+    text = _Q_KERNEL_SRC.read_text()
     assert "float store_scale = 1.0f;" in text
     assert "store_scale = params.scale;" in text
     body = text.split("if constexpr (kApplyHadamard) {", 1)[1]
@@ -521,13 +525,10 @@ def test_the_q_kernel_scales_only_when_it_rotates(path):
     )
 
 
-@pytest.mark.parametrize(
-    "path", (_Q_KERNEL_BINDING, _MODEL_Q_KERNEL_BINDING), ids=("kernels", "model")
-)
-def test_the_q_binding_defaults_to_rotating(path):
+def test_the_q_binding_defaults_to_rotating():
     """The bf16 AoS models keep their semantics even at an un-updated call."""
 
-    text = path.read_text()
+    text = _Q_KERNEL_BINDING.read_text()
     assert "bool apply_hadamard = true" in text
     assert 'pybind11::arg("apply_hadamard") = true' in text
     assert "fused_rope_hadamard_launch(params, apply_hadamard, stream)" in text

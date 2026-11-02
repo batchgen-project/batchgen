@@ -7,10 +7,27 @@ This mirrors setup.py ext_modules. When adding a new CUDAExtension in
 setup.py, add a corresponding entry here for JIT dev mode support.
 """
 
-# Common flag sets (mirror setup.py)
+# Common flag sets (mirror setup.py). SM90a code is always selected with the
+# explicit two-item ``-gencode arch=compute_90a,code=sm_90a``: the ``-arch=``
+# shorthand lets torch append its own arch flags and emits a plain compute_90
+# image that ptxas rejects for wgmma.*.
+_SM90A_GENCODE = ["-gencode", "arch=compute_90a,code=sm_90a"]
+
 _SM90A_FLAGS = [
-    "-std=c++17", "-arch=sm_90a", "-O3",
+    "-std=c++17", *_SM90A_GENCODE, "-O3",
     "--ptxas-options=-v", "-lineinfo", "--threads", "4",
+]
+
+# Hadamard extensions: the flags the kernels were validated with.
+_HADAMARD_NVCC_FLAGS = [
+    "-O3", "-std=c++17", "--use_fast_math",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--threads", "4",
 ]
 
 _SM80_GENCODE = [
@@ -49,7 +66,7 @@ def get_registry():
         "batchgen_kernels.moe._C_marlin_grouped_gemm": {
             "sources": ["src/moe/marlin_grouped_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
                 "--use_fast_math", "-lineinfo",
                 "-DUSE_BF16_COMPUTE",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -59,7 +76,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_gemm": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
                 "-lineinfo", "--expt-relaxed-constexpr",
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
                 "-DNDEBUG", "-Xptxas=-v",
@@ -70,14 +87,14 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_ops": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
                 "-lineinfo", "--threads", "4",
             ],
         },
         "batchgen_kernels.moe._C_marlin_transform": {
             "sources": ["src/moe/marlin_transform_kernel.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
                 "--use_fast_math", "--threads", "4",
             ],
         },
@@ -252,6 +269,44 @@ def get_registry():
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
+        },
+        # Only the 4-stage pipeline exists; build_module() rejects others.
+        "batchgen_kernels.attention._C_indexer_kv_proj_wgmma": {
+            "sources": ["src/attention/indexer_kv_proj_wgmma.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "--ptxas-options=-v", "-lineinfo",
+                "-DNUM_STAGES=4",
+                "--threads", "4",
+            ],
+        },
+
+        # ── AOT DSA indexer kernels (SM80+, no WGMMA) ──
+
+        "batchgen_kernels.attention._C_dsa_fast_topk": {
+            "sources": ["src/attention/dsa_fast_topk.cu"],
+            "nvcc_flags": [
+                "-O3", "--use_fast_math", "-std=c++17",
+                "--threads", "4",
+            ] + _SM80_GENCODE,
+        },
+        "batchgen_kernels.attention._C_fast_hadamard_transform": {
+            "sources": [
+                "src/attention/hadamard/hadamard_binding.cpp",
+                "src/attention/hadamard/fast_hadamard_transform_cuda.cu",
+            ],
+            "nvcc_flags": _HADAMARD_NVCC_FLAGS + _SM80_GENCODE,
+            "cxx_flags": ["-O3", "-std=c++17"],
+            "include_dirs": ["src/attention/hadamard"],
+        },
+        "batchgen_kernels.attention._C_fused_rope_hadamard": {
+            "sources": [
+                "src/attention/hadamard/fused_rope_hadamard_binding.cpp",
+                "src/attention/hadamard/fused_rope_hadamard.cu",
+            ],
+            "nvcc_flags": _HADAMARD_NVCC_FLAGS + _SM80_GENCODE,
+            "cxx_flags": ["-O3", "-std=c++17"],
+            "include_dirs": ["src/attention/hadamard"],
         },
 
         # ── AOT MoE token permutation (SM80+) ──

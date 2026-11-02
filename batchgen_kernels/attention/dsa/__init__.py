@@ -1,7 +1,7 @@
 """DSA (Dense Sparse Attention) indexer and absorb kernels for GLM-5 decode.
 
 Requires H20 (SM90a) with WGMMA + TMA support.
-All kernels use runtime CUDA compilation (load_inline) or Triton JIT.
+Native CUDA kernels are AOT extensions (setup.py); the rest are Triton JIT.
 """
 
 __all__ = []
