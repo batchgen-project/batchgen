@@ -80,7 +80,7 @@ def _glm5_router_gemm_split_k_kernel(
     stride_xk: tl.constexpr,
     stride_wn: tl.constexpr,
     stride_wk: tl.constexpr,
-    stride_ps: tl.constexpr,
+    stride_ps,
     stride_pm: tl.constexpr,
     stride_pn: tl.constexpr,
     block_m: tl.constexpr,
@@ -97,6 +97,9 @@ def _glm5_router_gemm_split_k_kernel(
     same range, so this program's accumulator is the serial kernel's partial
     sum over that range. ``m`` appears only in the row mask, never in a bound,
     so no row's arithmetic can change with the bucket size.
+
+    ``stride_ps`` is ``m * n``, so it is a runtime int like ``m``: as a
+    constexpr it would compile one binary per row count in the split-K range.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -144,7 +147,7 @@ def _glm5_router_split_k_reduce_kernel(
     output,
     m,
     n: tl.constexpr,
-    stride_ps: tl.constexpr,
+    stride_ps,
     stride_pm: tl.constexpr,
     stride_pn: tl.constexpr,
     stride_om: tl.constexpr,
