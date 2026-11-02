@@ -184,7 +184,7 @@ def build_packed_causal_ranges(
 def _offset_topk_indices_kernel(
     indices_ptr,
     starts_ptr,
-    n_elements: tl.constexpr,
+    n_elements,
     topk: tl.constexpr,
     block: tl.constexpr,
 ):
