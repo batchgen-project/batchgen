@@ -75,8 +75,10 @@ BatchGen does not compile its own C++/CUDA code at server startup or on the
 first request, so `TORCH_EXTENSIONS_DIR` and a warm torch-extensions cache play
 no part in a production install. Triton kernels are still compiled by Triton at
 run time and cached in Triton's cache directory (`TRITON_CACHE_DIR`, by default
-`~/.triton/cache`); Kimi-K3 and the GLM-5 family compile theirs before serving,
-as described in their deployment guides.
+`~/.triton/cache`), and DeepGEMM compiles its kernels into its own cache
+(`DG_JIT_CACHE_DIR`, by default `~/.deep_gemm`). Kimi-K3 and the GLM-5 family
+compile the kernels they serve with before serving, as described in their
+deployment guides; keep both caches on a local disk.
 
 ## Option C: Pre-built Wheels (Fastest, ~2 min)
 

@@ -173,7 +173,11 @@ ranks of the node split each phase's compiles over Triton's shared cache
 directory (`TRITON_CACHE_DIR`, by default `~/.triton/cache`), meet at a
 barrier, and then every rank loads the full set. The first start on an empty
 cache therefore takes longer; with a warm cache the phases only load binaries.
-Keep the cache on storage that outlives the container to avoid recompiling.
+Keep the cache on a local disk: on a network filesystem the ranks can hit
+stale-file-handle errors while they read each other's binaries. A local disk
+that outlives the container also avoids recompiling after a restart. The same
+phases compile the DeepGEMM kernels; see
+[Startup Kernel Prewarm](#8-startup-kernel-prewarm).
 
 Each phase logs its compile and load counts, and the end of the `geometry`
 phase arms a late-compile guard:
@@ -273,11 +277,10 @@ OOM kill before attributing later distributed-store or supervisor errors.
 
 ## 8. Startup Kernel Prewarm
 
-Every worker compiles the Triton and DeepGEMM kernels the GLM-5 serving code
-can select before it needs them, in three phases: at the first prefill
-configuration, at the first decode configuration, and right before decode
-CUDA-graph capture. The eight ranks of the node split each phase's compiles,
-meet at a barrier, and then load the full set. Each phase logs:
+The three prewarm phases described under
+[Startup Triton prewarm](#startup-triton-prewarm) also compile the DeepGEMM
+kernels the GLM-5 serving code can select, split over the node's ranks in the
+same way. Each phase logs:
 
 ```text
 [GLM5_TRITON_WARMUP] rank=R <phase> entries=E total wall=Xs DeepGEMM cache kernels A -> B
@@ -295,7 +298,8 @@ graph's masked projections and, with `--enable-deepep`, the routed experts'
 masked GEMMs over every batch up to the decode page table's slot capacity; the
 indexer's paged scorer for every 32-row batch alignment up to that capacity;
 and the packed sparse prefill's indexer scorer. The kernels persist in
-`DG_JIT_CACHE_DIR` (default `~/.deep_gemm`), so a warm cache only loads them.
+`DG_JIT_CACHE_DIR` (default `~/.deep_gemm`), so a warm cache only loads them;
+keep it on a local disk, like the Triton cache.
 After the graph phase each worker records the cache's kernel count and
 compares it at every later phase switch. A kernel compiled in between is
 reported as

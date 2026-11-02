@@ -65,8 +65,7 @@ Other components (license text retained in each file's header)
 CUTLASS -- NVIDIA, BSD-3-Clause
   batchgen_kernels/3rd/cutlass/
 fast-hadamard-transform -- Tri Dao, BSD-3-Clause
-  batchgen/other_kernels/hadamard_transform/csrc/
-  batchgen_kernels/attention/dsa/indexer/csrc/
+  batchgen_kernels/src/attention/hadamard/
 vLLM -- The vLLM team, Apache-2.0
   batchgen/distributed/utils.py
 SGLang -- SGLang Team, Apache-2.0

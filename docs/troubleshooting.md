@@ -127,7 +127,7 @@ reshape on load).
 
 ---
 
-## 7. First startup on a new node is slower than later ones (Triton prewarm)
+## 7. First startup on a new node is slower than later ones (kernel prewarm)
 
 **Symptom:** Kimi-K3 or a GLM-5 family model takes noticeably longer to become ready on a
 node with an empty Triton cache, and the log shows `[K3_TRITON_WARMUP]` or
@@ -137,10 +137,13 @@ node with an empty Triton cache, and the log shows `[K3_TRITON_WARMUP]` or
 can reach before they serve, so the first requests do not stall on compilation. The ranks
 of a node split the compiles over Triton's shared cache directory (`TRITON_CACHE_DIR`, by
 default `~/.triton/cache`). With a warm cache the same lines report `loaded=` counts and
-the step only loads binaries.
+the step only loads binaries. GLM-5 also compiles its DeepGEMM kernels in the same
+phases, into DeepGEMM's cache directory (`DG_JIT_CACHE_DIR`, by default `~/.deep_gemm`).
 
-**Fix:** None needed. To avoid recompiling after a container is recreated, keep the
-Triton cache directory on storage that outlives the container.
+**Fix:** None needed. Keep both cache directories on a local disk: on a network
+filesystem the ranks can hit stale-file-handle errors while they read each other's
+binaries. A local disk that outlives the container also avoids recompiling after the
+container is recreated.
 
 ---
 
@@ -156,6 +159,8 @@ specialisation key so the gap can be reported. `source=load` means the binary ca
 the on-disk cache but was still missed by the prewarm. For GLM-5, decode batches larger
 than the top CUDA-graph bucket run eagerly, and some eager kernels are keyed on the active
 page-table width; those keys are not prewarmed, so late compiles on that path are expected.
+For GLM-5, a DeepGEMM kernel compiled after the prewarm is reported at the next phase
+switch as `[GLM5_DEEPGEMM_WARMUP] ... DeepGEMM compiled N kernels after the prewarm`.
 
 **Fix:** Report the line. To make such a compile fail instead (acceptance runs only,
 never in production), create the batch with `"batchgen_debug": {"k3_triton_strict": true}`

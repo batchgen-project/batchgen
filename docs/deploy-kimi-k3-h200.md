@@ -299,8 +299,9 @@ shape classes (`KDA_PREFILL_SHAPES` in `kimi_linear/triton_prewarm.py`) through 
 itself, so the first requests load compiled kernels instead of compiling them. The eight ranks of
 a node share one Triton cache directory: each compiles its share, they meet at a barrier, and every
 rank then loads the full set. A cold cache makes startup slower; a warm cache only loads. The
-cache is Triton's cache directory (`TRITON_CACHE_DIR`, by default `~/.triton/cache`); keep it on
-storage that outlives the container to avoid recompiling after the container is recreated.
+cache is Triton's cache directory (`TRITON_CACHE_DIR`, by default `~/.triton/cache`); keep it on a
+local disk (a network filesystem can return stale-file-handle errors while the ranks read
+each other's binaries), ideally one that outlives the container to avoid recompiling.
 
 Each rank logs its two phases and, at the end, arms a late-compile guard:
 
