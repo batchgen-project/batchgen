@@ -60,6 +60,12 @@ and `batchgen_kernels` worktrees must be from the same release revision; a
 shared checkout that another model session moves can select incompatible
 kernels.
 
+This release requires `batchgen_kernels` 0.6.0 or newer. The GLM-5 DSA
+indexer kernels and the FP8 WGMMA MoE kernels are AOT extensions inside it,
+and the startup preflight refuses a build that lacks them; an environment
+built for an earlier release must rebuild `batchgen_kernels` (re-run
+`install_deps.sh --all` from the new checkout).
+
 The GLM-5.3 FA3 path also imports the SGLang-maintained `sgl-deep-gemm`
 distribution (`0.1.5.post3`). This is the DeepGEMM runtime package only; it
 does not install SGLang. Keep the license and attribution files from the
@@ -138,6 +144,12 @@ correctness but not for throughput measurements. Decode batches larger than the
 top bucket run eagerly. Keep `--disable-cuda-graphs` only for an explicitly
 isolated compatibility diagnostic.
 
+`--max-pool-size` is now a deprecated compatibility value: it is still accepted
+but no longer limits how many sequences the server holds, which is derived
+from `--input-ids-pool-size-gb` and the model context. The qualification in
+section 7 was recorded with an earlier build in which the flag still set the
+pool size.
+
 `--parse-thinking` places the generated reasoning before the template-primed
 `</think>` boundary in `message.reasoning_content` and leaves the answer in
 `message.content`. GLM-5.3 supports `reasoning_effort=low`, `high`, and `max`;
@@ -149,6 +161,14 @@ Wait for readiness before submitting a batch:
 ```bash
 curl --fail http://127.0.0.1:10904/health
 ```
+
+GLM-5.3 compiles its serving Triton kernels before it needs them, exactly as
+GLM-5.2 does: the `prefill` and `decode` phases run while the worker builds the
+persistent instances, the `geometry` phase runs when the first batch enters
+decode, and its end arms a late-compile guard. The first start on an empty
+Triton cache takes longer. The `[GLM5_TRITON_WARMUP]` log lines and the strict
+`batchgen_debug.glm5_triton_strict` check are described under "Startup Triton
+prewarm" in [the GLM-5.2 H200 guide](deploy-glm-5.2-h200.md#startup-triton-prewarm).
 
 ## 6. Submit requests
 

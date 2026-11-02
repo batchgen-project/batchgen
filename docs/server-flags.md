@@ -66,9 +66,23 @@ is passed explicitly to every worker; PyNccl initialization and recovery never
 scan outside `[pynccl-port-base, pynccl-port-base + pynccl-port-span)`.
 
 Every node runs a server, but only node 0 serves batches: on any other node the
-`/v1/files` and `/v1/batches` routes answer `409` naming node 0, and the server
-neither takes ownership of nor recovers the batch store at startup. Send batches
-and files to node 0; `/health` and `/v1/workers/status` are served on every node.
+`/v1/files`, `/v1/batches`, `/v1/turns` and `/v1/sessions` routes answer `409`
+naming node 0, and the server neither takes ownership of nor recovers the batch
+store at startup. Send batches, files, turns and session calls to node 0;
+`/health` and `/v1/workers/status` are served on every node.
+
+### Worker-pool restart
+
+`POST /v1/workers/restart` replaces the GPU worker processes while the server
+keeps running: the shared memory that holds the model weights and the host KV
+cache, and the batch store, are owned by the server process and survive the
+restart, so the checkpoint is not read again, and the new workers load
+BatchGen's Python code from disk again. A batch that is still running when the
+restart begins is marked failed and its host KV pages are released. The optional JSON body `{"timeout": <seconds>}`
+bounds the restart (default 600 s); a restart that exceeds it answers `504`.
+While the pool is restarting or down, `/health` answers `503` and
+`POST /v1/batches` answers `503` with `Retry-After`. The earlier `/v1/reload`
+endpoint no longer exists.
 
 ### Coordinated worker-pool restart
 
@@ -362,7 +376,7 @@ python -m batchgen.launch_http_server \
 
 ### CUDA Graph Acceleration
 
-CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CPU overhead. Enabled by default for supported models during the decode phase.
+CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CPU overhead. For GPT-OSS-120B, Kimi K2.5/K2.6 and the GLM-5 FP8 family, the decode graph is captured only when `--enable-cuda-graph` is passed. Kimi-Linear and Kimi-K3 choose their decode graphs through the planner and do not accept the flag.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -371,16 +385,46 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
 | `--persistent-phase-instances` | `false` | Keep supported prefill and decode model instances alive across phase switches. For GLM-5/5.1/5.2 this also retains decode graphs and swaps only the routed experts needed by the active phase. |
+| `--glm5-disable-decode-host-kv-staging` | `false` | Diagnostic only. Captures the GLM-5 whole-model decode graphs without the per-layer host-KV staging copies, so decoded tokens are never appended to the host KV cache and migration or recovery of decode tails is broken. Do not use it for serving. |
 
 **How it works:**
 - At startup, CUDA graphs are captured at multiple discrete batch sizes (buckets) from 1 to `--cuda-graph-max-bucket-size`
 - During decode, the actual batch size is rounded up to the nearest bucket and the pre-captured graph is replayed
 - If the batch size exceeds the max bucket on any rank, all ranks fall back to eager execution for that step
-- Use `BATCHGEN_SEGMENTED_GRAPH=1` to switch from whole-model graph to per-segment graph mode
+- The whole-model decode graph is the only graph mode. The retired environment variables `BATCHGEN_SEGMENTED_GRAPH` and `BATCHGEN_GLM5_*_CUDA_GRAPH` are no longer read and have no effect.
 
 For GLM-5/5.1/5.2, graph context capacity is derived from the model and its
 primary and auxiliary KV page tables. `--cuda-graph-max-bucket-size` limits
 decode batch size per rank; it does not limit prompt or context length.
+
+### Prefix Cache
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable-prefix-cache` | `false` | Enable page-level reuse of shared prompt prefixes through the host KV cache. Supported model types: GPT-OSS, GLM-5.2 and GLM-5.3 (sparse DSA prefill), Kimi-K3 and Kimi-Linear. For any other model the server refuses the flag at argument validation, before any resource is allocated. For GLM-5.2, GLM-5.3, Kimi-K3 and Kimi-Linear, reuse happens only inside a planned prefill wave. |
+| `--prefix-cache-debug-stats` | `false` | Log prefix-cache lifecycle statistics. Use it together with `--enable-prefix-cache`. |
+
+---
+
+## Logging
+
+Every process of a run (the HTTP server, every GPU worker and, where used, the
+standalone parameter server) writes one structured JSONL event log and a
+readable console log on stderr. All processes of one run, on every node, write
+under one run directory:
+
+```
+<log-dir>/<UTC start>-<run id prefix>/node<N>/server.jsonl
+<log-dir>/<UTC start>-<run id prefix>/node<N>/rank<R>.jsonl
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--log-dir` | `./batchgen_logs` | Root directory of the structured event log. A relative path resolves against the launch directory. |
+| `--log-level` | `INFO` | Minimum level of both the console and the JSONL log: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. The same level applies to the native (C++) loggers. |
+
+When a process exits because of a fatal error, its last record is a CRITICAL
+`process.exit` event that names the reason (see [Cluster fail-fast](#cluster-fail-fast)).
 
 ---
 
@@ -464,8 +508,10 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
-| `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
-| `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. When the config sets `store_residency` (`run` or `resident`, written by the store builder's `--store-residency`), the server first stages the store into a directory it owns under `store_staging_dir` (default `/dev/shm/batchgen-weight-stores`, a tmpfs; `huge=within_size` or `huge=always` under `--fast-init`) and maps that copy; `run` removes the copy when the server stops, `resident` keeps it for the next start. Without `store_residency` the store is mapped where it was built. |
+| `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). **Kimi-K3 with `--enable-deepep` is not supported in v1.1.0**: serve Kimi-K3 on the default NCCL exchange. |
+| `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON), currently for Kimi-K3 on 2 or 4 nodes of 8 GPUs. When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. The optional config key `bootstrap_timeout_s` (a positive integer, default 600) is the per-peer connect budget of the weight daemon at startup; raise it when one node's listener can open late. When the config sets `store_residency` (`run` or `resident`, written by the store builder's `--store-residency`), the server first stages the store into a directory it owns under `store_staging_dir` (default `/dev/shm/batchgen-weight-stores`, a tmpfs; `huge=within_size` or `huge=always` under `--fast-init`) and maps that copy; `run` removes the copy when the server stops, `resident` keeps it for the next start. Without `store_residency` the store is mapped where it was built. |
+| `--replicated-weights` | `false` | Explicit opt-in to the replicated parameter server for a multi-node Kimi-K3 launch, where the distributed host-weight store is the default. A multi-node Kimi-K3 launch must pass either `--distributed-weight-config` or `--replicated-weights`; passing both is rejected, and so is `--replicated-weights` on any other launch. See [Kimi-K3 on H200](deploy-kimi-k3-h200.md). |
+| `--input-ids-pool-size-gb` | `50.0` | Fixed node-shared budget, in GiB, of the int32 token-id pool. The number of sequences the server can hold is derived from this budget and the model's maximum context. Must be positive. |
 | `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |

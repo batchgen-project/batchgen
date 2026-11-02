@@ -132,6 +132,13 @@ pip install . --no-build-isolation
 cd ..
 ```
 
+This release needs `batchgen_kernels` 0.6.0 or newer, which also contains the
+GLM-5 DSA indexer and FP8 WGMMA MoE kernels as AOT extensions. If a build from
+an earlier release is installed, rebuild it from this checkout with the
+command above; the server refuses an older or incomplete build at startup and
+never compiles the missing kernels itself. Do not use an editable install
+(`pip install -e`).
+
 ---
 
 ## Step 8: Install BatchGen
@@ -141,8 +148,12 @@ tree on `sys.path`, which shadows the installed package and breaks ray/productio
 launches — see [INSTALL.md](INSTALL.md#important-do-not-run-from-the-source-directory).
 
 ```bash
-pip install . --no-build-isolation
+BUILD_OPS=1 pip install . --no-build-isolation
 ```
+
+`BUILD_OPS=1` builds `batchgen.core_engine` as an AOT extension during the
+install. Without it the package installs without `core_engine`, and the server
+refuses to start because it never compiles `core_engine` at run time.
 
 ---
 

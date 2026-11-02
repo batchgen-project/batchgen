@@ -12,7 +12,7 @@ submission and the client API, see the [Batch API Guide](batch-api-guide.md).
 3. [Install BatchGen](#3-install-batchgen)
 4. [Start the Server (2 × 8 H200)](#4-start-the-server-2--8-h200)
 5. [Submit Jobs](#5-submit-jobs)
-6. [Optional: DeepEP and Distributed Weights](#6-optional-deepep-and-distributed-weights)
+6. [Distributed Weights and DeepEP Status](#6-distributed-weights-and-deepep-status)
 7. [Startup Triton Prewarm](#7-startup-triton-prewarm)
 
 ---
@@ -48,33 +48,29 @@ python -m batchgen.tools.convert_checkpoint --input-dir /shared/models/Kimi-K3 -
 ## 3. Install BatchGen
 
 Build the Docker image or install from source — see [`docker/README.md`](../docker/README.md)
-and [Manual Installation](manual-installation.md). The default decode/prefill exchange is
-**NCCL**, which needs no extra build. (An optional DeepEP low-latency exchange is covered in
-§6.)
+and [Manual Installation](manual-installation.md). The decode/prefill exchange is
+**NCCL**, which needs no extra build. Kimi-K3 with `--enable-deepep` is not supported in
+v1.1.0 (see §6).
 
 Kimi-K3's KDA (Kimi Delta Attention) needs `fla-core>=0.5.0` (flash-linear-attention, the `fla` package). It is listed in `requirements.txt`, so the standard install pulls it automatically — no separate step.
 
 ## 4. Start the Server (2 × 8 H200)
 
-### Mount shared memory
+### Host memory for the weights
 
-BatchGen stages the **full converted checkpoint** in `/dev/shm` on each node — all 8 workers on a
-node mmap their shards from this single copy. K3's staged size is **~1454 GiB**, larger than the
-default `/dev/shm` (50% of RAM). On **both** nodes, before launch, enable transparent-hugepage
-shmem first (or per-worker page tables cost ~26 GB) and remount `/dev/shm` to the launcher's
-printed requirement **plus ~64 GiB** of headroom:
+With the replicated parameter server, each node holds the **full converted checkpoint** in host
+memory, and all 8 workers on a node map their shards from this single copy. The copy is anonymous
+shared memory (`memfd_create`) charged to host memory, not a file in `/dev/shm`, so the size of
+the `/dev/shm` mount does not limit it and no remount is needed (see the shared-memory notes in
+[Server Flags](server-flags.md#shared-memory)). On **both** nodes, before launch, enable
+transparent huge pages for shared memory so the workers' page tables for this mapping stay small:
 
 ```bash
-# 1. transparent hugepages for shmem (saves ~26 GB of page tables across 8 workers)
 echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
-
-# 2. remount /dev/shm for the staged checkpoint (2 TiB-RAM H200 shown: 1453.66 GiB + 64)
-sudo mount -o remount,size=1517G /dev/shm
-df -h /dev/shm                              # confirm the new size (should read ~1.5T)
 ```
 
-If the launcher aborts with `Shared memory size is not enough ... Required: <N> GiB`, remount to
-`<N> + 64` GiB. Do **not** set it to full host RAM — leave headroom for the workers.
+The distributed-weight store (§6) is different: its staged copy is a file in a tmpfs (default
+`/dev/shm/batchgen-weight-stores`), which must be large enough for the node's store.
 
 ### Lower the kernel memory watermark (2 TB-RAM nodes)
 
@@ -156,6 +152,13 @@ python -m batchgen.launch_http_server \
 > (this build reads the `PYTORCH_CUDA_ALLOC_CONF` name, not `PYTORCH_ALLOC_CONF`) so fragmented reserved
 > HBM is reusable, so the resident-expert repack fits within the per-GPU budget alongside the KV cache.
 
+Start node 0 first or together with node 1: node 1 waits a bounded time for node 0's control
+store. On two nodes `--cluster-fail-fast` is on by default, so a fatal worker error on either
+node, or the loss of either node, stops both servers with a nonzero exit and a CRITICAL
+`process.exit` log record naming the cause; relaunch both nodes. See
+[Cluster fail-fast](server-flags.md#cluster-fail-fast). Submit batches to node 0 only; node 1
+answers `409` on the batch and file routes.
+
 BatchGen's planner selects the parallelism from the checkpoint config; you only pass the
 16-GPU / 2-node topology. `--parse-thinking` extracts K3 reasoning blocks into the
 `reasoning_content` field. See [Server Flags](server-flags.md) for the full flag reference and
@@ -181,16 +184,13 @@ Kimi-K3 uses the standard OpenAI-compatible batch API. Set `"model": "kimi-k3"` 
 request body and follow the [Batch API Guide](batch-api-guide.md) to upload a JSONL file,
 create a batch, and download results.
 
-## 6. Optional: DeepEP and Distributed Weights
+## 6. Distributed Weights and DeepEP Status
 
-DeepEP is opt-in. The distributed-weight store is the **default** multi-node weight source: the
-commands in §4 reach the replicated parameter server only because they pass `--replicated-weights`.
+The distributed-weight store is the **default** multi-node weight source: the commands in §4
+reach the replicated parameter server only because they pass `--replicated-weights`.
 
-- **`--enable-deepep`** — use the DeepEP low-latency expert-parallel exchange for the decode
-  graph instead of the default NCCL all-gather + reduce-scatter. It requires a DeepEP build
-  patched for K3 (top-16 routing; upstream DeepEP asserts `topk <= 11`). If the build is not
-  importable the server **fails fast at startup** (no silent NCCL fallback) — omit the flag to
-  stay on NCCL.
+- **`--enable-deepep` is not supported for Kimi-K3 in v1.1.0.** Kimi-K3 decode uses the
+  default NCCL all-gather + reduce-scatter exchange; launch without `--enable-deepep`.
 - **`--distributed-weight-config <node0.json | node1.json>`** — map a compact per-node
   host-weight store instead of the replicated parameter server. Each node stages only its own
   ~838 GiB shard (routed experts + replicated bytes) rather than the full ~1454 GiB, so this is the
@@ -225,6 +225,14 @@ commands in §4 reach the replicated parameter server only because they pass `--
   another node rank, or whose sampled bytes no longer hash to the manifest. A distributed-store
   launch must therefore name its converted checkpoint. The refusal ends with the exact builder
   command that rebuilds the store.
+
+  **Startup connect budget.** At start each node's weight daemon connects to its peers. The
+  optional key `bootstrap_timeout_s` in `node${RANK}.json` (a positive integer number of
+  seconds, default 600) bounds how long the daemon waits for a peer, and the server's readiness
+  wait is derived from the same value. A config without the key uses the default, and the store
+  builder does not write it. To raise the budget, add the key to every node's config when one
+  node's daemon can start much later than the others; the launch checks do not hash the config
+  file, so this needs no rebuild.
 
   > **Requires a UCX with the InfiniBand transport.** The daemon exchanges shards between nodes over
   > UCX RDMA (`rc_x`). The `libucx-cu12` pip wheel provisioned by `install_deps.sh` is a
@@ -290,7 +298,9 @@ divisible by 16). Before the server reports ready, every worker runs these kerne
 shape classes (`KDA_PREFILL_SHAPES` in `kimi_linear/triton_prewarm.py`) through the serving code
 itself, so the first requests load compiled kernels instead of compiling them. The eight ranks of
 a node share one Triton cache directory: each compiles its share, they meet at a barrier, and every
-rank then loads the full set. A cold cache makes startup slower; a warm cache only loads.
+rank then loads the full set. A cold cache makes startup slower; a warm cache only loads. The
+cache is Triton's cache directory (`TRITON_CACHE_DIR`, by default `~/.triton/cache`); keep it on
+storage that outlives the container to avoid recompiling after the container is recreated.
 
 Each rank logs its two phases and, at the end, arms a late-compile guard:
 

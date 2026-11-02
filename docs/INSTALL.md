@@ -48,8 +48,8 @@ This installs (in order):
 2. **flash-attention 3** — built from source, Hopper only (~15-20 min)
 3. **FlashMLA** — built from source (~5-10 min)
 4. **DeepGEMM** — built from source (~5-10 min)
-5. **batchgen_kernels** — AOT-compiled CUDA extensions, 23 kernels (~7 min)
-6. **batchgen** — main package via `pip install .` (~1 min)
+5. **batchgen_kernels**: AOT-compiled CUDA extensions
+6. **batchgen**: the main package with the AOT `core_engine` extension
 
 Total: ~40-50 min on first install.
 
@@ -58,6 +58,25 @@ The production runtime is AOT-only: `install_deps.sh` builds and verifies
 on first launch. See [Runtime dependency contract](runtime-dependencies.md) for
 the Torch/ CUDA ABI, worktree-isolation, tokenizer, FA3/FA2, UCX, and
 fail-closed startup rules.
+
+### Upgrading from an earlier release
+
+This release requires `batchgen_kernels` 0.6.0 or newer. The GLM-5 DSA
+indexer kernels (the Hadamard pair, the 2048 top-k and the indexer KV
+projection) and the FP8 WGMMA MoE pipeline kernels are now AOT extensions in
+`batchgen_kernels`; earlier releases compiled them at run time. An environment
+built for an earlier release must rebuild `batchgen_kernels` from the new
+checkout. Re-running `./scripts/install_deps.sh --all` from that checkout does
+this: it finds the missing extensions and rebuilds the package. Until then the
+server refuses to start with `batchgen requires batchgen_kernels >= 0.6.0`, or,
+for the GLM-5 family, with `required runtime module ... failed to import`.
+
+BatchGen does not compile its own C++/CUDA code at server startup or on the
+first request, so `TORCH_EXTENSIONS_DIR` and a warm torch-extensions cache play
+no part in a production install. Triton kernels are still compiled by Triton at
+run time and cached in Triton's cache directory (`TRITON_CACHE_DIR`, by default
+`~/.triton/cache`); Kimi-K3 and the GLM-5 family compile theirs before serving,
+as described in their deployment guides.
 
 ## Option C: Pre-built Wheels (Fastest, ~2 min)
 
@@ -182,8 +201,8 @@ This does not apply to Docker (Option A), where the source is the install target
 | **Do not run from source dir** | Source tree shadows installed packages (see above) |
 | **batchgen_kernels** | Must use `--no-build-isolation` (needs installed PyTorch headers) |
 | **H20 GPUs** | Set `TORCH_CUDA_ARCH_LIST=9.0a` before building kernels |
-| **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s) |
-| **No JIT for compute kernels** | All 23 CUDA extensions are AOT-compiled in `batchgen_kernels` |
+| **Core engine** | AOT-built during installation (`BUILD_OPS=1`); the server refuses a missing or non-AOT `core_engine` instead of compiling it |
+| **No JIT for compute kernels** | Every BatchGen CUDA extension is AOT-compiled in `batchgen_kernels` (0.6.0 or newer) |
 
 ## Verification
 
@@ -220,11 +239,11 @@ PyTorch 2.9.0+cu128
 ├── flash-attention 3  (--no-build-isolation)
 ├── FlashMLA           (--no-build-isolation)
 ├── SGL DeepGEMM       (sgl-deep-gemm 0.1.5.post3 + apache-tvm-ffi 0.1.11)
-├── batchgen_kernels   (--no-build-isolation, 23 CUDAExtensions)
-│   ├── SM90a: WGMMA kernels (MoE, QKV, routing)
+├── batchgen_kernels   (--no-build-isolation, AOT CUDAExtensions)
+│   ├── SM90a: WGMMA kernels (MoE, QKV, routing, DSA indexer)
 │   └── SM80+: fused ops (RMSNorm, RoPE, dequant, MGN)
-└── batchgen           (pip install .)
-    └── core_engine    (JIT at first launch, automatic)
+└── batchgen           (BUILD_OPS=1 pip install .)
+    └── core_engine    (AOT, built at install time)
 ```
 
 ## Troubleshooting
@@ -232,8 +251,8 @@ PyTorch 2.9.0+cu128
 > See [`docs/troubleshooting.md`](troubleshooting.md) for the full list of commonly-met
 > problems (build, runtime, and model bring-up).
 
-### core_engine JIT build fails: `numa.h: No such file or directory`
-`core_engine` is JIT-compiled by ninja at first launch and needs the NUMA dev headers.
+### core_engine build fails: `numa.h: No such file or directory`
+The AOT `core_engine` build needs the NUMA dev headers.
 Install them (`sudo dnf install -y numactl-devel` on RHEL/TencentOS, or
 `sudo apt-get install -y libnuma-dev` on Debian/Ubuntu). `install_deps.sh` now does this
 automatically. The runtime `numactl`/`numactl-libs` packages are **not** enough — the

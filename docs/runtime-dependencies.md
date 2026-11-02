@@ -27,7 +27,11 @@ The installation builds or installs AOT (ahead-of-time) native extensions for
 extensions outside the checkout. A missing NUMA development header, an
 incomplete kernel wheel, or a JIT-built extension is an installation failure.
 The installer does not warm a JIT cache and the server never compiles these
-extensions on its first request.
+extensions on its first request. Since `batchgen_kernels` 0.6.0 this includes
+the GLM-5 DSA indexer and FP8 WGMMA MoE kernels, which earlier releases
+compiled at run time; an environment built for an earlier release must rebuild
+`batchgen_kernels`. Triton kernels are the exception: Triton compiles them and
+caches the binaries in its own cache directory.
 
 Never use an editable install (`pip install -e`) in a serving environment.
 
@@ -53,7 +57,7 @@ they use the same Torch/CUDA ABI and third-party wheels.
 | --- | --- |
 | Python only | nothing |
 | `core/**` | `--skip-kernels` (a stale `core_engine` fails the preflight) |
-| `batchgen_kernels/src/**` | `--skip-core` (stale kernels are **not** detected; always rebuild) |
+| `batchgen_kernels/src/**` | `--skip-core` (the preflight detects an old version or a missing extension, but **not** stale code in a present extension; always rebuild) |
 | Torch, CUDA, or a third-party native package | a new environment |
 
 ## Provenance rule
@@ -86,7 +90,13 @@ preflight before importing the HTTP server. It checks:
 - the FlashAttention module the model declares (FA3 or FA2) and FlashMLA
   where required;
 - the `libucx` runtime loader and DeepGEMM API where required;
-- AOT `batchgen_kernels` extensions, plus the WGMMA decode kernel on H20;
+- a `batchgen_kernels` version of at least 0.6.0;
+- AOT `batchgen_kernels` extensions, plus the WGMMA decode kernel on H20; for
+  the GLM-5 family (GLM-5, GLM-5.1, GLM-5.2, GLM-5.3) this includes the DSA
+  indexer extensions (`_C_fast_hadamard_transform`, `_C_fused_rope_hadamard`,
+  `_C_dsa_fast_topk`, `_C_indexer_kv_proj_wgmma`) and the FP8 WGMMA MoE
+  extensions (`_C_fp8_wgmma_grouped_gemm`, `_C_fp8_wgmma_quant_ops`,
+  `_C_dispatch_scatter_3d`);
 - a native (AOT) `batchgen.core_engine` module, not older than `core/` when
   running from a worktree;
 - the provenance rule above.
@@ -101,6 +111,8 @@ WGMMA decode kernel that fails to load is an error, not a switch to FA3.
 | Message | Meaning | Correct action |
 | --- | --- | --- |
 | `Torch ... unsupported` or CUDA ABI mismatch | The environment contains a different Torch build | Create the matching environment, or explicitly use `--repair` |
+| `batchgen requires batchgen_kernels >= 0.6.0, found ...` | The kernel package was built for an earlier release | Rebuild `batchgen_kernels` non-editably from this checkout: re-run `install_deps.sh --all`, or `build_source_runtime.sh` for a worktree |
+| `required runtime module 'batchgen_kernels...' failed to import` | The kernel build lacks an extension this model requires (for example a GLM-5 DSA or FP8 WGMMA MoE extension) | Rebuild `batchgen_kernels` from this checkout; do not enable a JIT fallback |
 | `... same install or worktree` | `batchgen`, kernels, and `core_engine` come from different roots | Rebuild one pyroot from one worktree, or reinstall |
 | `... outside site-packages` | A third-party native package is shadowed by a checkout | Run from a neutral directory; remove the shadowing path |
 | `core_engine ... is older than` | `core/` changed after the last build | `build_source_runtime.sh --skip-kernels` |
