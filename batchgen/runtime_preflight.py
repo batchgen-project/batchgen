@@ -100,6 +100,20 @@ _COMMON_EXTENSIONS = (
 _GLM5_DSA_EXTENSIONS = (
     "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
     "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
+    "batchgen_kernels.attention._C_fast_hadamard_transform",
+    "batchgen_kernels.attention._C_fused_rope_hadamard",
+    "batchgen_kernels.attention._C_dsa_fast_topk",
+    "batchgen_kernels.attention._C_indexer_kv_proj_wgmma",
+)
+
+# The FP8 WGMMA MoE pipeline the DSA models can select. Checked for every
+# DSA contract even though the pipeline is opt-in: the extensions ship in
+# the same kernel wheel, so a partial build is refused at startup rather than
+# at the first MoE forward that selects the pipeline.
+_DSA_MOE_WGMMA_EXTENSIONS = (
+    "batchgen_kernels.moe._C_fp8_wgmma_grouped_gemm",
+    "batchgen_kernels.moe._C_fp8_wgmma_quant_ops",
+    "batchgen_kernels.moe._C_dispatch_scatter_3d",
 )
 
 # These are exact model-type contracts, not family-wide fallback rules.  A new
@@ -112,17 +126,20 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "glm_moe_dsa": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
+        extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
+                    + _DSA_MOE_WGMMA_EXTENSIONS),
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_2": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
+        extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
+                    + _DSA_MOE_WGMMA_EXTENSIONS),
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
+        extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
+                    + _DSA_MOE_WGMMA_EXTENSIONS),
         require_deepgemm=True,
     ),
     "deepseek_v2": RuntimeContract(

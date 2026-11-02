@@ -271,6 +271,29 @@ def test_glm5_dsa_contracts_cover_the_decode_extensions():
             assert name in extensions, f"{model_type} does not check {name}"
 
 
+def test_glm5_dsa_contracts_cover_the_moe_wgmma_extensions():
+    for model_type in ("glm_moe_dsa", "glm_moe_dsa_5_2", "glm_moe_dsa_5_3"):
+        extensions = preflight._CONTRACTS[model_type].extensions
+        for name in preflight._DSA_MOE_WGMMA_EXTENSIONS:
+            assert name in extensions, f"{model_type} does not check {name}"
+
+
+def test_every_contract_extension_is_built_ahead_of_time():
+    """A name a contract requires but setup.py never builds would refuse every
+    start of that model; check against the extension list and the one
+    prebuilt library shipped as package data."""
+    setup_text = (
+        Path(preflight.__file__).resolve().parents[1]
+        / "batchgen_kernels" / "setup.py"
+    ).read_text()
+    shipped = {"batchgen_kernels.attention._C_gqa_mha_decode_bf16"}
+    for model_type, contract in preflight._CONTRACTS.items():
+        for name in contract.extensions:
+            assert name in shipped or f'"{name}"' in setup_text, (
+                f"{model_type} requires {name}, which setup.py does not build"
+            )
+
+
 def test_non_dsa_contracts_do_not_require_the_dsa_extensions():
     """A model that never takes the DSA decode path must not be refused."""
     for model_type, contract in preflight._CONTRACTS.items():
