@@ -546,8 +546,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         }
         with CaptureContext(AttnWrapperBase, ctx_attrs):
             outputs = seg.run_model_with_probes(
-                input_ids=captured_inputs.get("input_ids"),
-                inputs_embeds=captured_inputs.get("inputs_embeds"),
+                input_ids=captured_inputs["input_ids"],
                 position_ids=captured_inputs["position_ids"],
                 cache_seqlens=captured_inputs.get("cache_seqlens"),
                 primary_slot_indices=captured_inputs.get("primary_slot_indices"),
