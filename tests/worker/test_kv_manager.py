@@ -845,25 +845,10 @@ def test_migration_request_and_candidate_are_frozen():
 
 
 # ---------------------------------------------------------------------------
-# measure-once-cache pure helpers
+# measure-once-cache GPU KV pool sizing helpers
 # ---------------------------------------------------------------------------
-
-
-def test_compute_final_pool_gb_subtracts_provisional_pool():
-    final = KVCacheManager.compute_final_pool_gb(140.0, 0.93, 132.4, 19.1)
-    assert abs(final - (140.0 * 0.93 - (132.4 - 19.1))) < 1e-9
-
-
-def test_compute_final_pool_gb_is_deterministic_identity():
-    # Measuring again with the FINAL pool allocated returns the same value:
-    # used2 = steady + final, so total*frac - (used2 - final) = final.
-    total, frac, steady = 140.0, 0.93, 113.3
-    final = KVCacheManager.compute_final_pool_gb(total, frac, steady + 19.1, 19.1)
-    again = KVCacheManager.compute_final_pool_gb(total, frac, steady + final, final)
-    assert abs(final - again) < 1e-9
-
-
-def test_pool_floor_pages():
-    assert KVCacheManager.pool_floor_pages(128) == 512
-    assert KVCacheManager.pool_floor_pages(1) == 4
-    assert KVCacheManager.pool_floor_pages(0) == 4  # clamped bucket
+# ``compute_final_pool_gb`` / ``pool_pages_for_gb`` / ``check_cached_pool_fits``
+# / ``pool_floor_pages`` are covered in tests/unit/test_gpu_kv_pool_sizing.py.
+# That module imports ONLY batchgen.worker.kv_manager, so the sizing arithmetic
+# and the worker's sizing methods run on a plain CPU host without torch; this
+# module needs torch via batchgen.sequence/query_book.

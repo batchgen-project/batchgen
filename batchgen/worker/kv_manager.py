@@ -97,6 +97,31 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# GPU KV pool sizing constants
+# ---------------------------------------------------------------------------
+
+#: Device memory deliberately left free ABOVE the GPU KV pool, in GiB.
+#:
+#: The post-capture steady-state measurement already contains every persistent
+#: allocation (weights, resident experts, graph pools and their static buffers,
+#: NCCL/JIT first-touch caches), so the pool no longer needs the accidental
+#: ``(1 - gpu_memory_frac)`` slack that used to absorb the graph footprint the
+#: pre-capture measurement could not see. What still needs covering is only the
+#: memory nothing else accounts for: decode transients outside the captured
+#: graphs (eager-fallback activations, sampling temporaries) and allocator
+#: rounding. That is an explicit, auditable constant — not a fraction of the
+#: device whose size nobody chose.
+#:
+#: 2.0 GiB is the measured anchor: on the 2026-11-03 H200 GLM-5.3 server
+#: (frac 0.93, 139.81 GiB device) the first decode round ran its whole batch
+#: with 3.96 GiB free above an identically-captured steady state, so the
+#: non-pool demand fits inside 2.0 GiB with the other ~2 GiB handed to pool
+#: capacity. Raising this constant costs capacity; lowering it is only
+#: defensible against a measured decode-transient peak.
+GPU_KV_POOL_HEADROOM_GB: float = 2.0
+
+
+# ---------------------------------------------------------------------------
 # Stats dataclasses
 # ---------------------------------------------------------------------------
 
@@ -517,21 +542,94 @@ class KVCacheManager:
     @staticmethod
     def compute_final_pool_gb(
         total_gb: float,
-        gpu_memory_frac: float,
         used_gb: float,
         provisional_pool_gb: float,
+        headroom_gb: float = GPU_KV_POOL_HEADROOM_GB,
     ) -> float:
         """Final pool size from the post-capture steady-state measurement.
 
         ``used_gb`` is sampled AFTER the full graph warmup/capture with the
         provisional pool still allocated; subtracting the provisional pool
         yields the steady residency (weights + graph pools + runtime), and the
-        final pool is everything the memory fraction allows above it. Pure and
-        deterministic: cached by the worker and reused for every later pool
-        (re)creation (measure-once-cache contract, POIS 2026-10-05).
+        pool is everything left on the device above it, minus the explicit
+        ``headroom_gb``.
+
+        ``gpu_memory_frac`` is deliberately NOT applied here. It bounds the
+        PRE-capture provisional measurement, where the graph footprint is not
+        yet allocated and its slack is the only thing covering it. Applying it
+        again after the capture double-charges that footprint: the graphs are
+        inside ``steady_used_gb`` already, and ``(1 - frac) * total`` then sits
+        permanently free (9.79 GiB of a 139.81 GiB device at frac 0.93) for no
+        named consumer. The explicit constant replaces that accidental slack.
+
+        Pure and deterministic, and independent of the provisional pool it was
+        measured against: ``used_gb - provisional_pool_gb`` is the same steady
+        residency whatever pool was resident, so re-measuring with the final
+        pool in place returns the final pool again (measure-once-cache
+        contract, POIS 2026-10-05). The worker caches the result and reuses it
+        for every later pool (re)creation.
+
+        Fail-loud on inputs that cannot describe a real measurement; the
+        caller fail-louds on a result below the usable floor.
         """
+        if total_gb <= 0:
+            raise RuntimeError(
+                f"[GPU-KV] Invalid device total for pool sizing: {total_gb} GB"
+            )
+        if headroom_gb < 0:
+            raise RuntimeError(
+                f"[GPU-KV] Invalid pool headroom: {headroom_gb} GB (must be >= 0)"
+            )
         steady_used_gb = used_gb - provisional_pool_gb
-        return total_gb * gpu_memory_frac - steady_used_gb
+        if steady_used_gb <= 0:
+            raise RuntimeError(
+                f"[GPU-KV] Post-capture measurement is not a steady state: "
+                f"used {used_gb:.2f} GB minus provisional pool "
+                f"{provisional_pool_gb:.2f} GB leaves {steady_used_gb:.2f} GB "
+                "of residency, but the weights alone outweigh the pool. The "
+                "measurement did not see the pool that is allocated."
+            )
+        return total_gb - steady_used_gb - headroom_gb
+
+    @staticmethod
+    def pool_pages_for_gb(pool_gb: float, bytes_per_page: float) -> int:
+        """Page count a ``pool_gb`` pool funds at ``bytes_per_page``.
+
+        Non-positive sizes return 0 so the caller's floor check reports the
+        shortfall instead of a division artifact.
+        """
+        if bytes_per_page <= 0:
+            raise RuntimeError(
+                f"[GPU-KV] Invalid bytes-per-page for pool sizing: {bytes_per_page}"
+            )
+        if pool_gb <= 0:
+            return 0
+        return int(pool_gb * (1024 ** 3) / bytes_per_page)
+
+    @staticmethod
+    def check_cached_pool_fits(
+        cached_pool_gb: float, free_gb: float, *, rank: int = 0
+    ) -> None:
+        """Fail loud when the cached pool no longer fits the free memory.
+
+        The cached size is exactly what the post-capture steady state left
+        below the explicit headroom, so after the previous pool's segments are
+        released the free memory is the pool plus that headroom. Not fitting
+        therefore means resident memory GREW since the measurement — a leak or
+        an unaccounted allocation, which must be named here rather than
+        surface as a bare ``torch.zeros`` CUDA OOM inside pool creation (and
+        must never be absorbed by silently shrinking the pool, which is the
+        round-dependent squeeze this sizing path exists to remove).
+        """
+        if cached_pool_gb <= free_gb:
+            return
+        raise RuntimeError(
+            f"[GPU-KV] Rank {rank}: cached pool size {cached_pool_gb:.2f} GB "
+            f"no longer fits {free_gb:.2f} GB of free device memory "
+            f"(short by {cached_pool_gb - free_gb:.2f} GB). Resident memory "
+            "grew after the post-capture steady-state measurement; find the "
+            "growth instead of shrinking the pool."
+        )
 
     @staticmethod
     def pool_floor_pages(max_bucket_size: int, min_pages_per_sequence: int = 4) -> int:
