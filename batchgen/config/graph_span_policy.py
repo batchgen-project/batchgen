@@ -55,7 +55,9 @@ __all__ = [
 #   top bucket 128, bf16 AoS   : rows sum to 276, so 1104 MiB unbudgeted and
 #                                cap = 486,144
 # A trimmed span is not a correctness limit: a step past it runs eager decode.
-GRAPH_CONTEXT_STATICS_BUDGET_BYTES = 512 * 1024 * 1024
+# DIAGNOSTIC (span A/B): clamps the captured span to 131,072 tokens at top
+# bucket 128 to isolate the DeepGEMM logits-extent cost; never merge.
+GRAPH_CONTEXT_STATICS_BUDGET_BYTES = 64 * 1024 * 1024
 # The scorer logits are fp32.
 GRAPH_CONTEXT_STATICS_BYTES_PER_TOKEN_PER_ROW = 4
 # DeepGEMM's logits row stride is 256-aligned (`align_context_len`), so a span
