@@ -714,11 +714,15 @@ class GLM5ParallelStrategyManager:
                 f"{host_weight.device}: the skeleton was shared to the device "
                 "before the host-resident embedding was configured"
             )
-        vocab = int(self.model_config.vocab_size)
-        if int(host_weight.shape[0]) != vocab:
+        # The checkpoint tensor is the authority on the vocab size; the engine
+        # ModelConfig does not expose one under a stable name. Cross-check
+        # against the config only when it carries a matching field.
+        vocab = int(host_weight.shape[0])
+        config_vocab = getattr(self.model_config, "vocab_size", None)
+        if config_vocab is not None and int(config_vocab) != vocab:
             raise RuntimeError(
-                f"{self.EMBED_TOKENS_SKELETON_KEY} has {host_weight.shape[0]} "
-                f"rows, expected the vocab size {vocab}"
+                f"{self.EMBED_TOKENS_SKELETON_KEY} has {vocab} rows, but the "
+                f"model config declares vocab_size {config_vocab}"
             )
         module = HostResidentEmbedding(
             host_weight,
