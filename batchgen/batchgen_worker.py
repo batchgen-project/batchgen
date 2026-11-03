@@ -266,6 +266,7 @@ from batchgen.worker.decode import (
 	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
+	GPU_KV_POOL_HEADROOM_GB,
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
@@ -11606,17 +11607,34 @@ class BatchGenWorker:
 		# identical across decode rounds of the same server).
 		if self._gpu_kv_cached_pool_gb is not None:
 			self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
-					"(measure-once-cache)"
-				)
 			# The previous pool's segments already returned to CUDA at destroy
 			# (dedicated MemPool, whole-segment free). This flushes the
 			# GENERAL cache's all-free segments (prefill transients) too, so
-			# the full-size cudaMalloc below sees the maximum free memory.
+			# the full-size cudaMalloc below sees the maximum free memory. The
+			# collection first drops tensors still held only by cycles, so
+			# empty_cache can return their segments: with the pool margin now
+			# an explicit 2 GB rather than (1 - frac) of the device, retained
+			# segments are the difference between fitting and fail-loud.
 			torch.cuda.synchronize(self.torch_device)
+			gc.collect()
 			torch.cuda.empty_cache()
+			# The cached size is the device total minus the measured steady
+			# residency minus the explicit headroom, so what is free here must
+			# be the pool plus that headroom. Anything less is residency that
+			# grew after the measurement: name it instead of letting the pool's
+			# torch.zeros raise a bare CUDA OOM, and never re-measure (a fresh
+			# measurement is exactly the round-dependent squeeze this path
+			# removes).
+			free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
+			KVCacheManager.check_cached_pool_fits(
+				self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
+			)
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
+					f"(measure-once-cache; {free_mem_gb:.2f} GB free, headroom "
+					f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB)"
+				)
 			self._initialize_gpu_kv_manager_fixed_size()
 			if self.rank == 0:
 				stats = self.gpu_paged_kv_cache_manager.get_stats()
@@ -11627,8 +11645,13 @@ class BatchGenWorker:
 			return
 
 		# First time: PROVISIONAL size from the post-weights measurement. The
-		# final size is fixed by _finalize_gpu_kv_pool_after_capture once the
-		# graph warmup has materialized every persistent allocation.
+		# graph pools, their static buffers and the collective/JIT first-touch
+		# caches are not allocated yet, so (1 - gpu_memory_frac) of the device
+		# is the only thing covering them here — that is the one place the
+		# fraction is load-bearing. The final size is fixed by
+		# _finalize_gpu_kv_pool_after_capture once the graph warmup has
+		# materialized every persistent allocation, and from there the explicit
+		# GPU_KV_POOL_HEADROOM_GB replaces the fraction's slack.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -18071,12 +18094,25 @@ class BatchGenWorker:
 		(re)creation reuses it, making the pool identical across decode rounds
 		(invariant 1) and retiring the fresh-server round-1 protocol.
 
-		The current (first) round keeps the provisional pool — its sequences
-		already hold pages and captured graphs bake its addresses, and the
-		provisional size is never smaller than the final one (steady residency
-		only grows through capture). The cached size applies from the NEXT pool
-		creation (the per-round destroy/recreate that already exists), from
-		which point the page count is identical for every round.
+		The size is the device total minus that steady residency minus the
+		explicit ``GPU_KV_POOL_HEADROOM_GB``. ``gpu_memory_frac`` is NOT
+		applied again here: its slack is what covers the graph footprint the
+		PRE-capture measurement cannot see, and once that footprint is inside
+		the measurement, re-applying the fraction charges it twice and parks
+		``(1 - frac) * total`` permanently free with no named consumer. The
+		headroom constant is that consumer, measured and auditable.
+
+		The current (first) round keeps the provisional pool: its sequences
+		already hold pages, the captured graphs bake its addresses, and this
+		codebase deliberately refuses to recapture after a configured capture
+		(``_setup_cuda_graphs`` falls back to eager instead, and the reuse
+		lifecycle raises), so the live pool cannot be resized under them. With
+		the headroom sizing the provisional is the SMALLER pool (it still
+		carries the unmeasured-graph slack), so round 1 is a conservative
+		startup artifact, never an over-commitment. The cached size applies
+		from the NEXT pool creation (the per-round destroy/recreate that
+		already exists), from which point the page count is identical for
+		every round.
 		"""
 		if not self._gpu_kv_sizing_provisional:
 			return
@@ -18087,12 +18123,13 @@ class BatchGenWorker:
 		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
+		provisional_gb = self.gpu_kv_cache_size_gb
+		steady_used_gb = used_mem_gb - provisional_gb
 
 		final_gb = KVCacheManager.compute_final_pool_gb(
 			total_mem_gb,
-			self.gpu_memory_frac,
 			used_mem_gb,
-			self.gpu_kv_cache_size_gb,
+			provisional_gb,
 		)
 
 		# Broadcast rank 0's decision so every rank resizes identically.
@@ -18104,17 +18141,19 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		stats = manager.get_stats()
 		bytes_per_page = (
-			self.gpu_kv_cache_size_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
+			provisional_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
 		)
-		final_pages = int(final_gb * (1024 ** 3) / bytes_per_page)
+		final_pages = KVCacheManager.pool_pages_for_gb(final_gb, bytes_per_page)
 		bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [1])
 		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
 		if final_gb <= 0 or final_pages < floor_pages:
 			raise RuntimeError(
 				f"[GPU-KV] Final pool below floor: {final_gb:.2f} GB "
 				f"(~{final_pages} pages) < {floor_pages} pages required for the "
-				f"largest decode bucket. Steady residency leaves no room under "
-				f"gpu_memory_frac={self.gpu_memory_frac}; fix the configuration."
+				f"largest decode bucket. Steady residency {steady_used_gb:.2f} GB "
+				f"of {total_mem_gb:.2f} GB leaves nothing above the "
+				f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB pool headroom; fix the "
+				"configuration."
 			)
 
 		# Cache only: the live round keeps the provisional pool (its sequences
@@ -18124,10 +18163,19 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(
 				f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
-				f"(~{final_pages} pages; steady used "
-				f"{used_mem_gb - self.gpu_kv_cache_size_gb:.2f} GB; provisional "
-				f"{self.gpu_kv_cache_size_gb:.2f} GB stays for this round; cached "
-				"for every later pool creation)"
+				f"(~{final_pages} pages; steady used {steady_used_gb:.2f} GB of "
+				f"{total_mem_gb:.2f} GB; headroom {GPU_KV_POOL_HEADROOM_GB:.2f} GB; "
+				f"provisional {provisional_gb:.2f} GB stays for this round, delta "
+				f"{final_gb - provisional_gb:+.2f} GB; cached for every later pool "
+				"creation)"
+			)
+			logging.info(
+				"[GPU-KV] Pool margin is now the explicit %.2f GB headroom; "
+				"gpu_memory_frac=%.3f bounds only the pre-capture provisional "
+				"measurement (the frac-based final size would have been %.2f GB)",
+				GPU_KV_POOL_HEADROOM_GB,
+				self.gpu_memory_frac,
+				total_mem_gb * self.gpu_memory_frac - steady_used_gb,
 			)
 
 	def _setup_cuda_graphs(self, gpu_manager):
