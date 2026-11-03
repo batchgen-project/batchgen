@@ -68,13 +68,19 @@ class GLM5Planner(BasePlanner):
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "shared_expert"
             ] = 2
-            # Device memory the prefill prefix pool leaves for the forward,
-            # sized from the measured reserved-memory growth of the largest
-            # supported no-pool prefill forward plus margin for the pool
-            # path's per-row indexer-key gather. Provisional until a pool
-            # run measures its chunk peak; the worker fails loudly above it.
+            # Device memory the prefill prefix pool leaves for the forward.
+            # Measured on a pooled 64k-token-prefix wave (8xH200, 2026-11-03):
+            # between the budget measurement and the chunk forward the prefill
+            # expert ring and instance buffers grow allocations by ~19.5 GiB,
+            # and the packed sparse-prefill forward (DSA top-k scoring against
+            # a 64k context included) peaks ~21 GiB more — 40.5 GiB real
+            # growth; the earlier provisional 24 GiB left the pool budget
+            # overcommitted and a 64k wave died in fp8_mqa_logits with the
+            # pool at its planned peak. 56 GiB = the measured growth plus
+            # ~38% headroom for longer contexts and allocator fragmentation;
+            # the executor still fails loudly if a chunk exceeds it.
             self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
-                24 * 2**30
+                56 * 2**30
             )
 
     def _compute_batch_configs(self):
