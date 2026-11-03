@@ -1707,6 +1707,9 @@ class WorkerManager:
             global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
             enable_prefix_cache=self.args.enable_prefix_cache,
             prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
+            shared_prefix_admission=getattr(
+                self.args, "shared_prefix_admission", True
+            ),
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,

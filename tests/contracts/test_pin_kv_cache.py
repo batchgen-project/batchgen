@@ -355,6 +355,7 @@ PINS = {
                 "clear_page_table",
                 "copy_kv_to_tensor",
                 "copy_tensor_to_kv",
+                "count_mapped_leading_shared_pages",
                 "count_new_shared_pages",
                 "destroy",
                 "ensure_cuda_graph_page_table",
@@ -427,6 +428,14 @@ PINS = {
                         "num_tokens",
                         "page_keys_by_sequence",
                     ],
+                    "returns": "int",
+                },
+                # Added for shared-prefix-aware admission: decode admission
+                # must charge a row only for the pages its pool does NOT
+                # already hold, so it needs a read-only "how much of this page
+                # table is already mapped" query.
+                "count_mapped_leading_shared_pages": {
+                    "params": ["self", "page_keys"],
                     "returns": "int",
                 },
                 "allocate_pages_for_sequences_with_page_keys": {

@@ -30,6 +30,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from batchgen.worker.shared_prefix_charge import (
+    SharedPrefixLedger,
+    segments_from_pairs,
+)
+
+
 class DecodeCapacityError(RuntimeError):
     """A candidate cannot fit in the physical GPU-KV capacity."""
 
@@ -55,6 +61,15 @@ class DecodeCandidate:
     global_idx: int
     req_pages: int  # GPU pages for its two-page-buffer reservation
     decode_dp_group: Optional[int] = None
+    # ``(key, pages)`` leading run this row reads from a GPU page copy SHARED
+    # with other candidates. The GPU allocator maps ONE physical page per
+    # distinct Host page id (``allocate_pages_for_sequences_with_page_keys``),
+    # so rows of one shared prefix cost the pool one copy, not one each.
+    # Empty means "charge this row in full".
+    shared_prefix_segments: Tuple[Tuple[int, int], ...] = ()
+    # Leading pages of this row that the group's pool ALREADY maps, because a
+    # sequence already decoding shares them. Joining them costs nothing.
+    resident_shared_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,6 +178,38 @@ class DecodeScheduler:
     """Decode batch admission decision — pure, deterministic across ranks."""
 
     @staticmethod
+    def marginal_req_pages(
+        candidate: DecodeCandidate, ledger: SharedPrefixLedger
+    ) -> int:
+        """GPU pages this candidate costs GIVEN what the group's pool holds.
+
+        ``req_pages`` is the standalone reservation -- the pages the row needs
+        when none of its context is on the device.  It stays the number the
+        "larger than a whole replica" check uses, because that asks about the
+        row alone.
+
+        Admission asks what ADDING the row costs: the allocator maps one
+        physical GPU page per distinct Host page id, so a row whose leading
+        pages are already mapped (by a sibling admitted earlier in this walk,
+        or by a sequence already decoding) pays only for its private tail.
+        Both credits describe a PREFIX of the same page list, so the effective
+        credit is their maximum, not their sum.
+
+        Never zero: the ledger floors the charge at one page.
+        """
+        total = int(candidate.req_pages)
+        if total <= 0:
+            return total
+        credit = min(max(0, int(candidate.resident_shared_pages)), total - 1)
+        if candidate.shared_prefix_segments:
+            preview = ledger.preview(
+                total_pages=total,
+                segments=segments_from_pairs(candidate.shared_prefix_segments),
+            )
+            credit = max(credit, preview.credited_pages)
+        return total - credit
+
+    @staticmethod
     def select_decode_batch(req: DecodeBatchRequest) -> List[str]:
         """Greedily fill the decode batch using live physical capacity.
 
@@ -235,6 +282,15 @@ class DecodeScheduler:
                 )
 
         capacity_pages_used = [0] * num_capacity_groups
+        # One ledger per capacity group: a GPU pool belongs to one DP rank (or
+        # one replicated TP group), so a prefix mapped in one group saves
+        # nothing for a row admitted into another. Charging the MARGINAL cost
+        # is what makes admission agree with the allocator -- which already
+        # shares one physical page between rows that name the same Host page --
+        # instead of bounding decode by the logical page sum.
+        capacity_prefix_ledgers = [
+            SharedPrefixLedger() for _ in range(num_capacity_groups)
+        ]
         capacity_seq_count = (
             list(req.existing_sequence_counts)
             if req.existing_sequence_counts
@@ -258,9 +314,19 @@ class DecodeScheduler:
             if cap > 0 and capacity_seq_count[r] >= cap:
                 continue
 
-            if capacity_pages_used[r] + c.req_pages <= capacity_pages_available[r]:
+            ledger = capacity_prefix_ledgers[r]
+            req_pages = DecodeScheduler.marginal_req_pages(c, ledger)
+
+            if capacity_pages_used[r] + req_pages <= capacity_pages_available[r]:
                 decode_batch.append(c.uuid)
-                capacity_pages_used[r] += c.req_pages
+                capacity_pages_used[r] += req_pages
                 capacity_seq_count[r] += 1
+                # Charge only on admission: a candidate the greedy skipped
+                # loads nothing, so it must leave no credit behind for the
+                # next row of its prefix.
+                ledger.charge(
+                    total_pages=max(1, int(c.req_pages)),
+                    segments=segments_from_pairs(c.shared_prefix_segments),
+                )
 
         return decode_batch

@@ -181,6 +181,11 @@ def test_prefill_selection_request_uses_the_configured_initial_buffer():
         local_world_size=8,
         _decode_attn_tp_size=lambda: 1,
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
+        # This test is about the page-buffer constant reaching the snapshot,
+        # not about shared-prefix credit: report no shared segment so every
+        # candidate keeps its standalone reservation.
+        _admission_shared_prefix_segments=lambda uuids: {},
+        _shared_prefix_credit_applied=False,
     )
 
     request = make_request(worker, ["a"], [1 << 20], num_nodes=1,
