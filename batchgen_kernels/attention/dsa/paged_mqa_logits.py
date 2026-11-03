@@ -65,6 +65,8 @@ __all__ = [
     "align_context_len",
     "check_logits_layout",
     "guard_deep_gemm_context_lens",
+    "paged_mqa_live_block_columns",
+    "paged_mqa_stage_align_pages",
     "plan_paged_mqa_logits",
     "prepare_paged_mqa_inputs_reference",
     "quantize_q_e4m3_reference",
@@ -415,6 +417,65 @@ def prepare_paged_mqa_inputs_reference(
     ).contiguous()
     context_lens = true_lens.reshape(batch, 1).contiguous()
     return block_table, context_lens
+
+
+def paged_mqa_stage_align_pages(page_size: int) -> int:
+    """Page granularity the staged ``block_table`` extent is rounded up to.
+
+    DeepGEMM partitions a row's KV in ``PAGED_MQA_LOGITS_ALIGN``-token splits
+    (it asserts ``logits_stride % split_kv == 0`` on exactly that value), so a
+    CTA that owns the last, partial split can address the whole split's worth
+    of block-table columns even when the row's context ends inside it. Rounding
+    the staged extent up to a whole split keeps every column DeepGEMM can
+    address written, at a cost of at most ``split - 1`` columns per row (12 B
+    at a 64-token page) rather than the table's reserved width.
+    """
+
+    if int(page_size) <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    return max(1, PAGED_MQA_LOGITS_ALIGN // int(page_size))
+
+
+def paged_mqa_live_block_columns(
+    context_lens: torch.Tensor,
+    page_size: int,
+    max_pages: int,
+) -> torch.Tensor:
+    """Per row: how many ``block_table`` columns any reader of this step reaches.
+
+    This is the bound the device-side preparation pass stages to, and the only
+    reason that pass costs ``O(the step's context)`` rather than
+    ``O(the table's reserved width)``. The width is sized for the DEPLOYMENT
+    context bound -- 16384 columns at a 1M span and 64-token pages -- while a
+    decode row owns about a hundred of them, so staging the full width made a
+    per-step launch move tens of MB to rewrite columns nothing reads.
+
+    Derived from the GUARDED lengths, not the true ones: DeepGEMM visits page
+    ``t // page_size`` for ``t`` in ``[0, guarded_len)``, and row 0's guard
+    forces one page live even at true length 0 (that column must hold the
+    DEFINED page 0 a non-reading row gets). The top-k is bounded by the true
+    lengths, which are elementwise ``<=`` the guarded ones, so it reaches no
+    further.
+
+    The result is rounded up to a whole DeepGEMM KV split
+    (``paged_mqa_stage_align_pages``) and then clamped to ``max_pages``.
+
+    ``context_lens`` is the TRUE 2-D ``[batch, 1]`` form; the guard is applied
+    here. Returns an int32 ``[batch]`` tensor.
+    """
+
+    if context_lens.dim() != 2 or context_lens.dtype != torch.int32:
+        raise TypeError(
+            "context_lens must be a 2-D int32 tensor, got "
+            f"{tuple(context_lens.shape)} {context_lens.dtype}"
+        )
+    if int(max_pages) <= 0:
+        raise ValueError(f"max_pages must be positive, got {max_pages}")
+    align = paged_mqa_stage_align_pages(page_size)
+    guarded = guard_deep_gemm_context_lens(context_lens).reshape(-1)
+    pages = (guarded + int(page_size) - 1) // int(page_size)
+    pages = (pages + align - 1) // align * align
+    return pages.clamp(max=int(max_pages)).to(torch.int32)
 
 
 def guard_deep_gemm_context_lens(context_lens: torch.Tensor) -> torch.Tensor:

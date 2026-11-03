@@ -435,6 +435,20 @@ class _GPUPageTableManager:
 		self._cuda_graph_table: Optional[torch.Tensor] = None
 		self._cuda_graph_table_valid: bool = False
 		self._cuda_graph_slot_count: int = 0
+		# Per-slot count of graph-table columns this manager has ever written,
+		# i.e. the only columns that can hold anything but the ``-1`` the
+		# storage was created with. It is what makes a refresh cost
+		# O(the rows' real page counts) instead of O(the reserved width): the
+		# table is sized for the DEPLOYMENT context bound (16384 columns at a
+		# 1M span and 64-token pages) while a decode row owns ~100, so a
+		# full-width clear moved tens of MB per step to re-establish ``-1`` in
+		# columns that already held it. Invariant, maintained by
+		# ``_update_cuda_graph_table`` / ``clear_cuda_graph_rows`` as the only
+		# writers: ``table[slot, j] == -1`` for every ``j >= extent[slot]``.
+		# Sized here, not when the table is lazily created, so the list is
+		# never short of ``max_slots`` for a caller that reaches the refresh
+		# first.
+		self._cuda_graph_row_extents: List[int] = [0] * int(max_slots)
 		# Small cached 1-D slot_ids,like [0, 1, 2, ...] total length is len(sequence_ids)
 		self._slot_index_tensor: Optional[torch.Tensor] = None
 		# Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
@@ -579,18 +593,50 @@ class _GPUPageTableManager:
 			self._cuda_graph_table_valid = False
 			return
 		table = self._ensure_cuda_graph_table()
-		rows_to_clear = max(self._cuda_graph_slot_count, num_slots)
-		if rows_to_clear:
-			table[:rows_to_clear, :].fill_(-1)
+		extents = self._cuda_graph_row_extents
+		# Per-row staging bounded by the row's OWN page count. The reserved
+		# width is the deployment context bound; writing all of it for every
+		# row made this refresh cost `rows * width * 4 B` per step, which is
+		# tens of MB at a production batch and ~100x the rows' real extent.
+		# A row only ever needs: its pages, plus `-1` in the columns a SHORTER
+		# occupant of this slot leaves behind. Everything past
+		# `max(previous, count)` is already `-1` by the extent invariant.
 		for slot, seq_id in enumerate(sequence_ids):
 			state = sequences.get(seq_id)
-			if state is None or state.pages.numel() == 0:
-				continue
-			pages = state.pages.to(self.device, dtype=torch.int32)
-			count = int(pages.numel())
-			table[slot, :count] = pages[:count]
+			count = 0 if state is None else int(state.pages.numel())
+			previous = extents[slot]
+			if count:
+				pages = state.pages.to(self.device, dtype=torch.int32)
+				table[slot, :count] = pages[:count]
+			if previous > count:
+				table[slot, count:previous] = -1
+			extents[slot] = count
+		# Slots the previous batch used and this one does not: they are past
+		# `num_slots`, so no reader indexes them, but a later wider batch would
+		# inherit stale page ids in those rows without this.
+		for slot in range(num_slots, min(self._cuda_graph_slot_count, self.max_slots)):
+			previous = extents[slot]
+			if previous:
+				table[slot, :previous] = -1
+				extents[slot] = 0
 		self._cuda_graph_slot_count = num_slots
 		self._cuda_graph_table_valid = True
+
+	def clear_cuda_graph_rows(self) -> None:
+		"""Restore the graph table to all ``-1`` without touching unused columns.
+
+		Only the columns this manager has written can differ from ``-1``, so
+		resetting the reserved width would re-write (at a 1M span) tens of MB
+		of columns that already hold it.
+		"""
+		if self._cuda_graph_table is None:
+			return
+		table = self._cuda_graph_table
+		extents = self._cuda_graph_row_extents
+		for slot, extent in enumerate(extents):
+			if extent:
+				table[slot, :extent] = -1
+				extents[slot] = 0
 
 	def _ensure_cuda_graph_table(self) -> torch.Tensor:
 		if self._cuda_graph_table is None:
@@ -1493,7 +1539,8 @@ class GPUPagedKVCacheManager:
 		)
 		# The graph table can have been lazily created under inference_mode.
 		with torch.inference_mode():
-			mgr._ensure_cuda_graph_table().fill_(-1)
+			mgr._ensure_cuda_graph_table()
+			mgr.clear_cuda_graph_rows()
 		mgr._cuda_graph_table_valid = True
 		mgr._cuda_graph_slot_count = 0
 		

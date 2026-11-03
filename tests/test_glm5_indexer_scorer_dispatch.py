@@ -429,3 +429,64 @@ def test_deep_gemm_accessor_fails_loud_on_a_missing_api():
     assert "get_paged_mqa_logits_metadata" in src
     assert "get_num_sms" in src
     assert "raise RuntimeError" in src
+
+
+# --------------------------------------------------------------------------- #
+# The step prologue stages O(the step's context), not O(the reserved width)
+# --------------------------------------------------------------------------- #
+#
+# The aux page table and `aux_block_table` are both sized for the DEPLOYMENT
+# context bound, so at a 1,048,576-token span and 64-token pages they are
+# 16,384 columns wide while a decode row owns ~100. The prologue runs ONCE PER
+# DECODE STEP, so gathering the full width is `bucket * 16384 * 4 B` of read
+# plus the same of write every step -- 8 MiB each at bucket 128, against ~64
+# KiB for the rows' real extent. The grid still spans the width (it is baked
+# into the captured graph), so the bound has to live inside the kernel.
+
+
+def test_the_prologue_gather_is_masked_by_the_rows_extent_not_the_width():
+    kernel = _top_level(_tree(_SCORER_SRC), "_prepare_paged_mqa_inputs_kernel")
+    src = ast.unparse(kernel)
+    # The extent is the row's own page count, derived from the GUARDED length
+    # so row 0 keeps its one defined column at true length 0.
+    assert "row_pages = (dg_len + PAGE_SIZE - 1) // PAGE_SIZE" in src
+    # Rounded to a whole DeepGEMM KV split, the same arithmetic the torch-side
+    # `paged_mqa_live_block_columns` applies -- the two must not drift.
+    assert "STAGE_ALIGN_PAGES" in src
+    assert "extent = tl.minimum(row_pages, max_pages)" in src
+    assert "mask = offs < extent" in src
+    # The pre-fix form staged the whole reserved width.
+    assert "mask = offs < max_pages" not in src
+    # PAGE_SIZE must be a constexpr: the extent arithmetic is per-program and
+    # a runtime divisor would cost a division in every block.
+    page_size_arg = [a for a in kernel.args.args if a.arg == "PAGE_SIZE"]
+    assert page_size_arg, "the kernel must take PAGE_SIZE"
+    assert ast.unparse(page_size_arg[0].annotation) == "tl.constexpr"
+
+
+def test_every_prologue_caller_passes_the_aux_page_size():
+    """The extent is meaningless without the page size, so it is REQUIRED --
+    a default would silently restore the full-width stage for one caller."""
+    tree = _tree(_SCORER_SRC)
+    prep = _top_level(tree, "prepare_paged_mqa_inputs_out")
+    names = [a.arg for a in prep.args.kwonlyargs]
+    assert "page_size" in names
+    # Keyword-only with NO default.
+    default = prep.args.kw_defaults[names.index("page_size")]
+    assert default is None, "page_size must not have a default"
+
+    for caller in ("paged_mqa_step_prologue_out", "paged_mqa_score_and_topk_out"):
+        fn = _top_level(tree, caller)
+        callee = (
+            "prepare_paged_mqa_inputs_out"
+            if caller == "paged_mqa_step_prologue_out"
+            else "paged_mqa_step_prologue_out"
+        )
+        assert _call_kwargs(fn, callee)["page_size"] == "page_size"
+
+    # The segment driver hands it the AUX page size, which is the cache the
+    # block table indexes -- not the primary MLA page size.
+    segments = _tree(_SEGMENTS_SRC)
+    run_prep = _method(segments, "Glm5FullDsaAttnSegment", "run_paged_mqa_prep")
+    kwargs = _call_kwargs(run_prep, "paged_mqa_step_prologue_out")
+    assert kwargs["page_size"] == "self.aux_page_size"
