@@ -667,15 +667,7 @@ class Glm5WholeModelSegment:
                 )
             # ONE prologue per step instead of one per layer: its inputs are
             # the step-level statics below, passed unchanged to every layer.
-            # With the host-resident embedding the ids static is retired and
-            # the gathered rows carry the bucket dimension instead.
-            bucket_source = input_ids if input_ids is not None else inputs_embeds
-            if bucket_source is None:
-                raise RuntimeError(
-                    "whole-model capture needs input_ids or inputs_embeds to "
-                    "size the bucket"
-                )
-            bucket_size = int(bucket_source.shape[0])
+            bucket_size = int(input_ids.shape[0])
             self._run_row_validity_prologues(
                 bucket_size,
                 cache_seqlens=cache_seqlens,
