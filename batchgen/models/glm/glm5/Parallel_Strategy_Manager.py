@@ -108,15 +108,6 @@ class GLM5ParallelStrategyManager:
         # bucket-keyed entries. The worker derives it from its CUDA-graph
         # arguments; None until something hands it over (see triton_prewarm).
         self.decode_graph_buckets = None
-        # Host-resident embed_tokens (see _config_host_resident_embed_tokens).
-        # Default ON for GLM-5.3: its [154880, 6144] bf16 table is 1.7725 GiB
-        # of HBM per rank that a decode step reads at most `bucket` rows of.
-        # Set False before the first configure to keep the table on the device.
-        self.host_resident_embed_tokens = (
-            getattr(self.loaded_model_config, "model_type", None)
-            == "glm_moe_dsa_5_3"
-        )
-        self._host_embed_module = None
 
     @property
     def _instances_are_reused(self) -> bool:
@@ -149,10 +140,6 @@ class GLM5ParallelStrategyManager:
         step_start = time.perf_counter()
         self.model = Glm5ForCausalLM(self.loaded_model_config)
         timings['model_init'] = time.perf_counter() - step_start
-
-        # Before share_skeleton_on_device / _load_model_skeleton / .to(device):
-        # the swap is what keeps the table out of the device upload set.
-        self._config_host_resident_embed_tokens()
 
         self.state_dict_name_map = {}
         self.weight_copy_task = {
@@ -298,9 +285,6 @@ class GLM5ParallelStrategyManager:
         torch.cuda.empty_cache()
 
         self.model = Glm5ForCausalLM(self.loaded_model_config)
-
-        # Same ordering requirement as configure_prefill.
-        self._config_host_resident_embed_tokens()
 
         self.weight_copy_task = {
             "attn": [],
@@ -620,12 +604,6 @@ class GLM5ParallelStrategyManager:
         upload = self._skeleton_bind_keys() | {
             key for key in self.skeleton_state_dict if "weight_scale_inv" in key
         }
-        # Host-resident entries never reach the device. _skeleton_bind_keys()
-        # already drops embed_tokens once the module is swapped (it holds no
-        # Parameter), so this subtraction is belt-and-braces: it keeps the
-        # contract true even if something re-registers the table as one.
-        host_resident = self._host_resident_skeleton_keys()
-        upload -= host_resident
         device = self.engine_config.Basic_Config.device_torch
         start = time.perf_counter()
         buckets = {}
@@ -661,80 +639,6 @@ class GLM5ParallelStrategyManager:
                 ),
                 kept_count,
                 kept_bytes / (1024 ** 3),
-            )
-
-    EMBED_TOKENS_SKELETON_KEY = "model.embed_tokens.weight"
-
-    def _host_resident_skeleton_keys(self):
-        """Skeleton checkpoint keys deliberately kept in host memory.
-
-        Only ``embed_tokens`` qualifies: a decode step touches at most
-        ``bucket`` of its 154,880 rows, so the table buys nothing by sitting in
-        HBM. ``lm_head`` is a full ``[V, H]`` matmul every step and stays on the
-        device.
-        """
-        if not self.host_resident_embed_tokens:
-            return frozenset()
-        if self.EMBED_TOKENS_SKELETON_KEY not in self.skeleton_state_dict:
-            raise RuntimeError(
-                f"host-resident embed_tokens needs {self.EMBED_TOKENS_SKELETON_KEY} "
-                "in the skeleton state dict; it is absent"
-            )
-        return frozenset({self.EMBED_TOKENS_SKELETON_KEY})
-
-    def _config_host_resident_embed_tokens(self):
-        """Swap ``model.embed_tokens`` for the host-resident lookup.
-
-        Must run after the model is built and BEFORE
-        ``share_skeleton_on_device`` / ``_load_model_skeleton`` /
-        ``model.to(device)``:
-
-        * ``share_skeleton_on_device`` derives its upload set from
-          ``model.named_parameters()``, so the swap (which leaves no Parameter
-          behind) is what keeps the 1.7725 GiB table off the device;
-        * ``_load_model_skeleton`` then has no ``embed_tokens`` parameter to
-          bind, so the table never enters ``_skeleton_bound_params`` and
-          ``_assert_skeleton_still_shared`` has nothing to check for it;
-        * ``model.to(device)`` cannot move a plain attribute.
-
-        Both phase instances swap in the same host tensor, so prefill and
-        decode share ONE host copy exactly as they shared one device copy.
-        """
-        if not self.host_resident_embed_tokens:
-            return
-        from .host_embedding import HostResidentEmbedding
-
-        embed = self.model.model.embed_tokens
-        if isinstance(embed, HostResidentEmbedding):
-            return
-        host_weight = self.skeleton_state_dict[self.EMBED_TOKENS_SKELETON_KEY]
-        if host_weight.device.type != "cpu":
-            raise RuntimeError(
-                f"{self.EMBED_TOKENS_SKELETON_KEY} is already on "
-                f"{host_weight.device}: the skeleton was shared to the device "
-                "before the host-resident embedding was configured"
-            )
-        vocab = int(self.model_config.vocab_size)
-        if int(host_weight.shape[0]) != vocab:
-            raise RuntimeError(
-                f"{self.EMBED_TOKENS_SKELETON_KEY} has {host_weight.shape[0]} "
-                f"rows, expected the vocab size {vocab}"
-            )
-        module = HostResidentEmbedding(
-            host_weight,
-            self.engine_config.Basic_Config.device_torch,
-            padding_idx=getattr(embed, "padding_idx", None),
-        )
-        self.model.model.embed_tokens = module
-        self._host_embed_module = module
-        if self.rank == 0:
-            logging.info(
-                "[GLM5] embed_tokens host-resident: [%d, %d] %s, %.4f GiB/rank "
-                "not uploaded; decode gathers <=bucket rows per step",
-                vocab,
-                module.embedding_dim,
-                host_weight.dtype,
-                module.host_bytes() / (1024 ** 3),
             )
 
     def _skeleton_bind_keys(self):

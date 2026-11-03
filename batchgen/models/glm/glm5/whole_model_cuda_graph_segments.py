@@ -139,40 +139,17 @@ class Glm5WholeModelSegment:
         self.aux_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._no_v_cache = True
         self._capture_inputs: dict[str, torch.Tensor] | None = None
-        # Capture inputs that have no static buffer (host-resident embed:
-        # `input_ids`, used only to derive the capture-time embedding rows).
-        self._capture_only_inputs: frozenset[str] = frozenset()
         self._capture_dsa_short_count: int | None = None
 
-    @property
-    def embed_is_host_resident(self) -> bool:
-        """True when ``embed_tokens`` keeps its table in host memory.
-
-        A captured graph cannot gather from host memory, so in this mode the
-        embedding lookup moves out of capture: the graph takes the step's
-        already-gathered rows through the ``inputs_embeds`` static buffer (see
-        ``Glm5CudaGraphAdapter.prepare_replay_inputs``).
-        """
-        embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
-        return bool(getattr(embed, "host_resident", False))
-
     def set_capture_inputs(self, **inputs: torch.Tensor) -> None:
-        specs = set(self.get_static_input_specs(self.max_bucket_size))
-        # Host-resident embed: ``input_ids`` is a capture-only input (it has no
-        # static buffer) from which ``initialize_static_inputs`` derives the
-        # embedding rows, so warmup stays numerically identical to the
-        # device-resident build. ``inputs_embeds`` is correspondingly optional.
-        capture_only = {"input_ids"} if self.embed_is_host_resident else set()
-        accepted = specs | capture_only
-        required = accepted - {"inputs_embeds"}
+        required = set(self.get_static_input_specs(self.max_bucket_size))
         missing = required - set(inputs)
         if missing:
             raise ValueError(f"missing GLM-5 whole-model capture inputs: {sorted(missing)}")
-        unknown = set(inputs) - accepted
+        unknown = set(inputs) - required
         if unknown:
             raise ValueError(f"unknown GLM-5 whole-model capture inputs: {sorted(unknown)}")
         self._capture_inputs = dict(inputs)
-        self._capture_only_inputs = frozenset(capture_only)
 
     def initialize_static_inputs(
         self,
@@ -191,8 +168,6 @@ class Glm5WholeModelSegment:
                 target.fill_(spec.fill_value)
 
         for name, source in self._capture_inputs.items():
-            if name in self._capture_only_inputs:
-                continue
             target = static_inputs[name]
             if name == "rank_token_counts":
                 if tuple(source.shape) != tuple(target.shape):
@@ -216,29 +191,6 @@ class Glm5WholeModelSegment:
             if source.shape[0] > 0:
                 target[: source.shape[0]].copy_(
                     source.to(device=target.device, dtype=target.dtype),
-                    non_blocking=True,
-                )
-        if self.embed_is_host_resident and "inputs_embeds" not in self._capture_inputs:
-            # Warmup must see the SAME hidden states the device-resident build
-            # saw for these ids: warmup runs the real model over real slots, so
-            # feeding a zero-filled embeds buffer here would write KV derived
-            # from zeros into live pages.
-            embeds_target = static_inputs.get("inputs_embeds")
-            ids = self._capture_inputs.get("input_ids")
-            if embeds_target is None or ids is None:
-                raise RuntimeError(
-                    "host-resident embed_tokens capture needs the 'inputs_embeds' "
-                    "static buffer and the capture-only 'input_ids'"
-                )
-            rows = int(ids.shape[0])
-            if rows > embeds_target.shape[0]:
-                raise ValueError(
-                    f"GLM-5 whole-model capture input_ids batch dim {rows} exceeds "
-                    f"static inputs_embeds shape {tuple(embeds_target.shape)}"
-                )
-            if rows:
-                embeds_target[:rows].copy_(
-                    self.model.model.embed_tokens(ids).to(dtype=embeds_target.dtype),
                     non_blocking=True,
                 )
         cache_seqlens = static_inputs.get("cache_seqlens")
@@ -382,17 +334,6 @@ class Glm5WholeModelSegment:
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
         }
-        if self.embed_is_host_resident:
-            # Address-stable landing buffer for the out-of-capture host gather,
-            # and `input_ids` drops out of the static set on purpose: a caller
-            # that still replays by ids (the legacy non-adapter decode branch)
-            # would otherwise replay LAST step's embedding rows, which is
-            # silent corruption. Without the buffer it gets a loud KeyError
-            # from the graph manager instead.
-            specs.pop("input_ids")
-            specs["inputs_embeds"] = TensorSpec(
-                ("batch_size", 1, self.hidden_size), torch.bfloat16, fill_value=0
-            )
         if self.layer_segments:
             specs["num_valid_tokens"] = TensorSpec(
                 (1,), torch.int32, fill_value=float(bucket_size)
@@ -630,7 +571,7 @@ class Glm5WholeModelSegment:
     def run_model_with_probes(
         self,
         *,
-        input_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cache_seqlens: torch.Tensor | None = None,
@@ -639,17 +580,8 @@ class Glm5WholeModelSegment:
         num_valid_tokens: torch.Tensor | None = None,
         rank_token_counts: torch.Tensor | None = None,
         use_layer_segments: bool | None = None,
-        inputs_embeds: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        # ``inputs_embeds`` is the host-resident path: the rows were gathered
-        # outside capture, because a captured graph cannot read host memory.
-        # Eager callers (the graph-vs-eager compare probe) still pass ids only
-        # and let the module gather from host itself.
-        hidden_states = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.model.model.embed_tokens(input_ids)
-        )
+        hidden_states = self.model.model.embed_tokens(input_ids)
         outputs: dict[str, torch.Tensor] = {}
         if self.layer_segments and use_layer_segments is not False:
             required = {
@@ -746,27 +678,15 @@ class Glm5WholeModelSegment:
 
     def forward(
         self,
+        input_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         position_ids: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
         rank_token_counts: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
         num_valid_tokens: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
-        # Exactly one of the two embedding entry points. `input_ids` is absent
-        # from the static set when the table is host-resident (see
-        # get_static_input_specs), and present otherwise.
-        if (input_ids is None) == (inputs_embeds is None):
-            raise RuntimeError(
-                "GLM-5 whole-model graph needs exactly one of 'input_ids' or "
-                "'inputs_embeds'; host-resident embed_tokens supplies the "
-                "latter because a captured graph cannot read host memory"
-            )
-        bucket_size = int(
-            (input_ids if input_ids is not None else inputs_embeds).shape[0]
-        )
+        bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
 
         old_cache_seqlens = AttnWrapperBase.cache_seqlens
@@ -797,7 +717,6 @@ class Glm5WholeModelSegment:
             GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
             outputs = self.run_model_with_probes(
                 input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
                 position_ids=position_ids,
                 cache_seqlens=cache_seqlens,
                 primary_slot_indices=primary_slot_indices,
