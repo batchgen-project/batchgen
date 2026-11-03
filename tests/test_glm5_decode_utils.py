@@ -1727,14 +1727,14 @@ def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity():
         64,
         aux_page_table,
         64,
-        model_max_position_embeddings=131072,
+        deployment_context_tokens=131072,
     ) == 20480
     assert BatchGenWorker._glm5_dsa_graph_score_capacity_tokens(
         primary_page_table,
         64,
         aux_page_table,
         64,
-        model_max_position_embeddings=16889,
+        deployment_context_tokens=16889,
     ) == 16889
 
 
