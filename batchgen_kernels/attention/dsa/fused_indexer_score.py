@@ -62,33 +62,76 @@ class FP8WqbWeightsCUDA:
     Reuses FP8IndexerWeightsCUDA which handles arbitrary N, K.
     """
 
+    _RELEASED_MESSAGE = (
+        "this FP8WqbWeightsCUDA was released: its re-quantized wq_b copy and "
+        "TMA descriptor are gone because a merged [q_b | wq_b] GEMM operand "
+        "took over the projection. Build a new FP8WqbWeightsCUDA before "
+        "selecting the separate wq_b version again"
+    )
+
     def __init__(self, wq_b_weight_bf16: torch.Tensor, module, block_k: int = 128):
         # wq_b_weight_bf16: [4096, 2048]
         self.inner = FP8IndexerWeightsCUDA(wq_b_weight_bf16, module, block_k)
+        # Kept past release() so shape queries keep answering while the
+        # tensors fail loud: the operand's geometry is static metadata, the
+        # device bytes are the residency this container can give back.
+        self._shape = (self.inner.N, self.inner.K, self.inner.block_k)
+
+    @property
+    def released(self) -> bool:
+        return self.inner is None
+
+    def release(self) -> int:
+        """Drop the re-quantized wq_b copy and its TMA descriptor.
+
+        Returns the device bytes freed (0 if already released). Idempotent.
+
+        Only correct when the caller has proved that nothing will run the
+        separate wq_b projection against this container again; every tensor
+        accessor raises afterwards rather than handing out a stale TMA
+        descriptor, so a path that is wrongly still selected fails loud
+        instead of reading freed device memory.
+        """
+        inner = self.inner
+        if inner is None:
+            return 0
+        freed = (
+            inner.w_fp8.numel() * inner.w_fp8.element_size()
+            + inner.w_scale.numel() * inner.w_scale.element_size()
+        )
+        # The TMA descriptor is built from w_fp8's address, so it goes with
+        # it: dropping the inner container drops both together.
+        self.inner = None
+        return freed
+
+    def _require_inner(self):
+        if self.inner is None:
+            raise RuntimeError(self._RELEASED_MESSAGE)
+        return self.inner
 
     @property
     def w_fp8(self):
-        return self.inner.w_fp8
+        return self._require_inner().w_fp8
 
     @property
     def w_scale(self):
-        return self.inner.w_scale
+        return self._require_inner().w_scale
 
     @property
     def tma_desc(self):
-        return self.inner.tma_desc
+        return self._require_inner().tma_desc
 
     @property
     def N(self):
-        return self.inner.N
+        return self._shape[0]
 
     @property
     def K(self):
-        return self.inner.K
+        return self._shape[1]
 
     @property
     def block_k(self):
-        return self.inner.block_k
+        return self._shape[2]
 
 
 # ============================================================

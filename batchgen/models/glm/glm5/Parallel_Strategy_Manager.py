@@ -1153,6 +1153,13 @@ class GLM5ParallelStrategyManager:
     def _config_attn_module(self):
         """Replace attention modules with GLM5AttnWrapper."""
         start_time = time.perf_counter()
+        # Only the decode configure registers resident attention weights
+        # (configure_prefill lists every attn module in weight_copy_task, so
+        # its wrappers are non-persistent and stream per forward). The phase is
+        # read explicitly anyway, because the kv_b_proj release below is only
+        # correct for the instance that owns the BF16 absorb pair.
+        decode_phase = getattr(self.loaded_model_config, "phase", None) == "decode"
+        kv_b_released = 0
         for layer_idx in range(len(self.model.model.layers)):
             attn_module = self.model.model.layers[layer_idx].self_attn
             if self.engine_config.Basic_Config.gpu_arch in ("hopper", "blackwell"):
@@ -1220,6 +1227,19 @@ class GLM5ParallelStrategyManager:
             if persistent:
                 wrapper._register_fp8_weights()
                 wrapper.initialize_decode_absorb()
+                if decode_phase:
+                    # The absorb pair now holds everything decode reads out of
+                    # kv_b_proj; the FP8 weight is dead residency competing
+                    # with the GPU KV pool. See release_decode_kv_b_proj.
+                    kv_b_released += wrapper.release_decode_kv_b_proj()
+
+        if kv_b_released and self.rank == 0:
+            logging.info(
+                "[ATTN] released decode FP8 kv_b_proj on %d layers: %.3f GiB "
+                "(BF16 absorb pair is the decode authority)",
+                len(self.model.model.layers),
+                kv_b_released / (1024 ** 3),
+            )
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Attn module config time: {elapsed:.2f}s")

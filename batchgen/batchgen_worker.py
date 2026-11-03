@@ -18698,6 +18698,21 @@ class BatchGenWorker:
 					logging.warning(
 						"Phase B: failed to attach/record_capture on adapter: %s", _exc,
 					)
+			# The decode graphs are captured and active, so the eager MoE
+			# buffers these layers share (one set for the whole model) are dead
+			# residency competing with the KV pool that
+			# _finalize_gpu_kv_pool_after_capture sizes from the post-capture
+			# steady usage. The eager fallback paths re-create them on demand
+			# at their own entry, so this is a residency switch only.
+			for _mlp in moe_layers[:1]:
+				_eager_moe_freed = _mlp.release_eager_decode_buffers()
+				if _eager_moe_freed and self.rank == 0:
+					logging.info(
+						"Rank %s: released the eager MoE decode buffers "
+						"(%.3f GiB) after graph capture",
+						self.rank,
+						_eager_moe_freed / (1024 ** 3),
+					)
 			stats = manager.get_capture_stats()
 			logging.info(
 				f"Rank {self.rank}: GLM-5 whole-model CUDA graph ready in "
