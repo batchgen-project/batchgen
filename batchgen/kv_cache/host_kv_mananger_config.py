@@ -193,7 +193,9 @@ _GLM5_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# GLM-5 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128)
+# GLM-5/5.1 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128).
+# Those checkpoints ship no positive index_topk_freq, so every layer computes
+# top-k and owns an indexer K slot.
 _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=78,
 	num_k_heads=1,
@@ -203,12 +205,13 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# GLM-5.2 runs the DSA indexer on 21 of 78 layers ([0, 1, 2] + range(6, 78, 4),
-# i.e. index_topk_freq=4 / index_skip_topk_offset=3 — see
-# batchgen/models/glm/glm5/dsa_schedule.py); the other 57 skip_topk layers
-# reuse the previous full layer's top-k and never read the aux K cache. Store
-# only the 21 indexer layers densely in both host and GPU aux pools; the
-# logical map keeps engine-layer indexing at every caller (-1 = no slot).
+# GLM-5.2 and GLM-5.3 run the DSA indexer on 21 of 78 layers ([0, 1, 2] +
+# range(6, 78, 4), i.e. index_topk_freq=4 / index_skip_topk_offset=3 in both
+# checkpoints' config.json — see batchgen/models/glm/glm5/dsa_schedule.py);
+# the other 57 skip_topk layers reuse the previous full layer's top-k and
+# never read the aux K cache. Store only the 21 indexer layers densely in
+# both host and GPU aux pools; the logical map keeps engine-layer indexing at
+# every caller (-1 = no slot).
 _GLM5_2_INDEXER_LOGICAL_LAYERS = (0, 1, 2) + tuple(range(6, 78, 4))
 _GLM5_2_INDEXER_PHYSICAL_BY_LOGICAL = {
 	logical_layer: physical_layer
@@ -222,7 +225,7 @@ _GLM5_2_INDEXER_LAYER_MAP = tuple(
 # deep_gemm.fp8_paged_mqa_logits reads directly: per page
 # [64 x 128 B e4m3 K][64 x 4 B fp32 scale] = 8,448 B. k_head_dim is therefore
 # the per-token BYTE count (128 data + 4 scale = 132), not an element count:
-# 132 B/token against 256 B/token for bf16 AoS. GLM-5/5.1/5.3 keep
+# 132 B/token against 256 B/token for bf16 AoS. GLM-5/5.1 keep
 # `glm5_indexer` (bf16 AoS) untouched.
 _GLM5_2_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=len(_GLM5_2_INDEXER_LOGICAL_LAYERS),
@@ -369,20 +372,22 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
 	),
-	# GLM-5.2 stores only its 21 indexer layers (dense mapped profile).
-	# GLM-5.3's skip-layer schedule is not established here; it stays on the
-	# full 78-layer profile with GLM-5/5.1.
+	# GLM-5.2 and GLM-5.3 store only their 21 indexer layers (dense mapped
+	# profile). GLM-5.3's schedule is established from its checkpoint
+	# config.json (index_topk_freq=4 / index_skip_topk_offset=3, verified
+	# 2026-11-03): the same 21-layer set as GLM-5.2, so both share the
+	# page-split FP8 profile.
 	"glm5_2_indexer": (
 		"zai-org/glm-5.2-fp8",
 		"zai-org/glm-5.2",
 		"glm-5.2-fp8",
 		"glm-5.2",
-	),
-	"glm5_indexer": (
 		"zai-org/glm-5.3-fp8",
 		"zai-org/glm-5.3",
 		"glm-5.3-fp8",
 		"glm-5.3",
+	),
+	"glm5_indexer": (
 		"zai-org/glm-5-fp8",
 		"zai-org/glm-5",
 		"glm-5-fp8",
