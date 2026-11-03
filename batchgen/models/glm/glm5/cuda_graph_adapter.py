@@ -287,7 +287,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         """
         self._require_ctx()
         device = self._ctx.device
-        return {
+        empty_inputs = {
             "input_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
             "cache_seqlens": torch.empty((0,), dtype=torch.int32, device=device),
             "position_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
@@ -298,6 +298,15 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             ),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=device),
         }
+        host_embed = self._host_resident_embed()
+        if host_embed is not None:
+            empty_inputs.pop("input_ids")
+            empty_inputs["inputs_embeds"] = torch.empty(
+                (0, 1, host_embed.embedding_dim),
+                dtype=host_embed.host_weight.dtype,
+                device=device,
+            )
+        return empty_inputs
 
     # ---- Step-time ------------------------------------------------------
 
@@ -423,7 +432,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 "(next-token tensor for this step)"
             )
 
-        return {
+        replay_inputs = {
             "input_ids": input_ids[:local_bsz],
             "cache_seqlens": cache_seqlens_i32,
             "position_ids": position_ids_i64,
@@ -432,6 +441,30 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "rank_token_counts": rank_token_counts,
             "num_valid_tokens": num_valid_tokens,
         }
+        host_embed = self._host_resident_embed()
+        if host_embed is not None:
+            # The embedding table lives in host memory, which a captured graph
+            # cannot read. Gather this step's rows here, outside capture, and
+            # hand them to the graph's address-stable `inputs_embeds` buffer.
+            # `input_ids` has no static buffer in that build, so sending it
+            # would be a KeyError from the graph manager.
+            #
+            # Full bucket, not just the live rows: the device-resident build
+            # fed the graph a bucket-sized `input_ids` buffer whose padding
+            # rows were id 0, so its padded hidden states were embed[0], not
+            # zeros. `manager.replay` zero-fills any short input, so handing it
+            # `local_bsz` rows would silently change what the padded rows carry.
+            # Padding is masked downstream, but matching the old bytes exactly
+            # is what makes this change provably numerics-neutral.
+            bucket = int(
+                self._ctx.bucketing.get_padded_size(int(batch_state.max_rank_bsz))
+            )
+            padded_ids = torch.zeros((bucket, 1), dtype=torch.int64, device=device)
+            if local_bsz:
+                padded_ids[:local_bsz] = input_ids[:local_bsz].reshape(local_bsz, 1)
+            replay_inputs.pop("input_ids")
+            replay_inputs["inputs_embeds"] = host_embed(padded_ids)
+        return replay_inputs
 
     def stage_post_graph_kv(
         self,
@@ -611,6 +644,19 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             raise RuntimeError(
                 "Glm5CudaGraphAdapter has no build context; call build_segments() first"
             )
+
+    def _host_resident_embed(self):
+        """``embed_tokens`` when its table is host-resident, else None.
+
+        Duck-typed on the module's ``host_resident`` marker so the adapter does
+        not depend on where the table came from.
+        """
+        if self._ctx is None:
+            return None
+        embed = getattr(
+            getattr(self._ctx.model, "model", None), "embed_tokens", None
+        )
+        return embed if getattr(embed, "host_resident", False) else None
 
 
 __all__ = ["Glm5CudaGraphAdapter", "SEGMENT_NAME_WHOLE_MODEL"]
