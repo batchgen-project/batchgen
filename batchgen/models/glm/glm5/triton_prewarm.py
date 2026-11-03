@@ -784,6 +784,7 @@ def _run_paged_mqa_prepare(geometry: Glm5DecodeGeometry, device,
         num_valid_tokens=_valid_count(1, device),
         deep_gemm_context_lens_out=torch.empty((1, next_n), dtype=torch.int32,
                                                device=device),
+        page_size=geometry.aux_page_size,
     )
 
 

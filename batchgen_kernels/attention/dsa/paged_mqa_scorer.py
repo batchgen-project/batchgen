@@ -53,6 +53,7 @@ from batchgen_kernels.attention.dsa.paged_mqa_logits import (
     align_context_len,
     check_logits_layout,
     guard_deep_gemm_context_lens,
+    paged_mqa_stage_align_pages,
     plan_paged_mqa_logits,
     require_page_split_aux_cache,
     saturate_q_to_e4m3_range,
@@ -118,6 +119,8 @@ def _prepare_paged_mqa_inputs_kernel(
     page_table_stride,
     block_table_stride,
     max_pages,
+    PAGE_SIZE: tl.constexpr,
+    STAGE_ALIGN_PAGES: tl.constexpr,
     HAS_VALID_TOKENS: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
@@ -125,6 +128,16 @@ def _prepare_paged_mqa_inputs_kernel(
 
     Device-side form of ``prepare_paged_mqa_inputs_reference`` followed by
     ``guard_deep_gemm_context_lens``, fused so the guard costs no extra launch.
+
+    Each row is gathered only as far as its OWN context reaches:
+    ``ceil(dg_len / PAGE_SIZE)`` columns rounded up to ``STAGE_ALIGN_PAGES``,
+    where ``dg_len`` is the guarded length DeepGEMM is handed. The grid still
+    spans ``max_pages`` -- it is baked into a captured graph and must not move
+    -- but the blocks past a row's extent predicate every load and store off,
+    so the traffic is proportional to the step's context instead of to the
+    reserved width. That matters because the width is sized for the DEPLOYMENT
+    context bound (16384 columns at a 1M span and 64-token pages) while a
+    decode row owns ~100 of them, and this launch runs once per decode step.
     """
 
     pid_b = tl.program_id(0)
@@ -144,8 +157,26 @@ def _prepare_paged_mqa_inputs_kernel(
     reads = context_len > 0
     safe_slot = tl.where(reads, slot, 0).to(tl.int64)
 
+    # guard_deep_gemm_context_lens: row 0 >= 1, every other row unchanged, so
+    # the lengths DeepGEMM schedules over are never all zero.
+    dg_len = tl.where(pid_b == 0, tl.maximum(context_len, 1), context_len)
+    # The last column any reader can reach. DeepGEMM visits page
+    # `t // PAGE_SIZE` for `t` in `[0, dg_len)` and nothing beyond, and the
+    # top-k is bounded by `context_len <= dg_len`. Row 0's guard keeps one page
+    # live even at length 0, which is why the extent is derived from the
+    # GUARDED length: that one column must still be the DEFINED page 0 a
+    # non-reading row gets, never a stale id.
+    row_pages = (dg_len + PAGE_SIZE - 1) // PAGE_SIZE
+    # Rounded up to a whole DeepGEMM KV split: a CTA owning the last, partial
+    # split can address that split's whole block-table range. See
+    # ``paged_mqa_stage_align_pages`` -- this must stay the same arithmetic.
+    row_pages = (
+        (row_pages + STAGE_ALIGN_PAGES - 1) // STAGE_ALIGN_PAGES
+    ) * STAGE_ALIGN_PAGES
+    extent = tl.minimum(row_pages, max_pages)
+
     offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
-    mask = offs < max_pages
+    mask = offs < extent
     # For a reading row, `-1` entries are passed through: DeepGEMM never visits
     # a page past the row's context_len, and an out-of-range page index makes
     # its TMA load zero-fill -- the same value the retired Triton scorer
@@ -159,9 +190,6 @@ def _prepare_paged_mqa_inputs_kernel(
 
     if pid_p == 0:
         tl.store(CONTEXT_LENS_ptr + pid_b, context_len)
-        # guard_deep_gemm_context_lens: row 0 >= 1, every other row unchanged,
-        # so the lengths DeepGEMM schedules over are never all zero.
-        dg_len = tl.where(pid_b == 0, tl.maximum(context_len, 1), context_len)
         tl.store(DG_CONTEXT_LENS_ptr + pid_b, dg_len)
 
 
@@ -174,6 +202,7 @@ def prepare_paged_mqa_inputs_out(
     num_valid_tokens: Optional[torch.Tensor] = None,
     *,
     deep_gemm_context_lens_out: torch.Tensor,
+    page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One-launch, allocation-free form of ``prepare_paged_mqa_inputs_reference``.
 
@@ -182,6 +211,14 @@ def prepare_paged_mqa_inputs_out(
     ``context_lens_out`` keeps the TRUE lengths (the top-k's bound);
     ``deep_gemm_context_lens_out`` is the only form DeepGEMM may be handed.
     Returns ``(block_table_out, context_lens_out, deep_gemm_context_lens_out)``.
+
+    ``page_size`` is the aux cache's tokens per page and is REQUIRED: it is
+    what turns each row's context length into the number of block-table
+    columns that row's readers can reach, so the gather writes the row's own
+    extent instead of the reserved width. Columns past a row's extent are
+    left UNTOUCHED -- no reader can reach them (see the kernel docstring) --
+    so a caller must not treat the tail of ``block_table_out`` as rewritten
+    each call.
     """
 
     if page_table.dim() != 2:
@@ -244,6 +281,8 @@ def prepare_paged_mqa_inputs_out(
                 f"{tuple(num_valid_tokens.shape)}"
             )
 
+    stage_align_pages = paged_mqa_stage_align_pages(page_size)
+
     block_p = min(256, triton.next_power_of_2(max_pages))
     grid = (batch, triton.cdiv(max_pages, block_p))
     _prepare_paged_mqa_inputs_kernel[grid](
@@ -257,6 +296,8 @@ def prepare_paged_mqa_inputs_out(
         page_table.stride(0),
         block_table_out.stride(0),
         max_pages,
+        PAGE_SIZE=int(page_size),
+        STAGE_ALIGN_PAGES=stage_align_pages,
         HAS_VALID_TOKENS=num_valid_tokens is not None,
         BLOCK_P=block_p,
     )
@@ -398,6 +439,7 @@ def paged_mqa_step_prologue_out(
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
     deep_gemm_context_lens: torch.Tensor,
+    page_size: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The STEP-level half of the scorer: paged inputs + the work schedule.
@@ -414,6 +456,11 @@ def paged_mqa_step_prologue_out(
     keep that tensor alive for as long as any layer still has to score, and
     must hand it to every ``paged_mqa_score_and_topk_prepared_out`` call of
     the same step.
+
+    ``page_size`` bounds the ``block_table`` gather by each row's own context
+    (see ``prepare_paged_mqa_inputs_out``): the columns past a row's extent
+    keep whatever the previous step left there, and no reader of this step
+    reaches them.
     """
 
     prepare_paged_mqa_inputs_out(
@@ -424,6 +471,7 @@ def paged_mqa_step_prologue_out(
         context_lens,
         num_valid_tokens=num_valid_tokens,
         deep_gemm_context_lens_out=deep_gemm_context_lens,
+        page_size=page_size,
     )
     return paged_mqa_logits_schedule_meta(deep_gemm_context_lens)
 
@@ -576,6 +624,7 @@ def paged_mqa_score_and_topk_out(
         block_table=block_table,
         context_lens=context_lens,
         deep_gemm_context_lens=deep_gemm_context_lens,
+        page_size=page_size,
         num_valid_tokens=num_valid_tokens,
     )
     return paged_mqa_score_and_topk_prepared_out(

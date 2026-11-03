@@ -359,3 +359,166 @@ def test_layer_kv_cache_without_v_cache_returns_none():
     k_cache, v_cache = manager.get_layer_kv_cache(0)
     assert k_cache.data_ptr() == manager._k_cache[0].data_ptr()
     assert v_cache is None
+
+
+# --------------------------------------------------------------------------- #
+# The graph table is REFRESHED in O(the rows' pages), not O(its reserved width)
+# --------------------------------------------------------------------------- #
+#
+# The CUDA-graph page table is sized for the DEPLOYMENT context bound, so at a
+# 1,048,576-token span and 64-token pages it is 16,384 columns wide while a
+# decode row owns ~100 of them. The refresh used to re-establish `-1` across
+# the whole width of every active row on every rebuild, which is a per-step
+# cost proportional to the width instead of to the context: at 128 rows that is
+# 128 * 16384 * 4 B = 8 MiB per pool per step, against ~64 KiB for the rows'
+# real pages. These tests pin the accounting, not a timing.
+
+_GRAPH_WIDTH = 16384
+_GRAPH_SLOTS = 64
+_PAGES_PER_ROW = 128
+
+
+_WRITE_LEDGER = {"elements": 0}
+_COUNTED_WRITES = ("fill_", "zero_", "copy_", "__setitem__")
+
+
+class _WriteCountingTensor(torch.Tensor):
+    """A real tensor that records how many ELEMENTS each in-place write touches.
+
+    A subclass rather than a wrapper object, because the write patterns under
+    test differ in exactly the place a wrapper hides: a width-proportional
+    clear is ``table[:rows, :].fill_(-1)``, whose ``fill_`` lands on the SLICE.
+    Slicing a subclass yields a subclass, so the slice's own write is counted;
+    slicing a wrapper yields a plain tensor and the write disappears.
+    """
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if getattr(func, "__name__", "") in _COUNTED_WRITES:
+            target = args[0]
+            with torch._C.DisableTorchFunctionSubclass():
+                written = (
+                    target[args[1]].numel()
+                    if func.__name__ == "__setitem__"
+                    else target.numel()
+                )
+            _WRITE_LEDGER["elements"] += int(written)
+        return super().__torch_function__(func, types, args, kwargs)
+
+
+def _reset_write_ledger() -> None:
+    _WRITE_LEDGER["elements"] = 0
+
+
+def _written_elements() -> int:
+    return _WRITE_LEDGER["elements"]
+
+
+def _make_wide_graph_manager(
+    rows: int = _GRAPH_SLOTS, pages_per_row: int = _PAGES_PER_ROW
+):
+    """A manager whose graph table has the production width, write-counted."""
+    config = GPUPagedKVConfig(
+        num_layers=1,
+        # Room for a second batch of rows alongside the first, so a slot
+        # handover can be exercised without recycling pages.
+        num_pages=2 * rows * (pages_per_row + 1),
+        page_size_tokens=64,
+        num_k_heads=1,
+        k_head_dim=8,
+        num_v_heads=0,
+        v_head_dim=0,
+        kv_dtype=torch.bfloat16,
+        cuda_graph_max_pages_per_sequence=_GRAPH_WIDTH,
+        cuda_graph_max_slots=_GRAPH_SLOTS,
+    )
+    manager = GPUPagedKVCacheManager(config=config, device="cpu")
+    manager.initialize()
+    page_manager = manager._gpu_page_table_manager
+    assert page_manager.graph_max_pages_per_sequence == _GRAPH_WIDTH
+    # Create the real storage (which also seeds the written-extent bookkeeping),
+    # then count every write that reaches it.
+    real = page_manager._ensure_cuda_graph_table()
+    counted = torch.Tensor._make_subclass(_WriteCountingTensor, real, False)
+    page_manager._cuda_graph_table = counted
+    _reset_write_ledger()
+    return manager, page_manager, counted
+
+
+def test_graph_table_refresh_writes_the_rows_pages_not_the_reserved_width():
+    rows, pages_per_row = _GRAPH_SLOTS, _PAGES_PER_ROW
+    manager, page_manager, table = _make_wide_graph_manager(rows, pages_per_row)
+    seq_ids = list(range(100, 100 + rows))
+    tokens = [pages_per_row * 64] * rows
+    manager.allocate_pages_for_sequences(seq_ids, tokens)
+
+    manager.rebuild_page_table(seq_ids)
+    first = _written_elements()
+    assert first == rows * pages_per_row
+    # The point of the fix: the refresh must not scale with the reserved width.
+    assert first < rows * _GRAPH_WIDTH // 100
+
+    # A decode step that extends every row by one page writes that step's
+    # pages and nothing else -- no clear is owed, because a row only grows.
+    for seq_id in seq_ids:
+        manager.extend_pages_for_sequence(seq_id, (pages_per_row + 1) * 64)
+    _reset_write_ledger()
+    manager.rebuild_page_table(seq_ids)
+    assert _written_elements() == rows * (pages_per_row + 1)
+
+
+def test_graph_table_refresh_still_clears_what_a_shorter_occupant_inherits():
+    """O(context) must not mean "stale pages survive a slot handover"."""
+    rows, pages_per_row = 4, 16
+    manager, page_manager, table = _make_wide_graph_manager(rows, pages_per_row)
+    long_ids = list(range(10, 10 + rows))
+    manager.allocate_pages_for_sequences(long_ids, [pages_per_row * 64] * rows)
+    manager.rebuild_page_table(long_ids)
+
+    short_ids = list(range(50, 50 + rows))
+    manager.allocate_pages_for_sequences(short_ids, [3 * 64] * rows)
+    _reset_write_ledger()
+    manager.rebuild_page_table(short_ids)
+
+    # 3 pages written + 13 columns cleared per row: the shorter occupant's
+    # tail, never the 16384-column width.
+    assert _written_elements() == rows * pages_per_row
+    for slot, seq_id in enumerate(short_ids):
+        torch.testing.assert_close(table[slot, :3], manager._sequences[seq_id].pages)
+        assert torch.all(table[slot, 3:] == -1), slot
+
+
+def test_graph_table_refresh_clears_slots_the_batch_gave_up():
+    rows, pages_per_row = 4, 16
+    manager, page_manager, table = _make_wide_graph_manager(rows, pages_per_row)
+    seq_ids = list(range(10, 10 + rows))
+    manager.allocate_pages_for_sequences(seq_ids, [pages_per_row * 64] * rows)
+    manager.rebuild_page_table(seq_ids)
+
+    _reset_write_ledger()
+    manager.rebuild_page_table(seq_ids[:2])
+    # Two surviving rows rewritten, two retired rows cleared to -1.
+    assert _written_elements() == rows * pages_per_row
+    assert torch.all(table[2:, :] == -1)
+    # A later batch that reclaims those slots inherits no stale page id.
+    manager.rebuild_page_table(seq_ids)
+    for slot, seq_id in enumerate(seq_ids):
+        torch.testing.assert_close(
+            table[slot, :pages_per_row], manager._sequences[seq_id].pages
+        )
+        assert torch.all(table[slot, pages_per_row:] == -1), slot
+
+
+def test_clear_page_table_resets_without_touching_unused_columns():
+    rows, pages_per_row = 4, 16
+    manager, page_manager, table = _make_wide_graph_manager(rows, pages_per_row)
+    seq_ids = list(range(10, 10 + rows))
+    manager.allocate_pages_for_sequences(seq_ids, [pages_per_row * 64] * rows)
+    manager.rebuild_page_table(seq_ids)
+
+    _reset_write_ledger()
+    manager.clear_page_table()
+    assert _written_elements() == rows * pages_per_row
+    assert torch.all(table == -1)
+    assert page_manager._cuda_graph_slot_count == 0
