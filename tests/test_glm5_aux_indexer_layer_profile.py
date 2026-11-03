@@ -1,8 +1,8 @@
-"""GLM-5.2 aux (DSA indexer) KV pools hold only the 21 indexer layers.
+"""GLM-5.2/5.3 aux (DSA indexer) KV pools hold only the 21 indexer layers.
 
 Pure-CPU contract tests: the mapped `glm5_2_indexer` profile must agree with
-the model's real skip-topk schedule, route only the GLM-5.2 aliases, and
-thread its logical->physical map into the aux GPU KV config.
+the model's real skip-topk schedule, route the GLM-5.2 and GLM-5.3 aliases,
+and thread its logical->physical map into the aux GPU KV config.
 """
 
 import types
@@ -37,13 +37,22 @@ def test_layer_map_matches_dsa_schedule():
         assert (phys >= 0) == (logical in schedule_full_layers)
 
 
-def test_alias_routing_only_glm52_gets_mapped_profile():
-    for alias in ("zai-org/GLM-5.2-FP8", "glm-5.2", "glm-5.2-fp8"):
+def test_alias_routing_glm52_and_glm53_get_mapped_profile():
+    # GLM-5.3 ships the same index_topk_freq=4 / index_skip_topk_offset=3
+    # schedule as GLM-5.2 (checkpoint config.json, verified 2026-11-03).
+    for alias in (
+        "zai-org/GLM-5.2-FP8",
+        "glm-5.2",
+        "glm-5.2-fp8",
+        "zai-org/GLM-5.3-FP8",
+        "glm-5.3",
+        "glm-5.3-fp8",
+    ):
         profile = _resolve_indexer_profile(alias)
         assert profile is not None, alias
         assert profile.num_layers == 21, alias
         assert profile.logical_to_physical_layer is not None, alias
-    for alias in ("zai-org/GLM-5-FP8", "glm-5.1", "zai-org/GLM-5.3-FP8"):
+    for alias in ("zai-org/GLM-5-FP8", "glm-5.1"):
         profile = _resolve_indexer_profile(alias)
         assert profile is not None, alias
         assert profile.num_layers == 78, alias

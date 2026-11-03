@@ -35,9 +35,9 @@ def _load_host_kv_config(monkeypatch):
 
 
 def test_glm52_uses_glm5_primary_and_its_own_indexer_host_kv_profile(monkeypatch):
-    # GLM-5.2 shares the 78-layer MLA primary cache with GLM-5/5.1/5.3, but it
-    # owns its aux (indexer) profile: only its 21 top-k computing layers hold
-    # indexer keys, and they are stored in the page-split FP8 layout.
+    # GLM-5.2 shares the 78-layer MLA primary cache with GLM-5/5.1/5.3 and the
+    # 21-layer aux (indexer) profile with GLM-5.3: only the top-k computing
+    # layers hold indexer keys, stored in the page-split FP8 layout.
     config = _load_host_kv_config(monkeypatch)
 
     for model_name in (
@@ -53,7 +53,10 @@ def test_glm52_uses_glm5_primary_and_its_own_indexer_host_kv_profile(monkeypatch
         )
 
 
-def test_glm53_uses_glm5_primary_and_indexer_host_kv_profiles(monkeypatch):
+def test_glm53_uses_glm5_primary_and_glm52_indexer_host_kv_profiles(monkeypatch):
+    # GLM-5.3's checkpoint config.json carries the same skip-topk schedule as
+    # GLM-5.2 (index_topk_freq=4 / index_skip_topk_offset=3, verified
+    # 2026-11-03), so it shares the 21-layer page-split FP8 indexer profile.
     config = _load_host_kv_config(monkeypatch)
 
     for model_name in (
@@ -65,14 +68,14 @@ def test_glm53_uses_glm5_primary_and_indexer_host_kv_profiles(monkeypatch):
         assert config._resolve_profile(model_name) is config._GLM5_MLA_PROFILE
         assert (
             config._resolve_indexer_profile(model_name)
-            is config._GLM5_INDEXER_PROFILE
+            is config._GLM5_2_INDEXER_PROFILE
         )
 
 
 def test_only_glm52_aux_is_page_split_fp8(monkeypatch):
-    """The page-split FP8 flip is GLM-5.2-aux-only.
+    """The page-split FP8 flip lives in the GLM-5.2/5.3 aux profile only.
 
-    Every other profile — the GLM-5.x MLA primary, the GLM-5/5.1/5.3 indexer,
+    Every other profile — the GLM-5.x MLA primary, the GLM-5/5.1 indexer,
     DeepSeek-V3.2's indexer, the MLA and GQA caches — must stay bf16 AoS, so a
     reader of any of those regions keeps seeing token-major bf16 records.
     """
