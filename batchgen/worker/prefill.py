@@ -28,6 +28,11 @@ import math
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
 
+from batchgen.worker.shared_prefix_charge import (
+    SharedPrefixLedger,
+    segments_from_pairs,
+)
+
 
 def host_kv_eviction_enabled(host_kv_chunk_size: int) -> bool:
 	"""Return whether bounded chunked host-KV mode requires re-entry."""
@@ -103,6 +108,14 @@ class PrefillCandidate:
     # in one wave, instead of being split by a capacity cut and recomputing
     # their shared prefix.
     prefill_order: Optional[int] = None
+    # ``(segment_key, pages)`` runs this candidate reads from a copy SHARED
+    # with other candidates of the same wave, outermost first. The reservation
+    # plan allocates one Host copy per pooled segment and every member attaches
+    # that copy (``_prefill_pool_segment_host_pages`` plus per-member private
+    # remainders), so charging each row the whole prompt bounds the wave by the
+    # logical page sum instead of the physical one. Empty means "charge this
+    # row in full", which is every non-pooled caller.
+    shared_prefix_segments: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,6 +177,46 @@ class PrefillScheduler:
         return (
             pages_per_replica - candidate.cached_prefix_pages
         ) * candidate.host_kv_replication_factor
+
+    @staticmethod
+    def marginal_host_pages(
+        candidate: PrefillCandidate,
+        req: PrefillSelectionRequest,
+        ledger: SharedPrefixLedger,
+    ) -> int:
+        """Host pages this candidate costs GIVEN what the node already holds.
+
+        ``required_host_pages`` is the standalone cost -- what the candidate
+        needs when nothing of its prompt is in the pool.  It stays the number
+        the "can this ever fit?" rejection, the reclaim target and the blocker
+        text use, because each of those asks about the candidate alone.
+
+        Admission asks a different question: what does ADDING this row cost a
+        node that may already hold its shared prefix?  The first row of a
+        distinct shared prefix pays prefix + tail; a later row of the same
+        prefix pays only its tail, because the reservation plan gives the wave
+        one Host copy of that prefix and attaches it to every member.  Charging
+        the marginal cost is what lets prefix sharing raise admitted
+        concurrency instead of only saving compute.
+
+        Never zero: the ledger floors the charge at one page, so a prompt that
+        is shared end to end still pays for the private page holding the token
+        it produces logits for.
+        """
+        standalone = PrefillScheduler.required_host_pages(candidate, req)
+        if not candidate.shared_prefix_segments:
+            return standalone
+        factor = candidate.host_kv_replication_factor
+        per_replica = standalone // factor
+        if per_replica <= 0:
+            # The cross-wave estimate already discounted the whole
+            # reservation; there is nothing left for sharing to credit.
+            return standalone
+        result = ledger.preview(
+            total_pages=per_replica,
+            segments=segments_from_pairs(candidate.shared_prefix_segments),
+        )
+        return result.marginal_pages * factor
 
     @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:
@@ -269,6 +322,11 @@ class PrefillScheduler:
         rank_sequences_used: dict[int, int] = {}
         node_sequences_used = [0] * req.num_nodes
         admitted: List[PrefillCandidate] = []
+        # One ledger per node: Host KV is per-node, so a prefix one node holds
+        # saves nothing for a candidate admitted on another. A rejected
+        # candidate is never charged (the fit test only previews), so skipping
+        # a row that does not fit cannot credit a prefix nobody reads.
+        node_prefix_ledgers = [SharedPrefixLedger() for _ in range(req.num_nodes)]
 
         for c in all_candidates:
             seq_node = c.node_id
@@ -302,7 +360,8 @@ class PrefillScheduler:
                     f"candidate {c.uuid} has invalid host_kv_replication_factor="
                     f"{c.host_kv_replication_factor}"
                 )
-            req_pages = PrefillScheduler.required_host_pages(c, req)
+            ledger = node_prefix_ledgers[seq_node]
+            req_pages = PrefillScheduler.marginal_host_pages(c, req, ledger)
 
             if (
                 not bound_by_host_pages
@@ -311,6 +370,17 @@ class PrefillScheduler:
             ):
                 admitted.append(c)
                 node_pages_used[seq_node] += req_pages
+                # Charge only now: the ledger must record exactly the rows this
+                # wave admits, so the next row of the same prefix sees it as
+                # paid for and a row the greedy skipped leaves no credit behind.
+                ledger.charge(
+                    total_pages=max(
+                        1,
+                        PrefillScheduler.required_host_pages(c, req)
+                        // c.host_kv_replication_factor,
+                    ),
+                    segments=segments_from_pairs(c.shared_prefix_segments),
+                )
                 rank_sequences_used[c.assigned_rank] = (
                     rank_sequences_used.get(c.assigned_rank, 0) + 1
                 )

@@ -1170,6 +1170,29 @@ class GPUPagedKVCacheManager:
 			)
 		return len(new_keys)
 
+	def count_mapped_leading_shared_pages(
+		self, page_keys: Sequence[int]
+	) -> int:
+		"""Leading ``page_keys`` that already map to a resident GPU page.
+
+		Read-only. Admission uses it to charge a sequence only for what the
+		pool does NOT already hold: a prefix another sequence already mapped
+		costs nothing to join, because ``allocate_pages_for_sequences_with_page_keys``
+		reuses that physical page instead of taking a new one.
+
+		Counts a LEADING run, stopping at the first unmapped key, because a
+		page table is read from the start: a mapped page behind an unmapped one
+		still needs the pages before it to be loaded.
+		"""
+
+		self._ensure_initialized()
+		mapped = 0
+		for key in page_keys:
+			if int(key) not in self._shared_page_key_to_gpu_page:
+				break
+			mapped += 1
+		return mapped
+
 	def allocate_pages_for_sequences_with_page_keys(
 		self,
 		sequence_ids: Sequence[int],

@@ -499,6 +499,11 @@ def _selection_request(attn_tp_size, monkeypatch):
         rank=0, local_world_size=8,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
+        # This test is about the replication factor, not shared-prefix credit:
+        # report no shared segment so the candidate keeps its standalone
+        # reservation and the factor is the only thing under test.
+        _admission_shared_prefix_segments=lambda uuids: {},
+        _shared_prefix_credit_applied=False,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))

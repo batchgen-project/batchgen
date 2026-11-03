@@ -265,6 +265,10 @@ from batchgen.worker.decode import (
 	reduce_decode_capacity_snapshot,
 	estimate_max_decode_replica_batch,
 )
+from batchgen.worker.shared_prefix_charge import (
+	SharedPrefixLedger,
+	plan_shared_runs,
+)
 from batchgen.worker.kv_manager import (
 	GPU_KV_POOL_HEADROOM_GB,
 	KVCacheManager,
@@ -1023,6 +1027,10 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 	enable_prefix_cache: bool = False
 	prefix_cache_debug_stats: bool = False
+	# Charge a prefix several sequences read from one physical copy once per
+	# resource instead of once per row. Default on; the opt-out restores the
+	# per-row logical charge for comparison runs.
+	shared_prefix_admission: bool = True
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -1392,6 +1400,9 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		self.enable_prefix_cache = bool(args.enable_prefix_cache)
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self.shared_prefix_admission = bool(
+			getattr(args, "shared_prefix_admission", True)
+		)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
 		# Edge trigger for the prefix_drain metric: set when the row is
@@ -1425,6 +1436,24 @@ class BatchGenWorker:
 		# outcome, folded into the guard state so a rejected transaction is
 		# not mistaken for a wave that selected nothing.
 		self._prefill_reservation_outcome = None
+		# Shared-prefix admission credit: charge an in-wave shared prefix once
+		# per node instead of once per row. Suspended for the NEXT admission
+		# round whenever a credited wave is rejected by the reservation
+		# transaction -- the wave planner may decline to pool (a budget too
+		# small for the chain, the threshold ladder), and then each member
+		# really does compute and allocate its own prefix. Re-admitting the
+		# same credited wave would then repeat the same rejection forever, so
+		# the retry falls back to the full charge, makes progress, and the
+		# latch clears on the next committed reservation. Rank-uniform: both
+		# the rejection and the commit are decided by a collective.
+		self._shared_prefix_credit_suspended = False
+		self._shared_prefix_credit_applied = False
+		# global_idx -> cumulative per-page prompt digests, one entry per
+		# SHAREABLE page (a prompt's last page is private by construction, so
+		# every row keeps a tail). Cached because a digest is a property of the
+		# prompt, not of the round: recomputing it on every scheduler iteration
+		# would re-hash the whole candidate set each time.
+		self._prefix_page_digest_cache = {}
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
 		self._trajectory_frontier_committer = None
 		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
@@ -5778,6 +5807,60 @@ class BatchGenWorker:
 			has_evicted=self.enable_host_kv_eviction and self.global_batch.has_evicted(),
 		)
 
+	def _credit_reclaimable_prefix_pages(
+		self, stats: Dict[str, int]
+	) -> Dict[str, int]:
+		"""Report reclaimable retained prefix pages as free, not as pressure.
+
+		The Host allocator's counters are already PHYSICAL: a prefix several
+		sequences attach is one allocation and is charged to ``used`` exactly
+		once, so this node's utilisation never double-counts a shared page.
+		What it cannot distinguish is a page holding live KV from a page
+		holding a RETAINED prefix that nobody is reading -- a copy the prefix
+		cache keeps for a future hit and that admission reclaims on demand,
+		which is why ``per_node_host_reclaimable`` already counts it as part of
+		the admission budget.
+
+		Left as ``used``, those pages hold free% under the watermark forever,
+		so a pool filled with retained prefixes never preempts decode for
+		prefill -- the one situation the trigger exists for. Crediting them
+		here (and only here, so the legacy/native utilisation parity check
+		keeps comparing the raw counters) makes the trigger see the capacity
+		admission would actually get.
+
+		Read only when work is waiting: the trigger cannot fire otherwise, and
+		the count is an O(max_nodes) scan under the coordinator's lock.
+		"""
+		if not self.enable_prefix_cache:
+			return stats
+		coordinator = getattr(self, "prefix_cache_coordinator", None)
+		if coordinator is None:
+			return stats
+		waiting = self.global_batch.has_queueing() or (
+			self.enable_host_kv_eviction and self.global_batch.has_evicted()
+		)
+		if not waiting:
+			return stats
+		releasable = max(0, int(coordinator.count_releasable_pages(0)))
+		if releasable == 0:
+			return stats
+		total = int(stats["num_total_pages"])
+		used = int(stats["num_used_pages"])
+		# A retained page is charged to `used`, so crediting it moves the same
+		# count. Clamped so a stale read can never make `used` negative or
+		# free% exceed 100 -- a watermark fed an impossible snapshot would
+		# preempt decode on every step.
+		credited = min(releasable, used)
+		free = int(stats["num_free_pages"]) + credited
+		updated = dict(stats)
+		updated["num_used_pages"] = used - credited
+		updated["num_free_pages"] = free
+		updated["num_reclaimable_prefix_pages"] = credited
+		updated["free_percent"] = (
+			int((free / total) * 100) if total > 0 else 100
+		)
+		return updated
+
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
 
@@ -5796,7 +5879,9 @@ class BatchGenWorker:
 
 		# Only local_rank 0 reports (one per node)
 		if self.local_rank == 0:
-			local_stats = self._get_host_kv_utilization()
+			local_stats = self._credit_reclaimable_prefix_pages(
+				self._get_host_kv_utilization()
+			)
 		else:
 			local_stats = None
 
@@ -7282,6 +7367,7 @@ class BatchGenWorker:
 			# but a rejection that repeats with everything else unchanged is
 			# deterministic, not contention, and must still reach the limit.
 			self._prefill_reservation_outcome = "rejected_by_capacity_snapshot"
+			self._suspend_shared_prefix_credit("rejected_by_capacity_snapshot")
 			if self.rank == 0:
 				logging.warning(
 					"[PREFILL] Host KV admission rejected by fresh capacity snapshot; "
@@ -7403,6 +7489,9 @@ class BatchGenWorker:
 				self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
 			self._prefill_reservation_outcome = "rolled_back_after_allocator_failure"
+			self._suspend_shared_prefix_credit(
+				"rolled_back_after_allocator_failure"
+			)
 			return False
 
 		# Commit scalar reservation metadata only after every allocator agrees.
@@ -7423,6 +7512,9 @@ class BatchGenWorker:
 				owned = pages - state.attached_tokens // seq.PAGE_SIZE
 			seq.host_owned_pages = owned
 		self._prefill_reservation_outcome = "committed"
+		# A committed wave proves the credit (if any) matched what the
+		# allocator consumed, so the next round may credit again.
+		self._shared_prefix_credit_suspended = False
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -8379,6 +8471,172 @@ class BatchGenWorker:
 			)
 		return local_passes, global_passes
 
+	def _suspend_shared_prefix_credit(self, reason: str) -> None:
+		"""Fall back to the full per-row charge for the next admission round.
+
+		Called when a wave admitted with the shared-prefix credit is rejected
+		by the reservation transaction. The credit predicts that the wave
+		planner will pool each shared prefix into ONE Host copy; the planner
+		can still decline (an unmeasured or too-small pool budget, the
+		threshold ladder), and then every member really does allocate its own
+		prefix and the wave genuinely does not fit.
+
+		Re-admitting the same credited wave would repeat the same rejection on
+		every iteration, so the retry charges in full, admits the smaller wave
+		that does fit, and makes progress; the latch clears on the next
+		committed reservation. The suspension is logged by name -- it is a
+		measurable prediction miss, not a silent fallback.
+		"""
+		if not self._shared_prefix_credit_applied:
+			return
+		self._shared_prefix_credit_applied = False
+		if self._shared_prefix_credit_suspended:
+			return
+		self._shared_prefix_credit_suspended = True
+		if self.rank == 0:
+			logging.warning(
+				"[PREFILL] shared-prefix admission credit suspended for the "
+				"next round: a credited wave was %s, so the next wave is "
+				"charged per row",
+				reason,
+			)
+
+	def _shared_prefix_credit_enabled(self) -> bool:
+		"""Whether this round may charge an in-wave shared prefix once.
+
+		Every condition is a reason the prediction would otherwise be wrong:
+
+		- the credit describes prefix-cache sharing, so it needs the cache on;
+		- only the in-wave prefix POOL gives the wave one Host copy per shared
+		  segment with members attaching it, which is what the credit counts;
+		- the pool declines every wave until its page budget has been measured
+		  (the first wave after startup seeds it), and a declined wave
+		  allocates a full private copy per member;
+		- a previous credited wave that the reservation rejected suspends the
+		  credit for one round so admission makes progress.
+		"""
+		if not self.shared_prefix_admission:
+			return False
+		if not self.enable_prefix_cache:
+			return False
+		if self._shared_prefix_credit_suspended:
+			return False
+		if not self._prefill_prefix_pool_enabled():
+			return False
+		return self._prefill_pool_page_budget is not None
+
+	def _prefix_page_digests(self, seq) -> Tuple[int, ...]:
+		"""Cumulative page digests of this sequence's prompt, shareable pages.
+
+		Digest ``k`` identifies the first ``k+1`` pages of the prompt: two
+		sequences hold the same digest at ``k`` exactly when those pages carry
+		the same tokens, hence the same KV, hence one physical copy in the
+		pool. Using the digest itself as the ledger key therefore makes "same
+		key" mean "same physical pages", which is what the charge requires.
+
+		Deterministic across ranks: the digest is a function of the prompt
+		tokens, which every rank reads from the node-shared trajectory store.
+		"""
+		cached = self._prefix_page_digest_cache.get(seq.global_idx)
+		if cached is not None:
+			return cached
+		page_size = int(seq.PAGE_SIZE)
+		# The final page is never shareable, so a fully shared prompt still
+		# pays for the page holding the token it produces logits for.
+		shareable = (int(seq.prompt_length) - 1) // page_size
+		if shareable <= 0:
+			self._prefix_page_digest_cache[seq.global_idx] = ()
+			return ()
+		tokens = self._trajectory_tokens(seq, length=seq.prompt_length)
+		token_array = np.ascontiguousarray(
+			np.asarray(tokens, dtype=np.int64)
+		)
+		digests = []
+		running = b"\x00" * 16
+		for page in range(shareable):
+			block = token_array[page * page_size:(page + 1) * page_size]
+			running = hashlib.blake2b(
+				running + block.tobytes(), digest_size=16
+			).digest()
+			digests.append(
+				int.from_bytes(running[:8], "big", signed=False)
+			)
+		chain = tuple(digests)
+		self._prefix_page_digest_cache[seq.global_idx] = chain
+		return chain
+
+	def _prune_prefix_page_digest_cache(self) -> None:
+		"""Drop digests of sequences the batch no longer holds."""
+		if not self._prefix_page_digest_cache:
+			return
+		live = {
+			seq.global_idx
+			for seq in self.global_batch.sequences.values()
+		}
+		for global_idx in list(self._prefix_page_digest_cache):
+			if global_idx not in live:
+				del self._prefix_page_digest_cache[global_idx]
+
+	def _admission_shared_prefix_segments(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Per candidate, the shared run it reads with an ADJACENT candidate.
+
+		``_stamp_prefix_prefill_order`` sorts the admission by prompt token
+		ids, which on a prefix tree is a depth-first walk: candidates sharing
+		a prefix are contiguous. A candidate's shared run is therefore the
+		longer of its page-granular common prefix with its two neighbours in
+		admission order, and its key is the cumulative digest at the end of
+		that run -- equal for exactly the candidates that share it.
+
+		Conservative by construction: crediting only the deepest adjacent run
+		under-counts a wave whose families themselves share an outer prefix
+		(the outer run is charged once per family rather than once per wave),
+		and under-counting can only admit fewer rows, never over-admit.
+		"""
+		if not self._shared_prefix_credit_enabled():
+			return {}
+		self._prune_prefix_page_digest_cache()
+		ordered = sorted(
+			all_candidates,
+			key=lambda uuid: (
+				self._admission_order_key(
+					self.global_batch.get_sequence(uuid)
+				),
+				self.global_batch.get_sequence(uuid).global_idx,
+			),
+		)
+		digests = [
+			self._prefix_page_digests(self.global_batch.get_sequence(uuid))
+			for uuid in ordered
+		]
+
+		def shared_pages(left: int, right: int) -> int:
+			if left < 0 or right >= len(digests):
+				return 0
+			first, second = digests[left], digests[right]
+			limit = min(len(first), len(second))
+			index = 0
+			while index < limit and first[index] == second[index]:
+				index += 1
+			return index
+
+		segments: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for position, uuid in enumerate(ordered):
+			run = max(
+				shared_pages(position - 1, position),
+				shared_pages(position, position + 1),
+			)
+			if run <= 0:
+				continue
+			segments[uuid] = ((digests[position][run - 1], run),)
+		return segments
+
+	def _admission_order_key(self, seq) -> int:
+		"""The order ``select_prefill_batch`` walks QUEUEING candidates in."""
+		order = getattr(seq, "prefill_order", None)
+		return int(seq.global_idx if order is None else order)
+
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
 		num_nodes: int, chunk_size: int, *,
@@ -8386,6 +8644,8 @@ class BatchGenWorker:
 		per_node_host_reclaimable=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
+		shared_segments = self._admission_shared_prefix_segments(all_candidates)
+		self._shared_prefix_credit_applied = bool(shared_segments)
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8421,6 +8681,7 @@ class BatchGenWorker:
 				# the node allocator exactly one copy of req_pages.
 				host_kv_replication_factor=1,
 				prefill_order=getattr(seq, "prefill_order", None),
+				shared_prefix_segments=shared_segments.get(uuid, ()),
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -8559,8 +8820,17 @@ class BatchGenWorker:
 
 		# Candidate enumeration and logging stay here; pure physical-capacity
 		# selection is delegated.
+		# Owner-reported shared GPU prefixes, gathered before the pure
+		# selection so every rank charges the same marginal cost: rows that
+		# reference one Host page get ONE physical GPU page, so charging each
+		# row its whole context would bound decode by the logical page sum.
+		shared_segments = self._gather_decode_shared_prefix_segments(
+			all_candidates
+		)
 		decode_batch = DecodeScheduler.select_decode_batch(
-			self._make_decode_batch_request(all_candidates, capacity)
+			self._make_decode_batch_request(
+				all_candidates, capacity, shared_segments=shared_segments
+			)
 		)
 
 		# An all_short whole-model capture never runs indexer scoring, so a
@@ -8590,10 +8860,123 @@ class BatchGenWorker:
 
 		return decode_batch
 
+	def _decode_shared_prefix_credit_enabled(self) -> bool:
+		"""Whether decode admission may charge a shared GPU prefix once.
+
+		The credit is only honest where the ALLOCATOR shares: GPU pages are
+		deduplicated by Host page id inside
+		``allocate_pages_for_sequences_with_page_keys``, which
+		``_allocate_gpu_pages_with_host_identity`` reaches only with the prefix
+		cache on and a manager that is not the dual-KV coordinator. Everywhere
+		else each row really does load its own copy, so each row must pay for
+		it -- the same condition ``_host_identity_page_keys`` tests before
+		returning page keys at all.
+		"""
+		if not self.shared_prefix_admission:
+			return False
+		if not self.enable_prefix_cache:
+			return False
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not manager.is_initialized:
+			return False
+		if isinstance(manager, DualKVCacheCoordinator):
+			return False
+		return True
+
+	def _local_decode_shared_prefix_runs(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Shared leading page runs among the candidates THIS rank owns.
+
+		Grouped per owner because sharing only pays inside one GPU pool: the
+		pool belongs to one DP rank (or one replicated TP group whose Host-KV
+		leader owns every row), so two rows loading onto different pools each
+		need their own physical copy.
+
+		The identity is the HOST page id, which is what the allocator dedups
+		on, so a run here means those rows provably reference one physical
+		copy -- not merely equal tokens, which two distinct Host copies can
+		also have.
+		"""
+		worker_view = getattr(
+			self.core_engine, "host_paged_kv_worker_view", None
+		)
+		if worker_view is None:
+			return {}
+		mine = []
+		for uuid in all_candidates:
+			if uuid not in self._uuid_to_local_map:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			req_pages = int(seq.get_gpu_pages_for_two_page_buffer())
+			if req_pages <= 1:
+				continue
+			mine.append((uuid, seq, req_pages))
+		if len(mine) < 2:
+			return {}
+		host_tables = worker_view.build_page_table(
+			[int(seq.global_idx) for _, seq, _ in mine]
+		)
+		tables: Dict[int, List[int]] = {}
+		for (_uuid, seq, req_pages), host_pages in zip(mine, host_tables):
+			# Credit only pages that exist, and never the row's whole
+			# reservation: one page stays private so no row is charged zero.
+			# A Host table shorter than the reservation is named loudly by
+			# _host_identity_page_keys at allocation time; admission must not
+			# credit pages it cannot see.
+			usable = min(req_pages - 1, len(host_pages))
+			if usable <= 0:
+				continue
+			tables[int(seq.global_idx)] = [
+				int(page) for page in host_pages[:usable]
+			]
+		runs = plan_shared_runs(tables)
+		local: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for uuid, seq, _req_pages in mine:
+			run = runs.get(int(seq.global_idx))
+			if run is None:
+				continue
+			local[uuid] = ((int(run[0]), int(run[1])),)
+		return local
+
+	def _gather_decode_shared_prefix_segments(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Collect every rank's shared runs so selection stays rank-identical.
+
+		``select_decode_batch`` is pure and runs on every rank; a rank that
+		credited a run its peers did not would admit a different batch and the
+		next collective would deadlock. Only an owner can read its rows' Host
+		page tables, so the ground truth is gathered rather than re-derived.
+		``all_candidates`` is already rank-uniform (it comes from replicated
+		sequence status), so every rank reaches this gather together.
+		"""
+		if not self._decode_shared_prefix_credit_enabled():
+			return {}
+		local = self._local_decode_shared_prefix_runs(all_candidates)
+		if self.world_size == 1:
+			return local
+		if not dist.is_initialized():
+			raise RuntimeError(
+				"distributed process group is required to gather decode "
+				"shared-prefix runs"
+			)
+		gathered: List[Optional[Dict[str, Tuple[Tuple[int, int], ...]]]] = (
+			[None] * self.world_size
+		)
+		dist.all_gather_object(gathered, local)
+		merged: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for part in gathered:
+			if part:
+				merged.update(part)
+		return merged
+
 	def _make_decode_batch_request(
 		self, all_candidates: List[str], capacity: DecodeCapacitySnapshot,
+		shared_segments: Optional[Dict[str, Tuple[Tuple[int, int], ...]]] = None,
 	) -> DecodeBatchRequest:
 		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
+		shared_segments = shared_segments or {}
 		attn_tp_size = self._decode_attn_tp_size()
 		num_capacity_groups = self.world_size // attn_tp_size
 		existing_pages = [0] * num_capacity_groups
@@ -8625,6 +9008,7 @@ class BatchGenWorker:
 				global_idx=seq.global_idx,
 				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
 				decode_dp_group=seq.decode_dp_group,
+				shared_prefix_segments=shared_segments.get(uuid, ()),
 			))
 		return DecodeBatchRequest(
 			candidates=tuple(candidates),
