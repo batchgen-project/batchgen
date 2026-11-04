@@ -402,6 +402,7 @@ decode batch size per rank; it does not limit prompt or context length.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable-prefix-cache` | `false` | Enable page-level reuse of shared prompt prefixes through the host KV cache. Supported model types: GPT-OSS, GLM-5.2 and GLM-5.3 (sparse DSA prefill), Kimi-K3 and Kimi-Linear. For any other model the server refuses the flag at argument validation, before any resource is allocated. For GLM-5.2, GLM-5.3, Kimi-K3 and Kimi-Linear, reuse happens only inside a planned prefill wave. |
+| `--no-shared-prefix-admission` | `false` | Disable the shared-prefix admission credit. By default, admission charges a shared prefix once per node (host prefill) or per capacity group (GPU decode) and later rows of the same prefix pay only their private tail, which is what lets prefix sharing raise admitted concurrency; this flag restores the conservative full per-row charge. Diagnostic opt-out; sharing itself stays on. |
 | `--prefix-cache-debug-stats` | `false` | Log prefix-cache lifecycle statistics. Use it together with `--enable-prefix-cache`. |
 
 ---

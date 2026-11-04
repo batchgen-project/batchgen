@@ -173,3 +173,25 @@ raised inside the model forward, so it stops the worker pool, not only that batc
 
 Kimi-K3 with `--enable-deepep` is not supported in v1.1.0. Kimi-K3 decode uses the default
 NCCL expert-parallel exchange; launch Kimi-K3 without `--enable-deepep`.
+
+## 10. Launch refused with a `[MEM-PLAN host]` line
+
+Before any worker, shared memory or weight exists, the launcher computes the
+host memory plan — weights, host KV, a transient floor and headroom — from the
+checkpoint and the launch configuration, and logs one `[MEM-PLAN host]` line
+with a `verdict`. `verdict=REFUSE` means the requested configuration cannot fit
+on this host; the same line prints `max_host_kv=`, the largest
+`--host-kv-cache-size` that would fit. Lower the flag to that value (or free
+host memory) and relaunch. This is a planning check: nothing was allocated, so
+a refused launch leaves the node clean.
+
+## 11. Workers die mid-run with a `ROOT CAUSE: kernel OOM` line
+
+When the kernel's OOM killer takes a worker, every other rank later fails its
+next collective, which used to surface minutes afterwards as an unexplained
+NCCL abort. The worker manager now scans the kernel log when it reaps a worker:
+the first line names the rank the kernel killed (`ROOT CAUSE`), and the
+cascading failures are marked as secondary. Read the ROOT CAUSE line first —
+the fix is host memory pressure (usually `--host-kv-cache-size` too large for
+the node, see the `[MEM-PLAN host]` line at launch), not the collective that
+happened to report last.
