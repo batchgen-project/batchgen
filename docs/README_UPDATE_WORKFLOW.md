@@ -25,4 +25,7 @@ Use this process whenever `README.md` changes.
 
 The `README Update` GitHub check runs this same command for every pull request
 that changes `README.md`. A PR that drops or rewrites an old News bullet fails
-the check until the history is restored.
+the check until the history is restored. A deliberate rewrite (for example
+consolidating entries) is accepted only when the same change adds a new
+`<!-- news-rewrite-ack YYYY/MM: reason -->` comment line inside the News
+section, so the rewrite is visible and attributable in the diff.

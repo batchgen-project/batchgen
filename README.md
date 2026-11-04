@@ -19,14 +19,18 @@
 
 ## News
 
-- **2026/09 — GLM-5.3-FP8 support.** Added the dedicated GLM-5.3 chat
-  template, reasoning parser, request controls, and an 8×H200 deployment
-  guide. H200 short correctness and structured `reasoning_content` checks pass;
-  the 2,048-sequence MMLU-Pro qualification is still running.
-- **2026/09 — GLM-5.2-FP8 on 8×H200.** Added a one-node deployment guide and
-  source-qualified `8×1M` plus `32×256K` accumulated-token prefill. On the matched
-  `8×1M` workload, BatchGen reached 20,648 prompt tok/s, **1.71× faster** than
-  the best completed point in the recorded SGLang 0.5.18 tuning sweep.
+<!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one -->
+- **2026/11 — BatchGen v1.1.0.** Kimi-K3 multi-node serving on a compact
+  distributed weight store; GLM-5 with no runtime compilation (ahead-of-time
+  kernels plus a startup prewarm covering every reachable Triton and DeepGEMM
+  kernel); page-level prefix reuse; cluster fail-fast and a restartable worker
+  pool; prebuilt Hopper (sm90a) wheels.
+- **2026/09 — GLM-5.2-FP8 and GLM-5.3-FP8 on 8×H200.** One-node deployment
+  guides, the dedicated GLM-5.3 chat template, reasoning parser and request
+  controls, and source-qualified `8×1M` plus `32×256K` accumulated-token
+  prefill. On the matched `8×1M` workload, BatchGen reached 20,648 prompt
+  tok/s, **1.71× faster** than the best completed point in the recorded
+  SGLang 0.5.18 tuning sweep.
 - **2026/09 — Kimi-K3** (2.8T-parameter, 896-expert MXFP4, top-16) support —
   multi-node deployment on [2×8 H200](docs/deploy-kimi-k3-h200.md) or
   [4×8 H20](docs/deploy-kimi-k3-h20.md).

@@ -1,26 +1,25 @@
 # BatchGen — Troubleshooting / Commonly-Met Problems
 
 Symptom → root cause → fix, for issues hit repeatedly during setup and model bring-up.
-Build/install issues first, then model-development (Kimi-Linear / K3 family) issues.
+Build/install issues first, then model-development (Kimi-Linear / K3 family) issues, then
+startup and serving notes for this release.
 
 ---
 
-## 1. `core_engine` JIT build fails: `numa.h: No such file or directory`
+## 1. `core_engine` build fails: `numa.h: No such file or directory`
 
-**Symptom** — first server launch (or first `import` that pulls in a parameter server)
-raises `RuntimeError: Error building extension 'core_engine'`; running `ninja` in
-`~/.cache/torch_extensions/py311_cu128/core_engine/` shows:
+**Symptom:** The AOT `core_engine` build during installation (`install_deps.sh`, or
+`BUILD_OPS=1 pip install .`) fails with:
 
 ```
-FAILED: posix_shm.o
 core/Parameter_Server/posix_shm.cpp:41:10: fatal error: numa.h: No such file or directory
 ```
 
-**Cause** — `core_engine` is JIT-compiled by ninja at first launch and `#include <numa.h>`
+**Cause:** `core_engine` is built ahead of time at install and `#include <numa.h>`
 + links `-lnuma`. The runtime packages `numactl` / `numactl-libs` do **not** ship the
 header; the `-devel` / `-dev` package is required and is easy to miss on a fresh node.
 
-**Fix** — install the NUMA development headers:
+**Fix:** Install the NUMA development headers:
 
 ```bash
 # RHEL / TencentOS / CentOS
@@ -65,17 +64,23 @@ MXFP4 models (Kimi-K3) do.
 
 ---
 
-## 4. Stale / corrupted `core_engine` JIT build
+## 4. Startup refuses the kernel package after an upgrade
 
-**Symptom** — build errors that persist after fixing the real cause, or after two
-concurrent processes both triggered the JIT build (they race on the shared build dir).
+**Symptom:** The server exits before it serves, with
+`batchgen requires batchgen_kernels >= 0.6.0, found <version>`, or, for a GLM-5 family
+model, `required runtime module 'batchgen_kernels.attention._C_dsa_fast_topk' failed to
+import` (or another `_C_*` extension name).
 
-**Fix** — clear the cache and let it rebuild single-process:
+**Cause:** The installed `batchgen_kernels` was built for an earlier release. This release
+builds the GLM-5 DSA indexer kernels and the FP8 WGMMA MoE kernels ahead of time inside
+`batchgen_kernels` 0.6.0 instead of compiling them at run time, so an older build lacks
+them. The server does not fall back to compiling them.
 
-```bash
-rm -rf ~/.cache/torch_extensions/py311_cu128/core_engine
-python -c "import batchgen.models.moonshotai.kimi_k25.config"   # rebuilds once
-```
+**Fix:** Rebuild `batchgen_kernels` from the new checkout: re-run
+`./scripts/install_deps.sh --all`, or, for a source worktree,
+`./scripts/build_source_runtime.sh` without `--skip-kernels`. A stale `core_engine` is
+reported separately (`core_engine ... is older than`); see
+[Runtime dependency contract](runtime-dependencies.md#interpreting-common-failures).
 
 ---
 
@@ -119,3 +124,74 @@ reshape on load).
   For a ground-truth oracle, force eager instead (fp32 softmax, higher precision, no dep):
   set `config._attn_implementation = "eager"` on **every** module's `.config` *after*
   construction (the model `__init__` overrides it back to flash_attention_2).
+
+---
+
+## 7. First startup on a new node is slower than later ones (kernel prewarm)
+
+**Symptom:** Kimi-K3 or a GLM-5 family model takes noticeably longer to become ready on a
+node with an empty Triton cache, and the log shows `[K3_TRITON_WARMUP]` or
+`[GLM5_TRITON_WARMUP]` lines with `compiled=` counts above zero.
+
+**Cause:** Expected behaviour. Both models compile the Triton kernels their serving path
+can reach before they serve, so the first requests do not stall on compilation. The ranks
+of a node split the compiles over Triton's shared cache directory (`TRITON_CACHE_DIR`, by
+default `~/.triton/cache`). With a warm cache the same lines report `loaded=` counts and
+the step only loads binaries. GLM-5 also compiles its DeepGEMM kernels in the same
+phases, into DeepGEMM's cache directory (`DG_JIT_CACHE_DIR`, by default `~/.deep_gemm`).
+
+**Fix:** None needed. Keep both cache directories on a local disk: on a network
+filesystem the ranks can hit stale-file-handle errors while they read each other's
+binaries. A local disk that outlives the container also avoids recompiling after the
+container is recreated.
+
+---
+
+## 8. `late compile` warnings after startup
+
+**Symptom:** After `late-compile guard armed`, the log shows WARNING lines such as
+`[K3_TRITON_WARMUP] late compile kernel=<module.kernel> source=compile ...` (or the
+`[GLM5_TRITON_WARMUP]` equivalent).
+
+**Cause:** A Triton specialisation that the prewarm did not cover was compiled while
+serving. The request still completes; the line names the kernel and its full
+specialisation key so the gap can be reported. `source=load` means the binary came from
+the on-disk cache but was still missed by the prewarm. For GLM-5, decode batches larger
+than the top CUDA-graph bucket run eagerly, and some eager kernels are keyed on the active
+page-table width; those keys are not prewarmed, so late compiles on that path are expected.
+For GLM-5, a DeepGEMM kernel compiled after the prewarm is reported at the next phase
+switch as `[GLM5_DEEPGEMM_WARMUP] ... DeepGEMM compiled N kernels after the prewarm`.
+
+**Fix:** Report the line. To make such a compile fail instead (acceptance runs only,
+never in production), create the batch with `"batchgen_debug": {"k3_triton_strict": true}`
+for Kimi-K3 or `"batchgen_debug": {"glm5_triton_strict": true}` for GLM-5. The error is
+raised inside the model forward, so it stops the worker pool, not only that batch.
+
+---
+
+## 9. Known limitation: Kimi-K3 with `--enable-deepep`
+
+Kimi-K3 with `--enable-deepep` is not supported in v1.1.0. Kimi-K3 decode uses the default
+NCCL expert-parallel exchange; launch Kimi-K3 without `--enable-deepep`.
+
+## 10. Launch refused with a `[MEM-PLAN host]` line
+
+Before any worker, shared memory or weight exists, the launcher computes the
+host memory plan — weights, host KV, a transient floor and headroom — from the
+checkpoint and the launch configuration, and logs one `[MEM-PLAN host]` line
+with a `verdict`. `verdict=REFUSE` means the requested configuration cannot fit
+on this host; the same line prints `max_host_kv=`, the largest
+`--host-kv-cache-size` that would fit. Lower the flag to that value (or free
+host memory) and relaunch. This is a planning check: nothing was allocated, so
+a refused launch leaves the node clean.
+
+## 11. Workers die mid-run with a `ROOT CAUSE: kernel OOM` line
+
+When the kernel's OOM killer takes a worker, every other rank later fails its
+next collective, which used to surface minutes afterwards as an unexplained
+NCCL abort. The worker manager now scans the kernel log when it reaps a worker:
+the first line names the rank the kernel killed (`ROOT CAUSE`), and the
+cascading failures are marked as secondary. Read the ROOT CAUSE line first —
+the fix is host memory pressure (usually `--host-kv-cache-size` too large for
+the node, see the `[MEM-PLAN host]` line at launch), not the collective that
+happened to report last.

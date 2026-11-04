@@ -60,7 +60,12 @@ python -m batchgen.tools.convert_checkpoint \
 
 Use the first BatchGen release that includes this guide and its GLM-5.2 runtime
 dependencies; this deployment path is not present in v1.0.11. The server
-rejects a `batchgen_kernels` package older than its minimum required version.
+rejects a `batchgen_kernels` package older than its minimum required version
+(0.6.0 for v1.1.0). Since 0.6.0 the GLM-5 DSA indexer kernels and the FP8
+WGMMA MoE kernels are AOT extensions inside `batchgen_kernels`, and the startup
+preflight requires them, so an environment built for an earlier release must
+rebuild `batchgen_kernels` (re-run `install_deps.sh --all` from the new
+checkout).
 A full source installation is:
 
 ```bash
@@ -136,12 +141,73 @@ The launch flags match the qualified source campaign:
   decode batch size per rank rather than prompt length. A batch above the
   largest captured bucket uses eager execution.
 - `--kv-dtype bfloat16` is the qualified dual-KV format for this model.
+- `--max-pool-size` is now a deprecated compatibility value: it is still
+  accepted but no longer limits how many sequences the server holds. That
+  capacity is derived from `--input-ids-pool-size-gb` and the model context.
+  The pool-32 qualification in §7 was recorded with an earlier build in which
+  the flag still set the pool size.
 
 Wait for readiness before submitting work:
 
 ```bash
 curl --fail http://127.0.0.1:10900/health
 ```
+
+### Startup Triton prewarm
+
+GLM-5 runs several Triton kernels (FP8 activation casts, fused norms, RoPE and
+KV writes, the DSA indexer transforms and the router GEMM). Triton compiles one
+binary per specialisation, so BatchGen compiles every specialisation the
+serving path can reach before it is needed, in three phases that each run once
+per process:
+
+- `prefill`, when the prefill instance is configured;
+- `decode`, when the decode instance is configured;
+- `geometry`, right before decode CUDA-graph setup, for the kernels keyed on
+  the KV page-table widths. It runs again if those widths change.
+
+With `--persistent-phase-instances`, as above, the `prefill` and `decode`
+phases run while the worker builds both instances, before it admits the first
+request; the `geometry` phase runs when the first batch enters decode. The
+ranks of the node split each phase's compiles over Triton's shared cache
+directory (`TRITON_CACHE_DIR`, by default `~/.triton/cache`), meet at a
+barrier, and then every rank loads the full set. The first start on an empty
+cache therefore takes longer; with a warm cache the phases only load binaries.
+Keep the cache on a local disk: on a network filesystem the ranks can hit
+stale-file-handle errors while they read each other's binaries. A local disk
+that outlives the container also avoids recompiling after a restart. The same
+phases compile the DeepGEMM kernels; see
+[Startup Kernel Prewarm](#8-startup-kernel-prewarm).
+
+Each phase logs its compile and load counts, and the end of the `geometry`
+phase arms a late-compile guard:
+
+```text
+[GLM5_TRITON_WARMUP] prefill rank=R phase1 compiled=N loaded=M entries=E failed=F wall=Xs
+[GLM5_TRITON_WARMUP] rank=R prefill entries=E total wall=Xs
+[GLM5_TRITON_WARMUP] rank=R geometry primary_width=... aux_width=... page_sizes=.../... ...
+[GLM5_TRITON_WARMUP] rank=R late-compile guard armed: later compiles log at WARNING; batchgen_debug.glm5_triton_strict makes them raise
+```
+
+The `decode` phase also logs which kernels the configuration can reach without
+prewarming them; those lines are at WARNING when such a kernel is reachable.
+Any Triton compilation after the guard is armed is logged at WARNING with the
+kernel and its full specialisation key:
+
+```text
+[GLM5_TRITON_WARMUP] late compile kernel=<module.kernel> source=compile|load wall=Xs
+    options=... constexprs={...} signature={...} attrs={...}
+```
+
+Decode batches larger than the top CUDA-graph bucket run eagerly, and some
+eager-decode kernels are keyed on the active page-table width, which follows
+the longest sequence; those keys are not prewarmed, so late-compile lines on
+that path are expected. To make a late compile raise instead (acceptance runs
+only, never in production), create the batch with
+`"batchgen_debug": {"glm5_triton_strict": true}` (see
+[Batch API](batch-api.md#post-v1batches)). The error is raised inside the
+model forward, so it stops the worker pool, not only that batch, and it applies
+to every sequence decoded in the same step.
 
 ## 6. Submit Jobs
 
@@ -211,11 +277,10 @@ OOM kill before attributing later distributed-store or supervisor errors.
 
 ## 8. Startup Kernel Prewarm
 
-Every worker compiles the Triton and DeepGEMM kernels the GLM-5 serving code
-can select before it needs them, in three phases: at the first prefill
-configuration, at the first decode configuration, and right before decode
-CUDA-graph capture. The eight ranks of the node split each phase's compiles,
-meet at a barrier, and then load the full set. Each phase logs:
+The three prewarm phases described under
+[Startup Triton prewarm](#startup-triton-prewarm) also compile the DeepGEMM
+kernels the GLM-5 serving code can select, split over the node's ranks in the
+same way. Each phase logs:
 
 ```text
 [GLM5_TRITON_WARMUP] rank=R <phase> entries=E total wall=Xs DeepGEMM cache kernels A -> B
@@ -233,7 +298,8 @@ graph's masked projections and, with `--enable-deepep`, the routed experts'
 masked GEMMs over every batch up to the decode page table's slot capacity; the
 indexer's paged scorer for every 32-row batch alignment up to that capacity;
 and the packed sparse prefill's indexer scorer. The kernels persist in
-`DG_JIT_CACHE_DIR` (default `~/.deep_gemm`), so a warm cache only loads them.
+`DG_JIT_CACHE_DIR` (default `~/.deep_gemm`), so a warm cache only loads them;
+keep it on a local disk, like the Triton cache.
 After the graph phase each worker records the cache's kernel count and
 compares it at every later phase switch. A kernel compiled in between is
 reported as

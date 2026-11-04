@@ -22,6 +22,11 @@ This page is the README-specific map of current model support. It is deliberatel
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
 
+### Known limitations in v1.1.0
+
+- Kimi-K3 with `--enable-deepep` is not supported. Kimi-K3 decode uses the default NCCL expert-parallel exchange; launch it without `--enable-deepep`.
+- Multi-node Kimi-K3 uses the distributed host-weight store by default. The replicated parameter server needs an explicit `--replicated-weights` and room for the whole checkpoint in host memory on every node.
+
 ### How to read this table
 
 “Benchmark evidence” means that the exact model, precision, topology, and workload are recorded. It is not a promise of a general speedup over vLLM or SGLang. In particular, long-context prefill, decode-heavy batches, host-memory pressure, and request-length distributions can change the relative result substantially.

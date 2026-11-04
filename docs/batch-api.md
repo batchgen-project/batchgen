@@ -21,7 +21,12 @@ OpenAI-compatible REST API for batch inference. Base URL: `http://<host>:<port>`
 | POST | `/v1/sessions/{session_id}/close` | Close a session (end of session / trajectory) |
 | POST | `/v1/sessions/{session_id}/abort` | Abort a session and its in-flight turn |
 | POST | `/v1/turns` | Run one chat-completions turn of a session |
+| POST | `/v1/workers/restart` | Restart the GPU worker pool (see [Server Flags](server-flags.md#worker-pool-restart)) |
+| GET | `/v1/workers/status` | Worker-pool state and restart status |
 | GET | `/health` | Health check |
+
+On a multi-node server, send every `/v1/files`, `/v1/batches`, `/v1/turns` and
+`/v1/sessions` request to node 0. Any other node answers `409` naming node 0.
 
 ---
 
@@ -171,6 +176,11 @@ Create a batch job from an uploaded input file.
 | `temperature` | float | No | None | Default sampling temperature. Per-request values override. |
 | `top_p` | float | No | None | Default nucleus sampling threshold. Per-request values override. |
 | `top_k` | int | No | None | Default top-k filtering. Per-request values override. |
+| `batchgen_debug` | object | No | None | Batch-level debug flags, applied to every request of the batch and echoed in the `BatchObject`. Intended for diagnostics and acceptance runs, for example `{"k3_triton_strict": true}` (Kimi-K3) or `{"glm5_triton_strict": true}` (GLM-5 family), which make a Triton compile after the startup prewarm raise. |
+
+`POST /v1/batches` answers `503` with `Retry-After: 30` while the worker pool
+is not serving (during a worker-pool restart or after the pool went down), and
+`429` with `Retry-After: 30` when the intake pool is near capacity.
 
 **Response:** `BatchObject`
 

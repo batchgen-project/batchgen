@@ -45,7 +45,9 @@ with `Listen port ... is not available` or `bind ...: Address already in use`.
 ## 2. Prepare the Distributed-Weight Store
 
 The replicated parameter server does not fit H20's smaller host/GPU budget, so the 4-node
-path uses the **compact per-node distributed-weight store** (`--distributed-weight-config`).
+path uses the **compact per-node distributed-weight store** (`--distributed-weight-config`),
+which is also the default weight source for multi-node Kimi-K3: a launch that names neither
+`--distributed-weight-config` nor `--replicated-weights` is refused at argument validation.
 Each node maps only its own shard. Generate one `node{rank}.json` per node (ranks 0–3) on
 shared storage; each declares its `store_path`, `store_bytes`, the peer node IPs, and the
 RDMA rail devices (`--rail-devices`; the default names the H200 rails, so pass this
@@ -104,6 +106,19 @@ H20-specific notes (the rest matches the H200 guide):
 - **Distributed weights are the practical path on H20** (the replicated store does not fit);
   spreading the model across 4 nodes (EP over 32 GPUs) is what makes the 2.8T model fit.
 - `--host-kv-cache-size` is required and positive; K3 sizes its host paged-KV view from it.
+- **Do not pass `--enable-deepep`.** Kimi-K3 with `--enable-deepep` is not supported in v1.1.0;
+  K3 decode uses the default NCCL exchange.
+- **Start node 0 first or together with the others**, and send batches to node 0 only. With four
+  nodes `--cluster-fail-fast` is on by default: a fatal worker error on any node, or the loss of
+  any node, stops all four servers; relaunch every node. See
+  [Cluster fail-fast](server-flags.md#cluster-fail-fast).
+- **Startup connect budget.** If one node's weight daemon starts much later than the others, add
+  `"bootstrap_timeout_s": <seconds>` (default 600) to every node's config; see "Startup connect
+  budget" in §6 of the [H200 guide](deploy-kimi-k3-h200.md).
+- **Triton prewarm.** Before the server reports ready, every worker compiles K3's serving Triton
+  kernels and then arms a late-compile guard; the first startup on an empty Triton cache takes
+  longer. The log lines and the strict `batchgen_debug.k3_triton_strict` check are described in
+  §7 of the [H200 guide](deploy-kimi-k3-h200.md).
 
 See [Server Flags](server-flags.md) and [Troubleshooting](troubleshooting.md) for details.
 
