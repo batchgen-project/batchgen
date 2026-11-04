@@ -38,6 +38,9 @@ TOMBSTONE = EMPTY + 1
 RESIDENT = EMPTY + 2
 FREE_STACK_TOP_OFFSET = 84
 ACTIVE_SEQUENCES_OFFSET = 88
+# sequences_inserted, sequences_released, acquire_failures (uint64 each),
+# pinned by static_asserts in the backend.
+LIFETIME_COUNTERS_OFFSET = 96
 SEQUENCE_ENTRY = struct.Struct("<qIii4x")
 
 
@@ -307,3 +310,63 @@ def test_a_wrapped_active_sequence_counter_is_healed(regions):
     manager.release_all_sequences()
     assert region.active == 0
     assert manager.get_stats().num_free_pages == NUM_PAGES
+
+
+@native
+def test_audit_reports_stranded_pages_until_release_all_heals_them(regions):
+    """The page identity is the leak detector: pages taken off the free stack
+    and attached to nothing show up as a positive delta."""
+    manager, region = regions()
+    manager.allocate_pages(1, 2 * PAGE_TOKENS)
+    assert manager.get_audited_stats().audit.page_identity_delta == 0
+
+    region.top = region.top - 3  # writer killed after popping three pages
+    audit = manager.get_audited_stats().audit
+    assert audit.page_identity_delta == 3
+    assert audit.live_sequence_pages == 2
+
+    manager.release_all_sequences()
+    audit = manager.get_audited_stats().audit
+    assert audit.page_identity_delta == 0
+    assert audit.live_entries == 0
+    assert audit.empty_entries == SEQUENCE_CAPACITY
+
+
+@native
+def test_prefix_resident_pages_are_part_of_the_page_identity(regions):
+    manager, region = regions()
+    manager.allocate_pages(1, 2 * PAGE_TOKENS)
+    resident = region.stack()[-1]
+    region.top = region.top - 1
+    region.set_owner(resident, RESIDENT)
+    region.set_link(resident, -1)
+
+    stats = manager.get_audited_stats()
+    assert stats.num_used_pages == 3
+    assert stats.audit.live_sequence_pages == 2
+    assert stats.audit.prefix_resident_pages == 1
+    assert stats.audit.page_identity_delta == 0
+
+
+@native
+def test_lifetime_counters_live_in_the_shared_header(regions):
+    """They describe the region, not one process: they are read back through an
+    independent mapping and survive the release-all rebuild."""
+    manager, region = regions()
+    manager.allocate_pages(1, PAGE_TOKENS)
+    manager.allocate_pages(2, PAGE_TOKENS)
+    manager.free_sequence(2)
+    with pytest.raises(RuntimeError, match="Insufficient free pages"):
+        manager.allocate_pages(3, (NUM_PAGES + 1) * PAGE_TOKENS)
+
+    stats = manager.get_stats()
+    counters = (stats.sequences_inserted, stats.sequences_released,
+                stats.acquire_failures)
+    assert counters == (2, 1, 1)
+    assert struct.unpack_from("<3Q", region._mm, LIFETIME_COUNTERS_OFFSET) == counters
+
+    manager.release_all_sequences()
+    stats = manager.get_stats()
+    assert (stats.sequences_inserted, stats.sequences_released,
+            stats.acquire_failures) == (2, 2, 1)
+    assert struct.unpack_from("<3Q", region._mm, LIFETIME_COUNTERS_OFFSET) == (2, 2, 1)
