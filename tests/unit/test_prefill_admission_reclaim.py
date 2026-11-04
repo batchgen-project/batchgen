@@ -63,6 +63,16 @@ NAMESPACE = (1, 2, 3, 4)
 METHODS = (
     "_prepare_prefill_batch",
     "_make_prefill_selection_request",
+    # Shared-prefix admission credit. These fakes leave the prefill-pool page
+    # budget unmeasured, so the gate declines and every candidate is charged
+    # its whole reservation -- which is what the reclaim and guard assertions
+    # below are written against. Compiled from the real source so the gate is
+    # exercised rather than stubbed away.
+    "_admission_shared_prefix_segments",
+    "_shared_prefix_credit_enabled",
+    "_admission_order_key",
+    "_prune_prefix_page_digest_cache",
+    "_prefix_page_digests",
     # The reserve-time seam: selection admits against free + reclaimable, so
     # this is where the reclaimable part is actually released.
     "_collective_prefill_host_capacity_ok",
@@ -409,6 +419,14 @@ class FakeWorker:
         self._prefill_admission_totals = None
         self._prefill_admission_live = False
         self._prefill_reservation_outcome = None
+        self.shared_prefix_admission = True
+        self._shared_prefix_credit_suspended = False
+        self._shared_prefix_credit_applied = False
+        self._prefix_page_digest_cache = {}
+        # Unmeasured prefill-pool budget: the pool declines every wave until
+        # one is measured, so the shared-prefix credit declines with it and
+        # these fakes admit on the full per-row charge.
+        self._prefill_pool_page_budget = None
         # No pooled segments in these fakes: _prefill_pool_segment_host_pages
         # is compiled from the real source and reads it.
         self._prefill_pool_wave = None
