@@ -184,6 +184,29 @@ class WorkerManager:
     _RESTART_PHASE_TORN_DOWN = "P1"
     _RESTART_PHASE_READY = "P2"
 
+    # Where the kernel ring buffer is read from when an unexpected worker exit
+    # is reaped. A container without CAP_SYSLOG cannot open it; the
+    # attribution below is then simply unavailable, and the failure path is
+    # exactly what it was before.
+    _KERNEL_RING_BUFFER_PATH = "/dev/kmsg"
+    # Bound on the records one reap reads: the ring buffer holds minutes of
+    # history, which is what the attribution needs (the OOM kill is noticed
+    # only when the next collective touches the dead rank, which on the
+    # 2026-11-03 incident was 2.5 minutes later), and the bound keeps a noisy
+    # buffer from holding the monitor thread.
+    _KERNEL_RING_BUFFER_MAX_RECORDS = 20000
+    # Set once per cohort by _attribute_host_oom: the kernel OOM killer takes
+    # exactly ONE process, and everything the server sees afterwards --
+    # aborted NCCL communicators on every peer rank, TCPStore broken pipes --
+    # is that rank's absence reported by the next collective. Held so the
+    # cascade is logged as secondary to it instead of as a cause of its own.
+    _host_oom_root_cause: Optional[str] = None
+    # Worker pids already looked up in the ring buffer. The monitor hands the
+    # same dead cohort over on every poll, so the buffer is read once per
+    # newly reaped pid rather than once per poll. Immutable, and replaced
+    # rather than mutated, so the class default is safe to share.
+    _host_oom_checked_pids = frozenset()
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -613,6 +636,10 @@ class WorkerManager:
             self._state = "serving"
             self._first_ready = True
             self._reconciled_failure = False
+            # A fresh cohort owns no earlier cohort's root cause, and its pids
+            # have not been looked up in the ring buffer.
+            self._host_oom_root_cause = None
+            self._host_oom_checked_pids = frozenset()
         logger.info(
             "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
             _time.monotonic() - startup_start,
@@ -1494,6 +1521,9 @@ class WorkerManager:
             self._worker_exit_state.clear()
             self._reconciled_failure = False
             self._last_restart_error = None
+            # As in start(): the replacement cohort starts with no root cause.
+            self._host_oom_root_cause = None
+            self._host_oom_checked_pids = frozenset()
         result = {
             "generation": self.generation,
             "failed_batches": reconciliation["failed_batches"],
@@ -1899,6 +1929,135 @@ class WorkerManager:
                     self._handle_worker_failure(exit_reason, None)
             self._monitor_stop_event.wait(self._monitor_interval_s)
 
+    @classmethod
+    def _read_kernel_ring_buffer(cls, path: Optional[str] = None) -> List[str]:
+        """Records currently in the kernel ring buffer, oldest first.
+
+        A fresh ``open`` of ``/dev/kmsg`` starts at the oldest record the
+        buffer still holds, which is what an after-the-fact attribution needs:
+        the OOM kill happened before the server noticed the dead rank. The
+        descriptor is non-blocking, so the read loop ends at ``EAGAIN``
+        instead of waiting for the next kernel message.
+
+        Returns an empty list when the buffer cannot be read at all -- an
+        unprivileged container hides it, and a diagnostic may never change the
+        failure path it is describing.
+        """
+
+        import errno
+
+        try:
+            fd = os.open(
+                path or cls._KERNEL_RING_BUFFER_PATH, os.O_RDONLY | os.O_NONBLOCK
+            )
+        except OSError as exc:
+            logger.debug("Kernel ring buffer is unreadable: %s", exc)
+            return []
+        records: List[str] = []
+        try:
+            for _ in range(cls._KERNEL_RING_BUFFER_MAX_RECORDS):
+                try:
+                    chunk = os.read(fd, 8192)
+                except BlockingIOError:
+                    break  # EAGAIN: no unread record left in the buffer
+                except OSError as exc:
+                    if exc.errno == errno.EPIPE:
+                        # This record was overwritten while being read; the
+                        # read position already moved to the next one.
+                        continue
+                    logger.debug("Kernel ring buffer read failed: %s", exc)
+                    break
+                if not chunk:
+                    break
+                records.append(chunk.decode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+        return records
+
+    @staticmethod
+    def _parse_oom_kill_records(records: List[str]) -> Dict[int, str]:
+        """Victim pid -> the kernel's own OOM-kill line, for each kill found.
+
+        Matches the ``Killed process <pid>`` the OOM killer prints, under
+        either of its headings (``Out of memory:`` for the global killer,
+        ``Memory cgroup out of memory:`` for a cgroup limit). Each ``/dev/kmsg``
+        record carries a ``prio,seq,timestamp,flags;`` prefix before the text;
+        a line captured from ``dmesg`` has no prefix and parses the same way.
+        """
+
+        import re
+
+        killed: Dict[int, str] = {}
+        for record in records:
+            for line in record.splitlines():
+                head, separator, tail = line.partition(";")
+                message = (tail if separator and "," in head else line).strip()
+                match = re.search(r"Killed process (\d+)", message)
+                if match is not None:
+                    # Later records win: the buffer is chronological, so the
+                    # newest kill of a pid is the one being reaped now.
+                    killed[int(match.group(1))] = message
+        return killed
+
+    def _attribute_host_oom(self, exited: Dict[int, int]) -> Optional[str]:
+        """Name the kernel OOM killer as the root cause, if it took a worker.
+
+        ``exited`` maps the pid of each reaped worker to its rank index. Every
+        reaped pid is looked up, not only the signal-killed ones: this manager
+        deliberately interprets no exit status (it compares ``exitcode``
+        against None and nothing else, pinned by
+        ``test_the_manager_interprets_no_exit_status_specially``), and the
+        kernel's record is keyed by pid regardless of how multiprocessing
+        reported the death.
+
+        Returns the root-cause line, or None when no reaped worker matches an
+        OOM-kill record -- in which case nothing about the existing failure
+        path changes.
+
+        Logged once per cohort: the NCCL/TCPStore cascade that follows reports
+        the same event from every surviving rank, and only this line knows why.
+        """
+
+        if self._host_oom_root_cause is not None:
+            return self._host_oom_root_cause
+        pending = frozenset(exited) - self._host_oom_checked_pids
+        if not pending:
+            return None
+        self._host_oom_checked_pids = self._host_oom_checked_pids | pending
+        killed = self._parse_oom_kill_records(self._read_kernel_ring_buffer())
+        if not killed:
+            return None
+        for pid, idx in sorted(exited.items(), key=lambda item: item[1]):
+            kernel_line = killed.get(pid)
+            if kernel_line is None:
+                continue
+            node_rank = getattr(self.args, "node_rank", 0)
+            self._host_oom_root_cause = (
+                f"worker rank-idx={idx} (node={node_rank} pid={pid}) was "
+                "killed by the kernel OOM killer -- host memory exhausted; "
+                "see the [MEM-PLAN host] block at startup"
+            )
+            logger.error(
+                "ROOT CAUSE: %s. Kernel record: %s",
+                self._host_oom_root_cause,
+                kernel_line,
+            )
+            return self._host_oom_root_cause
+        return None
+
+    def _as_secondary_to_host_oom(self, reason: str) -> str:
+        """Prefix a failure reason with the host-OOM root cause, once known.
+
+        Every consumer of the reason -- this node's log, the peers' down
+        notice, the process exit record -- then carries the cause rather than
+        the first symptom a collective happened to report.
+        """
+
+        root_cause = self._host_oom_root_cause
+        if root_cause is None or root_cause in reason:
+            return reason
+        return f"secondary to host-OOM root cause [{root_cause}]: {reason}"
+
     def _collect_worker_exit_reason(self) -> Optional[str]:
         if self.worker_process is None:
             return None
@@ -1906,6 +2065,7 @@ class WorkerManager:
         if not processes:
             return None
         exited = []
+        exited_pids: Dict[int, int] = {}
         error_files = getattr(self.worker_process, "error_files", ())
         for idx, proc in enumerate(processes):
             if proc.exitcode is None:
@@ -1919,9 +2079,16 @@ class WorkerManager:
                 with open(error_files[idx], "rb") as error_file:
                     detail += " Python traceback:\n" + pickle.load(error_file)
             exited.append(detail)
+            exited_pids[int(proc.pid)] = idx
         if not exited:
             return None
-        return "Detected worker process exit: " + ", ".join(exited)
+        # Before the reason is built, so the root cause leads it rather than
+        # trailing whichever rank the collective happened to report first.
+        root_cause = self._attribute_host_oom(exited_pids)
+        reason = "Detected worker process exit: " + ", ".join(exited)
+        if root_cause is not None:
+            return f"{root_cause}. {reason}"
+        return reason
 
     def _handle_worker_failure(
         self,
@@ -1933,6 +2100,10 @@ class WorkerManager:
     ) -> None:
         if self._stopping:
             return
+        # A host-OOM root cause, once named, leads every later report of this
+        # cohort's death: the reason reaches this node's log, the peers'
+        # down notice and the process exit record from here.
+        reason = self._as_secondary_to_host_oom(reason)
         exit_reason = exit_reason or f"worker fatal: {reason}"
         # Teardown and reconciliation of a cohort have exactly one owner.  The
         # ownership check and the transition that claims it share one critical
