@@ -179,6 +179,99 @@ def test_page_ids_may_differ_between_pools_once_keys_are_in_play():
     coordinator.assert_mirrored_state("diverged ids are allowed", [101, 102])
 
 
+def test_releasing_every_shared_page_does_not_re_arm_id_mirroring():
+    """The GLM-5.3 lcb crash, as a unit test.
+
+    Rows sharing one chat-template prefix page diverged the two pools' page
+    ids; when the last reader released that page both registries went empty.
+    A LIVE "is anything shared right now" predicate then re-armed the page-id
+    and page-table CONTENT assertions against tables that had already
+    diverged, and the next ``free_pages_for_sequences`` raised
+    "primary/auxiliary page-table contents mismatch". Releasing the pages does
+    not un-diverge the ids, so the relaxation has to be sticky.
+    """
+
+    coordinator = _coordinator()
+    _allocate(coordinator)
+    diverged_primary = _pages(coordinator.primary, 101)
+    diverged_aux = _pages(coordinator.auxiliary, 101)
+    assert diverged_primary != diverged_aux
+
+    coordinator.free_pages_for_sequences([101])
+    coordinator.free_pages_for_sequences([102])
+    # Every shared page is gone, so the live read says "nothing shared" ...
+    assert coordinator.has_shared_pages() is False
+    # ... but the ids it diverged stay diverged, so mirroring stays relaxed.
+    assert coordinator._page_ids_must_mirror() is False
+
+    # The sequence that crashed the run: an unrelated, unkeyed row allocated,
+    # page-tabled and freed after the registries emptied.
+    coordinator.allocate_pages_for_sequences([7], [2 * PAGE_TOKENS])
+    coordinator.rebuild_page_table([7])
+    coordinator.get_stats()
+    coordinator.free_pages_for_sequences([7])
+    coordinator.clear_page_table()
+
+
+def test_a_rolled_back_keyed_attempt_stays_sticky():
+    """Conservative on purpose: an attempt arms the flag before any pop.
+
+    A keyed allocation that gets as far as the primary pool leaves that pool's
+    free stack reordered by a pop/push its peer never made, so the ids are
+    independent from then on even though the attempt failed. Arming before the
+    preflight only ever costs an assertion; it can never cost a false crash.
+    """
+
+    coordinator = _coordinator(primary_pages=POOL_PAGES, aux_pages=3)
+    with pytest.raises(RuntimeError, match="insufficient auxiliary free pages"):
+        _allocate(coordinator)
+    assert coordinator._page_ids_must_mirror() is False
+
+
+def test_reset_allocations_restores_strict_mirroring():
+    coordinator = _coordinator()
+    _allocate(coordinator)
+    assert coordinator._page_ids_must_mirror() is False
+
+    coordinator.reset_allocations()
+
+    # Every page is back and both registries are empty: the pools hand out the
+    # same ids again, so the strict assertion is meaningful and re-armed.
+    assert coordinator._page_ids_must_mirror() is True
+    coordinator.allocate_pages_for_sequences([7], [2 * PAGE_TOKENS])
+    assert _pages(coordinator.primary, 7) == _pages(coordinator.auxiliary, 7)
+    coordinator.auxiliary._sequences[7].pages = torch.tensor(
+        [13, 14], dtype=torch.int32
+    )
+    with pytest.raises(RuntimeError, match="page-vector mismatch"):
+        coordinator.assert_mirrored_state("mirror", [7])
+
+
+def test_destroy_restores_strict_mirroring():
+    coordinator = _coordinator()
+    _allocate(coordinator)
+    assert coordinator._page_ids_must_mirror() is False
+
+    coordinator.destroy()
+    assert coordinator._page_ids_must_mirror() is True
+
+    coordinator.initialize()
+    coordinator.allocate_pages_for_sequences([7], [2 * PAGE_TOKENS])
+    assert _pages(coordinator.primary, 7) == _pages(coordinator.auxiliary, 7)
+
+
+def test_wrapping_pools_that_already_hold_keyed_pages_starts_relaxed():
+    primary, auxiliary = _manager(), _manager()
+    primary.allocate_pages_for_sequences_with_page_keys(
+        [1, 2], [2 * PAGE_TOKENS] * 2, [[5, 6], [5, 7]]
+    )
+    auxiliary.allocate_pages_for_sequences_with_page_keys(
+        [1, 2], [2 * PAGE_TOKENS] * 2, [[6, 5], [6, 8]]
+    )
+    coordinator = KV.DualKVCacheCoordinator(primary, auxiliary)
+    assert coordinator._page_ids_must_mirror() is False
+
+
 def test_without_keys_the_pools_must_still_mirror_page_ids():
     coordinator = _coordinator()
     coordinator.allocate_pages_for_sequences([7], [2 * PAGE_TOKENS])

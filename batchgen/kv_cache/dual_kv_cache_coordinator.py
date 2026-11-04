@@ -96,6 +96,16 @@ class DualKVCacheCoordinator:
 				f"primary={primary.config.page_size_tokens}, "
 				f"aux={auxiliary.config.page_size_tokens}"
 			)
+		# STICKY: has keyed (deduplicated) allocation ever touched either
+		# pool's free stack? Once it has, the two pools' physical page ids are
+		# permanently independent and may never be compared again until both
+		# pools are rebuilt from empty. See `_page_ids_must_mirror`. Derived
+		# from the pools rather than hardcoded so wrapping managers that
+		# already hold keyed pages starts out relaxed, not crashing.
+		self._keyed_pages_assigned = bool(
+			primary._shared_page_key_to_gpu_page
+			or auxiliary._shared_page_key_to_gpu_page
+		)
 
 	# -- Lifecycle --
 
@@ -111,6 +121,14 @@ class DualKVCacheCoordinator:
 	def destroy(self, *, empty_cuda_cache: bool = False) -> None:
 		self.primary.destroy(empty_cuda_cache=empty_cuda_cache)
 		self.auxiliary.destroy(empty_cuda_cache=empty_cuda_cache)
+		# Both pools are back to empty: `_reset_runtime_state` (allocator
+		# pools) and `_release_fixed_address_pool` (fixed-address pools) both
+		# rebuild the free stack and drop the shared-page registry, so the
+		# next page handed out is the two pools' first again and strict
+		# id mirroring is meaningful once more. `initialize()` is NOT such a
+		# point: on an already-initialized manager it warns and returns
+		# without touching allocator state.
+		self._keyed_pages_assigned = False
 
 	@property
 	def is_initialized(self) -> bool:
@@ -313,6 +331,12 @@ class DualKVCacheCoordinator:
 		op_name = "allocate_pages_for_sequences_with_page_keys"
 		pools = self._pool_page_keys(page_keys_by_sequence, op_name)
 		created = [int(seq_id) for seq_id in sequence_ids]
+		# Armed BEFORE anything pops: one keyed allocation makes the two pools'
+		# page ids independent for good. Even a rolled-back attempt does,
+		# because the primary pool popped and pushed pages its peer never
+		# touched, so the two free stacks no longer hand out the same ids.
+		# Releasing every shared page later does NOT undo that.
+		self._keyed_pages_assigned = True
 		for name, manager, rows in pools:
 			manager._ensure_initialized()
 			demand = int(
@@ -364,6 +388,11 @@ class DualKVCacheCoordinator:
 	def reset_allocations(self) -> None:
 		self.primary.reset_allocations()
 		self.auxiliary.reset_allocations()
+		# Every page returns and both shared-page registries are cleared (see
+		# GPUPagedKVCacheManager.reset_allocations), so the pools are in
+		# lockstep again: re-arm strict page-id mirroring, and let the
+		# assertion below run under it.
+		self._keyed_pages_assigned = False
 		self.assert_mirrored_state("reset_allocations")
 
 	def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
@@ -547,7 +576,13 @@ class DualKVCacheCoordinator:
 			manager._clear_active_page_pointer_tables()
 
 	def has_shared_pages(self) -> bool:
-		"""Is either pool currently deduplicating pages by Host page key?"""
+		"""Is either pool deduplicating pages by Host page key RIGHT NOW?
+
+		A live read, for observability only. It must never gate a mirroring
+		assertion: it goes back to False as soon as the last shared page is
+		released, while the page ids it caused to diverge stay diverged. That
+		is what `_keyed_pages_assigned` is for.
+		"""
 
 		return bool(
 			self.primary._shared_page_key_to_gpu_page
@@ -574,9 +609,19 @@ class DualKVCacheCoordinator:
 		batchgen_worker.py:5376-5379). What must stay mirrored is the SHAPE --
 		the sequence set, the page count per sequence, the slot order and the
 		table shape -- and those are checked unconditionally.
+
+		STICKY, never live. The first version of this read
+		`not has_shared_pages()` and crashed a GLM-5.3 lcb run inside
+		`free_pages_for_sequences`: the rows shared one chat-template prefix
+		page, their ids diverged, then the last reader released that page, the
+		registries went empty and the CONTENT assertion re-armed against
+		tables that had already diverged. Divergence is not undone by
+		releasing the pages that caused it -- only by rebuilding both pools
+		from empty (`destroy`, `reset_allocations`), which is where the flag
+		is cleared.
 		"""
 
-		return not self.has_shared_pages()
+		return not self._keyed_pages_assigned
 
 	def _assert_mirrored_sequence_pages(self, sequence_id: int, op_name: str) -> None:
 		primary_state = self.primary._sequences.get(sequence_id)
