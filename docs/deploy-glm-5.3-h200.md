@@ -93,11 +93,13 @@ echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
 ```
 
 The exact host KV size depends on available RAM and the request mix. Each
-token needs 109,824 bytes of KV across the 78 layers: 89,856 for the 576-wide
-MLA latent cache and 19,968 for the 128-wide sparse-indexer cache, both
-bfloat16. One 64-token page is 6.70 MiB, so a 1,048,575-token sequence needs
-16,384 pages (107.25 GiB) and eight of them need 858 GiB. Add the 703.7 GiB of
-shared weight memory when sizing the host.
+token needs 92,628 bytes of KV: 89,856 for the 576-wide bfloat16 MLA latent
+cache across all 78 layers, plus 2,772 for the page-split FP8 sparse-indexer
+cache (128 data + 4 scale bytes) on the 21 top-k computing layers — the other
+57 layers reuse the previous full layer's top-k and hold no indexer keys. One
+64-token page is 5.65 MiB, so a 1,048,575-token sequence needs 16,384 pages
+(90.5 GiB) and eight of them need 724 GiB. Add the 703.7 GiB of shared weight
+memory when sizing the host.
 
 Start with a conservative value, then increase it only after checking
 `MemAvailable` and the verifier's host-memory gate. The container must be

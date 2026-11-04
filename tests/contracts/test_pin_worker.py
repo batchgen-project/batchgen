@@ -190,6 +190,10 @@ PINS = {
                 "gpu_arch",
                 "enable_prefix_cache",
                 "prefix_cache_debug_stats",
+                # Added for shared-prefix-aware admission: the launch-scoped
+                # opt-out (--no-shared-prefix-admission) that restores the
+                # per-row logical charge for comparison runs.
+                "shared_prefix_admission",
                 "watchdog_timeout",
                 "watchdog_test_stuck_time",
                 "watchdog_heartbeat_interval",

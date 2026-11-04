@@ -63,6 +63,7 @@ from batchgen_kernels.triton_prewarm import (  # noqa: F401 - re-exported
     PrewarmEntry,
     int_class,
 )
+from batchgen.config.graph_span_policy import graph_context_span_cap_tokens
 
 
 logger = logging.getLogger(__name__)
@@ -333,15 +334,28 @@ class Glm5DecodeGeometry:
     # Slot capacity of the primary GPU page table: no captured bucket exceeds
     # it, and it bounds the DeepGEMM geometry entries' row counts.
     max_decode_rows: int = 0
+    # `graph_span_policy.graph_context_span_cap_tokens` for this bucket set, i.e. the
+    # same trim the worker applies. 0 means the caller supplied no bucket set
+    # and the cap cannot bind.
+    span_cap_tokens: int = 0
 
     @property
     def graph_max_seqlen(self) -> int:
         """The score span the decode graph is captured with: the worker's
-        ``_glm5_dsa_graph_score_capacity_tokens``."""
+        ``_glm5_dsa_graph_score_capacity_tokens``.
+
+        Every term that method takes the ``min`` over appears here, including
+        the context-proportional statics cap -- the prewarm compiles the
+        span-dependent kernels, so a span that differs from the worker's would
+        warm the wrong template and leave the real one to compile inside the
+        capture.
+        """
         capacities = [self.primary_width * self.primary_page_size,
                       self.aux_width * self.aux_page_size]
         if self.max_position_embeddings > 0:
             capacities.append(self.max_position_embeddings)
+        if self.span_cap_tokens > 0:
+            capacities.append(self.span_cap_tokens)
         capacity = min(capacities)
         if capacity <= 0:
             raise Glm5PrewarmGeometryError(
@@ -362,7 +376,8 @@ class Glm5DecodeGeometry:
     def key(self) -> tuple:
         return (self.primary_width, self.aux_width, self.primary_page_size,
                 self.aux_page_size, self.aux_page_split,
-                self.max_position_embeddings, self.max_decode_rows)
+                self.max_position_embeddings, self.max_decode_rows,
+                self.span_cap_tokens)
 
 
 # ============================================================================
@@ -769,6 +784,7 @@ def _run_paged_mqa_prepare(geometry: Glm5DecodeGeometry, device,
         num_valid_tokens=_valid_count(1, device),
         deep_gemm_context_lens_out=torch.empty((1, next_n), dtype=torch.int32,
                                                device=device),
+        page_size=geometry.aux_page_size,
     )
 
 
@@ -1090,10 +1106,16 @@ def _aux_is_page_split(aux_manager, index_head_dim: int) -> bool:
     return bool(cache_is_page_split(probe, int(index_head_dim)))
 
 
-def decode_geometry(gpu_manager, shapes: Glm5PrewarmShapes
+def decode_geometry(gpu_manager, shapes: Glm5PrewarmShapes,
+                    decode_buckets: Optional[Sequence[int]] = None,
                     ) -> Tuple[Glm5DecodeGeometry, Any, Any]:
     """``(geometry, primary kv dtype, aux kv dtype)`` of the worker's KV
-    managers, as ``_setup_cuda_graphs`` reads them."""
+    managers, as ``_setup_cuda_graphs`` reads them.
+
+    ``decode_buckets`` is the bucket set the worker will capture; it decides
+    the context-proportional statics cap, so leaving it out gives a geometry
+    whose span can exceed the worker's.
+    """
     primary = getattr(gpu_manager, "primary", gpu_manager)
     aux = getattr(gpu_manager, "auxiliary", None)
     if primary is None or aux is None:
@@ -1101,14 +1123,24 @@ def decode_geometry(gpu_manager, shapes: Glm5PrewarmShapes
             "GLM-5 decode geometry needs the primary and auxiliary GPU KV "
             "managers"
         )
+    aux_page_split = _aux_is_page_split(aux, shapes.index_head_dim)
+    buckets = [int(b) for b in (decode_buckets or ()) if int(b) > 0]
+    span_cap = (
+        graph_context_span_cap_tokens(
+            bucket_sizes=buckets, aux_is_page_split=aux_page_split
+        )
+        if buckets
+        else 0
+    )
     geometry = Glm5DecodeGeometry(
         primary_width=_graph_table_width(primary, "primary"),
         aux_width=_graph_table_width(aux, "auxiliary"),
         primary_page_size=int(primary.config.page_size_tokens),
         aux_page_size=int(aux.config.page_size_tokens),
-        aux_page_split=_aux_is_page_split(aux, shapes.index_head_dim),
+        aux_page_split=aux_page_split,
         max_position_embeddings=shapes.max_position_embeddings,
         max_decode_rows=_page_table_slots(primary, "primary"),
+        span_cap_tokens=span_cap,
     )
     return geometry, primary.config.kv_dtype, aux.config.kv_dtype
 
@@ -1283,8 +1315,8 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
 
     shapes = Glm5PrewarmShapes.from_config(config)
     try:
-        geometry, primary_dtype, aux_dtype = decode_geometry(gpu_manager,
-                                                             shapes)
+        geometry, primary_dtype, aux_dtype = decode_geometry(
+            gpu_manager, shapes, decode_buckets)
         capacity = geometry.graph_max_seqlen
     except Glm5PrewarmGeometryError as exc:
         logger.warning("%s rank=%s geometry phase not run: %s", LOG_TAG, rank,

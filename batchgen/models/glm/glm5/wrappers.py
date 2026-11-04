@@ -743,6 +743,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # every decode consumer uses these FP8 weights and fails loud when
         # they are missing.
         self._fp8_absorb_weights = None
+        # Set by release_decode_kv_b_proj(): the decode instance's resident FP8
+        # kv_b_proj weight is gone and the BF16 absorb pair above is the only
+        # remaining decode authority. Nothing re-derives the absorb pair after
+        # this point; initialize_decode_absorb fails loud instead.
+        self._decode_kv_b_proj_released = False
         # WP2: Fused indexer KV proj (CUDA WGMMA)
         self._indexer_cuda_module = None
         self._indexer_cuda_weights = None
@@ -827,6 +832,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
         dequantization in _forward_decode_dsa().
         """
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+        if self._decode_kv_b_proj_released:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] initialize_decode_absorb after "
+                "release_decode_kv_b_proj: this decode instance no longer holds "
+                "the FP8 kv_b_proj weight, so the absorb pair cannot be rebuilt "
+                "in place. Rebuild the decode instance (configure_decoding) "
+                "instead of re-initializing absorb"
+            )
         attn = self.module
         weight_scale = self.weight_dequant_scale
         if weight_scale is None or "kv_b_proj.weight_scale_inv" not in weight_scale:
@@ -880,6 +893,48 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
+
+    def release_decode_kv_b_proj(self) -> int:
+        """Drop this DECODE instance's resident FP8 ``kv_b_proj`` weight.
+
+        Returns the bytes released (0 if already released).
+
+        ``initialize_decode_absorb`` has turned the FP8 ``kv_b_proj`` weight
+        into the BF16 absorb pair, and every decode consumer reads that pair:
+        ``_forward_decode_dsa`` out-absorb (``self._fp8_absorb_weights``, which
+        fails loud when absent), the eager selector's q-absorb
+        (``glm5_decode_selector._absorb_q_nope``) and both captured graph
+        segments (``absorb_weights=wrapper._fp8_absorb_weights``). No decode
+        path re-dequantizes from ``kv_b_proj``; the readers that do are
+        prefill-only (``sparse_prefill``, the ``fa3_backend`` chunked-prefill
+        entry points) and run on the PREFILL instance, whose attention wrappers
+        are non-persistent and stream their ``kv_b_proj`` weight per forward
+        from the core engine's host copy.
+
+        Safe to free rather than merely unbind: the weight is phase-managed,
+        not part of the shared device skeleton. Every
+        ``self_attn.kv_b_proj.weight`` key is in
+        ``GLM5ParallelStrategyManager.state_dict_name_map``, which
+        ``_skeleton_bind_keys`` skips and ``_check_shared_skeleton_binding``
+        refuses to let the skeleton bind, so this device tensor is the decode
+        instance's own ``.to(device)`` copy (``_load_attn_module``) and the
+        prefill instance cannot alias it. The host authority stays in the core
+        engine, so a later ``configure_decoding`` reloads it normally.
+        """
+        if self._fp8_absorb_weights is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] release_decode_kv_b_proj before the "
+                "BF16 absorb pair exists: initialize_decode_absorb must run "
+                "first, otherwise decode loses its only out-absorb authority"
+            )
+        weight = self.module.kv_b_proj.weight
+        released = weight.data.numel() * weight.data.element_size()
+        self.fp8_kv_b_proj = None
+        weight.data = torch.empty(
+            0, dtype=weight.data.dtype, device=weight.data.device
+        )
+        self._decode_kv_b_proj_released = True
+        return released
 
     def initialize_fused_kernels(self):
         """Initialize TMA-based CUDA kernels (WP2/WP4).
@@ -978,6 +1033,55 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # other version's numerics.
         if glm5_qb_wqb_merge_enabled():
             self._register_q_b_wq_b_merged(indexer)
+            self._release_separate_wq_b_operand()
+
+    def _release_separate_wq_b_operand(self) -> int:
+        """Free the WP4 container's re-quantized wq_b copy. Returns bytes freed.
+
+        A merged ``[q_b | wq_b]`` operand makes this a THIRD resident copy of
+        wq_b (checkpoint e4m3 in the skeleton, the merged operand's copy, and
+        this container's dequantize -> re-quantize copy plus its TMA
+        descriptor), and with the merge live nothing reads it:
+
+        * captured graph — ``Glm5FullDsaAttnSegment.forward`` reaches
+          ``cuda_wq_b_proj_out(self.wq_b_weights, ...)`` only in the ``else``
+          of ``if self._q_b_wq_b_merged``, inside ``if not self.all_short``.
+          ``_q_b_wq_b_merged`` is ``merge_selected and not all_short``, so with
+          the merge selected the branch is True whenever the block runs, and
+          when ``all_short`` the block is skipped entirely — unreachable
+          either way. ``setup_static_buffers`` already relies on this: it
+          installs 1-element placeholders for that version's activation
+          scratch and TMA descriptor (``_merged_wq_b_scratch_placeholders``).
+        * eager — ``build_glm5_dsa_flashmla_inputs`` computes ``q_index_raw``
+          from the merged GEMM for every indexer layer with the merge on, and
+          both ``score_and_select_paged`` call sites forward it, so
+          ``_score_and_select_paged_fp8`` / ``fused_score_pipeline`` take
+          their ``q_index_raw`` branch and never call ``cuda_wq_b_proj``.
+
+        The container object itself survives (the engine and
+        ``_init_fused_kernels`` require ``_fused_wqb_weights`` to be
+        non-None); only its device bytes go, and every tensor accessor raises
+        a named error afterwards instead of handing out a stale descriptor.
+        That is also the safety net for ``Glm5DsaAttnSegment``, the retired
+        per-layer DSA graph segment: its ``forward`` reads ``wq_b_weights``
+        unconditionally, and no production path instantiates it (only the
+        whole-model graph remains), so re-enabling that mode with the merge on
+        now raises the named error instead of running on a released operand.
+
+        Returns 0 on a wrapper with no merged operand — a streaming prefill
+        wrapper has no registered resident ``q_b``, so
+        ``_register_q_b_wq_b_merged`` leaves the merged operand None and this
+        container stays that instance's only wq_b authority.
+        """
+        if self._fp8_q_b_wq_b_proj is None or self._fused_wqb_weights is None:
+            return 0
+        released = self._fused_wqb_weights.release()
+        if released:
+            logging.debug(
+                f"[layer {self.layer_idx}] released the separate wq_b operand "
+                f"({released / 1e6:.2f} MB); merged [q_b | wq_b] is live"
+            )
+        return released
 
     def _register_q_b_wq_b_merged(self, indexer) -> None:
         """Concatenate ``[q_b_proj | indexer.wq_b]`` into one DeepGEMM operand.

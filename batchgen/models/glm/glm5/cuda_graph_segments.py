@@ -2085,6 +2085,7 @@ class Glm5FullDsaAttnSegment:
             block_table=buffers.aux_block_table,
             context_lens=buffers.aux_context_lens,
             deep_gemm_context_lens=buffers.aux_deep_gemm_context_lens,
+            page_size=self.aux_page_size,
             num_valid_tokens=num_valid_tokens,
         )
 

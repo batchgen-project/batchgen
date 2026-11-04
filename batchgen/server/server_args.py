@@ -217,6 +217,11 @@ class ServerArgs:
     glm5_disable_decode_host_kv_staging: bool = False
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
+    # Shared-prefix-aware capacity accounting is the default: a prefix several
+    # sequences read from one physical copy is charged once per resource, so
+    # reuse raises admitted concurrency instead of only saving compute. The
+    # opt-out restores the per-row logical charge for comparison runs.
+    shared_prefix_admission: bool = True
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -466,6 +471,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Log prefix-cache lifecycle statistics",
+    )
+    parser.add_argument(
+        "--no-shared-prefix-admission",
+        dest="shared_prefix_admission",
+        action="store_false",
+        default=True,
+        help=(
+            "Charge every sequence its whole prefix in admission accounting "
+            "even when sequences share one physical copy. Default is to "
+            "charge a shared prefix once per resource"
+        ),
     )
     parser.add_argument(
         "--gpu-arch", type=str, default=None, help="GPU architecture hint"
@@ -1013,6 +1029,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         glm5_disable_decode_host_kv_staging=parsed.glm5_disable_decode_host_kv_staging,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
+        shared_prefix_admission=parsed.shared_prefix_admission,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,

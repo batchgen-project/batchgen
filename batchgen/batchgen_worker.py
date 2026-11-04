@@ -29,6 +29,12 @@ from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertW
 # glm5_decode_*_slot_indices, glm5_dsa_*) live on GLM5AttnWrapper, not
 # AttnWrapperBase, per audit §A finding #8.
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
+# Captured-span policy, shared with the Triton prewarm so the kernels warmed
+# before capture are the ones the capture compiles.
+from batchgen.config.graph_span_policy import (
+	GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
+	graph_context_span_cap_tokens,
+)
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -111,6 +117,11 @@ DECODE_DEFERRED_TOKEN_READBACK = True
 _COHORT_QUIESCE_DEADLINE_S = 5.0
 _COHORT_QUIESCE_POLL_INTERVAL_S = 1e-3
 _COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
+
+# Seconds between two "step exceeds the captured span" warnings. The condition
+# holds for every step of a long sequence, so it is logged at a rate a human
+# reads rather than once per step.
+_GRAPH_SPAN_WARN_INTERVAL_S = 60.0
 
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
@@ -254,7 +265,12 @@ from batchgen.worker.decode import (
 	reduce_decode_capacity_snapshot,
 	estimate_max_decode_replica_batch,
 )
+from batchgen.worker.shared_prefix_charge import (
+	SharedPrefixLedger,
+	plan_shared_runs,
+)
 from batchgen.worker.kv_manager import (
+	GPU_KV_POOL_HEADROOM_GB,
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
@@ -293,6 +309,7 @@ from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, conf
 # rebinds at worker init; read them through the module at use time, never
 # import them by value (that binds the import-time defaults).
 import batchgen.sequence as _sequence_module
+from batchgen.kv_cache.host_kv_health import format_host_kv_health
 from batchgen.prefill.prepack import (
 	prepack_sequences,
 	unpack_last_token_logits,
@@ -1011,6 +1028,10 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 	enable_prefix_cache: bool = False
 	prefix_cache_debug_stats: bool = False
+	# Charge a prefix several sequences read from one physical copy once per
+	# resource instead of once per row. Default on; the opt-out restores the
+	# per-row logical charge for comparison runs.
+	shared_prefix_admission: bool = True
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -1260,6 +1281,8 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		# Monotonic timestamp of the last "step exceeds the captured span" WARN.
+		self._decode_graph_span_warn_monotonic = None
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
@@ -1378,6 +1401,9 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		self.enable_prefix_cache = bool(args.enable_prefix_cache)
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self.shared_prefix_admission = bool(
+			getattr(args, "shared_prefix_admission", True)
+		)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
 		# Edge trigger for the prefix_drain metric: set when the row is
@@ -1411,6 +1437,24 @@ class BatchGenWorker:
 		# outcome, folded into the guard state so a rejected transaction is
 		# not mistaken for a wave that selected nothing.
 		self._prefill_reservation_outcome = None
+		# Shared-prefix admission credit: charge an in-wave shared prefix once
+		# per node instead of once per row. Suspended for the NEXT admission
+		# round whenever a credited wave is rejected by the reservation
+		# transaction -- the wave planner may decline to pool (a budget too
+		# small for the chain, the threshold ladder), and then each member
+		# really does compute and allocate its own prefix. Re-admitting the
+		# same credited wave would then repeat the same rejection forever, so
+		# the retry falls back to the full charge, makes progress, and the
+		# latch clears on the next committed reservation. Rank-uniform: both
+		# the rejection and the commit are decided by a collective.
+		self._shared_prefix_credit_suspended = False
+		self._shared_prefix_credit_applied = False
+		# global_idx -> cumulative per-page prompt digests, one entry per
+		# SHAREABLE page (a prompt's last page is private by construction, so
+		# every row keeps a tail). Cached because a digest is a property of the
+		# prompt, not of the round: recomputing it on every scheduler iteration
+		# would re-hash the whole candidate set each time.
+		self._prefix_page_digest_cache = {}
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
 		self._trajectory_frontier_committer = None
 		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
@@ -5186,6 +5230,24 @@ class BatchGenWorker:
 	# `engine_config` / `model_config` / `args` attributes into the typed
 	# `PageTableCapacityRequest` frozen snapshot.
 
+	def _deployment_context_bound_tokens(self) -> int:
+		"""Longest context any sequence can reach for the life of this server.
+
+		Admission clamps every sequence to `model_context_length`
+		(`clamp_decode_to_context`, and the `ctx_lens >= model_context_length`
+		completion test), so no decode step's `max_seqlen` can ever exceed it.
+		That makes it the one DEPLOYMENT bound available to capture-time
+		sizing: `max_input_length` / `max_decoding_length` are per-batch — set
+		by `Init` and grown at admission — so sizing from them describes
+		whichever batch happens to arrive first, not the deployment.
+
+		`_initialize_core_components` sets it from the model config (131072
+		default) before any KV pool or graph exists, so it is always available
+		to the pool and capture paths. Returns 0 only before core init; the
+		caller decides whether that is an error.
+		"""
+		return int(getattr(self, "model_context_length", 0) or 0)
+
 	def _make_page_table_capacity_request(
 		self, sequence_tokens: Optional[Sequence[int]] = None,
 	) -> PageTableCapacityRequest:
@@ -5213,7 +5275,16 @@ class BatchGenWorker:
 			graph_buckets = getattr(basic, "decode_graph_buckets", None) or ()
 			engine_basic_decode_graph_max_bucket = max(graph_buckets) if graph_buckets else None
 		model_config = getattr(self, "model_config", None)
-		model_max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+		# Deployment bound first, model config second. `model_context_length`
+		# is what admission clamps to, and it exists even when the config class
+		# does not declare `max_position_embeddings` — a config that lacks the
+		# field used to drop the bound from the candidate set entirely, leaving
+		# the page table's token span at the first batch's
+		# `max_input_length + max_decoding_length`. A graph captured against
+		# that span then rejected every later, longer decode step.
+		model_max_position_embeddings = self._deployment_context_bound_tokens() or getattr(
+			model_config, "max_position_embeddings", None
+		)
 		args = getattr(self, "args", None)
 		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
 		return PageTableCapacityRequest(
@@ -5668,6 +5739,32 @@ class BatchGenWorker:
 			'num_valid_sequences': len(valid_sequences),
 		}
 
+	def _log_host_kv_health(self) -> None:
+		"""Log the audited health of this node's host-KV region(s).
+
+		One line per region: the used-page identity, the sequence-table
+		occupancy, and the region's lifetime counters (see
+		``batchgen.kv_cache.host_kv_health``). ``get_audited_stats()`` is
+		O(table + pages) under both region locks; call this only from the
+		periodic heartbeat.
+		"""
+		view = getattr(self, "host_paged_kv_worker_view", None)
+		if view is None:
+			return
+		if isinstance(view, DualHostKVCoordinator):
+			regions = (
+				("primary", view.primary),
+				("aux", view.require_auxiliary("host-KV health")),
+			)
+		else:
+			regions = (("host", view),)
+		node_id = self.rank // self.local_world_size
+		for name, region_view in regions:
+			logging.info(
+				f"[HOST_KV] node={node_id} "
+				f"{format_host_kv_health(name, region_view.get_audited_stats())}"
+			)
+
 	def _gather_host_kv_stats_by_node(self, worker_view: Optional[object]) -> List[Dict[str, int]]:
 		"""Gather one host-KV pool stat record per node.
 
@@ -5737,6 +5834,60 @@ class BatchGenWorker:
 			has_evicted=self.enable_host_kv_eviction and self.global_batch.has_evicted(),
 		)
 
+	def _credit_reclaimable_prefix_pages(
+		self, stats: Dict[str, int]
+	) -> Dict[str, int]:
+		"""Report reclaimable retained prefix pages as free, not as pressure.
+
+		The Host allocator's counters are already PHYSICAL: a prefix several
+		sequences attach is one allocation and is charged to ``used`` exactly
+		once, so this node's utilisation never double-counts a shared page.
+		What it cannot distinguish is a page holding live KV from a page
+		holding a RETAINED prefix that nobody is reading -- a copy the prefix
+		cache keeps for a future hit and that admission reclaims on demand,
+		which is why ``per_node_host_reclaimable`` already counts it as part of
+		the admission budget.
+
+		Left as ``used``, those pages hold free% under the watermark forever,
+		so a pool filled with retained prefixes never preempts decode for
+		prefill -- the one situation the trigger exists for. Crediting them
+		here (and only here, so the legacy/native utilisation parity check
+		keeps comparing the raw counters) makes the trigger see the capacity
+		admission would actually get.
+
+		Read only when work is waiting: the trigger cannot fire otherwise, and
+		the count is an O(max_nodes) scan under the coordinator's lock.
+		"""
+		if not self.enable_prefix_cache:
+			return stats
+		coordinator = getattr(self, "prefix_cache_coordinator", None)
+		if coordinator is None:
+			return stats
+		waiting = self.global_batch.has_queueing() or (
+			self.enable_host_kv_eviction and self.global_batch.has_evicted()
+		)
+		if not waiting:
+			return stats
+		releasable = max(0, int(coordinator.count_releasable_pages(0)))
+		if releasable == 0:
+			return stats
+		total = int(stats["num_total_pages"])
+		used = int(stats["num_used_pages"])
+		# A retained page is charged to `used`, so crediting it moves the same
+		# count. Clamped so a stale read can never make `used` negative or
+		# free% exceed 100 -- a watermark fed an impossible snapshot would
+		# preempt decode on every step.
+		credited = min(releasable, used)
+		free = int(stats["num_free_pages"]) + credited
+		updated = dict(stats)
+		updated["num_used_pages"] = used - credited
+		updated["num_free_pages"] = free
+		updated["num_reclaimable_prefix_pages"] = credited
+		updated["free_percent"] = (
+			int((free / total) * 100) if total > 0 else 100
+		)
+		return updated
+
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
 
@@ -5755,7 +5906,9 @@ class BatchGenWorker:
 
 		# Only local_rank 0 reports (one per node)
 		if self.local_rank == 0:
-			local_stats = self._get_host_kv_utilization()
+			local_stats = self._credit_reclaimable_prefix_pages(
+				self._get_host_kv_utilization()
+			)
 		else:
 			local_stats = None
 
@@ -7241,6 +7394,7 @@ class BatchGenWorker:
 			# but a rejection that repeats with everything else unchanged is
 			# deterministic, not contention, and must still reach the limit.
 			self._prefill_reservation_outcome = "rejected_by_capacity_snapshot"
+			self._suspend_shared_prefix_credit("rejected_by_capacity_snapshot")
 			if self.rank == 0:
 				logging.warning(
 					"[PREFILL] Host KV admission rejected by fresh capacity snapshot; "
@@ -7362,6 +7516,9 @@ class BatchGenWorker:
 				self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
 			self._prefill_reservation_outcome = "rolled_back_after_allocator_failure"
+			self._suspend_shared_prefix_credit(
+				"rolled_back_after_allocator_failure"
+			)
 			return False
 
 		# Commit scalar reservation metadata only after every allocator agrees.
@@ -7382,6 +7539,9 @@ class BatchGenWorker:
 				owned = pages - state.attached_tokens // seq.PAGE_SIZE
 			seq.host_owned_pages = owned
 		self._prefill_reservation_outcome = "committed"
+		# A committed wave proves the credit (if any) matched what the
+		# allocator consumed, so the next round may credit again.
+		self._shared_prefix_credit_suspended = False
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -8338,6 +8498,172 @@ class BatchGenWorker:
 			)
 		return local_passes, global_passes
 
+	def _suspend_shared_prefix_credit(self, reason: str) -> None:
+		"""Fall back to the full per-row charge for the next admission round.
+
+		Called when a wave admitted with the shared-prefix credit is rejected
+		by the reservation transaction. The credit predicts that the wave
+		planner will pool each shared prefix into ONE Host copy; the planner
+		can still decline (an unmeasured or too-small pool budget, the
+		threshold ladder), and then every member really does allocate its own
+		prefix and the wave genuinely does not fit.
+
+		Re-admitting the same credited wave would repeat the same rejection on
+		every iteration, so the retry charges in full, admits the smaller wave
+		that does fit, and makes progress; the latch clears on the next
+		committed reservation. The suspension is logged by name -- it is a
+		measurable prediction miss, not a silent fallback.
+		"""
+		if not self._shared_prefix_credit_applied:
+			return
+		self._shared_prefix_credit_applied = False
+		if self._shared_prefix_credit_suspended:
+			return
+		self._shared_prefix_credit_suspended = True
+		if self.rank == 0:
+			logging.warning(
+				"[PREFILL] shared-prefix admission credit suspended for the "
+				"next round: a credited wave was %s, so the next wave is "
+				"charged per row",
+				reason,
+			)
+
+	def _shared_prefix_credit_enabled(self) -> bool:
+		"""Whether this round may charge an in-wave shared prefix once.
+
+		Every condition is a reason the prediction would otherwise be wrong:
+
+		- the credit describes prefix-cache sharing, so it needs the cache on;
+		- only the in-wave prefix POOL gives the wave one Host copy per shared
+		  segment with members attaching it, which is what the credit counts;
+		- the pool declines every wave until its page budget has been measured
+		  (the first wave after startup seeds it), and a declined wave
+		  allocates a full private copy per member;
+		- a previous credited wave that the reservation rejected suspends the
+		  credit for one round so admission makes progress.
+		"""
+		if not self.shared_prefix_admission:
+			return False
+		if not self.enable_prefix_cache:
+			return False
+		if self._shared_prefix_credit_suspended:
+			return False
+		if not self._prefill_prefix_pool_enabled():
+			return False
+		return self._prefill_pool_page_budget is not None
+
+	def _prefix_page_digests(self, seq) -> Tuple[int, ...]:
+		"""Cumulative page digests of this sequence's prompt, shareable pages.
+
+		Digest ``k`` identifies the first ``k+1`` pages of the prompt: two
+		sequences hold the same digest at ``k`` exactly when those pages carry
+		the same tokens, hence the same KV, hence one physical copy in the
+		pool. Using the digest itself as the ledger key therefore makes "same
+		key" mean "same physical pages", which is what the charge requires.
+
+		Deterministic across ranks: the digest is a function of the prompt
+		tokens, which every rank reads from the node-shared trajectory store.
+		"""
+		cached = self._prefix_page_digest_cache.get(seq.global_idx)
+		if cached is not None:
+			return cached
+		page_size = int(seq.PAGE_SIZE)
+		# The final page is never shareable, so a fully shared prompt still
+		# pays for the page holding the token it produces logits for.
+		shareable = (int(seq.prompt_length) - 1) // page_size
+		if shareable <= 0:
+			self._prefix_page_digest_cache[seq.global_idx] = ()
+			return ()
+		tokens = self._trajectory_tokens(seq, length=seq.prompt_length)
+		token_array = np.ascontiguousarray(
+			np.asarray(tokens, dtype=np.int64)
+		)
+		digests = []
+		running = b"\x00" * 16
+		for page in range(shareable):
+			block = token_array[page * page_size:(page + 1) * page_size]
+			running = hashlib.blake2b(
+				running + block.tobytes(), digest_size=16
+			).digest()
+			digests.append(
+				int.from_bytes(running[:8], "big", signed=False)
+			)
+		chain = tuple(digests)
+		self._prefix_page_digest_cache[seq.global_idx] = chain
+		return chain
+
+	def _prune_prefix_page_digest_cache(self) -> None:
+		"""Drop digests of sequences the batch no longer holds."""
+		if not self._prefix_page_digest_cache:
+			return
+		live = {
+			seq.global_idx
+			for seq in self.global_batch.sequences.values()
+		}
+		for global_idx in list(self._prefix_page_digest_cache):
+			if global_idx not in live:
+				del self._prefix_page_digest_cache[global_idx]
+
+	def _admission_shared_prefix_segments(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Per candidate, the shared run it reads with an ADJACENT candidate.
+
+		``_stamp_prefix_prefill_order`` sorts the admission by prompt token
+		ids, which on a prefix tree is a depth-first walk: candidates sharing
+		a prefix are contiguous. A candidate's shared run is therefore the
+		longer of its page-granular common prefix with its two neighbours in
+		admission order, and its key is the cumulative digest at the end of
+		that run -- equal for exactly the candidates that share it.
+
+		Conservative by construction: crediting only the deepest adjacent run
+		under-counts a wave whose families themselves share an outer prefix
+		(the outer run is charged once per family rather than once per wave),
+		and under-counting can only admit fewer rows, never over-admit.
+		"""
+		if not self._shared_prefix_credit_enabled():
+			return {}
+		self._prune_prefix_page_digest_cache()
+		ordered = sorted(
+			all_candidates,
+			key=lambda uuid: (
+				self._admission_order_key(
+					self.global_batch.get_sequence(uuid)
+				),
+				self.global_batch.get_sequence(uuid).global_idx,
+			),
+		)
+		digests = [
+			self._prefix_page_digests(self.global_batch.get_sequence(uuid))
+			for uuid in ordered
+		]
+
+		def shared_pages(left: int, right: int) -> int:
+			if left < 0 or right >= len(digests):
+				return 0
+			first, second = digests[left], digests[right]
+			limit = min(len(first), len(second))
+			index = 0
+			while index < limit and first[index] == second[index]:
+				index += 1
+			return index
+
+		segments: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for position, uuid in enumerate(ordered):
+			run = max(
+				shared_pages(position - 1, position),
+				shared_pages(position, position + 1),
+			)
+			if run <= 0:
+				continue
+			segments[uuid] = ((digests[position][run - 1], run),)
+		return segments
+
+	def _admission_order_key(self, seq) -> int:
+		"""The order ``select_prefill_batch`` walks QUEUEING candidates in."""
+		order = getattr(seq, "prefill_order", None)
+		return int(seq.global_idx if order is None else order)
+
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
 		num_nodes: int, chunk_size: int, *,
@@ -8345,6 +8671,8 @@ class BatchGenWorker:
 		per_node_host_reclaimable=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
+		shared_segments = self._admission_shared_prefix_segments(all_candidates)
+		self._shared_prefix_credit_applied = bool(shared_segments)
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8380,6 +8708,7 @@ class BatchGenWorker:
 				# the node allocator exactly one copy of req_pages.
 				host_kv_replication_factor=1,
 				prefill_order=getattr(seq, "prefill_order", None),
+				shared_prefix_segments=shared_segments.get(uuid, ()),
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -8518,8 +8847,17 @@ class BatchGenWorker:
 
 		# Candidate enumeration and logging stay here; pure physical-capacity
 		# selection is delegated.
+		# Owner-reported shared GPU prefixes, gathered before the pure
+		# selection so every rank charges the same marginal cost: rows that
+		# reference one Host page get ONE physical GPU page, so charging each
+		# row its whole context would bound decode by the logical page sum.
+		shared_segments = self._gather_decode_shared_prefix_segments(
+			all_candidates
+		)
 		decode_batch = DecodeScheduler.select_decode_batch(
-			self._make_decode_batch_request(all_candidates, capacity)
+			self._make_decode_batch_request(
+				all_candidates, capacity, shared_segments=shared_segments
+			)
 		)
 
 		# An all_short whole-model capture never runs indexer scoring, so a
@@ -8549,10 +8887,123 @@ class BatchGenWorker:
 
 		return decode_batch
 
+	def _decode_shared_prefix_credit_enabled(self) -> bool:
+		"""Whether decode admission may charge a shared GPU prefix once.
+
+		The credit is only honest where the ALLOCATOR shares: GPU pages are
+		deduplicated by Host page id inside
+		``allocate_pages_for_sequences_with_page_keys``, which
+		``_allocate_gpu_pages_with_host_identity`` reaches only with the prefix
+		cache on and a manager that is not the dual-KV coordinator. Everywhere
+		else each row really does load its own copy, so each row must pay for
+		it -- the same condition ``_host_identity_page_keys`` tests before
+		returning page keys at all.
+		"""
+		if not self.shared_prefix_admission:
+			return False
+		if not self.enable_prefix_cache:
+			return False
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not manager.is_initialized:
+			return False
+		if isinstance(manager, DualKVCacheCoordinator):
+			return False
+		return True
+
+	def _local_decode_shared_prefix_runs(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Shared leading page runs among the candidates THIS rank owns.
+
+		Grouped per owner because sharing only pays inside one GPU pool: the
+		pool belongs to one DP rank (or one replicated TP group whose Host-KV
+		leader owns every row), so two rows loading onto different pools each
+		need their own physical copy.
+
+		The identity is the HOST page id, which is what the allocator dedups
+		on, so a run here means those rows provably reference one physical
+		copy -- not merely equal tokens, which two distinct Host copies can
+		also have.
+		"""
+		worker_view = getattr(
+			self.core_engine, "host_paged_kv_worker_view", None
+		)
+		if worker_view is None:
+			return {}
+		mine = []
+		for uuid in all_candidates:
+			if uuid not in self._uuid_to_local_map:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			req_pages = int(seq.get_gpu_pages_for_two_page_buffer())
+			if req_pages <= 1:
+				continue
+			mine.append((uuid, seq, req_pages))
+		if len(mine) < 2:
+			return {}
+		host_tables = worker_view.build_page_table(
+			[int(seq.global_idx) for _, seq, _ in mine]
+		)
+		tables: Dict[int, List[int]] = {}
+		for (_uuid, seq, req_pages), host_pages in zip(mine, host_tables):
+			# Credit only pages that exist, and never the row's whole
+			# reservation: one page stays private so no row is charged zero.
+			# A Host table shorter than the reservation is named loudly by
+			# _host_identity_page_keys at allocation time; admission must not
+			# credit pages it cannot see.
+			usable = min(req_pages - 1, len(host_pages))
+			if usable <= 0:
+				continue
+			tables[int(seq.global_idx)] = [
+				int(page) for page in host_pages[:usable]
+			]
+		runs = plan_shared_runs(tables)
+		local: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for uuid, seq, _req_pages in mine:
+			run = runs.get(int(seq.global_idx))
+			if run is None:
+				continue
+			local[uuid] = ((int(run[0]), int(run[1])),)
+		return local
+
+	def _gather_decode_shared_prefix_segments(
+		self, all_candidates: List[str]
+	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
+		"""Collect every rank's shared runs so selection stays rank-identical.
+
+		``select_decode_batch`` is pure and runs on every rank; a rank that
+		credited a run its peers did not would admit a different batch and the
+		next collective would deadlock. Only an owner can read its rows' Host
+		page tables, so the ground truth is gathered rather than re-derived.
+		``all_candidates`` is already rank-uniform (it comes from replicated
+		sequence status), so every rank reaches this gather together.
+		"""
+		if not self._decode_shared_prefix_credit_enabled():
+			return {}
+		local = self._local_decode_shared_prefix_runs(all_candidates)
+		if self.world_size == 1:
+			return local
+		if not dist.is_initialized():
+			raise RuntimeError(
+				"distributed process group is required to gather decode "
+				"shared-prefix runs"
+			)
+		gathered: List[Optional[Dict[str, Tuple[Tuple[int, int], ...]]]] = (
+			[None] * self.world_size
+		)
+		dist.all_gather_object(gathered, local)
+		merged: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+		for part in gathered:
+			if part:
+				merged.update(part)
+		return merged
+
 	def _make_decode_batch_request(
 		self, all_candidates: List[str], capacity: DecodeCapacitySnapshot,
+		shared_segments: Optional[Dict[str, Tuple[Tuple[int, int], ...]]] = None,
 	) -> DecodeBatchRequest:
 		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
+		shared_segments = shared_segments or {}
 		attn_tp_size = self._decode_attn_tp_size()
 		num_capacity_groups = self.world_size // attn_tp_size
 		existing_pages = [0] * num_capacity_groups
@@ -8584,6 +9035,7 @@ class BatchGenWorker:
 				global_idx=seq.global_idx,
 				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
 				decode_dp_group=seq.decode_dp_group,
+				shared_prefix_segments=shared_segments.get(uuid, ()),
 			))
 		return DecodeBatchRequest(
 			candidates=tuple(candidates),
@@ -11566,17 +12018,34 @@ class BatchGenWorker:
 		# identical across decode rounds of the same server).
 		if self._gpu_kv_cached_pool_gb is not None:
 			self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
-					"(measure-once-cache)"
-				)
 			# The previous pool's segments already returned to CUDA at destroy
 			# (dedicated MemPool, whole-segment free). This flushes the
 			# GENERAL cache's all-free segments (prefill transients) too, so
-			# the full-size cudaMalloc below sees the maximum free memory.
+			# the full-size cudaMalloc below sees the maximum free memory. The
+			# collection first drops tensors still held only by cycles, so
+			# empty_cache can return their segments: with the pool margin now
+			# an explicit 2 GB rather than (1 - frac) of the device, retained
+			# segments are the difference between fitting and fail-loud.
 			torch.cuda.synchronize(self.torch_device)
+			gc.collect()
 			torch.cuda.empty_cache()
+			# The cached size is the device total minus the measured steady
+			# residency minus the explicit headroom, so what is free here must
+			# be the pool plus that headroom. Anything less is residency that
+			# grew after the measurement: name it instead of letting the pool's
+			# torch.zeros raise a bare CUDA OOM, and never re-measure (a fresh
+			# measurement is exactly the round-dependent squeeze this path
+			# removes).
+			free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
+			KVCacheManager.check_cached_pool_fits(
+				self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
+			)
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
+					f"(measure-once-cache; {free_mem_gb:.2f} GB free, headroom "
+					f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB)"
+				)
 			self._initialize_gpu_kv_manager_fixed_size()
 			if self.rank == 0:
 				stats = self.gpu_paged_kv_cache_manager.get_stats()
@@ -11587,8 +12056,13 @@ class BatchGenWorker:
 			return
 
 		# First time: PROVISIONAL size from the post-weights measurement. The
-		# final size is fixed by _finalize_gpu_kv_pool_after_capture once the
-		# graph warmup has materialized every persistent allocation.
+		# graph pools, their static buffers and the collective/JIT first-touch
+		# caches are not allocated yet, so (1 - gpu_memory_frac) of the device
+		# is the only thing covering them here — that is the one place the
+		# fraction is load-bearing. The final size is fixed by
+		# _finalize_gpu_kv_pool_after_capture once the graph warmup has
+		# materialized every persistent allocation, and from there the explicit
+		# GPU_KV_POOL_HEADROOM_GB replaces the fraction's slack.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -17468,13 +17942,38 @@ class BatchGenWorker:
 		aux_page_table,
 		aux_page_size: int,
 		*,
-		model_max_position_embeddings: int | None = None,
+		deployment_context_tokens: int,
+		span_cap_tokens: int | None = None,
 	) -> int:
+		"""Token span the whole-model decode graph is captured for.
+
+		`deployment_context_tokens` is the bound from
+		`_deployment_context_bound_tokens` and is REQUIRED: it is the only term
+		here that does not move with the batch, and dropping it (which an
+		optional argument defaulting to None used to allow whenever the model
+		config carried no `max_position_embeddings`) leaves the span at
+		whatever the page tables happened to be sized for when the FIRST
+		decode batch created them.
+
+		The page-table terms stay in the `min` as hardware limits — a span
+		wider than a table's columns is unaddressable — and `span_cap_tokens`
+		applies the context-proportional statics budget.
+		"""
+		if int(deployment_context_tokens) <= 0:
+			raise RuntimeError(
+				"the DSA CUDA graph span requires a positive deployment context "
+				f"bound, got {deployment_context_tokens}; model_context_length is "
+				"set during core initialization and must be available before capture"
+			)
 		primary_capacity = int(primary_page_table.shape[1]) * int(primary_page_size)
 		aux_capacity = int(aux_page_table.shape[1]) * int(aux_page_size)
-		capacities = [primary_capacity, aux_capacity]
-		if model_max_position_embeddings is not None and int(model_max_position_embeddings) > 0:
-			capacities.append(int(model_max_position_embeddings))
+		capacities = [
+			primary_capacity,
+			aux_capacity,
+			int(deployment_context_tokens),
+		]
+		if span_cap_tokens is not None and int(span_cap_tokens) > 0:
+			capacities.append(int(span_cap_tokens))
 		capacity = min(capacities)
 		if capacity <= 0:
 			raise RuntimeError(
@@ -17770,6 +18269,31 @@ class BatchGenWorker:
 		if empty_cuda_cache and torch.cuda.is_available():
 			torch.cuda.empty_cache()
 
+	# Path states that mean "this step cannot replay the graph" but are still
+	# served correctly by eager decode, so a required graph must NOT make them
+	# fatal. A step longer than the captured span is the only such state: the
+	# eager decode path is length-agnostic. Every other reason means the
+	# capture itself is missing or stale, which stays fail-loud.
+	_WHOLE_GRAPH_EAGER_SERVABLE_REASONS = frozenset({"max_seqlen_exceeds_capture"})
+
+	def _warn_decode_graph_span_exceeded(self, step_max_seqlen: int, span: int) -> None:
+		"""Rate-limited WARN naming this step's max_seqlen and the captured span."""
+		now = time.monotonic()
+		last = getattr(self, "_decode_graph_span_warn_monotonic", None)
+		if last is not None and now - last < _GRAPH_SPAN_WARN_INTERVAL_S:
+			return
+		self._decode_graph_span_warn_monotonic = now
+		logging.warning(
+			"Rank %s: the whole-model decode graph covers %d context tokens but "
+			"this step's max_seqlen is %d; running the step in eager decode. The "
+			"span is the deployment context bound trimmed by the graph's "
+			"context-proportional statics budget (%d bytes).",
+			self.rank,
+			int(span),
+			int(step_max_seqlen),
+			GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
+		)
+
 	def _glm5_whole_graph_path_state(self, max_rank_bsz: int):
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if (
@@ -17981,12 +18505,25 @@ class BatchGenWorker:
 		(re)creation reuses it, making the pool identical across decode rounds
 		(invariant 1) and retiring the fresh-server round-1 protocol.
 
-		The current (first) round keeps the provisional pool — its sequences
-		already hold pages and captured graphs bake its addresses, and the
-		provisional size is never smaller than the final one (steady residency
-		only grows through capture). The cached size applies from the NEXT pool
-		creation (the per-round destroy/recreate that already exists), from
-		which point the page count is identical for every round.
+		The size is the device total minus that steady residency minus the
+		explicit ``GPU_KV_POOL_HEADROOM_GB``. ``gpu_memory_frac`` is NOT
+		applied again here: its slack is what covers the graph footprint the
+		PRE-capture measurement cannot see, and once that footprint is inside
+		the measurement, re-applying the fraction charges it twice and parks
+		``(1 - frac) * total`` permanently free with no named consumer. The
+		headroom constant is that consumer, measured and auditable.
+
+		The current (first) round keeps the provisional pool: its sequences
+		already hold pages, the captured graphs bake its addresses, and this
+		codebase deliberately refuses to recapture after a configured capture
+		(``_setup_cuda_graphs`` falls back to eager instead, and the reuse
+		lifecycle raises), so the live pool cannot be resized under them. With
+		the headroom sizing the provisional is the SMALLER pool (it still
+		carries the unmeasured-graph slack), so round 1 is a conservative
+		startup artifact, never an over-commitment. The cached size applies
+		from the NEXT pool creation (the per-round destroy/recreate that
+		already exists), from which point the page count is identical for
+		every round.
 		"""
 		if not self._gpu_kv_sizing_provisional:
 			return
@@ -17997,12 +18534,13 @@ class BatchGenWorker:
 		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
+		provisional_gb = self.gpu_kv_cache_size_gb
+		steady_used_gb = used_mem_gb - provisional_gb
 
 		final_gb = KVCacheManager.compute_final_pool_gb(
 			total_mem_gb,
-			self.gpu_memory_frac,
 			used_mem_gb,
-			self.gpu_kv_cache_size_gb,
+			provisional_gb,
 		)
 
 		# Broadcast rank 0's decision so every rank resizes identically.
@@ -18014,17 +18552,19 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		stats = manager.get_stats()
 		bytes_per_page = (
-			self.gpu_kv_cache_size_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
+			provisional_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
 		)
-		final_pages = int(final_gb * (1024 ** 3) / bytes_per_page)
+		final_pages = KVCacheManager.pool_pages_for_gb(final_gb, bytes_per_page)
 		bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [1])
 		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
 		if final_gb <= 0 or final_pages < floor_pages:
 			raise RuntimeError(
 				f"[GPU-KV] Final pool below floor: {final_gb:.2f} GB "
 				f"(~{final_pages} pages) < {floor_pages} pages required for the "
-				f"largest decode bucket. Steady residency leaves no room under "
-				f"gpu_memory_frac={self.gpu_memory_frac}; fix the configuration."
+				f"largest decode bucket. Steady residency {steady_used_gb:.2f} GB "
+				f"of {total_mem_gb:.2f} GB leaves nothing above the "
+				f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB pool headroom; fix the "
+				"configuration."
 			)
 
 		# Cache only: the live round keeps the provisional pool (its sequences
@@ -18034,10 +18574,19 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(
 				f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
-				f"(~{final_pages} pages; steady used "
-				f"{used_mem_gb - self.gpu_kv_cache_size_gb:.2f} GB; provisional "
-				f"{self.gpu_kv_cache_size_gb:.2f} GB stays for this round; cached "
-				"for every later pool creation)"
+				f"(~{final_pages} pages; steady used {steady_used_gb:.2f} GB of "
+				f"{total_mem_gb:.2f} GB; headroom {GPU_KV_POOL_HEADROOM_GB:.2f} GB; "
+				f"provisional {provisional_gb:.2f} GB stays for this round, delta "
+				f"{final_gb - provisional_gb:+.2f} GB; cached for every later pool "
+				"creation)"
+			)
+			logging.info(
+				"[GPU-KV] Pool margin is now the explicit %.2f GB headroom; "
+				"gpu_memory_frac=%.3f bounds only the pre-capture provisional "
+				"measurement (the frac-based final size would have been %.2f GB)",
+				GPU_KV_POOL_HEADROOM_GB,
+				self.gpu_memory_frac,
+				total_mem_gb * self.gpu_memory_frac - steady_used_gb,
 			)
 
 	def _setup_cuda_graphs(self, gpu_manager):
@@ -18184,18 +18733,31 @@ class BatchGenWorker:
 				)
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
+			# The span comes from the DEPLOYMENT bound, never from the batch in
+			# front of us: the first decode batch used to fix it for the life
+			# of the process, so a later, longer turn had no replayable graph.
+			# A 1-byte aux element type is the page-split FP8 layout, which
+			# decides which scorer owns the context-proportional statics.
+			aux_is_page_split = int(aux_manager.config.kv_dtype.itemsize) == 1
 			capacity_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
 				primary_page_table,
 				primary_page_size,
 				aux_page_table,
 				aux_page_size,
-				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
+				deployment_context_tokens=self._deployment_context_bound_tokens(),
+				span_cap_tokens=graph_context_span_cap_tokens(
+					bucket_sizes=bucketing.bucket_sizes,
+					aux_is_page_split=aux_is_page_split,
+				),
 			)
 			graph_max_seqlen = int(capacity_seqlen)
-			if int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) > graph_max_seqlen:
-				raise RuntimeError(
-					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "
-					f"exceeds model/KV capacity {graph_max_seqlen}"
+			# A batch already past the span is not a capture error: capturing
+			# at the span still serves every shorter step, and this step takes
+			# the eager path (see the decode-step fallback).
+			current_capture_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+			if current_capture_max_seqlen > graph_max_seqlen:
+				self._warn_decode_graph_span_exceeded(
+					current_capture_max_seqlen, graph_max_seqlen
 				)
 			# all_short lifetime: every admissible row's final length fits in
 			# index_topk, so the DSA segments attend densely to the resident
@@ -18546,6 +19108,21 @@ class BatchGenWorker:
 				except Exception as _exc:
 					logging.warning(
 						"Phase B: failed to attach/record_capture on adapter: %s", _exc,
+					)
+			# The decode graphs are captured and active, so the eager MoE
+			# buffers these layers share (one set for the whole model) are dead
+			# residency competing with the KV pool that
+			# _finalize_gpu_kv_pool_after_capture sizes from the post-capture
+			# steady usage. The eager fallback paths re-create them on demand
+			# at their own entry, so this is a residency switch only.
+			for _mlp in moe_layers[:1]:
+				_eager_moe_freed = _mlp.release_eager_decode_buffers()
+				if _eager_moe_freed and self.rank == 0:
+					logging.info(
+						"Rank %s: released the eager MoE decode buffers "
+						"(%.3f GiB) after graph capture",
+						self.rank,
+						_eager_moe_freed / (1024 ** 3),
 					)
 			stats = manager.get_capture_stats()
 			logging.info(
@@ -19016,6 +19593,8 @@ class BatchGenWorker:
 			_step_counters = StepCounters(logging.getLogger(__name__), _hb_last_time)
 			self._step_counters = _step_counters
 		_step_counters.begin_round(_hb_last_time)
+		# Host-KV health line: same cadence, one per node (see _log_host_kv_health)
+		_hkv_last_time = time.perf_counter()
 
 		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
 		# this decode round: a hot reload rebinds methods on the live worker,
@@ -19092,6 +19671,13 @@ class BatchGenWorker:
 					self._warn_sampling_bad_rows(_sampling_residency)
 				_hb_last_time = time.perf_counter()
 				_hb_tokens = 0
+
+			# Host KV is shared per node, so local rank 0 of every node reports
+			# its own regions; the audit walks the region under its locks, which
+			# is why it rides this ~30 s cadence and never runs per step.
+			if self.local_rank == 0 and time.perf_counter() - _hkv_last_time >= 30.0:
+				self._log_host_kv_health()
+				_hkv_last_time = time.perf_counter()
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:
@@ -19626,11 +20212,22 @@ class BatchGenWorker:
 					and not _glm5_whole_graph_over_bucket
 				):
 					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
-					raise RuntimeError(
-						"GLM-5 whole-model CUDA graph was required but no replayable "
-						"whole-model graph is available for this decode step "
-						f"(bucket={_required_bucket}, reason={_required_reason})"
-					)
+					if _required_reason in self._WHOLE_GRAPH_EAGER_SERVABLE_REASONS:
+						# A step longer than the captured span runs eager --
+						# correct, just slower. Every rank evaluates this from
+						# the globally-synced `_max_bs` and its own identical
+						# span, so all ranks take this branch together and the
+						# graph's baked NCCL ops stay matched.
+						self._warn_decode_graph_span_exceeded(
+							int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+							int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
+						)
+					else:
+						raise RuntimeError(
+							"GLM-5 whole-model CUDA graph was required but no replayable "
+							"whole-model graph is available for this decode step "
+							f"(bucket={_required_bucket}, reason={_required_reason})"
+						)
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
 					and self._cuda_graph_manager is not None

@@ -92,6 +92,35 @@ def _plan_kwargs(batch: int = 4, max_seqlen: int = 4096, **overrides):
     return kwargs
 
 
+def _assert_staged_to_live_extent(
+    block_table: torch.Tensor,
+    reference_block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    page_size: int,
+    max_pages: int,
+    poison: int = 12345,
+) -> None:
+    """Each row equals the reference up to its live extent and is UNTOUCHED past it.
+
+    The preparation pass stages ``paged_mqa_live_block_columns`` entries per
+    row, not the table's reserved width, so the two halves are asserted
+    separately: a regression that restores the full-width write shows up as a
+    missing poison value in the tail.
+    """
+
+    extents = _pm.paged_mqa_live_block_columns(
+        context_lens, page_size, max_pages
+    ).tolist()
+    for row, extent in enumerate(extents):
+        assert torch.equal(
+            block_table[row, :extent], reference_block_table[row, :extent]
+        ), f"row {row} differs inside its live extent {extent}"
+        tail = block_table[row, extent:]
+        assert torch.equal(
+            tail, torch.full_like(tail, poison)
+        ), f"row {row} wrote past its live extent {extent}"
+
+
 # --------------------------------------------------------------------------- #
 # The row-stride trap
 # --------------------------------------------------------------------------- #
@@ -669,7 +698,11 @@ def test_triton_prepare_matches_the_reference(num_valid):
         else torch.tensor([num_valid], dtype=torch.int32, device=device)
     )
 
-    # Poisoned outputs: every element must be WRITTEN, never left behind.
+    # Poisoned outputs: every element a reader can REACH must be written. The
+    # pass stages each row only to its live extent, so the poison must survive
+    # past it -- that untouched tail is what makes the launch cost the step's
+    # context instead of the table's reserved width.
+    page_size = 64
     block_table = torch.full((batch, max_pages), 12345, dtype=torch.int32, device=device)
     context_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
     dg_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
@@ -681,13 +714,16 @@ def test_triton_prepare_matches_the_reference(num_valid):
         context_lens,
         num_valid_tokens=nvt,
         deep_gemm_context_lens_out=dg_lens,
+        page_size=page_size,
     )
     ref_bt, ref_ctx = _pm.prepare_paged_mqa_inputs_reference(
         page_table, slots, seqlens, nvt
     )
-    assert torch.equal(block_table, ref_bt)
     assert torch.equal(context_lens, ref_ctx)
     assert torch.equal(dg_lens, _pm.guard_deep_gemm_context_lens(ref_ctx))
+    _assert_staged_to_live_extent(
+        block_table, ref_bt, ref_ctx, page_size, max_pages
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for Triton")
@@ -726,6 +762,7 @@ def test_triton_prepare_guards_the_deep_gemm_lens(batch, case):
         page_table, slots, seqlens, nvt
     )
 
+    page_size = 64
     block_table = torch.full((batch, 4), 12345, dtype=torch.int32, device=device)
     context_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
     dg_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
@@ -737,8 +774,104 @@ def test_triton_prepare_guards_the_deep_gemm_lens(batch, case):
         context_lens,
         num_valid_tokens=None if nvt is None else nvt.to(device),
         deep_gemm_context_lens_out=dg_lens,
+        page_size=page_size,
     )
-    assert torch.equal(block_table.cpu(), ref_bt)
     assert torch.equal(context_lens.cpu(), ref_ctx)
     assert torch.equal(dg_lens.cpu(), _pm.guard_deep_gemm_context_lens(ref_ctx))
     assert int(dg_lens.sum()) > 0
+    # The all-zero case is the one the guard exists for: row 0 must still get
+    # its DEFINED page-0 column even though its true length is 0, and that is
+    # exactly one column, not the whole row.
+    _assert_staged_to_live_extent(
+        block_table.cpu(), ref_bt, ref_ctx, page_size, 4
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The live block-table extent: what makes the step prologue O(context)
+# --------------------------------------------------------------------------- #
+
+def test_live_block_columns_is_the_rows_pages_not_the_reserved_width():
+    """At the production geometry the extent is ~1% of the table's width.
+
+    The table is sized for the DEPLOYMENT context bound (1,048,576 tokens ->
+    16,384 columns at 64-token pages). A row at an 8K context reaches 128 of
+    them, so staging the width instead of the extent is 128x the traffic in a
+    launch that runs once per decode step.
+    """
+    width = 16_384
+    lens = torch.tensor([[8192], [8192 + 1], [5600], [1_048_576]], dtype=torch.int32)
+    extents = _pm.paged_mqa_live_block_columns(lens, 64, width)
+    # 8192 -> 128 pages exactly; 8193 -> 129 pages rounded up to the 4-page
+    # DeepGEMM split -> 132; 5600 -> 88 -> 88 (already aligned).
+    assert extents.tolist() == [128, 132, 88, width]
+    assert extents.dtype == torch.int32
+    # The whole point, stated as the ratio the regression restored.
+    assert int(extents[0]) * 100 < width
+
+
+def test_live_block_columns_keeps_row_zeros_guarded_column():
+    """Row 0's guard forces DeepGEMM to read one token even at true length 0,
+    so row 0 always gets exactly one live column while the other all-zero rows
+    get none."""
+    lens = torch.zeros((4, 1), dtype=torch.int32)
+    # Row 0's single live page is rounded up to one whole 4-page split.
+    assert _pm.paged_mqa_live_block_columns(lens, 64, 16_384).tolist() == [4, 0, 0, 0]
+
+
+def test_live_block_columns_never_exceeds_the_table():
+    """A context past the table's columns is unaddressable, so the extent
+    clamps instead of running off the row."""
+    lens = torch.tensor([[10_000_000]], dtype=torch.int32)
+    assert _pm.paged_mqa_live_block_columns(lens, 64, 4).tolist() == [4]
+
+
+def test_live_block_columns_rejects_a_bad_shape_or_page_size():
+    with pytest.raises(TypeError, match="2-D int32"):
+        _pm.paged_mqa_live_block_columns(
+            torch.zeros(4, dtype=torch.int32), 64, 16
+        )
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        _pm.paged_mqa_live_block_columns(
+            torch.zeros((1, 1), dtype=torch.int32), 0, 16
+        )
+    with pytest.raises(ValueError, match="max_pages must be positive"):
+        _pm.paged_mqa_live_block_columns(
+            torch.zeros((1, 1), dtype=torch.int32), 64, 0
+        )
+
+
+def test_live_block_columns_covers_every_page_the_topk_can_read():
+    """The extent must cover the TRUE lengths too: the top-k reads a row's
+    first ``context_len`` columns, and ``true <= guarded`` elementwise."""
+    page_size = 64
+    width = 64
+    for length in (1, 63, 64, 65, 127, 128, 4095, 4096):
+        lens = torch.tensor([[7], [length]], dtype=torch.int32)
+        extent = int(_pm.paged_mqa_live_block_columns(lens, page_size, width)[1])
+        last_page_read = min(length - 1, width * page_size - 1) // page_size
+        assert extent > last_page_read, (length, extent, last_page_read)
+
+
+def test_stage_align_pages_is_a_whole_deep_gemm_kv_split():
+    """The staged extent's rounding granularity is DeepGEMM's KV split, which
+    is why a 64-token page rounds in groups of 4."""
+    assert _pm.PAGED_MQA_LOGITS_ALIGN == 256
+    assert _pm.paged_mqa_stage_align_pages(64) == 4
+    assert _pm.paged_mqa_stage_align_pages(256) == 1
+    # A page wider than one split still stages whole pages.
+    assert _pm.paged_mqa_stage_align_pages(512) == 1
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        _pm.paged_mqa_stage_align_pages(0)
+
+
+def test_live_block_columns_is_a_whole_split_wide_for_every_length():
+    """Whatever the context, the staged extent covers every column a CTA
+    owning the row's last partial KV split can address."""
+    page_size, width = 64, 16_384
+    align = _pm.paged_mqa_stage_align_pages(page_size)
+    for length in (1, 64, 65, 255, 256, 257, 5600, 8192, 8193):
+        lens = torch.tensor([[length]], dtype=torch.int32)
+        extent = int(_pm.paged_mqa_live_block_columns(lens, page_size, width)[0])
+        assert extent % align == 0, (length, extent)
+        assert extent * page_size >= length, (length, extent)
