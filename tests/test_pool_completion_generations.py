@@ -171,6 +171,11 @@ def _scheduler(tmp_path: Path):
     scheduler._pump_stop = None
     scheduler._completion_listener_task = None
     scheduler._pool_initialized = False
+    # Session-control gate (off here: no session KV hold).
+    scheduler._session_kv_hold = False
+    scheduler._control_lock = threading.Lock()
+    scheduler._control_queue = None
+    scheduler._session_hold_info = None
     scheduler.worker = _WorkerStub()
     scheduler.storage = _StorageStub()
     scheduler._scheduling_pool = _SchedulingPoolStub()

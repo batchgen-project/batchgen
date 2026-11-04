@@ -105,6 +105,25 @@ def require_prefix_cache_model_support(model_name: str) -> str:
     return model_type
 
 
+def require_session_hold_model_support(model_name: str) -> str:
+    """Return the model type, or refuse a model session KV hold cannot serve.
+
+    A resumed turn prefills only its suffix over held Host pages through the
+    full-K/V prefix materialization path, which exists for GPT-OSS only.
+    """
+
+    try:
+        model_type = require_prefix_cache_model_support(model_name)
+    except ValueError:
+        model_type = None
+    if model_type not in _FULL_KV_MODEL_TYPES:
+        raise ValueError(
+            f"model {model_name!r} has no suffix prefill over held pages "
+            "(session KV hold supports GPT-OSS only)"
+        )
+    return model_type
+
+
 def prefix_reuse_requires_prefill_pool(model_type: str) -> bool:
     """True when only the in-wave prefix pool can serve this model's reuse."""
 

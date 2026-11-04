@@ -307,3 +307,26 @@ def test_a_wrapped_active_sequence_counter_is_healed(regions):
     manager.release_all_sequences()
     assert region.active == 0
     assert manager.get_stats().num_free_pages == NUM_PAGES
+
+
+@native
+def test_release_all_with_resident_pages_frees_held_session_pages(regions):
+    """Session KV holds keep resident pages whose ids die with the cohort;
+    the hold-aware reconcile primitive frees them all (fresh allocator)."""
+    expected = _fresh_state(regions)
+    manager, region = regions()
+    taken = region.stack()[-3:]
+    region.top = region.top - 3
+    for page in taken:
+        region.set_owner(page, RESIDENT)
+        region.set_link(page, -1)
+    manager.allocate_pages(1, 2 * PAGE_TOKENS)
+
+    manager.release_all_sequences()
+    assert manager.get_stats().num_free_pages == NUM_PAGES - 3
+
+    assert manager.release_all_sequences_and_resident_pages() == 3
+    assert region.allocator_state() == expected
+    assert manager.get_stats().num_free_pages == NUM_PAGES
+    # Nothing resident left: a second sweep frees nothing.
+    assert manager.release_all_sequences_and_resident_pages() == 0

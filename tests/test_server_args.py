@@ -257,3 +257,21 @@ def test_log_options_resolved_absolute_with_info_default(tmp_path, monkeypatch):
     )
     assert explicit.log_dir == os.path.join(cwd, "logs", "run")
     assert explicit.log_level == "WARNING"
+
+
+def test_session_hold_idle_ttl_defaults_and_is_validated(tmp_path):
+    resolve = server_args_module.resolve_session_hold_idle_ttl_s
+    validate_hold = server_args_module.validate_session_kv_hold_args
+    gpt_oss = dict(model="openai/gpt-oss-120b", nnodes=1,
+                   enable_prefix_cache=False)
+    # Unset: the documented default (1.5x the 600 s fetch timeout).
+    assert resolve(ServerArgs(**gpt_oss)) == 900.0
+    assert resolve(ServerArgs(**gpt_oss, session_hold_idle_ttl_s=0.0)) == 0.0
+    validate_hold(ServerArgs(**gpt_oss, session_hold_idle_ttl_s=30.0))
+    with pytest.raises(ValueError, match="must be >= 0"):
+        validate_hold(ServerArgs(**gpt_oss, session_hold_idle_ttl_s=-1.0))
+    # Without the hold the TTL means nothing: refused, not ignored.
+    args = _args(tmp_path, distributed_weight_config=None, nnodes=1,
+                 world_size=8, session_hold_idle_ttl_s=60.0)
+    with pytest.raises(ValueError, match="needs --enable-session-kv-hold"):
+        validate_server_args(args)
