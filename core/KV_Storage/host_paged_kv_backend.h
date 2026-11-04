@@ -43,6 +43,27 @@ inline std::string ToString(HostKVPageFormat format) {
     return "unknown";
 }
 
+// A whole-region walk, produced only by CollectAuditedStats(). It is
+// O(sequence_table_capacity + num_pages) under both region mutexes, so it is
+// for a periodic health line, never for a per-step path.
+struct HostPagedKVSequenceAudit {
+    // Sequence-table occupancy; the three always sum to the capacity.
+    std::size_t live_entries = 0;
+    std::size_t tombstone_entries = 0;
+    std::size_t empty_entries = 0;
+    // Pages held by live sequence entries (sum of their page counts), and
+    // pages parked as prefix-resident, which belong to no sequence entry.
+    std::size_t live_sequence_pages = 0;
+    std::size_t prefix_resident_pages = 0;
+    // used_pages - (live_sequence_pages + prefix_resident_pages). Exactly 0
+    // when the region is quiescent; a page leak (popped off the free stack and
+    // reachable from nothing) makes it positive. Another process's acquire or
+    // release that is between its two critical sections when the walk runs
+    // shows up as a transient positive bounded by that request's pages, so
+    // only a value that persists or grows across walks indicates a leak.
+    std::int64_t page_identity_delta = 0;
+};
+
 struct HostPagedKVStats {
     std::size_t num_total_pages = 0;
     std::size_t num_free_pages = 0;
@@ -50,6 +71,16 @@ struct HostPagedKVStats {
     std::size_t num_active_sequences = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t total_bytes = 0;
+    // Lifetime counters of the shared region, kept in its header so every
+    // attached process reads the same values. Inserted counts committed new
+    // sequence entries, released counts ReleaseSequence calls, and
+    // acquire_failures counts acquires the region refused once the request
+    // was valid (out of free pages, or the sequence table full).
+    std::uint64_t sequences_inserted = 0;
+    std::uint64_t sequences_released = 0;
+    std::uint64_t acquire_failures = 0;
+    // Present only in CollectAuditedStats() results.
+    std::optional<HostPagedKVSequenceAudit> audit;
 };
 
 struct HostPagedKVConfig {
@@ -255,7 +286,20 @@ inline std::string ToString(const HostPagedKVStats& stats) {
         << ", used_pages=" << stats.num_used_pages
         << ", active_sequences=" << stats.num_active_sequences
         << ", sequence_table_capacity=" << stats.sequence_table_capacity
-        << ", total_bytes=" << stats.total_bytes << ")";
+        << ", total_bytes=" << stats.total_bytes
+        << ", sequences_inserted=" << stats.sequences_inserted
+        << ", sequences_released=" << stats.sequences_released
+        << ", acquire_failures=" << stats.acquire_failures;
+    if (stats.audit.has_value()) {
+        const HostPagedKVSequenceAudit& audit = *stats.audit;
+        oss << ", live_entries=" << audit.live_entries
+            << ", tombstone_entries=" << audit.tombstone_entries
+            << ", empty_entries=" << audit.empty_entries
+            << ", live_sequence_pages=" << audit.live_sequence_pages
+            << ", prefix_resident_pages=" << audit.prefix_resident_pages
+            << ", page_identity_delta=" << audit.page_identity_delta;
+    }
+    oss << ")";
     return oss.str();
 }
 
@@ -326,7 +370,15 @@ class HostPagedKVBackend {
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
 
+    // O(1): header counters only, no lock. Safe on any path.
     HostPagedKVStats CollectStats() const;
+
+    // CollectStats() plus a full sequence-table and page-owner walk taken
+    // under allocation_mutex then sequence_mutex (the file's lock order), so
+    // the counts and the walk are one consistent snapshot. It blocks every
+    // acquire and release on the region for the duration of the walk: call it
+    // from a periodic health line, never per step.
+    HostPagedKVStats CollectAuditedStats() const;
 
     std::byte* DataBase();
     const std::byte* DataBase() const;

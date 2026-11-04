@@ -98,6 +98,9 @@ class SWAHostPagedKVWorkerView {
     const HostPagedKVConfig& config() const { return base_view_.config(); }
     const auto& layout() const { return base_view_.layout(); }
     HostPagedKVStats GetStats() const { return base_view_.GetStats(); }
+    HostPagedKVStats GetAuditedStats() const {
+        return base_view_.GetAuditedStats();
+    }
     int device_index() const { return base_view_.device_index(); }
     std::size_t page_size_tokens() const { return page_size_tokens_; }
     std::size_t window_size_tokens() const { return window_size_tokens_; }

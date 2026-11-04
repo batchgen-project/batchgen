@@ -104,6 +104,10 @@ void BindHostPagedManager(py::module& m, const char* name) {
         .def("build_page_table", &Manager::BuildPageTable,
              py::arg("sequence_ids"))
         .def("get_stats", &Manager::GetStats)
+        .def("get_audited_stats", &Manager::GetAuditedStats,
+             "get_stats() plus a whole-region walk (sequence-table occupancy "
+             "and the used-page identity) under both region locks. "
+             "O(table + pages): for a periodic health line, never per step.")
         .def("memfd_fd", &Manager::memfd_fd)
        .def("__repr__",
            [](const Manager& self) { return self.DebugString(); })
@@ -220,6 +224,10 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             "layer id before address calculation. Raises when this worker "
             "view has no V cache.")
         .def("get_stats", &WorkerView::GetStats)
+        .def("get_audited_stats", &WorkerView::GetAuditedStats,
+             "get_stats() plus a whole-region walk (sequence-table occupancy "
+             "and the used-page identity) under both region locks. "
+             "O(table + pages): for a periodic health line, never per step.")
        .def("build_page_table",
            [](WorkerView& self,
              const std::vector<std::int64_t>& sequence_ids) {
@@ -821,6 +829,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "shared-memory region is only reusable by a config with the same "
         "hash, so the page format is part of it.");
 
+    py::class_<kv::HostPagedKVSequenceAudit>(m, "HostPagedKVSequenceAudit")
+        .def(py::init<>())
+        .def_readwrite("live_entries",
+                       &kv::HostPagedKVSequenceAudit::live_entries)
+        .def_readwrite("tombstone_entries",
+                       &kv::HostPagedKVSequenceAudit::tombstone_entries)
+        .def_readwrite("empty_entries",
+                       &kv::HostPagedKVSequenceAudit::empty_entries)
+        .def_readwrite("live_sequence_pages",
+                       &kv::HostPagedKVSequenceAudit::live_sequence_pages)
+        .def_readwrite("prefix_resident_pages",
+                       &kv::HostPagedKVSequenceAudit::prefix_resident_pages)
+        .def_readwrite("page_identity_delta",
+                       &kv::HostPagedKVSequenceAudit::page_identity_delta);
+
     py::class_<kv::HostPagedKVStats>(m, "HostPagedKVStats")
         .def(py::init<>())
         .def_readwrite("num_total_pages", &kv::HostPagedKVStats::num_total_pages)
@@ -831,6 +854,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("sequence_table_capacity",
                        &kv::HostPagedKVStats::sequence_table_capacity)
         .def_readwrite("total_bytes", &kv::HostPagedKVStats::total_bytes)
+        .def_readwrite("sequences_inserted",
+                       &kv::HostPagedKVStats::sequences_inserted)
+        .def_readwrite("sequences_released",
+                       &kv::HostPagedKVStats::sequences_released)
+        .def_readwrite("acquire_failures",
+                       &kv::HostPagedKVStats::acquire_failures)
+        // None unless the stats came from get_audited_stats().
+        .def_readwrite("audit", &kv::HostPagedKVStats::audit)
         .def("__repr__",
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);

@@ -687,6 +687,10 @@ class HostPagedKVWorkerView : private LayerMapper {
     const HostPagedKVConfig& config() const { return config_; }
     const Layout& layout() const { return layout_; }
     HostPagedKVStats GetStats() const { return backend_.CollectStats(); }
+    // O(table) walk under both region locks; see CollectAuditedStats.
+    HostPagedKVStats GetAuditedStats() const {
+        return backend_.CollectAuditedStats();
+    }
     int device_index() const { return device_index_; }
 
     std::string DebugString() const {
