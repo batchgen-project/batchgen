@@ -69,6 +69,7 @@ import time
 import torch
 from torch.distributed import ReduceOp
 
+from batchgen.moe import expert_counts_capture
 from batchgen.moe.dispatch_scatter_3d import (
     dispatch_scatter_3d,
     reduce_weighted_scatter_fp32,
@@ -442,8 +443,14 @@ class ResidentEPMXFP4MoELayer:
     _prefill_y = None
 
     def __init__(self, layer_idx, shard, down_proj, norm, up_proj,
-                 comm=None, world_size=1, rank=0, expert_start=0):
+                 comm=None, world_size=1, rank=0, expert_start=0,
+                 counts_slot=None):
         self.layer_idx = layer_idx
+        # Row of this layer in the rank's expert-counts capture matrix (the
+        # MoE-layer ordinal, which skips dense layers, so it is NOT layer_idx).
+        # None when the layer was built outside the server build path, which
+        # also registers the geometry; the capture then simply skips it.
+        self.counts_slot = counts_slot
         self.shard = shard
         self.down_proj = down_proj
         self.norm = norm                 # may be None (latent_moe_use_norm False)
@@ -580,6 +587,7 @@ class ResidentEPMXFP4MoELayer:
         dispatch_capacity=None,
         packed_capacity=None,
         packed_max_rows=None,
+        counts_capture=None,
     ):
         """Dispatch ``num_rows`` latent rows into this rank's local expert shard
         and run grouped marlin S1(gate+up+SiTU) -> S3(down); returns
@@ -707,6 +715,15 @@ class ResidentEPMXFP4MoELayer:
             )
             max_m_tiles = (min(num_rows, mtp) + 15) // 16
 
+        # ``expert_counts`` is final for both dispatch branches here, and is
+        # about to be consumed by the grouped GEMM and dropped.  One in-place
+        # device add into the capture's persistent row keeps it: no host read,
+        # no synchronization, so the add is recordable into a decode CUDA graph
+        # (see batchgen/moe/expert_counts_capture.py).  Passed in by the DECODE
+        # call sites only, so a prefill pass never pollutes the decode matrix.
+        if counts_capture is not None and self.counts_slot is not None:
+            counts_capture.accumulate(self.counts_slot, expert_counts)
+
         if profiler is not None:
             profiler.end_profile_span("grouped_dispatch", span)
             span = profiler.begin_profile_span()
@@ -794,7 +811,8 @@ class ResidentEPMXFP4MoELayer:
 
         # --- local shard (all experts at world=1) -> expert_out, topk_pos ---
         expert_out, topk_pos = self._expert_path(
-            x_latent, topk_idx.to(torch.int32), T)
+            x_latent, topk_idx.to(torch.int32), T,
+            counts_capture=expert_counts_capture.active())
 
         # --- FP32 weighted combine (oracle-identical), then bf16 downcast ---
         y = self._combine_fp32(
@@ -936,7 +954,8 @@ class ResidentEPMXFP4MoELayer:
                 )
         else:
             expert_out, topk_pos = self._expert_path(
-                all_latent, all_idx, num_global
+                all_latent, all_idx, num_global,
+                counts_capture=expert_counts_capture.active(),
             )
             y = self._combine_fp32(
                 expert_out,
@@ -1004,6 +1023,7 @@ def build_resident_ep_mxfp4_layers(model_layers, get_tensor, comm, world_size,
     start_t = time.perf_counter()
     total_bytes = 0
     num_layers = 0
+    built_layer_ids = []
     for layer_idx, layer in enumerate(model_layers):
         moe = getattr(layer, "block_sparse_moe", None)
         if moe is None or moe.experts is None:
@@ -1025,9 +1045,19 @@ def build_resident_ep_mxfp4_layers(model_layers, get_tensor, comm, world_size,
             moe.routed_expert_up_proj,
             comm=comm, world_size=world_size, rank=rank,
             expert_start=expert_start,
+            counts_slot=num_layers,
         )
         total_bytes += shard.nbytes()
+        built_layer_ids.append(layer_idx)
         num_layers += 1
+    # Record the shape the decode tokens-per-expert capture would use.  This
+    # allocates nothing; the accumulator is only built if a batch arms the
+    # capture.  ``counts_slot`` above is the matrix row, i.e. the MoE-layer
+    # ordinal, so the registered id list maps rows back to model layers.
+    if built_layer_ids:
+        expert_counts_capture.register_geometry(
+            built_layer_ids, num_local, expert_start, device
+        )
     logging.info(
         f"Rank {rank}: resident EP MXFP4 marlin shards materialized — "
         f"{num_layers} MoE layers x {num_local} experts, "

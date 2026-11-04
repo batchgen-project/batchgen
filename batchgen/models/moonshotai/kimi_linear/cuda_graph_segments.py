@@ -672,6 +672,11 @@ class KimiLinearDecodeGraph:
         self._moe_bucket = 0
         self._moe_group_bucket = 0
         self._moe_ntp = 0
+        # Epoch of the decode tokens-per-expert capture that the currently
+        # captured MoE / whole-model graphs were recorded under (0 = not
+        # capturing).  The accumulating add lives INSIDE those graphs, so a
+        # change of this epoch invalidates them; see _sync_expert_counts_epoch.
+        self._expert_counts_epoch = 0
         # K3 whole-model graph state.  The existing per-layer managers remain
         # available as the correctness/fallback path; the outer manager owns a
         # separate graph pool so it can capture direct child forwards rather
@@ -906,6 +911,42 @@ class KimiLinearDecodeGraph:
                 "[KIMI_DECODE_GRAPH] rank=%s eager fallback (x%d): %s",
                 self.rank, n, reason,
             )
+
+    def _sync_expert_counts_epoch(self) -> None:
+        """Drop MoE / whole-model graphs when the expert-counts capture toggles.
+
+        The capture's accumulating add is recorded into the MoE segment's graph
+        (``moe_cuda_graph_segments.K3MoEGraphSegment._capture_expert_counts``),
+        so a graph captured while the batch-level flag was off contains no add
+        and would silently return an empty matrix, and one captured while it was
+        on would keep adding after the flag is cleared. Neither is acceptable:
+        this diagnostic must measure the decode it claims to measure.
+
+        The flag is batch-level and replicated to every rank's decode sequences,
+        and this runs before the step's replays and before
+        ``prewarm_decode_graphs``' capture barrier, so all expert-parallel ranks
+        drop and re-capture at the same batch boundary and the graph-captured
+        collective sequence stays matched.
+
+        The accumulator is allocated once per geometry and never freed, so a
+        re-arm reproduces the previous epoch and costs no second re-capture.
+        """
+        from batchgen.moe import expert_counts_capture
+
+        epoch = expert_counts_capture.graph_epoch()
+        if epoch == self._expert_counts_epoch:
+            return
+        had_graphs = self._moe_built or self._whole_built
+        self._expert_counts_epoch = epoch
+        if not had_graphs:
+            return
+        logger.info(
+            "[KIMI_DECODE_GRAPH] rank=%s dropping MoE/whole-model graphs: "
+            "expert-counts capture epoch changed to %s (re-capture follows)",
+            self.rank, epoch,
+        )
+        self._drop_whole_graphs()
+        self._drop_moe_graphs()
 
     def _moe_all_ranks_nonempty(self) -> bool:
         """Return the boundary-synchronized EP emptiness decision.
@@ -1188,6 +1229,7 @@ class KimiLinearDecodeGraph:
         if AttnWrapperBase.phase != "decode":
             self._fallback("decode graph prewarm requested outside decode")
             return False
+        self._sync_expert_counts_epoch()
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         bsz = len(seq_ids)
         if bsz == 0:
@@ -1283,6 +1325,7 @@ class KimiLinearDecodeGraph:
         mode = _debug_mode() or self.mode
         if mode == "eager":
             return
+        self._sync_expert_counts_epoch()
 
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         bsz = len(seq_ids)

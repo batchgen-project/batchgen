@@ -35,6 +35,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
+from batchgen.moe import expert_counts_capture
 from batchgen.moe.dispatch_scatter_3d import (
     dispatch_scatter_3d,
     reduce_weighted_scatter_fp32,
@@ -644,6 +645,29 @@ class K3MoEGraphSegment:
             bufs.combined,
         )
 
+    def _capture_expert_counts(self, counts: torch.Tensor) -> None:
+        """Accumulate this layer's per-local-expert dispatch counts, if armed.
+
+        Both exchanges produce a per-local-expert row count that the grouped
+        GEMM consumes and discards (``expert_counts`` on the NCCL path,
+        DeepEP's ``recv_count`` on the low-latency path). When the batch armed
+        the decode tokens-per-expert capture, add it into that rank's
+        persistent matrix: one device-side add, no host read and no sync, so it
+        is recorded into this segment's CUDA graph and re-executed on every
+        replay against the same address.
+
+        The armed state is therefore baked into the capture; the adapter's
+        epoch check (``cuda_graph_segments._sync_expert_counts_epoch``) drops
+        and re-captures these graphs when the flag's state changes.
+        """
+        capture = expert_counts_capture.active()
+        if capture is None:
+            return
+        slot = self.resident.counts_slot
+        if slot is None:
+            return
+        capture.accumulate(slot, counts)
+
     def _exchange_deepep(self, bufs, x_latent, topk_idx, topk_weight):
         """Slice 3 (DECODE_CONCURRENCY_PLAN.md): TP all_to_all assembles this
         rank's own rows' full latent from the column slices, DeepEP LL dispatch
@@ -673,6 +697,7 @@ class K3MoEGraphSegment:
         recv_x, recv_count, handle = self.pool.deepep.dispatch(
             bufs.ll_send, bufs.ll_topk_idx
         )
+        self._capture_expert_counts(recv_count)
         e = self.num_local_experts
         k = self.latent_size
         mtp = self.pool.ll_max_tokens_padded
@@ -798,6 +823,7 @@ class K3MoEGraphSegment:
             bufs.expert_counters,
             bufs.topk_pos,
         )
+        self._capture_expert_counts(expert_counts)
 
         # The resident layer's weight pointers and K3 SiTU kernel are reused;
         # only the activation/metadata storage is graph-owned and static.

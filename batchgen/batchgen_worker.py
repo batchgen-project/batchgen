@@ -1614,6 +1614,10 @@ class BatchGenWorker:
 		# _active_batchgen_debug_for_sequences, whose result is None while no
 		# sequence carries any, so a sticky True merely restores the scan.
 		self._any_sequence_batchgen_debug: bool = False
+		# Local mirror of the decode expert-counts capture state. Keeps the
+		# off path to one attribute read, and lets the decode-end flush run
+		# without importing the capture module when nothing was armed.
+		self._expert_counts_capture_armed: bool = False
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -9777,6 +9781,68 @@ class BatchGenWorker:
 				except Exception as exc:  # noqa: BLE001 - diagnostics only
 					logging.warning("[K3_DECODE_PROFILE] trace export failed: %s", exc)
 
+	def _expert_counts_capture_step(self, batchgen_debug) -> None:
+		"""Batch-level ``batchgen_debug.expert_counts_capture = true``.
+
+		Accumulates, for every decode step of this batch, each MoE layer's
+		per-local-expert dispatched-row count into one persistent
+		``[num_moe_layers, num_local_experts]`` int64 matrix per rank, and logs
+		it at the decode boundary (``_expert_counts_capture_flush``).  The
+		accumulation is a device-side add with no host read and no
+		synchronization on the decode path; there is exactly one
+		device-to-host copy, at the flush.
+
+		Called at the decode-config boundary BEFORE CUDA-graph capture (so the
+		add is recorded into the graphs that will replay it) and again once per
+		decode step (to count the steps).  Arming is idempotent, so the
+		per-step call never discards what is already accumulated.
+
+		Also accepts ``expert_counts_capture_dir = "<dir>"``, which writes each
+		rank's full matrix as JSON there instead of inline in the log.
+
+		Off path: one dict lookup and one attribute read; nothing is allocated
+		and no device work is recorded.
+		"""
+		requested = (batchgen_debug or {}).get("expert_counts_capture")
+		if requested is None and not self._expert_counts_capture_armed:
+			return
+		if requested is not None and not isinstance(requested, bool):
+			raise ValueError(
+				"batchgen_debug.expert_counts_capture must be a boolean, got "
+				f"{requested!r}"
+			)
+		from batchgen.moe import expert_counts_capture
+
+		if not requested:
+			# The flag was dropped by a later batch: publish what was captured
+			# and stop, rather than leaving a half-window matrix behind.
+			if self._expert_counts_capture_armed:
+				self._expert_counts_capture_flush("capture_flag_cleared")
+			return
+		expert_counts_capture.arm()
+		self._expert_counts_capture_armed = True
+		expert_counts_capture.mark_step()
+
+	def _expert_counts_capture_flush(self, reason: str) -> None:
+		"""Read back and log the per-rank expert-counts matrix, then disarm."""
+		if not self._expert_counts_capture_armed:
+			return
+		from batchgen.moe import expert_counts_capture
+
+		debug = (
+			self._batchgen_debug
+			or getattr(AttnWrapperBase, "batchgen_debug", None)
+			or {}
+		)
+		artifact_dir = debug.get("expert_counts_capture_dir")
+		if artifact_dir is not None and not isinstance(artifact_dir, str):
+			raise ValueError(
+				"batchgen_debug.expert_counts_capture_dir must be a directory "
+				f"path string, got {artifact_dir!r}"
+			)
+		self._expert_counts_capture_armed = False
+		expert_counts_capture.flush(self.rank, reason, artifact_dir)
+
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
 		"""End one env-gated nsys decode-forward range and optionally exit."""
 		if forward_idx is None:
@@ -10714,6 +10780,13 @@ class BatchGenWorker:
 					global_decode_sequences
 				)
 				self._configure_glm5_dispatch_trace(global_decode_sequences)
+				# Arm BEFORE the graph prewarm below: the per-layer
+				# accumulating add is recorded into the decode graphs, so the
+				# capture must already own its (eagerly zeroed) accumulator
+				# when capture happens.
+				self._expert_counts_capture_step(
+					AttnWrapperBase.batchgen_debug
+				)
 
 				# B. Config Decode
 				config_start = time.perf_counter()
@@ -20032,6 +20105,7 @@ class BatchGenWorker:
 				global_decode_sequences
 			)
 			self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+			self._expert_counts_capture_step(AttnWrapperBase.batchgen_debug)
 			self._configure_glm5_dispatch_trace(global_decode_sequences)
 
 			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
@@ -20995,6 +21069,7 @@ class BatchGenWorker:
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
 		self._flush_glm5_dispatch_trace_summary("decode_end")
+		self._expert_counts_capture_flush("decode_end")
 		AttnWrapperBase.batchgen_debug = None
 		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
 		GLM5AttnWrapper.glm5_dispatch_trace_id = None
