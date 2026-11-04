@@ -181,6 +181,9 @@ PINS = {
             "public_methods": [
                 "allocate_pages",
                 "allocate_pages_for_sequences",
+                # Added with GPU page-key dedup for DSA: both wrapped pools
+                # deduplicate, each on its own Host region's page ids.
+                "allocate_pages_for_sequences_with_page_keys",
                 "assert_mirrored_state",
                 "assert_pool_mapped",
                 "capacity_snapshot",
@@ -188,6 +191,7 @@ PINS = {
                 "config",
                 "copy_kv_to_tensor",
                 "copy_tensor_to_kv",
+                "count_new_shared_pages",
                 "destroy",
                 "device",
                 "export_active_sequence_page_counts",
@@ -199,10 +203,12 @@ PINS = {
                 "get_layer_kv_with_page_table",
                 "get_padded_3d_page_pointers",
                 "get_page_table_version",
+                "get_prefix_gpu_share_stats",
                 "get_sequence_layer_page_pointers",
                 "get_stats",
                 "grow_pages_for_sequences",
                 "grow_sequence_pages",
+                "has_shared_pages",
                 "initialize",
                 "is_initialized",
                 "pool_is_mapped",
@@ -336,6 +342,49 @@ PINS = {
                     "params": ["self", "op_name", "sequence_ids"],
                     "returns": "None",
                 },
+                # GPU page-key dedup for DSA. The keys argument is
+                # DualPoolPageKeys, never a plain row list: the two pools are
+                # separate Host KV regions, so one pool's Host page id says
+                # nothing about the other's.
+                "count_new_shared_pages": {
+                    "params": [
+                        "self",
+                        "sequence_ids",
+                        "num_tokens",
+                        "page_keys_by_sequence",
+                    ],
+                    "returns": "int",
+                },
+                "allocate_pages_for_sequences_with_page_keys": {
+                    "params": [
+                        "self",
+                        "sequence_ids",
+                        "num_tokens",
+                        "page_keys_by_sequence",
+                    ],
+                    "returns": "Dict[int, List[int]]",
+                },
+                "get_prefix_gpu_share_stats": {
+                    "params": ["self"],
+                    "returns": "PrefixGPUShareStats",
+                },
+                "has_shared_pages": {
+                    "params": ["self"],
+                    "returns": "bool",
+                },
+            },
+        },
+        "DualPoolPageKeys": {
+            "kind": "class",
+            "bases": [],
+            "fields": ["primary", "auxiliary"],
+            "members": {},
+            "public_methods": ["from_rows"],
+            "methods": {
+                "from_rows": {
+                    "params": ["cls", "primary", "auxiliary"],
+                    "returns": "'DualPoolPageKeys'",
+                },
             },
         },
     },
@@ -379,6 +428,7 @@ PINS = {
                 "grow_sequence_pages",
                 "initialize",
                 "is_initialized",
+                "is_shared_page_key_mapped",
                 "pool_is_mapped",
                 "prepare_prefill_suffix_append",
                 "rebuild_page_table",
@@ -437,6 +487,12 @@ PINS = {
                 "count_mapped_leading_shared_pages": {
                     "params": ["self", "page_keys"],
                     "returns": "int",
+                },
+                # A caller that reserves pages a row will WRITE proves the
+                # write head is private before handing the key in.
+                "is_shared_page_key_mapped": {
+                    "params": ["self", "page_key"],
+                    "returns": "bool",
                 },
                 "allocate_pages_for_sequences_with_page_keys": {
                     "params": [
