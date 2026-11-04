@@ -1264,29 +1264,104 @@ class Glm5MoE3DBuffers:
         self.num_tokens_per_rank = num_tokens_per_rank
         self.device = device
 
-        NK = max_global_bsz * topk
         self.capacity = _glm5_ragged_row_capacity(max_global_bsz, topk, E_local)
+        # True between release() and the next ensure_resident(): every tensor
+        # attribute is None and only the scalars above remain, which is exactly
+        # what ensure_resident() re-allocates from.
+        self._released = False
 
-        self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
-        self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
-        self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
-        self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
-        self.cu_seqlens = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
-        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
-        self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self._alloc_comm_buffers()
         self._alloc_row_buffers()
 
-        total_bytes = 0
-        for t in (self.all_tokens, self.padded, self.expert_counts, self.expert_counters,
-                  self.cu_seqlens, self.topk_pos, self.dispatched_x, self.intermediate,
-                  self.expert_out, self.result_buffer, self.x_fp8, self.x_scale,
-                  self.inter_fp8, self.inter_scale):
-            total_bytes += t.nelement() * t.element_size()
         logging.info(
             f"[Glm5MoE3DBuffers] ragged: E_local={E_local}, capacity={self.capacity} rows "
-            f"(NK={NK} + align pad), H={H}, N_inter={N_inter}, "
-            f"total={total_bytes / (1024**3):.2f} GiB"
+            f"(NK={max_global_bsz * topk} + align pad), H={H}, N_inter={N_inter}, "
+            f"total={self.nbytes() / (1024**3):.2f} GiB"
         )
+
+    # Every device tensor this object owns. release() drops all of them and
+    # ensure_resident() re-creates all of them; nothing else may hold one
+    # across a decode step (each is handed to a kernel and read back in the
+    # same call), so the pair is a pure residency switch.
+    _BUFFER_ATTRS = (
+        "all_tokens", "padded", "expert_counts", "expert_counters",
+        "cu_seqlens", "topk_pos", "result_buffer",
+        "dispatched_x", "intermediate", "expert_out",
+        "x_fp8", "x_scale", "inter_fp8", "inter_scale",
+    )
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def nbytes(self) -> int:
+        """Device bytes currently held (0 while released)."""
+        if self._released:
+            return 0
+        return sum(
+            getattr(self, name).nelement() * getattr(self, name).element_size()
+            for name in self._BUFFER_ATTRS
+        )
+
+    def release(self) -> int:
+        """Drop every device buffer, keeping the shape state. Returns bytes freed.
+
+        The captured MoE graph owns its own buffers
+        (``Glm5MoEGraphBufferPool``, moe_cuda_graph_segments.py) and never
+        reads these, so once the decode graphs are captured and active this is
+        pure dead residency competing with the GPU KV pool. Idempotent;
+        ``ensure_resident()`` undoes it bit-identically (same shapes, same
+        zero / -1 initializers), so an eager decode step that follows a
+        release behaves exactly as it did before.
+        """
+        if self._released:
+            return 0
+        freed = self.nbytes()
+        for name in self._BUFFER_ATTRS:
+            setattr(self, name, None)
+        self._released = True
+        logging.info(
+            "[Glm5MoE3DBuffers] released eager decode buffers: %.3f GiB "
+            "(capacity=%d rows; re-created on demand at eager entry)",
+            freed / (1024 ** 3), self.capacity,
+        )
+        return freed
+
+    def ensure_resident(self) -> int:
+        """Re-create the buffers if they were released. Returns bytes allocated.
+
+        Called at eager-decode entry, not inside the per-expert loops: an
+        eager step is already orders slower than a graph replay, so one
+        allocation at its entry is affordable, and after the first one the
+        object is resident again.
+        """
+        if not self._released:
+            return 0
+        self._released = False
+        self._alloc_comm_buffers()
+        self._alloc_row_buffers()
+        allocated = self.nbytes()
+        logging.info(
+            "[Glm5MoE3DBuffers] re-created eager decode buffers: %.3f GiB "
+            "(capacity=%d rows, max_global_bsz=%d)",
+            allocated / (1024 ** 3), self.capacity, self.max_global_bsz,
+        )
+        return allocated
+
+    def _alloc_comm_buffers(self):
+        """(Re)allocate the comm/routing buffers sized by the global batch."""
+        H, device = self.H, self.device
+        NK = self.max_global_bsz * self.topk
+        self.all_tokens = torch.zeros(
+            self.max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self.padded = torch.zeros(
+            self.num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
+        self.expert_counts = torch.zeros(self.E_local, dtype=torch.int32, device=device)
+        self.expert_counters = torch.zeros(self.E_local, dtype=torch.int32, device=device)
+        self.cu_seqlens = torch.zeros(self.E_local + 1, dtype=torch.int32, device=device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+        self.result_buffer = torch.empty(
+            self.max_global_bsz, H, dtype=torch.bfloat16, device=device)
 
     def _alloc_row_buffers(self):
         """(Re)allocate everything indexed by the compact row space."""
@@ -1323,6 +1398,11 @@ class Glm5MoE3DBuffers:
         logging.info(
             f"[Glm5MoE3DBuffers] Resizing comm buffers: {self.max_global_bsz} -> {global_bsz}")
         self.max_global_bsz = global_bsz
+        if self._released:
+            # Nothing to resize yet: record the new bound (and capacity) so the
+            # next ensure_resident() allocates at the larger size directly.
+            self.capacity = max(self.capacity, needed)
+            return
         NK = global_bsz * self.topk
         self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
         self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
@@ -1735,6 +1815,12 @@ class Glm5MoE(nn.Module):
         if self.use_3d_moe and Glm5MoE._3d_buf is not None:
             buf = Glm5MoE._3d_buf
             buf.resize_if_needed(global_num_tokens)
+            if buf.released:
+                # Released after decode-graph capture: only the scalar that
+                # ensure_resident() sizes `padded` from has to follow, and the
+                # re-create then produces the same buffer this block would.
+                buf.num_tokens_per_rank = num_tokens_per_rank
+                return
             # The send buffer MUST match num_tokens_per_rank exactly — NCCL
             # all_gather sends `input.numel()` elements per rank. If padded
             # stays at its initial size (e.g. 128) while num_tokens_per_rank
@@ -1749,6 +1835,27 @@ class Glm5MoE(nn.Module):
                     dtype=torch.bfloat16, device=buf.device,
                 )
                 buf.num_tokens_per_rank = num_tokens_per_rank
+
+    def release_eager_decode_buffers(self) -> int:
+        """Free the shared eager 3D MoE buffers. Returns the bytes freed.
+
+        The engine calls this once, after the decode CUDA graphs are captured
+        and active: from then on every in-bucket decode step replays a graph
+        whose MoE buffers come from ``Glm5MoEGraphBufferPool``, and these
+        eager buffers are dead residency competing with the GPU KV pool
+        (which is sized from the post-capture steady usage).
+
+        ``_3d_buf`` deliberately stays NON-None: ``_forward_decode`` gates the
+        whole 3D path — graph replay included — on it, so nulling the class
+        attribute would silently demote every decode step to the non-3D
+        fallback. Only the buffers inside it go, and every eager entry
+        (``_forward_decode_3d``) calls ``ensure_resident()`` first, so the
+        eager fallbacks keep working with the same shapes and initializers.
+        """
+        buf = Glm5MoE._3d_buf
+        if buf is None:
+            return 0
+        return buf.release()
 
     # ── Weight pointer setup (called by PSM) ──
 
@@ -2420,6 +2527,11 @@ class Glm5MoE(nn.Module):
         num_global = ntp * self.world_size
         topk = self.num_experts_per_tok
         buf = Glm5MoE._3d_buf
+        # Eager entry: the buffers may have been released once the decode
+        # graphs were captured and active (release_eager_decode_buffers).
+        # Re-create them here, at the entry of an already-slow eager step,
+        # never inside the per-layer or per-expert loops below.
+        buf.ensure_resident()
         buf.resize_if_needed(num_global)
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
