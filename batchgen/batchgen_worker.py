@@ -302,7 +302,10 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_host_kv_worker_view,
 	is_dsa_model,
 )
-from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
+from batchgen.kv_cache.dual_kv_cache_coordinator import (
+	DualKVCacheCoordinator,
+	DualPoolPageKeys,
+)
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
 # The page-buffer sizes are module globals that configure_page_buffers()
@@ -5125,38 +5128,165 @@ class BatchGenWorker:
 			self._make_token_budget_request(), sequence_ids
 		)
 
+	def _shared_page_identity_sources(self, manager):
+		"""The pools whose GPU pages can be deduplicated by Host page id.
+
+		Returns one ``(pool name, GPU manager, Host worker view)`` triple per
+		pool, or ``None`` when shared-page identity does not apply at all.
+		``None`` is the single condition behind BOTH the allocator and the
+		decode admission credit: plain allocation gives every row its own
+		physical copy, so a credit there would charge for a copy that was
+		really made.
+
+		A DSA model (GLM-5.x, DeepSeek-V3.2) runs TWO pools -- primary MLA
+		latent KV and auxiliary indexer KV -- backed by two separate Host KV
+		regions. Each pool therefore gets its own Host worker view, which is
+		its own key space; group 0 is the MLA region and group 1 the indexer
+		region (``DualHostKVCoordinator.views_by_group``), matching
+		primary/auxiliary on the GPU side.
+		"""
+		if manager is None or not self.enable_prefix_cache:
+			return None
+		if isinstance(manager, DualKVCacheCoordinator):
+			host_view = getattr(self, "host_paged_kv_worker_view", None)
+			if not isinstance(host_view, DualHostKVCoordinator):
+				return None
+			views = host_view.views_by_group()
+			primary_view = views.get(0)
+			auxiliary_view = views.get(1)
+			if primary_view is None or auxiliary_view is None:
+				return None
+			return (
+				("primary", manager.primary, primary_view),
+				("auxiliary", manager.auxiliary, auxiliary_view),
+			)
+		worker_view = getattr(
+			self.core_engine, "host_paged_kv_worker_view", None
+		)
+		if worker_view is None:
+			return None
+		return (("primary", manager, worker_view),)
+
 	def _host_identity_page_keys(
 		self,
 		manager,
 		global_sequence_ids: Sequence[int],
 		sequence_tokens: Sequence[int],
-	) -> Optional[List[List[int]]]:
-		"""Host page ids backing each sequence's GPU reservation, or ``None``.
+	):
+		"""The page-key argument for ``manager``'s keyed allocation, or ``None``.
+
+		One manager: a list of Host page id rows, one row per sequence, in
+		logical page order -- equal ids mean one physical GPU page.
+
+		A DSA dual coordinator: ``DualPoolPageKeys``, which carries that same
+		row list ONCE PER POOL. The two pools are separate Host KV regions, so
+		a Host page id identifies content only inside its own region and the
+		two key spaces must never be crossed; each pool deduplicates on its
+		own ids.
 
 		``None`` means shared-page identity does not apply (prefix cache off,
-		or a DSA coordinator) and plain allocation is used.
+		or the Host views that define the identity are not bound) and plain
+		allocation is used.
 		"""
-		if (
-			not self.enable_prefix_cache
-			or isinstance(manager, DualKVCacheCoordinator)
-		):
+		sources = self._shared_page_identity_sources(manager)
+		if sources is None:
 			return None
-		worker_view = self.core_engine.host_paged_kv_worker_view
+		rows_by_pool: Dict[str, List[List[int]]] = {}
+		for pool_name, pool_manager, worker_view in sources:
+			rows_by_pool[pool_name] = self._pool_host_identity_page_keys(
+				pool_name,
+				pool_manager,
+				worker_view,
+				global_sequence_ids,
+				sequence_tokens,
+			)
+		if isinstance(manager, DualKVCacheCoordinator):
+			return DualPoolPageKeys.from_rows(
+				rows_by_pool["primary"], rows_by_pool["auxiliary"]
+			)
+		return rows_by_pool["primary"]
+
+	def _pool_host_identity_page_keys(
+		self,
+		pool_name: str,
+		pool_manager,
+		worker_view,
+		global_sequence_ids: Sequence[int],
+		sequence_tokens: Sequence[int],
+	) -> List[List[int]]:
+		"""One pool's Host page ids behind each sequence's GPU reservation."""
 		host_tables = worker_view.build_page_table(global_sequence_ids)
-		page_size = int(manager.config.page_size_tokens)
-		page_keys = []
+		page_size = int(pool_manager.config.page_size_tokens)
+		page_keys: List[List[int]] = []
 		for sequence_id, tokens, host_pages in zip(
 			global_sequence_ids, sequence_tokens, host_tables
 		):
 			required = math.ceil(int(tokens) / page_size)
 			if len(host_pages) < required:
 				raise RuntimeError(
-					"Host page table is shorter than GPU reservation: "
-					f"sequence={sequence_id}, host_pages={len(host_pages)}, "
-					f"required={required}"
+					f"Host page table ({pool_name} pool) is shorter than GPU "
+					f"reservation: sequence={sequence_id}, "
+					f"host_pages={len(host_pages)}, required={required}"
 				)
 			page_keys.append([int(page) for page in host_pages[:required]])
+		self._assert_private_writable_page_keys(
+			pool_name, pool_manager, global_sequence_ids, page_keys, page_size
+		)
 		return page_keys
+
+	def _assert_private_writable_page_keys(
+		self,
+		pool_name: str,
+		pool_manager,
+		global_sequence_ids: Sequence[int],
+		page_keys: Sequence[Sequence[int]],
+		page_size: int,
+	) -> None:
+		"""Fail loud if a page the row will WRITE carries a shared key.
+
+		Sharing a physical page is safe only for a committed prefix, which is
+		immutable and page aligned. Everything from the row's write head on is
+		its private tail: decode writes the new token at position
+		``current_context_length`` (``update_layer_decode_new_token``), i.e.
+		into logical page ``current_context_length // page_size``, and every
+		later page of the reservation is future tail. Those pages come from
+		the row's OWN Host reservation, so their Host page ids -- the keys --
+		are private by construction; this states that invariant as a check
+		instead of trusting it, because a shared key here would let two rows
+		write one physical page.
+		"""
+		write_heads: List[int] = []
+		for sequence_id in global_sequence_ids:
+			sequence = self.global_batch.get_sequence_by_global_idx(
+				int(sequence_id)
+			)
+			if sequence is None:
+				raise RuntimeError(
+					"shared GPU page identity needs the row's context length: "
+					f"global sequence {sequence_id} is not in the batch"
+				)
+			write_heads.append(
+				int(sequence.current_context_length) // int(page_size)
+			)
+		rows_per_key: Dict[int, int] = {}
+		for row in page_keys:
+			for key in row:
+				rows_per_key[int(key)] = rows_per_key.get(int(key), 0) + 1
+		for sequence_id, row, write_head in zip(
+			global_sequence_ids, page_keys, write_heads
+		):
+			for index in range(max(0, write_head), len(row)):
+				key = int(row[index])
+				if (
+					rows_per_key[key] > 1
+					or pool_manager.is_shared_page_key_mapped(key)
+				):
+					raise RuntimeError(
+						f"{pool_name} GPU pool: sequence {sequence_id} would "
+						f"share writable logical page {index} (write head "
+						f"{write_head}); only a committed prefix page may be "
+						"shared"
+					)
 
 	def _allocate_gpu_pages_with_host_identity(
 		self,
@@ -5185,10 +5315,17 @@ class BatchGenWorker:
 				for row in allocations.values()
 				for page in row
 			}
+			# Both pools request the same logical page count per row, so the
+			# primary rows describe the request for either shape.
+			primary_rows = (
+				page_keys.primary
+				if isinstance(page_keys, DualPoolPageKeys)
+				else page_keys
+			)
 			self._emit_prefix_cache_metric(
 				"prefix_gpu_share",
 				sequences=len(global_sequence_ids),
-				requested_logical_pages=sum(len(row) for row in page_keys),
+				requested_logical_pages=sum(len(row) for row in primary_rows),
 				new_physical_pages=len(new_physical_pages),
 				logical_page_references=sharing.logical_page_references,
 				physical_pages=sharing.physical_pages,
@@ -8893,11 +9030,13 @@ class BatchGenWorker:
 		The credit is only honest where the ALLOCATOR shares: GPU pages are
 		deduplicated by Host page id inside
 		``allocate_pages_for_sequences_with_page_keys``, which
-		``_allocate_gpu_pages_with_host_identity`` reaches only with the prefix
-		cache on and a manager that is not the dual-KV coordinator. Everywhere
-		else each row really does load its own copy, so each row must pay for
-		it -- the same condition ``_host_identity_page_keys`` tests before
-		returning page keys at all.
+		``_allocate_gpu_pages_with_host_identity`` reaches exactly when
+		``_shared_page_identity_sources`` names the pools to key. A DSA dual
+		coordinator is now one of those: both of its pools deduplicate, each
+		on its own Host region's page ids. Everywhere else each row really
+		does load its own copy, so each row must pay for it -- the same
+		condition ``_host_identity_page_keys`` tests before returning page
+		keys at all.
 		"""
 		if not self.shared_prefix_admission:
 			return False
@@ -8906,9 +9045,7 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not manager.is_initialized:
 			return False
-		if isinstance(manager, DualKVCacheCoordinator):
-			return False
-		return True
+		return self._shared_page_identity_sources(manager) is not None
 
 	def _local_decode_shared_prefix_runs(
 		self, all_candidates: List[str]
@@ -8924,12 +9061,20 @@ class BatchGenWorker:
 		on, so a run here means those rows provably reference one physical
 		copy -- not merely equal tokens, which two distinct Host copies can
 		also have.
+
+		The view comes from ``_shared_page_identity_sources``, so the runs are
+		read from exactly the key space the allocator will dedup on. On a DSA
+		dual coordinator that is the PRIMARY pool (the MLA latent region): the
+		auxiliary pool shares the same rows page for page, and the charge is
+		counted in primary-pool pages, so one pool's identity describes the
+		credit for both.
 		"""
-		worker_view = getattr(
-			self.core_engine, "host_paged_kv_worker_view", None
+		sources = self._shared_page_identity_sources(
+			self.gpu_paged_kv_cache_manager
 		)
-		if worker_view is None:
+		if not sources:
 			return {}
+		worker_view = sources[0][2]
 		mine = []
 		for uuid in all_candidates:
 			if uuid not in self._uuid_to_local_map:
