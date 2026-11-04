@@ -24,6 +24,10 @@ from batchgen.eventlog.process import (
     recording_exit,
 )
 from batchgen.server.server_args import prepare_server_args
+from batchgen.host_memory_preflight import (
+    HostMemoryPlanError,
+    run_host_memory_preflight,
+)
 from batchgen.runtime_preflight import RuntimePreflightError, run_runtime_preflight
 
 
@@ -72,11 +76,19 @@ def _serve(server_args) -> None:
         # Run before importing worker_manager/http_server so missing native
         # dependencies fail before workers, SHM, ports, or model weights exist.
         run_runtime_preflight(server_args)
+        # Same stage, same contract: the host memory this launch commits is
+        # printed and checked against MemTotal before the first memfd, SHM
+        # region or weight byte exists, so an overcommitted budget is refused
+        # here instead of by the kernel OOM killer during warmup.
+        run_host_memory_preflight(server_args)
         from batchgen.server.http_server import launch_server
 
         launch_server(server_args)
     except RuntimePreflightError as exc:
         logging.error("Runtime preflight failed: %s", exc)
+        sys.exit(1)
+    except HostMemoryPlanError as exc:
+        logging.error("Host memory preflight failed: %s", exc)
         sys.exit(1)
     except KeyboardInterrupt:
         logging.info("Server shutdown requested")
