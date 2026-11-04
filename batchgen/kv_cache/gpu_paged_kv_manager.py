@@ -1179,6 +1179,36 @@ class GPUPagedKVCacheManager:
 		the preview accepts cannot fail validation later; never mutates state.
 		"""
 
+		_rows, new_keys = self._normalize_shared_page_keys(
+			sequence_ids, num_tokens, page_keys_by_sequence
+		)
+		return len(new_keys)
+
+	def _normalize_shared_page_keys(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		page_keys_by_sequence: Sequence[Sequence[int]],
+	) -> Tuple[List[List[int]], set]:
+		"""Validate keyed-allocation inputs once for the preview and the real one.
+
+		Returns the per-sequence key rows and the set of keys this pool does
+		not map yet (one new physical page each). The preview and the
+		allocation MUST agree, so every rule lives here:
+
+		- one key per required page, no duplicate key inside a row, new
+		  sequences only;
+		- shared keys form a LEADING run of each row. A key is shared when
+		  this pool already maps it or when another row of the same call
+		  carries it. Sharing comes from attaching a committed prefix chain,
+		  which is page aligned and always starts at logical page 0, so an
+		  interior shared page means the caller's page identity is wrong --
+		  and the admission credit
+		  (``count_mapped_leading_shared_pages``, ``plan_shared_runs``)
+		  credits leading runs only, so an interior share would be charged as
+		  if it were private.
+		"""
+
 		self._ensure_initialized()
 		if not (
 			len(sequence_ids)
@@ -1192,7 +1222,9 @@ class GPUPagedKVCacheManager:
 			raise ValueError("shared GPU allocation sequence ids must be unique")
 
 		required_counts = self._geometry.required_pages(num_tokens).tolist()
+		rows: List[List[int]] = []
 		new_keys: set[int] = set()
+		rows_per_key: Dict[int, int] = {}
 		for seq_id, required, raw_keys in zip(
 			sequence_ids, required_counts, page_keys_by_sequence
 		):
@@ -1211,10 +1243,29 @@ class GPUPagedKVCacheManager:
 				raise ValueError(
 					f"sequence {seq_id} contains duplicate Host page keys"
 				)
+			rows.append(keys)
+			for key in keys:
+				rows_per_key[key] = rows_per_key.get(key, 0) + 1
 			new_keys.update(
 				key for key in keys if key not in self._shared_page_key_to_gpu_page
 			)
-		return len(new_keys)
+
+		for seq_id, keys in zip(sequence_ids, rows):
+			private_seen = False
+			for index, key in enumerate(keys):
+				shared = (
+					key in self._shared_page_key_to_gpu_page
+					or rows_per_key[key] > 1
+				)
+				if shared and private_seen:
+					raise ValueError(
+						"shared GPU page keys must form a leading run: "
+						f"sequence={seq_id} shares page {index} after a "
+						"private page"
+					)
+				if not shared:
+					private_seen = True
+		return rows, new_keys
 
 	def count_mapped_leading_shared_pages(
 		self, page_keys: Sequence[int]
@@ -1252,43 +1303,9 @@ class GPUPagedKVCacheManager:
 		only after the last sequence reference disappears.
 		"""
 
-		self._ensure_initialized()
-		if not (
-			len(sequence_ids)
-			== len(num_tokens)
-			== len(page_keys_by_sequence)
-		):
-			raise ValueError(
-				"shared GPU allocation inputs must have equal lengths"
-			)
-		if len(set(int(seq_id) for seq_id in sequence_ids)) != len(sequence_ids):
-			raise ValueError("shared GPU allocation sequence ids must be unique")
-
-		required_counts = self._geometry.required_pages(num_tokens).tolist()
-		normalized_rows: List[List[int]] = []
-		new_keys: set[int] = set()
-		for seq_id, required, raw_keys in zip(
-			sequence_ids, required_counts, page_keys_by_sequence
-		):
-			if int(seq_id) in self._sequences:
-				raise ValueError(
-					"shared GPU allocation requires a new sequence: "
-					f"{seq_id}"
-				)
-			keys = [int(key) for key in raw_keys]
-			if len(keys) != int(required):
-				raise ValueError(
-					"Host page-key count does not match required GPU pages: "
-					f"sequence={seq_id}, keys={len(keys)}, required={required}"
-				)
-			if len(keys) != len(set(keys)):
-				raise ValueError(
-					f"sequence {seq_id} contains duplicate Host page keys"
-				)
-			normalized_rows.append(keys)
-			new_keys.update(
-				key for key in keys if key not in self._shared_page_key_to_gpu_page
-			)
+		normalized_rows, new_keys = self._normalize_shared_page_keys(
+			sequence_ids, num_tokens, page_keys_by_sequence
+		)
 
 		if len(new_keys) > self._free_pages.size:
 			raise RuntimeError(
@@ -1436,6 +1453,23 @@ class GPUPagedKVCacheManager:
 			missing_pages = max(0, required_pages - int(state.pages.numel()))
 			if missing_pages:
 				self.grow_sequence_pages(seq_id, missing_pages)
+
+		# The suffix write lands on every page from the prefix boundary on.
+		# A page shared with another sequence may only be READ, so a write
+		# destination that is not private is a corruption bug: name it here
+		# instead of silently overwriting a sibling's committed prefix.
+		page_tokens = int(self.config.page_size_tokens)
+		for seq_id, prefix, full_length in zip(
+			sequence_ids, prefix_values, full_lengths
+		):
+			self._assert_pages_are_private_for_writes(
+				"prepare_prefill_suffix_append",
+				seq_id,
+				first_page=int(prefix) // page_tokens,
+				last_page_exclusive=int(
+					self._geometry.required_pages(full_length)
+				),
+			)
 
 		if rebuild_page_table:
 			page_table = self.rebuild_page_table(sequence_ids)
@@ -1587,6 +1621,17 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		self._sequences = {}
 		self._free_pages = _TensorStack(self.config.num_pages)
+		# Every physical page goes back to the free stack, so the shared-page
+		# registry and the refcounts must go with it: a key left mapped here
+		# would hand a later keyed allocation a page that is ALSO free for
+		# somebody else, and a stale refcount would make the next release of
+		# that page look like an underflow. `_release_fixed_address_pool` and
+		# `_reset_runtime_state` already clear all three; this flush path did
+		# not, which is the one place the keyed registry could outlive its
+		# pages.
+		self._gpu_page_refcounts = {}
+		self._shared_page_key_to_gpu_page = {}
+		self._gpu_page_to_shared_key = {}
 		self.clear_page_table()
 		self._k_cache.zero_()
 		if self._v_cache is not None:
@@ -2127,6 +2172,55 @@ class GPUPagedKVCacheManager:
 		if state is None:
 			raise KeyError(f"Sequence {sequence_id} not registered on GPU")
 		return state
+
+	def is_shared_page_key_mapped(self, page_key: int) -> bool:
+		"""Does this pool already hold a physical page for ``page_key``?
+
+		Read-only. A caller that reserves pages a sequence will WRITE uses
+		it to prove the write head is private before it hands the key in.
+		"""
+
+		self._ensure_initialized()
+		return int(page_key) in self._shared_page_key_to_gpu_page
+
+	def _assert_pages_are_private_for_writes(
+		self,
+		op_name: str,
+		sequence_id: int,
+		*,
+		first_page: int,
+		last_page_exclusive: int,
+	) -> None:
+		"""Fail loud when a page a sequence writes is shared with another row.
+
+		Dedup is only safe because a shared page is immutable: the sharers
+		READ a committed prefix. Every page from the write head on must
+		therefore be referenced by this sequence alone, i.e. refcount 1.
+
+		A refcount-1 page that still carries a page key is fine: the key is
+		this row's own private Host page, it is registered only so a later
+		batch can recognise it, and it leaves the registry the moment this row
+		releases the page. What may never happen is a write to a page a second
+		reader is holding.
+		"""
+
+		state = self._sequences.get(int(sequence_id))
+		if state is None:
+			raise KeyError(
+				f"{op_name}: sequence {sequence_id} is not allocated on GPU"
+			)
+		pages = state.pages[max(0, int(first_page)):int(last_page_exclusive)]
+		for offset, page in enumerate(pages.tolist()):
+			page_id = int(page)
+			refcount = int(self._gpu_page_refcounts.get(page_id, 0))
+			shared_key = self._gpu_page_to_shared_key.get(page_id)
+			if refcount != 1:
+				raise RuntimeError(
+					f"{op_name}: sequence {sequence_id} would write logical "
+					f"page {max(0, int(first_page)) + offset} on a page it does "
+					f"not own (refcount={refcount}, shared_key={shared_key}); "
+					"a shared prefix page is read-only"
+				)
 
 	def _retain_gpu_pages(self, pages: torch.Tensor) -> None:
 		for page in pages.tolist():
