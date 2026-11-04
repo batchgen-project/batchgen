@@ -29,6 +29,12 @@ from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertW
 # glm5_decode_*_slot_indices, glm5_dsa_*) live on GLM5AttnWrapper, not
 # AttnWrapperBase, per audit §A finding #8.
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
+# Captured-span policy, shared with the Triton prewarm so the kernels warmed
+# before capture are the ones the capture compiles.
+from batchgen.config.graph_span_policy import (
+	GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
+	graph_context_span_cap_tokens,
+)
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -111,6 +117,11 @@ DECODE_DEFERRED_TOKEN_READBACK = True
 _COHORT_QUIESCE_DEADLINE_S = 5.0
 _COHORT_QUIESCE_POLL_INTERVAL_S = 1e-3
 _COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
+
+# Seconds between two "step exceeds the captured span" warnings. The condition
+# holds for every step of a long sequence, so it is logged at a rate a human
+# reads rather than once per step.
+_GRAPH_SPAN_WARN_INTERVAL_S = 60.0
 
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
@@ -1261,6 +1272,8 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		# Monotonic timestamp of the last "step exceeds the captured span" WARN.
+		self._decode_graph_span_warn_monotonic = None
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
@@ -5187,6 +5200,24 @@ class BatchGenWorker:
 	# `engine_config` / `model_config` / `args` attributes into the typed
 	# `PageTableCapacityRequest` frozen snapshot.
 
+	def _deployment_context_bound_tokens(self) -> int:
+		"""Longest context any sequence can reach for the life of this server.
+
+		Admission clamps every sequence to `model_context_length`
+		(`clamp_decode_to_context`, and the `ctx_lens >= model_context_length`
+		completion test), so no decode step's `max_seqlen` can ever exceed it.
+		That makes it the one DEPLOYMENT bound available to capture-time
+		sizing: `max_input_length` / `max_decoding_length` are per-batch — set
+		by `Init` and grown at admission — so sizing from them describes
+		whichever batch happens to arrive first, not the deployment.
+
+		`_initialize_core_components` sets it from the model config (131072
+		default) before any KV pool or graph exists, so it is always available
+		to the pool and capture paths. Returns 0 only before core init; the
+		caller decides whether that is an error.
+		"""
+		return int(getattr(self, "model_context_length", 0) or 0)
+
 	def _make_page_table_capacity_request(
 		self, sequence_tokens: Optional[Sequence[int]] = None,
 	) -> PageTableCapacityRequest:
@@ -5214,7 +5245,16 @@ class BatchGenWorker:
 			graph_buckets = getattr(basic, "decode_graph_buckets", None) or ()
 			engine_basic_decode_graph_max_bucket = max(graph_buckets) if graph_buckets else None
 		model_config = getattr(self, "model_config", None)
-		model_max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+		# Deployment bound first, model config second. `model_context_length`
+		# is what admission clamps to, and it exists even when the config class
+		# does not declare `max_position_embeddings` — a config that lacks the
+		# field used to drop the bound from the candidate set entirely, leaving
+		# the page table's token span at the first batch's
+		# `max_input_length + max_decoding_length`. A graph captured against
+		# that span then rejected every later, longer decode step.
+		model_max_position_embeddings = self._deployment_context_bound_tokens() or getattr(
+			model_config, "max_position_embeddings", None
+		)
 		args = getattr(self, "args", None)
 		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
 		return PageTableCapacityRequest(
@@ -17491,13 +17531,38 @@ class BatchGenWorker:
 		aux_page_table,
 		aux_page_size: int,
 		*,
-		model_max_position_embeddings: int | None = None,
+		deployment_context_tokens: int,
+		span_cap_tokens: int | None = None,
 	) -> int:
+		"""Token span the whole-model decode graph is captured for.
+
+		`deployment_context_tokens` is the bound from
+		`_deployment_context_bound_tokens` and is REQUIRED: it is the only term
+		here that does not move with the batch, and dropping it (which an
+		optional argument defaulting to None used to allow whenever the model
+		config carried no `max_position_embeddings`) leaves the span at
+		whatever the page tables happened to be sized for when the FIRST
+		decode batch created them.
+
+		The page-table terms stay in the `min` as hardware limits — a span
+		wider than a table's columns is unaddressable — and `span_cap_tokens`
+		applies the context-proportional statics budget.
+		"""
+		if int(deployment_context_tokens) <= 0:
+			raise RuntimeError(
+				"the DSA CUDA graph span requires a positive deployment context "
+				f"bound, got {deployment_context_tokens}; model_context_length is "
+				"set during core initialization and must be available before capture"
+			)
 		primary_capacity = int(primary_page_table.shape[1]) * int(primary_page_size)
 		aux_capacity = int(aux_page_table.shape[1]) * int(aux_page_size)
-		capacities = [primary_capacity, aux_capacity]
-		if model_max_position_embeddings is not None and int(model_max_position_embeddings) > 0:
-			capacities.append(int(model_max_position_embeddings))
+		capacities = [
+			primary_capacity,
+			aux_capacity,
+			int(deployment_context_tokens),
+		]
+		if span_cap_tokens is not None and int(span_cap_tokens) > 0:
+			capacities.append(int(span_cap_tokens))
 		capacity = min(capacities)
 		if capacity <= 0:
 			raise RuntimeError(
@@ -17792,6 +17857,31 @@ class BatchGenWorker:
 		gc.collect()
 		if empty_cuda_cache and torch.cuda.is_available():
 			torch.cuda.empty_cache()
+
+	# Path states that mean "this step cannot replay the graph" but are still
+	# served correctly by eager decode, so a required graph must NOT make them
+	# fatal. A step longer than the captured span is the only such state: the
+	# eager decode path is length-agnostic. Every other reason means the
+	# capture itself is missing or stale, which stays fail-loud.
+	_WHOLE_GRAPH_EAGER_SERVABLE_REASONS = frozenset({"max_seqlen_exceeds_capture"})
+
+	def _warn_decode_graph_span_exceeded(self, step_max_seqlen: int, span: int) -> None:
+		"""Rate-limited WARN naming this step's max_seqlen and the captured span."""
+		now = time.monotonic()
+		last = getattr(self, "_decode_graph_span_warn_monotonic", None)
+		if last is not None and now - last < _GRAPH_SPAN_WARN_INTERVAL_S:
+			return
+		self._decode_graph_span_warn_monotonic = now
+		logging.warning(
+			"Rank %s: the whole-model decode graph covers %d context tokens but "
+			"this step's max_seqlen is %d; running the step in eager decode. The "
+			"span is the deployment context bound trimmed by the graph's "
+			"context-proportional statics budget (%d bytes).",
+			self.rank,
+			int(span),
+			int(step_max_seqlen),
+			GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
+		)
 
 	def _glm5_whole_graph_path_state(self, max_rank_bsz: int):
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
@@ -18232,18 +18322,31 @@ class BatchGenWorker:
 				)
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
+			# The span comes from the DEPLOYMENT bound, never from the batch in
+			# front of us: the first decode batch used to fix it for the life
+			# of the process, so a later, longer turn had no replayable graph.
+			# A 1-byte aux element type is the page-split FP8 layout, which
+			# decides which scorer owns the context-proportional statics.
+			aux_is_page_split = int(aux_manager.config.kv_dtype.itemsize) == 1
 			capacity_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
 				primary_page_table,
 				primary_page_size,
 				aux_page_table,
 				aux_page_size,
-				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
+				deployment_context_tokens=self._deployment_context_bound_tokens(),
+				span_cap_tokens=graph_context_span_cap_tokens(
+					bucket_sizes=bucketing.bucket_sizes,
+					aux_is_page_split=aux_is_page_split,
+				),
 			)
 			graph_max_seqlen = int(capacity_seqlen)
-			if int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) > graph_max_seqlen:
-				raise RuntimeError(
-					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "
-					f"exceeds model/KV capacity {graph_max_seqlen}"
+			# A batch already past the span is not a capture error: capturing
+			# at the span still serves every shorter step, and this step takes
+			# the eager path (see the decode-step fallback).
+			current_capture_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+			if current_capture_max_seqlen > graph_max_seqlen:
+				self._warn_decode_graph_span_exceeded(
+					current_capture_max_seqlen, graph_max_seqlen
 				)
 			# all_short lifetime: every admissible row's final length fits in
 			# index_topk, so the DSA segments attend densely to the resident
@@ -19689,11 +19792,22 @@ class BatchGenWorker:
 					and not _glm5_whole_graph_over_bucket
 				):
 					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
-					raise RuntimeError(
-						"GLM-5 whole-model CUDA graph was required but no replayable "
-						"whole-model graph is available for this decode step "
-						f"(bucket={_required_bucket}, reason={_required_reason})"
-					)
+					if _required_reason in self._WHOLE_GRAPH_EAGER_SERVABLE_REASONS:
+						# A step longer than the captured span runs eager --
+						# correct, just slower. Every rank evaluates this from
+						# the globally-synced `_max_bs` and its own identical
+						# span, so all ranks take this branch together and the
+						# graph's baked NCCL ops stay matched.
+						self._warn_decode_graph_span_exceeded(
+							int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+							int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
+						)
+					else:
+						raise RuntimeError(
+							"GLM-5 whole-model CUDA graph was required but no replayable "
+							"whole-model graph is available for this decode step "
+							f"(bucket={_required_bucket}, reason={_required_reason})"
+						)
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
 					and self._cuda_graph_manager is not None
