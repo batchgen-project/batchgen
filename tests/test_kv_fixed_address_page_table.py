@@ -438,6 +438,10 @@ class _StubPool:
         self.pool_is_mapped = mapped
         self.uses_fixed_address_pool = fixed
         self.depth = 0
+        # The coordinator reads each pool's shared-page registry when it is
+        # constructed, to decide whether the two pools' physical page ids may
+        # already have diverged (page-key dedup). Empty = never keyed.
+        self._shared_page_key_to_gpu_page = {}
 
     def assert_pool_mapped(self, context):
         if not self.pool_is_mapped:
