@@ -56,7 +56,6 @@ def _growth_plan(*, free_pages, completed_pages):
         free_pages=free_pages,
         total_pages=16,
         completed_pages=completed_pages,
-        watermark_percent=0,
         safety_margin=0,
     )
 

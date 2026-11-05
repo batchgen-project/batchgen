@@ -1739,7 +1739,6 @@ class WorkerManager:
             detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
             host_kv_chunk_size=self.args.host_kv_chunk_size,
             enable_host_kv_eviction=self.args.enable_host_kv_eviction,
-            host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
             adaptive_chunk=self.args.adaptive_chunk,
             adaptive_chunk_min=self.args.adaptive_chunk_min,
             adaptive_chunk_max=self.args.adaptive_chunk_max,

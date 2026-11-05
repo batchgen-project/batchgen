@@ -1072,7 +1072,6 @@ class BatchGenWorkerArgs:
 	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 	# Dynamic host KV reservation
 	host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens
-	host_kv_eviction_watermark: int = 10  # Trigger eviction when free < this %
 	enable_host_kv_eviction: bool = False  # Enable host KV eviction + recompute
 	adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
 	adaptive_chunk_min: int = 1024
@@ -1173,7 +1172,6 @@ class BatchGenWorker:
 
 		# Dynamic host KV reservation
 		self.host_kv_chunk_size = args.host_kv_chunk_size
-		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
 		# The deprecated CLI switch cannot disable re-entry. Any positive chunk
 		# creates bounded host-KV reservations, so eviction is part of that mode's
 		# correctness contract.
@@ -1192,7 +1190,6 @@ class BatchGenWorker:
 		if args.global_rank == 0:
 			logging.info(
 				f"Dynamic Host KV Config: chunk_size={args.host_kv_chunk_size}, "
-				f"eviction_watermark={args.host_kv_eviction_watermark}%, "
 				f"eviction_enabled={self.enable_host_kv_eviction}, "
 				f"adaptive_chunk={args.adaptive_chunk}"
 			)
@@ -16555,7 +16552,6 @@ class BatchGenWorker:
 			num_gpus_per_node=self.local_world_size,
 			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
-			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
 			attn_tp_size=self._decode_attn_tp_size(),
 		)
 

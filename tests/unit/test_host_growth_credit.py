@@ -60,7 +60,6 @@ def _plan(state, *, free_pages, enable_host_kv_eviction=False):
         world_size=_GPN,
         num_gpus_per_node=_GPN,
         enable_host_kv_eviction=enable_host_kv_eviction,
-        host_kv_eviction_watermark=0,
     ))
 
 

@@ -300,7 +300,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 |------|---------|-------------|
 | `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length, is at least one decode decision interval, and is rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
 | `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is enabled exactly when the effective `--host-kv-chunk-size` is greater than zero; the parser rejects non-positive chunk sizes, and this flag cannot override that mode. Telemetry reports the derived effective state. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
-| `--host-kv-eviction-watermark` | `10` | Host-KV growth-planner watermark (0-100). The planner preserves this free-page margin, after completed-row release and safety margin; if growth cannot fit, it evicts an active sequence for later re-entry. This does not control the prefill admission threshold above. |
+| `--host-kv-eviction-watermark` | _(ignored)_ | **[Deprecated]** Host-KV eviction is driven only by growth debt: the planner evicts active sequences only when remaining growth plus the safety margin cannot fit in free pages after completed-row release. A free-page watermark no longer evicts active sequences, so a pool legitimately filled by full reservations decodes to completion instead of thrashing through evict/recompute cycles. |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
 | `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
@@ -313,7 +313,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 1. The first pool drain sends one worker `init` message. Its `max_output_len` is the maximum per-request output length in that first drain. The worker uses that value only to cap host-KV chunk sizing; it is not a server-wide output limit.
 2. At prefill, each sequence reserves pages for its prompt plus the effective chunk, capped by that sequence's full KV budget (`prompt + max_completion_tokens` or the applicable fallback).
 3. During decode, a sequence approaching its current host-KV capacity requests another chunk, capped by its own KV budget. Successful growth is not eviction and is not re-entry.
-4. Eviction occurs when the host-KV growth planner determines that the active set cannot safely satisfy the required admission or growth while preserving the configured free-page watermark and safety margin. This can be proactive; it does not require a page allocation to fail first. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
+4. Eviction occurs when the host-KV growth planner determines that the active set's remaining growth debt plus the safety margin cannot fit in the free pages left after completed-row release. This can be proactive; it does not require a page allocation to fail first. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again. Active sequences with no growth debt are never evicted: a full pool is the intended steady state of admission, not an eviction trigger.
 5. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA).
 
 The first-init rule matters when later admissions use a larger `max_completion_tokens`: the per-request decode budget remains authoritative, but the initial host-KV reservation may be smaller and grow during decode.
@@ -325,7 +325,6 @@ python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --host-kv-cache-size 256 \
     --host-kv-chunk-size 512 \
-    --host-kv-eviction-watermark 10 \
     --adaptive-chunk
 ```
 
