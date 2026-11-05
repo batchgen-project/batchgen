@@ -63,11 +63,11 @@ Full settings and reproduction scripts: [`benchmarks/`](benchmarks/).
 
 | Model and hardware | Workload | BatchGen | Best tuned reference | Faster engine |
 | --- | --- | ---: | ---: | ---: |
-| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3-FP8) (753B), 8×H200 | Long-context QA, no cross-request sharing: 312 distinct 64K-token documents × 1 question each (~0.1% cross-request prefix overlap), EOS honoured (cap 4,096) | 2,251.9 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, grouped-tuned stack: 2,909.4 s | **BatchGen 1.29×** |
-| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3-FP8) (753B), 8×H200 | Document-grouped QA: 64 docs × 64K-token shared prefix × 8 questions, 512 requests, EOS honoured (cap 4,096) | 1,381.7 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, 4-arm tuned sweep incl. prefix-aware external router: 1,253.7 s | **reference 1.10×** |
-| Kimi-K3 (2.8T), 4×8 H20 | Code-generation long decode: 512 LiveCodeBench prompts × forced 4,096 completion tokens | 901.6 s | SGLang 0.5.22 · 3-arm sweep (TP32 and DP4-attention mamba-budget arms): 2,523.6 s | **BatchGen 2.80×** |
-| Kimi-K3 (2.8T), 4×8 H20 | Diverse mixed eval (384 MMLU-Pro + 128 LongBench), 512 requests × forced 1,024 completion tokens | 348.8 s (mean of 2) | SGLang 0.5.22 · DP4-attention + tuned mamba-cache sweep: 658.5 s (mean of 4) | **BatchGen 1.89×** |
-| Kimi-K3 (2.8T), 4×8 H20 | same workload | 348.8 s (mean of 2) | vLLM 0.32.0 · TP32 Marlin MoE + EP, memory-utilization sweep: 565.0 s (mean of 2) | **BatchGen 1.62×** |
+| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3) (753B), 8×H200 | Long-context QA, no cross-request sharing: 312 distinct 64K-token documents × 1 question each (~0.1% cross-request prefix overlap), EOS honoured (cap 4,096) | 2,251.9 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, grouped-tuned stack: 2,909.4 s | **BatchGen 1.29×** |
+| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3) (753B), 8×H200 | Document-grouped QA: 64 docs × 64K-token shared prefix × 8 questions, 512 requests, EOS honoured (cap 4,096) | 1,381.7 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, 4-arm tuned sweep incl. prefix-aware external router: 1,253.7 s | **reference 1.10×** |
+| [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T), 4×8 H20 | Code-generation long decode: 512 LiveCodeBench prompts × forced 4,096 completion tokens | 901.6 s | SGLang 0.5.22 · 3-arm sweep (TP32 and DP4-attention mamba-budget arms): 2,523.6 s | **BatchGen 2.80×** |
+| [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T), 4×8 H20 | Diverse mixed eval (384 MMLU-Pro + 128 LongBench), 512 requests × forced 1,024 completion tokens | 348.8 s (mean of 2) | SGLang 0.5.22 · DP4-attention + tuned mamba-cache sweep: 658.5 s (mean of 4) | **BatchGen 1.89×** |
+| [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T), 4×8 H20 | same workload | 348.8 s (mean of 2) | vLLM 0.32.0 · TP32 Marlin MoE + EP, memory-utilization sweep: 565.0 s (mean of 2) | **BatchGen 1.62×** |
 
 We publish the grouped row even though the tuned reference wins it: at an
 85% prefix-reuse ceiling, a fully configured radix-cache router is the right
@@ -86,7 +86,7 @@ workload builders and the batch driver used for every row.
 
 | Model and hardware | Workload | BatchGen | Reference | Advantage | Measured |
 | --- | --- | ---: | ---: | ---: | --- |
-| Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** | 2026-09-03 · `ae374617` |
+| [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** | 2026-09-03 · `ae374617` |
 | Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8/TP16: 1,202.9 s | **1.61× faster** | 2026-07-10 campaign |
 | [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) (753B), 8× H200 | 8×1M accumulated-token prefill, pure DP8 | 20,648 prompt tok/s | SGLang 0.5.18 · DP8 attention / TP8 MoE, tuned CPU offload + chunk: 12,106 prompt tok/s | **1.71× faster** | 2026-09-23 · `954b2bc6` |
 
