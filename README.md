@@ -20,6 +20,12 @@
 ## News
 
 <!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one -->
+- **2026/11 — BatchGen v1.1.1.** Scheduling fix: host-KV eviction is now
+  strictly growth-driven, so long-context batches with little cross-request
+  prefix sharing decode to completion instead of cycling through
+  evict/recompute ([#588](https://github.com/batchgen-project/batchgen/pull/588));
+  plus the published end-to-end batch-completion results and the
+  [`benchmarks/`](benchmarks/) reproduction suite.
 - **2026/11 — BatchGen v1.1.0.** Kimi-K3 multi-node serving on a compact
   distributed weight store; GLM-5 with no runtime compilation (ahead-of-time
   kernels plus a startup prewarm covering every reachable Triton and DeepGEMM
@@ -75,9 +81,10 @@ tool, and the row documents exactly where that crossover sits. BatchGen's
 advantage concentrates where reuse cannot help — long distinct contexts and
 long forced decodes under heavy oversubscription.
 
-BatchGen runs use the v1.1.0 engine and the linked deployment guides (the
-long-context row includes a scheduler fix merged immediately after the
-release, [#588](https://github.com/batchgen-project/batchgen/pull/588));
+BatchGen runs use the v1.1.1 engine and the linked deployment guides (v1.1.1
+is v1.1.0 plus the scheduler fix
+[#588](https://github.com/batchgen-project/batchgen/pull/588) that the
+long-context row depends on);
 baselines were tuned with the sweeps documented in
 [`benchmarks/README.md`](benchmarks/README.md), which also carries the exact
 workload builders and the batch driver used for every row.
