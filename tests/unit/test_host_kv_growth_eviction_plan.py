@@ -70,19 +70,19 @@ def test_growth_debt_covered_by_free_pages_evicts_nothing():
 
 
 def test_growth_debt_beyond_free_pages_evicts_only_enough():
-    # 6 pages of growth + 10 safety against 2 free: evicting the growers
-    # themselves (shortest-decoded first) retires their debt; the plan stops
-    # as soon as the remaining debt plus safety fits.
+    # 6 pages of growth + 1 safety against 2 free. Evicting seq0 (first in
+    # shortest-decoded order) returns its 3 own pages AND retires its 2-page
+    # debt, leaving 4 remaining debt + 1 safety against 5 expected free: the
+    # plan must stop after exactly that one eviction.
     plan = _plan(
         active_uuids=[f"seq{i}" for i in range(4)],
         eviction_candidates=_candidates(4, pages_each=3),
         host_growth_uuids=["seq0", "seq1", "seq2"],
         host_growth_pages=[2, 2, 2],
         free_pages=2,
-        safety_margin=10,
+        safety_margin=1,
     )
-    assert plan.evicted_uuids  # some eviction was genuinely required
-    assert len(plan.evicted_uuids) < 4  # but never the whole active set
+    assert plan.evicted_uuids == ["seq0"]
     assert plan.growth_feasible_after_eviction is True
     assert plan.expected_free_pages >= plan.required_free_pages
 

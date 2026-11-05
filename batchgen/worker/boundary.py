@@ -210,10 +210,11 @@ class BoundaryHandler:
             else:
                 active_uuids.append(uuid)
 
-        # Host KV growth + eviction decisions. Growth and eviction must be
-        # planned together: if growth is needed, watermark-only eviction is not
-        # enough. The plan reserves enough free pages for remaining growth debt
-        # after completed and evicted rows release their host pages.
+        # Host KV growth + eviction decisions. Growth and eviction are planned
+        # together and eviction is strictly growth-driven: the plan reserves
+        # enough free pages for the remaining growth debt (plus the safety
+        # margin) after completed and evicted rows release their host pages,
+        # and evicts nothing when no active row carries growth debt.
         host_growth_uuids = []
         host_growth_pages_list = []
         for uuid in active_uuids:

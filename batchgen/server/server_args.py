@@ -928,8 +928,8 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_chunk_size <= 0:
         raise ValueError("host_kv_chunk_size must be positive")
-    if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
-        raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
+    # host_kv_eviction_watermark is deprecated and ignored: accept any value so
+    # existing launch scripts keep working.
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
     if args.adaptive_chunk_max < args.adaptive_chunk_min:
