@@ -19,18 +19,13 @@
 
 ## News
 
-<!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one -->
-- **2026/11 — BatchGen v1.1.1.** Scheduling fix: host-KV eviction is now
-  strictly growth-driven, so long-context batches with little cross-request
-  prefix sharing decode to completion instead of cycling through
-  evict/recompute ([#588](https://github.com/batchgen-project/batchgen/pull/588));
-  plus the published end-to-end batch-completion results and the
-  [`benchmarks/`](benchmarks/) reproduction suite.
-- **2026/11 — BatchGen v1.1.0.** Kimi-K3 multi-node serving on a compact
+<!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one, and of the v1.1.0 + v1.1.1 entries into one v1.1.1 entry -->
+- **2026/11 — BatchGen v1.1.1.** Kimi-K3 multi-node serving on a compact
   distributed weight store; GLM-5 with no runtime compilation (ahead-of-time
   kernels plus a startup prewarm covering every reachable Triton and DeepGEMM
   kernel); page-level prefix reuse; cluster fail-fast and a restartable worker
-  pool; prebuilt Hopper (sm90a) wheels.
+  pool; prebuilt Hopper (sm90a) wheels; published end-to-end batch-completion
+  results with the [`benchmarks/`](benchmarks/) reproduction suite.
 - **2026/09 — GLM-5.2-FP8 and GLM-5.3-FP8 on 8×H200.** One-node deployment
   guides, the dedicated GLM-5.3 chat template, reasoning parser and request
   controls, and source-qualified `8×1M` plus `32×256K` accumulated-token
