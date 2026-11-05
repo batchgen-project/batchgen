@@ -11,7 +11,7 @@
 
 **High-throughput batch inference for large MoE models**
 
-[Support matrix](docs/support-matrix.md) · [Deployment guides](docs/) · [Batch API](docs/batch-api-guide.md) · [Contributing](CONTRIBUTING.md) · [Paper](https://www.usenix.org/conference/osdi26/presentation/xu-tairan)
+[Selected results](#selected-results) · [Support matrix](docs/support-matrix.md) · [Deployment guides](docs/) · [Batch API](docs/batch-api-guide.md) · [Contributing](CONTRIBUTING.md) · [Paper](https://www.usenix.org/conference/osdi26/presentation/xu-tairan)
 
 </div>
 
@@ -54,21 +54,7 @@ BatchGen is intended for both production users and researchers: the same batch A
 
 The numbers below are workload-specific measurements, not a universal ranking. Comparisons use the same request set and report the measured wall-clock or throughput metric for that workload. “Faster” is computed as baseline divided by BatchGen.
 
-### Recent long-context engineering snapshots
-
-| Model and hardware | Workload | BatchGen | Reference | Advantage |
-| --- | --- | ---: | ---: | ---: |
-| Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** |
-| Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8/TP16: 1,202.9 s | **1.61× faster** |
-| [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) (753B), 8× H200 | 8×1M accumulated-token prefill, pure DP8 | 20,648 prompt tok/s | SGLang 0.5.18 · DP8 attention / TP8 MoE, tuned CPU offload + chunk: 12,106 prompt tok/s | **1.71× faster** |
-
-These snapshots come from the latest gated campaigns available to this repository. The GLM-5.2 row is the exact eight-prompt, one-request-per-rank workload; it covers prefill and the first sampled token rather than sustained 1M-context decode.
-
-Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 uses the 2026-07-10 long-context campaign; GLM-5.2 uses source assembly `954b2bc6` and a bracketed SGLang 0.5.18 chunk/offload sweep from 2026-09-23. The GLM source result still requires final installed-wheel replay. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
-
-The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
-
-### End-to-end batch decode (2026/11)
+### End-to-end batch completion (2026/11)
 
 Batch completion time on identical request sets (same prompts, sampling, and
 arrival order), with every baseline tuned on the same hardware and workload via
@@ -95,6 +81,20 @@ release, [#588](https://github.com/batchgen-project/batchgen/pull/588));
 baselines were tuned with the sweeps documented in
 [`benchmarks/README.md`](benchmarks/README.md), which also carries the exact
 workload builders and the batch driver used for every row.
+
+### Recent long-context engineering snapshots
+
+| Model and hardware | Workload | BatchGen | Reference | Advantage | Measured |
+| --- | --- | ---: | ---: | ---: | --- |
+| Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** | 2026-09-03 · `ae374617` |
+| Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8/TP16: 1,202.9 s | **1.61× faster** | 2026-07-10 campaign |
+| [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) (753B), 8× H200 | 8×1M accumulated-token prefill, pure DP8 | 20,648 prompt tok/s | SGLang 0.5.18 · DP8 attention / TP8 MoE, tuned CPU offload + chunk: 12,106 prompt tok/s | **1.71× faster** | 2026-09-23 · `954b2bc6` |
+
+These snapshots come from the latest gated campaigns available to this repository. The GLM-5.2 row is the exact eight-prompt, one-request-per-rank workload; it covers prefill and the first sampled token rather than sustained 1M-context decode.
+
+Measurement provenance: the Measured column gives the campaign date and the BatchGen commit (Kimi-K3: the `ae374617` campaign cohort, 2026-09-03; Kimi-K2.5: the 2026-07-10 long-context campaign, whose engine commit was not recorded in the public note; GLM-5.2: source assembly `954b2bc6` against a bracketed SGLang 0.5.18 chunk/offload sweep from 2026-09-23). The GLM source result still requires final installed-wheel replay. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
+
+The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
 
 ## Supported models and hardware
 
