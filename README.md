@@ -68,6 +68,34 @@ Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 u
 
 The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
 
+### End-to-end batch decode (2026/11)
+
+Batch completion time on identical request sets (same prompts, sampling, and
+arrival order), with every baseline tuned on the same hardware and workload via
+a recorded sweep; the baseline's best completed configuration is reported.
+Full settings and reproduction scripts: [`benchmarks/`](benchmarks/).
+
+| Model and hardware | Workload | BatchGen | Best tuned reference | Faster engine |
+| --- | --- | ---: | ---: | ---: |
+| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3-FP8) (753B), 8×H200 | Long-context QA, no cross-request sharing: 312 distinct 64K-token documents × 1 question each (~0.1% cross-request prefix overlap), EOS honoured (cap 4,096) | 2,251.9 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, grouped-tuned stack: 2,909.4 s | **BatchGen 1.29×** |
+| [GLM-5.3-FP8](https://huggingface.co/zai-org/GLM-5.3-FP8) (753B), 8×H200 | Document-grouped QA: 64 docs × 64K-token shared prefix × 8 questions, 512 requests, EOS honoured (cap 4,096) | 1,381.7 s | SGLang 0.5.21 · TP8/DP8-attention/EP8, 4-arm tuned sweep incl. prefix-aware external router: 1,253.7 s | **reference 1.10×** |
+| Kimi-K3 (2.8T), 4×8 H20 | Code-generation long decode: 512 LiveCodeBench prompts × forced 4,096 completion tokens | 901.6 s | SGLang 0.5.22 · 3-arm sweep (TP32 and DP4-attention mamba-budget arms): 2,523.6 s | **BatchGen 2.80×** |
+| Kimi-K3 (2.8T), 4×8 H20 | Diverse mixed eval (384 MMLU-Pro + 128 LongBench), 512 requests × forced 1,024 completion tokens | 348.8 s (mean of 2) | SGLang 0.5.22 · DP4-attention + tuned mamba-cache sweep: 658.5 s (mean of 4) | **BatchGen 1.89×** |
+| Kimi-K3 (2.8T), 4×8 H20 | same workload | 348.8 s (mean of 2) | vLLM 0.32.0 · TP32 Marlin MoE + EP, memory-utilization sweep: 565.0 s (mean of 2) | **BatchGen 1.62×** |
+
+We publish the grouped row even though the tuned reference wins it: at an
+85% prefix-reuse ceiling, a fully configured radix-cache router is the right
+tool, and the row documents exactly where that crossover sits. BatchGen's
+advantage concentrates where reuse cannot help — long distinct contexts and
+long forced decodes under heavy oversubscription.
+
+BatchGen runs use the v1.1.0 engine and the linked deployment guides (the
+long-context row includes a scheduler fix merged immediately after the
+release, [#588](https://github.com/batchgen-project/batchgen/pull/588));
+baselines were tuned with the sweeps documented in
+[`benchmarks/README.md`](benchmarks/README.md), which also carries the exact
+workload builders and the batch driver used for every row.
+
 ## Supported models and hardware
 
 The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, GLM-5.1, GLM-5.2, and GLM-5.3; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
