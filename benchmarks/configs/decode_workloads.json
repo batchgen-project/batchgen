@@ -1,0 +1,754 @@
+{
+ "schema_version": "batchgen/decode-workloads/v1",
+ "description": "Canonical decode performance workloads. MoE routing depends on the token stream, so MoE performance evidence must come from distinct prompts sampled at temperature 1; DSA models additionally need rows on both sides of index_topk. scripts/decode_run.py enforces these profiles at record time and scripts/compare_decode_runs.py refuses MoE records without canonical evidence.",
+ "profiles": {
+  "glm-dsa-diverse-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Single-batch GLM-5.x decode workload with rows on both sides of the DSA index_topk boundary: S stays at or below it for the whole run, X crosses it during decode, L starts above it.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "enable_thinking": true,
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261009,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "Bands and weights keep G512 (64 rows/rank) admissible at once with ~10% page margin on the 2026-10-08 H200 engine (2982 pages/rank, admission fraction 0.9); G1024 is not a fixed-shape point."
+  },
+  "glm-dsa-diverse-v2": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "glm-dsa-diverse-v1 with a row sampling form both BatchGen and SGLang accept: top_k omitted (disabled in both engines; SGLang rejects top_k=0), temperature 1.0 / top_p 1.0, and the thinking switch both as top-level enable_thinking (BatchGen) and chat_template_kwargs.enable_thinking (SGLang). Same strata, bands, sources and selection as v1, so the prompts are identical row for row.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261009,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "Bands and weights keep G512 (64 rows/rank) admissible at once with ~10% page margin on the 2026-10-08 H200 engine (2982 pages/rank, admission fraction 0.9); G1024 is not a fixed-shape point."
+  },
+  "k3-diverse-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Matched-concurrency single-batch workload of the Kimi-K3 4-node H20 decode campaign: a realistic eval mix of distinct prompts sampled at temperature 1, in the cross-engine row form of glm-dsa-diverse-v2 (top_k omitted; thinking both as top-level enable_thinking for BatchGen and chat_template_kwargs.enable_thinking for SGLang). K3 is hybrid KDA+MLA with no DSA, so the S/X/L strata carry no index_topk boundary semantics; their bands and weights are kept identical to glm-dsa-diverse-v1 for cross-campaign comparability.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261029,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "Target G512. Admission numbers for the K3 H20 engine (per-rank GPU KV pages, world size) are TBD and must be passed at build time via --gpu-pool-pages/--world-size; the build refuses a workload that cannot be admitted at once."
+  },
+  "glm-dsa-diverse-short-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Supplementary GLM-5.x cell: every row stays at or below index_topk for the whole run, so the all-short attention path is exercised. Never a substitute for glm-dsa-diverse-v1.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "enable_thinking": true,
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261009,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "S"
+   ],
+   "min_stratum_fraction": 1.0
+  },
+  "glm-dsa-diverse-short-v2": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "glm-dsa-diverse-short-v1 with the v2 cross-engine row sampling form (see glm-dsa-diverse-v2). Never a substitute for glm-dsa-diverse-v2.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261009,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "S"
+   ],
+   "min_stratum_fraction": 1.0
+  },
+  "moe-diverse-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Single-batch decode workload for MoE models without DSA: distinct MMLU-Pro prompts sampled at temperature 1.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "enable_thinking": true,
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261009,
+   "strata": {
+    "M": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1000,
+      1600
+     ],
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "M"
+   ],
+   "min_stratum_fraction": 1.0
+  },
+  "moe-matrix-exact-ctx-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "run_test.sh wave-matrix lane for MoE models: distinct MMLU-Pro rows padded to one exact prompt length per cell, sampled at temperature 1. For DSA models run_decode_matrix.sh requires context cells on both sides of index_topk.",
+   "lane": "wave_matrix",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "ignore_eos": true
+  },
+  "forest-v1": {
+   "workload_kind": "prefix",
+   "workload_class": "prefix-reuse",
+   "description": "GPT-OSS prefix-reuse workload W3: a prefix forest with high prefix variance (6 application families with shared system prompts, 79 shared documents, multi-turn threads, edited variants, private attachments, 8% cold requests; interleaved order that keeps turns in order).",
+   "source_plan": "tairan/prefix-kv-integrity-stress:plans/prefix-reuse-gptoss-h200/perf-v2.md (section 4, W3)",
+   "data_file": "w3_forest_v1/forest.jsonl",
+   "data_digest": null,
+   "digest_note": "The source plan records only the truncated prefix a69442be... of the forest.jsonl SHA-256, and no file on branch tairan/prefix-kv-integrity-stress records the full value. The full digest is the inputs.forest.sha256 field of the manifest.json that scripts/prefix_reuse_forest_workload.py writes beside forest.jsonl in the w3_forest_v1 artifact directory; copy it from that manifest, or from sha256 of the artifact's forest.jsonl, and confirm it starts with a69442be.",
+   "generator": {
+    "script": "scripts/prefix_reuse_forest_workload.py",
+    "commit": "1115a338a417c053e7ed8c61638a6960e6663789",
+    "arguments": "defaults",
+    "corpus": "1,206 BatchGen source and doc files at BatchGen 91c06026, special-token text escaped"
+   },
+   "request_count": 2399,
+   "questions": {
+    "lookup": 1204,
+    "sum": 706,
+    "summary": 489
+   },
+   "request_parameters": {
+    "source": "body() and KINDS in scripts/prefix_reuse_forest_workload.py at the generator commit",
+    "model": "openai/gpt-oss-120b",
+    "temperature": 0,
+    "reasoning_effort": "low",
+    "max_tokens": {
+     "lookup": 256,
+     "sum": 512,
+     "summary": 1024
+    }
+   }
+  },
+  "k3-diverse-v1c": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Completions-format twin of k3-diverse-v1: identical selection seed, strata, sampling and content; the chat template (enable_thinking=true) is pre-rendered to prompt text by the BatchGen tokenizer so a foreign engine tokenizes exactly the predicted prompt tokens. Row-for-row token-identical to k3-diverse-v1.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "ignore_eos": true,
+   "max_completion_tokens": 1024,
+   "selection_seed": 20261029,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "Target G512. Admission numbers for the K3 H20 engine (per-rank GPU KV pages, world size) are TBD and must be passed at build time via --gpu-pool-pages/--world-size; the build refuses a workload that cannot be admitted at once.",
+   "request_format": "completions"
+  },
+  "k3-diverse-e2e-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "k3-diverse-v1 as an end-to-end batch workload: the same strata, sources, sampling and cross-engine row form, but natural stopping (no ignore_eos) with an 8192-token completion cap, 2048 distinct prompts.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": false,
+   "max_completion_tokens": 8192,
+   "selection_seed": 20261029,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "Target G2048 on the 4x8 H20 engine (20000 pages/rank, admission 0.9): 64 rows/rank at <= ceil((2600+8192)/64)=169 pages each stays under the 18000-page cap, so the batch is admissible at once."
+  },
+  "glm-dsa-e2e-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "glm-dsa-diverse-v2 as an end-to-end batch workload: natural stopping (no ignore_eos) with an 8192-token completion cap, 2048 distinct prompts; on one 8xH200 node the batch is oversubscribed by design and runs in waves, so runs of this profile are end-to-end rows, not fixed-shape decode rows.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": false,
+   "max_completion_tokens": 8192,
+   "selection_seed": 20261009,
+   "strata": {
+    "S": {
+     "source": "mmlu_pro",
+     "shots": [
+      2,
+      3
+     ],
+     "prompt_tokens": [
+      600,
+      1000
+     ],
+     "weight": 0.45
+    },
+    "X": {
+     "source": "mmlu_pro",
+     "shots": [
+      5
+     ],
+     "prompt_tokens": [
+      1100,
+      1900
+     ],
+     "weight": 0.3
+    },
+    "L": {
+     "source": "longbench",
+     "prompt_tokens": [
+      2100,
+      2600
+     ],
+     "weight": 0.25
+    }
+   },
+   "required_strata": [
+    "S",
+    "X",
+    "L"
+   ],
+   "min_stratum_fraction": 0.2,
+   "capacity_note": "G2048 on one 8xH200 node (2982 pages/rank) is deliberately oversubscribed: build with --allow-oversubscribed; the engine admits in waves and the measured quantity is batch completion time."
+  },
+  "glm-long-e2e-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Long-context fixed-length stress: longbench documents at 6000-8000 prompt tokens with ignore_eos and a fixed 4096-token completion, 512 distinct prompts. Every row decodes the full 4096 tokens, so decode runs at the GPU-KV-pool-bound concurrency for the whole run with no EOS drain tail; the measured quantities are batch completion time and sustained decode throughput at a large per-row KV footprint.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": true,
+   "max_completion_tokens": 4096,
+   "selection_seed": 20261102,
+   "strata": {
+    "LL": {
+     "source": "longbench",
+     "prompt_tokens": [
+      6000,
+      8000
+     ],
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "LL"
+   ],
+   "min_stratum_fraction": 1.0,
+   "capacity_note": "512 rows x (~7k prompt + 4096 completion) ~= 5.7M KV tokens; a 50 GiB/rank unified pool holds ~0.6M tokens, so the run is ~10x oversubscribed and admits in pool-bound waves: build with --allow-oversubscribed."
+  },
+  "lcb-fixed4096-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "LiveCodeBench medium and hard competitive-programming prompts at natural length, ignore_eos with a fixed 4096-token completion, 512 distinct problems. Shared by GLM-5.3 and Kimi-K3 and by the SGLang arm. Natural completion length is measured by a separate pilot, not assumed.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": true,
+   "max_completion_tokens": 4096,
+   "selection_seed": 20261103,
+   "strata": {
+    "C": {
+     "source": "livecodebench",
+     "prompt_tokens": [
+      1,
+      4000
+     ],
+     "difficulties": [
+      "medium",
+      "hard"
+     ],
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "C"
+   ],
+   "min_stratum_fraction": 1.0,
+   "capacity_note": "Oversubscribes the GPU KV pool on one 8xH200 node: build with --allow-oversubscribed."
+  },
+  "nqa64k-grouped-v1": {
+   "workload_kind": "decode",
+   "workload_class": "prefix-reuse",
+   "description": "Document-grouped long-prefix batch: 64 distinct NarrativeQA books truncated to a 64k-token shared prefix, 8 questions per book (512 rows). Distinct groups share distinct prefixes (RAG/doc-QA shape). EOS honoured with a 4096-token cap, thinking on; decided with the release owner 2026-11-03 (forced decode rejected to avoid post-EOS gibberish steering expert routing).",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": false,
+   "max_completion_tokens": 4096,
+   "selection_seed": 20261103,
+   "strata": {
+    "G": {
+     "source": "narrativeqa_grouped",
+     "groups": 64,
+     "rows_per_group": 8,
+     "prefix_tokens_target": 64000,
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "G"
+   ],
+   "min_stratum_fraction": 1.0,
+   "capacity_note": "Massively oversubscribes the GPU KV pool (512 x ~64.1k prompt tokens); host-KV streaming and prefix reuse are the mechanisms under test: build with --allow-oversubscribed."
+  },
+  "nqa64k-distinct-v1": {
+   "workload_kind": "decode",
+   "workload_class": "fixed-shape",
+   "description": "Distinct-document pure long-prefill batch: 312 distinct NarrativeQA books (train and test splits pooled, one row per book) each truncated to a 64k-token prefix with one question (312 rows; the train+test pool holds 389 books that survive a 260k-char pre-filter and 317 that still reach 64k tokens under the GLM tokenizer). Cross-sequence prefix reuse is ~0.1% by construction (only the shared chat-template header), so the workload measures raw long-context prefill and oversubscribed decode without any reuse mechanism in play. Controlled A/B twin of nqa64k-grouped-v1: ~20.0M total prompt tokens, same sampling and EOS contract; the only variable is the reuse structure.",
+   "lane": "single_batch",
+   "distinct_prompts": true,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "ignore_eos": false,
+   "max_completion_tokens": 4096,
+   "selection_seed": 20261105,
+   "strata": {
+    "G": {
+     "source": "narrativeqa_grouped",
+     "groups": 389,
+     "rows_per_group": 1,
+     "prefix_tokens_target": 64000,
+     "weight": 1.0
+    }
+   },
+   "required_strata": [
+    "G"
+   ],
+   "min_stratum_fraction": 1.0,
+   "capacity_note": "Massively oversubscribes the GPU KV pool (312 x ~64.1k prompt tokens) with no cross-row prefix sharing available; host-KV streaming and prefill scheduling are the mechanisms under test: build with --allow-oversubscribed."
+  }
+ },
+ "pending_profiles_comment": "Prefix-reuse family profiles not registered yet: controlled prefix-tree, long-tail, re-entry.",
+ "models": [
+  {
+   "name": "glm-5.x",
+   "match": [
+    "glm5",
+    "glm52",
+    "glm53",
+    "glm5-fp8",
+    "~(^|/)GLM-5(\\.\\d+)?(-FP8)?/?$"
+   ],
+   "moe": true,
+   "dsa_index_topk": 2048,
+   "mmlu_template": "glm5",
+   "profiles": {
+    "single_batch": [
+     "glm-dsa-diverse-v1",
+     "glm-dsa-diverse-short-v1",
+     "glm-dsa-diverse-v2",
+     "glm-dsa-diverse-short-v2",
+     "glm-dsa-e2e-v1",
+     "glm-long-e2e-v1",
+     "lcb-fixed4096-v1",
+     "nqa64k-grouped-v1",
+     "nqa64k-distinct-v1"
+    ],
+    "wave_matrix": [
+     "moe-matrix-exact-ctx-v1"
+    ]
+   }
+  },
+  {
+   "name": "kimi-k2.5",
+   "match": [
+    "k25",
+    "kimi-k25",
+    "~(^|/)Kimi-K2\\.5/?$"
+   ],
+   "moe": true,
+   "mmlu_template": "kimi-k25",
+   "profiles": {
+    "single_batch": [
+     "moe-diverse-v1"
+    ],
+    "wave_matrix": [
+     "moe-matrix-exact-ctx-v1"
+    ]
+   }
+  },
+  {
+   "name": "kimi-k3",
+   "match": [
+    "k3",
+    "kimi-k3",
+    "~(^|/)Kimi-K3/?$"
+   ],
+   "moe": true,
+   "mmlu_template": "kimi-k3",
+   "profiles": {
+    "single_batch": [
+     "k3-diverse-v1",
+     "k3-diverse-v1c",
+     "k3-diverse-e2e-v1",
+     "lcb-fixed4096-v1"
+    ],
+    "wave_matrix": []
+   }
+  },
+  {
+   "name": "minimax-m2.5",
+   "match": [
+    "minimax",
+    "minimax-m25",
+    "~(^|/)MiniMax-M2\\.5/?$"
+   ],
+   "moe": true,
+   "mmlu_template": "minimax",
+   "profiles": {
+    "single_batch": [
+     "moe-diverse-v1"
+    ],
+    "wave_matrix": [
+     "moe-matrix-exact-ctx-v1"
+    ]
+   }
+  },
+  {
+   "name": "gpt-oss",
+   "match": [
+    "gptoss",
+    "gpt-oss",
+    "~(^|/)gpt-oss-[^/]+/?$"
+   ],
+   "moe": true,
+   "mmlu_template": "gpt-oss",
+   "profiles": {
+    "single_batch": [
+     "moe-diverse-v1"
+    ],
+    "wave_matrix": [
+     "moe-matrix-exact-ctx-v1"
+    ]
+   }
+  },
+  {
+   "name": "deepseek-v4-flash",
+   "match": [
+    "deepseek-v4-flash",
+    "~(^|/)DeepSeek-V4-Flash/?$"
+   ],
+   "moe": true,
+   "mmlu_template": "deepseek-v4-flash",
+   "profiles": {
+    "single_batch": [
+     "moe-diverse-v1"
+    ],
+    "wave_matrix": [
+     "moe-matrix-exact-ctx-v1"
+    ]
+   }
+  }
+ ]
+}
