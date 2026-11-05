@@ -257,7 +257,7 @@ class ServerArgs:
     detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
     # Dynamic host KV reservation settings
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
-    host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
+    host_kv_eviction_watermark: int = 10  # Deprecated, ignored: host-KV eviction is growth-driven only
     enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
     adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
     adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
@@ -701,7 +701,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host-kv-eviction-watermark",
         type=int,
         default=10,
-        help="Trigger host KV eviction when free pages drop below this percentage (default: 10)",
+        help=(
+            "[Deprecated] Ignored. Host-KV eviction is driven only by growth "
+            "debt that free pages cannot cover; a free-page watermark no "
+            "longer evicts active sequences."
+        ),
     )
     parser.add_argument(
         "--enable-host-kv-eviction",
@@ -924,8 +928,8 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_chunk_size <= 0:
         raise ValueError("host_kv_chunk_size must be positive")
-    if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
-        raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
+    # host_kv_eviction_watermark is deprecated and ignored: accept any value so
+    # existing launch scripts keep working.
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
     if args.adaptive_chunk_max < args.adaptive_chunk_min:

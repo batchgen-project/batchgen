@@ -60,7 +60,6 @@ def _plan(state, *, free_pages, enable_host_kv_eviction=False):
         world_size=_GPN,
         num_gpus_per_node=_GPN,
         enable_host_kv_eviction=enable_host_kv_eviction,
-        host_kv_eviction_watermark=0,
     ))
 
 
@@ -111,3 +110,24 @@ def test_eviction_credits_only_owned_pages():
     assert plan.host_evicted_uuids == ["victim0", "victim1", "victim2"]
     assert plan.growth_feasible is True
     assert plan.scheduler_error is None
+
+
+def test_full_pool_without_growth_evicts_nothing():
+    # Regression for the distinct long-context collapse: the pool is
+    # legitimately full of active rows with NO growth debt. The boundary must
+    # leave every row in decode — a free-page watermark is not an eviction
+    # trigger.
+    state = {
+        f"active{i}": _state(
+            completed=False, allocated=61, owned=29, decoded_length=100 + i
+        )
+        for i in range(7)
+    }
+    plan = _plan(state, free_pages=2, enable_host_kv_eviction=True)
+    assert plan.host_evicted_uuids == []
+    # growth_feasible means "there is growth to execute", so it stays False
+    # when no row carries debt; the important part is no error and no row
+    # removed from decode.
+    assert plan.scheduler_error is None
+    assert sorted(plan.decode_uuids_final) == sorted(state)
+    assert plan.onhold_uuids == []

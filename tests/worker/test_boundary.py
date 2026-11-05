@@ -62,7 +62,7 @@ def _meta(gidx, *, priority=0, ctx=100, cap=4096, host_pages=2):
 def _req(
     *, decode_uuids, global_seq_state, per_rank_free, world_size,
     global_candidate_info=None, per_node_host_stats=None, seq_meta=None,
-    chunk_size=64, enable_host_kv_eviction=False, host_kv_eviction_watermark=10,
+    chunk_size=64, enable_host_kv_eviction=False,
     attn_tp_size=1, per_rank_total=None, max_rank_bsz=0,
 ):
     if seq_meta is None:
@@ -79,7 +79,6 @@ def _req(
         world_size=world_size,
         num_gpus_per_node=_GPN,
         enable_host_kv_eviction=enable_host_kv_eviction,
-        host_kv_eviction_watermark=host_kv_eviction_watermark,
         attn_tp_size=attn_tp_size,
         max_rank_bsz=max_rank_bsz,
     )

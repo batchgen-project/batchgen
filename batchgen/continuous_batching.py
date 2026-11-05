@@ -470,7 +470,6 @@ def plan_host_kv_growth_evictions(
     free_pages: int,
     total_pages: int,
     completed_pages: int,
-    watermark_percent: float,
     safety_margin: int,
     strategy: EvictionStrategy = EvictionStrategy.SHORTEST_FIRST,
     page_key: str = "host_pages_allocated",
@@ -481,15 +480,21 @@ def plan_host_kv_growth_evictions(
     that needs host growth must either have enough free pages to grow, or must
     have been removed from decode. This planner accounts for pages that will be
     released by completed rows before growth, then selects deterministic
-    eviction candidates until both the free-page watermark and the remaining
-    growth debt plus reserve are satisfied.
+    eviction candidates until the remaining growth debt plus the safety
+    reserve is satisfied.
+
+    Eviction is strictly growth-driven: a full pool whose active rows carry no
+    growth debt evicts nothing. Admission deliberately fills the pool with
+    full reservations, so a free-page watermark must not force active rows
+    out — an evicted row loses its whole decode state and re-enters as a full
+    prompt recompute, which costs far more than whatever headroom the
+    watermark would buy.
     """
     if len(host_growth_uuids) != len(host_growth_pages):
         raise ValueError("host_growth_uuids and host_growth_pages must align")
 
     completed_set = set(completed_uuids)
     base_free = min(max(total_pages, 0), max(free_pages, 0) + max(completed_pages, 0))
-    target_free = int(max(total_pages, 0) * max(watermark_percent, 0.0) / 100.0)
     growth_by_uuid = {
         uuid: pages
         for uuid, pages in zip(host_growth_uuids, host_growth_pages)
@@ -530,8 +535,7 @@ def plan_host_kv_growth_evictions(
 
     while True:
         expected_free = min(max(total_pages, 0), base_free + freed_pages)
-        growth_required_free = remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
-        required_free = max(target_free, growth_required_free)
+        required_free = remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
         if expected_free >= required_free:
             break
 
@@ -555,9 +559,8 @@ def plan_host_kv_growth_evictions(
     remaining_growth_uuids = [uuid for uuid in host_growth_uuids if uuid in growth_by_uuid]
     remaining_growth_pages = [growth_by_uuid[uuid] for uuid in remaining_growth_uuids]
     expected_free = min(max(total_pages, 0), base_free + freed_pages)
-    required_free = max(
-        target_free,
-        remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0,
+    required_free = (
+        remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
     )
     growth_feasible = remaining_growth == 0 or expected_free >= remaining_growth + max(safety_margin, 0)
 

@@ -17,8 +17,7 @@ here:
     static ``global_idx``; this avoids enlarging the broadcast payload).
   - ``self._get_node_for_rank(rank)`` → ``rank // num_gpus_per_node``
     (equivalent: the single-node case collapses to 0).
-  - ``self.{world_size, enable_host_kv_eviction, host_kv_eviction_watermark}``
-    → request fields.
+  - ``self.{world_size, enable_host_kv_eviction}`` → request fields.
 
 The actual per-node growth/eviction math and the loading selection are
 the pre-existing pure helpers ``plan_host_kv_growth_evictions`` and
@@ -75,7 +74,6 @@ class BoundaryDecisionRequest:
     world_size: int
     num_gpus_per_node: int
     enable_host_kv_eviction: bool
-    host_kv_eviction_watermark: int
     # Decode attention TP size.  G==1 is pure DP; G>1 makes each sequence
     # resident on the contiguous G ranks of ``decode_dp_group``.
     attn_tp_size: int = 1
@@ -110,7 +108,6 @@ class BoundaryHandler:
         world_size = req.world_size
         gpn = req.num_gpus_per_node
         enable_host_kv_eviction = req.enable_host_kv_eviction
-        host_kv_eviction_watermark = req.host_kv_eviction_watermark
         group_size = int(req.attn_tp_size)
         if group_size <= 0 or world_size % group_size != 0:
             raise ValueError(
@@ -213,10 +210,11 @@ class BoundaryHandler:
             else:
                 active_uuids.append(uuid)
 
-        # Host KV growth + eviction decisions. Growth and eviction must be
-        # planned together: if growth is needed, watermark-only eviction is not
-        # enough. The plan reserves enough free pages for remaining growth debt
-        # after completed and evicted rows release their host pages.
+        # Host KV growth + eviction decisions. Growth and eviction are planned
+        # together and eviction is strictly growth-driven: the plan reserves
+        # enough free pages for the remaining growth debt (plus the safety
+        # margin) after completed and evicted rows release their host pages,
+        # and evicts nothing when no active row carries growth debt.
         host_growth_uuids = []
         host_growth_pages_list = []
         for uuid in active_uuids:
@@ -304,7 +302,6 @@ class BoundaryHandler:
                     free_pages=free_pages,
                     total_pages=total_pages,
                     completed_pages=completed_host_pages,
-                    watermark_percent=host_kv_eviction_watermark if enable_host_kv_eviction else 0,
                     safety_margin=safety_margin,
                     strategy=EvictionStrategy.SHORTEST_FIRST,
                     page_key='host_owned_pages',

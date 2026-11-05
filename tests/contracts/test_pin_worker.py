@@ -217,7 +217,6 @@ PINS = {
                 "persistent_phase_instances",
                 "detokenization_include_special_tokens",
                 "host_kv_chunk_size",
-                "host_kv_eviction_watermark",
                 "enable_host_kv_eviction",
                 "adaptive_chunk",
                 "adaptive_chunk_min",
