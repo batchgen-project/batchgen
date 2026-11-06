@@ -1170,3 +1170,24 @@ def test_parallel_copy_raises_on_a_source_that_ends_early(env, tmp_path):
     (env.ckpt / shard).write_bytes(b"")
     with pytest.raises(sb.K3StoreBuilderError, match="ended|I/O error"):
         sb.write_store(plan, tmp_path / "truncated.bin", copy_workers=4)
+
+
+def test_a_failing_copy_worker_publishes_nothing(env, monkeypatch):
+    output = env.tmp / "node0"
+    plan = env.plan()
+    doomed = sorted({record.shard_file for record in plan.local_records})[-1]
+    real_copy_span = sb._copy_span
+
+    def failing_copy_span(source, descriptor, record, view, source_path, store_path):
+        if record.shard_file == doomed:
+            raise sb.K3StoreBuilderError(
+                f"{source_path} ended 1 B early while reading {record.ckpt_name}"
+            )
+        return real_copy_span(
+            source, descriptor, record, view, source_path, store_path
+        )
+
+    monkeypatch.setattr(sb, "_copy_span", failing_copy_span)
+    with pytest.raises(sb.K3StoreBuilderError, match="ended 1 B early"):
+        env.build(output, 0)
+    assert sorted(path.name for path in output.iterdir()) == [sb.LOCK_FILE_NAME]

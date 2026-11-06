@@ -1031,13 +1031,18 @@ def write_store(
                 f"cannot size {store_path} to {plan.store_bytes} B: {error}"
             ) from error
 
+        thread_state = threading.local()
+
         def copy_shard(shard_file: str) -> Tuple[Dict[int, bytes], int]:
             nonlocal progress_bytes
             source_path = plan.converted_ckpt / shard_file
             records = sorted(
                 by_shard[shard_file], key=lambda record: record.source_offset
             )
-            view = memoryview(bytearray(read_buffer_bytes))
+            view = getattr(thread_state, "view", None)
+            if view is None:
+                view = memoryview(bytearray(read_buffer_bytes))
+                thread_state.view = view
             try:
                 source = open(source_path, "rb", buffering=0)
             except OSError as error:
