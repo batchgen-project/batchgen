@@ -32,6 +32,7 @@ import distutils.ccompiler
 import distutils.log
 import distutils.sysconfig
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -78,6 +79,22 @@ def installed_cuda_version(name=""):
     # Ignore patch versions, only look at major + minor
     cuda_major, cuda_minor = release[:2]
     return int(cuda_major), int(cuda_minor)
+
+
+_COMPUTE_CAPABILITY = re.compile(r"(\d+)\.(\d+)[a-z]?(\+PTX)?")
+
+
+def parse_compute_capability(cc: str):
+    """Split a TORCH_CUDA_ARCH_LIST entry such as "9.0", "10.0" or "8.6+PTX".
+
+    Majors may have two digits (Blackwell is 10.x/12.x), so the entry is parsed
+    by its "." separator, never by character position. An arch-specific suffix
+    such as the "a" in "9.0a" is accepted and ignored, as before.
+    """
+    match = _COMPUTE_CAPABILITY.fullmatch(cc.strip())
+    if match is None:
+        raise ValueError(f"malformed compute capability {cc!r}")
+    return int(match.group(1)), int(match.group(2)), match.group(3) is not None
 
 
 def get_default_compute_capabilities():
@@ -674,12 +691,13 @@ class CUDAOpBuilder(OpBuilder):
         args = []
         self.enable_bf16 = True
         for cc in ccs:
-            num = cc[0] + cc[2]
+            major, minor, ptx = parse_compute_capability(cc)
+            num = f"{major}{minor}"
             args.append(f"-gencode=arch=compute_{num},code=sm_{num}")
-            if cc.endswith("+PTX"):
+            if ptx:
                 args.append(f"-gencode=arch=compute_{num},code=compute_{num}")
 
-            if int(cc[0]) <= 7:
+            if major <= 7:
                 self.enable_bf16 = False
 
         return args
