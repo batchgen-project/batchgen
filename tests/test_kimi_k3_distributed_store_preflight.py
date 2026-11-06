@@ -312,6 +312,10 @@ def test_replicated_weights_outside_multinode_k3_is_refused(tmp_path, model, nno
 def test_k3_is_the_registered_identity_not_a_substring(tmp_path):
     is_k3 = server_args_module._is_kimi_k3_model
     assert is_k3("moonshotai/Kimi-K3")
+    # K3.1 is K3 plus the DSA indexer on the same store layout; like K3 its
+    # converted checkpoint does not fit one node's host memory, so it takes
+    # the distributed store (and the multi-node default) too.
+    assert is_k3("moonshotai/Kimi-K3.1-Pro")
     assert not is_k3("moonshotai/Kimi-Linear-48B-A3B-Instruct")
     assert not is_k3("openai/gpt-oss-120b")
     # Not bound to kimi_k3 by the registry, so the default flip does not
