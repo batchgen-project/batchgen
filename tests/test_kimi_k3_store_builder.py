@@ -1367,3 +1367,138 @@ def test_a_restored_store_is_reverified_by_reread(env, monkeypatch):
     )
     env.build(env.tmp / "second", 0, extra=_cache_args(env))
     assert calls == [1]
+
+
+# --------------------------------------------------------------------------- #
+#  Adaptive concurrency                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_controller_doubles_while_doubling_pays():
+    assert sb._next_worker_level([(4, 100.0)], 64) == (8, False)
+    assert sb._next_worker_level([(4, 100.0), (8, 190.0)], 64) == (16, False)
+
+
+def test_controller_settles_on_the_best_level_when_gain_stalls():
+    assert sb._next_worker_level([(4, 100.0), (8, 105.0)], 64) == (8, True)
+
+
+def test_controller_steps_back_when_doubling_loses():
+    assert sb._next_worker_level([(4, 100.0), (8, 160.0), (16, 90.0)], 64) == (
+        8,
+        True,
+    )
+
+
+def test_controller_stops_at_the_limit():
+    assert sb._next_worker_level([(4, 100.0), (8, 200.0)], 8) == (8, True)
+
+
+def _fast_adaptive(monkeypatch, start=1, cap=16):
+    monkeypatch.setattr(sb, "ADAPTIVE_START_WORKERS", start)
+    monkeypatch.setattr(sb, "ADAPTIVE_MAX_WORKERS", cap)
+    monkeypatch.setattr(sb, "ADAPTIVE_SETTLE_S", 0.02)
+    monkeypatch.setattr(sb, "ADAPTIVE_WINDOW_S", 0.15)
+    monkeypatch.setattr(sb.os, "cpu_count", lambda: 64)
+
+
+def test_adaptive_pool_grows_on_scalable_work(monkeypatch, caplog):
+    import time as _time
+
+    _fast_adaptive(monkeypatch)
+    peak = {"now": 0, "max": 0}
+    lock = __import__("threading").Lock()
+
+    def work(item, progress):
+        with lock:
+            peak["now"] += 1
+            peak["max"] = max(peak["max"], peak["now"])
+        _time.sleep(0.01)
+        progress(1 << 20)
+        with lock:
+            peak["now"] -= 1
+        return item * 2
+
+    caplog.set_level("INFO")
+    out = sb._parallel_map(list(range(600)), work, None, "probe")
+    assert out == [item * 2 for item in range(600)]
+    assert peak["max"] >= 2, "independent sleeps must grow past the start level"
+
+
+def test_adaptive_pool_holds_on_serialized_work(monkeypatch, caplog):
+    import threading as _threading
+    import time as _time
+
+    _fast_adaptive(monkeypatch, start=2, cap=64)
+    monkeypatch.setattr(sb, "ADAPTIVE_WINDOW_S", 0.4)
+    bottleneck = _threading.Lock()
+
+    def work(item, progress):
+        with bottleneck:
+            _time.sleep(0.004)
+        progress(1 << 20)
+        return item
+
+    caplog.set_level("INFO")
+    sb._parallel_map(list(range(1500)), work, None, "probe")
+    settled = [rec.message for rec in caplog.records if "settling at" in rec.message]
+    assert settled, "a bandwidth-bound workload must settle"
+    level = int(settled[-1].rsplit("settling at ", 1)[1])
+    # Noisy windows may buy a spurious doubling or two (the decision rule is
+    # pinned by the pure-function tests above); climbing all the way to the
+    # cap would mean the controller cannot see a flat throughput curve.
+    assert level < 64
+
+
+def test_adaptive_pool_raises_the_first_failure_in_item_order(monkeypatch):
+    _fast_adaptive(monkeypatch, start=4)
+
+    def work(item, progress):
+        if item in (7, 3):
+            raise ValueError(f"item {item}")
+        return item
+
+    with pytest.raises(ValueError, match="item 3"):
+        sb._parallel_map(list(range(20)), work, None, "probe")
+
+
+def test_small_chunks_split_shards_and_stay_byte_identical(env, monkeypatch):
+    serial = env.tmp / "serial"
+    env.build(serial, 0, extra=("--copy-workers", "1"))
+    plan = env.plan()
+    whole = len({record.shard_file for record in plan.local_records})
+    monkeypatch.setattr(sb, "COPY_CHUNK_BYTES", 1)
+    assert len(sb._copy_chunks(plan)) > whole
+    chunked = env.tmp / "chunked"
+    env.build(chunked, 0, extra=("--copy-workers", "auto"))
+    assert (chunked / sb.STORE_FILE_NAME).read_bytes() == (
+        serial / sb.STORE_FILE_NAME
+    ).read_bytes()
+    one = json.loads((serial / sb.MANIFEST_FILE_NAME).read_text())
+    two = json.loads((chunked / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        two.pop(volatile)
+    assert one == two
+
+
+def test_worker_flags_accept_auto_and_reject_garbage(env):
+    env.build(env.tmp / "auto", 0, extra=("--copy-workers", "auto", "--hash-workers", "auto"))
+    with pytest.raises(SystemExit):
+        env.build(env.tmp / "bad", 0, extra=("--copy-workers", "many"))
+    with pytest.raises(sb.K3StoreBuilderError, match="--hash-workers"):
+        env.build(env.tmp / "zero", 0, extra=("--hash-workers", "0"))
+
+
+def test_copy_chunks_interleave_shards(env, monkeypatch):
+    plan = env.plan()
+    shards = sorted({record.shard_file for record in plan.local_records})
+    monkeypatch.setattr(sb, "COPY_CHUNK_BYTES", 1)
+    chunks = sb._copy_chunks(plan)
+    assert [shard for shard, _ in chunks[: len(shards)]] == shards
+    # Every local record is copied exactly once, each chunk in source order.
+    rows = [record.row for _, records in chunks for record in records]
+    assert sorted(rows) == sorted(record.row for record in plan.local_records)
+    for _, records in chunks:
+        offsets = [record.source_offset for record in records]
+        assert offsets == sorted(offsets)

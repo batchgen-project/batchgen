@@ -109,6 +109,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -182,15 +183,30 @@ H200_RAIL_DEVICES = tuple(f"mlx5_bond_{index}:1" for index in range(8))
 #: is ever assembled in memory.
 DEFAULT_READ_BUFFER_BYTES = 64 * 1024 * 1024
 
-#: Threads for the verification re-read. ``hashlib`` releases the GIL while
-#: hashing large buffers, so segments hash in parallel.
-DEFAULT_HASH_WORKERS = 8
+#: Threads for the copy and for the verification re-read. Reads, hashing and
+#: ``os.pwrite`` all release the GIL, so work items run in parallel. ``None``
+#: means adaptive: the right count depends on the storage (a network
+#: filesystem saturates at some number of concurrent streams and can degrade
+#: past it; a local NVMe is bound by hashing cores), so it is measured at run
+#: time instead of fixed. Memory stays bounded at one read buffer per thread.
+DEFAULT_HASH_WORKERS: Optional[int] = None
+DEFAULT_COPY_WORKERS: Optional[int] = None
 
-#: Threads for the copy. Reads, hashing and ``os.pwrite`` all release the
-#: GIL, and a shared filesystem needs several concurrent streams to reach
-#: its read bandwidth, so shards copy in parallel. Memory stays bounded at
-#: ``copy_workers`` read buffers.
-DEFAULT_COPY_WORKERS = 8
+#: Copy work item size. Each item is one contiguous run of a shard's spans in
+#: source order, read through its own file descriptor, so access stays
+#: sequential inside an item while parallelism is not capped by the number
+#: of source files.
+COPY_CHUNK_BYTES = 1 << 30
+
+#: Adaptive concurrency. Start at ADAPTIVE_START_WORKERS, measure throughput
+#: for ADAPTIVE_WINDOW_S after ADAPTIVE_SETTLE_S at each level, double while
+#: a doubling still gains at least ADAPTIVE_MIN_GAIN, then hold at the best
+#: measured level (stepping back if the last doubling lost throughput).
+ADAPTIVE_START_WORKERS = 4
+ADAPTIVE_MAX_WORKERS = 64
+ADAPTIVE_SETTLE_S = 2.0
+ADAPTIVE_WINDOW_S = 8.0
+ADAPTIVE_MIN_GAIN = 0.10
 
 #: First line of ``metadata.tsv``. The reader skips any row whose first field
 #: is ``H`` (``Weights_Storage.cpp:379-381``).
@@ -993,6 +1009,166 @@ class CopyResult:
     shards: List[Dict[str, Any]]
 
 
+def _next_worker_level(
+    history: Sequence[Tuple[int, float]], limit: int
+) -> Tuple[int, bool]:
+    """Hill-climbing step: ``history`` is ``(workers, bytes_per_s)`` per level.
+
+    Returns ``(next_level, settled)``. Doubles while the latest doubling
+    gained at least :data:`ADAPTIVE_MIN_GAIN`; otherwise settles on the best
+    measured level, which steps back when the latest doubling lost throughput.
+    """
+    level, rate = history[-1]
+    grew = len(history) == 1 or rate >= history[-2][1] * (1 + ADAPTIVE_MIN_GAIN)
+    if grew and level < limit:
+        return min(level * 2, limit), False
+    best_level, _ = max(history, key=lambda entry: (entry[1], -entry[0]))
+    return best_level, True
+
+
+class _Gate:
+    """A semaphore whose capacity the controller can raise or lower."""
+
+    def __init__(self, level: int) -> None:
+        self._condition = threading.Condition()
+        self._level = level
+        self._active = 0
+
+    def set_level(self, level: int) -> None:
+        with self._condition:
+            self._level = level
+            self._condition.notify_all()
+
+    def __enter__(self) -> "_Gate":
+        with self._condition:
+            while self._active >= self._level:
+                self._condition.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+
+def _parallel_map(
+    items: Sequence[Any],
+    work: Any,
+    workers: Optional[int],
+    label: str,
+) -> List[Any]:
+    """``[work(item, progress) for item in items]`` on parallel threads.
+
+    ``work`` reports bytes processed through ``progress(nbytes)``. With an
+    explicit ``workers`` count the pool is fixed; with ``None`` the count is
+    found at run time by :func:`_next_worker_level`, so the same code
+    saturates a network filesystem, a local NVMe or a tmpfs re-read without
+    knowing which it is. Results keep item order; the first failing item (in
+    item order) re-raises after every thread stopped.
+    """
+    count = len(items)
+    if count == 0:
+        return []
+    if workers is not None:
+        size = max(1, min(workers, count))
+        with ThreadPoolExecutor(max_workers=size) as pool:
+            return list(pool.map(lambda item: work(item, _no_progress), items))
+
+    limit = max(1, min(ADAPTIVE_MAX_WORKERS, os.cpu_count() or 1, count))
+    level = min(ADAPTIVE_START_WORKERS, limit)
+    gate = _Gate(level)
+    lock = threading.Lock()
+    state = {"next": 0, "bytes": 0}
+    results: List[Any] = [None] * count
+    errors: Dict[int, BaseException] = {}
+    stop = threading.Event()
+
+    def progress(nbytes: int) -> None:
+        with lock:
+            state["bytes"] += nbytes
+
+    def run() -> None:
+        while not stop.is_set():
+            with gate:
+                if stop.is_set():
+                    return
+                with lock:
+                    index = state["next"]
+                    state["next"] += 1
+                if index >= count:
+                    return
+                try:
+                    results[index] = work(items[index], progress)
+                except BaseException as error:  # re-raised by the caller
+                    errors[index] = error
+                    stop.set()
+                    return
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(limit)]
+    for thread in threads:
+        thread.start()
+
+    def wait(seconds: float) -> bool:
+        """Sleep up to ``seconds``; False once every thread has finished."""
+        deadline = time.monotonic() + seconds
+        while True:
+            live = [thread for thread in threads if thread.is_alive()]
+            if not live:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            live[0].join(min(remaining, 0.25))
+
+    history: List[Tuple[int, float]] = []
+    settled = False
+    while not settled and not stop.is_set():
+        if not wait(ADAPTIVE_SETTLE_S):
+            break
+        with lock:
+            start_bytes = state["bytes"]
+        start = time.monotonic()
+        if not wait(ADAPTIVE_WINDOW_S):
+            break
+        with lock:
+            window_bytes = state["bytes"] - start_bytes
+        rate = window_bytes / max(time.monotonic() - start, 1e-9)
+        history.append((level, rate))
+        new_level, settled = _next_worker_level(history, limit)
+        logger.info(
+            "%s: %d workers -> %.2f GiB/s%s",
+            label,
+            level,
+            rate / float(1 << 30),
+            f"; settling at {new_level}" if settled else f"; trying {new_level}",
+        )
+        if new_level != level:
+            level = new_level
+            gate.set_level(level)
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[min(errors)]
+    return results
+
+
+def _worker_count(value: str) -> Optional[int]:
+    """argparse type for a thread count: ``auto`` or an integer."""
+    if value == "auto":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected 'auto' or an integer, got {value!r}"
+        ) from None
+
+
+def _no_progress(nbytes: int) -> None:
+    del nbytes
+
+
 def _shard_entries(
     plan: StorePlan, digests: Mapping[int, bytes]
 ) -> List[Dict[str, Any]]:
@@ -1028,29 +1204,66 @@ def _shard_entries(
     return entries
 
 
+def _copy_chunks(plan: StorePlan) -> List[Tuple[str, List[TensorRecord]]]:
+    """This node's spans as copy work items.
+
+    Each item is a contiguous run of one shard's spans in source order of at
+    most :data:`COPY_CHUNK_BYTES` (a single larger tensor is its own item).
+    Items are interleaved across shards -- first chunk of every shard, then
+    every second chunk, ... -- so concurrent workers read different files
+    whenever there are at least as many files as workers, and only split a
+    file when there are few of them.
+    """
+    by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
+    for record in plan.local_records:
+        by_shard[record.shard_file].append(record)
+    per_shard: List[List[Tuple[str, List[TensorRecord]]]] = []
+    for shard_file in sorted(by_shard):
+        runs: List[Tuple[str, List[TensorRecord]]] = []
+        current: List[TensorRecord] = []
+        size = 0
+        for record in sorted(
+            by_shard[shard_file], key=lambda record: record.source_offset
+        ):
+            if current and size + record.byte_size > COPY_CHUNK_BYTES:
+                runs.append((shard_file, current))
+                current, size = [], 0
+            current.append(record)
+            size += record.byte_size
+        if current:
+            runs.append((shard_file, current))
+        per_shard.append(runs)
+    chunks: List[Tuple[str, List[TensorRecord]]] = []
+    for depth in range(max((len(runs) for runs in per_shard), default=0)):
+        chunks.extend(runs[depth] for runs in per_shard if depth < len(runs))
+    return chunks
+
+
+def _check_workers(workers: Optional[int], what: str) -> None:
+    if workers is not None and workers <= 0:
+        raise K3StoreBuilderError(f"{what} workers must be positive")
+
+
 def write_store(
     plan: StorePlan,
     store_path: Path,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    copy_workers: int = DEFAULT_COPY_WORKERS,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
 ) -> CopyResult:
     """Copy this node's spans into a NEW ``store_path``, hashing each tensor.
 
-    Shards copy on ``copy_workers`` threads; each source ``.bin`` is opened
-    once by its thread and read forward, every tensor lands at its
-    ``compact_offset`` via ``os.pwrite``, and memory stays bounded at one
-    read buffer per worker. The result is byte-identical for any worker
-    count: offsets are disjoint by construction and the per-shard manifest
-    entries are assembled in sorted shard order after every copy finished.
+    The spans are split into contiguous per-shard work items
+    (:func:`_copy_chunks`) that run on parallel threads -- ``copy_workers``
+    of them, or an adaptively measured count when ``None``. Each item opens
+    its shard and reads forward; every tensor lands at its ``compact_offset``
+    via ``os.pwrite``, and memory stays bounded at one read buffer per
+    thread. The result is byte-identical for any worker count: offsets are
+    disjoint by construction and the per-shard manifest entries are assembled
+    in sorted shard order after every copy finished.
     """
     if read_buffer_bytes <= 0:
         raise K3StoreBuilderError("read buffer must be a positive size")
-    if copy_workers <= 0:
-        raise K3StoreBuilderError("copy workers must be positive")
-    by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
-    for record in plan.local_records:
-        by_shard[record.shard_file].append(record)
-    sidecars = {shard.file_name: shard for shard in plan.shards}
+    _check_workers(copy_workers, "copy")
 
     progress_lock = threading.Lock()
     progress_bytes = 0
@@ -1071,12 +1284,12 @@ def write_store(
 
         thread_state = threading.local()
 
-        def copy_shard(shard_file: str) -> Tuple[Dict[int, bytes], int]:
+        def copy_chunk(
+            chunk: Tuple[str, List[TensorRecord]], progress: Any
+        ) -> Tuple[Dict[int, bytes], int]:
             nonlocal progress_bytes
+            shard_file, records = chunk
             source_path = plan.converted_ckpt / shard_file
-            records = sorted(
-                by_shard[shard_file], key=lambda record: record.source_offset
-            )
             view = getattr(thread_state, "view", None)
             if view is None:
                 view = memoryview(bytearray(read_buffer_bytes))
@@ -1087,14 +1300,15 @@ def write_store(
                 raise K3StoreBuilderError(
                     f"cannot open {source_path}: {error}"
                 ) from error
-            shard_digests: Dict[int, bytes] = {}
+            chunk_digests: Dict[int, bytes] = {}
             copied = 0
             with source:
                 for record in records:
-                    shard_digests[record.row] = _copy_span(
+                    chunk_digests[record.row] = _copy_span(
                         source, descriptor, record, view, source_path, store_path
                     )
                     copied += record.byte_size
+                    progress(record.byte_size)
             with progress_lock:
                 progress_bytes += copied
                 logger.info(
@@ -1103,12 +1317,11 @@ def write_store(
                     len(records),
                     progress_bytes / float(1 << 30),
                 )
-            return shard_digests, copied
+            return chunk_digests, copied
 
-        shard_files = sorted(by_shard)
-        workers = min(copy_workers, len(shard_files)) or 1
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(copy_shard, shard_files))
+        results = _parallel_map(
+            _copy_chunks(plan), copy_chunk, copy_workers, "store copy"
+        )
 
         written = 0
         digests: Dict[int, bytes] = {}
@@ -1224,6 +1437,7 @@ def _read_span_digests(
     spans: Sequence[Span],
     read_buffer_bytes: int,
     sink: Optional[int] = None,
+    progress: Any = None,
 ) -> List[bytes]:
     """Per-tensor digests of ``spans`` read from ``descriptor``.
 
@@ -1250,6 +1464,8 @@ def _read_span_digests(
                     written += os.pwrite(sink, view[written:], position + written)
             position += len(chunk)
         out.append(hasher.digest())
+        if progress is not None:
+            progress(byte_size)
     return out
 
 
@@ -1273,7 +1489,7 @@ def verify_store(
     store_path: Path,
     copy: CopyResult,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    hash_workers: int = DEFAULT_HASH_WORKERS,
+    hash_workers: Optional[int] = DEFAULT_HASH_WORKERS,
 ) -> List[Dict[str, Any]]:
     """Re-read ``store_path`` and require every tensor's source bytes.
 
@@ -1290,8 +1506,12 @@ def verify_store(
     except OSError as error:
         raise K3StoreBuilderError(f"cannot reopen {store_path}: {error}") from error
 
-    def check(segment: List[Span]) -> str:
-        digests = _read_span_digests(descriptor, segment, read_buffer_bytes)
+    _check_workers(hash_workers, "hash")
+
+    def check(segment: List[Span], progress: Any) -> str:
+        digests = _read_span_digests(
+            descriptor, segment, read_buffer_bytes, progress=progress
+        )
         for (row, offset, byte_size), digest in zip(segment, digests):
             if copy.record_digests.get(row) != digest:
                 record = plan.records[row]
@@ -1304,8 +1524,7 @@ def verify_store(
         return _rollup(digests)
 
     try:
-        with ThreadPoolExecutor(max_workers=hash_workers) as pool:
-            rollups = list(pool.map(check, segments))
+        rollups = _parallel_map(segments, check, hash_workers, "store verify")
     except (OSError, EOFError) as error:
         raise K3StoreBuilderError(
             f"cannot re-read {store_path} for verification: {error}"
@@ -1384,17 +1603,18 @@ def _copy_and_hash_segments(
     source: int,
     segments: List[List[Span]],
     read_buffer_bytes: int,
-    copy_workers: int,
+    copy_workers: Optional[int],
     sink: Optional[int] = None,
+    label: str = "store restore",
 ) -> List[List[bytes]]:
     """Per-tensor digests of every segment, optionally copying into ``sink``."""
 
-    def one(segment: List[Span]) -> List[bytes]:
-        return _read_span_digests(source, segment, read_buffer_bytes, sink)
+    def one(segment: List[Span], progress: Any) -> List[bytes]:
+        return _read_span_digests(
+            source, segment, read_buffer_bytes, sink, progress
+        )
 
-    workers = min(copy_workers, len(segments)) or 1
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(one, segments))
+    return _parallel_map(segments, one, copy_workers, label)
 
 
 def _segment_entries(
@@ -1417,7 +1637,7 @@ def restore_store_from_cache(
     fingerprint: str,
     store_path: Path,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    copy_workers: int = DEFAULT_COPY_WORKERS,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
 ) -> Optional[Tuple[CopyResult, List[Dict[str, Any]]]]:
     """Copy a cached store into ``store_path``, hashing every tensor.
 
@@ -1509,7 +1729,7 @@ def populate_store_cache(
     output_dir: Path,
     manifest: Mapping[str, Any],
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    copy_workers: int = DEFAULT_COPY_WORKERS,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
 ) -> None:
     """Copy the just-published store set into the local cache slot.
 
@@ -1543,7 +1763,7 @@ def populate_store_cache(
                 os.ftruncate(destination, plan.store_bytes)
                 digest_lists = _copy_and_hash_segments(
                     source, segments, read_buffer_bytes, copy_workers,
-                    destination,
+                    destination, "store cache write",
                 )
                 os.fsync(destination)
             finally:
@@ -2317,13 +2537,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--read-buffer-bytes", type=int, default=DEFAULT_READ_BUFFER_BYTES
     )
     parser.add_argument(
-        "--hash-workers", type=int, default=DEFAULT_HASH_WORKERS
+        "--hash-workers", type=_worker_count, default=DEFAULT_HASH_WORKERS,
+        help=(
+            "Threads for the verification re-read: 'auto' (default) measures "
+            "the count that saturates the storage, or a fixed positive count."
+        ),
     )
     parser.add_argument(
-        "--copy-workers", type=int, default=DEFAULT_COPY_WORKERS,
+        "--copy-workers", type=_worker_count, default=DEFAULT_COPY_WORKERS,
         help=(
-            "Threads copying source shards in parallel "
-            f"(default {DEFAULT_COPY_WORKERS}; 1 restores the serial copy)."
+            "Threads for the copy (from the checkpoint or the local cache): "
+            "'auto' (default) measures the count that saturates the storage, "
+            "or a fixed positive count; 1 restores the serial copy."
         ),
     )
     parser.add_argument(
@@ -2386,10 +2611,10 @@ def build(
         )
     if args.read_buffer_bytes <= 0:
         raise K3StoreBuilderError("--read-buffer-bytes must be positive")
-    if args.hash_workers <= 0:
-        raise K3StoreBuilderError("--hash-workers must be positive")
-    if args.copy_workers <= 0:
-        raise K3StoreBuilderError("--copy-workers must be positive")
+    if args.hash_workers is not None and args.hash_workers <= 0:
+        raise K3StoreBuilderError("--hash-workers must be positive or 'auto'")
+    if args.copy_workers is not None and args.copy_workers <= 0:
+        raise K3StoreBuilderError("--copy-workers must be positive or 'auto'")
     if not os.path.isabs(args.store_staging_dir):
         raise K3StoreBuilderError(
             f"--store-staging-dir must be an absolute path; got "
