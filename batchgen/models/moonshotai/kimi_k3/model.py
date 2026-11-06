@@ -59,6 +59,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import KimiK3Config
+from .dsa_indexer import KimiK3Indexer, dsa_attention_bias
 
 __all__ = [
     "KimiK3Config",
@@ -435,7 +436,14 @@ def eager_attention_forward(query, key, value, attention_mask, scaling):
 
 class KimiK3MLAAttention(nn.Module):
     """NoPE Multi-Latent Attention with q-LoRA and sigmoid output gate
-    (ML:340-474)."""
+    (ML:340-474).
+
+    On Kimi-K3.1 the layer additionally carries a sparse-attention ``indexer``
+    (``dsa_indexer.KimiK3Indexer``) which restricts the keys each query
+    attends to.  The attribute is **structurally absent** on Kimi-K3
+    (``config.dsa_config is None``), so every K3 build is the module it was
+    before this feature existed — same parameters, same forward statements.
+    """
 
     def __init__(self, config: KimiK3Config, layer_idx: int):
         super().__init__()
@@ -480,6 +488,13 @@ class KimiK3MLAAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.v_head_dim, bias=False)
 
+        # K3.1 only. `is_dsa_layer` is False for every layer when dsa_config is
+        # None, so the attribute is not even created on a K3 build — a
+        # `getattr(..., "indexer", None)` below then routes to dense without a
+        # config lookup, and a K3 state_dict has no unexpected key.
+        if config.is_dsa_layer(layer_idx):
+            self.indexer = KimiK3Indexer(config, layer_idx)
+
     def _apply_output_gate(self, attn_output: torch.Tensor,
                            hidden_states: torch.Tensor) -> torch.Tensor:
         """Sigmoid output gate from the POST-input_layernorm hidden, in model
@@ -498,7 +513,12 @@ class KimiK3MLAAttention(nn.Module):
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
-        q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        # Split out of `q_b_proj(q_a_layernorm(q_a_proj(h)))` so the indexer can
+        # read the same q_a intermediate (its wq_b is a second head off this
+        # activation). Identical ops in identical order, so the dense path is
+        # unaffected.
+        q_a = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q_states = self.q_b_proj(q_a)
         q_states = q_states.view(query_shape).transpose(1, 2)
         q_pass, q_rot = torch.split(
             q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -516,6 +536,11 @@ class KimiK3MLAAttention(nn.Module):
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
         query_states, key_states = _nope_join(q_pass, q_rot, k_pass, k_rot)
+
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            attention_mask = dsa_attention_bias(
+                indexer, q_a, hidden_states, attention_mask)
 
         attn_output = eager_attention_forward(
             query_states, key_states, value_states, attention_mask, self.scaling)

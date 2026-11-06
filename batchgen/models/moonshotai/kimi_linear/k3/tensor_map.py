@@ -5,7 +5,7 @@
 #  licensed under the apache license, version 2.0 (the "license");              #
 # ---------------------------------------------------------------------------- #
 
-"""Kimi-K3 checkpoint <-> BatchGen tensor-name / shape map.
+"""Kimi-K3 / Kimi-K3.1 checkpoint <-> BatchGen tensor-name / shape map.
 
 Owns the three declarations that must agree with the artifact or the model loads
 and returns confidently wrong logits:
@@ -41,6 +41,17 @@ Facts below were read out of the released checkpoint on ``<gpu-host>``
     different dtype — hence the explicit ``tensor_dtypes`` overrides.
   * routed experts ship ``w{1,2,3}.weight_packed`` + ``.weight_scale`` only.
     There is no ``.weight`` for any routed expert.
+
+Kimi-K3.1-Pro (``model_type`` ``kimi_k31``) shares every declaration here and
+adds exactly one thing: the five ``self_attn.indexer.*`` tensors on the 24
+full-attention layers (:data:`K3_MLA_INDEXER_TENSOR_NAMES`).  Measured from the
+two released ``model.safetensors.index.json`` files: 497,340 vs 497,220
+tensors, 120 added and 0 removed or changed, ``metadata.total_size``
+1,561,217,377,280 vs 1,560,860,324,864.  Everything else — the KDA layers, the
+MoE, the MXFP4 packing, the skeleton, the vision tower and its ignore pins — is
+byte-identical, so the two identities share this map and are kept apart by
+:data:`K3_MODEL_TYPES` plus the ``dsa_config`` gate in
+:func:`validate_k3_config`.
 
 Scope: PREFILL ONLY.  Vision is explicitly ignorable, not silently dropped.
 """
@@ -117,6 +128,50 @@ _SHM_ALIGNMENT = 4096
 #  that is not a module parameter, so a rename on either side is a             #
 #  silent-zeros bug.                                                           #
 # --------------------------------------------------------------------------- #
+
+#: Kimi-K3.1 ONLY: the sparse-attention indexer, on each of the 24
+#: full-attention layers and nowhere else.  These five patterns are the
+#: COMPLETE delta between the two released checkpoints: diffing the indexes
+#: gives exactly 120 new tensors (5 x 24) and zero removed, and their bf16
+#: bytes sum to 14,877,184 per layer — 24 x that is 357,052,416, which is
+#: exactly ``metadata.total_size`` K3.1 (1,561,217,377,280) minus K3
+#: (1,560,860,324,864).  BF16, never quantized: the MXFP4 quantization_config
+#: ignores ``re:.*self_attn.*``, which covers the indexer subtree.
+#:
+#: Checkpoint layer indexes are 0-BASED (3, 7, ..., 91, 92) — the same 24
+#: layers that carry ``q_a_proj``.  ``dsa_config['dsa_layers']`` lists them
+#: 1-BASED (4, 8, ..., 92, 93), exactly like ``linear_attn_config``'s lists.
+K3_MLA_INDEXER_TENSOR_NAMES: Tuple[str, ...] = (
+    "indexer.wq_b.weight",
+    "indexer.wk.weight",
+    "indexer.weights_proj.weight",
+    "indexer.k_norm.weight",
+    "indexer.k_norm.bias",
+)
+
+#: The eight keys of ``text_config.dsa_config``.  The checkpoint's own
+#: ``configuration_kimi_k3.py`` stores the block unvalidated, so this list is
+#: the loader-side gate; ``kimi_k3/config.py`` holds the model-side parse and
+#: ``tests/test_kimi_k31_config.py`` proves the two agree.
+K3_DSA_CONFIG_KEYS: Tuple[str, ...] = (
+    "dsa_layers",
+    "index_topk",
+    "index_head_dim",
+    "index_num_heads",
+    "index_rope_dim",
+    "index_k_norm_type",
+    "index_topk_freq",
+    "index_skip_topk_offset",
+)
+
+#: Wrapper ``model_type`` values this map serves, and whether that identity
+#: carries the indexer.  K3 and K3.1 share every other declaration in this
+#: file, so they share the map; the flag is what keeps them from sharing the
+#: WRONG one.
+K3_MODEL_TYPES: Dict[str, bool] = {
+    "kimi_k3": False,
+    "kimi_k31": True,
+}
 
 #: NoPE-MLA, 24 layers.  Deltas vs the 48B: Q is factored through a LoRA triple
 #: instead of a single ``q_proj``, and there is a sigmoid output gate ``g_proj``.
@@ -239,6 +294,125 @@ def _k3_dims(cfg) -> Dict[str, int]:
     return dims
 
 
+def k3_dsa_block(cfg) -> Optional[Dict[str, Any]]:
+    """The raw ``dsa_config`` dict of a K3.1 config, or ``None`` for dense K3.
+
+    Read through ``getattr`` so a config class that predates the field (and the
+    offline stand-ins in the test suite) is dense rather than a crash.
+    """
+    raw = getattr(cfg, "dsa_config", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError(
+            "dsa_config must be the raw config.json object (a dict), got "
+            "{}".format(type(raw).__name__))
+    return raw
+
+
+def k3_indexer_dims(cfg) -> Optional[Dict[str, int]]:
+    """``{heads, head_dim, index_dim, topk}`` of the indexer, or ``None``.
+
+    Called only after :func:`validate_k3_config`, which proves the keys exist
+    and the geometry is positive.
+    """
+    dsa = k3_dsa_block(cfg)
+    if dsa is None:
+        return None
+    heads = int(dsa["index_num_heads"])
+    head_dim = int(dsa["index_head_dim"])
+    return {
+        "heads": heads,
+        "head_dim": head_dim,
+        "index_dim": heads * head_dim,
+        "topk": int(dsa["index_topk"]),
+    }
+
+
+def _dsa_config_problems(cfg, model_type, lac) -> List[str]:
+    """Loader-side gate on ``dsa_config``; mirrors ``kimi_k3/config.py``.
+
+    Deliberately a second, independent statement of the same invariants: this
+    module is the one the parameter server runs at startup, and it must not
+    depend on the model package (it is loaded by file path in the offline
+    suite).  ``tests/test_kimi_k31_config.py`` holds both sides to the same
+    verdict on the released configs and on each mutation.
+    """
+    problems: List[str] = []
+    dsa = k3_dsa_block(cfg)
+    expects_dsa = K3_MODEL_TYPES.get(model_type, False)
+
+    if dsa is None:
+        if expects_dsa:
+            problems.append(
+                "model_type is {!r} but dsa_config is absent. The indexer is "
+                "the only delta vs Kimi-K3: without it the checkpoint's 120 "
+                "indexer tensors have no destination in the name map and the "
+                "24 full-attention layers would silently run dense."
+                .format(model_type))
+        return problems
+
+    if not expects_dsa:
+        problems.append(
+            "dsa_config is set but model_type is {!r}; the released Kimi-K3 "
+            "checkpoint ships no self_attn.indexer.* tensors, so declaring "
+            "them would over-size the attn ring slot and leave the indexer "
+            "weights uninitialised.".format(model_type))
+
+    unknown = sorted(k for k in dsa if k not in K3_DSA_CONFIG_KEYS)
+    if unknown:
+        problems.append(
+            "dsa_config carries unknown key(s) {}; known keys are {}. Unknown "
+            "keys are never silently dropped.".format(
+                unknown, list(K3_DSA_CONFIG_KEYS)))
+    missing = [k for k in K3_DSA_CONFIG_KEYS if dsa.get(k) is None]
+    # index_rope_dim is legitimately 0, which `.get(k) is None` passes but a
+    # truthiness test would not; it is checked for PRESENCE only.
+    if "index_rope_dim" in missing and "index_rope_dim" in dsa:
+        missing.remove("index_rope_dim")
+    if missing:
+        problems.append(
+            "dsa_config is missing required key(s) {}. Every indexer dimension "
+            "is load-bearing for the name map and the ring slot; none is "
+            "defaulted.".format(sorted(missing)))
+    if missing or unknown:
+        return problems
+
+    for key in ("index_topk", "index_head_dim", "index_num_heads"):
+        if int(dsa[key]) <= 0:
+            problems.append("dsa_config['{}'] must be positive".format(key))
+    if int(dsa["index_rope_dim"]) != 0:
+        problems.append(
+            "dsa_config['index_rope_dim'] is {}; only the NoPE index path is "
+            "implemented (K3.1 ships 0)".format(dsa["index_rope_dim"]))
+    if str(dsa["index_k_norm_type"]) != "layernorm":
+        problems.append(
+            "dsa_config['index_k_norm_type'] is {!r}; only 'layernorm' is "
+            "implemented, and it is what makes indexer.k_norm.bias a declared "
+            "tensor".format(dsa["index_k_norm_type"]))
+    if int(dsa["index_topk_freq"]) != 1:
+        problems.append(
+            "dsa_config['index_topk_freq'] is {}; only 1 (every DSA layer owns "
+            "its top-k) is implemented. The checkpoint confirms 1: all 24 "
+            "full-attention layers ship indexer weights, so no layer has a "
+            "previous layer's selection to reuse.".format(dsa["index_topk_freq"]))
+
+    dsa_layers = set(int(x) for x in (dsa.get("dsa_layers") or []))
+    full_attn = set(int(x) for x in ((lac or {}).get("full_attn_layers") or []))
+    if not dsa_layers:
+        problems.append("dsa_config['dsa_layers'] is empty")
+    elif full_attn and dsa_layers != full_attn:
+        problems.append(
+            "dsa_config['dsa_layers'] != linear_attn_config['full_attn_layers'] "
+            "(only={}, missing={}). The declarations below put the indexer "
+            "tensors in the `attn` ring slot, which every full-attention layer "
+            "shares, so the two sets must coincide exactly or the slot is "
+            "wrong for some layer. Both lists are 1-INDEXED.".format(
+                sorted(dsa_layers - full_attn)[:8],
+                sorted(full_attn - dsa_layers)[:8]))
+    return problems
+
+
 def validate_k3_config(cfg) -> None:
     """Hard-fail on every K3 feature switch that can be silently dropped.
 
@@ -253,15 +427,17 @@ def validate_k3_config(cfg) -> None:
     """
     problems: List[str] = []
 
-    if getattr(cfg, "model_type", None) != "kimi_k3":
+    model_type = getattr(cfg, "model_type", None)
+    if model_type not in K3_MODEL_TYPES:
         problems.append(
-            "model_type is {!r}, expected 'kimi_k3'. The name-pattern registry "
+            "model_type is {!r}, expected one of {}. The name-pattern registry "
             "shortcut (model_registry.py:232-238) returns "
             "CONFIG_REGISTRY['kimi_k3']() == KimiLinearConfig() with its 48B "
             "DEFAULTS, whose model_type field is the literal 'kimi_linear'. "
             "Build the config with KimiLinearConfig.from_json(<cache_dir>/"
-            "config.json), which flattens text_config and stamps 'kimi_k3'."
-            .format(getattr(cfg, "model_type", None))
+            "config.json), which flattens text_config and stamps the wrapper's "
+            "own model_type."
+            .format(model_type, sorted(K3_MODEL_TYPES))
         )
 
     lac = getattr(cfg, "linear_attn_config", None) or {}
@@ -357,8 +533,11 @@ def validate_k3_config(cfg) -> None:
             "layers.0.mlp.{gate,up,down}_proj — layer 0 is dense."
         )
 
+    problems.extend(_dsa_config_problems(cfg, model_type, lac))
+
     try:
-        validate_quantization_config(getattr(cfg, "quantization_config", None))
+        validate_quantization_config(
+            getattr(cfg, "quantization_config", None), model_type)
     except Exception as exc:                       # noqa: BLE001 — re-reported below
         problems.append(str(exc))
 
@@ -396,6 +575,13 @@ def build_k3_state_dict_name_map(cfg) -> Tuple[Dict[str, Dict[str, str]],
     first_moe = int(cfg.first_k_dense_replace)
     expert_names = routed_expert_tensor_names()
 
+    dsa = k3_dsa_block(cfg)
+    mla_names = K3_MLA_TENSOR_NAMES
+    if dsa is not None:
+        # validate_k3_config proved dsa_layers == full_attn_layers, so every
+        # MLA layer carries the indexer and one name list covers them all.
+        mla_names = mla_names + K3_MLA_INDEXER_TENSOR_NAMES
+
     name_map: Dict[str, Dict[str, str]] = {}
     task: Dict[str, List[str]] = {t: [] for t in K3_MODULE_TYPES}
 
@@ -406,7 +592,7 @@ def build_k3_state_dict_name_map(cfg) -> Tuple[Dict[str, Dict[str, str]],
             names, ring = K3_KDA_TENSOR_NAMES, "kda_attn"
         else:
             module_key = "attn_{}".format(layer)
-            names, ring = K3_MLA_TENSOR_NAMES, "attn"
+            names, ring = mla_names, "attn"
         for name in names:
             full = "{}model.layers.{}.self_attn.{}".format(prefix, layer, name)
             name_map[full] = {"module_key": module_key, "tensor_key": name}
@@ -545,6 +731,20 @@ def k3_module_shapes(cfg) -> Tuple[
             dims["moe_ffn"], dims["latent"]),
     }
 
+    # K3.1: the indexer joins the `attn` ring slot. 14,877,184 B/layer on top
+    # of the 464,392,192 B dense MLA slot. BF16 like the rest of the slot, so
+    # no `tensor_dtypes` override is needed (and adding one would be wrong:
+    # the MXFP4 config ignores `re:.*self_attn.*`).
+    indexer = k3_indexer_dims(cfg)
+    if indexer is not None:
+        module_shapes["attn"].update({
+            "indexer.wq_b.weight": [indexer["index_dim"], dims["q_lora"]],  # [4096, 1536]
+            "indexer.wk.weight": [indexer["head_dim"], hidden],             # [128, 7168]
+            "indexer.weights_proj.weight": [indexer["heads"], hidden],      # [32, 7168]
+            "indexer.k_norm.weight": [indexer["head_dim"]],                 # [128]
+            "indexer.k_norm.bias": [indexer["head_dim"]],                   # [128]
+        })
+
     weight_dtypes: Dict[str, torch.dtype] = {
         "attn": torch.bfloat16,
         "kda_attn": torch.bfloat16,
@@ -568,6 +768,71 @@ def k3_module_shapes(cfg) -> Tuple[
         "routed_expert": routed_expert_tensor_dtypes(),
     }
     return module_shapes, weight_dtypes, tensor_dtypes
+
+
+# --------------------------------------------------------------------------- #
+#  2b. Paged-KV geometry per token — computed, never a constant                 #
+# --------------------------------------------------------------------------- #
+
+def k3_mla_kv_bytes_per_token(cfg) -> int:
+    """BF16 latent-KV bytes one token costs across ALL full-attention layers.
+
+    ``compressed_kv_dim`` (kv_lora_rank + qk_rope_head_dim = 576) elements of
+    BF16, one MQA head, times the number of MLA layers (24).  The KDA layers
+    contribute nothing: their per-sequence conv/recurrent state is fixed-size
+    and is not a function of context length.
+    """
+    dims = _k3_dims(cfg)
+    n_mla = sum(1 for i in range(int(cfg.num_hidden_layers))
+                if not cfg.is_kda_layer(i))
+    return n_mla * dims["compressed_kv"] * 2
+
+
+#: Per-token bytes of one page-split FP8 index key: ``index_head_dim`` e4m3
+#: bytes plus ONE fp32 scale. DeepGEMM's ``fp8_paged_mqa_logits`` reads this
+#: layout directly (per page: the keys, then the scales).
+K31_INDEX_K_SCALE_BYTES = 4
+
+
+def k31_index_k_bytes_per_token_per_layer(cfg) -> int:
+    """One DSA layer's index-key bytes per token (132 for K3.1), or 0 for K3.
+
+    Page-split FP8: ``index_head_dim`` (128) e4m3 bytes + one fp32 scale. The
+    indexer caches ONE MQA key per token — not ``index_num_heads *
+    index_head_dim``: the key is shared across the 32 index heads
+    (``KimiK3Indexer.index_keys``).
+    """
+    indexer = k3_indexer_dims(cfg)
+    if indexer is None:
+        return 0
+    return indexer["head_dim"] + K31_INDEX_K_SCALE_BYTES
+
+
+def k31_indexer_kv_bytes_per_token(cfg) -> int:
+    """Index-key bytes one token costs across all DSA layers, or 0 for K3."""
+    dsa = k3_dsa_block(cfg)
+    if dsa is None:
+        return 0
+    return len(dsa["dsa_layers"]) * k31_index_k_bytes_per_token_per_layer(cfg)
+
+
+def k3_paged_kv_bytes_per_token(cfg) -> int:
+    """Total paged-KV bytes per token: latent + (K3.1) index keys.
+
+    K3   : 24 x 576 x 2                       = 27,648 B/token.
+    K3.1 : 24 x (576 x 2 + 128 x 1 + 4)       = 30,816 B/token.
+
+    The K3.1 index keys are page-split FP8 (the ReLU-gated DeepGEMM scorer's
+    native layout), not bf16.
+
+    This is the model-side declaration of the admission geometry.  Its
+    consumer — the dual (primary + auxiliary) Host/GPU KV profile pair and the
+    page-budget split that sizes them — lives in core
+    (``batchgen/kv_cache/host_kv_mananger_config.py`` profile tables, consumed
+    by ``batchgen_worker.py``); ``tests/unit/test_kimi_k31_kv_profile.py``
+    holds the two to the same number.
+    """
+    return k3_mla_kv_bytes_per_token(cfg) + k31_indexer_kv_bytes_per_token(cfg)
 
 
 # --------------------------------------------------------------------------- #

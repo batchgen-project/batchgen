@@ -50,7 +50,7 @@ from tqdm import trange
 from batchgen.config.model_registry import load_config
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
-from .config import require_num_routed_experts
+from .config import is_k3_model_type, require_num_routed_experts
 from batchgen.eventlog.process import native_log_level
 
 try:
@@ -177,12 +177,15 @@ class KimiLinear_Parameter_Server:
                 from .config import KimiLinearConfig
 
                 self.model_config = KimiLinearConfig.from_json(cfg_json)
-        if self.family == "kimi_k3" and self.model_config.model_type != "kimi_k3":
+        if self.family == "kimi_k3" and not is_k3_model_type(
+            self.model_config.model_type
+        ):
             raise RuntimeError(
                 "Kimi-K3 checkpoint resolved to a config whose model_type is "
                 f"{self.model_config.model_type!r}. KimiLinearConfig.from_json "
-                "must be reached for K3 — it flattens text_config and stamps "
-                "model_type='kimi_k3'; the 48B defaults were loaded instead."
+                "must be reached for K3 / K3.1 — it flattens text_config and "
+                "stamps the wrapper's model_type ('kimi_k3' / 'kimi_k31'); the "
+                "48B defaults were loaded instead."
             )
         self.num_layers = self.model_config.num_hidden_layers  # 27
         self.num_experts = require_num_routed_experts(self.model_config)
