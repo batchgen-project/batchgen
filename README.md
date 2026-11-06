@@ -86,7 +86,8 @@ long forced decodes under heavy oversubscription.
 BatchGen runs use the v1.1.1 engine and the linked deployment guides (v1.1.1
 is v1.1.0 plus the scheduler fix
 [#588](https://github.com/batchgen-project/batchgen/pull/588) that the
-long-context row depends on);
+long-context row depends on; v1.2.0 adds Kimi-K3.1-Pro support on the same
+engine without touching these measured paths);
 baselines were tuned with the sweeps documented in
 [`benchmarks/README.md`](benchmarks/README.md), which also carries the exact
 workload builders and the batch driver used for every row.
