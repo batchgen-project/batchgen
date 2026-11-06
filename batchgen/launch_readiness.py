@@ -288,6 +288,11 @@ def _run_nvidia_smi(argv: Sequence[str], timeout_s: float) -> str:
     ).stdout
 
 
+def _pid_visible(pid: int) -> bool:
+    """Whether ``pid`` names a process in this PID namespace."""
+    return Path(f"/proc/{pid}").exists()
+
+
 def _nearest_existing(path: Path) -> Optional[Path]:
     """The deepest existing directory at or above ``path``.
 
@@ -317,6 +322,7 @@ class LaunchReadinessProbe:
         free_bytes_of: Optional[Callable[[Path], int]] = None,
         port_probe: Optional[Callable[[int], bool]] = None,
         run_nvidia_smi: Callable[[Sequence[str], float], str] = _run_nvidia_smi,
+        pid_visible: Callable[[int], bool] = _pid_visible,
         opener: Callable[..., Any] = open,
         read_deadline_s: float = DEFAULT_READ_DEADLINE_S,
         staging: Any = None,
@@ -327,6 +333,7 @@ class LaunchReadinessProbe:
         self._free_bytes_of = free_bytes_of
         self._port_probe = port_probe or is_port_free
         self._run_nvidia_smi = run_nvidia_smi
+        self._pid_visible = pid_visible
         self._staging_module = staging
         self._opener = opener
         self._read_deadline_s = read_deadline_s
@@ -695,13 +702,34 @@ class LaunchReadinessProbe:
                 f"processes are not pre-judged: {(error.stderr or '').strip()}",
             )
         processes = [line.strip() for line in output.splitlines() if line.strip()]
-        if processes:
+        # nvidia-smi reports host PIDs. A PID visible in this PID namespace is
+        # a live process this launch would contend with: refuse. One that is
+        # not visible belongs to another container or is a context the driver
+        # has not reclaimed from an exited process; it cannot be stopped from
+        # here and runs no work, so it only costs the memory it still holds:
+        # warn with that footprint instead of refusing every launch on the node.
+        local, foreign = [], []
+        for line in processes:
+            pid_text = line.split(",", 1)[0].strip()
+            visible = pid_text.isdigit() and self._pid_visible(int(pid_text))
+            (local if visible else foreign).append(line)
+        if local:
             return CheckResult(
                 name,
                 STATUS_FAIL,
-                f"{len(processes)} compute process(es) still hold these GPUs "
-                f"({'; '.join(processes)}); a launch would contend with them "
+                f"{len(local)} compute process(es) still hold these GPUs "
+                f"({'; '.join(local)}); a launch would contend with them "
                 "for memory and SMs",
+            )
+        if foreign:
+            return CheckResult(
+                name,
+                STATUS_WARN,
+                f"{len(foreign)} GPU context(s) are held by processes outside "
+                f"this PID namespace ({'; '.join(foreign)}): another "
+                "container's work or contexts not yet reclaimed; their memory "
+                "is unavailable to this launch, so leave headroom in "
+                "--gpu-memory-frac",
             )
         return CheckResult(name, STATUS_OK, "no compute process holds these GPUs")
 
