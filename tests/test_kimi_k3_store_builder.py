@@ -1191,3 +1191,108 @@ def test_a_failing_copy_worker_publishes_nothing(env, monkeypatch):
     with pytest.raises(sb.K3StoreBuilderError, match="ended 1 B early"):
         env.build(output, 0)
     assert sorted(path.name for path in output.iterdir()) == [sb.LOCK_FILE_NAME]
+
+
+# --------------------------------------------------------------------------- #
+#  Local store cache                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _cache_args(env):
+    return ("--local-cache-dir", str(env.tmp / "cache"))
+
+
+def test_build_populates_the_local_cache(env):
+    output = env.tmp / "node0"
+    plan = env.build(output, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    assert (slot / sb.STORE_FILE_NAME).read_bytes() == (
+        output / sb.STORE_FILE_NAME
+    ).read_bytes()
+    cached = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    published = json.loads((output / sb.MANIFEST_FILE_NAME).read_text())
+    assert cached == published
+    assert plan.store_bytes == cached["store"]["bytes"]
+
+
+def test_second_build_restores_from_cache_without_reading_sources(
+    env, monkeypatch
+):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+
+    def no_source_copy(*args, **kwargs):
+        raise AssertionError("restore must not copy from the checkpoint")
+
+    monkeypatch.setattr(sb, "write_store", no_source_copy)
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    assert (second / sb.METADATA_FILE_NAME).read_bytes() == (
+        first / sb.METADATA_FILE_NAME
+    ).read_bytes()
+    one = json.loads((first / sb.MANIFEST_FILE_NAME).read_text())
+    two = json.loads((second / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        two.pop(volatile)
+    assert one == two
+
+
+def test_a_foreign_fingerprint_in_the_cache_forces_a_rebuild(env):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    manifest["source"]["fingerprint"] = "0" * len(
+        manifest["source"]["fingerprint"]
+    )
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    calls = []
+    real_write_store = sb.write_store
+
+    def counting_write_store(*args, **kwargs):
+        calls.append(1)
+        return real_write_store(*args, **kwargs)
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(sb, "write_store", counting_write_store)
+        env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    assert calls, "a fingerprint mismatch must rebuild from the checkpoint"
+
+
+def test_a_corrupt_cached_store_is_discarded_and_rebuilt(env):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    with open(slot / sb.STORE_FILE_NAME, "r+b") as handle:
+        handle.seek(0)
+        first_byte = handle.read(1)
+        handle.seek(0)
+        handle.write(bytes([first_byte[0] ^ 0x01]))
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    # The corrupt slot was discarded and repopulated by the rebuild.
+    assert (slot / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+
+
+def test_an_unwritable_cache_only_warns(env):
+    cache = env.tmp / "cache"
+    cache.mkdir()
+    os.chmod(cache, 0o500)
+    try:
+        output = env.tmp / "node0"
+        env.build(output, 0, extra=("--local-cache-dir", str(cache)))
+        assert (output / sb.MANIFEST_FILE_NAME).exists()
+        assert not list(cache.iterdir())
+    finally:
+        os.chmod(cache, 0o700)

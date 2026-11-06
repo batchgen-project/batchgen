@@ -990,6 +990,41 @@ class CopyResult:
     shards: List[Dict[str, Any]]
 
 
+def _shard_entries(
+    plan: StorePlan, digests: Mapping[int, bytes]
+) -> List[Dict[str, Any]]:
+    """The manifest's per-source-shard entries, in sorted shard order.
+
+    ``digests`` maps every local record's row to its tensor digest, so the
+    entries are identical whether the digests came from a source copy or
+    from re-hashing a restored store.
+    """
+    by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
+    for record in plan.local_records:
+        by_shard[record.shard_file].append(record)
+    sidecars = {shard.file_name: shard for shard in plan.shards}
+    entries: List[Dict[str, Any]] = []
+    for shard_file in sorted(by_shard):
+        records = sorted(
+            by_shard[shard_file], key=lambda record: record.source_offset
+        )
+        sidecar = sidecars.get(shard_file)
+        entries.append(
+            {
+                "sidecar": sidecar.json_name if sidecar else None,
+                "file": shard_file,
+                "file_bytes": sidecar.file_bytes if sidecar else None,
+                "sidecar_digest": sidecar.sidecar_digest if sidecar else None,
+                "tensors_copied": len(records),
+                "bytes_copied": sum(record.byte_size for record in records),
+                "copied_digest": _rollup(
+                    digests[record.row] for record in records
+                ),
+            }
+        )
+    return entries
+
+
 def write_store(
     plan: StorePlan,
     store_path: Path,
@@ -1074,27 +1109,10 @@ def write_store(
 
         written = 0
         digests: Dict[int, bytes] = {}
-        shard_entries: List[Dict[str, Any]] = []
-        for shard_file, (shard_digests, copied) in zip(shard_files, results):
+        for shard_digests, copied in results:
             digests.update(shard_digests)
             written += copied
-            sidecar = sidecars.get(shard_file)
-            records = sorted(
-                by_shard[shard_file], key=lambda record: record.source_offset
-            )
-            shard_entries.append(
-                {
-                    "sidecar": sidecar.json_name if sidecar else None,
-                    "file": shard_file,
-                    "file_bytes": sidecar.file_bytes if sidecar else None,
-                    "sidecar_digest": sidecar.sidecar_digest if sidecar else None,
-                    "tensors_copied": len(records),
-                    "bytes_copied": copied,
-                    "copied_digest": _rollup(
-                        shard_digests[record.row] for record in records
-                    ),
-                }
-            )
+        shard_entries = _shard_entries(plan, digests)
         try:
             os.fsync(descriptor)
         except OSError as error:
@@ -1300,6 +1318,225 @@ def verify_store(
         }
         for segment, digest in zip(segments, rollups)
     ]
+
+
+# --------------------------------------------------------------------------- #
+#  6b. Local store cache: restore a built store from the node's local SSD     #
+# --------------------------------------------------------------------------- #
+
+
+def _cache_slot(local_cache_dir: Path, plan: StorePlan) -> Path:
+    """One slot per node identity; a new fingerprint replaces the old one."""
+    return local_cache_dir / f"node{plan.node_rank}-of{plan.num_nodes}"
+
+
+def _plan_segments(plan: StorePlan) -> List[List[Span]]:
+    spans = [
+        (record.row, record.compact_offset, record.byte_size)
+        for record in sorted(
+            plan.local_records, key=lambda item: item.compact_offset
+        )
+    ]
+    return segment_spans(spans)
+
+
+def _copy_and_hash_segments(
+    source: int,
+    segments: List[List[Span]],
+    read_buffer_bytes: int,
+    copy_workers: int,
+    sink: Optional[int] = None,
+) -> List[List[bytes]]:
+    """Per-tensor digests of every segment, optionally copying into ``sink``."""
+
+    def one(segment: List[Span]) -> List[bytes]:
+        return _read_span_digests(source, segment, read_buffer_bytes, sink)
+
+    workers = min(copy_workers, len(segments)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, segments))
+
+
+def _segment_entries(
+    segments: List[List[Span]], digest_lists: List[List[bytes]]
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "offset": segment[0][1],
+            "bytes": sum(span[2] for span in segment),
+            "tensors": len(segment),
+            "digest": _rollup(digests),
+        }
+        for segment, digests in zip(segments, digest_lists)
+    ]
+
+
+def restore_store_from_cache(
+    plan: StorePlan,
+    local_cache_dir: Path,
+    fingerprint: str,
+    store_path: Path,
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: int = DEFAULT_COPY_WORKERS,
+) -> Optional[Tuple[CopyResult, List[Dict[str, Any]]]]:
+    """Copy a cached store into ``store_path``, hashing every tensor.
+
+    Returns the equivalent of a source copy plus the verified manifest
+    segment entries, or ``None`` when there is no cache for this exact
+    checkpoint/node identity or the cached bytes fail verification (the
+    caller then rebuilds from the checkpoint). The copy and the verification
+    are one pass: each tensor is hashed from exactly the bytes written.
+    """
+    slot = _cache_slot(local_cache_dir, plan)
+    try:
+        manifest = json.loads((slot / MANIFEST_FILE_NAME).read_text())
+    except (OSError, ValueError):
+        logger.info("no usable local store cache at %s", slot)
+        return None
+    expected = {
+        "format": MANIFEST_FORMAT,
+        "complete": True,
+        "hash_algorithm": HASH_ALGORITHM,
+        "node_rank": plan.node_rank,
+        "num_nodes": plan.num_nodes,
+    }
+    if (
+        not isinstance(manifest, dict)
+        or any(manifest.get(key) != value for key, value in expected.items())
+        or manifest.get("source", {}).get("fingerprint") != fingerprint
+        or manifest.get("store", {}).get("bytes") != plan.store_bytes
+    ):
+        logger.info(
+            "local store cache at %s is for a different checkpoint or "
+            "topology; rebuilding from the checkpoint",
+            slot,
+        )
+        return None
+    segments = _plan_segments(plan)
+    try:
+        source = os.open(slot / STORE_FILE_NAME, os.O_RDONLY)
+    except OSError as error:
+        logger.error("local store cache at %s is unreadable: %s", slot, error)
+        return None
+    created = False
+    try:
+        destination = os.open(
+            store_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644
+        )
+        created = True
+        try:
+            os.ftruncate(destination, plan.store_bytes)
+            digest_lists = _copy_and_hash_segments(
+                source, segments, read_buffer_bytes, copy_workers, destination
+            )
+            os.fsync(destination)
+        finally:
+            os.close(destination)
+    except (OSError, EOFError) as error:
+        logger.error(
+            "restore from the local store cache %s failed (%s); rebuilding "
+            "from the checkpoint",
+            slot,
+            error,
+        )
+        if created:
+            with contextlib.suppress(OSError):
+                os.unlink(store_path)
+        return None
+    finally:
+        os.close(source)
+    entries = _segment_entries(segments, digest_lists)
+    if entries != manifest.get("store", {}).get("segments"):
+        logger.error(
+            "local store cache at %s does not hash to its manifest; "
+            "discarding it and rebuilding from the checkpoint",
+            slot,
+        )
+        shutil.rmtree(slot, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(store_path)
+        return None
+    digests = {
+        span[0]: digest
+        for segment, digest_list in zip(segments, digest_lists)
+        for span, digest in zip(segment, digest_list)
+    }
+    written = sum(span[2] for segment in segments for span in segment)
+    logger.info(
+        "restored store.bin from the local cache %s (%d segments verified)",
+        slot,
+        len(entries),
+    )
+    copy = CopyResult(
+        written=written,
+        record_digests=digests,
+        shards=_shard_entries(plan, digests),
+    )
+    return copy, entries
+
+
+def populate_store_cache(
+    plan: StorePlan,
+    local_cache_dir: Path,
+    output_dir: Path,
+    manifest: Mapping[str, Any],
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: int = DEFAULT_COPY_WORKERS,
+) -> None:
+    """Copy the just-published store set into the local cache slot.
+
+    Best effort: a failure only logs a warning, because the published build
+    is already complete and later cold starts can still read the checkpoint.
+    The cached manifest is written last as the slot's commit point, and the
+    copy is hashed against the manifest before the slot is swapped in.
+    """
+    slot = _cache_slot(local_cache_dir, plan)
+    staging = Path(f"{slot}.tmp{os.getpid()}")
+    try:
+        local_cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir()
+        segments = _plan_segments(plan)
+        source = os.open(output_dir / STORE_FILE_NAME, os.O_RDONLY)
+        try:
+            destination = os.open(
+                staging / STORE_FILE_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o644,
+            )
+            try:
+                os.ftruncate(destination, plan.store_bytes)
+                digest_lists = _copy_and_hash_segments(
+                    source, segments, read_buffer_bytes, copy_workers,
+                    destination,
+                )
+                os.fsync(destination)
+            finally:
+                os.close(destination)
+        finally:
+            os.close(source)
+        if _segment_entries(segments, digest_lists) != manifest["store"][
+            "segments"
+        ]:
+            raise K3StoreBuilderError(
+                "the cache copy does not hash to the manifest"
+            )
+        _write_new_file(
+            staging / MANIFEST_FILE_NAME,
+            (json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
+            .encode(),
+        )
+        shutil.rmtree(slot, ignore_errors=True)
+        os.replace(staging, slot)
+        _fsync_directory(local_cache_dir)
+        logger.info("cached the published store at %s", slot)
+    except (OSError, EOFError, KeyError, K3StoreBuilderError) as error:
+        logger.warning(
+            "could not cache the store at %s: %s (cold starts keep reading "
+            "the checkpoint)",
+            slot,
+            error,
+        )
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2054,6 +2291,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--local-cache-dir",
+        default=None,
+        help=(
+            "Local-disk directory caching the published store set per node. "
+            "A build whose checkpoint fingerprint and node identity match "
+            "the cache restores from it instead of reading the checkpoint; "
+            "a fresh build repopulates it. Off when omitted."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -2196,13 +2443,34 @@ def build(
             staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=output_dir))
             try:
                 store_path = staging / STORE_FILE_NAME
-                copy = write_store(
-                    plan, store_path, args.read_buffer_bytes, args.copy_workers
+                local_cache_dir = (
+                    Path(os.path.abspath(args.local_cache_dir))
+                    if args.local_cache_dir
+                    else None
                 )
-                self_check(plan, store_path, copy.written)
-                segments = verify_store(
-                    plan, store_path, copy, args.read_buffer_bytes, args.hash_workers
-                )
+                restored = None
+                if local_cache_dir is not None:
+                    restored = restore_store_from_cache(
+                        plan,
+                        local_cache_dir,
+                        fingerprint,
+                        store_path,
+                        args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
+                if restored is None:
+                    copy = write_store(
+                        plan, store_path, args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
+                    self_check(plan, store_path, copy.written)
+                    segments = verify_store(
+                        plan, store_path, copy, args.read_buffer_bytes,
+                        args.hash_workers,
+                    )
+                else:
+                    copy, segments = restored
+                    self_check(plan, store_path, copy.written)
                 manifest = build_manifest(
                     plan,
                     segments=segments,
@@ -2222,6 +2490,15 @@ def build(
                     (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
                 )
                 _publish(staging, output_dir, config_name)
+                if local_cache_dir is not None and restored is None:
+                    populate_store_cache(
+                        plan,
+                        local_cache_dir,
+                        output_dir,
+                        manifest,
+                        args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
             finally:
                 # After a successful publish only the empty directory is left;
                 # after a failure, everything not yet published goes with it.
