@@ -185,6 +185,101 @@ def test_per_token_bytes(monkeypatch):
             == EXPECTED_PAGED_BYTES_PER_TOKEN == 30_816)
 
 
+def _load_dual_coordinator(monkeypatch, host_kv_config):
+    """``dual_host_kv_coordinator`` by file path, sharing the already-loaded
+    ``host_kv_mananger_config`` so both see the same profile tables."""
+    eventlog = types.ModuleType("batchgen.eventlog.process")
+    eventlog.native_log_level = lambda *a, **k: 0
+    native_loader = types.ModuleType("batchgen.native_loader")
+    native_loader.core_engine = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "batchgen.eventlog.process", eventlog)
+    monkeypatch.setitem(sys.modules, "batchgen.native_loader", native_loader)
+    monkeypatch.setitem(
+        sys.modules, "batchgen.kv_cache.host_kv_mananger_config", host_kv_config)
+
+    module_name = "_k31_dual_coordinator_for_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, ROOT / "batchgen" / "kv_cache" / "dual_host_kv_coordinator.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dual_host_configs_split_one_page_count(monkeypatch):
+    """The dual split is the single source of the shared page count, and it
+    refuses a primary/aux page-size mismatch — so K3.1's two regions have to be
+    compatible with each other, not merely individually well-formed."""
+    config = _load_host_kv_config(monkeypatch)
+    dual = _load_dual_coordinator(monkeypatch, config)
+
+    budget = 64 * (1 << 30)
+    primary, aux, num_pages = dual._compute_dual_page_count(
+        "moonshotai/Kimi-K3.1-Pro", budget)
+    assert primary is config._KIMI_K3_MLA_PROFILE
+    assert aux is config._KIMI_K31_INDEXER_PROFILE
+    assert num_pages > 0
+    combined = (primary.bytes_per_page() * primary.num_layers
+                + aux.bytes_per_page() * aux.num_layers)
+    assert num_pages * combined <= budget
+    # One page count, both regions: a token's pages cost latent + index keys.
+    assert combined == EXPECTED_PAGED_BYTES_PER_TOKEN * primary.page_size
+
+    # GPU-DEFERRED: DualHostKVCoordinator.build_host_configs turns this split
+    # into two bg_lib.HostPagedKVConfig objects, which only the compiled engine
+    # can construct. The arithmetic above IS that function's own, and the early
+    # return for a dense model is covered below; the config objects themselves
+    # are validated on-node.
+
+
+def test_a_dense_model_gets_no_dual_configs(monkeypatch):
+    """CPU-provable leg of ``build_host_configs``: the non-DSA early return,
+    which precedes every native call."""
+    config = _load_host_kv_config(monkeypatch)
+    dual = _load_dual_coordinator(monkeypatch, config)
+    for dense in ("moonshotai/Kimi-K3",
+                  "moonshotai/Kimi-Linear-48B-A3B-Instruct"):
+        assert dual.DualHostKVCoordinator.build_host_configs(
+            dense, 64 * (1 << 30)) is None
+
+
+def test_aux_gpu_config_is_built_from_the_profile(monkeypatch):
+    config = _load_host_kv_config(monkeypatch)
+    built = config.build_gpu_kv_config_aux("moonshotai/Kimi-K3.1-Pro", [4096])
+    assert built.num_layers == 24
+    assert built.num_k_heads == 1
+    assert built.k_head_dim == INDEX_K_BYTES
+    assert built.kv_dtype is torch.float8_e4m3fn
+    assert len(built.logical_to_physical_layer) == K3_ENGINE_LAYERS
+    assert config.build_gpu_kv_config_aux("moonshotai/Kimi-K3", [4096]) is None
+
+
+def test_other_models_profiles_are_unchanged(monkeypatch):
+    """Regression: adding K3.1 must not move any existing resolution."""
+    config = _load_host_kv_config(monkeypatch)
+    expected = {
+        "zai-org/GLM-5": ("_GLM5_MLA_PROFILE", "_GLM5_INDEXER_PROFILE"),
+        "zai-org/GLM-5.1": ("_GLM5_MLA_PROFILE", "_GLM5_INDEXER_PROFILE"),
+        "zai-org/GLM-5.2": ("_GLM5_MLA_PROFILE", "_GLM5_2_INDEXER_PROFILE"),
+        "zai-org/GLM-5.3": ("_GLM5_MLA_PROFILE", "_GLM5_2_INDEXER_PROFILE"),
+        "deepseek-ai/DeepSeek-V3.2": (
+            "_DEEPSEEK_MLA_PROFILE", "_DEEPSEEK_V3_2_INDEXER_PROFILE"),
+        "openai/gpt-oss-120b": ("_GPT_OSS_GQA_PROFILE", None),
+        "MiniMaxAI/MiniMax-M2.5": ("_MINIMAX_M25_GQA_PROFILE", None),
+    }
+    for model_id, (primary_name, aux_name) in expected.items():
+        assert config._resolve_profile(model_id) is getattr(config, primary_name)
+        got_aux = config._resolve_indexer_profile(model_id)
+        assert got_aux is (None if aux_name is None
+                           else getattr(config, aux_name)), model_id
+
+
+def test_an_unlisted_kimi_identifier_still_fails_loud(monkeypatch):
+    config = _load_host_kv_config(monkeypatch)
+    with pytest.raises(ValueError, match="Unsupported model"):
+        config._resolve_profile("moonshotai/Kimi-K3.2-Pro")
+
+
 # --------------------------------------------------------------------------- #
 #  2. Config name-pattern registry                                            #
 # --------------------------------------------------------------------------- #
