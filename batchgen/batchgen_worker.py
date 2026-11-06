@@ -216,7 +216,12 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import (
+	is_kimi_k25_backend_model,
+	# Re-exported for the worker main loop: which served ids take the
+	# pre-readiness startup is a model-name fact (exact ids, not a family).
+	runs_startup_before_readiness,
+)
 from batchgen.config.cuda_graph_flag_policy import (
 	cli_enables_whole_model_graph,
 	require_cuda_graph_flag_supported,
@@ -370,11 +375,6 @@ BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS'
 # this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
 # the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
 _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
-
-# The one served model whose workload-independent startup work runs before the
-# server reports ready (prepare_kimi_k3_startup). Matched EXACTLY: the sibling
-# Kimi-Linear/K2.5 checkpoints share this architecture but not this lifecycle.
-KIMI_K3_MODEL_ID = "moonshotai/Kimi-K3"
 
 def _reentry_history_length(
 	prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
@@ -9950,6 +9950,13 @@ class BatchGenWorker:
 		)
 		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
 		self._preload_kimi_k3_runtime_extensions()
+		# Model-specific native dependencies beyond the family's (e.g. a
+		# sparse-attention indexer's kernels), owned by the model package.
+		preload_model_extensions = getattr(
+			self.parallel_manager, "preload_runtime_extensions", None
+		)
+		if preload_model_extensions is not None:
+			preload_model_extensions()
 		self._ensure_pynccl_communicator()
 		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
 		# manager needs the communicator before configure_decoding, not at the

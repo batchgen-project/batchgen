@@ -48,10 +48,12 @@ K3_ENGINE_LAYERS = 93
 LATENT_DIM = 576            # kv_lora_rank 512 + qk_rope_head_dim 64
 INDEX_HEAD_DIM = 128        # dsa_config.index_head_dim
 BF16_BYTES = 2
+#: Page-split FP8 index key: 128 e4m3 bytes + one fp32 scale per token.
+INDEX_K_BYTES = INDEX_HEAD_DIM * 1 + 4                                # 132
 EXPECTED_LATENT_BYTES_PER_TOKEN = 24 * LATENT_DIM * BF16_BYTES        # 27,648
-EXPECTED_INDEXER_BYTES_PER_TOKEN = 24 * INDEX_HEAD_DIM * BF16_BYTES   # 6,144
+EXPECTED_INDEXER_BYTES_PER_TOKEN = 24 * INDEX_K_BYTES                 # 3,168
 EXPECTED_PAGED_BYTES_PER_TOKEN = (
-    EXPECTED_LATENT_BYTES_PER_TOKEN + EXPECTED_INDEXER_BYTES_PER_TOKEN)  # 33,792
+    EXPECTED_LATENT_BYTES_PER_TOKEN + EXPECTED_INDEXER_BYTES_PER_TOKEN)  # 30,816
 
 K31_IDS = (
     "moonshotai/Kimi-K3.1-Pro",
@@ -143,14 +145,25 @@ def test_indexer_profile_geometry(monkeypatch):
     aux = config._KIMI_K31_INDEXER_PROFILE
     assert aux.num_layers == 24
     assert aux.num_k_heads == 1
-    assert aux.k_head_dim == INDEX_HEAD_DIM
     assert aux.num_v_heads == 0 and aux.v_head_dim == 0
-    assert aux.kv_dtype == "bfloat16"
-    # AoS, NOT the page-split FP8 layout GLM-5.2/5.3 use: index_rope_dim is 0,
-    # so nothing rotates the keys and there are no per-token scales to carry.
-    # k_head_dim is therefore an ELEMENT count, not a byte count.
-    assert not aux.is_page_split
+    # Page-split FP8: the layout DeepGEMM's ReLU-gated paged scorer reads, so
+    # k_head_dim counts BYTES (128 e4m3 + one fp32 scale), not elements.
+    assert aux.is_page_split
+    assert aux.kv_dtype == "float8_e4m3fn"
+    assert aux.k_head_dim == INDEX_K_BYTES == 132
     assert aux.k_data_dim() == INDEX_HEAD_DIM
+
+
+def test_indexer_profile_has_the_page_split_route_geometry(monkeypatch):
+    """Per layer, the K3.1 aux record is the record the production page-split
+    route already stores and scores; only the layer map differs."""
+    config = _load_host_kv_config(monkeypatch)
+    aux = config._KIMI_K31_INDEXER_PROFILE
+    reference = config._GLM5_2_INDEXER_PROFILE
+    for field in ("num_k_heads", "k_head_dim", "num_v_heads", "v_head_dim",
+                  "kv_dtype", "page_size", "page_format"):
+        assert getattr(aux, field) == getattr(reference, field), field
+    assert aux.bytes_per_page() == reference.bytes_per_page()
 
 
 def test_indexer_layer_map_is_the_full_attention_layers(monkeypatch):
@@ -183,7 +196,7 @@ def test_per_token_bytes(monkeypatch):
     assert _profile_bytes_per_token(primary) == EXPECTED_LATENT_BYTES_PER_TOKEN
     assert _profile_bytes_per_token(aux) == EXPECTED_INDEXER_BYTES_PER_TOKEN
     assert (_profile_bytes_per_token(primary) + _profile_bytes_per_token(aux)
-            == EXPECTED_PAGED_BYTES_PER_TOKEN == 33_792)
+            == EXPECTED_PAGED_BYTES_PER_TOKEN == 30_816)
 
 
 def test_core_profiles_agree_with_the_model_side_declaration(monkeypatch):
@@ -285,8 +298,8 @@ def test_aux_gpu_config_is_built_from_the_profile(monkeypatch):
     built = config.build_gpu_kv_config_aux("moonshotai/Kimi-K3.1-Pro", [4096])
     assert built.num_layers == 24
     assert built.num_k_heads == 1
-    assert built.k_head_dim == INDEX_HEAD_DIM
-    assert built.kv_dtype is torch.bfloat16
+    assert built.k_head_dim == INDEX_K_BYTES
+    assert built.kv_dtype is torch.float8_e4m3fn
     assert len(built.logical_to_physical_layer) == K3_ENGINE_LAYERS
     assert config.build_gpu_kv_config_aux("moonshotai/Kimi-K3", [4096]) is None
 
