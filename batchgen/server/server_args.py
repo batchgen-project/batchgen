@@ -277,6 +277,11 @@ class ServerArgs:
     decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
     # Startup timeout
     startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
+    # Multiplies every per-phase startup budget the startup phase watchdog
+    # enforces (batchgen.worker.startup_phases). One knob rather than one per
+    # phase: the budgets are already generous and only their SCALE is
+    # deployment-dependent (a slower filesystem, a larger store).
+    startup_phase_timeout_scale: float = 1.0
     # Request pool: max QueryBook capacity. Must be > 0 (see validate_server_args).
     max_pool_size: int = 10240
     # Fixed node-shared host token pool budget. Sequence capacity is derived
@@ -546,6 +551,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Maximum seconds from process launch to server ready (/health returns 200). If exceeded, server exits. Default: disabled. Recommended: 1800.",
+    )
+    parser.add_argument(
+        "--startup-phase-timeout-scale",
+        type=float,
+        default=1.0,
+        help="Scale every per-phase startup budget the startup phase watchdog "
+             "enforces. A startup stuck in one phase past its budget is "
+             "failed, with the stuck rank and phase logged first. Default: 1.0.",
     )
     parser.add_argument(
         "--max-pool-size",
@@ -911,6 +924,11 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("decode_step_timeout must be positive")
     if args.startup_timeout is not None and args.startup_timeout <= 0:
         raise ValueError("startup_timeout must be positive")
+    if args.startup_phase_timeout_scale <= 0:
+        raise ValueError(
+            "startup_phase_timeout_scale must be positive: the startup phase "
+            "watchdog is not disabled by a zero or negative budget"
+        )
     if args.host_kv_watermark < 0 or args.host_kv_watermark > 100:
         raise ValueError("host_kv_watermark must be between 0 and 100")
     if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
@@ -1080,6 +1098,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         no_incremental_save=parsed.no_incremental_save,
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
+        startup_phase_timeout_scale=parsed.startup_phase_timeout_scale,
         max_pool_size=parsed.max_pool_size,
         input_ids_pool_size_gb=parsed.input_ids_pool_size_gb,
         max_intake_capacity=parsed.max_intake_capacity,

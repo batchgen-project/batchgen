@@ -55,6 +55,10 @@ PINS = {
                 "set_decode_watchdog",
                 "set_phase",
                 "set_response_queue",
+                # Installed by the worker supervisor, beside the cohort
+                # shutdown probe: the handle this worker reports its named
+                # startup phases through for the server's startup watchdog.
+                "set_startup_phase_reporter",
                 "set_watchdog",
                 "update_new_token",
             ],

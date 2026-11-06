@@ -257,6 +257,7 @@ from batchgen.worker.prefill import (
 	prefill_reclaim_target_pages,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
+from batchgen.worker.startup_phases import NULL_STARTUP_PHASE_REPORTER
 from batchgen.worker.boundary import (
 	BoundaryDecisionRequest,
 	BoundaryHandler,
@@ -3530,6 +3531,29 @@ class BatchGenWorker:
 		# Start disabled — only enable around actual decode iterations
 		if hasattr(watchdog, '_active'):
 			watchdog._active = False
+
+	# This worker's slot in the server's shared startup-phase record, installed
+	# by the supervisor.  The null default keeps every phase-reporting step
+	# below working in a worker no server is watching (tests, the legacy
+	# launcher) while still rejecting an undeclared phase name.
+	_startup_phase_reporter = NULL_STARTUP_PHASE_REPORTER
+
+	def set_startup_phase_reporter(self, reporter) -> None:
+		"""Install the handle this worker reports its startup phases through.
+
+		Like the cohort-shutdown probe below, the shape behind it -- a
+		lock-free shared record the server polls -- stays in the supervisor;
+		this class only ever says which phase it has entered.
+		"""
+		self._startup_phase_reporter = reporter
+
+	def _startup_phase(self, name: str):
+		"""Report one named startup phase for the duration of the body.
+
+		``name`` must be one of ``batchgen.worker.startup_phases.STARTUP_PHASES``;
+		the reporter refuses anything else.
+		"""
+		return self._startup_phase_reporter.phase(name)
 
 	def set_cohort_shutdown_probe(self, probe) -> None:
 		"""Install the zero-argument cohort-teardown probe.
@@ -9948,42 +9972,54 @@ class BatchGenWorker:
 			f"Rank {self.rank}: [K3_STARTUP] Building model and weight pipeline "
 			f"before readiness"
 		)
-		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
-		self._preload_kimi_k3_runtime_extensions()
+		# Each step below reports itself as a named startup phase: every one is
+		# long, silent and workload-independent, so a step that STOPS -- a
+		# checkpoint read that never returns, a rendezvous a peer never joins --
+		# is indistinguishable from a step that is merely slow until the
+		# server's watchdog names the phase this rank has been sitting in.
+		with self._startup_phase("model-build"):
+			self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
+		with self._startup_phase("extension-preload"):
+			self._preload_kimi_k3_runtime_extensions()
 		# Model-specific native dependencies beyond the family's (e.g. a
 		# sparse-attention indexer's kernels), owned by the model package.
 		preload_model_extensions = getattr(
 			self.parallel_manager, "preload_runtime_extensions", None
 		)
 		if preload_model_extensions is not None:
-			preload_model_extensions()
-		self._ensure_pynccl_communicator()
-		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
-		# manager needs the communicator before configure_decoding, not at the
-		# first decode phase.
-		self.parallel_manager.set_comm(self.comm)
+			with self._startup_phase("model-extension-preload"):
+				preload_model_extensions()
+		with self._startup_phase("communicator-init"):
+			self._ensure_pynccl_communicator()
+			# The resident-EP decode MoE runs its own all_gather/all_reduce, so
+			# the manager needs the communicator before configure_decoding, not
+			# at the first decode phase.
+			self.parallel_manager.set_comm(self.comm)
 
 		# Decode first: configure_decoding materializes the stacked MXFP4 EP
 		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
 		# the runtime decode path applies to its own estimate, so the padded MoE
 		# buffers are already sized for the largest batch that can be admitted.
-		self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+		with self._startup_phase("decode-shard-build"):
+			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 
 		# Then hand the built model to the prefill mode this weight topology
 		# will actually use, so the first admission inherits this phase directly
 		# instead of rebuilding the streamed-SP8 buffers itself.
 		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
-		self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
-		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
-		self.set_phase("prefill")
-		self._install_prefill_weight_copy_pipeline(k3_prefill_profile=False)
+		with self._startup_phase("prefill-configure"):
+			self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
+			self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+			self.set_phase("prefill")
+			self._install_prefill_weight_copy_pipeline(k3_prefill_profile=False)
 
 		# Slice 3: the DeepEP buffer lives for the process; build it before
 		# readiness so the first decode configure does not pay the NVSHMEM
 		# handshake inside the measured wall.
 		prewarm_exchange = getattr(self.parallel_manager, "prewarm_deepep_exchange", None)
 		if prewarm_exchange is not None:
-			prewarm_exchange()
+			with self._startup_phase("prewarm"):
+				prewarm_exchange()
 
 		self._k3_startup_completed = True
 		self._k3_startup_prefill_ready = True

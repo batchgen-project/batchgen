@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import logging
@@ -46,6 +47,11 @@ from batchgen.server.server_args import (
     validate_shared_runtime_capability,
 )
 from batchgen.utils import config_torch_module_initializer
+from batchgen.worker.startup_phases import (
+    PHASE_STORE_STAGING,
+    StartupPhaseRecord,
+    StartupPhaseWatchdog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +212,13 @@ class WorkerManager:
     # newly reaped pid rather than once per poll. Immutable, and replaced
     # rather than mutated, so the class default is safe to share.
     _host_oom_checked_pids = frozenset()
+    # This start-up's phase record and the thread that enforces its per-phase
+    # budgets, bound for the whole of one start-up (see
+    # _start_startup_phase_watchdog). Class defaults, like the two above, so
+    # the teardown path can always ask whether a watchdog is running --
+    # including on a manager whose construction never reached __init__.
+    _startup_phases: Optional[StartupPhaseRecord] = None
+    _startup_phase_watchdog: Optional[StartupPhaseWatchdog] = None
 
     def __init__(
         self,
@@ -453,6 +466,69 @@ class WorkerManager:
         # run id is fresh random hex, so nothing but this scan can ever remove it.
         reclaim_dead_runs(self.args.runtime_identity)
 
+    # ---------------------- Startup phase watchdog ----------------------
+    def _startup_phase_slot_labels(self) -> List[str]:
+        """One label per slot of the record, as the CRIT line names it.
+
+        Slot 0 is this process, which runs the phases that precede the
+        workers; the local ranks follow it, named by their GLOBAL rank so a
+        multi-node log names the same rank the launch does.
+        """
+        local_world_size = self._local_world_size or 0
+        first_global_rank = self.args.node_rank * local_world_size
+        return [f"node {self.args.node_rank} server"] + [
+            f"node {self.args.node_rank} rank {first_global_rank + local_rank}"
+            for local_rank in range(local_world_size)
+        ]
+
+    def _server_startup_phase(self, phase: str):
+        """Report one of THIS process's startup phases into slot 0."""
+        record = self._startup_phases
+        if record is None:
+            return contextlib.nullcontext()
+        return record.reporter(0).phase(phase)
+
+    def _start_startup_phase_watchdog(self) -> None:
+        """Bind this start-up's phase record and watch it until readiness.
+
+        Started before the first long phase and before any worker exists: the
+        record carries this process's own staging phase as well as every
+        rank's, and the workers inherit it through ``mp.spawn``.
+        """
+        labels = self._startup_phase_slot_labels()
+        self._startup_phases = StartupPhaseRecord.create(len(labels), self._mp_ctx)
+        watchdog = StartupPhaseWatchdog(
+            self._startup_phases,
+            labels,
+            self._fail_startup_phase_breach,
+            scale=self.args.startup_phase_timeout_scale,
+        )
+        self._startup_phase_watchdog = watchdog
+        watchdog.start()
+        logger.info(
+            "Startup phase watchdog armed over %d slots (budget scale %.2f)",
+            len(labels),
+            self.args.startup_phase_timeout_scale,
+        )
+
+    def _stop_startup_phase_watchdog(self) -> None:
+        watchdog, self._startup_phase_watchdog = self._startup_phase_watchdog, None
+        if watchdog is None:
+            return
+        watchdog.stop()
+
+    def _fail_startup_phase_breach(self, reason: str) -> None:
+        """End a start-up that has stopped inside one phase.
+
+        The watchdog has already logged one CRITICAL line per stuck slot, so
+        the evidence is in the log BEFORE anything is torn down -- that is the
+        whole point of this path. The failure itself then takes the ordinary
+        worker-fatal route: before readiness it publishes this node's reason
+        to the peers, which are waiting in the same rendezvous, and ends this
+        process, so the whole multi-node group aborts instead of spinning.
+        """
+        self.report_worker_fatal(reason)
+
     def start(self) -> None:
         if self.started:
             return
@@ -530,6 +606,9 @@ class WorkerManager:
         self._ready_event.clear()
         self._fatal_ack_event.clear()
         self._prepare_runtime_dir()
+        # Armed before the first long phase below, and stopped once the cohort
+        # is ready (or by stop() on a failed start-up).
+        self._start_startup_phase_watchdog()
 
         # Opened before the long model-loading phases: a peer connects to node
         # 0's store as soon as its own process starts, and every node spends
@@ -627,6 +706,10 @@ class WorkerManager:
         except Exception:
             self._shutdown_prefix_cache_owner()
             raise
+        finally:
+            # Every phase this watchdog covers is behind the cohort now,
+            # whether it became ready or failed.
+            self._stop_startup_phase_watchdog()
         logger.info("[startup] Workers ready in %.2fs",
                     _time.monotonic() - spawn_start)
 
@@ -650,6 +733,9 @@ class WorkerManager:
     def stop(self) -> None:
         if self._stopping:
             return
+        # A start-up that failed before readiness never reached the stop above,
+        # so its watchdog is still polling a record nothing will advance again.
+        self._stop_startup_phase_watchdog()
         has_partial_runtime = any(
             (
                 self.started,
@@ -1788,6 +1874,12 @@ class WorkerManager:
                 f"spawned from {threading.current_thread().name!r} would be "
                 "killed when that thread exits."
             )
+        # This cohort's slots must not still hold the phases of the cohort a
+        # restart replaced: the record outlives one cohort, its slots do not.
+        if self._startup_phases is not None:
+            self._startup_phases.reset(
+                range(1, self._startup_phases.slots)
+            )
         self.worker_process = mp.spawn(
             server_worker_main,
             args=(
@@ -1798,6 +1890,7 @@ class WorkerManager:
                 self._fatal_ack_event,
                 self._cohort_shutdown_flag,
                 self._cohort_rendezvous_flag,
+                self._startup_phases,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
@@ -2260,16 +2353,22 @@ class WorkerManager:
         every cohort receive the same effective config. Released by
         :meth:`_release_staged_weight_store` once both are gone; a worker
         restart never touches it.
+
+        Reported as the ``store-staging`` phase: the copy reads every byte of
+        the source store, so it is the one phase of THIS process that a
+        filesystem which stops answering can park in, and the startup phase
+        watchdog bounds it exactly as it bounds a worker's phases.
         """
         from batchgen.server.weight_store_staging import (
             stage_distributed_weight_store,
         )
 
-        staged = stage_distributed_weight_store(
-            self.args.distributed_weight_config,
-            self.args.runtime_identity.runtime_dir,
-            fast_init=self.args.fast_init,
-        )
+        with self._server_startup_phase(PHASE_STORE_STAGING):
+            staged = stage_distributed_weight_store(
+                self.args.distributed_weight_config,
+                self.args.runtime_identity.runtime_dir,
+                fast_init=self.args.fast_init,
+            )
         self._staged_weight_store = staged
         self._distributed_weight_config_path = (
             staged.effective_config_path
