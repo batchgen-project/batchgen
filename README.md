@@ -20,6 +20,13 @@
 ## News
 
 <!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one, and of the v1.1.0 + v1.1.1 entries into one v1.1.1 entry -->
+- **2026/11 — BatchGen v1.2.0: Kimi-K3.1-Pro.** Day-one support for
+  [Kimi-K3.1-Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) — Kimi-K3 with a
+  gated sparse-attention indexer on its 24 full-attention layers — served on
+  4×8 H20 through a dual-region KV cache (MLA latent + page-split FP8 index
+  keys), sparse long-prompt prefill and CUDA-graph sparse decode, validated
+  end to end (MMLU-Pro smoke and a 512-request mixed eval batch to
+  completion). See the [deployment guide](docs/deploy-kimi-k3.1-h20.md).
 - **2026/11 — BatchGen v1.1.1.** Kimi-K3 multi-node serving on a compact
   distributed weight store; GLM-5 with no runtime compilation (ahead-of-time
   kernels plus a startup prewarm covering every reachable Triton and DeepGEMM
@@ -100,7 +107,7 @@ The reference column reports the recorded configuration rather than claiming a g
 
 ## Supported models and hardware
 
-The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, GLM-5.1, GLM-5.2, and GLM-5.3; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
+The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, Kimi-K3.1-Pro, GPT-OSS-120B, GLM-5.1, GLM-5.2, and GLM-5.3; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
 
 ## Quick start
 
@@ -127,6 +134,7 @@ Choose the guide that matches your model and topology:
 - [DeepSeek-R1 on H20](docs/deploy-deepseek-r1-h20.md)
 - [Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)
 - [Kimi-K3 on H20](docs/deploy-kimi-k3-h20.md)
+- [Kimi-K3.1-Pro on H20](docs/deploy-kimi-k3.1-h20.md)
 - [GPT-OSS-120B on H20](docs/deploy-gpt-oss-h20.md)
 
 ### Submit a batch
