@@ -725,6 +725,27 @@ class KimiMLAAttention(nn.Module):
         if self.use_output_gate:
             self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.v_head_dim, bias=False)
 
+        # Kimi-K3.1 DSA indexer. The SAME class the eager reference
+        # (kimi_k3/model.py) builds, so the parity oracle exercises these
+        # parameters and this math rather than a second transcription. The
+        # attribute name is the checkpoint contract: apply_weights matches
+        # named_parameters() ("indexer.wk.weight", ...) against the ring's
+        # tensor keys (k3/tensor_map.py:K3_MLA_INDEXER_TENSOR_NAMES). Absent
+        # on every Kimi-Linear / Kimi-K3 layer.
+        if config.is_dsa_layer(layer_idx):
+            from batchgen.models.moonshotai.kimi_k3.dsa_indexer import KimiK3Indexer
+
+            from .dsa_index_rotation import check_index_head_dim
+
+            dsa = config.dsa()
+            check_index_head_dim(dsa.index_head_dim)
+            self.indexer = KimiK3Indexer.from_dims(
+                dsa,
+                hidden_size=self.hidden_size,
+                q_lora_rank=self.q_lora_rank,
+                layer_idx=layer_idx,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -733,6 +754,16 @@ class KimiMLAAttention(nn.Module):
         past_key_values=None,
         **kwargs,
     ) -> torch.Tensor:
+        if getattr(self, "indexer", None) is not None:
+            # This eager forward is dense. On a DSA layer that would attend over
+            # the whole context and never read the indexer: a different model
+            # that produces plausible output. The eager DSA reference is
+            # kimi_k3/model.py; serving goes through KimiLinearAttnWrapper.
+            raise NotImplementedError(
+                f"KimiMLAAttention.forward is dense and layer {self.layer_idx} "
+                "is a Kimi-K3.1 DSA layer; use the kimi_k3 eager reference or "
+                "the serving wrapper"
+            )
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)

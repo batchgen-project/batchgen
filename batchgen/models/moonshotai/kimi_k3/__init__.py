@@ -7,9 +7,12 @@
 
 Contents:
   * ``tokenizer``       — the K3 tokenizer + vendored, md5-verified assets.
-  * ``config``          — strict K3 config parser (:func:`parse_k3_config`);
-                          hard-fails on unknown keys and violated invariants.
+  * ``config``          — strict K3 / K3.1 config parser
+                          (:func:`parse_k3_config`); hard-fails on unknown keys
+                          and violated invariants.
   * ``model``           — the K3 decoder (M2: prefill-only, eager).
+  * ``dsa_indexer``     — K3.1's sparse-attention indexer (eager reference);
+                          structurally absent from a K3 build.
   * ``kda_reference``   — vendored pure-torch KDA core; parity-oracle only,
                           never a serving path.
   * ``assets/``         — checkpoint config/tokenizer files (byte-pinned).
@@ -28,4 +31,4 @@ This directory MUST remain an importable package (not a bare data folder):
 ``find_packages()`` sees ``assets`` as a package. See ``assets/__init__.py``.
 """
 
-__all__ = ["tokenizer", "config", "model", "kda_reference"]
+__all__ = ["tokenizer", "config", "model", "dsa_indexer", "kda_reference"]

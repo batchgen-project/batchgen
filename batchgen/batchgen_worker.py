@@ -1827,6 +1827,19 @@ class BatchGenWorker:
 				num_v_heads=primary_profile.num_v_heads,
 				v_head_dim=primary_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(primary_profile.kv_dtype),
+				# Engine-layer -> cache-slot map, exactly as the dense builder
+				# passes it. A fully-DSA model (GLM) has None here (engine ==
+				# physical); an interleaved model (Kimi-K3.1: 24 MLA rows among
+				# 93 engine layers) addresses BOTH regions by engine layer id,
+				# and without the map the primary pool bounds-checks engine ids
+				# against its 24 physical slots and refuses layer 27 at the
+				# first decode-graph capture.
+				logical_to_physical_layer=(
+					list(primary_profile.logical_to_physical_layer)
+					if getattr(primary_profile, "logical_to_physical_layer", None)
+					is not None
+					else None
+				),
 			)
 			primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
 			aux_config = GPUPagedKVConfig(

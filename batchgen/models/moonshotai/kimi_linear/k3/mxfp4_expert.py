@@ -113,9 +113,10 @@ def is_mxfp4_quantized(config) -> bool:
         ``quantization_config`` on purpose, so that the serving MoE can be
         compared against it.  Raising here would delete that comparison.
     """
+    model_type = getattr(config, "model_type", None)
     quantization_config = getattr(config, "quantization_config", None)
     if quantization_config is not None:
-        validate_quantization_config(quantization_config)
+        validate_quantization_config(quantization_config, model_type)
         return True
 
     if str(getattr(config, "quantization", "none")).lower() == "mxfp4":
@@ -126,7 +127,7 @@ def is_mxfp4_quantized(config) -> bool:
             "nothing to build MXFP4 experts from."
         )
 
-    if getattr(config, "model_type", None) == "kimi_k3":
+    if model_type in ("kimi_k3", "kimi_k31"):
         logging.warning(
             "Kimi-K3 config carries NO quantization_config: building BF16 "
             "routed experts (KimiBlockSparseMLP, w{1,2,3}.weight). The RELEASED "

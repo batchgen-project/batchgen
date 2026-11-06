@@ -15,12 +15,19 @@ This page is the README-specific map of current model support. It is deliberatel
 | DeepSeek-R1 / V3 | 671B | FP8 | 2×8 H20 guide; H200 evaluation | Documented deployment · Benchmark evidence | Published OSDI'26 BCT results: 1.66× faster than SGLang-Opt on 16×H20 for 8K → 2K. |
 | Kimi-K2.5 | 1.04T | INT4 / W4A16 | 16× H20 long-context campaign | Benchmark evidence | 255K prefill comparison uses SGLang 0.5.9 DP8/TP16: 1.61× faster in the recorded workload. |
 | Kimi-K3 | 2.8T | MXFP4, 896 experts | 2×8 H200; 4×8 H20 guides | Documented deployment · Benchmark evidence | Exact-64K comparison uses SGLang 0.5.18 TP16/EP16: 1.42× faster in the recorded workload. |
+| Kimi-K3.1-Pro | 2.8T | MXFP4, 896 experts + DSA indexer | 4×8 H20 guide | Documented deployment | Gated sparse attention on the 24 full-attention layers; validated end to end with an MMLU-Pro smoke and a 512-request mixed eval batch. Hopper (sm90a) only. |
 | GLM-5 / GLM-5.1 | 754B (≈40B active) | FP8 | H20 support note | Documented deployment | Deployment and validation instructions are available; performance coverage is workload-dependent. |
 | GLM-5.2 | 753B MoE | FP8 | 1×8 H200 guide and long-context prefill campaign | Documented deployment · Benchmark evidence | The pure-DP8 `8×1M` comparison uses the best completed SGLang 0.5.18 chunk/offload point: 1.71× faster in the recorded workload. Final installed-wheel replay remains required. |
 | GLM-5.3 | 753B MoE | FP8 | 1×8 H200 deployment guide and MMLU-Pro qualification | Documented deployment | A 2,048-request MMLU-Pro batch completed without worker errors on the qualified configuration. Shares the GLM-5.2 architecture and long-context prefill path. |
 | GPT-OSS-120B | 117B (≈5.1B active) | MXFP4 | H20 deployment guide | Documented deployment · Experimental | Functional path is documented; no comparable recent end-to-end advantage is claimed here. |
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
+
+### Known limitations in v1.2.0
+
+- Kimi-K3.1-Pro does not support the prefix cache in this release; a launch with `--enable-prefix-cache` is refused.
+- Kimi-K3.1-Pro's sparse-attention extensions are Hopper (sm90a) builds; an SM100 build is refused by the runtime preflight.
+- Kimi-K3.1-Pro with `--enable-deepep` is unsupported, as for Kimi-K3.
 
 ### Known limitations in v1.1.0
 
