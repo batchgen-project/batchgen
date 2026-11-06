@@ -22,7 +22,8 @@ import torch
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
 
-from .config import KimiLinearConfig, require_num_routed_experts
+from .config import KimiLinearConfig, is_k3_model_type, require_num_routed_experts
+from .dsa_runtime import require_servable_indexer
 from .planner import KimiLinearPlanner
 
 try:
@@ -54,21 +55,38 @@ class KimiLinearInitializer:
                     input_arguments.huggingface_ckpt_name
                 )
 
-        # Kimi-K3 must reach KimiLinearConfig.from_json — it flattens
-        # `text_config` and stamps model_type="kimi_k3". If it did not, the
+        # Kimi-K3 / K3.1 must reach KimiLinearConfig.from_json — it flattens
+        # `text_config` and stamps the wrapper's model_type. If it did not, the
         # name-pattern registry shortcut (model_registry.py:232-238) has handed
         # us KimiLinearConfig() with its 48B DEFAULTS, which builds a model that
         # loads, runs, and is wrong.
-        self.is_k3 = self.batchgen_config.model_type == "kimi_k3"
+        #
+        # K3.1 is K3 plus the DSA indexer: it shares EVERY serving behaviour
+        # keyed off `is_k3` (resident prefill, the streamed MXFP4 rings, the
+        # TP8 latent/vocab sharding, the KDA state plan, the graph buckets), so
+        # it must set the same flag. Reading `== "kimi_k3"` alone would route a
+        # 2.8T K3.1 down the 48B testbed plan.
+        self.is_k31 = self.batchgen_config.model_type == "kimi_k31"
+        self.is_k3 = is_k3_model_type(self.batchgen_config.model_type)
         if "kimi-k3" in input_arguments.huggingface_ckpt_name.lower() \
                 and not self.is_k3:
             raise RuntimeError(
                 "Kimi-K3 identifier "
                 f"{input_arguments.huggingface_ckpt_name!r} resolved to a "
-                f"config with model_type={self.batchgen_config.model_type!r}. "
+                f"config with model_type={self.batchgen_config.model_type!r}, "
+                "expected 'kimi_k3' or 'kimi_k31'. "
                 f"Pass --cache-dir pointing at the checkpoint directory so its "
                 "config.json is read; there is no K3 default config."
             )
+        if self.is_k31:
+            # K3.1 serves through the sparse (DSA) attention path: prefill and
+            # decode write every token's index key to the auxiliary Host
+            # region, and a query with more than index_topk keys attends only
+            # to its indexer-selected ones (dsa_prefill / dsa_sparse_prefill /
+            # dsa_decode, captured by the decode graph). Those kernels are
+            # instantiated for the released indexer geometry; anything else is
+            # refused here, before any weight is mapped.
+            require_servable_indexer(self.batchgen_config.dsa())
 
         # Model instantiation config (same class; structure from config.json).
         self.loaded_model_config = self.batchgen_config

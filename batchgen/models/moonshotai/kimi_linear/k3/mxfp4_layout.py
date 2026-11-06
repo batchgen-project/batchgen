@@ -102,6 +102,31 @@ K3_EXPECTED_QUANT_IGNORE = frozenset({
     "re:.*mm_projector.*",
 })
 
+#: Kimi-K3.1's list is K3's plus two patterns, and nothing else in the whole
+#: ``quantization_config`` differs (verified against both released configs).
+#: Both additions name modules the K3 checkpoint ALREADY ships as BF16 —
+#: ``block_sparse_moe.gate.weight`` [896, 7168], ``routed_expert_down_proj``
+#: [3584, 7168] and ``routed_expert_up_proj`` [7168, 3584] are declared BF16
+#: skeleton tensors in ``tensor_map._SKELETON_PER_MOE_LAYER`` and measured BF16
+#: in the K3 shard headers.  So K3.1 only states explicitly what K3's list left
+#: implicit: no module moves between the packed and the BF16 partition, and NO
+#: ``module_shapes`` entry is re-derived.
+#:
+#: The indexer needs no entry of its own: ``re:.*self_attn.*`` already covers
+#: ``self_attn.indexer.*``, which is why the five indexer tensors ship BF16.
+K31_EXPECTED_QUANT_IGNORE = K3_EXPECTED_QUANT_IGNORE | {
+    r"re:.*block_sparse_moe\.gate$",
+    r"re:.*block_sparse_moe\.routed_expert_(up|down)_proj.*",
+}
+
+#: Which pin a config is held to.  A ``model_type`` outside this table is held
+#: to the K3 pin (the historical behaviour of every caller): the check stays
+#: exact either way, and a mismatch names both sets.
+_EXPECTED_QUANT_IGNORE_BY_MODEL_TYPE = {
+    "kimi_k3": K3_EXPECTED_QUANT_IGNORE,
+    "kimi_k31": K31_EXPECTED_QUANT_IGNORE,
+}
+
 # Which nibble of a packed byte holds the LOWER K index.  UNVERIFIED — this is
 # an ASSUMPTION carried in code so it is reviewable, not a measured constant.
 # "lo_first" is what every existing BatchGen consumer assumes
@@ -184,7 +209,8 @@ def routed_expert_tensor_dtypes() -> Dict[str, torch.dtype]:
 #  Validation — every unsupported declaration hard-fails                        #
 # --------------------------------------------------------------------------- #
 
-def validate_quantization_config(quantization_config: Optional[Dict[str, Any]]
+def validate_quantization_config(quantization_config: Optional[Dict[str, Any]],
+                                 model_type: Optional[str] = "kimi_k3",
                                  ) -> Dict[str, Any]:
     """Reject every quantization declaration this load path does not implement.
 
@@ -192,6 +218,11 @@ def validate_quantization_config(quantization_config: Optional[Dict[str, Any]]
     error, not "unquantized": K3 nests the block under ``text_config``, so a
     config read from the top level of ``config.json`` arrives here empty and
     would otherwise load 1.45 TB of packed nibbles as if they were weights.
+
+    ``model_type`` selects the ``ignore``-list pin
+    (:data:`_EXPECTED_QUANT_IGNORE_BY_MODEL_TYPE`); K3.1's list is K3's plus
+    two redundant restatements.  Everything else in the block is identical
+    between the two checkpoints and is checked identically.
     """
     if quantization_config is None:
         raise K3QuantContractError(
@@ -262,16 +293,19 @@ def validate_quantization_config(quantization_config: Optional[Dict[str, Any]]
             "the packed form this load path streams."
         )
 
+    expected_ignore = _EXPECTED_QUANT_IGNORE_BY_MODEL_TYPE.get(
+        model_type, K3_EXPECTED_QUANT_IGNORE)
     ignored = frozenset(quantization_config.get("ignore") or ())
-    if ignored != K3_EXPECTED_QUANT_IGNORE:
+    if ignored != expected_ignore:
         raise K3QuantContractError(
-            "quantization_config['ignore'] changed: "
-            f"missing={sorted(K3_EXPECTED_QUANT_IGNORE - ignored)}, "
-            f"added={sorted(ignored - K3_EXPECTED_QUANT_IGNORE)}. This list is "
+            "quantization_config['ignore'] changed for model_type="
+            f"{model_type!r}: missing={sorted(expected_ignore - ignored)}, "
+            f"added={sorted(ignored - expected_ignore)}. This list is "
             "the checkpoint's own statement of which modules are NOT MXFP4, and "
             "module_shapes declares attention / shared experts / lm_head / the "
             "dense MLP as BF16 on the strength of it. Re-derive the affected "
-            "module_shapes entries before updating K3_EXPECTED_QUANT_IGNORE."
+            "module_shapes entries before updating the pin for this model_type "
+            "(K3_EXPECTED_QUANT_IGNORE / K31_EXPECTED_QUANT_IGNORE)."
         )
     return quantization_config
 

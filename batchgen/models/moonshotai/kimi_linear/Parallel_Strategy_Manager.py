@@ -46,7 +46,7 @@ from .block_residual import (
     decoder_layer_forward_block_residual,
     make_output_block_residual_pre_hook,
 )
-from .config import require_num_routed_experts
+from .config import is_k3_model_type, require_num_routed_experts
 from .serving_modules import (
     fuse_kda_decode_projections,
     kda_decode_serving,
@@ -112,11 +112,12 @@ class KimiLinearParallelStrategyManager:
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
 
-        # K3 vs 48B. The ONLY thing this decides in the PSM is the skeleton key
-        # translation (`_skeleton_ckpt_key`); it is the same discriminator the
-        # rest of the family uses (kimi_initializer.is_k3,
-        # kimi_parameter_server._detect_kimi_family).
-        self._is_k3 = getattr(loaded_model_config, "model_type", None) == "kimi_k3"
+        # K3 (and K3.1) vs 48B: the same family test the rest of the family
+        # reads (config.is_k3_model_type — kimi_initializer.is_k3,
+        # kimi_parameter_server). Skeleton key translation, the resident/
+        # streamed prefill modes, distributed weights and the TP-G seams all
+        # branch on it.
+        self._is_k3 = is_k3_model_type(getattr(loaded_model_config, "model_type", None))
         self._distributed_weight_sharded = bool(
             getattr(
                 engine_config.Basic_Config,
@@ -1361,6 +1362,25 @@ class KimiLinearParallelStrategyManager:
         )
         self._decode_graph.install()
 
+    def preload_runtime_extensions(self) -> tuple:
+        """Model-specific native dependencies, resolved before readiness.
+
+        The worker's pre-readiness startup pass calls this after its own
+        family-wide preload. Kimi-K3.1's DSA layers reach kernels no Kimi-K3
+        layer does (``dsa_runtime``); a dense model has nothing to add.
+        Returns the names resolved.
+        """
+        dsa = getattr(self.loaded_model_config, "dsa", None)
+        if dsa is None or dsa() is None:
+            return ()
+        from .dsa_runtime import preload_dsa_runtime
+
+        resolved = preload_dsa_runtime()
+        logging.info(
+            "Rank %s: [K3_STARTUP] Loaded DSA runtime %s", self.rank, list(resolved)
+        )
+        return resolved
+
     def prewarm_deepep_exchange(self) -> bool:
         """Build the process-lifetime DeepEP low-latency buffer at startup.
 
@@ -1413,6 +1433,11 @@ class KimiLinearParallelStrategyManager:
         if gpu_manager is not None:
             manager = getattr(gpu_manager, "primary", gpu_manager)
             AttnWrapperBase.gpu_paged_kv_manager = manager
+            # Kimi-K3.1: the DSA spans also bake the auxiliary (index-key)
+            # cache; a single-region manager binds none.
+            AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(
+                gpu_manager, "auxiliary", None
+            )
         return self._decode_graph.prewarm_decode_graphs()
 
     def _init_resident_ep_decode(self):

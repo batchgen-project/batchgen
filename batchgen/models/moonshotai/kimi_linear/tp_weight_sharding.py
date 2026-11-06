@@ -44,11 +44,18 @@ def shard_mla_tensor(tensor, name, tp_size, tp_rank):
         return tensor
 
     base = name.split(".", 1)[0]
+    # The DSA indexer (Kimi-K3.1) is replicated, not head-parallel: it caches
+    # ONE MQA key per token, and its 32 index heads are summed into a single
+    # score per key before the top-k. Sharding those heads would hand each
+    # rank a partial sum and a different top-k unless an all-reduce were added
+    # ahead of the selection; replicating it costs no collective and gives
+    # every rank the identical selection.
     if base in (
         "q_a_proj",
         "q_a_layernorm",
         "kv_a_proj_with_mqa",
         "kv_a_layernorm",
+        "indexer",
     ):
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid MLA TP rank {tp_rank}/{tp_size}")
