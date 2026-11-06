@@ -28,6 +28,7 @@ from batchgen.host_memory_preflight import (
     HostMemoryPlanError,
     run_host_memory_preflight,
 )
+from batchgen.launch_readiness import LaunchReadinessError, run_launch_readiness
 from batchgen.runtime_preflight import RuntimePreflightError, run_runtime_preflight
 
 
@@ -73,6 +74,12 @@ def _serve(server_args) -> None:
     logging.info(f"Watchdog timeout: {server_args.watchdog_timeout}s")
 
     try:
+        # First of the three startup gates: the node-level environment this
+        # launch depends on -- mount flags, kernel watermarks, port ownership
+        # and a bounded read of every path it names. Each of those used to be
+        # discovered minutes in, from inside a staging copy or a rendezvous,
+        # after the whole group had already committed its GPUs to the start.
+        run_launch_readiness(server_args)
         # Run before importing worker_manager/http_server so missing native
         # dependencies fail before workers, SHM, ports, or model weights exist.
         run_runtime_preflight(server_args)
@@ -84,6 +91,9 @@ def _serve(server_args) -> None:
         from batchgen.server.http_server import launch_server
 
         launch_server(server_args)
+    except LaunchReadinessError as exc:
+        logging.error("Launch readiness failed: %s", exc)
+        sys.exit(1)
     except RuntimePreflightError as exc:
         logging.error("Runtime preflight failed: %s", exc)
         sys.exit(1)

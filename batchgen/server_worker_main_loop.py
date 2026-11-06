@@ -35,6 +35,11 @@ from batchgen.server.process_utils import (
 from batchgen.server.runtime_locks import hold_run_lock
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
+from batchgen.worker.startup_phases import (
+	NULL_STARTUP_PHASE_REPORTER,
+	PHASE_COMMUNICATOR_INIT,
+	PHASE_MODEL_BUILD,
+)
 
 
 _WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
@@ -607,6 +612,7 @@ def server_worker_main(
 	fatal_ack_event: Optional[mp.Event] = None,
 	shutdown_flag: Optional[Any] = None,
 	rendezvous_flag: Optional[Any] = None,
+	phase_record: Optional[Any] = None,
 ):
 	try:
 		_server_worker_main_impl(
@@ -618,6 +624,7 @@ def server_worker_main(
 			fatal_ack_event,
 			shutdown_flag,
 			rendezvous_flag,
+			phase_record,
 		)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
@@ -657,6 +664,7 @@ def _server_worker_main_impl(
 	fatal_ack_event: Optional[mp.Event] = None,
 	shutdown_flag: Optional[Any] = None,
 	rendezvous_flag: Optional[Any] = None,
+	phase_record: Optional[Any] = None,
 ):
 	"""
 	The main loop for the GPU workers.
@@ -723,12 +731,29 @@ def _server_worker_main_impl(
 	args.global_rank = args.local_world_size * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
+	# This rank's slot in the server's shared startup-phase record.  Slot 0 is
+	# the server itself, so the local ranks take the slots after it.  Phases are
+	# entered back to back below rather than wrapped: the entries bracket code
+	# that exits the process on failure, and entering the next phase ends the
+	# previous one, so no second of a rank's pre-readiness life escapes a budget.
+	# A worker spawned without a record (tests, the legacy launcher) reports to
+	# the null reporter instead, which still validates every phase name.
+	phase_reporter = (
+		NULL_STARTUP_PHASE_REPORTER
+		if phase_record is None
+		else phase_record.reporter(1 + rank_idx)
+	)
+
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
 
 	# Set CUDA device before init_process_group so NCCL uses the correct device context
 	torch.cuda.set_device(args.local_rank)
 
+	# The rendezvous below and the NCCL warmup after it are one phase: both
+	# complete for every rank together or for none, so a rank that sits in
+	# either past its budget is a rank the cohort will never finish without.
+	phase_reporter.enter(PHASE_COMMUNICATOR_INIT)
 	try:
 		pg_kwargs = dict(
 			backend="nccl",
@@ -803,7 +828,11 @@ def _server_worker_main_impl(
 		sys.exit(1)
 
 	# 2. Instantiate the BatchGenWorker
+	phase_reporter.enter(PHASE_MODEL_BUILD)
 	worker = BatchGenWorker(args)
+	# From here the worker reports the finer phases of its own startup pass
+	# into the same slot; each entry restarts the budget for the step it names.
+	worker.set_startup_phase_reporter(phase_reporter)
 
 	# 2.5. Initialize watchdog for stuck process detection
 	watchdog_timeout = getattr(args, 'watchdog_timeout', None)
@@ -835,8 +864,12 @@ def _server_worker_main_impl(
 	# Without this barrier, faster ranks will start the main loop and attempt collective
 	# operations while slower ranks are still initializing, causing NCCL errors.
 	logging.info(f"Rank {args.global_rank}: Worker initialized, waiting for all ranks at barrier...")
+	phase_reporter.enter(PHASE_COMMUNICATOR_INIT)
 	dist.barrier()
 	logging.info(f"Rank {args.global_rank}: All ranks ready, entering main loop.")
+	# Past every tracked phase: this rank is about to report itself ready, and
+	# an idle slot carries no budget, so nothing below is watched by it.
+	phase_reporter.leave()
 
 	# Each launcher owns a node-local event, so local rank 0 must signal its own
 	# WorkerManager. The global barrier above proves all workers are ready first.
