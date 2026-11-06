@@ -297,6 +297,12 @@ def mla_materialize_pool_segment(
     comparison rather than a reinterpretation.
 
     ``slots`` are this slab's pool slots, in token order.
+
+    A DSA (K3.1) pool holds the LATENT itself rather than the expanded heads --
+    its sparse attention is the absorbed ``qv`` form, so there is no V row and
+    no projection to apply. The load is then the plain write of the stored
+    bytes into the same slots, which is again exactly what the computed path
+    writes (``dsa_sparse_prefill``). ``pool.v is None`` is that case.
     """
 
     total_tokens = latent.shape[0]
@@ -311,6 +317,10 @@ def mla_materialize_pool_segment(
             f"{self.kv_lora_rank + self.qk_rope_head_dim} wide, got "
             f"{latent.shape[-1]}"
         )
+    if pool.v is None:
+        k_cache = pool.k[pool_layer]
+        k_cache.view(-1, k_cache.shape[-1])[slots] = latent.to(k_cache.dtype)
+        return total_tokens
     normed_kv, k_pe = torch.split(
         latent, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
@@ -329,6 +339,48 @@ def mla_materialize_pool_segment(
     k_cache, v_cache = pool.k[pool_layer], pool.v[pool_layer]
     k_cache.view(-1, *k_cache.shape[-2:]).index_copy_(0, slots, key_states)
     v_cache.view(-1, *v_cache.shape[-2:]).index_copy_(0, slots, value_states)
+    return total_tokens
+
+
+def dsa_materialize_pool_segment_index_keys(
+    self, index_keys, *, pool, indexer_row, slots
+):
+    """Write a committed prefix's INDEX KEYS into this layer's indexer row.
+
+    The auxiliary region's pages are the index keys themselves, so unlike the
+    latent there is nothing to project: the loader has already turned the
+    page-split FP8 bytes back into ``[tokens, index_head_dim]`` keys and this
+    writes them into the same pool slots the computed path writes
+    (``dsa_sparse_prefill``, ``indexer_flat[pool.slots]``). The suffix's scorer
+    then gathers cached and new keys out of one row without knowing which is
+    which.
+
+    These are the keys the stored bytes REPRESENT, i.e. what decode scores
+    against for the same tokens -- not the pre-quantization keys the wave that
+    computed the prefix scored. A cached prefix is served from the cache, and
+    this is the cache's value.
+    """
+
+    total_tokens = index_keys.shape[0]
+    if int(slots.numel()) != total_tokens:
+        raise ValueError(
+            f"materializing {total_tokens} index key(s) into "
+            f"{int(slots.numel())} pool slot(s)"
+        )
+    if pool.indexer is None:
+        raise RuntimeError(
+            "this prefill prefix pool has no indexer rows, so a DSA prefix's "
+            "index keys have nowhere to land and its suffix would select over "
+            "its own keys only"
+        )
+    row = pool.indexer[indexer_row]
+    width = int(row.shape[-1])
+    if int(index_keys.shape[-1]) != width:
+        raise ValueError(
+            f"a materialized index key is {width} wide in the pool, got "
+            f"{int(index_keys.shape[-1])}"
+        )
+    row.view(-1, width)[slots] = index_keys.to(row.dtype)
     return total_tokens
 
 

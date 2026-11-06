@@ -48,6 +48,7 @@ from .block_residual import (
 )
 from .config import is_k3_model_type, require_num_routed_experts
 from .serving_modules import (
+    dsa_materialize_pool_segment_index_keys,
     fuse_kda_decode_projections,
     kda_decode_serving,
     kda_prefill_serving,
@@ -1710,6 +1711,15 @@ class KimiLinearParallelStrategyManager:
         sized from the Host geometry. ``layer_map`` maps an engine layer to its
         dense pool row, the same way the Host and GPU pools are mapped.
 
+        K3.1 (DSA) is the other case: its pooled prefill is the SPARSE one,
+        whose attention is the absorbed ``qv`` form over the 576-wide latent at
+        page size 1 (``dsa_sparse_prefill``), and whose selection reads the
+        index keys. So the pool holds one latent head and no V, and the index
+        keys go in the pool's own indexer rows (the worker's
+        ``_prefill_pool_layout`` declares those from the layers' indexers).
+        Declaring the expanded heads there instead would size the pool for a
+        kernel the DSA path never calls.
+
         Answerable with or without a resident model: the worker calls this
         while planning a wave, which happens in the decode phase where the
         model may be deep-freed.
@@ -1720,6 +1730,20 @@ class KimiLinearParallelStrategyManager:
             if cfg.is_mla_layer(layer_idx)
         ]
         rows = {layer_idx: row for row, layer_idx in enumerate(mla_layers)}
+        layer_map = tuple(
+            rows.get(layer_idx, -1)
+            for layer_idx in range(cfg.num_hidden_layers)
+        )
+        sparse = bool(cfg.num_dsa_layers)
+        if sparse and sorted(rows) != sorted(
+            layer_idx for layer_idx in rows if cfg.is_dsa_layer(layer_idx)
+        ):
+            raise RuntimeError(
+                "the prefill prefix pool needs every MLA layer of a DSA "
+                "model to be indexer-gated: the pool keeps one latent row "
+                "per MLA layer and the sparse prefill selects on every one "
+                f"of them ({cfg.num_dsa_layers} DSA of {len(rows)} MLA)"
+            )
         # Derived from the config, NOT from the module: the worker plans a
         # pooled wave at reservation time, which can fall in a phase window
         # where the model has been deep-freed and not rebuilt yet
@@ -1733,16 +1757,24 @@ class KimiLinearParallelStrategyManager:
         heads = int(cfg.num_attention_heads)
         if self._attn_tp_size > 1:
             heads //= self._attn_tp_size
-        layout = {
-            "num_layers": len(mla_layers),
-            "layer_map": tuple(
-                rows.get(layer_idx, -1)
-                for layer_idx in range(cfg.num_hidden_layers)
-            ),
-            "num_kv_heads": heads,
-            "k_head_dim": int(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
-            "v_head_dim": int(cfg.v_head_dim),
-        }
+        if sparse:
+            layout = {
+                "num_layers": len(mla_layers),
+                "layer_map": layer_map,
+                "num_kv_heads": 1,
+                "k_head_dim": int(cfg.compressed_kv_dim),
+                # No V row: the absorbed sparse attention reads the latent's
+                # two halves out of the K row itself.
+                "v_head_dim": 0,
+            }
+        else:
+            layout = {
+                "num_layers": len(mla_layers),
+                "layer_map": layer_map,
+                "num_kv_heads": heads,
+                "k_head_dim": int(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
+                "v_head_dim": int(cfg.v_head_dim),
+            }
         if self.model is None:
             return layout
         # The module is the ground truth whenever it is resident, so compare
@@ -1751,11 +1783,20 @@ class KimiLinearParallelStrategyManager:
         # sized, rather than corrupt pool rows it no longer matches.
         attn = self.model.model.layers[mla_layers[0]].self_attn
         attn = getattr(attn, "module", attn)
-        live = {
-            "num_kv_heads": int(attn.num_heads),
-            "k_head_dim": int(attn.qk_nope_head_dim + attn.qk_rope_head_dim),
-            "v_head_dim": int(attn.v_head_dim),
-        }
+        if sparse:
+            live = {
+                "num_kv_heads": 1,
+                "k_head_dim": int(attn.kv_lora_rank + attn.qk_rope_head_dim),
+                "v_head_dim": 0,
+            }
+        else:
+            live = {
+                "num_kv_heads": int(attn.num_heads),
+                "k_head_dim": int(
+                    attn.qk_nope_head_dim + attn.qk_rope_head_dim
+                ),
+                "v_head_dim": int(attn.v_head_dim),
+            }
         divergent = {
             key: (value, layout[key])
             for key, value in live.items() if value != layout[key]
@@ -2395,6 +2436,13 @@ class KimiLinearParallelStrategyManager:
             attn.mla_materialize_pool_segment = types.MethodType(
                 mla_materialize_pool_segment, attn
             )
+            if getattr(attn, "indexer", None) is not None:
+                # K3.1: the auxiliary region's pages ARE the index keys, so
+                # the second half of a dual-region prefix load is a write into
+                # this layer's indexer pool row.
+                attn.dsa_materialize_pool_segment_index_keys = types.MethodType(
+                    dsa_materialize_pool_segment_index_keys, attn
+                )
             attn.attn_tp_size = self._attn_tp_size
             attn.attn_tp_rank = self._attn_tp_rank
             attn.attn_tp_group = self._attn_tp_group
