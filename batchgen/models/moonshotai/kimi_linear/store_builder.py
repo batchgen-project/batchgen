@@ -1065,7 +1065,9 @@ def _parallel_map(
     found at run time by :func:`_next_worker_level`, so the same code
     saturates a network filesystem, a local NVMe or a tmpfs re-read without
     knowing which it is. Results keep item order; the first failing item (in
-    item order) re-raises after every thread stopped.
+    item order) re-raises after every thread stopped. Threads that never
+    pass the gate never run ``work``, so per-thread buffers are bounded by
+    the highest level the controller reached.
     """
     count = len(items)
     if count == 0:
@@ -1123,31 +1125,45 @@ def _parallel_map(
 
     history: List[Tuple[int, float]] = []
     settled = False
-    while not settled and not stop.is_set():
-        if not wait(ADAPTIVE_SETTLE_S):
-            break
-        with lock:
-            start_bytes = state["bytes"]
-        start = time.monotonic()
-        if not wait(ADAPTIVE_WINDOW_S):
-            break
-        with lock:
-            window_bytes = state["bytes"] - start_bytes
-        rate = window_bytes / max(time.monotonic() - start, 1e-9)
-        history.append((level, rate))
-        new_level, settled = _next_worker_level(history, limit)
-        logger.info(
-            "%s: %d workers -> %.2f GiB/s%s",
-            label,
-            level,
-            rate / float(1 << 30),
-            f"; settling at {new_level}" if settled else f"; trying {new_level}",
-        )
-        if new_level != level:
-            level = new_level
-            gate.set_level(level)
-    for thread in threads:
-        thread.join()
+    try:
+        while not settled and not stop.is_set():
+            if not wait(ADAPTIVE_SETTLE_S):
+                break
+            with lock:
+                start_bytes = state["bytes"]
+            start = time.monotonic()
+            if not wait(ADAPTIVE_WINDOW_S):
+                break
+            with lock:
+                window_bytes = state["bytes"] - start_bytes
+            if window_bytes == 0:
+                # No item reported progress: no information about this
+                # level yet, so measure it again rather than score it 0.
+                continue
+            rate = window_bytes / max(time.monotonic() - start, 1e-9)
+            history.append((level, rate))
+            new_level, settled = _next_worker_level(history, limit)
+            logger.info(
+                "%s: %d workers -> %.2f GiB/s%s",
+                label,
+                level,
+                rate / float(1 << 30),
+                f"; settling at {new_level}" if settled
+                else f"; trying {new_level}",
+            )
+            if new_level != level:
+                level = new_level
+                gate.set_level(level)
+        for thread in threads:
+            thread.join()
+    except BaseException:
+        # Interrupted (e.g. KeyboardInterrupt): stop admitting work and let
+        # in-flight items finish, so the caller's cleanup never closes a
+        # descriptor or removes a directory under a live worker.
+        stop.set()
+        for thread in threads:
+            thread.join()
+        raise
     if errors:
         raise errors[min(errors)]
     return results
@@ -1501,12 +1517,11 @@ def verify_store(
         for record in sorted(plan.local_records, key=lambda item: item.compact_offset)
     ]
     segments = segment_spans(spans)
+    _check_workers(hash_workers, "hash")
     try:
         descriptor = os.open(store_path, os.O_RDONLY)
     except OSError as error:
         raise K3StoreBuilderError(f"cannot reopen {store_path}: {error}") from error
-
-    _check_workers(hash_workers, "hash")
 
     def check(segment: List[Span], progress: Any) -> str:
         digests = _read_span_digests(
