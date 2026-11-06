@@ -20,13 +20,16 @@
 ## News
 
 <!-- news-rewrite-ack 2026/11: owner-directed consolidation of the two 2026/09 GLM entries into one, and of the v1.1.0 + v1.1.1 entries into one v1.1.1 entry -->
-- **2026/11 — BatchGen v1.2.0: Kimi-K3.1-Pro.** Day-one support for
+<!-- news-rewrite-ack 2026/11: owner-directed withdrawal of the v1.2.0 release before adoption; the Kimi-K3.1-Pro entry no longer names an unpublished version and ships as v1.1.2 -->
+- **2026/11 — Kimi-K3.1-Pro support (release pending).** Support for
   [Kimi-K3.1-Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) — Kimi-K3 with a
   gated sparse-attention indexer on its 24 full-attention layers — served on
   4×8 H20 through a dual-region KV cache (MLA latent + page-split FP8 index
   keys), sparse long-prompt prefill and CUDA-graph sparse decode, validated
   end to end (MMLU-Pro smoke and a 512-request mixed eval batch to
-  completion). See the [deployment guide](docs/deploy-kimi-k3.1-h20.md).
+  completion). Ships in v1.1.2 together with prefix-cache support for this
+  model and the formal benchmark refresh. See the
+  [deployment guide](docs/deploy-kimi-k3.1-h20.md).
 - **2026/11 — BatchGen v1.1.1.** Kimi-K3 multi-node serving on a compact
   distributed weight store; GLM-5 with no runtime compilation (ahead-of-time
   kernels plus a startup prewarm covering every reachable Triton and DeepGEMM
@@ -86,8 +89,8 @@ long forced decodes under heavy oversubscription.
 BatchGen runs use the v1.1.1 engine and the linked deployment guides (v1.1.1
 is v1.1.0 plus the scheduler fix
 [#588](https://github.com/batchgen-project/batchgen/pull/588) that the
-long-context row depends on; v1.2.0 adds Kimi-K3.1-Pro support on the same
-engine without touching these measured paths);
+long-context row depends on; the pending v1.1.2 adds Kimi-K3.1-Pro support
+on the same engine without touching these measured paths);
 baselines were tuned with the sweeps documented in
 [`benchmarks/README.md`](benchmarks/README.md), which also carries the exact
 workload builders and the batch driver used for every row.
