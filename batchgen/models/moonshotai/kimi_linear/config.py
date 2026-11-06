@@ -69,11 +69,30 @@ def require_num_routed_experts(cfg) -> int:
     )
 
 
+# Wrapper (VLM) ``model_type`` values of the K3 family, and whether that
+# identity carries the DSA indexer.  Both checkpoints declare
+# ``text_config.model_type == "kimi_linear"``, so only the TOP-LEVEL value
+# distinguishes them; stamping one of these is what `from_hf_dict` does.
+_K3_WRAPPER_MODEL_TYPES = {
+    "kimi_k3": False,
+    "kimi_k31": True,
+}
+
+
+def is_k3_model_type(model_type) -> bool:
+    """Kimi-K3 or Kimi-K3.1: the K3 architecture, with or without the DSA
+    indexer. The ONE family test every K3 branch reads — the 48B testbed
+    (``kimi_linear``) is the only other model type these modules serve, and a
+    K3.1 routed down a ``== "kimi_k3"`` test lands on the 48B plan."""
+    return model_type in _K3_WRAPPER_MODEL_TYPES
+
+
 @register_config("kimi_linear")
 @register_config("kimi_k3")
+@register_config("kimi_k31")
 @dataclass
 class KimiLinearConfig(BaseModelConfig):
-    """Kimi-Linear / Kimi-K3 hybrid (KDA + NoPE-MLA) MoE configuration."""
+    """Kimi-Linear / Kimi-K3 / Kimi-K3.1 hybrid (KDA + NoPE-MLA) MoE config."""
 
     # ==================== Identity ====================
     model_type: str = "kimi_linear"
@@ -102,6 +121,16 @@ class KimiLinearConfig(BaseModelConfig):
     # dict: {kda_layers:[1-indexed], full_attn_layers:[...], num_heads, head_dim,
     #        short_conv_kernel_size, use_full_rank_gate?, gate_lower_bound?}
     linear_attn_config: Optional[Dict[str, Any]] = None
+
+    # ==================== DSA indexer (Kimi-K3.1 only) ====================
+    # Raw ``text_config.dsa_config``: {dsa_layers:[1-indexed], index_topk,
+    # index_head_dim, index_num_heads, index_rope_dim, index_k_norm_type,
+    # index_topk_freq, index_skip_topk_offset}. None IS the Kimi-K3 (dense)
+    # configuration — there is no default, because a defaulted indexer would
+    # make a K3.1 checkpoint load as a dense K3 with 120 unused tensors.
+    # Validated by k3/tensor_map.py (loader gate) and parsed into a checked
+    # dataclass by :meth:`dsa` / kimi_k3/config.py (model gate).
+    dsa_config: Optional[Dict[str, Any]] = None
 
     # ==================== MoE ====================
     num_local_experts: int = 256
@@ -163,11 +192,23 @@ class KimiLinearConfig(BaseModelConfig):
     @classmethod
     def from_hf_dict(cls, data: Dict[str, Any]) -> "KimiLinearConfig":
         top_model_type = data.get("model_type", "kimi_linear")
-        # K3: the language-model fields live under text_config; flatten them up.
+        # K3 / K3.1: the language-model fields live under text_config; flatten
+        # them up and keep the WRAPPER's identity. Both checkpoints declare
+        # text_config.model_type == "kimi_linear", so stamping the flattened
+        # value would erase the distinction between a dense K3 and a sparse
+        # K3.1 — and K3.1's dsa_config would then be rejected as belonging to
+        # the wrong identity.
         merged: Dict[str, Any] = {}
         if "text_config" in data and isinstance(data["text_config"], dict):
+            if top_model_type not in _K3_WRAPPER_MODEL_TYPES:
+                raise ValueError(
+                    "A nested (text_config) Kimi config must declare a known "
+                    "wrapper model_type at top level; got {!r}, expected one "
+                    "of {}. The wrapper identity selects the attention graph "
+                    "(dense MLA vs DSA-gated MLA) and is never defaulted."
+                    .format(top_model_type, sorted(_K3_WRAPPER_MODEL_TYPES)))
             merged.update(data["text_config"])
-            merged["model_type"] = "kimi_k3"
+            merged["model_type"] = top_model_type
         else:
             merged.update(data)
             merged.setdefault("model_type", top_model_type)
@@ -194,7 +235,7 @@ class KimiLinearConfig(BaseModelConfig):
         # quantization label from compressed-tensors mxfp4 config
         qc = self.quantization_config or {}
         fmt = (qc.get("format") or qc.get("quant_method") or "")
-        if "mxfp4" in str(fmt).lower() or self.model_type == "kimi_k3":
+        if "mxfp4" in str(fmt).lower() or self.model_type in _K3_WRAPPER_MODEL_TYPES:
             if self.quantization == "none" and self.quantization_config:
                 self.quantization = "mxfp4"
 
@@ -208,6 +249,35 @@ class KimiLinearConfig(BaseModelConfig):
 
     def is_mla_layer(self, layer_idx: int) -> bool:
         return not self.is_kda_layer(layer_idx)
+
+    # ------------------------------------------------------------------ #
+    #  DSA indexer helpers (Kimi-K3.1)
+    # ------------------------------------------------------------------ #
+    def dsa(self):
+        """The parsed, validated ``dsa_config``, or ``None`` for dense K3.
+
+        Parsing is delegated to ``kimi_k3/config.py:parse_dsa_config`` so the
+        serving config and the reference model agree by construction rather
+        than by two transcriptions of the same eight keys. Imported lazily:
+        that module is torch-free and batchgen-free, and nothing on the
+        Kimi-Linear-48B path should pay for it.
+        """
+        if self.dsa_config is None:
+            return None
+        from batchgen.models.moonshotai.kimi_k3.config import parse_dsa_config
+
+        return parse_dsa_config(self.dsa_config, int(self.num_hidden_layers))
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """Whether this MLA layer is indexer-gated. False for all of K3."""
+        dsa = self.dsa_config
+        if not dsa:
+            return False
+        return (layer_idx + 1) in [int(x) for x in dsa.get("dsa_layers", [])]
+
+    @property
+    def num_dsa_layers(self) -> int:
+        return sum(self.is_dsa_layer(i) for i in range(self.num_hidden_layers))
 
     @property
     def kda_num_heads(self) -> int:
