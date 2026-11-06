@@ -13923,29 +13923,39 @@ class BatchGenWorker:
 		return layers
 
 	def _materialized_segment_loader(self, wave):
-		"""Staging for this wave's loads, or None when it materializes none."""
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		"""Staging for this wave's loads, or None when it materializes none.
+
+		One loader per prefix-cache KV group, keyed by group id. Group 0 is the
+		primary region's MLA latent, which the model expands. A dual-region
+		(DSA) model adds group 1, the page-split FP8 indexer keys: those pages
+		ARE the index keys, so they are read back and dequantized rather than
+		reconstructed, and they are cut at the same page boundaries as the
+		latent so the two slab streams pair up one for one.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			build_gpu_kv_config,
+			build_gpu_kv_config_aux,
+		)
 		from batchgen.prefix_reuse.pool_materialize import (
 			DEFAULT_SLAB_BYTES,
 			MaterializedSegmentLoader,
+			PageSplitIndexKeyLoader,
 		)
 
 		if not wave.materialized:
 			return None
 		views = self._host_views_by_group()
-		if len(views) != 1:
-			# A dual-region model keeps a second Host KV region (the DSA
-			# indexer keys), which a latent expansion does not reconstruct.
+		if sorted(views) not in ([0], [0, 1]):
 			raise RuntimeError(
-				f"materializing a prefix needs exactly one Host KV region, "
-				f"this model has {len(views)}"
+				"materializing a prefix needs the primary Host KV region "
+				"(group 0) alone or beside the DSA indexer region (group 1), "
+				f"this model has groups {sorted(views)}"
 			)
-		group_id, view = next(iter(sorted(views.items())))
 		geometry = build_gpu_kv_config(
 			self.huggingface_ckpt_name, [int(wave.page_tokens)]
 		)
-		loader = MaterializedSegmentLoader(
-			worker_view=view,
+		primary = MaterializedSegmentLoader(
+			worker_view=views[0],
 			num_layers=int(geometry.num_layers),
 			page_tokens=int(wave.page_tokens),
 			latent_dim=int(geometry.num_k_heads) * int(geometry.k_head_dim),
@@ -13953,31 +13963,124 @@ class BatchGenWorker:
 			device=self.torch_device,
 			max_slab_bytes=DEFAULT_SLAB_BYTES,
 		)
+		loaders = {0: primary}
+		if 1 in views:
+			aux_geometry = build_gpu_kv_config_aux(
+				self.huggingface_ckpt_name, [int(wave.page_tokens)]
+			)
+			if aux_geometry is None:
+				raise RuntimeError(
+					"this model has a second Host KV region but no DSA "
+					"indexer profile, so the auxiliary pages cannot be read "
+					"back as index keys"
+				)
+			if int(aux_geometry.num_layers) != int(geometry.num_layers):
+				raise RuntimeError(
+					"the DSA indexer region keeps "
+					f"{int(aux_geometry.num_layers)} row(s) against the "
+					f"latent region's {int(geometry.num_layers)}; a prefix "
+					"load addresses both by the same row"
+				)
+			loaders[1] = PageSplitIndexKeyLoader(
+				worker_view=views[1],
+				num_layers=int(aux_geometry.num_layers),
+				page_tokens=int(wave.page_tokens),
+				carrier_bytes=self._prefix_pool_index_key_carrier(aux_geometry),
+				slab_pages=primary.slab_pages,
+				dtype=geometry.kv_dtype,
+				device=self.torch_device,
+			)
 		logging.info(
 			"[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
-			"%d B of device staging (%d Host page(s) per slab, group %s)",
-			self.rank, len(wave.materialized), loader.staging_bytes,
-			loader.slab_pages, group_id,
+			"%d B of device staging (%d Host page(s) per slab, groups %s)",
+			self.rank, len(wave.materialized),
+			sum(loader.staging_bytes for loader in loaders.values()),
+			primary.slab_pages, sorted(loaders),
 		)
-		return loader
+		return loaders
 
-	def _load_materialized_segments(self, wave, rows, loader) -> int:
+	def _prefix_pool_index_key_carrier(self, aux_geometry) -> int:
+		"""Bytes per token in the auxiliary region, scale bytes included.
+
+		A page-split FP8 region declares ``k_head_dim`` in BYTES per token (the
+		e4m3 data bytes plus one fp32 scale); the loader turns that into the
+		key width through the layout's own statement. An AoS indexer region
+		declares ELEMENTS and carries no scale, so reading it as page-split
+		bytes would silently reinterpret every key: refused here.
+		"""
+		if aux_geometry.kv_dtype is not torch.float8_e4m3fn:
+			raise RuntimeError(
+				"loading a cached prefix's index keys needs the page-split "
+				f"FP8 indexer region, got {aux_geometry.kv_dtype}"
+			)
+		return int(aux_geometry.k_head_dim)
+
+	def _materialized_pool_index_key_layers(self, pool):
+		"""The attention layers that materialize INDEX KEYS, in pool-row order.
+
+		The same assertion the latent walk makes, against the pool's indexer
+		rows: the n-th index-key-materializing layer must be indexer row n,
+		because the auxiliary Host region keeps one dense row per DSA layer in
+		engine order and the load addresses it by that one index. A model whose
+		two orders disagree would load every layer's prefix keys into the wrong
+		row and the suffix would select plausible keys from the wrong depth.
+		"""
+		rows = getattr(pool, "indexer_row", None) if pool is not None else None
+		if not rows:
+			raise RuntimeError(
+				"a materialized DSA prefix needs the pool's indexer rows"
+			)
+		layers = []
+		for engine_layer, decoder_layer in enumerate(self.model.model.layers):
+			attn = decoder_layer.self_attn
+			if not hasattr(attn, "materialize_pool_segment_index_keys"):
+				continue
+			row = rows.get(engine_layer)
+			if row is None:
+				raise RuntimeError(
+					f"engine layer {engine_layer} materializes index keys but "
+					"has no prefix-pool indexer row"
+				)
+			if row != len(layers):
+				raise RuntimeError(
+					f"engine layer {engine_layer} is pool indexer row {row} "
+					f"but the {len(layers)}th index-key materializing layer; "
+					"the pool and Host orders must agree for a prefix load"
+				)
+			layers.append(attn)
+		if len(layers) != len(rows):
+			raise RuntimeError(
+				f"{len(layers)} layer(s) materialize index keys against "
+				f"{len(rows)} pool indexer row(s)"
+			)
+		return layers
+
+	def _load_materialized_segments(self, wave, rows, loaders) -> int:
 		"""Fill this chunk's loaded segments BEFORE its forward reads them.
 
-		Per slab: one H2D of the committed latent across every layer, waited
-		on, then each layer expands its own slab through its own projection
-		into the pool slots that layer's row would have written. Returns the
-		number of tokens loaded, for the wave's metrics.
+		Per slab: one H2D per KV group of the committed prefix across every
+		layer, waited on, then each layer writes its own slab into the pool
+		slots that layer's row would have written. The primary region holds the
+		MLA latent, which the model expands through its own projection; a DSA
+		model's auxiliary region holds the index keys themselves, which are
+		dequantized from their page-split FP8 bytes and written as keys. Both
+		regions carry the SAME segment pages in the same order, so the slabs
+		pair up and one window of pool slots receives both. Returns the number
+		of tokens loaded, for the wave's metrics.
 		"""
 		if not rows.materialized:
 			return 0
-		if loader is None:
+		if not loaders:
 			raise RuntimeError(
 				f"Rank {self.rank}: this chunk loads "
 				f"{len(rows.materialized)} materialized segment(s) with no "
 				"staging; the wave was built without a loader"
 			)
 		layers = self._materialized_pool_layers()
+		key_layers = (
+			self._materialized_pool_index_key_layers(wave.pool)
+			if 1 in loaders else ()
+		)
 		loaded = 0
 		for stage in rows.materialized:
 			pages_by_group = wave.segment_host_pages.get(stage.segment_id)
@@ -13986,29 +14089,55 @@ class BatchGenWorker:
 					f"Rank {self.rank}: materialized segment "
 					f"{stage.segment_id} names no Host page to load from"
 				)
-			if len(pages_by_group) != 1:
+			if sorted(pages_by_group) != sorted(loaders):
 				raise RuntimeError(
 					f"Rank {self.rank}: materialized segment "
-					f"{stage.segment_id} spans {len(pages_by_group)} Host KV "
-					"regions; a latent expansion fills one"
+					f"{stage.segment_id} names Host pages in groups "
+					f"{sorted(pages_by_group)}, this model loads groups "
+					f"{sorted(loaders)}"
 				)
-			pages = next(iter(pages_by_group.values()))
-			for slab in loader.slabs(
-				host_page_ids=pages, tokens=int(stage.tokens)
-			):
+			pages = pages_by_group[0]
+			streams = [
+				loaders[group].slabs(
+					host_page_ids=pages_by_group[group],
+					tokens=int(stage.tokens),
+				)
+				for group in sorted(loaders)
+			]
+			for slabs in zip(*streams):
+				latent_slab = slabs[0]
 				window = stage.slots[
-					slab.token_start:slab.token_start + slab.tokens
+					latent_slab.token_start:
+					latent_slab.token_start + latent_slab.tokens
 				]
 				for physical, attn in enumerate(layers):
 					attn.materialize_pool_segment(
-						latent=slab.latent[physical], slots=window
+						latent=latent_slab.latent[physical], slots=window
 					)
-				loaded += int(slab.tokens)
+				for key_slab in slabs[1:]:
+					if (
+						key_slab.token_start != latent_slab.token_start
+						or key_slab.tokens != latent_slab.tokens
+					):
+						raise RuntimeError(
+							f"Rank {self.rank}: materialized segment "
+							f"{stage.segment_id} loaded index keys for "
+							f"[{key_slab.token_start}, {key_slab.tokens}) "
+							f"against a latent slab of "
+							f"[{latent_slab.token_start}, "
+							f"{latent_slab.tokens})"
+						)
+					for physical, attn in enumerate(key_layers):
+						attn.materialize_pool_segment_index_keys(
+							index_keys=key_slab.keys[physical], slots=window
+						)
+				loaded += int(latent_slab.tokens)
 			logging.info(
 				"[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
-				"token(s) over %d Host page(s) into %d pool page(s)",
+				"token(s) over %d Host page(s) per region into %d pool "
+				"page(s), groups %s",
 				self.rank, stage.segment_id, int(stage.tokens), len(pages),
-				len(stage.pages),
+				len(stage.pages), sorted(loaders),
 			)
 		return loaded
 
@@ -14272,7 +14401,8 @@ class BatchGenWorker:
 			# here — the wave is over and no later batch carries those ids.
 			self._release_kda_state_slots(list(wave.segment_sids.values()))
 			if materialized_loader is not None:
-				materialized_loader.release()
+				for group_loader in materialized_loader.values():
+					group_loader.release()
 			# Probe recorder teardown, unconditional: a wave that died anywhere
 			# above must not leave its records attached to a class attribute or
 			# to a pool the next wave inherits. The dump recorder is finished
