@@ -71,7 +71,10 @@ the spans sum to both ``total_byte_size`` and the file length. The copy pass
 hashes every tensor (BLAKE2b-128) as it streams; a verification pass then
 re-reads ``store.bin`` and requires every tensor's bytes to hash to what was
 read from the source, so a corrupted or concurrently modified store never
-publishes.
+publishes. A store restored from ``--local-cache-dir`` is hashed as it is
+copied, must reproduce every segment digest of the cached manifest (which is
+only an integrity reference and never republished), and then passes the same
+re-read verification as a fresh copy.
 
 Publication
 -----------
@@ -1330,6 +1333,43 @@ def _cache_slot(local_cache_dir: Path, plan: StorePlan) -> Path:
     return local_cache_dir / f"node{plan.node_rank}-of{plan.num_nodes}"
 
 
+def _cache_matches(manifest: Any, plan: StorePlan, fingerprint: str) -> bool:
+    """Whether a cached manifest describes this exact build.
+
+    Any malformed manifest is a mismatch, never an exception: the cache is a
+    shortcut, and a damaged one must fall back to a rebuild.
+    """
+    if not isinstance(manifest, dict):
+        return False
+    store = manifest.get("store")
+    source = manifest.get("source")
+    builder = manifest.get("builder")
+    if not (
+        isinstance(store, dict)
+        and isinstance(source, dict)
+        and isinstance(builder, dict)
+        and isinstance(store.get("segments"), list)
+    ):
+        return False
+    return (
+        manifest.get("format") == MANIFEST_FORMAT
+        and manifest.get("complete") is True
+        and manifest.get("hash_algorithm") == HASH_ALGORITHM
+        and manifest.get("node_rank") == plan.node_rank
+        and manifest.get("num_nodes") == plan.num_nodes
+        and builder.get("version") == STORE_BUILDER_VERSION
+        and source.get("fingerprint") == fingerprint
+        and store.get("bytes") == plan.store_bytes
+        and store.get("segment_target_bytes") == SEGMENT_TARGET_BYTES
+    )
+
+
+def _sweep_cache_residue(slot: Path) -> None:
+    """Remove temporary slots left by interrupted cache writes."""
+    for residue in slot.parent.glob(f"{slot.name}.tmp*"):
+        shutil.rmtree(residue, ignore_errors=True)
+
+
 def _plan_segments(plan: StorePlan) -> List[List[Span]]:
     spans = [
         (record.row, record.compact_offset, record.byte_size)
@@ -1393,19 +1433,7 @@ def restore_store_from_cache(
     except (OSError, ValueError):
         logger.info("no usable local store cache at %s", slot)
         return None
-    expected = {
-        "format": MANIFEST_FORMAT,
-        "complete": True,
-        "hash_algorithm": HASH_ALGORITHM,
-        "node_rank": plan.node_rank,
-        "num_nodes": plan.num_nodes,
-    }
-    if (
-        not isinstance(manifest, dict)
-        or any(manifest.get(key) != value for key, value in expected.items())
-        or manifest.get("source", {}).get("fingerprint") != fingerprint
-        or manifest.get("store", {}).get("bytes") != plan.store_bytes
-    ):
+    if not _cache_matches(manifest, plan, fingerprint):
         logger.info(
             "local store cache at %s is for a different checkpoint or "
             "topology; rebuilding from the checkpoint",
@@ -1446,7 +1474,7 @@ def restore_store_from_cache(
     finally:
         os.close(source)
     entries = _segment_entries(segments, digest_lists)
-    if entries != manifest.get("store", {}).get("segments"):
+    if entries != manifest["store"]["segments"]:
         logger.error(
             "local store cache at %s does not hash to its manifest; "
             "discarding it and rebuilding from the checkpoint",
@@ -1489,12 +1517,20 @@ def populate_store_cache(
     is already complete and later cold starts can still read the checkpoint.
     The cached manifest is written last as the slot's commit point, and the
     copy is hashed against the manifest before the slot is swapped in.
+
+    This runs only after a build that did not restore, so whatever the slot
+    holds is stale (missing, foreign or corrupt) and is evicted BEFORE the
+    copy: the cache never needs room for two stores. Temporary slots of
+    interrupted writes are swept first. Concurrent builders of one node are
+    not coordinated here; the manifest commit point plus full verification
+    on restore keep any race from publishing wrong bytes.
     """
     slot = _cache_slot(local_cache_dir, plan)
     staging = Path(f"{slot}.tmp{os.getpid()}")
     try:
         local_cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(staging, ignore_errors=True)
+        _sweep_cache_residue(slot)
+        shutil.rmtree(slot, ignore_errors=True)
         staging.mkdir()
         segments = _plan_segments(plan)
         source = os.open(output_dir / STORE_FILE_NAME, os.O_RDONLY)
@@ -1525,7 +1561,6 @@ def populate_store_cache(
             (json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
             .encode(),
         )
-        shutil.rmtree(slot, ignore_errors=True)
         os.replace(staging, slot)
         _fsync_directory(local_cache_dir)
         logger.info("cached the published store at %s", slot)
@@ -1536,6 +1571,7 @@ def populate_store_cache(
             slot,
             error,
         )
+    finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -2463,14 +2499,13 @@ def build(
                         plan, store_path, args.read_buffer_bytes,
                         args.copy_workers,
                     )
-                    self_check(plan, store_path, copy.written)
-                    segments = verify_store(
-                        plan, store_path, copy, args.read_buffer_bytes,
-                        args.hash_workers,
-                    )
                 else:
-                    copy, segments = restored
-                    self_check(plan, store_path, copy.written)
+                    copy, _ = restored
+                self_check(plan, store_path, copy.written)
+                segments = verify_store(
+                    plan, store_path, copy, args.read_buffer_bytes,
+                    args.hash_workers,
+                )
                 manifest = build_manifest(
                     plan,
                     segments=segments,

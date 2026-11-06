@@ -1296,3 +1296,74 @@ def test_an_unwritable_cache_only_warns(env):
         assert not list(cache.iterdir())
     finally:
         os.chmod(cache, 0o700)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda m: m.__setitem__("store", None),
+        lambda m: m.__setitem__("source", "x"),
+        lambda m: m.__setitem__("builder", []),
+        lambda m: m["store"].__setitem__("segments", None),
+        lambda m: m["store"].__setitem__("segment_target_bytes", 1),
+    ],
+)
+def test_a_malformed_cached_manifest_falls_back_to_a_rebuild(env, damage):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    damage(manifest)
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    # The rebuild replaced the damaged slot with a usable one.
+    repaired = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    assert repaired["store"]["segments"] == json.loads(
+        (first / sb.MANIFEST_FILE_NAME).read_text()
+    )["store"]["segments"]
+
+
+def test_interrupted_cache_writes_are_swept(env):
+    cache = env.tmp / "cache"
+    residue = cache / f"node0-of{NUM_NODES}.tmp999999"
+    residue.mkdir(parents=True)
+    (residue / sb.STORE_FILE_NAME).write_bytes(b"partial")
+    env.build(env.tmp / "node0", 0, extra=_cache_args(env))
+    assert not residue.exists()
+    assert sorted(path.name for path in cache.iterdir()) == [
+        f"node0-of{NUM_NODES}"
+    ]
+
+
+def test_a_foreign_slot_is_replaced_by_the_rebuild(env):
+    env.build(env.tmp / "first", 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    real = manifest["source"]["fingerprint"]
+    manifest["source"]["fingerprint"] = "f" * len(real)
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    refreshed = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    assert refreshed["source"]["fingerprint"] == real
+
+
+def test_a_restored_store_is_reverified_by_reread(env, monkeypatch):
+    env.build(env.tmp / "first", 0, extra=_cache_args(env))
+    calls = []
+    real_verify = sb.verify_store
+
+    def counting_verify(*args, **kwargs):
+        calls.append(1)
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(sb, "verify_store", counting_verify)
+    monkeypatch.setattr(
+        sb, "write_store",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no source copy")),
+    )
+    env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    assert calls == [1]
