@@ -261,6 +261,23 @@ _KIMI_K3_MLA_PROFILE = _HostKVModelProfile(
 	logical_to_physical_layer=_KIMI_K3_MLA_LAYER_MAP,
 )
 
+# DSA indexer-K region sharing the K3 latent map (same 24 rows, so one
+# page table serves both regions). MQA single head, bf16 AoS, k_head_dim
+# counts ELEMENTS (no rotation on the index path, no page-split scales).
+# The per-token cost is declared and cross-asserted model-side, in
+# batchgen/models/moonshotai/kimi_linear/k3/tensor_map.py.
+_KIMI_K31_INDEXER_LOGICAL_LAYERS = _KIMI_K3_MLA_LOGICAL_LAYERS
+_KIMI_K31_INDEXER_LAYER_MAP = _KIMI_K3_MLA_LAYER_MAP
+_KIMI_K31_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=len(_KIMI_K31_INDEXER_LOGICAL_LAYERS),
+	num_k_heads=1,
+	k_head_dim=128,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+	logical_to_physical_layer=_KIMI_K31_INDEXER_LAYER_MAP,
+)
+
 # Kimi-Linear: MLA latent KV (compressed_kv_dim=576, 27 engine layers; only
 # the 7 MLA layers ever append — KDA layers hold no KV).
 _KIMI_LINEAR_MLA_PROFILE = _HostKVModelProfile(
@@ -284,6 +301,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"glm5_2_indexer": _GLM5_2_INDEXER_PROFILE,
 	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
 	"kimi_k3_mla": _KIMI_K3_MLA_PROFILE,
+	"kimi_k31_indexer": _KIMI_K31_INDEXER_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -339,6 +357,9 @@ for canonical, aliases in {
 		"moonshotai/kimi-k3",
 		"kimi-k3",
 		"kimi_k3",
+		"moonshotai/kimi-k3.1-pro",
+		"kimi-k3.1-pro",
+		"kimi_k31",
 	),
 	"glm5_mla": (
 		"zai-org/glm-5.2-fp8",
@@ -397,6 +418,13 @@ for canonical, aliases in {
 		"zai-org/glm-5.1",
 		"glm-5.1-fp8",
 		"glm-5.1",
+	),
+	# Membership in THIS table is what makes is_dsa_model() true; a dense
+	# sibling sharing the primary profile must never appear here.
+	"kimi_k31_indexer": (
+		"moonshotai/kimi-k3.1-pro",
+		"kimi-k3.1-pro",
+		"kimi_k31",
 	),
 }.items():
 	for alias in aliases:
