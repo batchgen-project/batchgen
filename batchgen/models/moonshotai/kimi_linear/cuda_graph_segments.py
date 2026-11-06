@@ -79,6 +79,17 @@ replays the same collective shapes even when DP groups have different local
 batch sizes. If any EP rank is empty, all ranks use eager MoE for that step;
 this avoids mixing graph and eager collectives.
 
+KIMI-K3.1 DSA LAYERS
+--------------------
+A full-attention layer that carries the DSA indexer captures
+``dsa_decode.dsa_decode_graph_safe`` instead of the dense NoPE-MLA inline:
+the index key write, every row scored, the selection transform and FA3 over
+the selected tokens, all against static tables. The auxiliary (index-key)
+cache gets its own fixed ``[bucket, max_aux_pages]`` page-table buffer,
+refreshed with the latent table's batch order, and its own place in the KV
+signature. The step's index keys leave the graph the way the latent does: as
+static outputs the driver appends to the auxiliary Host region after replay.
+
 Mode is planner/config-driven (`Basic_Config.decode_graph_mode`, default
 "eager") with a batch-level override through
 `batchgen_debug.kimi_decode_graph_mode` = "graph" | "eager" | "compare"
@@ -100,6 +111,8 @@ from batchgen.cuda_graph.graph_manager import (
 from batchgen.models.wrappers import AttnWrapperBase
 
 from .block_residual import apply_attn_res, num_block_residual_columns
+from .dsa_decode import dsa_decode_forward, dsa_decode_graph_safe
+from .dsa_index_rotation import KERNEL_INDEX_HEAD_DIM
 from .serving_modules import (
     _reduce_mla_tp_output,
     kda_decode_serving,
@@ -306,7 +319,7 @@ class _BucketStatics:
 
     def __init__(self, bucket: int, max_pages: int, device, kda_slots, *,
                  block_residual_columns: int = 0, hidden_size: int = 0,
-                 dtype=None):
+                 dtype=None, max_aux_pages: int = 0):
         self.bucket = bucket
         self.cache_seqlens = torch.ones(
             bucket, dtype=torch.int32, device=device
@@ -323,6 +336,13 @@ class _BucketStatics:
         )
         self.page_table = torch.zeros(
             (bucket, max_pages), dtype=torch.int32, device=device
+        )
+        # Kimi-K3.1 DSA: the auxiliary (index-key) cache's rows in the SAME
+        # batch order, so ``slot_indices`` addresses both tables. None for a
+        # model without indexer layers.
+        self.aux_page_table = (
+            torch.zeros((bucket, max_aux_pages), dtype=torch.int32, device=device)
+            if max_aux_pages > 0 else None
         )
         # View of KDAStateGPUManager's persistent slot buffer (M5.1) — bound,
         # not allocated.
@@ -342,20 +362,37 @@ class _BucketStatics:
         self.cache_seqlens.fill_(1)
         self.token_indices.zero_()
         self.page_table.zero_()
+        if self.aux_page_table is not None:
+            self.aux_page_table.zero_()
         if self.block_residual is not None:
             self.block_residual.zero_()
 
-    def refresh(self, bsz: int, cache_seqlens, token_indices, page_rows) -> None:
+    def refresh(self, bsz: int, cache_seqlens, token_indices, page_rows,
+                aux_page_rows=None) -> None:
         """Bind this step's batch into the static buffers (rows >= bsz are
         padding: KV-write-skipped, page 0, seqlen 1)."""
+        if self.aux_page_table is None and aux_page_rows is not None:
+            raise RuntimeError(
+                "decode graph statics: this step gave auxiliary rows but the "
+                "auxiliary page table is absent"
+            )
+        if self.aux_page_table is not None and aux_page_rows is None and bsz > 0:
+            raise RuntimeError(
+                "decode graph statics: the auxiliary page table is allocated "
+                "but this step gave no auxiliary rows"
+            )
         self.num_valid_tokens.fill_(bsz)
         if bsz < self.bucket:
             self.cache_seqlens[bsz:].fill_(1)
             self.token_indices[bsz:].zero_()
             self.page_table[bsz:].zero_()
+            if self.aux_page_table is not None:
+                self.aux_page_table[bsz:].zero_()
         self.cache_seqlens[:bsz].copy_(cache_seqlens, non_blocking=True)
         self.token_indices[:bsz].copy_(token_indices, non_blocking=True)
         self.page_table[:bsz].copy_(page_rows, non_blocking=True)
+        if self.aux_page_table is not None and bsz > 0:
+            self.aux_page_table[:bsz].copy_(aux_page_rows, non_blocking=True)
 
 
 class KimiLinearSpanSegment:
@@ -375,11 +412,26 @@ class KimiLinearSpanSegment:
     """
 
     def __init__(self, layer, layer_idx: int, statics: Dict[int, _BucketStatics],
-                 page_size_tokens: int, dtype):
+                 page_size_tokens: int, dtype, *, aux_page_size_tokens: int = 0,
+                 max_aux_context: int = 0):
         self.layer = layer
         self.layer_idx = layer_idx
         self.attn = getattr(layer.self_attn, "module", layer.self_attn)
         self.is_kda = bool(layer.is_linear_attn)
+        # Kimi-K3.1: a full-attention layer with the DSA indexer captures the
+        # sparse step (``_graph_attention``); the dense inline would attend
+        # over every cached token and never score the index keys.
+        self.is_dsa = (
+            not self.is_kda and getattr(self.attn, "indexer", None) is not None
+        )
+        if self.is_dsa and (aux_page_size_tokens <= 0 or max_aux_context <= 0):
+            raise ValueError(
+                f"DSA layer {layer_idx} needs the auxiliary cache geometry "
+                f"(aux_page_size_tokens={aux_page_size_tokens}, "
+                f"max_aux_context={max_aux_context})"
+            )
+        self.aux_page_size_tokens = int(aux_page_size_tokens)
+        self.max_aux_context = int(max_aux_context)
         self.fold_ffn = not hasattr(layer, "block_sparse_moe")
         self.hidden_size = layer.hidden_size
         self.page_size_tokens = page_size_tokens
@@ -427,6 +479,11 @@ class KimiLinearSpanSegment:
             specs["k_tensor"] = TensorSpec(
                 ("batch_size", 1, 1, self.kv_dim), self.dtype
             )
+        if self.is_dsa:
+            specs["index_k"] = TensorSpec(
+                ("batch_size", 1, 1, KERNEL_INDEX_HEAD_DIM), torch.float8_e4m3fn
+            )
+            specs["index_scales"] = TensorSpec(("batch_size",), torch.float32)
         return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
@@ -473,15 +530,14 @@ class KimiLinearSpanSegment:
 
         layer = self.layer
         normed = layer.input_layernorm(hidden_states)
-        attn_out, k_tensor = attention(normed)
+        attn_out, kv_outputs = attention(normed)
         residual = hidden_states + attn_out
         normed_out = layer.post_attention_layernorm(residual)
         if self.fold_ffn:
             out = {"hidden": residual + layer.mlp(normed_out)}
         else:
             out = {"normed": normed_out, "residual": residual}
-        if k_tensor is not None:
-            out["k_tensor"] = k_tensor
+        out.update(kv_outputs)
         return out
 
     def _graph_attention(
@@ -491,6 +547,9 @@ class KimiLinearSpanSegment:
         flashmla_num_splits=None,
         kda_cu_seqlens=None,
     ):
+        """``(attn_out, kv_outputs)``: the attention output and the cache rows
+        this step produced for the Host append (``k_tensor``; plus
+        ``index_k`` / ``index_scales`` on a DSA layer), empty for KDA."""
         buf = self._buf
         if self.is_kda:
             attn_out = kda_decode_serving(
@@ -499,7 +558,41 @@ class KimiLinearSpanSegment:
                 self.kda_state,
                 cu_seqlens=kda_cu_seqlens,
             )
-            k_tensor = None
+            return attn_out, {}
+        if self.is_dsa:
+            # FlashMLA's schedule is unused here: the sparse attention runs on
+            # FA3 over the selected tokens.
+            blocked_k, _, _ = (
+                AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
+                    layer_idx=self.layer_idx
+                )
+            )
+            aux_blocked_k, _, _ = (
+                AttnWrapperBase.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
+                    self.layer_idx
+                )
+            )
+            step = dsa_decode_graph_safe(
+                self.attn,
+                normed,
+                layer_idx=self.layer_idx,
+                page_table=buf.page_table,
+                slot_indices=buf.slot_indices,
+                token_indices=buf.token_indices,
+                cache_seqlens=buf.cache_seqlens,
+                num_valid_tokens=buf.num_valid_tokens,
+                page_size_tokens=self.page_size_tokens,
+                blocked_k=blocked_k,
+                aux_blocked_k=aux_blocked_k,
+                aux_page_table=buf.aux_page_table,
+                aux_page_size=self.aux_page_size_tokens,
+                max_seqlen=self.max_aux_context,
+            )
+            return step.attn_output, {
+                "k_tensor": step.k_tensor,
+                "index_k": step.index_k_fp8,
+                "index_scales": step.index_scales,
+            }
         else:
             attn_out, k_tensor = _mla_decode_graph_safe(
                 self.attn,
@@ -514,7 +607,7 @@ class KimiLinearSpanSegment:
                 flashmla_metadata=flashmla_metadata,
                 flashmla_num_splits=flashmla_num_splits,
             )
-        return attn_out, k_tensor
+        return attn_out, {"k_tensor": k_tensor}
 
     def _forward_block_residual(
         self,
@@ -557,7 +650,7 @@ class KimiLinearSpanSegment:
             prefix_sum = None
 
         normed = layer.input_layernorm(attn_input)
-        attn_out, k_tensor = attention(normed)
+        attn_out, kv_outputs = attention(normed)
         prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
 
         ffn_input = apply_attn_res(
@@ -571,8 +664,7 @@ class KimiLinearSpanSegment:
             out = {"hidden": prefix_sum + layer.mlp(normed_out)}
         else:
             out = {"normed": normed_out, "residual": prefix_sum}
-        if k_tensor is not None:
-            out["k_tensor"] = k_tensor
+        out.update(kv_outputs)
         return out
 
 
@@ -633,6 +725,15 @@ class KimiLinearDecodeGraph:
         self._kv_signature = None
         self._max_pages = 0
         self._page_size_tokens = 0
+        # Kimi-K3.1 DSA: the auxiliary (index-key) cache geometry. Zero when
+        # the model has no indexer layer, which keeps every K3 path unchanged.
+        self._has_dsa = any(
+            getattr(getattr(layer.self_attn, "module", layer.self_attn),
+                    "indexer", None) is not None
+            for layer in model.model.layers
+        )
+        self._max_aux_pages = 0
+        self._aux_page_size_tokens = 0
         self._orig_model_forward = None
         self._orig_new_block_residual = None
         self._orig_layer_forwards: Dict[int, object] = {}
@@ -1208,6 +1309,7 @@ class KimiLinearDecodeGraph:
                 ensure(seq_ids) if ensure is not None
                 else kv_manager.get_cuda_graph_page_table()
             )
+            aux_page_table = self._aux_graph_page_table(seq_ids)
         except (RuntimeError, KeyError) as exc:
             self._fallback(f"prewarm page table unavailable ({exc})")
             return False
@@ -1238,7 +1340,9 @@ class KimiLinearDecodeGraph:
             statics.arm_for_capture()
             if whole_bucket not in self._whole_captured:
                 self._capture_whole_bucket(whole_bucket)
-            self._refresh_statics(whole_bucket, bsz, seq_ids, page_table)
+            self._refresh_statics(
+                whole_bucket, bsz, seq_ids, page_table, aux_page_table
+            )
             logger.info(
                 "[KIMI_DECODE_GRAPH] rank=%s whole-model prewarm complete: "
                 "bucket=%d captured=%s",
@@ -1260,7 +1364,7 @@ class KimiLinearDecodeGraph:
         # consume.  This is not required by capture itself, but makes the
         # prewarm contract observable and catches a page-table capacity/order
         # error before the measured decode interval.
-        self._refresh_statics(bucket, bsz, seq_ids, page_table)
+        self._refresh_statics(bucket, bsz, seq_ids, page_table, aux_page_table)
         logger.info(
             "[KIMI_DECODE_GRAPH] rank=%s prewarm complete: attention_bucket=%d "
             "moe_bucket=%s captured_attention=%s captured_moe=%s",
@@ -1317,6 +1421,7 @@ class KimiLinearDecodeGraph:
                 ensure(seq_ids) if ensure is not None
                 else kv_manager.get_cuda_graph_page_table()
             )
+            aux_page_table = self._aux_graph_page_table(seq_ids)
         except (RuntimeError, KeyError) as exc:
             self._fallback(f"graph page table unavailable ({exc})")
             return
@@ -1355,7 +1460,7 @@ class KimiLinearDecodeGraph:
                     if whole_bucket not in self._whole_captured:
                         self._capture_whole_bucket(whole_bucket)
                     self._refresh_statics(
-                        whole_bucket, bsz, seq_ids, page_table
+                        whole_bucket, bsz, seq_ids, page_table, aux_page_table
                     )
                     # ``_run_whole_model`` is entered from the patched model
                     # forward, while ``_bucket`` is also used by the legacy
@@ -1396,7 +1501,7 @@ class KimiLinearDecodeGraph:
             self._compare_arange = torch.arange(
                 bsz, dtype=torch.int32, device=self.device
             )
-        self._refresh_statics(bucket, bsz, seq_ids, page_table)
+        self._refresh_statics(bucket, bsz, seq_ids, page_table, aux_page_table)
 
         self._bucket = bucket
         self._bsz = bsz
@@ -1497,6 +1602,7 @@ class KimiLinearDecodeGraph:
                     logical_layer_idx
                 ]
                 callback(logical_layer_idx, staged[physical_layer_idx], None)
+            self._append_whole_index_keys()
             # Host cost of issuing the staging work, not its device time: the
             # clone and the callbacks are asynchronous and must stay that way.
             self._whole_kv_stage_host_ms += (
@@ -1524,6 +1630,10 @@ class KimiLinearDecodeGraph:
             # Cloned: the worker defers the D2H offload, the static output
             # buffer is overwritten by this segment's next replay.
             AttnWrapperBase.kv_append_callback(layer_idx, k_tensor.clone(), None)
+        if segment.is_dsa:
+            self._append_index_keys(
+                layer_idx, outputs["index_k"], outputs["index_scales"]
+            )
 
         if segment.fold_ffn:
             return outputs["hidden"]
@@ -1599,6 +1709,11 @@ class KimiLinearDecodeGraph:
         table = kv_manager.get_cuda_graph_page_table_storage()
         self._max_pages = int(table.shape[1])
         self._page_size_tokens = int(kv_manager.config.page_size_tokens)
+        if self._has_dsa:
+            aux_manager = self._require_aux_manager()
+            aux_table = aux_manager.get_cuda_graph_page_table_storage()
+            self._max_aux_pages = int(aux_table.shape[1])
+            self._aux_page_size_tokens = int(aux_manager.config.page_size_tokens)
         if self._scratch_slot is None:
             raise RuntimeError(
                 "Kimi decode graph KDA scratch slot was not reserved during "
@@ -1609,6 +1724,8 @@ class KimiLinearDecodeGraph:
         for layer_idx, layer in enumerate(layers):
             segment = KimiLinearSpanSegment(
                 layer, layer_idx, self._statics, self._page_size_tokens, dtype,
+                aux_page_size_tokens=self._aux_page_size_tokens,
+                max_aux_context=self._max_aux_pages * self._aux_page_size_tokens,
             )
             self.segments[layer_idx] = segment
             self.manager.register_segment(self._name(layer_idx), segment)
@@ -1641,6 +1758,7 @@ class KimiLinearDecodeGraph:
                 hidden_size=self.model_config.hidden_size,
                 dtype=(self.segments[0].dtype
                        if self._uses_block_residual else None),
+                max_aux_pages=self._max_aux_pages,
             )
             self._statics[bucket] = statics
         return statics
@@ -1817,12 +1935,90 @@ class KimiLinearDecodeGraph:
                 self._tensor_signature(t)
                 for t in (recurrent, *conv, prepared)
             )
+        aux_state = ()
+        if self._has_dsa:
+            # The DSA spans bake the auxiliary cache's per-layer views too.
+            aux_manager = self._require_aux_manager()
+            aux_k_cache, _ = aux_manager.get_kv_tensors()
+            aux_state = (
+                self._tensor_signature(
+                    aux_manager.get_cuda_graph_page_table_storage()
+                ),
+                self._tensor_signature(aux_k_cache),
+                int(aux_manager.config.page_size_tokens),
+            )
         return (
             self._tensor_signature(storage),
             self._tensor_signature(k_cache),
             kda_state,
             int(kv_manager.config.page_size_tokens),
+            aux_state,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Kimi-K3.1 DSA: the auxiliary (index-key) cache                     #
+    # ------------------------------------------------------------------ #
+
+    def _require_aux_manager(self):
+        aux_manager = AttnWrapperBase.gpu_paged_kv_manager_aux
+        if aux_manager is None:
+            raise RuntimeError(
+                "Kimi-K3.1 decode graph: the model has DSA indexer layers but no "
+                "auxiliary (index-key) GPU KV manager is bound"
+            )
+        return aux_manager
+
+    def _aux_graph_page_table(self, seq_ids):
+        """The auxiliary cache's graph-stable table in ``seq_ids`` order, or
+        None for a model without indexer layers. Same accessor contract as
+        the latent table: rebuilt only when the order no longer matches,
+        raising (an eager step) when the batch exceeds the graph capacity."""
+        if not self._has_dsa:
+            return None
+        aux_manager = self._require_aux_manager()
+        ensure = getattr(aux_manager, "ensure_cuda_graph_page_table", None)
+        return (
+            ensure(seq_ids) if ensure is not None
+            else aux_manager.get_cuda_graph_page_table()
+        )
+
+    def _append_index_keys(self, layer_idx, index_k, index_scales) -> None:
+        """Hand one DSA layer's index keys to the auxiliary Host append.
+
+        Cloned, like the latent: the worker defers the D2H copy and the static
+        outputs are overwritten by the next replay. Without an auxiliary
+        callback while the latent one is bound, the Host would keep a latent
+        token with no index key for decode to score — refused.
+        """
+        callback = AttnWrapperBase.kv_append_callback_aux
+        if callback is None:
+            if AttnWrapperBase.kv_append_callback is not None:
+                raise RuntimeError(
+                    f"Kimi-K3.1 DSA layer {layer_idx}: a latent Host append "
+                    "callback is bound but no auxiliary one is"
+                )
+            return
+        if self._bsz <= 0:
+            return
+        callback(
+            layer_idx,
+            index_k[: self._bsz].clone(),
+            None,
+            index_scales[: self._bsz].clone(),
+        )
+
+    def _append_whole_index_keys(self) -> None:
+        """The whole-model graph's staged index keys, one aux append per DSA
+        layer (logical engine layer ids, like the latent)."""
+        segment = self.whole_segment
+        if segment is None or not segment.index_key_layers:
+            return
+        for position, layer_idx in enumerate(segment.index_key_layers):
+            self._append_index_keys(
+                layer_idx,
+                segment.index_key_buffer[position],
+                segment.index_scale_buffer[position],
+            )
 
     # ------------------------------------------------------------------ #
     #  Per-step static refresh                                            #
@@ -1861,7 +2057,8 @@ class KimiLinearDecodeGraph:
         self._step_active = True
         self._whole_step_active = True
 
-    def _refresh_statics(self, bucket, bsz, seq_ids, page_table) -> None:
+    def _refresh_statics(self, bucket, bsz, seq_ids, page_table,
+                         aux_page_table=None) -> None:
         state_manager = KimiLinearKDAWrapper.state_manager
         statics = self._bucket_statics(bucket)
 
@@ -1887,7 +2084,9 @@ class KimiLinearDecodeGraph:
         # (page-table row i == batch row i; the worker rebuilds the table when
         # the batch order changes).
         statics.refresh(
-            bsz, cache_seqlens, token_indices, page_table[:bsz, : self._max_pages]
+            bsz, cache_seqlens, token_indices, page_table[:bsz, : self._max_pages],
+            None if aux_page_table is None
+            else aux_page_table[:bsz, : self._max_aux_pages],
         )
 
         if self._compare_step:
@@ -1932,8 +2131,24 @@ class KimiLinearDecodeGraph:
                         normed,
                         self._clone_kda_state(segment.kda_state),
                     ),
-                    None,
+                    {},
                 )
+            if segment.is_dsa:
+                # The production eager DSA step; both cache writes are
+                # idempotent (same rows, same values as the graph's), and no
+                # Host append is fired here.
+                result = dsa_decode_forward(
+                    segment.attn,
+                    normed,
+                    AttnWrapperBase.position_ids,
+                    AttnWrapperBase.cache_seqlens,
+                    AttnWrapperBase.max_seqlen,
+                    AttnWrapperBase.gpu_paged_kv_manager,
+                    AttnWrapperBase.gpu_paged_kv_manager_aux,
+                    segment.layer_idx,
+                    list(AttnWrapperBase.cur_batch or []),
+                )
+                return result.attn_output, {}
             attn_out, k_tensor = mla_decoding_nope_with_pagekv(
                 segment.attn,
                 normed,
@@ -1945,7 +2160,7 @@ class KimiLinearDecodeGraph:
                 segment.layer_idx,
                 None,
             )
-            return attn_out, k_tensor
+            return attn_out, {}
 
         if segment.use_block_residual:
             return segment._forward_block_residual(

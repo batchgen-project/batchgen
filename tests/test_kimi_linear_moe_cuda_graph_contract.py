@@ -568,6 +568,8 @@ def test_whole_model_setup_and_release_reach_inline_moe_segments(monkeypatch):
     segment.moe_segments = {1: Child("moe", fused_front=torch.empty(0))}
     segment._kv_key_buffer = None
     segment._primary_kv_dim = 0
+    segment.index_key_layers = ()       # no Kimi-K3.1 DSA layer
+    segment.index_key_buffer = None
     segment._flashmla_metadata = {}
     segment._kda_cu_seqlens = {}
     segment.device = torch.device("cpu")

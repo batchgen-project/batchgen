@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 
+from .config import is_k3_model_type
 from .wrappers import KimiLinearExpertWrapper
 
 
@@ -1283,7 +1284,7 @@ def _require_k3_latent_moe(self):
     first with all 1026 skeleton params missing.
     """
     cfg = getattr(self, "config", None)
-    if getattr(cfg, "model_type", None) != "kimi_k3":
+    if not is_k3_model_type(getattr(cfg, "model_type", None)):
         return                      # 48B (and every other model): no LatentMoE
     if not getattr(self, "use_latent_moe", False):
         raise RuntimeError(

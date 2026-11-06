@@ -124,6 +124,20 @@ class KimiLinearWholeModelSegment:
         )
         self._kv_key_buffer: Optional[torch.Tensor] = None
         self._kv_buffers: Optional[list[dict[str, torch.Tensor | None]]] = None
+        # Kimi-K3.1 DSA layers also emit this step's index keys (e4m3 + one
+        # fp32 scale per row) for the auxiliary Host region. Staged like the
+        # latent: one fixed buffer per DSA layer, appended after replay.
+        self.index_key_layers = tuple(
+            layer_idx
+            for layer_idx, segment in enumerate(self.layer_segments)
+            if bool(getattr(segment, "is_dsa", False))
+        )
+        self._index_key_position = {
+            layer_idx: position
+            for position, layer_idx in enumerate(self.index_key_layers)
+        }
+        self.index_key_buffer: Optional[torch.Tensor] = None
+        self.index_scale_buffer: Optional[torch.Tensor] = None
         self.primary_kv_offload_buffers = None
         # FlashMLA's scheduler metadata depends on the decode batch's
         # cache_seqlens but not on the layer.  Keep the capture-time pair per
@@ -221,6 +235,24 @@ class KimiLinearWholeModelSegment:
                 for i in range(len(self._primary_kv_layers))
             ]
             self.primary_kv_offload_buffers = self._kv_buffers
+        if self.index_key_layers and self.index_key_buffer is None:
+            from .dsa_index_rotation import KERNEL_INDEX_HEAD_DIM
+
+            self.index_key_buffer = torch.zeros(
+                len(self.index_key_layers),
+                self.max_bucket_size,
+                1,
+                1,
+                KERNEL_INDEX_HEAD_DIM,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            self.index_scale_buffer = torch.zeros(
+                len(self.index_key_layers),
+                self.max_bucket_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
     def release_static_buffers(self, bucket_size: int) -> None:
         # Do not release the shared KV staging buffer here: CUDAGraphManager
@@ -303,6 +335,10 @@ class KimiLinearWholeModelSegment:
             k_tensor = outputs.get("k_tensor")
             if k_tensor is not None and self._kv_key_buffer is not None:
                 self._copy_primary_kv(layer_idx, k_tensor)
+            if "index_k" in outputs:
+                self._copy_index_keys(
+                    layer_idx, outputs["index_k"], outputs["index_scales"]
+                )
 
             if bool(getattr(layer_segment, "fold_ffn", False)):
                 hidden_states = outputs["hidden"]
@@ -432,6 +468,18 @@ class KimiLinearWholeModelSegment:
                 f"expected (*, 1, 1, {self._primary_kv_dim})"
             )
         self._kv_key_buffer[physical_layer_idx, : k_tensor.shape[0]].copy_(k_tensor)
+
+    def _copy_index_keys(
+        self, layer_idx: int, index_k: torch.Tensor, index_scales: torch.Tensor
+    ) -> None:
+        position = self._index_key_position.get(int(layer_idx))
+        if position is None or self.index_key_buffer is None:
+            raise RuntimeError(
+                f"whole graph has no index-key staging for layer {layer_idx}"
+            )
+        rows = index_k.shape[0]
+        self.index_key_buffer[position, :rows].copy_(index_k)
+        self.index_scale_buffer[position, :rows].copy_(index_scales)
 
     # ------------------------------------------------------------------ #
     # TP row-map construction                                             #

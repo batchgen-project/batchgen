@@ -3,10 +3,26 @@
 #  Copyright (c) 2025-2026 BatchGen Team                                        #
 #  Licensed under the Apache License, Version 2.0                               #
 # ---------------------------------------------------------------------------- #
-"""Strict Kimi-K3 text-model configuration (M2, prefill-only).
+"""Strict Kimi-K3 / Kimi-K3.1 text-model configuration (M2, prefill-only).
 
 Parses the checkpoint's ``config.json`` (the K3 form: everything under
 ``text_config``) into a flat, validated :class:`KimiK3Config`.
+
+Two checkpoints share this parser, distinguished by the TOP-LEVEL
+``model_type`` of the VLM wrapper:
+
+  * ``kimi_k3``   — ``moonshotai/Kimi-K3``, no ``dsa_config``.
+  * ``kimi_k31``  — ``moonshotai/Kimi-K3.1-Pro``: byte-identical architecture
+    plus a DeepSeek-style sparse-attention indexer on the 24 full-attention
+    layers, declared by ``text_config.dsa_config``.  Nothing else differs:
+    the released indexes differ by exactly 120 tensors (5 patterns x 24
+    layers, see ``kimi_linear/k3/tensor_map.py``), SiTU/KDA/MoE/MXFP4/MLA
+    geometry and the tokenizer are identical.
+
+The two are kept apart by a hard requirement rather than a default:
+``dsa_config`` is REQUIRED for ``kimi_k31`` and REFUSED for ``kimi_k3``.  A
+default would let a K3.1 checkpoint load as a dense K3 — loadable, runnable,
+and silently attending to the whole context on every full-attention layer.
 
 Design decisions (POIS ledger 2026-08-04, decision 1 — hard-fail everywhere):
 
@@ -100,7 +116,30 @@ _ARCH_KEYS = frozenset({
     "routed_expert_hidden_size",
     "topk_method",
     "quantization_config",
+    # K3.1 only (absent from K3's config.json); see _DSA_KEYS.
+    "dsa_config",
 })
+
+#: The eight keys of K3.1's ``text_config.dsa_config``.  The checkpoint's own
+#: ``configuration_kimi_k3.py`` stores the block as an opaque
+#: ``dsa_config: Optional[dict] = None`` and validates NOTHING in it (unlike
+#: ``linear_attn_config``, which it asserts on), so this allowlist is the only
+#: place the block is checked at all.  Keys outside it raise.
+_DSA_KEYS = frozenset({
+    "dsa_layers",
+    "index_topk",
+    "index_head_dim",
+    "index_num_heads",
+    "index_rope_dim",
+    "index_k_norm_type",
+    "index_topk_freq",
+    "index_skip_topk_offset",
+})
+
+#: The only index-K normalisation this port implements.  K3.1 ships a
+#: LayerNorm (``indexer.k_norm.weight`` AND ``indexer.k_norm.bias``); an RMS
+#: variant would ship no bias, so the name is load-bearing for the weight map.
+_DSA_K_NORM_LAYERNORM = "layernorm"
 
 # HF bookkeeping keys `transformers` (4.56.2, the checkpoint's own
 # transformers_version) serializes into every config.json.  Accepted and
@@ -213,6 +252,157 @@ def _require(d: Dict[str, Any], key: str, where: str) -> Any:
     return d[key]
 
 
+def _require_present(d: Dict[str, Any], key: str, where: str) -> Any:
+    """:func:`_require` for a key whose legitimate value may be falsy.
+
+    ``index_rope_dim`` is 0 in the released K3.1 config; ``_require``'s
+    ``is None`` test passes it, but a future truthiness-based read would not,
+    so the presence-only check is explicit here.
+    """
+    if key not in d:
+        raise ValueError(
+            "Kimi-K3 config: required key '{}' is missing in {}. Load-bearing "
+            "architecture fields are never defaulted.".format(key, where)
+        )
+    value = d[key]
+    if value is None:
+        raise ValueError(
+            "Kimi-K3 config: required key '{}' in {} is null.".format(key, where)
+        )
+    return value
+
+
+def dsa_layer_skips_topk(freq: int, offset: int, layer_idx: int) -> bool:
+    """Whether a DSA layer reuses the PREVIOUS indexer layer's top-k indices.
+
+    Same frequency/offset formula the repo already carries for GLM-5.2 at
+    ``batchgen/models/glm/glm5/dsa_schedule.py:dsa_layer_skips_topk`` (ported
+    there from the upstream reference schedule).  Restated here as a pure
+    function of the two integers so this package keeps its no-cross-model-
+    import property; ``tests/test_kimi_k31_config.py`` asserts the two agree
+    layer-for-layer over the released K3.1 and GLM-5.2 parameters.
+
+    ``freq == 1`` means every layer recomputes its own top-k and the offset is
+    inert.  K3.1 ships ``index_topk_freq=1``, which is independently confirmed
+    by its checkpoint: ALL 24 full-attention layers carry indexer weights, so
+    no layer has a previous layer's selection to reuse.
+    """
+    if freq <= 0:
+        raise ValueError("index_topk_freq must be positive, got {}".format(freq))
+    if freq == 1:
+        return False
+    if offset <= 0:
+        raise ValueError(
+            "index_skip_topk_offset must be positive; offset <= 0 marks layer 0 "
+            "as a reuse layer with no prior top-k to reuse (got {})".format(offset))
+    return max(layer_idx - offset + 1, 0) % freq != 0
+
+
+@dataclass(frozen=True)
+class KimiDsaConfig:
+    """Validated ``text_config.dsa_config`` of Kimi-K3.1.
+
+    Released values: ``dsa_layers`` = the 24 full-attention layers (1-INDEXED,
+    exactly ``linear_attn_config['full_attn_layers']``), ``index_topk`` 2048,
+    ``index_head_dim`` 128, ``index_num_heads`` 32, ``index_rope_dim`` 0,
+    ``index_k_norm_type`` "layernorm", ``index_topk_freq`` 1,
+    ``index_skip_topk_offset`` 1.
+
+    Every field is required; there are no defaults.  The indexer is the only
+    thing that distinguishes K3.1 from K3, so a defaulted field here is a
+    silently different model.
+    """
+
+    dsa_layers: tuple
+    index_topk: int
+    index_head_dim: int
+    index_num_heads: int
+    index_rope_dim: int
+    index_k_norm_type: str
+    index_topk_freq: int
+    index_skip_topk_offset: int
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """``dsa_layers`` is 1-INDEXED, like ``linear_attn_config``'s lists."""
+        return (layer_idx + 1) in self.dsa_layers
+
+    def skips_topk(self, layer_idx: int) -> bool:
+        return dsa_layer_skips_topk(
+            self.index_topk_freq, self.index_skip_topk_offset, layer_idx)
+
+    @property
+    def index_dim(self) -> int:
+        """Q width per token: ``index_num_heads * index_head_dim`` (4096)."""
+        return self.index_num_heads * self.index_head_dim
+
+
+def parse_dsa_config(raw: Dict[str, Any], num_hidden_layers: int) -> KimiDsaConfig:
+    """Parse and validate ``text_config.dsa_config``.  Unknown/missing raise."""
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "dsa_config must be an object, got {}".format(type(raw).__name__))
+    _reject_unknown_keys([k for k in raw if k not in _DSA_KEYS], "dsa_config")
+    where = "dsa_config"
+
+    layers = tuple(int(x) for x in _require(raw, "dsa_layers", where))
+    cfg = KimiDsaConfig(
+        dsa_layers=layers,
+        index_topk=int(_require(raw, "index_topk", where)),
+        index_head_dim=int(_require(raw, "index_head_dim", where)),
+        index_num_heads=int(_require(raw, "index_num_heads", where)),
+        # `_require` rejects null but NOT 0, and 0 is this key's released
+        # value, so it must be read with an explicit presence test instead.
+        index_rope_dim=int(_require_present(raw, "index_rope_dim", where)),
+        index_k_norm_type=str(_require(raw, "index_k_norm_type", where)),
+        index_topk_freq=int(_require(raw, "index_topk_freq", where)),
+        index_skip_topk_offset=int(_require(raw, "index_skip_topk_offset", where)),
+    )
+
+    problems: List[str] = []
+    for name in ("index_topk", "index_head_dim", "index_num_heads"):
+        if int(getattr(cfg, name)) <= 0:
+            problems.append("dsa_config['{}'] must be positive".format(name))
+    if not layers:
+        problems.append("dsa_config['dsa_layers'] is empty — no layer would be sparse")
+    out_of_range = sorted(x for x in layers if not 1 <= x <= num_hidden_layers)
+    if out_of_range:
+        problems.append(
+            "dsa_config['dsa_layers'] entries {} fall outside 1..{} — the list "
+            "is 1-INDEXED like linear_attn_config's".format(
+                out_of_range[:8], num_hidden_layers))
+    if len(set(layers)) != len(layers):
+        problems.append("dsa_config['dsa_layers'] contains duplicates")
+    if problems:
+        raise ValueError(
+            "Kimi-K3.1 dsa_config is invalid — {} problem(s):\n  - {}".format(
+                len(problems), "\n  - ".join(problems)))
+
+    # Separate raises: each names the unimplemented variant rather than
+    # quietly running the implemented one over different weights.
+    if cfg.index_rope_dim != 0:
+        raise NotImplementedError(
+            "dsa_config['index_rope_dim']={} — only the NoPE index path is "
+            "implemented (K3.1 ships 0: no rotation is applied anywhere on the "
+            "index path, so prefill-written and decode-scored index keys live "
+            "in the same space without one)".format(cfg.index_rope_dim))
+    if cfg.index_k_norm_type != _DSA_K_NORM_LAYERNORM:
+        raise NotImplementedError(
+            "dsa_config['index_k_norm_type']={!r} — only {!r} is implemented; "
+            "K3.1 ships indexer.k_norm.weight AND indexer.k_norm.bias, which "
+            "only a LayerNorm has".format(
+                cfg.index_k_norm_type, _DSA_K_NORM_LAYERNORM))
+    reuse = [idx for idx in range(num_hidden_layers)
+             if cfg.is_dsa_layer(idx) and cfg.skips_topk(idx)]
+    if reuse:
+        raise NotImplementedError(
+            "dsa_config schedule marks DSA layers {} as top-k REUSE layers "
+            "(index_topk_freq={}, index_skip_topk_offset={}), but every K3.1 "
+            "full-attention layer ships its own indexer weights and the reuse "
+            "path is not implemented here".format(
+                reuse[:8], cfg.index_topk_freq, cfg.index_skip_topk_offset))
+    return cfg
+
+
 @dataclass
 class KimiK3Config:
     """Flat, validated Kimi-K3 text-model configuration.
@@ -242,6 +432,9 @@ class KimiK3Config:
 
     # KDA
     linear_attn_config: Optional[Dict[str, Any]] = None
+
+    # DSA (K3.1 only; None IS the K3 configuration and the dense-MLA gate)
+    dsa_config: Optional[KimiDsaConfig] = None
 
     # MoE
     num_experts: Optional[int] = None
@@ -290,6 +483,14 @@ class KimiK3Config:
 
     def is_mla_layer(self, layer_idx: int) -> bool:
         return not self.is_kda_layer(layer_idx)
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """Whether this MLA layer runs the sparse (indexer-gated) path.
+
+        False for every layer of K3 (``dsa_config is None``), which is what
+        keeps the K3 build structurally identical to before this feature.
+        """
+        return self.dsa_config is not None and self.dsa_config.is_dsa_layer(layer_idx)
 
     @property
     def kda_num_heads(self) -> int:
@@ -408,6 +609,37 @@ class KimiK3Config:
                     "kda num_heads ({}) exceeds the A_log padded buffer length "
                     "({})".format(lac["num_heads"], self.a_log_padded_len))
 
+        # --- DSA (K3.1) ---
+        dsa = self.dsa_config
+        if dsa is not None:
+            if self.model_type != "kimi_k31":
+                problems.append(
+                    "dsa_config is set but model_type is {!r}; the indexer is "
+                    "the K3.1 delta and must not be attached to another "
+                    "identity".format(self.model_type))
+            full_attn = set(map(int, (lac or {}).get("full_attn_layers") or []))
+            if full_attn and set(dsa.dsa_layers) != full_attn:
+                problems.append(
+                    "dsa_config['dsa_layers'] != linear_attn_config"
+                    "['full_attn_layers']: only={}, missing={}. The indexer "
+                    "lives on the full-attention layers (the checkpoint ships "
+                    "self_attn.indexer.* on exactly those 24 layers); a KDA "
+                    "layer has no MLA attention to gate and no q_a to read."
+                    .format(sorted(set(dsa.dsa_layers) - full_attn)[:8],
+                            sorted(full_attn - set(dsa.dsa_layers))[:8]))
+            if self.q_lora_rank is None:
+                problems.append(
+                    "dsa_config is set but q_lora_rank is None — the indexer's "
+                    "wq_b reads the MLA q_a intermediate (shape "
+                    "[index_num_heads*index_head_dim, q_lora_rank])")
+        elif self.model_type == "kimi_k31":
+            problems.append(
+                "model_type is 'kimi_k31' but dsa_config is absent. The sparse "
+                "indexer is the ONLY thing that distinguishes K3.1 from K3, so "
+                "there is no default: without it the 24 full-attention layers "
+                "would silently run dense over the whole context while the "
+                "checkpoint's 120 indexer tensors had no destination.")
+
         # --- MoE ---
         for name in ("num_experts", "num_experts_per_token", "moe_intermediate_size",
                      "routed_expert_hidden_size"):
@@ -465,13 +697,28 @@ class KimiK3Config:
 #  Parser                                                                      #
 # --------------------------------------------------------------------------- #
 
+#: Wrapper ``model_type`` values this parser accepts, and whether that
+#: identity carries the DSA indexer.  An unlisted value raises: binding an
+#: unknown Kimi wrapper to either of these graphs is exactly the silent
+#: mis-load this parser exists to prevent.
+_WRAPPER_MODEL_TYPES = {
+    "kimi_k3": False,
+    "kimi_k31": True,
+}
+
+
 def parse_k3_config(raw: Dict[str, Any]) -> KimiK3Config:
     """Parse the checkpoint's full ``config.json`` dict into a validated
     :class:`KimiK3Config`.
 
     Requires the K3 nesting: the text model lives under ``raw['text_config']``.
-    Unknown keys — top-level, text-level, or inside ``linear_attn_config`` —
-    raise (they are listed in the error).
+    Unknown keys — top-level, text-level, or inside ``linear_attn_config`` /
+    ``dsa_config`` — raise (they are listed in the error).
+
+    The TOP-LEVEL ``model_type`` selects the identity: ``kimi_k3`` (dense) or
+    ``kimi_k31`` (DSA).  Both checkpoints declare ``text_config.model_type``
+    as the literal ``"kimi_linear"``, so the text-level value cannot be used
+    to tell them apart.
     """
     if not isinstance(raw, dict):
         raise ValueError("parse_k3_config expects the config.json dict, got {}".format(type(raw)))
@@ -484,17 +731,40 @@ def parse_k3_config(raw: Dict[str, Any]) -> KimiK3Config:
     _reject_unknown_keys([k for k in raw if k not in _TOP_LEVEL_KEYS],
                          "config.json (top level)")
 
+    wrapper_type = str(_require(raw, "model_type", "top-level config"))
+    if wrapper_type not in _WRAPPER_MODEL_TYPES:
+        raise ValueError(
+            "Kimi-K3 config: top-level model_type is {!r}; this parser serves "
+            "{}. The wrapper identity selects the attention graph (dense vs "
+            "DSA-gated), so an unrecognised one is never defaulted."
+            .format(wrapper_type, sorted(_WRAPPER_MODEL_TYPES)))
+
     tc = raw["text_config"]
     _reject_unknown_keys(
         [k for k in tc if k not in _ARCH_KEYS and k not in _HF_BOOKKEEPING_KEYS],
         "config.json['text_config']")
 
     where = "text_config"
+    num_layers = int(_require(tc, "num_hidden_layers", where))
+    dsa_raw = tc.get("dsa_config")
+    expects_dsa = _WRAPPER_MODEL_TYPES[wrapper_type]
+    if dsa_raw is None and expects_dsa:
+        raise ValueError(
+            "Kimi-K3 config: model_type={!r} requires text_config.dsa_config "
+            "(the sparse indexer is its only delta vs Kimi-K3) and it is "
+            "absent.".format(wrapper_type))
+    if dsa_raw is not None and not expects_dsa:
+        raise ValueError(
+            "Kimi-K3 config: model_type={!r} must not carry a dsa_config — the "
+            "released Kimi-K3 checkpoint ships no indexer weights, so a model "
+            "built with one would attend over an all-zero index space."
+            .format(wrapper_type))
+    dsa_cfg = None if dsa_raw is None else parse_dsa_config(dsa_raw, num_layers)
     cfg = KimiK3Config(
         vocab_size=int(_require(tc, "vocab_size", where)),
         hidden_size=int(_require(tc, "hidden_size", where)),
         intermediate_size=int(_require(tc, "intermediate_size", where)),
-        num_hidden_layers=int(_require(tc, "num_hidden_layers", where)),
+        num_hidden_layers=num_layers,
         rms_norm_eps=float(_require(tc, "rms_norm_eps", where)),
         num_attention_heads=int(_require(tc, "num_attention_heads", where)),
         num_key_value_heads=int(_require(tc, "num_key_value_heads", where)),
@@ -506,6 +776,7 @@ def parse_k3_config(raw: Dict[str, Any]) -> KimiK3Config:
         mla_use_nope=bool(_require(tc, "mla_use_nope", where)),
         mla_use_output_gate=bool(_require(tc, "mla_use_output_gate", where)),
         linear_attn_config=dict(_require(tc, "linear_attn_config", where)),
+        dsa_config=dsa_cfg,
         num_experts=int(_require(tc, "num_experts", where)),
         num_experts_per_token=int(_require(tc, "num_experts_per_token", where)),
         moe_intermediate_size=int(_require(tc, "moe_intermediate_size", where)),
@@ -538,7 +809,7 @@ def parse_k3_config(raw: Dict[str, Any]) -> KimiK3Config:
         # released checkpoint ships the key at top level.
         media_placeholder_token_id=int(
             _require(raw, "media_placeholder_token_id", "top-level config")),
-        model_type="kimi_k3",
+        model_type=wrapper_type,
         raw_text_config=dict(tc),
     )
     cfg.validate()
