@@ -73,19 +73,25 @@ class WeightSourceError(ValueError):
 _K3_DISTRIBUTED_NODE_COUNTS = (2, 4)
 
 
+#: Registry types of the Kimi-K3 family: K3, and K3.1 (K3 + the DSA indexer,
+#: the same 92 x 896 routed-expert topology and host-weight store layout).
+_K3_FAMILY_MODEL_TYPES = frozenset({"kimi_k3", "kimi_k31"})
+
+
 def _is_kimi_k3_model(model_name: Optional[str]) -> bool:
-    """The registered Kimi-K3 identity, not a substring guess.
+    """A registered Kimi-K3-family identity, not a substring guess.
 
     Resolved through the config registry every startup path already uses
     (``model_registry._detect_model_type_from_identifier``), so a model that
-    the registry does not bind to ``kimi_k3`` is not treated as K3 here
+    the registry does not bind to a K3-family type is not treated as K3 here
     either.
     """
     from batchgen.config.model_registry import (
         _detect_model_type_from_identifier,
     )
 
-    return _detect_model_type_from_identifier(model_name or "") == "kimi_k3"
+    model_type = _detect_model_type_from_identifier(model_name or "")
+    return model_type in _K3_FAMILY_MODEL_TYPES
 
 
 def _launch_converted_ckpt_dir(args: "ServerArgs") -> Optional[Path]:

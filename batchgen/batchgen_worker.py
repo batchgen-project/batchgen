@@ -216,7 +216,12 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import (
+	is_kimi_k25_backend_model,
+	# Re-exported for the worker main loop: which served ids take the
+	# pre-readiness startup is a model-name fact (exact ids, not a family).
+	runs_startup_before_readiness,
+)
 from batchgen.config.cuda_graph_flag_policy import (
 	cli_enables_whole_model_graph,
 	require_cuda_graph_flag_supported,
@@ -370,11 +375,6 @@ BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS'
 # this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
 # the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
 _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
-
-# The one served model whose workload-independent startup work runs before the
-# server reports ready (prepare_kimi_k3_startup). Matched EXACTLY: the sibling
-# Kimi-Linear/K2.5 checkpoints share this architecture but not this lifecycle.
-KIMI_K3_MODEL_ID = "moonshotai/Kimi-K3"
 
 def _reentry_history_length(
 	prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
@@ -1826,6 +1826,19 @@ class BatchGenWorker:
 				num_v_heads=primary_profile.num_v_heads,
 				v_head_dim=primary_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(primary_profile.kv_dtype),
+				# Engine-layer -> cache-slot map, exactly as the dense builder
+				# passes it. A fully-DSA model (GLM) has None here (engine ==
+				# physical); an interleaved model (Kimi-K3.1: 24 MLA rows among
+				# 93 engine layers) addresses BOTH regions by engine layer id,
+				# and without the map the primary pool bounds-checks engine ids
+				# against its 24 physical slots and refuses layer 27 at the
+				# first decode-graph capture.
+				logical_to_physical_layer=(
+					list(primary_profile.logical_to_physical_layer)
+					if getattr(primary_profile, "logical_to_physical_layer", None)
+					is not None
+					else None
+				),
 			)
 			primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
 			aux_config = GPUPagedKVConfig(
@@ -9950,6 +9963,13 @@ class BatchGenWorker:
 		)
 		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
 		self._preload_kimi_k3_runtime_extensions()
+		# Model-specific native dependencies beyond the family's (e.g. a
+		# sparse-attention indexer's kernels), owned by the model package.
+		preload_model_extensions = getattr(
+			self.parallel_manager, "preload_runtime_extensions", None
+		)
+		if preload_model_extensions is not None:
+			preload_model_extensions()
 		self._ensure_pynccl_communicator()
 		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
 		# manager needs the communicator before configure_decoding, not at the
@@ -13686,11 +13706,25 @@ class BatchGenWorker:
 	def _prefill_pool_layout(self, geometry) -> tuple:
 		"""(with_v, indexer_layers, indexer_dim) of this model's prefill pool.
 
-		A DSA model (dual Host KV) pools only the MLA latent plus the indexer
-		keys of its full (top-k computing) layers; every other model pools K/V.
+		A DSA model (dual Host KV) pools the indexer keys of its full (top-k
+		computing) layers next to its attention rows; a non-DSA model pools
+		K/V and no index keys.
+
+		Whether the pool carries V is a property of the POOL ROW, not of DSA:
+		the row's owner is the PSM's ``prefill_pool_layout`` when it declares
+		one (a model whose pool holds the expanded per-head K AND V, as
+		``_prefill_pool_page_dims`` already reads for the widths), otherwise
+		the Host geometry, whose DSA form is a single latent with no V side.
+		Deciding it from "is the coordinator dual" instead would drop the V
+		rows of any DSA model that pools expanded heads while
+		``_prefill_pool_page_dims`` kept declaring ``v_head_dim``, and the
+		two would disagree silently -- ``PrefillPrefixPool`` simply leaves
+		``self.v`` as None.
 		"""
 		if not isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
 			return True, (), 0
+		psm_layout = self._prefill_pool_psm_layout()
+		with_v = bool(psm_layout and int(psm_layout["v_head_dim"]) > 0)
 		if self.model is None:
 			# Wave planning runs at reservation time (decode phase), where the
 			# model object is not resident. The layout is a model constant and
@@ -13710,12 +13744,25 @@ class BatchGenWorker:
 			attn = getattr(layer.self_attn, "module", layer.self_attn)
 			if getattr(attn, "indexer", None) is not None:
 				indexers[layer_idx] = attn.indexer
-		if not indexers or len(self.model.model.layers) != geometry.num_layers:
-			raise RuntimeError("DSA prefill pool: indexer layers do not match the KV geometry")
+		# Compare against the primary cache's LOGICAL depth, not its row count:
+		# a profile that stores its attention layers densely carries a
+		# logical->physical map (Kimi-K3's 93 engine layers -> 24 MLA rows), and
+		# `num_layers` is then the physical row count, which no model's layer
+		# stack is ever equal to. The check is "does this cache describe this
+		# model's depth", so it must read whichever of the two the profile
+		# declares -- a table lookup, not a per-model branch.
+		logical_map = getattr(geometry, "logical_to_physical_layer", None)
+		kv_depth = len(logical_map) if logical_map else geometry.num_layers
+		if not indexers or len(self.model.model.layers) != kv_depth:
+			raise RuntimeError(
+				"DSA prefill pool: indexer layers do not match the KV geometry "
+				f"({len(indexers)} indexer layers, {len(self.model.model.layers)} "
+				f"engine layers, KV logical depth {kv_depth})"
+			)
 		dims = {int(indexer.index_head_dim) for indexer in indexers.values()}
 		if len(dims) != 1:
 			raise RuntimeError(f"DSA prefill pool: mixed indexer head dims {sorted(dims)}")
-		layout = (False, tuple(indexers), dims.pop())
+		layout = (with_v, tuple(indexers), dims.pop())
 		self._prefill_pool_layout_cache = layout
 		return layout
 

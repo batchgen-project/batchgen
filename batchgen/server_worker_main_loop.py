@@ -21,9 +21,9 @@ from batchgen.kernel_compat import check_kernels_version
 check_kernels_version()
 
 from batchgen.batchgen_worker import (
-	KIMI_K3_MODEL_ID,
 	BatchGenWorker,
 	BatchGenWorkerArgs,
+	runs_startup_before_readiness,
 )
 from batchgen import eventlog
 from batchgen.deprecation import LegacyInferenceDeprecated
@@ -823,10 +823,11 @@ def _server_worker_main_impl(
 	# Kimi-K3 finishes its workload-independent one-time work — model build,
 	# resident-EP decode shards, streamed-SP8 buffers and the H2D weight
 	# schedule — BEFORE the readiness signal below, so a server that reports
-	# ready can serve its first request immediately. Exact model id only: the
-	# sibling Kimi-Linear checkpoints share the architecture but not this
-	# lifecycle. Any failure propagates and the worker never signals ready.
-	if args.model_name == KIMI_K3_MODEL_ID:
+	# ready can serve its first request immediately. Exact model ids only
+	# (model_name_utils.PRE_READINESS_STARTUP_MODEL_IDS): the sibling
+	# Kimi-Linear checkpoints share the architecture but not this lifecycle.
+	# Any failure propagates and the worker never signals ready.
+	if runs_startup_before_readiness(args.model_name):
 		worker.prepare_kimi_k3_startup()
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister

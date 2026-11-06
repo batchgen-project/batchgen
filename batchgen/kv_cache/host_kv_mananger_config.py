@@ -261,6 +261,26 @@ _KIMI_K3_MLA_PROFILE = _HostKVModelProfile(
 	logical_to_physical_layer=_KIMI_K3_MLA_LAYER_MAP,
 )
 
+# DSA indexer-K region sharing the K3 latent map (same 24 rows, so one
+# page table serves both regions). MQA single head in DeepGEMM's page-split
+# FP8 layout, the format the ReLU-gated paged scorer reads directly: per page
+# [64 x 128 B e4m3 K][64 x 4 B fp32 scale], so k_head_dim counts BYTES
+# (128 data + 4 scale), exactly as in the 21-layer page-split profile above.
+# The per-token cost is declared and cross-asserted model-side, in
+# batchgen/models/moonshotai/kimi_linear/k3/tensor_map.py.
+_KIMI_K31_INDEXER_LOGICAL_LAYERS = _KIMI_K3_MLA_LOGICAL_LAYERS
+_KIMI_K31_INDEXER_LAYER_MAP = _KIMI_K3_MLA_LAYER_MAP
+_KIMI_K31_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=len(_KIMI_K31_INDEXER_LOGICAL_LAYERS),
+	num_k_heads=1,
+	k_head_dim=128 + PAGE_SPLIT_SCALE_BYTES_PER_TOKEN,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="float8_e4m3fn",
+	logical_to_physical_layer=_KIMI_K31_INDEXER_LAYER_MAP,
+	page_format=PAGE_FORMAT_FP8_PAGE_SPLIT,
+)
+
 # Kimi-Linear: MLA latent KV (compressed_kv_dim=576, 27 engine layers; only
 # the 7 MLA layers ever append — KDA layers hold no KV).
 _KIMI_LINEAR_MLA_PROFILE = _HostKVModelProfile(
@@ -284,6 +304,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"glm5_2_indexer": _GLM5_2_INDEXER_PROFILE,
 	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
 	"kimi_k3_mla": _KIMI_K3_MLA_PROFILE,
+	"kimi_k31_indexer": _KIMI_K31_INDEXER_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -339,6 +360,9 @@ for canonical, aliases in {
 		"moonshotai/kimi-k3",
 		"kimi-k3",
 		"kimi_k3",
+		"moonshotai/kimi-k3.1-pro",
+		"kimi-k3.1-pro",
+		"kimi_k31",
 	),
 	"glm5_mla": (
 		"zai-org/glm-5.2-fp8",
@@ -397,6 +421,13 @@ for canonical, aliases in {
 		"zai-org/glm-5.1",
 		"glm-5.1-fp8",
 		"glm-5.1",
+	),
+	# Membership in THIS table is what makes is_dsa_model() true; a dense
+	# sibling sharing the primary profile must never appear here.
+	"kimi_k31_indexer": (
+		"moonshotai/kimi-k3.1-pro",
+		"kimi-k3.1-pro",
+		"kimi_k31",
 	),
 }.items():
 	for alias in aliases:

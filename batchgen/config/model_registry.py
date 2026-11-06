@@ -97,9 +97,19 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "GLM-5.1": "glm_moe_dsa",
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
-    # Kimi-Linear (testbed) + Kimi-K3 family (hybrid KDA + NoPE-MLA MoE)
+    # Kimi-Linear (testbed) + Kimi-K3 family (hybrid KDA + NoPE-MLA MoE).
+    # More-specific patterns MUST precede the broad "Kimi-K3": it is a
+    # substring of "Kimi-K3.1-Pro", so without the entries below a K3.1
+    # identifier binds to the DENSE kimi_k3 config, which carries no
+    # dsa_config — a loadable, runnable model whose 24 full-attention layers
+    # silently attend over the whole context while the checkpoint's 120
+    # indexer tensors have no destination. Same hazard the broad "GLM-5"
+    # entry has, and _warn_if_unlisted_glm5_variant is the precedent for
+    # guarding a future unlisted Kimi-K3.x the same way.
     "Kimi-Linear-48B-A3B": "kimi_linear",
     "Kimi-Linear": "kimi_linear",
+    "Kimi-K3.1-Pro": "kimi_k31",
+    "Kimi-K3.1": "kimi_k31",
     "Kimi-K3": "kimi_k3",
 }
 
