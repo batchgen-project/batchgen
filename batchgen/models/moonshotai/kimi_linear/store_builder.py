@@ -105,6 +105,7 @@ import shlex
 import shutil
 import stat
 import tempfile
+import threading
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -181,6 +182,12 @@ DEFAULT_READ_BUFFER_BYTES = 64 * 1024 * 1024
 #: Threads for the verification re-read. ``hashlib`` releases the GIL while
 #: hashing large buffers, so segments hash in parallel.
 DEFAULT_HASH_WORKERS = 8
+
+#: Threads for the copy. Reads, hashing and ``os.pwrite`` all release the
+#: GIL, and a shared filesystem needs several concurrent streams to reach
+#: its read bandwidth, so shards copy in parallel. Memory stays bounded at
+#: ``copy_workers`` read buffers.
+DEFAULT_COPY_WORKERS = 8
 
 #: First line of ``metadata.tsv``. The reader skips any row whose first field
 #: is ``H`` (``Weights_Storage.cpp:379-381``).
@@ -987,24 +994,29 @@ def write_store(
     plan: StorePlan,
     store_path: Path,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: int = DEFAULT_COPY_WORKERS,
 ) -> CopyResult:
     """Copy this node's spans into a NEW ``store_path``, hashing each tensor.
 
-    Each source ``.bin`` is opened once and read forward, so the copy is
-    sequential on the source side and O(1) in memory.
+    Shards copy on ``copy_workers`` threads; each source ``.bin`` is opened
+    once by its thread and read forward, every tensor lands at its
+    ``compact_offset`` via ``os.pwrite``, and memory stays bounded at one
+    read buffer per worker. The result is byte-identical for any worker
+    count: offsets are disjoint by construction and the per-shard manifest
+    entries are assembled in sorted shard order after every copy finished.
     """
     if read_buffer_bytes <= 0:
         raise K3StoreBuilderError("read buffer must be a positive size")
+    if copy_workers <= 0:
+        raise K3StoreBuilderError("copy workers must be positive")
     by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
     for record in plan.local_records:
         by_shard[record.shard_file].append(record)
     sidecars = {shard.file_name: shard for shard in plan.shards}
 
-    buffer = bytearray(read_buffer_bytes)
-    view = memoryview(buffer)
-    written = 0
-    digests: Dict[int, bytes] = {}
-    shard_entries: List[Dict[str, Any]] = []
+    progress_lock = threading.Lock()
+    progress_bytes = 0
+
     try:
         descriptor = os.open(
             store_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644
@@ -1018,26 +1030,53 @@ def write_store(
             raise K3StoreBuilderError(
                 f"cannot size {store_path} to {plan.store_bytes} B: {error}"
             ) from error
-        for shard_file in sorted(by_shard):
+
+        def copy_shard(shard_file: str) -> Tuple[Dict[int, bytes], int]:
+            nonlocal progress_bytes
             source_path = plan.converted_ckpt / shard_file
             records = sorted(
                 by_shard[shard_file], key=lambda record: record.source_offset
             )
+            view = memoryview(bytearray(read_buffer_bytes))
             try:
                 source = open(source_path, "rb", buffering=0)
             except OSError as error:
                 raise K3StoreBuilderError(
                     f"cannot open {source_path}: {error}"
                 ) from error
+            shard_digests: Dict[int, bytes] = {}
             copied = 0
             with source:
                 for record in records:
-                    digests[record.row] = _copy_span(
+                    shard_digests[record.row] = _copy_span(
                         source, descriptor, record, view, source_path, store_path
                     )
                     copied += record.byte_size
+            with progress_lock:
+                progress_bytes += copied
+                logger.info(
+                    "copied %s (%d tensors, %.2f GiB cumulative)",
+                    shard_file,
+                    len(records),
+                    progress_bytes / float(1 << 30),
+                )
+            return shard_digests, copied
+
+        shard_files = sorted(by_shard)
+        workers = min(copy_workers, len(shard_files)) or 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(copy_shard, shard_files))
+
+        written = 0
+        digests: Dict[int, bytes] = {}
+        shard_entries: List[Dict[str, Any]] = []
+        for shard_file, (shard_digests, copied) in zip(shard_files, results):
+            digests.update(shard_digests)
             written += copied
             sidecar = sidecars.get(shard_file)
+            records = sorted(
+                by_shard[shard_file], key=lambda record: record.source_offset
+            )
             shard_entries.append(
                 {
                     "sidecar": sidecar.json_name if sidecar else None,
@@ -1046,14 +1085,10 @@ def write_store(
                     "sidecar_digest": sidecar.sidecar_digest if sidecar else None,
                     "tensors_copied": len(records),
                     "bytes_copied": copied,
-                    "copied_digest": _rollup(digests[record.row] for record in records),
+                    "copied_digest": _rollup(
+                        shard_digests[record.row] for record in records
+                    ),
                 }
-            )
-            logger.info(
-                "copied %s (%d tensors, %.2f GiB cumulative)",
-                shard_file,
-                len(records),
-                written / float(1 << 30),
             )
         try:
             os.fsync(descriptor)
@@ -2007,6 +2042,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--hash-workers", type=int, default=DEFAULT_HASH_WORKERS
     )
     parser.add_argument(
+        "--copy-workers", type=int, default=DEFAULT_COPY_WORKERS,
+        help=(
+            "Threads copying source shards in parallel "
+            f"(default {DEFAULT_COPY_WORKERS}; 1 restores the serial copy)."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -2058,6 +2100,8 @@ def build(
         raise K3StoreBuilderError("--read-buffer-bytes must be positive")
     if args.hash_workers <= 0:
         raise K3StoreBuilderError("--hash-workers must be positive")
+    if args.copy_workers <= 0:
+        raise K3StoreBuilderError("--copy-workers must be positive")
     if not os.path.isabs(args.store_staging_dir):
         raise K3StoreBuilderError(
             f"--store-staging-dir must be an absolute path; got "
@@ -2147,7 +2191,9 @@ def build(
             staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=output_dir))
             try:
                 store_path = staging / STORE_FILE_NAME
-                copy = write_store(plan, store_path, args.read_buffer_bytes)
+                copy = write_store(
+                    plan, store_path, args.read_buffer_bytes, args.copy_workers
+                )
                 self_check(plan, store_path, copy.written)
                 segments = verify_store(
                     plan, store_path, copy, args.read_buffer_bytes, args.hash_workers

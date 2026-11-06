@@ -963,8 +963,8 @@ def test_a_failed_build_publishes_nothing_and_cleans_its_staging(env, monkeypatc
     output = env.tmp / "node0"
     real_write_store = sb.write_store
 
-    def corrupting_write_store(plan, store_path, read_buffer_bytes):
-        result = real_write_store(plan, store_path, read_buffer_bytes)
+    def corrupting_write_store(plan, store_path, read_buffer_bytes, copy_workers):
+        result = real_write_store(plan, store_path, read_buffer_bytes, copy_workers)
         with open(store_path, "r+b") as handle:
             handle.seek(plan.store_bytes - 1)
             last = handle.read(1)
@@ -1117,3 +1117,56 @@ def test_a_missing_or_invalid_model_config_is_refused(env):
 def test_main_reports_a_named_failure_without_raising(env):
     argv = env.argv(env.tmp / "out", 0, extra=["--dry-run"], ckpt=env.tmp / "absent")
     assert sb.main(argv) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  Parallel copy                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_parallel_copy_is_byte_identical_to_serial(env):
+    serial = env.tmp / "serial"
+    parallel = env.tmp / "parallel"
+    env.build(serial, 0, extra=("--copy-workers", "1"))
+    env.build(parallel, 0, extra=("--copy-workers", "4"))
+    assert (serial / sb.STORE_FILE_NAME).read_bytes() == (
+        parallel / sb.STORE_FILE_NAME
+    ).read_bytes()
+    assert (serial / sb.METADATA_FILE_NAME).read_bytes() == (
+        parallel / sb.METADATA_FILE_NAME
+    ).read_bytes()
+    one = json.loads((serial / sb.MANIFEST_FILE_NAME).read_text())
+    many = json.loads((parallel / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        many.pop(volatile)
+    assert one == many
+
+
+def test_write_store_results_are_identical_for_any_worker_count(env, tmp_path):
+    plan = env.plan()
+    results = {}
+    for workers in (1, 3, 16):
+        store = tmp_path / f"store{workers}.bin"
+        results[workers] = sb.write_store(plan, store, copy_workers=workers)
+        assert store.read_bytes() == (tmp_path / "store1.bin").read_bytes()
+    base = results[1]
+    for workers in (3, 16):
+        assert results[workers].written == base.written
+        assert results[workers].record_digests == base.record_digests
+        assert results[workers].shards == base.shards
+
+
+def test_copy_workers_must_be_positive(env):
+    with pytest.raises(sb.K3StoreBuilderError, match="--copy-workers"):
+        env.build(env.tmp / "zero", 0, extra=("--copy-workers", "0"))
+    with pytest.raises(sb.K3StoreBuilderError, match="copy workers"):
+        sb.write_store(env.plan(), env.tmp / "direct.bin", copy_workers=0)
+
+
+def test_parallel_copy_raises_on_a_source_that_ends_early(env, tmp_path):
+    plan = env.plan()
+    shard = sorted({record.shard_file for record in plan.local_records})[0]
+    (env.ckpt / shard).write_bytes(b"")
+    with pytest.raises(sb.K3StoreBuilderError, match="ended|I/O error"):
+        sb.write_store(plan, tmp_path / "truncated.bin", copy_workers=4)
