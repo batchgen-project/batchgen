@@ -515,9 +515,35 @@ def test_resident_compute_processes_fail():
     result = probe(
         LaunchTarget(model="m"),
         run_nvidia_smi=lambda argv, timeout: "41, 512 MiB\n77, 64 MiB\n",
+        pid_visible=lambda pid: True,
     ).check_gpu_idle()
     assert result.status == STATUS_FAIL
     assert "2 compute process(es)" in result.evidence
+
+
+def test_contexts_outside_this_pid_namespace_only_warn():
+    """Host PIDs this container cannot see (another container, or a context
+    the driver never reclaimed) cannot be stopped from here and run no work:
+    they cost memory headroom, not the launch."""
+    result = probe(
+        LaunchTarget(model="m"),
+        run_nvidia_smi=lambda argv, timeout: "191475, 474 MiB\n191476, 474 MiB\n",
+        pid_visible=lambda pid: False,
+    ).check_gpu_idle()
+    assert result.status == STATUS_WARN
+    assert "2 GPU context(s)" in result.evidence
+    assert "474 MiB" in result.evidence
+
+
+def test_a_visible_process_fails_even_beside_foreign_contexts():
+    result = probe(
+        LaunchTarget(model="m"),
+        run_nvidia_smi=lambda argv, timeout: "41, 512 MiB\n191475, 474 MiB\n",
+        pid_visible=lambda pid: pid == 41,
+    ).check_gpu_idle()
+    assert result.status == STATUS_FAIL
+    assert "1 compute process(es)" in result.evidence
+    assert "191475" not in result.evidence
 
 
 def test_a_missing_nvidia_smi_only_warns():
