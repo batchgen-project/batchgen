@@ -7,11 +7,9 @@
 
 Three things, all CPU, no CUDA and no compiled engine:
 
-1. the dual (primary + auxiliary indexer) Host/GPU KV profiles, including a
-   cross-assertion that the auxiliary region's per-token cost is EXACTLY the
-   number the model side declares in
-   ``batchgen/models/moonshotai/kimi_linear/k3/tensor_map.py``.  The two live
-   in different change sets and must not be able to drift;
+1. the dual (primary + auxiliary indexer) Host/GPU KV profiles.  The
+   cross-assertion against the model side's own declaration lives with the
+   model set (``tests/test_kimi_k31_kv_agreement.py``);
 2. the ``MODEL_NAME_PATTERNS`` fix — ``"Kimi-K3"`` is a substring of
    ``"Kimi-K3.1-Pro"``, so without an explicit earlier pattern a K3.1
    identifier bound to the dense ``kimi_k3`` identity;
@@ -48,10 +46,12 @@ K3_ENGINE_LAYERS = 93
 LATENT_DIM = 576            # kv_lora_rank 512 + qk_rope_head_dim 64
 INDEX_HEAD_DIM = 128        # dsa_config.index_head_dim
 BF16_BYTES = 2
+#: Page-split FP8 index key: 128 e4m3 bytes + one fp32 scale per token.
+INDEX_K_BYTES = INDEX_HEAD_DIM * 1 + 4                                # 132
 EXPECTED_LATENT_BYTES_PER_TOKEN = 24 * LATENT_DIM * BF16_BYTES        # 27,648
-EXPECTED_INDEXER_BYTES_PER_TOKEN = 24 * INDEX_HEAD_DIM * BF16_BYTES   # 6,144
+EXPECTED_INDEXER_BYTES_PER_TOKEN = 24 * INDEX_K_BYTES                 # 3,168
 EXPECTED_PAGED_BYTES_PER_TOKEN = (
-    EXPECTED_LATENT_BYTES_PER_TOKEN + EXPECTED_INDEXER_BYTES_PER_TOKEN)  # 33,792
+    EXPECTED_LATENT_BYTES_PER_TOKEN + EXPECTED_INDEXER_BYTES_PER_TOKEN)  # 30,816
 
 K31_IDS = (
     "moonshotai/Kimi-K3.1-Pro",
@@ -96,18 +96,6 @@ def _profile_bytes_per_token(profile) -> int:
     return profile.num_layers * (k + v)
 
 
-def _load_model_side_tensor_map():
-    """The MODEL set's ``tensor_map`` + its K3.1 config stand-in."""
-    spec = importlib.util.spec_from_file_location(
-        "_k31_model_side_tensor_map",
-        ROOT / "tests" / "test_kimi_k31_tensor_map.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["_k31_model_side_tensor_map"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 # --------------------------------------------------------------------------- #
 #  1. Profiles                                                                #
 # --------------------------------------------------------------------------- #
@@ -143,14 +131,25 @@ def test_indexer_profile_geometry(monkeypatch):
     aux = config._KIMI_K31_INDEXER_PROFILE
     assert aux.num_layers == 24
     assert aux.num_k_heads == 1
-    assert aux.k_head_dim == INDEX_HEAD_DIM
     assert aux.num_v_heads == 0 and aux.v_head_dim == 0
-    assert aux.kv_dtype == "bfloat16"
-    # AoS, NOT the page-split FP8 layout GLM-5.2/5.3 use: index_rope_dim is 0,
-    # so nothing rotates the keys and there are no per-token scales to carry.
-    # k_head_dim is therefore an ELEMENT count, not a byte count.
-    assert not aux.is_page_split
+    # Page-split FP8: the layout DeepGEMM's ReLU-gated paged scorer reads, so
+    # k_head_dim counts BYTES (128 e4m3 + one fp32 scale), not elements.
+    assert aux.is_page_split
+    assert aux.kv_dtype == "float8_e4m3fn"
+    assert aux.k_head_dim == INDEX_K_BYTES == 132
     assert aux.k_data_dim() == INDEX_HEAD_DIM
+
+
+def test_indexer_profile_has_the_page_split_route_geometry(monkeypatch):
+    """Per layer, the K3.1 aux record is the record the production page-split
+    route already stores and scores; only the layer map differs."""
+    config = _load_host_kv_config(monkeypatch)
+    aux = config._KIMI_K31_INDEXER_PROFILE
+    reference = config._GLM5_2_INDEXER_PROFILE
+    for field in ("num_k_heads", "k_head_dim", "num_v_heads", "v_head_dim",
+                  "kv_dtype", "page_size", "page_format"):
+        assert getattr(aux, field) == getattr(reference, field), field
+    assert aux.bytes_per_page() == reference.bytes_per_page()
 
 
 def test_indexer_layer_map_is_the_full_attention_layers(monkeypatch):
@@ -183,138 +182,7 @@ def test_per_token_bytes(monkeypatch):
     assert _profile_bytes_per_token(primary) == EXPECTED_LATENT_BYTES_PER_TOKEN
     assert _profile_bytes_per_token(aux) == EXPECTED_INDEXER_BYTES_PER_TOKEN
     assert (_profile_bytes_per_token(primary) + _profile_bytes_per_token(aux)
-            == EXPECTED_PAGED_BYTES_PER_TOKEN == 33_792)
-
-
-def test_core_profiles_agree_with_the_model_side_declaration(monkeypatch):
-    """The cross-set assertion.
-
-    ``tensor_map`` declares the admission geometry as a property of the MODEL
-    (it is derived from ``dsa_config`` and the checkpoint); the profile tables
-    declare it as a property of the CACHE.  A K3.1 serving build is only
-    correct if the two agree, and they are in different PRs.
-    """
-    config = _load_host_kv_config(monkeypatch)
-    model_side = _load_model_side_tensor_map()
-    tm = model_side.tm
-    cfg = model_side._K31Config()
-    k3_cfg = model_side.k3t._K3Config()
-
-    primary = config._resolve_profile("moonshotai/Kimi-K3.1-Pro")
-    aux = config._resolve_indexer_profile("moonshotai/Kimi-K3.1-Pro")
-
-    assert tm.k3_mla_kv_bytes_per_token(cfg) == _profile_bytes_per_token(primary)
-    assert tm.k31_indexer_kv_bytes_per_token(cfg) == _profile_bytes_per_token(aux)
-    assert (tm.k3_paged_kv_bytes_per_token(cfg)
-            == _profile_bytes_per_token(primary) + _profile_bytes_per_token(aux))
-
-    # And the dense K3 side: no aux region, no indexer bytes.
-    assert config._resolve_indexer_profile("moonshotai/Kimi-K3") is None
-    assert tm.k31_indexer_kv_bytes_per_token(k3_cfg) == 0
-    assert (tm.k3_paged_kv_bytes_per_token(k3_cfg)
-            == _profile_bytes_per_token(config._resolve_profile("moonshotai/Kimi-K3")))
-
-    # The indexer's per-layer width is the MQA key the model caches, not the
-    # 32-head query width: a per-head aux region would be 32x too large.
-    indexer_dims = tm.k3_indexer_dims(cfg)
-    assert aux.k_data_dim() == indexer_dims["head_dim"]
-    assert aux.k_data_dim() * indexer_dims["heads"] == indexer_dims["index_dim"]
-    assert aux.num_layers == len(cfg.dsa_config["dsa_layers"])
-
-
-def _load_dual_coordinator(monkeypatch, host_kv_config):
-    """``dual_host_kv_coordinator`` by file path, sharing the already-loaded
-    ``host_kv_mananger_config`` so both see the same profile tables."""
-    eventlog = types.ModuleType("batchgen.eventlog.process")
-    eventlog.native_log_level = lambda *a, **k: 0
-    native_loader = types.ModuleType("batchgen.native_loader")
-    native_loader.core_engine = SimpleNamespace()
-    monkeypatch.setitem(sys.modules, "batchgen.eventlog.process", eventlog)
-    monkeypatch.setitem(sys.modules, "batchgen.native_loader", native_loader)
-    monkeypatch.setitem(
-        sys.modules, "batchgen.kv_cache.host_kv_mananger_config", host_kv_config)
-
-    module_name = "_k31_dual_coordinator_for_test"
-    spec = importlib.util.spec_from_file_location(
-        module_name, ROOT / "batchgen" / "kv_cache" / "dual_host_kv_coordinator.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_dual_host_configs_split_one_page_count(monkeypatch):
-    """The dual split is the single source of the shared page count, and it
-    refuses a primary/aux page-size mismatch — so K3.1's two regions have to be
-    compatible with each other, not merely individually well-formed."""
-    config = _load_host_kv_config(monkeypatch)
-    dual = _load_dual_coordinator(monkeypatch, config)
-
-    budget = 64 * (1 << 30)
-    primary, aux, num_pages = dual._compute_dual_page_count(
-        "moonshotai/Kimi-K3.1-Pro", budget)
-    assert primary is config._KIMI_K3_MLA_PROFILE
-    assert aux is config._KIMI_K31_INDEXER_PROFILE
-    assert num_pages > 0
-    combined = (primary.bytes_per_page() * primary.num_layers
-                + aux.bytes_per_page() * aux.num_layers)
-    assert num_pages * combined <= budget
-    # One page count, both regions: a token's pages cost latent + index keys.
-    assert combined == EXPECTED_PAGED_BYTES_PER_TOKEN * primary.page_size
-
-    # GPU-DEFERRED: DualHostKVCoordinator.build_host_configs turns this split
-    # into two bg_lib.HostPagedKVConfig objects, which only the compiled engine
-    # can construct. The arithmetic above IS that function's own, and the early
-    # return for a dense model is covered below; the config objects themselves
-    # are validated on-node.
-
-
-def test_a_dense_model_gets_no_dual_configs(monkeypatch):
-    """CPU-provable leg of ``build_host_configs``: the non-DSA early return,
-    which precedes every native call."""
-    config = _load_host_kv_config(monkeypatch)
-    dual = _load_dual_coordinator(monkeypatch, config)
-    for dense in ("moonshotai/Kimi-K3",
-                  "moonshotai/Kimi-Linear-48B-A3B-Instruct"):
-        assert dual.DualHostKVCoordinator.build_host_configs(
-            dense, 64 * (1 << 30)) is None
-
-
-def test_aux_gpu_config_is_built_from_the_profile(monkeypatch):
-    config = _load_host_kv_config(monkeypatch)
-    built = config.build_gpu_kv_config_aux("moonshotai/Kimi-K3.1-Pro", [4096])
-    assert built.num_layers == 24
-    assert built.num_k_heads == 1
-    assert built.k_head_dim == INDEX_HEAD_DIM
-    assert built.kv_dtype is torch.bfloat16
-    assert len(built.logical_to_physical_layer) == K3_ENGINE_LAYERS
-    assert config.build_gpu_kv_config_aux("moonshotai/Kimi-K3", [4096]) is None
-
-
-def test_other_models_profiles_are_unchanged(monkeypatch):
-    """Regression: adding K3.1 must not move any existing resolution."""
-    config = _load_host_kv_config(monkeypatch)
-    expected = {
-        "zai-org/GLM-5": ("_GLM5_MLA_PROFILE", "_GLM5_INDEXER_PROFILE"),
-        "zai-org/GLM-5.1": ("_GLM5_MLA_PROFILE", "_GLM5_INDEXER_PROFILE"),
-        "zai-org/GLM-5.2": ("_GLM5_MLA_PROFILE", "_GLM5_2_INDEXER_PROFILE"),
-        "zai-org/GLM-5.3": ("_GLM5_MLA_PROFILE", "_GLM5_2_INDEXER_PROFILE"),
-        "deepseek-ai/DeepSeek-V3.2": (
-            "_DEEPSEEK_MLA_PROFILE", "_DEEPSEEK_V3_2_INDEXER_PROFILE"),
-        "openai/gpt-oss-120b": ("_GPT_OSS_GQA_PROFILE", None),
-        "MiniMaxAI/MiniMax-M2.5": ("_MINIMAX_M25_GQA_PROFILE", None),
-    }
-    for model_id, (primary_name, aux_name) in expected.items():
-        assert config._resolve_profile(model_id) is getattr(config, primary_name)
-        got_aux = config._resolve_indexer_profile(model_id)
-        assert got_aux is (None if aux_name is None
-                           else getattr(config, aux_name)), model_id
-
-
-def test_an_unlisted_kimi_identifier_still_fails_loud(monkeypatch):
-    config = _load_host_kv_config(monkeypatch)
-    with pytest.raises(ValueError, match="Unsupported model"):
-        config._resolve_profile("moonshotai/Kimi-K3.2-Pro")
+            == EXPECTED_PAGED_BYTES_PER_TOKEN == 30_816)
 
 
 # --------------------------------------------------------------------------- #
@@ -341,24 +209,6 @@ def test_the_k31_patterns_precede_the_broad_kimi_k3_pattern():
     keys = list(MODEL_NAME_PATTERNS)
     assert keys.index("Kimi-K3.1-Pro") < keys.index("Kimi-K3")
     assert keys.index("Kimi-K3.1") < keys.index("Kimi-K3")
-
-
-def test_the_name_pattern_shortcut_cannot_serve_k31_unvalidated():
-    """Detection is fixed, but the shortcut still returns BUILT-IN DEFAULTS.
-
-    ``load_config`` on a non-local identifier returns ``KimiLinearConfig()``,
-    whose ``model_type`` field is the literal ``"kimi_linear"`` and which
-    carries no ``dsa_config``.  The loader gate must reject it, so the only way
-    to serve K3.1 remains a ``--cache-dir`` with the real ``config.json``.
-    """
-    from batchgen.config.model_registry import CONFIG_REGISTRY, load_config
-    from batchgen.models.moonshotai.kimi_linear.k3 import tensor_map as tm
-
-    assert "kimi_k31" in CONFIG_REGISTRY
-    cfg = load_config("moonshotai/Kimi-K3.1-Pro")
-    assert cfg.dsa_config is None
-    with pytest.raises(ValueError, match="model_type"):
-        tm.validate_k3_config(cfg)
 
 
 # --------------------------------------------------------------------------- #

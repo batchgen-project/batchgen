@@ -262,8 +262,10 @@ _KIMI_K3_MLA_PROFILE = _HostKVModelProfile(
 )
 
 # DSA indexer-K region sharing the K3 latent map (same 24 rows, so one
-# page table serves both regions). MQA single head, bf16 AoS, k_head_dim
-# counts ELEMENTS (no rotation on the index path, no page-split scales).
+# page table serves both regions). MQA single head in DeepGEMM's page-split
+# FP8 layout, the format the ReLU-gated paged scorer reads directly: per page
+# [64 x 128 B e4m3 K][64 x 4 B fp32 scale], so k_head_dim counts BYTES
+# (128 data + 4 scale), exactly as in the 21-layer page-split profile above.
 # The per-token cost is declared and cross-asserted model-side, in
 # batchgen/models/moonshotai/kimi_linear/k3/tensor_map.py.
 _KIMI_K31_INDEXER_LOGICAL_LAYERS = _KIMI_K3_MLA_LOGICAL_LAYERS
@@ -271,11 +273,12 @@ _KIMI_K31_INDEXER_LAYER_MAP = _KIMI_K3_MLA_LAYER_MAP
 _KIMI_K31_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=len(_KIMI_K31_INDEXER_LOGICAL_LAYERS),
 	num_k_heads=1,
-	k_head_dim=128,
+	k_head_dim=128 + PAGE_SPLIT_SCALE_BYTES_PER_TOKEN,
 	num_v_heads=0,
 	v_head_dim=0,
-	kv_dtype="bfloat16",
+	kv_dtype="float8_e4m3fn",
 	logical_to_physical_layer=_KIMI_K31_INDEXER_LAYER_MAP,
+	page_format=PAGE_FORMAT_FP8_PAGE_SPLIT,
 )
 
 # Kimi-Linear: MLA latent KV (compressed_kv_dim=576, 27 engine layers; only

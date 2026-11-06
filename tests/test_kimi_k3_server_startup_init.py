@@ -228,9 +228,12 @@ def test_decode_graph_reserves_kda_scratch_before_sequence_admission():
 # --------------------------------------------------------------------------- #
 
 
-def test_kimi_k3_startup_is_gated_on_the_exact_model_id():
-    model_id = _module_constant(WORKER, "KIMI_K3_MODEL_ID")
-    assert model_id == "moonshotai/Kimi-K3"
+def test_kimi_k3_startup_is_gated_on_the_exact_model_ids():
+    from batchgen.config import model_name_utils
+
+    ids = model_name_utils.PRE_READINESS_STARTUP_MODEL_IDS
+    # Kimi-K3, and Kimi-K3.1 (K3 + the DSA indexer, the same lifecycle).
+    assert ids == frozenset({"moonshotai/Kimi-K3", "moonshotai/Kimi-K3.1-Pro"})
 
     test = _startup_guard().test
 
@@ -241,25 +244,56 @@ def test_kimi_k3_startup_is_gated_on_the_exact_model_id():
                 "<guard>",
                 "eval",
             ),
-            {"KIMI_K3_MODEL_ID": model_id, "args": SimpleNamespace(model_name=name)},
+            {
+                "runs_startup_before_readiness": (
+                    model_name_utils.runs_startup_before_readiness
+                ),
+                "args": SimpleNamespace(model_name=name),
+            },
         )
 
     assert matches("moonshotai/Kimi-K3")
-    # Every sibling that shares the Kimi-Linear architecture, the bare name and
-    # a case variant must all miss: they do not share this lifecycle.
+    assert matches("moonshotai/Kimi-K3.1-Pro")
+    # Every sibling that shares the Kimi-Linear architecture, the bare names,
+    # case variants and an unlisted K3.x must all miss: they do not share
+    # this lifecycle (or have not been validated on it).
     for other in (
         "moonshotai/Kimi-K2.5",
         "moonshotai/Kimi-Linear-48B-A3B-Instruct",
         "moonshotai/Kimi-K3-Instruct",
+        "moonshotai/Kimi-K3.2",
         "Kimi-K3",
+        "Kimi-K3.1-Pro",
         "moonshotai/kimi-k3",
+        "moonshotai/kimi-k3.1-pro",
         "zai-org/GLM-5",
+        None,
     ):
         assert not matches(other), other
 
-    # One equality against the served model id — no substring, prefix or
-    # case-folded family match anywhere in the predicate.
-    assert ast.unparse(test) == "args.model_name == KIMI_K3_MODEL_ID"
+    # One membership test of the served model id in the exact-id set — no
+    # substring, prefix or case-folded family match anywhere in the predicate.
+    assert ast.unparse(test) == "runs_startup_before_readiness(args.model_name)"
+    predicate = ast.parse(
+        Path(model_name_utils.__file__).read_text()
+    )
+    fn = next(n for n in predicate.body
+              if isinstance(n, ast.FunctionDef) and n.name == "runs_startup_before_readiness")
+    assert ast.unparse(fn.body[-1]) == "return model_name in PRE_READINESS_STARTUP_MODEL_IDS"
+
+
+def test_the_startup_pass_resolves_the_models_own_runtime_extensions():
+    """After the family-wide preload, the model package's own native
+    dependencies (Kimi-K3.1's DSA kernels) resolve before readiness."""
+    startup = _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
+    calls = _calls(startup)
+    family = calls["_preload_kimi_k3_runtime_extensions"]
+    model = calls["preload_model_extensions"]
+    assert len(family) == 1 and len(model) == 1
+    assert family[0] < model[0] < min(calls["_ensure_pynccl_communicator"])
+    assert "getattr(self.parallel_manager, 'preload_runtime_extensions', None)" in (
+        _body_source(startup)
+    )
 
 
 # --------------------------------------------------------------------------- #

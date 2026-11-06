@@ -294,12 +294,90 @@ def test_every_contract_extension_is_built_ahead_of_time():
             )
 
 
+#: Contracts of models that take a page-split DSA path, and the DSA
+#: extensions each requires beyond its dense set.
+_PAGE_SPLIT_DSA_CONTRACTS = {
+    "glm_moe_dsa": "_GLM5_DSA_EXTENSIONS",
+    "glm_moe_dsa_5_2": "_GLM5_DSA_EXTENSIONS",
+    "glm_moe_dsa_5_3": "_GLM5_DSA_EXTENSIONS",
+    "kimi_k31": "_DSA_PAGE_SPLIT_INDEXER_EXTENSIONS",
+}
+
+
 def test_non_dsa_contracts_do_not_require_the_dsa_extensions():
-    """A model that never takes the DSA decode path must not be refused."""
+    """A model that never takes a DSA path must not be refused for one, and a
+    DSA model is refused only for the DSA extensions its own path loads."""
     for model_type, contract in preflight._CONTRACTS.items():
-        if model_type.startswith("glm_moe_dsa"):
-            continue
+        allowed = set(getattr(preflight, _PAGE_SPLIT_DSA_CONTRACTS.get(model_type, ""), ()) or ())
         for name in preflight._GLM5_DSA_EXTENSIONS:
-            assert name not in contract.extensions, (
-                f"{model_type} should not require {name}"
-            )
+            if name in allowed:
+                assert name in contract.extensions, f"{model_type} does not check {name}"
+            else:
+                assert name not in contract.extensions, (
+                    f"{model_type} should not require {name}"
+                )
+
+
+def test_the_page_split_indexer_extensions_are_part_of_every_glm5_dsa_contract():
+    assert set(preflight._DSA_PAGE_SPLIT_INDEXER_EXTENSIONS) <= set(
+        preflight._GLM5_DSA_EXTENSIONS)
+
+
+# --- Kimi-K3.1 -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model, expected", [
+    ("moonshotai/Kimi-K3.1-Pro", "kimi_k31"),
+    ("Kimi-K3.1-Pro", "kimi_k31"),
+    ("/data/models/kimi-k3.1-pro", "kimi_k31"),
+    ("moonshotai/Kimi-K3", "kimi_k3"),
+    ("moonshotai/Kimi-Linear-48B-A3B-Instruct", "kimi_linear"),
+])
+def test_kimi_identifiers_resolve_to_their_own_contract(model, expected):
+    """"Kimi-K3" is a substring of "Kimi-K3.1-Pro": without the specific entry
+    first, K3.1 is checked against the DENSE K3 contract and starts without
+    its DSA extensions or DeepGEMM."""
+    assert preflight._resolve_model_type(model) == expected
+
+
+def test_the_k31_contract_is_the_k3_contract_plus_the_dsa_indexer():
+    k3, k31 = preflight._CONTRACTS["kimi_k3"], preflight._CONTRACTS["kimi_k31"]
+    assert k31.modules == k3.modules
+    assert k31.extensions == k3.extensions + preflight._DSA_PAGE_SPLIT_INDEXER_EXTENSIONS
+    assert k31.require_deepgemm and not k3.require_deepgemm
+
+
+# The entries the table dropped as dead (2026-11-06), with the type each
+# resolved to. They must still resolve identically through what remains.
+_DROPPED_DEAD_PATTERNS = (
+    ("DeepSeek-V2-Lite", "deepseek_v2"),
+    ("GLM-5.3-FP8", "glm_moe_dsa_5_3"),
+    ("GLM-5.2-FP8", "glm_moe_dsa_5_2"),
+    ("GLM-5.1-FP8", "glm_moe_dsa"),
+    ("GLM-5.1", "glm_moe_dsa"),
+    ("GLM-5-FP8", "glm_moe_dsa"),
+    ("Kimi-Linear-48B-A3B", "kimi_linear"),
+)
+
+
+@pytest.mark.parametrize("pattern, expected", _DROPPED_DEAD_PATTERNS)
+def test_dropped_dead_patterns_resolve_unchanged(pattern, expected):
+    for model in (pattern, f"org/{pattern}-Instruct", pattern.lower()):
+        assert preflight._detect_model_type_from_identifier(model) == expected
+
+
+def test_the_identifier_table_has_no_shadowed_or_dead_entry():
+    table = preflight._KNOWN_IDENTIFIER_PATTERNS
+    for i, (pattern, model_type) in enumerate(table):
+        # reachable: no EARLIER pattern is contained in it
+        for earlier, _ in table[:i]:
+            assert earlier.lower() not in pattern.lower(), (
+                f"{pattern!r} is shadowed by the earlier {earlier!r}")
+        # not dead: the first LATER pattern it contains (the entry that would
+        # resolve its identifiers without it) must resolve them differently
+        contained = [(later, later_type) for later, later_type in table[i + 1:]
+                     if later.lower() in pattern.lower()]
+        if contained:
+            later, later_type = contained[0]
+            assert later_type != model_type, (
+                f"{pattern!r} is dead: the later {later!r} resolves it the same way")

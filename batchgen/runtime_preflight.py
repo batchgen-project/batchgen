@@ -27,27 +27,26 @@ from batchgen.kernel_compat import check_kernels_version
 logger = logging.getLogger(__name__)
 
 
+# First case-insensitive substring match wins, so a more specific pattern must
+# precede any pattern it contains when the two resolve differently ("Kimi-K3"
+# is a substring of "Kimi-K3.1-Pro"). An entry whose type equals that of a
+# LATER pattern it contains is dead and is not listed: the later one already
+# resolves every identifier it would (tests/test_runtime_preflight.py).
 _KNOWN_IDENTIFIER_PATTERNS = (
     ("DeepSeek-V4-Flash", "deepseek_v4"),
     ("DeepSeek-V4-Pro", "deepseek_v4"),
     ("MiniMax-M2.5", "minimax_m25"),
     ("DeepSeek-R1", "deepseek_v3"),
     ("DeepSeek-V3", "deepseek_v3"),
-    ("DeepSeek-V2-Lite", "deepseek_v2"),
     ("DeepSeek-V2", "deepseek_v2"),
     ("Mixtral-8x22B", "mixtral"),
     ("Mixtral-8x7B", "mixtral"),
     ("gpt-oss", "gpt_oss"),
-    ("GLM-5.3-FP8", "glm_moe_dsa_5_3"),
     ("GLM-5.3", "glm_moe_dsa_5_3"),
-    ("GLM-5.2-FP8", "glm_moe_dsa_5_2"),
     ("GLM-5.2", "glm_moe_dsa_5_2"),
-    ("GLM-5.1-FP8", "glm_moe_dsa"),
-    ("GLM-5.1", "glm_moe_dsa"),
-    ("GLM-5-FP8", "glm_moe_dsa"),
     ("GLM-5", "glm_moe_dsa"),
-    ("Kimi-Linear-48B-A3B", "kimi_linear"),
     ("Kimi-Linear", "kimi_linear"),
+    ("Kimi-K3.1", "kimi_k31"),
     ("Kimi-K3", "kimi_k3"),
 )
 
@@ -94,15 +93,20 @@ _COMMON_EXTENSIONS = (
     "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
 )
 
+# AOT extensions of the page-split FP8 DSA indexer itself: the fused index-key
+# writer and the top-k both scorers end in. Every DSA contract carries them.
+_DSA_PAGE_SPLIT_INDEXER_EXTENSIONS = (
+    "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+    "batchgen_kernels.attention._C_dsa_fast_topk",
+)
+
 # AOT extensions the GLM-5 DSA decode path loads on top of the common set.
 # They are listed per contract rather than in _COMMON_EXTENSIONS because a
 # model that never takes the DSA decode path must not be refused for them.
-_GLM5_DSA_EXTENSIONS = (
-    "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+_GLM5_DSA_EXTENSIONS = _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS + (
     "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
     "batchgen_kernels.attention._C_fast_hadamard_transform",
     "batchgen_kernels.attention._C_fused_rope_hadamard",
-    "batchgen_kernels.attention._C_dsa_fast_topk",
     "batchgen_kernels.attention._C_indexer_kv_proj_wgmma",
 )
 
@@ -169,6 +173,13 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     "kimi_k3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=_COMMON_EXTENSIONS,
+    ),
+    # The dense contract plus the page-split DSA indexer: DeepGEMM scores the
+    # index keys (paged on decode, causal on prefill).
+    "kimi_k31": RuntimeContract(
+        modules=("flash_attn_interface", "flash_mla", "libucx"),
+        extensions=_COMMON_EXTENSIONS + _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS,
+        require_deepgemm=True,
     ),
     "kimi_k25": RuntimeContract(
         modules=("flash_attn", "libucx"),

@@ -26,6 +26,23 @@ def is_kimi_k25_backend_model(model_name: str | None) -> bool:
     return any(pattern in normalized for pattern in KIMI_K25_BACKEND_NAME_PATTERNS)
 
 
+# The served models whose workload-independent one-time work — model build,
+# resident decode shards, streamed buffers, the weight schedule and the
+# model's own runtime extensions — runs BEFORE the worker signals readiness
+# (``BatchGenWorker.prepare_kimi_k3_startup``). Matched EXACTLY: the sibling
+# Kimi-Linear / K2.5 checkpoints share the architecture but not this
+# lifecycle, and an unlisted Kimi-K3.x must not inherit it by substring.
+PRE_READINESS_STARTUP_MODEL_IDS = frozenset({
+    "moonshotai/Kimi-K3",
+    "moonshotai/Kimi-K3.1-Pro",
+})
+
+
+def runs_startup_before_readiness(model_name: str | None) -> bool:
+    """Whether this exact served model id takes the pre-readiness startup."""
+    return model_name in PRE_READINESS_STARTUP_MODEL_IDS
+
+
 GLM5_BACKEND_NAME_PATTERNS = (
     "zai-org/glm-5",
     "zai-org/glm-5.1",
