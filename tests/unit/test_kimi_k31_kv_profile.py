@@ -243,6 +243,25 @@ def test_a_dense_model_gets_no_dual_configs(monkeypatch):
             dense, 64 * (1 << 30)) is None
 
 
+def test_worker_dual_branch_passes_the_primary_layer_map():
+    """The worker's dual (DSA) GPU-KV branch must hand BOTH pools the
+    engine-layer map. GLM never exposed the omission (every engine layer is a
+    DSA layer, so engine id == physical slot); on Kimi-K3.1 the primary pool
+    without its map bounds-checks engine layer 27 against 24 slots and the
+    first decode-graph capture dies with resolve_physical_layer out of range
+    (measured 2026-11-06, 4x8 H20)."""
+    calls = {}
+    for node in ast.walk(_worker_method_node("_initialize_gpu_kv_manager_fixed_size")):
+        if (isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "id", None) == "GPUPagedKVConfig"
+                and isinstance(node.targets[0], ast.Name)):
+            calls[node.targets[0].id] = {k.arg for k in node.value.keywords}
+    assert "primary_config" in calls and "aux_config" in calls
+    assert "logical_to_physical_layer" in calls["primary_config"]
+    assert "logical_to_physical_layer" in calls["aux_config"]
+
+
 def test_aux_gpu_config_is_built_from_the_profile(monkeypatch):
     config = _load_host_kv_config(monkeypatch)
     built = config.build_gpu_kv_config_aux("moonshotai/Kimi-K3.1-Pro", [4096])
