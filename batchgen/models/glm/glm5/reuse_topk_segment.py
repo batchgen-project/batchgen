@@ -627,6 +627,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 num_valid_tokens=num_valid_tokens,
                 scale_tma_aligned=num_valid_tokens is not None,
             )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_q_a_norm_quant", self.layer_idx)
         w8a8_deepgemm(
             q_a_fp8, q_a_scale, attn.q_b_proj.weight,
             self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],

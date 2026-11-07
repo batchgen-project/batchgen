@@ -20,6 +20,11 @@ class Glm5DecoderLayerGraphSegment:
     directly. It must not call a nested CUDA graph replay from inside capture.
     """
 
+    # Decode criticality probe (criticality_probe.py), installed by the
+    # whole-model segment before capture. None, the default, launches nothing.
+    # A class attribute so segments built without __init__ start uninstalled.
+    criticality_probe = None
+
     def __init__(
         self,
         *,
@@ -264,6 +269,18 @@ class Glm5DecoderLayerGraphSegment:
             )
         install(key=key, aux_key=aux_key, aux_scale=aux_scale)
 
+    def set_criticality_probe(self, probe) -> None:
+        """Install (or clear, with ``None``) the decode criticality probe.
+
+        The layer marks its own two norm sites and the attention output; the
+        attention and MoE segments mark the sites inside them, so the probe is
+        handed down to both.
+        """
+        self.dsa_segment.set_criticality_probe(probe)
+        if self.moe_segment is not None:
+            self.moe_segment.set_criticality_probe(probe)
+        self.criticality_probe = probe
+
     def selected_positions_key(self, bucket_size: int) -> Optional[tuple]:
         """Delegate: identity of the selected-position transform's tensors.
 
@@ -390,6 +407,8 @@ class Glm5DecoderLayerGraphSegment:
                 self.layer.input_layernorm.weight,
                 self.layer.input_layernorm.eps,
             )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_input_norm_quant", self.layer_idx)
 
         dsa_out = self.dsa_segment.forward(
             hidden_states=attn_input,
@@ -411,6 +430,8 @@ class Glm5DecoderLayerGraphSegment:
             # add below, so the segment must not spend a launch on it.
             attn_output_mask_deferred=True,
         )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_attention", self.layer_idx)
         # Same question for the MoE block's shared expert: does it want its x
         # activation emitted BY this post-attention norm? A dense layer has no
         # MoE segment and therefore no shared expert, so it never fuses.
@@ -447,6 +468,8 @@ class Glm5DecoderLayerGraphSegment:
                 self.layer.post_attention_layernorm.eps,
                 row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
             )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_post_attn_norm_quant", self.layer_idx)
 
         if self.moe_segment is None:
             mlp_output = self.layer.mlp(hidden_states)
