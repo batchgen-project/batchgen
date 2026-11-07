@@ -963,8 +963,8 @@ def test_a_failed_build_publishes_nothing_and_cleans_its_staging(env, monkeypatc
     output = env.tmp / "node0"
     real_write_store = sb.write_store
 
-    def corrupting_write_store(plan, store_path, read_buffer_bytes):
-        result = real_write_store(plan, store_path, read_buffer_bytes)
+    def corrupting_write_store(plan, store_path, read_buffer_bytes, copy_workers):
+        result = real_write_store(plan, store_path, read_buffer_bytes, copy_workers)
         with open(store_path, "r+b") as handle:
             handle.seek(plan.store_bytes - 1)
             last = handle.read(1)
@@ -1117,3 +1117,445 @@ def test_a_missing_or_invalid_model_config_is_refused(env):
 def test_main_reports_a_named_failure_without_raising(env):
     argv = env.argv(env.tmp / "out", 0, extra=["--dry-run"], ckpt=env.tmp / "absent")
     assert sb.main(argv) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  Parallel copy                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_parallel_copy_is_byte_identical_to_serial(env):
+    serial = env.tmp / "serial"
+    parallel = env.tmp / "parallel"
+    env.build(serial, 0, extra=("--copy-workers", "1"))
+    env.build(parallel, 0, extra=("--copy-workers", "4"))
+    assert (serial / sb.STORE_FILE_NAME).read_bytes() == (
+        parallel / sb.STORE_FILE_NAME
+    ).read_bytes()
+    assert (serial / sb.METADATA_FILE_NAME).read_bytes() == (
+        parallel / sb.METADATA_FILE_NAME
+    ).read_bytes()
+    one = json.loads((serial / sb.MANIFEST_FILE_NAME).read_text())
+    many = json.loads((parallel / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        many.pop(volatile)
+    assert one == many
+
+
+def test_write_store_results_are_identical_for_any_worker_count(env, tmp_path):
+    plan = env.plan()
+    results = {}
+    for workers in (1, 3, 16):
+        store = tmp_path / f"store{workers}.bin"
+        results[workers] = sb.write_store(plan, store, copy_workers=workers)
+        assert store.read_bytes() == (tmp_path / "store1.bin").read_bytes()
+    base = results[1]
+    for workers in (3, 16):
+        assert results[workers].written == base.written
+        assert results[workers].record_digests == base.record_digests
+        assert results[workers].shards == base.shards
+
+
+def test_copy_workers_must_be_positive(env):
+    with pytest.raises(sb.K3StoreBuilderError, match="--copy-workers"):
+        env.build(env.tmp / "zero", 0, extra=("--copy-workers", "0"))
+    with pytest.raises(sb.K3StoreBuilderError, match="copy workers"):
+        sb.write_store(env.plan(), env.tmp / "direct.bin", copy_workers=0)
+
+
+def test_parallel_copy_raises_on_a_source_that_ends_early(env, tmp_path):
+    plan = env.plan()
+    shard = sorted({record.shard_file for record in plan.local_records})[0]
+    (env.ckpt / shard).write_bytes(b"")
+    with pytest.raises(sb.K3StoreBuilderError, match="ended|I/O error"):
+        sb.write_store(plan, tmp_path / "truncated.bin", copy_workers=4)
+
+
+def test_a_failing_copy_worker_publishes_nothing(env, monkeypatch):
+    output = env.tmp / "node0"
+    plan = env.plan()
+    doomed = sorted({record.shard_file for record in plan.local_records})[-1]
+    real_copy_span = sb._copy_span
+
+    def failing_copy_span(source, descriptor, record, view, source_path, store_path):
+        if record.shard_file == doomed:
+            raise sb.K3StoreBuilderError(
+                f"{source_path} ended 1 B early while reading {record.ckpt_name}"
+            )
+        return real_copy_span(
+            source, descriptor, record, view, source_path, store_path
+        )
+
+    monkeypatch.setattr(sb, "_copy_span", failing_copy_span)
+    with pytest.raises(sb.K3StoreBuilderError, match="ended 1 B early"):
+        env.build(output, 0)
+    assert sorted(path.name for path in output.iterdir()) == [sb.LOCK_FILE_NAME]
+
+
+# --------------------------------------------------------------------------- #
+#  Local store cache                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _cache_args(env):
+    return ("--local-cache-dir", str(env.tmp / "cache"))
+
+
+def test_build_populates_the_local_cache(env):
+    output = env.tmp / "node0"
+    plan = env.build(output, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    assert (slot / sb.STORE_FILE_NAME).read_bytes() == (
+        output / sb.STORE_FILE_NAME
+    ).read_bytes()
+    cached = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    published = json.loads((output / sb.MANIFEST_FILE_NAME).read_text())
+    assert cached == published
+    assert plan.store_bytes == cached["store"]["bytes"]
+
+
+def test_second_build_restores_from_cache_without_reading_sources(
+    env, monkeypatch
+):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+
+    def no_source_copy(*args, **kwargs):
+        raise AssertionError("restore must not copy from the checkpoint")
+
+    monkeypatch.setattr(sb, "write_store", no_source_copy)
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    assert (second / sb.METADATA_FILE_NAME).read_bytes() == (
+        first / sb.METADATA_FILE_NAME
+    ).read_bytes()
+    one = json.loads((first / sb.MANIFEST_FILE_NAME).read_text())
+    two = json.loads((second / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        two.pop(volatile)
+    assert one == two
+
+
+def test_a_foreign_fingerprint_in_the_cache_forces_a_rebuild(env):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    manifest["source"]["fingerprint"] = "0" * len(
+        manifest["source"]["fingerprint"]
+    )
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    calls = []
+    real_write_store = sb.write_store
+
+    def counting_write_store(*args, **kwargs):
+        calls.append(1)
+        return real_write_store(*args, **kwargs)
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(sb, "write_store", counting_write_store)
+        env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    assert calls, "a fingerprint mismatch must rebuild from the checkpoint"
+
+
+def test_a_corrupt_cached_store_is_discarded_and_rebuilt(env):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    with open(slot / sb.STORE_FILE_NAME, "r+b") as handle:
+        handle.seek(0)
+        first_byte = handle.read(1)
+        handle.seek(0)
+        handle.write(bytes([first_byte[0] ^ 0x01]))
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    # The corrupt slot was discarded and repopulated by the rebuild.
+    assert (slot / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+
+
+def test_an_unwritable_cache_only_warns(env):
+    cache = env.tmp / "cache"
+    cache.mkdir()
+    os.chmod(cache, 0o500)
+    try:
+        output = env.tmp / "node0"
+        env.build(output, 0, extra=("--local-cache-dir", str(cache)))
+        assert (output / sb.MANIFEST_FILE_NAME).exists()
+        assert not list(cache.iterdir())
+    finally:
+        os.chmod(cache, 0o700)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda m: m.__setitem__("store", None),
+        lambda m: m.__setitem__("source", "x"),
+        lambda m: m.__setitem__("builder", []),
+        lambda m: m["store"].__setitem__("segments", None),
+        lambda m: m["store"].__setitem__("segment_target_bytes", 1),
+    ],
+)
+def test_a_malformed_cached_manifest_falls_back_to_a_rebuild(env, damage):
+    first = env.tmp / "first"
+    env.build(first, 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    damage(manifest)
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    second = env.tmp / "second"
+    env.build(second, 0, extra=_cache_args(env))
+    assert (second / sb.STORE_FILE_NAME).read_bytes() == (
+        first / sb.STORE_FILE_NAME
+    ).read_bytes()
+    # The rebuild replaced the damaged slot with a usable one.
+    repaired = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    assert repaired["store"]["segments"] == json.loads(
+        (first / sb.MANIFEST_FILE_NAME).read_text()
+    )["store"]["segments"]
+
+
+def test_interrupted_cache_writes_are_swept(env):
+    cache = env.tmp / "cache"
+    residue = cache / f"node0-of{NUM_NODES}.tmp999999"
+    residue.mkdir(parents=True)
+    (residue / sb.STORE_FILE_NAME).write_bytes(b"partial")
+    env.build(env.tmp / "node0", 0, extra=_cache_args(env))
+    assert not residue.exists()
+    assert sorted(path.name for path in cache.iterdir()) == [
+        f"node0-of{NUM_NODES}"
+    ]
+
+
+def test_a_foreign_slot_is_replaced_by_the_rebuild(env):
+    env.build(env.tmp / "first", 0, extra=_cache_args(env))
+    slot = env.tmp / "cache" / f"node0-of{NUM_NODES}"
+    manifest = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    real = manifest["source"]["fingerprint"]
+    manifest["source"]["fingerprint"] = "f" * len(real)
+    (slot / sb.MANIFEST_FILE_NAME).write_text(json.dumps(manifest))
+    env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    refreshed = json.loads((slot / sb.MANIFEST_FILE_NAME).read_text())
+    assert refreshed["source"]["fingerprint"] == real
+
+
+def test_a_restored_store_is_reverified_by_reread(env, monkeypatch):
+    env.build(env.tmp / "first", 0, extra=_cache_args(env))
+    calls = []
+    real_verify = sb.verify_store
+
+    def counting_verify(*args, **kwargs):
+        calls.append(1)
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(sb, "verify_store", counting_verify)
+    monkeypatch.setattr(
+        sb, "write_store",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no source copy")),
+    )
+    env.build(env.tmp / "second", 0, extra=_cache_args(env))
+    assert calls == [1]
+
+
+# --------------------------------------------------------------------------- #
+#  Adaptive concurrency                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_controller_doubles_while_doubling_pays():
+    assert sb._next_worker_level([(4, 100.0)], 64) == (8, False)
+    assert sb._next_worker_level([(4, 100.0), (8, 190.0)], 64) == (16, False)
+
+
+def test_controller_settles_on_the_best_level_when_gain_stalls():
+    assert sb._next_worker_level([(4, 100.0), (8, 105.0)], 64) == (8, True)
+
+
+def test_controller_steps_back_when_doubling_loses():
+    assert sb._next_worker_level([(4, 100.0), (8, 160.0), (16, 90.0)], 64) == (
+        8,
+        True,
+    )
+
+
+def test_controller_stops_at_the_limit():
+    assert sb._next_worker_level([(4, 100.0), (8, 200.0)], 8) == (8, True)
+
+
+def _fast_adaptive(monkeypatch, start=1, cap=16):
+    monkeypatch.setattr(sb, "ADAPTIVE_START_WORKERS", start)
+    monkeypatch.setattr(sb, "ADAPTIVE_MAX_WORKERS", cap)
+    monkeypatch.setattr(sb, "ADAPTIVE_SETTLE_S", 0.02)
+    monkeypatch.setattr(sb, "ADAPTIVE_WINDOW_S", 0.15)
+    monkeypatch.setattr(sb.os, "cpu_count", lambda: 64)
+
+
+def test_adaptive_pool_grows_on_scalable_work(monkeypatch, caplog):
+    import time as _time
+
+    _fast_adaptive(monkeypatch)
+    peak = {"now": 0, "max": 0}
+    lock = __import__("threading").Lock()
+
+    def work(item, progress):
+        with lock:
+            peak["now"] += 1
+            peak["max"] = max(peak["max"], peak["now"])
+        _time.sleep(0.01)
+        progress(1 << 20)
+        with lock:
+            peak["now"] -= 1
+        return item * 2
+
+    caplog.set_level("INFO")
+    out = sb.parallel_map(list(range(600)), work, None, "probe")
+    assert out == [item * 2 for item in range(600)]
+    assert peak["max"] >= 2, "independent sleeps must grow past the start level"
+
+
+def test_adaptive_pool_holds_on_serialized_work(monkeypatch, caplog):
+    import threading as _threading
+    import time as _time
+
+    _fast_adaptive(monkeypatch, start=2, cap=64)
+    monkeypatch.setattr(sb, "ADAPTIVE_WINDOW_S", 0.4)
+    bottleneck = _threading.Lock()
+
+    def work(item, progress):
+        with bottleneck:
+            _time.sleep(0.004)
+        progress(1 << 20)
+        return item
+
+    caplog.set_level("INFO")
+    sb.parallel_map(list(range(1500)), work, None, "probe")
+    settled = [rec.message for rec in caplog.records if "settling at" in rec.message]
+    assert settled, "a bandwidth-bound workload must settle"
+    level = int(settled[-1].rsplit("settling at ", 1)[1])
+    # Noisy windows may buy a spurious doubling or two (the decision rule is
+    # pinned by the pure-function tests above); climbing all the way to the
+    # cap would mean the controller cannot see a flat throughput curve.
+    assert level < 64
+
+
+def test_adaptive_pool_raises_the_first_failure_in_item_order(monkeypatch):
+    _fast_adaptive(monkeypatch, start=4)
+
+    def work(item, progress):
+        if item in (7, 3):
+            raise ValueError(f"item {item}")
+        return item
+
+    with pytest.raises(ValueError, match="item 3"):
+        sb.parallel_map(list(range(20)), work, None, "probe")
+
+
+def test_small_chunks_split_shards_and_stay_byte_identical(env, monkeypatch):
+    serial = env.tmp / "serial"
+    env.build(serial, 0, extra=("--copy-workers", "1"))
+    plan = env.plan()
+    whole = len({record.shard_file for record in plan.local_records})
+    monkeypatch.setattr(sb, "COPY_CHUNK_BYTES", 1)
+    assert len(sb._copy_chunks(plan)) > whole
+    chunked = env.tmp / "chunked"
+    env.build(chunked, 0, extra=("--copy-workers", "auto"))
+    assert (chunked / sb.STORE_FILE_NAME).read_bytes() == (
+        serial / sb.STORE_FILE_NAME
+    ).read_bytes()
+    one = json.loads((serial / sb.MANIFEST_FILE_NAME).read_text())
+    two = json.loads((chunked / sb.MANIFEST_FILE_NAME).read_text())
+    for volatile in ("created_utc", "build_command"):
+        one.pop(volatile)
+        two.pop(volatile)
+    assert one == two
+
+
+def test_worker_flags_accept_auto_and_reject_garbage(env):
+    env.build(env.tmp / "auto", 0, extra=("--copy-workers", "auto", "--hash-workers", "auto"))
+    with pytest.raises(SystemExit):
+        env.build(env.tmp / "bad", 0, extra=("--copy-workers", "many"))
+    with pytest.raises(sb.K3StoreBuilderError, match="--hash-workers"):
+        env.build(env.tmp / "zero", 0, extra=("--hash-workers", "0"))
+
+
+def test_copy_chunks_interleave_shards(env, monkeypatch):
+    plan = env.plan()
+    shards = sorted({record.shard_file for record in plan.local_records})
+    monkeypatch.setattr(sb, "COPY_CHUNK_BYTES", 1)
+    chunks = sb._copy_chunks(plan)
+    assert [shard for shard, _ in chunks[: len(shards)]] == shards
+    # Every local record is copied exactly once, each chunk in source order.
+    rows = [record.row for _, records in chunks for record in records]
+    assert sorted(rows) == sorted(record.row for record in plan.local_records)
+    for _, records in chunks:
+        offsets = [record.source_offset for record in records]
+        assert offsets == sorted(offsets)
+
+
+def test_the_exported_fixed_hash_worker_count_stays_an_int():
+    # The server's staging copy sizes its own pool from this constant; only
+    # the builder CLI defaults to adaptive.
+    assert isinstance(sb.DEFAULT_HASH_WORKERS, int) and sb.DEFAULT_HASH_WORKERS > 0
+    assert sb.DEFAULT_COPY_WORKERS is None and sb.DEFAULT_VERIFY_WORKERS is None
+
+
+@pytest.mark.parametrize("buffer_bytes", [1, 3, 7, 64, 1 << 20])
+def test_run_reads_hash_each_span_exactly_like_per_span_reads(tmp_path, buffer_bytes):
+    import random as _random
+
+    rng = _random.Random(7)
+    data = bytes(rng.randrange(256) for _ in range(4096))
+    path = tmp_path / "blob.bin"
+    path.write_bytes(data)
+    # Contiguous runs with zero-length tensors, a gap, and a run that
+    # crosses many buffer boundaries.
+    spans = [
+        (0, 0, 10), (1, 10, 0), (2, 10, 33), (3, 43, 0), (4, 43, 0),
+        (5, 43, 100), (6, 200, 17), (7, 217, 1000), (8, 1217, 0),
+        (9, 3000, 1096),
+    ]
+    sink_path = tmp_path / "sink.bin"
+    descriptor = os.open(path, os.O_RDONLY)
+    sink = os.open(sink_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.ftruncate(sink, len(data))
+    seen = []
+    try:
+        got = sb._read_span_digests(
+            descriptor, spans, buffer_bytes, sink, progress=seen.append
+        )
+    finally:
+        os.close(descriptor)
+        os.close(sink)
+    expected = []
+    for _, offset, size in spans:
+        hasher = sb._digest()
+        hasher.update(data[offset: offset + size])
+        expected.append(hasher.digest())
+    assert got == expected
+    assert seen == [size for _, _, size in spans]
+    copied = sink_path.read_bytes()
+    for _, offset, size in spans:
+        assert copied[offset: offset + size] == data[offset: offset + size]
+
+
+def test_run_read_of_a_truncated_store_names_the_row(tmp_path):
+    path = tmp_path / "short.bin"
+    path.write_bytes(b"x" * 50)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(EOFError, match="metadata row 2"):
+            sb._read_span_digests(descriptor, [(1, 0, 40), (2, 40, 40)], 16)
+    finally:
+        os.close(descriptor)

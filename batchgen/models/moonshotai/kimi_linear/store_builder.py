@@ -71,7 +71,10 @@ the spans sum to both ``total_byte_size`` and the file length. The copy pass
 hashes every tensor (BLAKE2b-128) as it streams; a verification pass then
 re-reads ``store.bin`` and requires every tensor's bytes to hash to what was
 read from the source, so a corrupted or concurrently modified store never
-publishes.
+publishes. A store restored from ``--local-cache-dir`` is hashed as it is
+copied, must reproduce every segment digest of the cached manifest (which is
+only an integrity reference and never republished), and then passes the same
+re-read verification as a fresh copy.
 
 Publication
 -----------
@@ -105,6 +108,8 @@ import shlex
 import shutil
 import stat
 import tempfile
+import threading
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -178,9 +183,35 @@ H200_RAIL_DEVICES = tuple(f"mlx5_bond_{index}:1" for index in range(8))
 #: is ever assembled in memory.
 DEFAULT_READ_BUFFER_BYTES = 64 * 1024 * 1024
 
-#: Threads for the verification re-read. ``hashlib`` releases the GIL while
-#: hashing large buffers, so segments hash in parallel.
+#: Fixed thread count for callers outside the builder CLI that hash store
+#: segments on their own pool (the server's staging copy imports it).
 DEFAULT_HASH_WORKERS = 8
+
+#: Builder thread counts for the copy and the verification re-read. Reads,
+#: hashing and ``os.pwrite`` all release the GIL, so work items run in
+#: parallel. ``None`` means adaptive: the right count depends on the storage
+#: (a network filesystem saturates at some number of concurrent streams and
+#: can degrade past it; a local NVMe or tmpfs is bound by cores and the write
+#: path), so it is measured at run time instead of fixed. Memory stays
+#: bounded at one read buffer per thread.
+DEFAULT_COPY_WORKERS: Optional[int] = None
+DEFAULT_VERIFY_WORKERS: Optional[int] = None
+
+#: Copy work item size. Each item is one contiguous run of a shard's spans in
+#: source order, read through its own file descriptor, so access stays
+#: sequential inside an item while parallelism is not capped by the number
+#: of source files.
+COPY_CHUNK_BYTES = 1 << 30
+
+#: Adaptive concurrency. Start at ADAPTIVE_START_WORKERS, measure throughput
+#: for ADAPTIVE_WINDOW_S after ADAPTIVE_SETTLE_S at each level, double while
+#: a doubling still gains at least ADAPTIVE_MIN_GAIN, then hold at the best
+#: measured level (stepping back if the last doubling lost throughput).
+ADAPTIVE_START_WORKERS = 4
+ADAPTIVE_MAX_WORKERS = 64
+ADAPTIVE_SETTLE_S = 2.0
+ADAPTIVE_WINDOW_S = 8.0
+ADAPTIVE_MIN_GAIN = 0.10
 
 #: First line of ``metadata.tsv``. The reader skips any row whose first field
 #: is ``H`` (``Weights_Storage.cpp:379-381``).
@@ -983,28 +1014,281 @@ class CopyResult:
     shards: List[Dict[str, Any]]
 
 
-def write_store(
-    plan: StorePlan,
-    store_path: Path,
-    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-) -> CopyResult:
-    """Copy this node's spans into a NEW ``store_path``, hashing each tensor.
+def _next_worker_level(
+    history: Sequence[Tuple[int, float]], limit: int
+) -> Tuple[int, bool]:
+    """Hill-climbing step: ``history`` is ``(workers, bytes_per_s)`` per level.
 
-    Each source ``.bin`` is opened once and read forward, so the copy is
-    sequential on the source side and O(1) in memory.
+    Returns ``(next_level, settled)``. Doubles while the latest doubling
+    gained at least :data:`ADAPTIVE_MIN_GAIN`; otherwise settles on the best
+    measured level, which steps back when the latest doubling lost throughput.
     """
-    if read_buffer_bytes <= 0:
-        raise K3StoreBuilderError("read buffer must be a positive size")
+    level, rate = history[-1]
+    grew = len(history) == 1 or rate >= history[-2][1] * (1 + ADAPTIVE_MIN_GAIN)
+    if grew and level < limit:
+        return min(level * 2, limit), False
+    best_level, _ = max(history, key=lambda entry: (entry[1], -entry[0]))
+    return best_level, True
+
+
+class _Gate:
+    """A semaphore whose capacity the controller can raise or lower."""
+
+    def __init__(self, level: int) -> None:
+        self._condition = threading.Condition()
+        self._level = level
+        self._active = 0
+
+    def set_level(self, level: int) -> None:
+        with self._condition:
+            self._level = level
+            self._condition.notify_all()
+
+    def __enter__(self) -> "_Gate":
+        with self._condition:
+            while self._active >= self._level:
+                self._condition.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+
+def parallel_map(
+    items: Sequence[Any],
+    work: Any,
+    workers: Optional[int],
+    label: str,
+) -> List[Any]:
+    """``[work(item, progress) for item in items]`` on parallel threads.
+
+    ``work`` reports bytes processed through ``progress(nbytes)``. With an
+    explicit ``workers`` count the pool is fixed; with ``None`` the count is
+    found at run time by :func:`_next_worker_level`, so the same code
+    saturates a network filesystem, a local NVMe or a tmpfs re-read without
+    knowing which it is. Results keep item order; the first failing item (in
+    item order) re-raises after every thread stopped. Threads that never
+    pass the gate never run ``work``, so per-thread buffers are bounded by
+    the highest level the controller reached.
+    """
+    count = len(items)
+    if count == 0:
+        return []
+    if workers is not None:
+        size = max(1, min(workers, count))
+        with ThreadPoolExecutor(max_workers=size) as pool:
+            return list(pool.map(lambda item: work(item, _no_progress), items))
+
+    limit = max(1, min(ADAPTIVE_MAX_WORKERS, os.cpu_count() or 1, count))
+    level = min(ADAPTIVE_START_WORKERS, limit)
+    gate = _Gate(level)
+    lock = threading.Lock()
+    state = {"next": 0, "bytes": 0}
+    results: List[Any] = [None] * count
+    errors: Dict[int, BaseException] = {}
+    stop = threading.Event()
+
+    def progress(nbytes: int) -> None:
+        with lock:
+            state["bytes"] += nbytes
+
+    def run() -> None:
+        while not stop.is_set():
+            with gate:
+                if stop.is_set():
+                    return
+                with lock:
+                    index = state["next"]
+                    state["next"] += 1
+                if index >= count:
+                    return
+                try:
+                    results[index] = work(items[index], progress)
+                except BaseException as error:  # re-raised by the caller
+                    errors[index] = error
+                    stop.set()
+                    return
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(limit)]
+    for thread in threads:
+        thread.start()
+
+    def wait(seconds: float) -> bool:
+        """Sleep up to ``seconds``; False once every thread has finished."""
+        deadline = time.monotonic() + seconds
+        while True:
+            live = [thread for thread in threads if thread.is_alive()]
+            if not live:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            live[0].join(min(remaining, 0.25))
+
+    history: List[Tuple[int, float]] = []
+    settled = False
+    try:
+        while not settled and not stop.is_set():
+            if not wait(ADAPTIVE_SETTLE_S):
+                break
+            with lock:
+                start_bytes = state["bytes"]
+            start = time.monotonic()
+            if not wait(ADAPTIVE_WINDOW_S):
+                break
+            with lock:
+                window_bytes = state["bytes"] - start_bytes
+            if window_bytes == 0:
+                # No item reported progress: no information about this
+                # level yet, so measure it again rather than score it 0.
+                continue
+            rate = window_bytes / max(time.monotonic() - start, 1e-9)
+            history.append((level, rate))
+            new_level, settled = _next_worker_level(history, limit)
+            logger.info(
+                "%s: %d workers -> %.2f GiB/s%s",
+                label,
+                level,
+                rate / float(1 << 30),
+                f"; settling at {new_level}" if settled
+                else f"; trying {new_level}",
+            )
+            if new_level != level:
+                level = new_level
+                gate.set_level(level)
+        for thread in threads:
+            thread.join()
+    except BaseException:
+        # Interrupted (e.g. KeyboardInterrupt): stop admitting work and let
+        # in-flight items finish, so the caller's cleanup never closes a
+        # descriptor or removes a directory under a live worker.
+        stop.set()
+        for thread in threads:
+            thread.join()
+        raise
+    if errors:
+        raise errors[min(errors)]
+    return results
+
+
+def _worker_count(value: str) -> Optional[int]:
+    """argparse type for a thread count: ``auto`` or an integer."""
+    if value == "auto":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected 'auto' or an integer, got {value!r}"
+        ) from None
+
+
+def _no_progress(nbytes: int) -> None:
+    del nbytes
+
+
+def _shard_entries(
+    plan: StorePlan, digests: Mapping[int, bytes]
+) -> List[Dict[str, Any]]:
+    """The manifest's per-source-shard entries, in sorted shard order.
+
+    ``digests`` maps every local record's row to its tensor digest, so the
+    entries are identical whether the digests came from a source copy or
+    from re-hashing a restored store.
+    """
     by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
     for record in plan.local_records:
         by_shard[record.shard_file].append(record)
     sidecars = {shard.file_name: shard for shard in plan.shards}
+    entries: List[Dict[str, Any]] = []
+    for shard_file in sorted(by_shard):
+        records = sorted(
+            by_shard[shard_file], key=lambda record: record.source_offset
+        )
+        sidecar = sidecars.get(shard_file)
+        entries.append(
+            {
+                "sidecar": sidecar.json_name if sidecar else None,
+                "file": shard_file,
+                "file_bytes": sidecar.file_bytes if sidecar else None,
+                "sidecar_digest": sidecar.sidecar_digest if sidecar else None,
+                "tensors_copied": len(records),
+                "bytes_copied": sum(record.byte_size for record in records),
+                "copied_digest": _rollup(
+                    digests[record.row] for record in records
+                ),
+            }
+        )
+    return entries
 
-    buffer = bytearray(read_buffer_bytes)
-    view = memoryview(buffer)
-    written = 0
-    digests: Dict[int, bytes] = {}
-    shard_entries: List[Dict[str, Any]] = []
+
+def _copy_chunks(plan: StorePlan) -> List[Tuple[str, List[TensorRecord]]]:
+    """This node's spans as copy work items.
+
+    Each item is a contiguous run of one shard's spans in source order of at
+    most :data:`COPY_CHUNK_BYTES` (a single larger tensor is its own item).
+    Items are interleaved across shards -- first chunk of every shard, then
+    every second chunk, ... -- so concurrent workers read different files
+    whenever there are at least as many files as workers, and only split a
+    file when there are few of them.
+    """
+    by_shard: Dict[str, List[TensorRecord]] = defaultdict(list)
+    for record in plan.local_records:
+        by_shard[record.shard_file].append(record)
+    per_shard: List[List[Tuple[str, List[TensorRecord]]]] = []
+    for shard_file in sorted(by_shard):
+        runs: List[Tuple[str, List[TensorRecord]]] = []
+        current: List[TensorRecord] = []
+        size = 0
+        for record in sorted(
+            by_shard[shard_file], key=lambda record: record.source_offset
+        ):
+            if current and size + record.byte_size > COPY_CHUNK_BYTES:
+                runs.append((shard_file, current))
+                current, size = [], 0
+            current.append(record)
+            size += record.byte_size
+        if current:
+            runs.append((shard_file, current))
+        per_shard.append(runs)
+    chunks: List[Tuple[str, List[TensorRecord]]] = []
+    for depth in range(max((len(runs) for runs in per_shard), default=0)):
+        chunks.extend(runs[depth] for runs in per_shard if depth < len(runs))
+    return chunks
+
+
+def _check_workers(workers: Optional[int], what: str) -> None:
+    if workers is not None and workers <= 0:
+        raise K3StoreBuilderError(f"{what} workers must be positive")
+
+
+def write_store(
+    plan: StorePlan,
+    store_path: Path,
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
+) -> CopyResult:
+    """Copy this node's spans into a NEW ``store_path``, hashing each tensor.
+
+    The spans are split into contiguous per-shard work items
+    (:func:`_copy_chunks`) that run on parallel threads -- ``copy_workers``
+    of them, or an adaptively measured count when ``None``. Each item opens
+    its shard and reads forward; every tensor lands at its ``compact_offset``
+    via ``os.pwrite``, and memory stays bounded at one read buffer per
+    thread. The result is byte-identical for any worker count: offsets are
+    disjoint by construction and the per-shard manifest entries are assembled
+    in sorted shard order after every copy finished.
+    """
+    if read_buffer_bytes <= 0:
+        raise K3StoreBuilderError("read buffer must be a positive size")
+    _check_workers(copy_workers, "copy")
+
+    progress_lock = threading.Lock()
+    progress_bytes = 0
+
     try:
         descriptor = os.open(
             store_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644
@@ -1018,43 +1302,54 @@ def write_store(
             raise K3StoreBuilderError(
                 f"cannot size {store_path} to {plan.store_bytes} B: {error}"
             ) from error
-        for shard_file in sorted(by_shard):
+
+        thread_state = threading.local()
+
+        def copy_chunk(
+            chunk: Tuple[str, List[TensorRecord]], progress: Any
+        ) -> Tuple[Dict[int, bytes], int]:
+            nonlocal progress_bytes
+            shard_file, records = chunk
             source_path = plan.converted_ckpt / shard_file
-            records = sorted(
-                by_shard[shard_file], key=lambda record: record.source_offset
-            )
+            view = getattr(thread_state, "view", None)
+            if view is None:
+                view = memoryview(bytearray(read_buffer_bytes))
+                thread_state.view = view
             try:
                 source = open(source_path, "rb", buffering=0)
             except OSError as error:
                 raise K3StoreBuilderError(
                     f"cannot open {source_path}: {error}"
                 ) from error
+            chunk_digests: Dict[int, bytes] = {}
             copied = 0
             with source:
                 for record in records:
-                    digests[record.row] = _copy_span(
+                    chunk_digests[record.row] = _copy_span(
                         source, descriptor, record, view, source_path, store_path
                     )
                     copied += record.byte_size
+                    progress(record.byte_size)
+            with progress_lock:
+                progress_bytes += copied
+                logger.info(
+                    "copied %s (%d tensors, %.2f GiB cumulative)",
+                    shard_file,
+                    len(records),
+                    progress_bytes / float(1 << 30),
+                )
+            return chunk_digests, copied
+
+        results = parallel_map(
+            _copy_chunks(plan), copy_chunk, copy_workers, "store copy"
+        )
+
+        written = 0
+        digests: Dict[int, bytes] = {}
+        for shard_digests, copied in results:
+            digests.update(shard_digests)
             written += copied
-            sidecar = sidecars.get(shard_file)
-            shard_entries.append(
-                {
-                    "sidecar": sidecar.json_name if sidecar else None,
-                    "file": shard_file,
-                    "file_bytes": sidecar.file_bytes if sidecar else None,
-                    "sidecar_digest": sidecar.sidecar_digest if sidecar else None,
-                    "tensors_copied": len(records),
-                    "bytes_copied": copied,
-                    "copied_digest": _rollup(digests[record.row] for record in records),
-                }
-            )
-            logger.info(
-                "copied %s (%d tensors, %.2f GiB cumulative)",
-                shard_file,
-                len(records),
-                written / float(1 << 30),
-            )
+        shard_entries = _shard_entries(plan, digests)
         try:
             os.fsync(descriptor)
         except OSError as error:
@@ -1163,33 +1458,94 @@ def _read_span_digests(
     spans: Sequence[Span],
     read_buffer_bytes: int,
     sink: Optional[int] = None,
+    progress: Any = None,
 ) -> List[bytes]:
     """Per-tensor digests of ``spans`` read from ``descriptor``.
 
     With ``sink``, every chunk is also written to that descriptor at the same
-    offset, so a copy is hashed from exactly the bytes it wrote.
+    offset, so a copy is hashed from exactly the bytes it wrote. Reads land
+    in a reused per-thread buffer (``os.preadv``) rather than a fresh bytes
+    object per chunk, which would add an allocation and a copy to every
+    read on a path that can be bound by memory bandwidth.
     """
-    out = []
-    for row, offset, byte_size in spans:
-        hasher = _digest()
-        position, end = offset, offset + byte_size
-        while position < end:
-            chunk = os.pread(
-                descriptor, min(end - position, read_buffer_bytes), position
-            )
-            if not chunk:
-                raise EOFError(
-                    f"store ends at {position} B inside metadata row {row}"
-                )
-            hasher.update(chunk)
-            if sink is not None:
-                view = memoryview(chunk)
-                written = 0
-                while written < len(chunk):
-                    written += os.pwrite(sink, view[written:], position + written)
-            position += len(chunk)
-        out.append(hasher.digest())
+    buffer = getattr(_READ_BUFFERS, "view", None)
+    if buffer is None or len(buffer) < read_buffer_bytes:
+        buffer = memoryview(bytearray(read_buffer_bytes))
+        _READ_BUFFERS.view = buffer
+    out: List[bytes] = []
+    start = 0
+    while start < len(spans):
+        # Back-to-back spans (the store layout has no padding) are read as
+        # one run in full-buffer chunks, so small tensors do not each cost a
+        # read; every tensor is still hashed over exactly its own bytes.
+        stop = start + 1
+        while stop < len(spans) and spans[stop][1] == (
+            spans[stop - 1][1] + spans[stop - 1][2]
+        ):
+            stop += 1
+        _read_run_digests(
+            descriptor, spans[start:stop], buffer[:read_buffer_bytes], sink,
+            progress, out,
+        )
+        start = stop
     return out
+
+
+def _read_run_digests(
+    descriptor: int,
+    run: Sequence[Span],
+    buffer: memoryview,
+    sink: Optional[int],
+    progress: Any,
+    out: List[bytes],
+) -> None:
+    """Append the digests of contiguous ``run`` to ``out``."""
+    index = 0
+    hasher = _digest()
+    remaining = run[0][2]
+
+    def finish_empty_tensors() -> None:
+        nonlocal index, hasher, remaining
+        while remaining == 0 and index < len(run):
+            out.append(hasher.digest())
+            if progress is not None:
+                progress(run[index][2])
+            index += 1
+            if index < len(run):
+                hasher = _digest()
+                remaining = run[index][2]
+
+    finish_empty_tensors()
+    position = run[0][1]
+    end = run[-1][1] + run[-1][2]
+    while position < end:
+        got = os.preadv(
+            descriptor, [buffer[: min(end - position, len(buffer))]], position
+        )
+        if not got:
+            raise EOFError(
+                f"store ends at {position} B inside metadata row "
+                f"{run[index][0]}"
+            )
+        chunk = buffer[:got]
+        if sink is not None:
+            written = 0
+            while written < got:
+                written += os.pwrite(sink, chunk[written:], position + written)
+        consumed = 0
+        while consumed < got:
+            take = min(remaining, got - consumed)
+            if take == 0:  # unreachable: the run's sizes sum to its length
+                raise AssertionError("contiguous run outgrew its spans")
+            hasher.update(chunk[consumed: consumed + take])
+            consumed += take
+            remaining -= take
+            finish_empty_tensors()
+        position += got
+
+
+#: Per-thread read buffers of :func:`_read_span_digests`.
+_READ_BUFFERS = threading.local()
 
 
 def hash_store_segment(
@@ -1197,14 +1553,19 @@ def hash_store_segment(
     spans: Sequence[Span],
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
     sink: Optional[int] = None,
+    progress: Any = None,
 ) -> str:
     """One manifest segment's digest: the rollup of its tensors' digests.
 
     ``spans`` are the segment's spans from :func:`manifest_segment_spans`.
     With ``sink``, the segment is also copied into that descriptor at the
-    same offsets. Raises ``OSError`` or ``EOFError``.
+    same offsets; ``progress(nbytes)`` is reported per tensor when given
+    (the :func:`parallel_map` adaptive runner feeds on it). Raises
+    ``OSError`` or ``EOFError``.
     """
-    return _rollup(_read_span_digests(descriptor, spans, read_buffer_bytes, sink))
+    return _rollup(
+        _read_span_digests(descriptor, spans, read_buffer_bytes, sink, progress)
+    )
 
 
 def verify_store(
@@ -1212,7 +1573,7 @@ def verify_store(
     store_path: Path,
     copy: CopyResult,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    hash_workers: int = DEFAULT_HASH_WORKERS,
+    hash_workers: Optional[int] = DEFAULT_VERIFY_WORKERS,
 ) -> List[Dict[str, Any]]:
     """Re-read ``store_path`` and require every tensor's source bytes.
 
@@ -1224,13 +1585,16 @@ def verify_store(
         for record in sorted(plan.local_records, key=lambda item: item.compact_offset)
     ]
     segments = segment_spans(spans)
+    _check_workers(hash_workers, "hash")
     try:
         descriptor = os.open(store_path, os.O_RDONLY)
     except OSError as error:
         raise K3StoreBuilderError(f"cannot reopen {store_path}: {error}") from error
 
-    def check(segment: List[Span]) -> str:
-        digests = _read_span_digests(descriptor, segment, read_buffer_bytes)
+    def check(segment: List[Span], progress: Any) -> str:
+        digests = _read_span_digests(
+            descriptor, segment, read_buffer_bytes, progress=progress
+        )
         for (row, offset, byte_size), digest in zip(segment, digests):
             if copy.record_digests.get(row) != digest:
                 record = plan.records[row]
@@ -1243,8 +1607,7 @@ def verify_store(
         return _rollup(digests)
 
     try:
-        with ThreadPoolExecutor(max_workers=hash_workers) as pool:
-            rollups = list(pool.map(check, segments))
+        rollups = parallel_map(segments, check, hash_workers, "store verify")
     except (OSError, EOFError) as error:
         raise K3StoreBuilderError(
             f"cannot re-read {store_path} for verification: {error}"
@@ -1260,6 +1623,259 @@ def verify_store(
         }
         for segment, digest in zip(segments, rollups)
     ]
+
+
+# --------------------------------------------------------------------------- #
+#  6b. Local store cache: restore a built store from the node's local SSD     #
+# --------------------------------------------------------------------------- #
+
+
+def _cache_slot(local_cache_dir: Path, plan: StorePlan) -> Path:
+    """One slot per node identity; a new fingerprint replaces the old one."""
+    return local_cache_dir / f"node{plan.node_rank}-of{plan.num_nodes}"
+
+
+def _cache_matches(manifest: Any, plan: StorePlan, fingerprint: str) -> bool:
+    """Whether a cached manifest describes this exact build.
+
+    Any malformed manifest is a mismatch, never an exception: the cache is a
+    shortcut, and a damaged one must fall back to a rebuild.
+    """
+    if not isinstance(manifest, dict):
+        return False
+    store = manifest.get("store")
+    source = manifest.get("source")
+    builder = manifest.get("builder")
+    if not (
+        isinstance(store, dict)
+        and isinstance(source, dict)
+        and isinstance(builder, dict)
+        and isinstance(store.get("segments"), list)
+    ):
+        return False
+    return (
+        manifest.get("format") == MANIFEST_FORMAT
+        and manifest.get("complete") is True
+        and manifest.get("hash_algorithm") == HASH_ALGORITHM
+        and manifest.get("node_rank") == plan.node_rank
+        and manifest.get("num_nodes") == plan.num_nodes
+        and builder.get("version") == STORE_BUILDER_VERSION
+        and source.get("fingerprint") == fingerprint
+        and store.get("bytes") == plan.store_bytes
+        and store.get("segment_target_bytes") == SEGMENT_TARGET_BYTES
+    )
+
+
+def _sweep_cache_residue(slot: Path) -> None:
+    """Remove temporary slots left by interrupted cache writes."""
+    for residue in slot.parent.glob(f"{slot.name}.tmp*"):
+        shutil.rmtree(residue, ignore_errors=True)
+
+
+def _plan_segments(plan: StorePlan) -> List[List[Span]]:
+    spans = [
+        (record.row, record.compact_offset, record.byte_size)
+        for record in sorted(
+            plan.local_records, key=lambda item: item.compact_offset
+        )
+    ]
+    return segment_spans(spans)
+
+
+def _copy_and_hash_segments(
+    source: int,
+    segments: List[List[Span]],
+    read_buffer_bytes: int,
+    copy_workers: Optional[int],
+    sink: Optional[int] = None,
+    label: str = "store restore",
+) -> List[List[bytes]]:
+    """Per-tensor digests of every segment, optionally copying into ``sink``."""
+
+    def one(segment: List[Span], progress: Any) -> List[bytes]:
+        return _read_span_digests(
+            source, segment, read_buffer_bytes, sink, progress
+        )
+
+    return parallel_map(segments, one, copy_workers, label)
+
+
+def _segment_entries(
+    segments: List[List[Span]], digest_lists: List[List[bytes]]
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "offset": segment[0][1],
+            "bytes": sum(span[2] for span in segment),
+            "tensors": len(segment),
+            "digest": _rollup(digests),
+        }
+        for segment, digests in zip(segments, digest_lists)
+    ]
+
+
+def restore_store_from_cache(
+    plan: StorePlan,
+    local_cache_dir: Path,
+    fingerprint: str,
+    store_path: Path,
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
+) -> Optional[Tuple[CopyResult, List[Dict[str, Any]]]]:
+    """Copy a cached store into ``store_path``, hashing every tensor.
+
+    Returns the equivalent of a source copy plus the verified manifest
+    segment entries, or ``None`` when there is no cache for this exact
+    checkpoint/node identity or the cached bytes fail verification (the
+    caller then rebuilds from the checkpoint). The copy and the verification
+    are one pass: each tensor is hashed from exactly the bytes written.
+    """
+    slot = _cache_slot(local_cache_dir, plan)
+    try:
+        manifest = json.loads((slot / MANIFEST_FILE_NAME).read_text())
+    except (OSError, ValueError):
+        logger.info("no usable local store cache at %s", slot)
+        return None
+    if not _cache_matches(manifest, plan, fingerprint):
+        logger.info(
+            "local store cache at %s is for a different checkpoint or "
+            "topology; rebuilding from the checkpoint",
+            slot,
+        )
+        return None
+    segments = _plan_segments(plan)
+    try:
+        source = os.open(slot / STORE_FILE_NAME, os.O_RDONLY)
+    except OSError as error:
+        logger.error("local store cache at %s is unreadable: %s", slot, error)
+        return None
+    created = False
+    try:
+        destination = os.open(
+            store_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644
+        )
+        created = True
+        try:
+            os.ftruncate(destination, plan.store_bytes)
+            digest_lists = _copy_and_hash_segments(
+                source, segments, read_buffer_bytes, copy_workers, destination
+            )
+            os.fsync(destination)
+        finally:
+            os.close(destination)
+    except (OSError, EOFError) as error:
+        logger.error(
+            "restore from the local store cache %s failed (%s); rebuilding "
+            "from the checkpoint",
+            slot,
+            error,
+        )
+        if created:
+            with contextlib.suppress(OSError):
+                os.unlink(store_path)
+        return None
+    finally:
+        os.close(source)
+    entries = _segment_entries(segments, digest_lists)
+    if entries != manifest["store"]["segments"]:
+        logger.error(
+            "local store cache at %s does not hash to its manifest; "
+            "discarding it and rebuilding from the checkpoint",
+            slot,
+        )
+        shutil.rmtree(slot, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(store_path)
+        return None
+    digests = {
+        span[0]: digest
+        for segment, digest_list in zip(segments, digest_lists)
+        for span, digest in zip(segment, digest_list)
+    }
+    written = sum(span[2] for segment in segments for span in segment)
+    logger.info(
+        "restored store.bin from the local cache %s (%d segments verified)",
+        slot,
+        len(entries),
+    )
+    copy = CopyResult(
+        written=written,
+        record_digests=digests,
+        shards=_shard_entries(plan, digests),
+    )
+    return copy, entries
+
+
+def populate_store_cache(
+    plan: StorePlan,
+    local_cache_dir: Path,
+    output_dir: Path,
+    manifest: Mapping[str, Any],
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: Optional[int] = DEFAULT_COPY_WORKERS,
+) -> None:
+    """Copy the just-published store set into the local cache slot.
+
+    Best effort: a failure only logs a warning, because the published build
+    is already complete and later cold starts can still read the checkpoint.
+    The cached manifest is written last as the slot's commit point, and the
+    copy is hashed against the manifest before the slot is swapped in.
+
+    This runs only after a build that did not restore, so whatever the slot
+    holds is stale (missing, foreign or corrupt) and is evicted BEFORE the
+    copy: the cache never needs room for two stores. Temporary slots of
+    interrupted writes are swept first. Concurrent builders of one node are
+    not coordinated here; the manifest commit point plus full verification
+    on restore keep any race from publishing wrong bytes.
+    """
+    slot = _cache_slot(local_cache_dir, plan)
+    staging = Path(f"{slot}.tmp{os.getpid()}")
+    try:
+        local_cache_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_cache_residue(slot)
+        shutil.rmtree(slot, ignore_errors=True)
+        staging.mkdir()
+        segments = _plan_segments(plan)
+        source = os.open(output_dir / STORE_FILE_NAME, os.O_RDONLY)
+        try:
+            destination = os.open(
+                staging / STORE_FILE_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o644,
+            )
+            try:
+                os.ftruncate(destination, plan.store_bytes)
+                digest_lists = _copy_and_hash_segments(
+                    source, segments, read_buffer_bytes, copy_workers,
+                    destination, "store cache write",
+                )
+                os.fsync(destination)
+            finally:
+                os.close(destination)
+        finally:
+            os.close(source)
+        if _segment_entries(segments, digest_lists) != manifest["store"][
+            "segments"
+        ]:
+            raise K3StoreBuilderError(
+                "the cache copy does not hash to the manifest"
+            )
+        _write_new_file(
+            staging / MANIFEST_FILE_NAME,
+            (json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
+            .encode(),
+        )
+        os.replace(staging, slot)
+        _fsync_directory(local_cache_dir)
+        logger.info("cached the published store at %s", slot)
+    except (OSError, EOFError, KeyError, K3StoreBuilderError) as error:
+        logger.warning(
+            "could not cache the store at %s: %s (cold starts keep reading "
+            "the checkpoint)",
+            slot,
+            error,
+        )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2004,7 +2620,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--read-buffer-bytes", type=int, default=DEFAULT_READ_BUFFER_BYTES
     )
     parser.add_argument(
-        "--hash-workers", type=int, default=DEFAULT_HASH_WORKERS
+        "--hash-workers", type=_worker_count, default=DEFAULT_VERIFY_WORKERS,
+        help=(
+            "Threads for the verification re-read: 'auto' (default) measures "
+            "the count that saturates the storage, or a fixed positive count."
+        ),
+    )
+    parser.add_argument(
+        "--copy-workers", type=_worker_count, default=DEFAULT_COPY_WORKERS,
+        help=(
+            "Threads for the copy (from the checkpoint or the local cache): "
+            "'auto' (default) measures the count that saturates the storage, "
+            "or a fixed positive count; 1 restores the serial copy."
+        ),
+    )
+    parser.add_argument(
+        "--local-cache-dir",
+        default=None,
+        help=(
+            "Local-disk directory caching the published store set per node. "
+            "A build whose checkpoint fingerprint and node identity match "
+            "the cache restores from it instead of reading the checkpoint; "
+            "a fresh build repopulates it. Off when omitted."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -2056,8 +2694,10 @@ def build(
         )
     if args.read_buffer_bytes <= 0:
         raise K3StoreBuilderError("--read-buffer-bytes must be positive")
-    if args.hash_workers <= 0:
-        raise K3StoreBuilderError("--hash-workers must be positive")
+    if args.hash_workers is not None and args.hash_workers <= 0:
+        raise K3StoreBuilderError("--hash-workers must be positive or 'auto'")
+    if args.copy_workers is not None and args.copy_workers <= 0:
+        raise K3StoreBuilderError("--copy-workers must be positive or 'auto'")
     if not os.path.isabs(args.store_staging_dir):
         raise K3StoreBuilderError(
             f"--store-staging-dir must be an absolute path; got "
@@ -2147,10 +2787,32 @@ def build(
             staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=output_dir))
             try:
                 store_path = staging / STORE_FILE_NAME
-                copy = write_store(plan, store_path, args.read_buffer_bytes)
+                local_cache_dir = (
+                    Path(os.path.abspath(args.local_cache_dir))
+                    if args.local_cache_dir
+                    else None
+                )
+                restored = None
+                if local_cache_dir is not None:
+                    restored = restore_store_from_cache(
+                        plan,
+                        local_cache_dir,
+                        fingerprint,
+                        store_path,
+                        args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
+                if restored is None:
+                    copy = write_store(
+                        plan, store_path, args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
+                else:
+                    copy, _ = restored
                 self_check(plan, store_path, copy.written)
                 segments = verify_store(
-                    plan, store_path, copy, args.read_buffer_bytes, args.hash_workers
+                    plan, store_path, copy, args.read_buffer_bytes,
+                    args.hash_workers,
                 )
                 manifest = build_manifest(
                     plan,
@@ -2171,6 +2833,15 @@ def build(
                     (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
                 )
                 _publish(staging, output_dir, config_name)
+                if local_cache_dir is not None and restored is None:
+                    populate_store_cache(
+                        plan,
+                        local_cache_dir,
+                        output_dir,
+                        manifest,
+                        args.read_buffer_bytes,
+                        args.copy_workers,
+                    )
             finally:
                 # After a successful publish only the empty directory is left;
                 # after a failure, everything not yet published goes with it.

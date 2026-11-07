@@ -218,6 +218,20 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   completion manifest `store_manifest.json`. An interrupted build leaves no manifest; `--dry-run`
   writes nothing.
 
+  The copy and the verification run on parallel threads. By default (`--copy-workers auto`,
+  `--hash-workers auto`) the builder measures throughput as it adds threads and settles on the
+  count that saturates the storage it is reading from, so a network filesystem and a local disk
+  each get a suitable level; the log names every level tried and the one chosen. Pass a number
+  to fix the count (`1` is a serial copy). The output is identical for any count.
+
+  For repeated cold starts on the same node (for example while debugging), add
+  `--local-cache-dir <dir on a local disk>`. After a fresh build the builder copies the published
+  store into a per-node slot there; a later build of the same converted checkpoint and node rank
+  restores from that slot instead of reading the checkpoint again, verifying every segment
+  against the cached manifest and then re-reading the result like a fresh build. A cache that is
+  missing, damaged, or from another checkpoint falls back to a normal build and is replaced. The
+  slot needs room for one node store.
+
   At launch, argument validation refuses a store whose completion manifest is missing or
   incomplete, whose files no longer match it (a cleared tmpfs, a partial copy, metadata of another
   build), that was built from a different converted checkpoint or `config.json` than the launch's
@@ -288,7 +302,21 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   > sudo mount -o remount,huge=within_size /dev/shm
   > ```
   >
-  > Without `--fast-init` any tmpfs is accepted.
+  > Without `--fast-init` any tmpfs is accepted — but check the mount anyway. On a tmpfs
+  > without `huge=`, concurrent writers of **one** file serialize on its inode, so the staging
+  > copy and the store builder plateau far below what the source storage delivers however many
+  > threads run; with `huge=within_size` the same copy scales. The server logs the staging
+  > mount's options at startup and warns when `huge=` is missing.
+  >
+  > A fresh node or a restarted container typically comes up with a small `/dev/shm`, no
+  > `huge=` option and `transparent_hugepage/shmem_enabled=never`, silently reverting any
+  > earlier remount. Make the remount part of the node's pre-launch routine, not a one-time
+  > setup:
+  >
+  > ```bash
+  > sudo mount -o remount,size=<fits the node store>,huge=within_size /dev/shm
+  > echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+  > ```
 
 ## 7. Startup Triton Prewarm
 
