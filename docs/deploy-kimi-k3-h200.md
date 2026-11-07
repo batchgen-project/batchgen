@@ -302,7 +302,21 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   > sudo mount -o remount,huge=within_size /dev/shm
   > ```
   >
-  > Without `--fast-init` any tmpfs is accepted.
+  > Without `--fast-init` any tmpfs is accepted — but check the mount anyway. On a tmpfs
+  > without `huge=`, concurrent writers of **one** file serialize on its inode, so the staging
+  > copy and the store builder plateau far below what the source storage delivers however many
+  > threads run; with `huge=within_size` the same copy scales. The server logs the staging
+  > mount's options at startup and warns when `huge=` is missing.
+  >
+  > A fresh node or a restarted container typically comes up with a small `/dev/shm`, no
+  > `huge=` option and `transparent_hugepage/shmem_enabled=never`, silently reverting any
+  > earlier remount. Make the remount part of the node's pre-launch routine, not a one-time
+  > setup:
+  >
+  > ```bash
+  > sudo mount -o remount,size=<fits the node store>,huge=within_size /dev/shm
+  > echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+  > ```
 
 ## 7. Startup Triton Prewarm
 
