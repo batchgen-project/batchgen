@@ -216,6 +216,15 @@ def get_registry():
                 "--threads", "4",
             ],
         },
+        # NEW kernel beside the common ops (GLM-5 decode criticality probe).
+        # Mirrors setup.py: plain SM80 flags, no --use_fast_math.
+        "batchgen_kernels.common._C_spin_delay": {
+            "sources": ["src/common/spin_delay.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17",
+                "--threads", "4",
+            ] + _SM80_GENCODE,
+        },
         "batchgen_kernels.common._C_mgn_ops": {
             "sources": [
                 "src/moe/mgn/mgn_extension.cc",

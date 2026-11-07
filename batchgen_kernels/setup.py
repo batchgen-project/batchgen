@@ -457,6 +457,18 @@ _sm80_extensions = [
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
+    # Run-time-duration spin delay (GLM-5 decode criticality probe) — NEW
+    # kernel, replaces nothing. No --use_fast_math: the kernel has no
+    # floating-point math, and the flags stay the plain SM80 set.
+    CUDAExtension(
+        name="batchgen_kernels.common._C_spin_delay",
+        sources=["src/common/spin_delay.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
     # MGN (MoE General Native) ops — token dispatch, fused gate, bincount, rmsnorm
     CUDAExtension(
         name="batchgen_kernels.common._C_mgn_ops",
