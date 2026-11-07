@@ -183,14 +183,19 @@ H200_RAIL_DEVICES = tuple(f"mlx5_bond_{index}:1" for index in range(8))
 #: is ever assembled in memory.
 DEFAULT_READ_BUFFER_BYTES = 64 * 1024 * 1024
 
-#: Threads for the copy and for the verification re-read. Reads, hashing and
-#: ``os.pwrite`` all release the GIL, so work items run in parallel. ``None``
-#: means adaptive: the right count depends on the storage (a network
-#: filesystem saturates at some number of concurrent streams and can degrade
-#: past it; a local NVMe is bound by hashing cores), so it is measured at run
-#: time instead of fixed. Memory stays bounded at one read buffer per thread.
-DEFAULT_HASH_WORKERS: Optional[int] = None
+#: Fixed thread count for callers outside the builder CLI that hash store
+#: segments on their own pool (the server's staging copy imports it).
+DEFAULT_HASH_WORKERS = 8
+
+#: Builder thread counts for the copy and the verification re-read. Reads,
+#: hashing and ``os.pwrite`` all release the GIL, so work items run in
+#: parallel. ``None`` means adaptive: the right count depends on the storage
+#: (a network filesystem saturates at some number of concurrent streams and
+#: can degrade past it; a local NVMe or tmpfs is bound by cores and the write
+#: path), so it is measured at run time instead of fixed. Memory stays
+#: bounded at one read buffer per thread.
 DEFAULT_COPY_WORKERS: Optional[int] = None
+DEFAULT_VERIFY_WORKERS: Optional[int] = None
 
 #: Copy work item size. Each item is one contiguous run of a shard's spans in
 #: source order, read through its own file descriptor, so access stays
@@ -1515,7 +1520,7 @@ def verify_store(
     store_path: Path,
     copy: CopyResult,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
-    hash_workers: Optional[int] = DEFAULT_HASH_WORKERS,
+    hash_workers: Optional[int] = DEFAULT_VERIFY_WORKERS,
 ) -> List[Dict[str, Any]]:
     """Re-read ``store_path`` and require every tensor's source bytes.
 
@@ -2562,7 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--read-buffer-bytes", type=int, default=DEFAULT_READ_BUFFER_BYTES
     )
     parser.add_argument(
-        "--hash-workers", type=_worker_count, default=DEFAULT_HASH_WORKERS,
+        "--hash-workers", type=_worker_count, default=DEFAULT_VERIFY_WORKERS,
         help=(
             "Threads for the verification re-read: 'auto' (default) measures "
             "the count that saturates the storage, or a fixed positive count."

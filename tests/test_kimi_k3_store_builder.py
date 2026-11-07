@@ -1502,3 +1502,10 @@ def test_copy_chunks_interleave_shards(env, monkeypatch):
     for _, records in chunks:
         offsets = [record.source_offset for record in records]
         assert offsets == sorted(offsets)
+
+
+def test_the_exported_fixed_hash_worker_count_stays_an_int():
+    # The server's staging copy sizes its own pool from this constant; only
+    # the builder CLI defaults to adaptive.
+    assert isinstance(sb.DEFAULT_HASH_WORKERS, int) and sb.DEFAULT_HASH_WORKERS > 0
+    assert sb.DEFAULT_COPY_WORKERS is None and sb.DEFAULT_VERIFY_WORKERS is None
