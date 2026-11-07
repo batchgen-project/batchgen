@@ -757,10 +757,11 @@ class Glm5Indexer(nn.Module):
                 q_index_raw=q_index_raw,
             )
 
-        # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1, GLM-5.3 --
-        # keep the retired no-ReLU Triton scorer over a dense gather. GLM-5.2
-        # cannot reach this branch: its cache is page-split, and a mis-sized
-        # cache is named by `cache_is_page_split` rather than falling through.
+        # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1 -- keep
+        # the retired no-ReLU Triton scorer over a dense gather. GLM-5.2 and
+        # GLM-5.3 cannot reach this branch: their cache is page-split, and a
+        # mis-sized cache is named by `cache_is_page_split` rather than
+        # falling through.
         from batchgen_kernels.attention.dsa import fused_dense_paged_gather
 
         num_k_heads = indexer_blocked_k.shape[2]

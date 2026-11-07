@@ -98,6 +98,7 @@ CONV_WIDTH = 4
 # prefill_pool_layout's MLA geometry.
 MLA_HEADS = 32
 K_NOPE, K_ROPE, V_DIM = 128, 64, 128
+KV_LORA = 512
 LIVE_SEQUENCES = (41, 42, 43)
 
 
@@ -117,9 +118,14 @@ def _loaded_model_config():
         qk_nope_head_dim=K_NOPE,
         qk_rope_head_dim=K_ROPE,
         v_head_dim=V_DIM,
+        # Dense K3: no indexer, so the prefill pool holds the expanded heads.
+        num_dsa_layers=0,
+        kv_lora_rank=KV_LORA,
+        compressed_kv_dim=KV_LORA + K_ROPE,
     )
     cfg.is_kda_layer = lambda layer_idx: layer_idx in KDA_LAYERS
     cfg.is_mla_layer = lambda layer_idx: layer_idx not in KDA_LAYERS
+    cfg.is_dsa_layer = lambda layer_idx: False
     return cfg
 
 

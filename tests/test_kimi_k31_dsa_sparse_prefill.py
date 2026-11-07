@@ -377,6 +377,7 @@ def _run_wrapper(monkeypatch, module, lengths):
     wrapper = SimpleNamespace(
         module=module, layer_idx=1,
         _prefill_needs_selection=KimiLinearAttnWrapper._prefill_needs_selection,
+        _pool_sparse_rows=lambda: (None, None, None),
         _pool_prefill_kwargs=lambda: {},
         _offload_prepacked_kv=lambda kv, cu_: trace.append(("latent", kv.shape[0])),
         _write_prefill_index_keys=lambda keys, cu_: trace.append(("index", keys.clone())),

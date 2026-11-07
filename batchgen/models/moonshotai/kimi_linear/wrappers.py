@@ -382,6 +382,11 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
 class KimiLinearAttnWrapper(AttnWrapperBase):
     """Wrapper for KimiMLAAttention (NoPE-MLA, paged KV)."""
 
+    #: ``(ChunkBatch, DsaPoolPrefill)`` of the prefix-pool chunk being
+    #: prefilled, or None. The addressing is index math over the chunk's page
+    #: table, identical for every DSA layer, so it is built once per chunk.
+    _pool_sparse_ctx = None
+
     def __init__(self, module, layer_idx, core_engine, engine_config,
                  model_config, persistent=True):
         super().__init__(module, layer_idx, core_engine, engine_config,
@@ -405,15 +410,12 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
                 "Standard padded prefill is not supported."
             )
         indexer = getattr(self.module, "indexer", None)
-        if indexer is not None and AttnWrapperBase.prefill_pool_batch is not None:
-            # Refused before any work: the prefix pool keeps index keys in a
-            # pool row of its own (PrefillPrefixPool.indexer) that this path
-            # does not fill yet, so a pooled wave would leave rows without
-            # index keys for decode to score.
-            raise NotImplementedError(
-                f"Kimi-K3.1 DSA layer {self.layer_idx}: index keys are not "
-                "written for a prefill prefix-pool wave yet"
-            )
+        # Resolved first, before any projection runs: a pooled DSA wave needs
+        # this layer's latent AND index-key pool rows, and a pool that cannot
+        # give both is named here rather than after the compute.
+        pool_ctx = latent_pool = indexer_pool = None
+        if indexer is not None:
+            pool_ctx, latent_pool, indexer_pool = self._pool_sparse_rows()
         device = hidden_states.device
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
         cu_seqlens = AttnWrapperBase.prepack_cu_seqlens.to(device)
@@ -443,6 +445,9 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
                 index_keys,
                 cu_seqlens,
                 AttnWrapperBase.prepack_max_seqlen,
+                pool=pool_ctx,
+                latent_pool=latent_pool,
+                indexer_pool=indexer_pool,
             )
         else:
             attn_output, offload_kv = self.module.mla_prefill_nope_prepacked(
@@ -458,9 +463,16 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         offload_span = (
             profiler.begin_profile_span() if profiler is not None else None
         )
-        self._offload_prepacked_kv(offload_kv, cu_seqlens)
-        if index_keys is not None:
-            self._write_prefill_index_keys(index_keys, cu_seqlens)
+        if AttnWrapperBase.prefill_pool_batch is not None:
+            # One pass over the rows writing BOTH regions: the latent and, on
+            # a DSA layer, the index keys of the same tokens at the same Host
+            # positions. Two passes would leave a window in which a region
+            # holds a row the other does not.
+            self._offload_prefill_pool_rows(offload_kv, index_keys)
+        else:
+            self._offload_prepacked_kv(offload_kv, cu_seqlens)
+            if index_keys is not None:
+                self._write_prefill_index_keys(index_keys, cu_seqlens)
         if profiler is not None:
             profiler.end_profile_span("mla_kv_offload", offload_span)
         return attn_output.unsqueeze(0)
@@ -471,15 +483,99 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         keys. Kimi prefill attends within each packed row only (the dense path
         hands FlashAttention the same ``cu_seqlens`` for q and k), so a row's
         longest causal context is its own length; when every row fits, the
-        selection is the identity and the dense K3 prefill is exact."""
+        selection is the identity and the dense K3 prefill is exact.
+
+        A prefix-pool row is the exception: it continues a prefix that is
+        already KV, so its causal context is longer than its own query span
+        and the pool is only readable through the sparse path (which the
+        selection being the identity makes exact for a short context too).
+        """
+        if AttnWrapperBase.prefill_pool_batch is not None:
+            return True
         return int(AttnWrapperBase.prepack_max_seqlen) > int(indexer.index_topk)
+
+    def _pool_sparse_rows(self):
+        """``(pool chunk, latent pool row, indexer pool row)``, or three Nones.
+
+        Outside a pool wave the sparse prefill runs over its own packed keys
+        and takes no pool argument. Inside one, every DSA layer shares the
+        chunk's addressing -- it is pure index math over the chunk's page
+        table -- so it is built once per chunk and cached on the class, the
+        same way the KDA levels are.
+        """
+        pool_batch = AttnWrapperBase.prefill_pool_batch
+        if pool_batch is None:
+            KimiLinearAttnWrapper._pool_sparse_ctx = None
+            return None, None, None
+        from .dsa_sparse_prefill import build_dsa_pool_prefill
+
+        # Resolved BEFORE any index math, so a pool this layer cannot score
+        # against is refused by name and not by an attribute error halfway
+        # through building a chunk's addressing.
+        pool = AttnWrapperBase.prefill_pool
+        indexer_row = (
+            (pool.indexer_row or {}).get(self.layer_idx)
+            if pool is not None and pool.indexer is not None
+            else None
+        )
+        if indexer_row is None:
+            raise RuntimeError(
+                f"Kimi-K3.1 DSA layer {self.layer_idx} has no prefix-pool "
+                "indexer row; the pool must keep one index-key row per DSA "
+                "layer or a pooled suffix would select over its own keys only"
+            )
+        latent_row = self._pool_prefill_kwargs()["pool_layer"]
+        cached = KimiLinearAttnWrapper._pool_sparse_ctx
+        if cached is not None and cached[0] is pool_batch:
+            ctx = cached[1]
+        else:
+            ctx = build_dsa_pool_prefill(
+                page_table=pool_batch.page_table,
+                cache_seqlens=pool_batch.cache_seqlens,
+                cu_seqlens_q=pool_batch.cu_seqlens_q,
+                position_ids=AttnWrapperBase.position_ids,
+                slots=pool_batch.slots,
+                page_tokens=pool.page_tokens,
+                max_cache_seqlen=pool_batch.max_cache_seqlen,
+            )
+            KimiLinearAttnWrapper._pool_sparse_ctx = (pool_batch, ctx)
+        return ctx, pool.k[latent_row], pool.indexer[indexer_row]
+
+    def materialize_pool_segment_index_keys(self, *, index_keys, slots):
+        """Worker seam: load one slab of cached INDEX KEYS into this layer.
+
+        The dual-region counterpart of ``materialize_pool_segment``. Same
+        duck-typed contract: the worker walks its attention layers and calls
+        this on the ones that have it, so a model without an indexer is
+        skipped. The row comes from the same indexer map the computed path
+        uses, so a loaded prefix's keys and a computed one's land in the same
+        row at the same slots.
+        """
+
+        pool = AttnWrapperBase.prefill_pool
+        if pool is None or AttnWrapperBase.prefill_pool_batch is None:
+            raise RuntimeError(
+                f"Kimi-K3.1 DSA layer {self.layer_idx} was asked to "
+                "materialize index keys outside a prefix-pool wave"
+            )
+        row = (pool.indexer_row or {}).get(self.layer_idx)
+        if row is None:
+            raise RuntimeError(
+                f"Kimi-K3.1 DSA layer {self.layer_idx} has no prefix-pool "
+                "indexer row to materialize into"
+            )
+        return self.module.dsa_materialize_pool_segment_index_keys(
+            index_keys, pool=pool, indexer_row=row, slots=slots
+        )
 
     def _write_prefill_index_keys(self, index_keys, cu_seqlens):
         """Kimi-K3.1: leave one index key per prompt token in the aux region.
 
         Same packed rows, ids and lengths the latent offload just used, so the
-        two regions hold the same tokens at the same positions. Only reached
-        outside a prefix-pool wave (refused at the top of _forward_prefill).
+        two regions hold the same tokens at the same positions. The PACKED
+        form: a prefix-pool wave writes both regions row by row instead
+        (``_offload_prefill_pool_rows``), because a pooled row's Host
+        destination is its own start, not token 0.
         """
         from .dsa_prefill import offload_packed_index_keys, quantize_index_keys
 
@@ -596,7 +692,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             task.wait()
             start_idx = end_idx
 
-    def _offload_prefill_pool_rows(self, offload_kv):
+    def _offload_prefill_pool_rows(self, offload_kv, index_keys=None):
         """Offload each prefix-pool row's latent at its own Host start.
 
         A pooled segment row goes to its segment's pseudo sequence at 0, a tail
@@ -605,8 +701,43 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         as the chunk ends. Every rank of a serve group offloads, exactly as the
         packed path above does: the group replicates the rows and writes the
         same bytes to the same mirrored pages.
+
+        ``index_keys`` are this chunk's bf16 DSA index keys (K3.1), written to
+        the AUXILIARY region at the same row starts and token counts: the two
+        regions must hold the same tokens at the same positions, because one
+        page table addresses both and a prefix is only reusable when every
+        group holds it. The aux region is page-split FP8, so the quantization
+        happens here, at the offload boundary, exactly as the packed
+        (non-pooled) writer does -- the pool's own indexer row stays bf16 for
+        this layer's scoring.
         """
         view = self.core_engine.host_paged_kv_worker_view
+        aux_view = None
+        if index_keys is not None:
+            from .dsa_prefill import quantize_index_keys
+
+            aux_view = AttnWrapperBase.host_paged_kv_worker_view_aux
+            if aux_view is None:
+                raise RuntimeError(
+                    f"Kimi-K3.1 DSA layer {self.layer_idx}: no auxiliary Host "
+                    "KV worker view is bound, so this pooled chunk's index "
+                    "keys would be dropped and every decode step would score "
+                    "against stale or zeroed keys"
+                )
+            if not getattr(aux_view, "is_page_split", False):
+                raise RuntimeError(
+                    f"Kimi-K3.1 DSA layer {self.layer_idx}: the auxiliary Host "
+                    "region is not page-split FP8; K3.1 writes e4m3 keys + "
+                    "fp32 scales for the ReLU-gated paged scorer, so the "
+                    "kimi_k31_indexer profile must be the one allocated"
+                )
+            if index_keys.shape[0] != offload_kv.shape[0]:
+                raise RuntimeError(
+                    f"Kimi-K3.1 DSA layer {self.layer_idx}: "
+                    f"{index_keys.shape[0]} index key(s) against "
+                    f"{offload_kv.shape[0]} latent token(s) in this pooled "
+                    "chunk"
+                )
         bounds = AttnWrapperBase.prefill_pool_batch.row_bounds
         starts = AttnWrapperBase.prefill_pool_row_starts
         sequence_ids = list(AttnWrapperBase.cur_batch or [])
@@ -646,6 +777,22 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             AttnWrapperBase.pin_prefill_offload_tensor(row_kv, self.layer_idx)
             AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
             task.wait()
+            if index_keys is None:
+                continue
+            keys_fp8, scales = quantize_index_keys(index_keys[start:end])
+            aux_task = aux_view.async_offload_layer_kv_range_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=[sequence_ids[row]],
+                k_tensor=keys_fp8.unsqueeze(0),
+                v_tensor=None,
+                raw_start_positions=[starts[row]],
+                token_counts=[end - start],
+                scale_tensor=scales.unsqueeze(0),
+            )
+            AttnWrapperBase.pin_prefill_offload_tensor(keys_fp8, self.layer_idx)
+            AttnWrapperBase.pin_prefill_offload_tensor(scales, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(aux_task, self.layer_idx)
+            aux_task.wait()
 
     def _forward_decode(self, hidden_states, **kwargs):
         if getattr(self.module, "indexer", None) is not None:

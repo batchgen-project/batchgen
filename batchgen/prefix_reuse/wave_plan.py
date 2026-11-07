@@ -46,6 +46,7 @@ materialized segment computes for nobody, so it saves all of its members.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -285,8 +286,13 @@ def _schedule(
     same_chunk_ancestors: bool = False,
     chunk_keys: Optional[int] = None,
     materialized: Sequence[tuple[int, tuple[int, ...]]] = (),
+    pooled: Optional[frozenset[int]] = None,
 ) -> Optional[WavePrefixPlan]:
     """List-schedule one threshold; None if the pool deadlocks.
+
+    ``pooled``, when given, is the exact ancestor-closed set of tree segments
+    to pool (a threshold set trimmed to a segment budget); ``threshold`` is
+    then only reported.
 
     ``materialized`` is ``(tokens, members)`` per materialized segment, in the
     order the segments are numbered. Its members take no part in ``tree`` (the
@@ -294,9 +300,12 @@ def _schedule(
     materialized segment.
     """
 
-    pooled_old = [
-        threshold is not None and c >= max(threshold, 2) for c in tree.count
-    ]
+    if pooled is not None:
+        pooled_old = [seg in pooled for seg in range(len(tree.count))]
+    else:
+        pooled_old = [
+            threshold is not None and c >= max(threshold, 2) for c in tree.count
+        ]
     num_materialized = len(materialized)
     # Which materialized segment each member reads; a non-member is absent.
     materialized_of: dict[int, int] = {}
@@ -564,6 +573,40 @@ def group_materialized_prefixes(
     )
 
 
+def _cap_pooled_segments(
+    tree: _Tree, block_tokens: int, threshold: int, budget: int
+) -> frozenset[int]:
+    """The threshold's pooled set, trimmed to at most ``budget`` segments.
+
+    Each computed segment holds a per-sequence recurrent-state slot for its
+    wave (K3/K3.1 KDA), so a model with such state can pool only as many
+    segments as it has spare slots. Rather than declining the whole wave, keep
+    the segments that save the most computed tokens: grow an ancestor-closed
+    set from the roots, always taking the frontier segment with the largest
+    ``(count - 1) * tokens`` saving (ties broken by segment id, so every rank
+    of a group picks the same set). The result is closed under ancestors by
+    construction, which ``_schedule`` requires.
+    """
+    eligible = [c >= max(threshold, 2) for c in tree.count]
+    kids: dict[Optional[int], list[int]] = {}
+    for seg, ok in enumerate(eligible):
+        if ok:
+            kids.setdefault(tree.parent[seg], []).append(seg)
+
+    def saving(seg: int) -> int:
+        return (tree.count[seg] - 1) * (tree.end_block[seg] - tree.start_block[seg]) * block_tokens
+
+    frontier = [(-saving(seg), seg) for seg in kids.get(None, [])]
+    heapq.heapify(frontier)
+    chosen: set[int] = set()
+    while frontier and len(chosen) < budget:
+        _, seg = heapq.heappop(frontier)
+        chosen.add(seg)
+        for child in kids.get(seg, []):
+            heapq.heappush(frontier, (-saving(child), child))
+    return frozenset(chosen)
+
+
 def plan_wave_prefix_sharing(
     prompts: Sequence[Sequence[int]],
     *,
@@ -573,8 +616,16 @@ def plan_wave_prefix_sharing(
     same_chunk_ancestors: bool = False,
     chunk_keys: Optional[int] = None,
     materialized: Sequence[MaterializedPrefix] = (),
+    max_computed_segments: Optional[int] = None,
 ) -> WavePrefixPlan:
     """Plan one wave; pools the most segments whose schedule fits the pool.
+
+    ``max_computed_segments`` bounds how many segments a row computes (each
+    holds a recurrent-state slot for the wave on a model with such state);
+    ``None`` means unbounded. A threshold whose pooled set exceeds it keeps
+    the highest-saving ancestor-closed subset that fits instead of being
+    skipped, so a wave short of spare slots still shares what it can.
+    Materialized segments are not computed and do not count.
 
     The threshold starts at 2 (every shared segment pooled) and rises until
     the schedule fits ``pool_pages``; with nothing pooled every prompt is a
@@ -589,6 +640,8 @@ def plan_wave_prefix_sharing(
 
     if block_tokens <= 0 or chunk_tokens <= 0 or pool_pages < 0:
         raise ValueError("block_tokens and chunk_tokens must be positive, pool_pages >= 0")
+    if max_computed_segments is not None and max_computed_segments < 0:
+        raise ValueError("max_computed_segments must be >= 0 or None")
     if any(len(tokens) == 0 for tokens in prompts):
         raise ValueError("every prompt must be non-empty")
     groups = group_materialized_prefixes(
@@ -611,8 +664,16 @@ def plan_wave_prefix_sharing(
     tree = _build_tree(prompts, block_tokens, skip)
     # 2 means every shared segment; higher values only where counts exist.
     for threshold in sorted({2} | {c for c in tree.count if c > 2}):
+        pooled = None
+        if max_computed_segments is not None:
+            eligible = sum(1 for c in tree.count if c >= threshold)
+            if eligible > max_computed_segments:
+                pooled = _cap_pooled_segments(
+                    tree, block_tokens, threshold, max_computed_segments
+                )
         plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
-                         threshold, same_chunk_ancestors, chunk_keys, groups)
+                         threshold, same_chunk_ancestors, chunk_keys, groups,
+                         pooled=pooled)
         if plan is not None:
             return plan
     plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, None,

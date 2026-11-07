@@ -31,6 +31,8 @@ __all__ = [
     "quantize_indexer_k_fp8",
     "page_split_geometry",
     "page_split_write_reference",
+    "page_split_read_reference",
+    "dequantize_page_split_pages",
     "page_split_cache_pages",
     "cache_is_page_split",
     "cache_data_dim",
@@ -335,6 +337,89 @@ def page_split_write_reference(
         scales.reshape(-1).float().view(torch.uint8).reshape(-1)
     )
     return buf_u8
+
+
+def page_split_read_reference(
+    buf_u8: torch.Tensor,
+    page_size: int,
+    data_dim: int,
+    tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The exact inverse of :func:`page_split_write_reference`.
+
+    ``buf_u8`` is ``[num_pages, page_bytes]`` uint8 holding pages in token
+    order, and ``tokens`` is how many of the ``num_pages * page_size`` token
+    records carry data (a prefix is page aligned, so this is the whole span
+    unless a caller trims a tail). Returns ``([tokens, data_dim] e4m3,
+    [tokens] fp32)``: the bytes as the producer wrote them, reinterpreted and
+    nothing else. Reading a page-split region back is how a cached prefix
+    re-enters the device, so this stays the one statement of the layout.
+    """
+
+    if buf_u8.dim() != 2 or buf_u8.dtype is not torch.uint8:
+        raise ValueError("buf_u8 must be a 2-D uint8 [num_pages, page_bytes]")
+    page_size = int(page_size)
+    data_dim = int(data_dim)
+    tokens = int(tokens)
+    num_pages, page_bytes = int(buf_u8.shape[0]), int(buf_u8.shape[1])
+    if page_size <= 0 or data_dim <= 0:
+        raise ValueError(
+            f"page_size and data_dim must be positive, got page_size="
+            f"{page_size}, data_dim={data_dim}"
+        )
+    if page_bytes != page_size * (data_dim + SCALE_BYTES_PER_TOKEN):
+        raise ValueError(
+            f"page bytes {page_bytes} do not match page_size={page_size} and "
+            f"data_dim={data_dim}"
+        )
+    if not 0 <= tokens <= num_pages * page_size:
+        raise ValueError(
+            f"{tokens} token(s) do not fit in {num_pages} page(s) of "
+            f"{page_size}"
+        )
+    pages = -(-tokens // page_size)
+    if pages == 0:
+        return (
+            torch.empty(0, data_dim, dtype=torch.float8_e4m3fn,
+                        device=buf_u8.device),
+            torch.empty(0, dtype=torch.float32, device=buf_u8.device),
+        )
+    block = buf_u8[:pages].contiguous()
+    scale_region_offset = page_size * data_dim
+    k_fp8 = (
+        block[:, :scale_region_offset]
+        .reshape(pages * page_size, data_dim)
+        .view(torch.float8_e4m3fn)[:tokens]
+    )
+    scales = (
+        block[:, scale_region_offset:]
+        .reshape(-1)
+        .view(torch.float32)
+        .reshape(pages * page_size)[:tokens]
+    )
+    return k_fp8.contiguous(), scales.contiguous()
+
+
+def dequantize_page_split_pages(
+    buf_u8: torch.Tensor,
+    page_size: int,
+    data_dim: int,
+    tokens: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """``[tokens, data_dim]`` keys a page-split region holds, as ``dtype``.
+
+    ``e4m3 * scale``, the value the stored record represents -- the same value
+    the paged scorer reconstructs when it reads this page. It is NOT the
+    pre-quantization key: a round trip through the region is lossy, and this
+    function returns what the region actually holds rather than pretending
+    otherwise.
+    """
+
+    k_fp8, scales = page_split_read_reference(
+        buf_u8, page_size, data_dim, tokens
+    )
+    return (k_fp8.float() * scales.unsqueeze(-1)).to(dtype)
 
 
 @dataclass(frozen=True)

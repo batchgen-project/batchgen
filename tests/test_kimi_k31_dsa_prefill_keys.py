@@ -491,10 +491,20 @@ def test_wrapper_falls_back_to_cu_seqlens_for_lengths(monkeypatch):
     assert view.calls[0]["sequence_lengths"] == [1, 3]
 
 
-def test_wrapper_refuses_a_prefix_pool_wave_before_any_work(monkeypatch):
+@pytest.mark.parametrize("pool, match", [
+    (None, "no prefix-pool indexer row"),
+    (SimpleNamespace(indexer=None, indexer_row={3: 0}), "no prefix-pool indexer row"),
+    (SimpleNamespace(indexer=object(), indexer_row={}), "no prefix-pool indexer row"),
+])
+def test_wrapper_refuses_a_pool_wave_without_an_indexer_row(monkeypatch, pool, match):
+    """A pooled DSA wave is served (``dsa_sparse_prefill`` with the pool), but
+    only when this layer HAS an index-key pool row. Without one the suffix
+    would select over its own keys and silently ignore the cached prefix, so
+    it is refused before any index math runs."""
     from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearAttnWrapper
 
     monkeypatch.setattr(AttnWrapperBase, "prefill_pool_batch", object(), raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "prefill_pool", pool, raising=False)
     monkeypatch.setattr(AttnWrapperBase, "prepack_mode", True, raising=False)
     monkeypatch.setattr(AttnWrapperBase, "retire_pending_prefill_offloads_before_layer",
                         staticmethod(lambda *a, **k: None), raising=False)
@@ -506,7 +516,8 @@ def test_wrapper_refuses_a_prefix_pool_wave_before_any_work(monkeypatch):
     wrapper = SimpleNamespace(
         module=module, layer_idx=3,
         _offload_prepacked_kv=lambda *a, **k: touched.append("offload"),
+        _pool_sparse_rows=lambda: KimiLinearAttnWrapper._pool_sparse_rows(wrapper),
     )
-    with pytest.raises(NotImplementedError, match="prefix-pool"):
+    with pytest.raises(RuntimeError, match=match):
         KimiLinearAttnWrapper._forward_prefill(wrapper, torch.randn(1, 4, 64))
     assert touched == []
