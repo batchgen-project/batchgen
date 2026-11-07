@@ -1420,7 +1420,7 @@ def test_adaptive_pool_grows_on_scalable_work(monkeypatch, caplog):
         return item * 2
 
     caplog.set_level("INFO")
-    out = sb._parallel_map(list(range(600)), work, None, "probe")
+    out = sb.parallel_map(list(range(600)), work, None, "probe")
     assert out == [item * 2 for item in range(600)]
     assert peak["max"] >= 2, "independent sleeps must grow past the start level"
 
@@ -1440,7 +1440,7 @@ def test_adaptive_pool_holds_on_serialized_work(monkeypatch, caplog):
         return item
 
     caplog.set_level("INFO")
-    sb._parallel_map(list(range(1500)), work, None, "probe")
+    sb.parallel_map(list(range(1500)), work, None, "probe")
     settled = [rec.message for rec in caplog.records if "settling at" in rec.message]
     assert settled, "a bandwidth-bound workload must settle"
     level = int(settled[-1].rsplit("settling at ", 1)[1])
@@ -1459,7 +1459,7 @@ def test_adaptive_pool_raises_the_first_failure_in_item_order(monkeypatch):
         return item
 
     with pytest.raises(ValueError, match="item 3"):
-        sb._parallel_map(list(range(20)), work, None, "probe")
+        sb.parallel_map(list(range(20)), work, None, "probe")
 
 
 def test_small_chunks_split_shards_and_stay_byte_identical(env, monkeypatch):

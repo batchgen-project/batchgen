@@ -1057,7 +1057,7 @@ class _Gate:
             self._condition.notify_all()
 
 
-def _parallel_map(
+def parallel_map(
     items: Sequence[Any],
     work: Any,
     workers: Optional[int],
@@ -1340,7 +1340,7 @@ def write_store(
                 )
             return chunk_digests, copied
 
-        results = _parallel_map(
+        results = parallel_map(
             _copy_chunks(plan), copy_chunk, copy_workers, "store copy"
         )
 
@@ -1553,14 +1553,19 @@ def hash_store_segment(
     spans: Sequence[Span],
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
     sink: Optional[int] = None,
+    progress: Any = None,
 ) -> str:
     """One manifest segment's digest: the rollup of its tensors' digests.
 
     ``spans`` are the segment's spans from :func:`manifest_segment_spans`.
     With ``sink``, the segment is also copied into that descriptor at the
-    same offsets. Raises ``OSError`` or ``EOFError``.
+    same offsets; ``progress(nbytes)`` is reported per tensor when given
+    (the :func:`parallel_map` adaptive runner feeds on it). Raises
+    ``OSError`` or ``EOFError``.
     """
-    return _rollup(_read_span_digests(descriptor, spans, read_buffer_bytes, sink))
+    return _rollup(
+        _read_span_digests(descriptor, spans, read_buffer_bytes, sink, progress)
+    )
 
 
 def verify_store(
@@ -1602,7 +1607,7 @@ def verify_store(
         return _rollup(digests)
 
     try:
-        rollups = _parallel_map(segments, check, hash_workers, "store verify")
+        rollups = parallel_map(segments, check, hash_workers, "store verify")
     except (OSError, EOFError) as error:
         raise K3StoreBuilderError(
             f"cannot re-read {store_path} for verification: {error}"
@@ -1692,7 +1697,7 @@ def _copy_and_hash_segments(
             source, segment, read_buffer_bytes, sink, progress
         )
 
-    return _parallel_map(segments, one, copy_workers, label)
+    return parallel_map(segments, one, copy_workers, label)
 
 
 def _segment_entries(
