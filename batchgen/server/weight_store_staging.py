@@ -635,7 +635,29 @@ def stage_distributed_weight_store(
         free_bytes_of=free_bytes_of,
         interleave=interleave,
     )
-    check_staging_mount(stager.staging_dir, fast_init=fast_init, read_mounts=read_mounts)
+    mount = check_staging_mount(
+        stager.staging_dir, fast_init=fast_init, read_mounts=read_mounts
+    )
+    logger.info(
+        "weight store staging tmpfs %s is mounted with options %s",
+        mount.mountpoint,
+        ",".join(mount.options),
+    )
+    if (mount.option("huge") or "never") not in HUGE_MOUNT_OPTIONS:
+        # Reached only without --fast-init (with it, check_staging_mount
+        # already refused): still worth a loud warning, because concurrent
+        # writers of ONE tmpfs file serialize on its inode without huge=,
+        # so the staging copy runs far below the source storage no matter
+        # how many copy threads run. Fresh nodes and restarted containers
+        # come up this way, silently reverting any earlier remount.
+        logger.warning(
+            "the staging tmpfs %s has no huge= mount option; the staged "
+            "store stays on small pages and the copy's concurrent writes "
+            "serialize. Remount it before launch: "
+            "mount -o remount,huge=within_size %s",
+            mount.mountpoint,
+            shlex.quote(mount.mountpoint),
+        )
     stager.staging_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     sweep_idle_stores(stager.staging_dir, keep=stager.staged_id)
 
