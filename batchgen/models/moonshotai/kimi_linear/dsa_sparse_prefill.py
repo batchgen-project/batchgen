@@ -30,10 +30,23 @@ query heads per rank under TP8.
 Everything else is the dense prefill's own statement: the projections, the
 NoPE latent written to the Host cache, the absorbed query and out-absorb, the
 sigmoid output gate, ``o_proj`` and the TP reduce.
+
+This is also the pooled form. Under the in-wave prefill prefix pool a row
+continues a prefix that is already KV in the pool, so its keys are not only
+the ones this chunk computes: ``build_dsa_pool_prefill`` turns the chunk's
+page table into a per-row key list over pool slots, the chunk's own keys are
+written into the pool before the scorer gathers that list, and the selected
+indices are mapped back to pool slots for attention. Both regions take part --
+the latent pool row carries attention's KV, the indexer pool row carries the
+keys selection scores -- which is why a DSA pool wave is refused unless both
+rows are handed in. Prefill then stays the sparse path for every pooled wave,
+short rows included, exactly as it does for a long packed batch: the selection
+is the identity whenever a row sees at most ``index_topk`` keys.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -45,6 +58,87 @@ from .serving_modules import _reduce_mla_tp_output
 
 #: ``fast_topk_2048_out`` is the only top-k the production causal scorer has.
 PREFILL_TOPK = 2048
+
+
+@dataclass(frozen=True)
+class DsaPoolPrefill:
+    """One prefix-pool chunk's addressing, shared by every DSA layer.
+
+    A pooled row continues a prefix that is already KV in the pool -- computed
+    by an earlier row of this wave or LOADED from the prefix cache -- so its
+    query tokens must select over the cached keys as well as their own.
+
+    ``key_slots`` lists every row's keys ``[0, cache_len)`` as pool slots, rows
+    concatenated; a query token's causal range is its row's span in that list
+    up to and including its own absolute position, which is exactly the
+    packed-row range of the no-pool form shifted by the prefix length. Top-k
+    indices over that list are mapped back to pool slots, so both the scorer
+    and attention read the pool directly and nothing re-materializes a key.
+    """
+
+    slots: torch.Tensor  # int64 [T]: pool slot of each query token
+    key_slots: torch.Tensor  # int64 [K]
+    causal_starts: torch.Tensor  # int32 [T]
+    causal_ends: torch.Tensor  # int32 [T]
+    max_cache_seqlen: int
+
+
+def build_dsa_pool_prefill(
+    *,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    position_ids: torch.Tensor,
+    slots: torch.Tensor,
+    page_tokens: int,
+    max_cache_seqlen: int,
+) -> DsaPoolPrefill:
+    """Address a pool chunk whose rows hold ancestor pages then their own.
+
+    Pooled segments and tails start on page boundaries, so a row's key at
+    absolute position ``t`` sits in slot ``t % page_tokens`` of its
+    ``t // page_tokens``-th page.
+    """
+
+    device = page_table.device
+    rows = cache_seqlens.numel()
+    cache = cache_seqlens.to(torch.int64)
+    key_offsets = torch.zeros(rows + 1, dtype=torch.int64, device=device)
+    key_offsets[1:] = torch.cumsum(cache, 0)
+    total_keys = int(key_offsets[-1])
+    key_rows = torch.repeat_interleave(
+        torch.arange(rows, device=device), cache, output_size=total_keys
+    )
+    t = torch.arange(total_keys, device=device) - key_offsets[:-1][key_rows]
+    key_slots = (
+        page_table.to(torch.int64)[key_rows, t // page_tokens] * page_tokens
+        + t % page_tokens
+    )
+    q_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
+    q_rows = torch.repeat_interleave(
+        torch.arange(rows, device=device), q_lengths,
+        output_size=position_ids.numel(),
+    )
+    starts = key_offsets[:-1][q_rows]
+    ends = starts + position_ids.to(torch.int64) + 1
+    return DsaPoolPrefill(
+        slots=slots.to(torch.int64),
+        key_slots=key_slots.contiguous(),
+        causal_starts=starts.to(torch.int32).contiguous(),
+        causal_ends=ends.to(torch.int32).contiguous(),
+        max_cache_seqlen=int(max_cache_seqlen),
+    )
+
+
+def map_topk_to_pool_slots(
+    topk_indices: torch.Tensor, key_slots: torch.Tensor
+) -> torch.Tensor:
+    """Key-list offsets -> pool slots; ``-1`` padding stays ``-1``."""
+
+    mapped = key_slots[topk_indices.clamp(min=0).to(torch.int64)].to(
+        topk_indices.dtype
+    )
+    return torch.where(topk_indices >= 0, mapped, topk_indices).contiguous()
 
 
 def packed_causal_ranges(cu_seqlens: torch.Tensor,
@@ -138,12 +232,23 @@ def dsa_sparse_prefill(
     index_keys: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    pool: DsaPoolPrefill | None = None,
+    latent_pool: torch.Tensor | None = None,
+    indexer_pool: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA prefill of a packed batch: ``(attn_output [T, hidden],
     offload_kv [T, kv_lora_rank + qk_rope_head_dim])``.
 
     ``index_keys`` are this chunk's ``[T, 128]`` bf16 index keys
     (``dsa_prefill.prefill_index_keys``), the same keys the Host write stores.
+
+    With ``pool`` the rows continue prefixes already resident in the in-wave
+    prefix pool. This layer's latent and index keys are written to their pool
+    slots first; the scorer then gathers each row's WHOLE key list -- cached
+    prefix keys and this chunk's own, in one packed tensor -- so a suffix query
+    selects over cached and new keys together, and attention reads the latent
+    pool (``latent_pool``, this layer's row) through the selected slots. The
+    no-pool form is the same statement with every row's prefix empty.
     """
     indexer = module.indexer
     check_index_head_dim(indexer.index_head_dim)
@@ -152,6 +257,23 @@ def dsa_sparse_prefill(
         raise ValueError(
             f"index_keys must be [{total}, {indexer.index_head_dim}], got "
             f"{tuple(index_keys.shape)}"
+        )
+    if pool is not None:
+        if latent_pool is None or indexer_pool is None:
+            raise RuntimeError(
+                "a Kimi-K3.1 DSA pool-prefill layer needs both this layer's "
+                "latent pool row and its indexer pool row; without the "
+                "indexer row the suffix would select over its own keys only "
+                "and silently ignore the cached prefix"
+            )
+        if int(pool.slots.numel()) != total:
+            raise ValueError(
+                f"the pool chunk names {int(pool.slots.numel())} slot(s) for "
+                f"{total} query token(s)"
+            )
+    elif latent_pool is not None or indexer_pool is not None:
+        raise RuntimeError(
+            "pool rows were given without a pool chunk to address them"
         )
     heads, lora = module.num_heads, module.kv_lora_rank
 
@@ -165,7 +287,18 @@ def dsa_sparse_prefill(
     offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
 
     # ---- selection ----
-    starts, ends = packed_causal_ranges(cu_seqlens, total)
+    if pool is None:
+        starts, ends = packed_causal_ranges(cu_seqlens, total)
+        score_keys = index_keys.to(torch.bfloat16)
+        score_width = int(max_seqlen)
+    else:
+        # The chunk's own keys land in the pool first, so the gather below
+        # returns cached prefix keys and new keys in one causal order.
+        starts, ends = pool.causal_starts, pool.causal_ends
+        indexer_flat = indexer_pool.view(-1, index_keys.shape[-1])
+        indexer_flat[pool.slots] = index_keys.to(indexer_flat.dtype)
+        score_keys = indexer_flat[pool.key_slots].to(torch.bfloat16)
+        score_width = pool.max_cache_seqlen
     q_idx = F.linear(q_a, indexer.wq_b.weight).view(
         total, indexer.index_n_heads, indexer.index_head_dim)
     q_idx = index_q_rows(q_idx).to(torch.bfloat16).contiguous()
@@ -175,21 +308,29 @@ def dsa_sparse_prefill(
     topk = int(indexer.index_topk)
     indices = _prefill_index_topk()(
         q_idx=q_idx,
-        index_keys=index_keys.to(torch.bfloat16),
+        index_keys=score_keys,
         head_gates=gates,
         causal_starts=starts,
         causal_ends=ends,
-        max_seqlen=int(max_seqlen),
+        max_seqlen=int(score_width),
         topk=topk,
     )
     selected = (ends - starts).clamp(max=topk).to(torch.int32).contiguous()
 
-    # ---- attention: FA3 qv over this chunk's latent, one row per query ----
+    # ---- attention: FA3 qv over the latent, one row per query ----
     kv_b = module.kv_b_proj.weight.view(heads, -1, lora)
     q_absorb = kv_b[:, : module.qk_nope_head_dim, :]
     out_absorb = kv_b[:, module.qk_nope_head_dim:, :]
     q_latent = torch.einsum("thd,hdc->thc", q_nope, q_absorb)
-    flat_kv = offload_kv.view(total, 1, 1, offload_kv.shape[-1])
+    if pool is None:
+        flat_kv = offload_kv.view(total, 1, 1, offload_kv.shape[-1])
+    else:
+        latent_flat = latent_pool.view(-1, offload_kv.shape[-1])
+        latent_flat[pool.slots] = offload_kv.to(latent_flat.dtype)
+        # Pool slots ARE the page-size-1 page ids of the selection, so the
+        # kernel's KV source is the whole pool row.
+        flat_kv = latent_flat.view(-1, 1, 1, offload_kv.shape[-1])
+        indices = map_topk_to_pool_slots(indices, pool.key_slots)
     attn_latent = _fa3_with_kvcache()(
         q=q_pe.reshape(total, 1, heads, module.qk_rope_head_dim).contiguous(),
         k_cache=flat_kv[..., lora:],

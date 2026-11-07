@@ -1,3 +1,4 @@
+import contextlib
 """Kimi-K3 pre-readiness startup. CPU only: no weights, no GPU, no CUDA.
 
 The HTTP server used to signal worker readiness right after BatchGenWorker(args)
@@ -336,6 +337,11 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
     worker._install_prefill_weight_copy_pipeline = lambda k3_prefill_profile: trace.append(
         ("install_h2d", k3_prefill_profile)
     )
+    # The startup pass sizes the decode buffers from the runtime cap and wraps
+    # each step in a named startup phase (watched by the server's startup
+    # watchdog); neither is part of the order these tests pin.
+    worker._max_decode_rank_bsz = lambda: 128
+    worker._startup_phase = lambda name: contextlib.nullcontext()
     return worker
 
 
@@ -630,19 +636,15 @@ def test_kimi_k3_startup_fails_closed_when_a_runtime_extension_is_missing(
 
 
 def test_kimi_k3_startup_uses_the_runtime_decode_batch_cap():
-    # 128 is the cap the decode path applies to its own per-rank estimate, so
-    # the padded MoE buffers built here already fit the worst admitted batch.
-    assign = next(
-        node
-        for node in ast.parse(WORKER.read_text()).body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(t, ast.Name) and t.id == "_MAX_DECODE_RANK_BSZ"
-            for t in node.targets
-        )
+    # The startup decode build is sized by the same per-rank cap the decode
+    # path applies to its own estimate (_max_decode_rank_bsz: the generic
+    # guard, lifted to the planner's per-node cap for TP-group models), so the
+    # padded MoE buffers built here already fit the worst admitted batch.
+    startup = _body_source(
+        _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
     )
-    assert "128" in ast.unparse(assign)
-    assert "_MAX_DECODE_RANK_BSZ" in ast.unparse(
+    assert "self._load_decode_model(self._max_decode_rank_bsz()" in startup
+    assert "_max_decode_rank_bsz" in _calls(
         _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
     )
 
@@ -698,12 +700,15 @@ def test_kimi_decode_graph_is_prewarmed_before_continuous_decode():
     """The first measured decode forward must not capture graphs lazily."""
     generate = _function(WORKER, "generate", "BatchGenWorker")
     calls = _calls(generate)
-    assert len(calls["prewarm_decode_graphs"]) == 1
+    # The model's prewarm hook is resolved off the parallel manager (dense
+    # models without one skip it) and bound to a local before the call.
+    assert len(calls["prewarm_kimi_graphs"]) == 1
     assert len(calls["decoding_continuous"]) == 1
-    assert calls["prewarm_decode_graphs"][0] < calls["decoding_continuous"][0]
+    assert calls["prewarm_kimi_graphs"][0] < calls["decoding_continuous"][0]
 
     source = _body_source(generate)
-    assert "self._get_cuda_graph_gpu_manager()" in source
+    assert "prewarm_decode_graphs" in source
+    assert "prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())" in source
 
 
 # --------------------------------------------------------------------------- #
