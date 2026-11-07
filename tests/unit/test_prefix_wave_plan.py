@@ -276,3 +276,71 @@ def test_same_chunk_reads_are_invalid_unless_the_plan_allows_them():
         validate_wave_prefix_plan(
             dataclasses.replace(result, same_chunk_ancestors=False), prompts
         )
+
+
+# --- computed-segment budget (recurrent-state slots) -------------------------
+# Savings in TREE: A=(4-1)*8=24, B=(2-1)*8=8, A1=A2=(2-1)*4=4.
+
+
+def budget_plan(prompts, budget, pool_pages=1000, chunk_tokens=1000):
+    result = plan_wave_prefix_sharing(
+        prompts, block_tokens=B, pool_pages=pool_pages,
+        chunk_tokens=chunk_tokens, max_computed_segments=budget,
+    )
+    validate_wave_prefix_plan(result, prompts)
+    return result
+
+
+def test_unbounded_and_ample_budget_match_the_unbudgeted_plan():
+    full = plan(TREE)
+    for budget in (None, 4, 100):
+        result = budget_plan(TREE, budget)
+        assert result.segments == full.segments
+        assert result.saved_tokens == full.saved_tokens == 40
+
+
+@pytest.mark.parametrize("budget,spans,saved", [
+    (0, [], 0),
+    (1, [(0, 8, (0, 1, 2, 3))], 24),                       # A only
+    (2, [(0, 8, (0, 1, 2, 3)), (0, 8, (4, 5))], 32),       # A, then B
+    (3, None, 36),                                         # A, B, one of A1/A2
+])
+def test_short_budget_keeps_the_highest_saving_segments(budget, spans, saved):
+    result = budget_plan(TREE, budget)
+    assert len(result.segments) == min(budget, 4)
+    assert result.saved_tokens == saved
+    if spans is not None:
+        assert sorted((s.token_start, s.token_end, s.members)
+                      for s in result.segments) == sorted(spans)
+    # The pooled set stays closed under ancestors: a child is pooled only
+    # together with its parent (validate_wave_prefix_plan checks the chain).
+    if budget == 3:
+        members = {s.members for s in result.segments}
+        assert (0, 1, 2, 3) in members and (4, 5) in members
+
+
+def test_budget_never_beats_a_bigger_budget():
+    saved = [budget_plan(TREE, b).saved_tokens for b in range(6)]
+    assert saved == sorted(saved)
+
+
+def test_budget_is_deterministic():
+    rng = random.Random(7)
+    docs = [[rng.randrange(1000) for _ in range(5 * B)] for _ in range(12)]
+    prompts = [docs[i % 12] + blk(100 + i) + [i] for i in range(40)]
+    first = budget_plan(prompts, 5)
+    again = budget_plan(list(prompts), 5)
+    assert first.segments == again.segments
+    assert first.chunks == again.chunks
+    assert len(first.segments) == 5
+
+
+def test_budget_composes_with_a_tight_pool():
+    result = budget_plan(TREE, 2, pool_pages=2)
+    assert len(result.segments) <= 2
+    assert result.peak_pool_pages <= 2
+
+
+def test_negative_budget_is_refused():
+    with pytest.raises(ValueError, match="max_computed_segments"):
+        budget_plan(TREE, -1)

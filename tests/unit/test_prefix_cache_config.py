@@ -366,6 +366,73 @@ def test_kimi_k3_group_converts_to_the_core_mla_semantic():
     assert [spec.semantic for spec in converted.group_specs] == ["mla-enum"]
 
 
+def _k31_indexer_host_config(**overrides):
+    # kimi_k31_indexer: the same 24 rows and page size as the latent, page-split
+    # FP8 -- one MQA head whose k_head_dim counts BYTES (128 e4m3 data + one
+    # fp32 scale) at a 1-byte element size.
+    return _host_config(num_layers=24, num_k_heads=1, k_head_dim=132,
+                        k_element_size_bytes=1, num_v_heads=0, v_head_dim=0,
+                        **overrides)
+
+
+def _k31_config(**kwargs):
+    return build_prefix_cache_runtime_config(
+        model_name="moonshotai/Kimi-K3.1-Pro",
+        kv_dtype="bfloat16",
+        host_kv_config=kwargs.pop("primary", _k3_host_config()),
+        aux_host_kv_config=kwargs.pop("aux", _k31_indexer_host_config()),
+        shm_name=_SHM,
+        **kwargs,
+    )
+
+
+def test_kimi_k31_is_supported_and_dense_k3_still_is():
+    assert require_prefix_cache_model_support(
+        "moonshotai/Kimi-K3.1-Pro") == "kimi_k31"
+    assert require_prefix_cache_model_support("moonshotai/Kimi-K3.1") == "kimi_k31"
+    assert require_prefix_cache_model_support("moonshotai/Kimi-K3") == "kimi_k3"
+
+
+def test_kimi_k31_gets_a_latent_group_and_an_indexer_group():
+    config = _k31_config()
+
+    assert [spec.semantic for spec in config.group_specs] == [
+        PrefixKVGroupSemantic.MLA_LATENT,
+        PrefixKVGroupSemantic.DSA_INDEXER_KEYS,
+    ]
+    assert [spec.group_id for spec in config.group_specs] == [0, 1]
+    assert all(spec.required_for_reuse for spec in config.group_specs)
+    assert config.max_group_entries == 2 * 4097
+    assert config.max_page_handles == 2 * 4096
+    # 576 bf16 latent elements plus 132 single-byte page-split carrier bytes.
+    assert config.host_page_bytes_all_layers == 24 * 64 * (576 * 2 + 132)
+
+
+def test_kimi_k31_needs_its_aux_region():
+    with pytest.raises(ValueError, match="aux"):
+        build_prefix_cache_runtime_config(
+            model_name="moonshotai/Kimi-K3.1-Pro",
+            kv_dtype="bfloat16",
+            host_kv_config=_k3_host_config(),
+            shm_name=_SHM,
+        )
+
+
+def test_kimi_k31_and_dense_k3_do_not_share_a_namespace():
+    """One region against two, so a K3 prefix must never be reused as a K3.1
+    one: the digest carries the model type and both group semantics."""
+    assert _k31_config().namespace_digest != _k3_config().namespace_digest
+    assert (
+        _k31_config().namespace_digest
+        != _glm_config("zai-org/GLM-5.3-FP8").namespace_digest
+    )
+
+
+def test_kimi_k31_groups_share_page_size_and_page_count():
+    with pytest.raises(ValueError, match="share page size and page count"):
+        _k31_config(aux=_k31_indexer_host_config(num_pages=2048))
+
+
 def test_only_the_pool_serves_k3_and_dsa_reuse():
     # K3 and DSA have no cross-wave materialization path; GPT-OSS keeps both.
     assert prefix_reuse_requires_prefill_pool(
@@ -373,6 +440,9 @@ def test_only_the_pool_serves_k3_and_dsa_reuse():
     )
     assert prefix_reuse_requires_prefill_pool(
         require_prefix_cache_model_support("zai-org/GLM-5.3-FP8")
+    )
+    assert prefix_reuse_requires_prefill_pool(
+        require_prefix_cache_model_support("moonshotai/Kimi-K3.1-Pro")
     )
     assert not prefix_reuse_requires_prefill_pool(
         require_prefix_cache_model_support("openai/gpt-oss-120b")

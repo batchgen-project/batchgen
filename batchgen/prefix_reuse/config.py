@@ -14,7 +14,14 @@ from typing import Any
 _FULL_KV_MODEL_TYPES = frozenset({"gpt_oss"})
 # GLM-5.2 sparse DSA prefill: MLA latent in the primary Host-KV region and the
 # indexer keys in the auxiliary one. GLM-5/5.1 (glm_moe_dsa) prefill is dense.
-_DSA_MODEL_TYPES = frozenset({"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"})
+_GLM_DSA_MODEL_TYPES = frozenset({"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"})
+# Kimi-K3.1 sparse DSA prefill: the same two-region shape -- the kimi_k3_mla
+# latent in the primary region, the kimi_k31_indexer page-split FP8 keys in the
+# auxiliary one, both on the same 24 physical rows and the same page size, so
+# one page table addresses both.
+_KIMI_DSA_MODEL_TYPES = frozenset({"kimi_k31"})
+# Every dual-region (latent + indexer) prefill path, i.e. two KV groups.
+_DSA_MODEL_TYPES = _GLM_DSA_MODEL_TYPES | _KIMI_DSA_MODEL_TYPES
 # Kimi-K3 and Kimi-Linear-48B dense MLA prefill: one Host-KV region holding
 # the latent -- the kimi_k3_mla profile (24 physical layers of 1 head x 576
 # bf16, page 64) over 93 engine layers, or kimi_linear_mla over 27. No indexer,
@@ -98,9 +105,9 @@ def require_prefix_cache_model_support(model_name: str) -> str:
         not in _FULL_KV_MODEL_TYPES | _DSA_MODEL_TYPES | _MLA_LATENT_MODEL_TYPES
     ):
         raise ValueError(
-            "prefix cache reuse currently supports only GPT-OSS, Kimi-K3 and "
-            f"models on the GLM-5.2 sparse DSA prefill path; model "
-            f"{model_name!r} (type {model_type!r}) is unsupported"
+            "prefix cache reuse currently supports only GPT-OSS, Kimi-K3, "
+            "Kimi-K3.1 and models on the GLM-5.2 sparse DSA prefill path; "
+            f"model {model_name!r} (type {model_type!r}) is unsupported"
         )
     return model_type
 

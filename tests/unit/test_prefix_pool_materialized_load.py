@@ -208,14 +208,17 @@ def _clear_class_state():
     AttnWrapperBase.prefill_pool_materialized_segments = ()
 
 
-def _stub_geometry(monkeypatch):
+def _stub_geometry(monkeypatch, aux=None):
     monkeypatch.setitem(
         sys.modules,
         "batchgen.kv_cache.host_kv_mananger_config",
-        SimpleNamespace(build_gpu_kv_config=lambda *a, **k: SimpleNamespace(
-            num_layers=LAYERS, num_k_heads=1, k_head_dim=LATENT,
-            kv_dtype=torch.float32,
-        )),
+        SimpleNamespace(
+            build_gpu_kv_config=lambda *a, **k: SimpleNamespace(
+                num_layers=LAYERS, num_k_heads=1, k_head_dim=LATENT,
+                kv_dtype=torch.float32,
+            ),
+            build_gpu_kv_config_aux=lambda *a, **k: aux,
+        ),
     )
 
 
@@ -265,21 +268,36 @@ def test_a_wave_that_materializes_gets_staging_for_every_layer(monkeypatch):
     _stub_geometry(monkeypatch)
     pool = _pool()
     worker, _ = _worker(pool)
-    loader = worker._materialized_segment_loader(_wave(pool))
-    assert loader is not None
+    loaders = worker._materialized_segment_loader(_wave(pool))
+    assert sorted(loaders) == [0]
+    loader = loaders[0]
     assert loader.slab_pages >= 1
     assert loader.staging_bytes == (
         LAYERS * loader.slab_pages * PAGE_TOKENS * LATENT * 4
     )
 
 
-def test_a_second_host_kv_region_is_refused_by_name(monkeypatch):
-    _stub_geometry(monkeypatch)
+def test_a_second_host_kv_region_without_an_indexer_profile_is_refused(monkeypatch):
+    """Two regions is the DSA shape, and group 1 is read back as page-split
+    index keys. A model that has the region but declares no indexer profile is
+    named here, not fed latent bytes as keys."""
+    _stub_page_split_codec(monkeypatch)
+    _stub_geometry(monkeypatch, aux=None)
     pool = _pool()
     worker, _ = _worker(
         pool, views={0: _FakeHostView(), 1: _FakeHostView()}
     )
-    with pytest.raises(RuntimeError, match="exactly one Host KV region"):
+    with pytest.raises(RuntimeError, match="no DSA\\s+indexer profile"):
+        worker._materialized_segment_loader(_wave(pool))
+
+
+def test_a_third_host_kv_region_is_refused_by_name(monkeypatch):
+    _stub_geometry(monkeypatch)
+    pool = _pool()
+    worker, _ = _worker(
+        pool, views={0: _FakeHostView(), 1: _FakeHostView(), 2: _FakeHostView()}
+    )
+    with pytest.raises(RuntimeError, match=r"groups \[0, 1, 2\]"):
         worker._materialized_segment_loader(_wave(pool))
 
 
@@ -333,7 +351,7 @@ def test_a_segment_with_no_bound_pages_is_refused_by_name(monkeypatch):
         worker._load_materialized_segments(wave, rows, loader)
 
 
-def test_a_segment_spanning_two_regions_is_refused_by_name(monkeypatch):
+def test_a_segment_naming_regions_the_model_does_not_load_is_refused(monkeypatch):
     _stub_geometry(monkeypatch)
     pool = _pool()
     wave = _wave(pool)
@@ -341,7 +359,7 @@ def test_a_segment_spanning_two_regions_is_refused_by_name(monkeypatch):
     loader = worker._materialized_segment_loader(wave)
     rows = wave.executor.build(wave.plan.chunks[0])
     wave.segment_host_pages[0] = {0: FRONTIER_PAGES, 1: FRONTIER_PAGES}
-    with pytest.raises(RuntimeError, match="Host KV regions"):
+    with pytest.raises(RuntimeError, match="this model loads groups"):
         worker._load_materialized_segments(wave, rows, loader)
 
 
@@ -422,3 +440,300 @@ def test_the_hits_host_page_table_starts_with_the_frontier(monkeypatch):
     wave = _wave(pool)
     assert wave.chain_host_pages(0) == {0: FRONTIER_PAGES}
     assert wave.chain_tokens(0) == BOUNDARY
+
+
+# --------------------------------------------------------------------------- #
+#  5. A dual-region (DSA) model: latent AND page-split index keys             #
+# --------------------------------------------------------------------------- #
+
+INDEX_DIM = 16
+#: page-split carrier: the e4m3 data bytes plus one fp32 scale per token.
+AUX_CARRIER = INDEX_DIM + 4
+
+
+def _page_split_quant():
+    """The shipped page-split layout module, loaded BY PATH.
+
+    ``batchgen_kernels.attention.dsa.__init__`` imports triton, which a CPU
+    environment does not have; the layout statement itself is torch-only,
+    which is why the loader reaches it through a seam.
+    """
+    import importlib.util
+
+    name = "_k31_pool_load_indexer_k_quant"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = (
+        Path(__file__).resolve().parents[2] / "batchgen_kernels" / "attention"
+        / "dsa" / "indexer_k_quant.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_page_split_codec(monkeypatch):
+    from batchgen.prefix_reuse import pool_materialize
+
+    quant = _page_split_quant()
+    monkeypatch.setattr(
+        pool_materialize, "_page_split_codec",
+        lambda: (int(quant.SCALE_BYTES_PER_TOKEN),
+                 quant.dequantize_page_split_pages),
+    )
+
+
+def _dsa_aux_geometry():
+    return SimpleNamespace(
+        num_layers=LAYERS, num_k_heads=1, k_head_dim=AUX_CARRIER,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+
+
+class _FakeDsaLayer(_FakeMLALayer):
+    """An MLA layer that also materializes index keys into its indexer row."""
+
+    def __init__(self, layer_idx, pool_row, pool):
+        super().__init__(layer_idx, pool_row, pool)
+        self.key_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def materialize_pool_segment_index_keys(self, *, index_keys, slots):
+        self.key_calls.append((index_keys.clone(), slots.clone()))
+        row = self._pool.indexer[self.pool_row]
+        row.view(-1, row.shape[-1])[slots] = (
+            (slots.to(torch.float32) + 1.0).reshape(-1, 1)
+            + float(self.pool_row + 1)
+        ).expand(int(slots.numel()), row.shape[-1])
+        return int(slots.numel())
+
+
+def _dsa_pool(num_pages=32):
+    """A K3.1-shaped pool: one latent row per MLA layer, no V, indexer rows."""
+    pool = PrefillPrefixPool(
+        num_layers=LAYERS,
+        num_pages=num_pages,
+        page_tokens=PAGE_TOKENS,
+        num_kv_heads=1,
+        head_dim=LATENT,
+        dtype=torch.float32,
+        device="cpu",
+        with_v=False,
+        indexer_layers=[layer for layer, row in enumerate(LAYER_MAP) if row >= 0],
+        indexer_dim=INDEX_DIM,
+    )
+    pool.k.zero_()
+    pool.indexer.zero_()
+    return pool
+
+
+def _dsa_model(pool):
+    layers = []
+    pool_rows = iter(range(LAYERS))
+    for engine_layer, row in enumerate(LAYER_MAP):
+        if row < 0:
+            layers.append(SimpleNamespace(self_attn=_FakeKDALayer()))
+            continue
+        layers.append(SimpleNamespace(
+            self_attn=_FakeDsaLayer(engine_layer, next(pool_rows), pool)
+        ))
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def _dsa_worker(pool):
+    methods = _worker_methods(
+        METHODS + ("_materialized_pool_index_key_layers",
+                   "_prefix_pool_index_key_carrier"),
+        {"logging": __import__("logging"), "torch": torch},
+    )
+    host_views = {0: _FakeHostView(), 1: _FakeHostView()}
+    worker = SimpleNamespace(
+        rank=0,
+        torch_device="cpu",
+        huggingface_ckpt_name="moonshotai/Kimi-K3.1-Pro",
+        model=_dsa_model(pool),
+        _host_views_by_group=lambda: host_views,
+    )
+    worker = _bind(worker, methods)
+    AttnWrapperBase.prefill_pool_layer_map = LAYER_MAP
+    return worker, host_views
+
+
+def _dsa_wave(pool, *, aux_pages=None):
+    """``_wave`` with Host pages bound in BOTH regions, as the dual host
+    coordinator allocates them: the same page ids in the same order."""
+    plan = plan_wave_prefix_sharing(
+        PROMPTS,
+        block_tokens=PAGE_TOKENS,
+        pool_pages=24,
+        chunk_tokens=64,
+        same_chunk_ancestors=True,
+        materialized=[MaterializedPrefix(index=0, tokens=BOUNDARY)],
+    )
+    wave = PoolWave(
+        plan=plan,
+        prompts=[list(prompt) for prompt in PROMPTS],
+        uuids=["hit", "a", "b"],
+        global_ids=list(GLOBAL_IDS),
+        page_tokens=PAGE_TOKENS,
+        total_pages=pool.num_pages,
+        pool=pool,
+        executor=PoolChunkExecutor(plan, PROMPTS, pool),
+    )
+    for segment_id in sorted(wave.materialized):
+        wave.bind_materialized_host_pages(
+            segment_id,
+            {0: FRONTIER_PAGES,
+             1: FRONTIER_PAGES if aux_pages is None else aux_pages},
+        )
+    wave.segment_sids = {
+        seg.segment_id: -11 - position
+        for position, seg in enumerate(wave.computed_segments())
+    }
+    return wave
+
+
+def test_a_dual_region_model_gets_one_loader_per_region(
+    monkeypatch
+):
+    _stub_page_split_codec(monkeypatch)
+    _stub_geometry(monkeypatch, aux=_dsa_aux_geometry())
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    loaders = worker._materialized_segment_loader(_dsa_wave(pool))
+    assert sorted(loaders) == [0, 1]
+    # Same slab geometry in both regions: a dual-region prefix is the SAME
+    # page ids in the same order, so the two slab streams must pair up.
+    assert loaders[1].slab_pages == loaders[0].slab_pages
+    assert loaders[1].staging_bytes == (
+        LAYERS * loaders[1].slab_pages * PAGE_TOKENS * AUX_CARRIER
+    )
+
+
+def test_an_aos_indexer_region_is_refused_by_name(monkeypatch):
+    """The load reads page-split pages; a bf16 AoS indexer profile declares
+    elements, not bytes, and is named rather than read as bytes."""
+    _stub_geometry(
+        monkeypatch,
+        aux=SimpleNamespace(num_layers=LAYERS, num_k_heads=1,
+                            k_head_dim=INDEX_DIM, kv_dtype=torch.bfloat16),
+    )
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    with pytest.raises(RuntimeError, match="page-split"):
+        worker._materialized_segment_loader(_dsa_wave(pool))
+
+
+def test_a_region_pair_with_different_row_counts_is_refused(
+    monkeypatch
+):
+    _stub_geometry(
+        monkeypatch,
+        aux=SimpleNamespace(num_layers=LAYERS + 1, num_k_heads=1,
+                            k_head_dim=AUX_CARRIER,
+                            kv_dtype=torch.float8_e4m3fn),
+    )
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    with pytest.raises(RuntimeError, match="addresses both by the same row"):
+        worker._materialized_segment_loader(_dsa_wave(pool))
+
+
+def _load_dsa_chunk(monkeypatch, *, pool=None, aux_pages=None):
+    _stub_page_split_codec(monkeypatch)
+    _stub_geometry(monkeypatch, aux=_dsa_aux_geometry())
+    pool = pool or _dsa_pool()
+    wave = _dsa_wave(pool, aux_pages=aux_pages)
+    worker, views = _dsa_worker(pool)
+    loaders = worker._materialized_segment_loader(wave)
+    rows = wave.executor.build(wave.plan.chunks[0])
+    loaded = worker._load_materialized_segments(wave, rows, loaders)
+    return worker, wave, rows, views, loaded
+
+
+def test_both_regions_read_the_same_pages_in_the_same_order(
+    monkeypatch
+):
+    _, _, _, views, loaded = _load_dsa_chunk(monkeypatch)
+    assert loaded == BOUNDARY
+    latent_read = [page for pages, _ in views[0].loads for page in pages]
+    keys_read = [page for pages, _ in views[1].loads for page in pages]
+    assert latent_read == keys_read == FRONTIER_PAGES
+    assert [count for _, count in views[0].loads] == [
+        count for _, count in views[1].loads
+    ]
+    # Each slab of each region was waited on before anything read it.
+    assert views[0].waits == len(views[0].loads)
+    assert views[1].waits == len(views[1].loads)
+
+
+def test_every_layer_fills_its_latent_row_and_its_indexer_row(
+    monkeypatch
+):
+    pool = _dsa_pool()
+    worker, _, rows, _, _ = _load_dsa_chunk(monkeypatch, pool=pool)
+    stage = rows.materialized[0]
+    slots = stage.slots.tolist()
+    for layer in worker._materialized_pool_layers():
+        latent = [slot for _, s in layer.calls for slot in s.tolist()]
+        keys = [slot for _, s in layer.key_calls for slot in s.tolist()]
+        assert latent == keys == slots, (
+            "a dual-region load fills both rows over the same slots, in order"
+        )
+    for row in range(LAYERS):
+        written_latent = pool.k[row].view(-1, pool.k.shape[-1]).index_select(
+            0, stage.slots
+        )
+        written_keys = pool.indexer[row].view(
+            -1, pool.indexer.shape[-1]
+        ).index_select(0, stage.slots)
+        assert torch.count_nonzero(written_latent) == written_latent.numel()
+        assert torch.count_nonzero(written_keys) == written_keys.numel()
+
+
+def test_a_segment_whose_regions_name_different_pages_is_refused(
+    monkeypatch
+):
+    """Both regions allocate in lockstep, so a segment whose aux pages are a
+    different COUNT is refused when the wave binds them."""
+    with pytest.raises(RuntimeError, match="Host page"):
+        _load_dsa_chunk(monkeypatch, aux_pages=FRONTIER_PAGES[:-1])
+
+
+def test_the_key_loader_refuses_a_page_count_that_is_not_the_segment(
+    monkeypatch
+):
+    """The loader's own gate, named for the auxiliary region: a prefix is page
+    aligned in both regions, so a token count and a page count that disagree
+    mean the two streams would not pair up."""
+    _stub_page_split_codec(monkeypatch)
+    _stub_geometry(monkeypatch, aux=_dsa_aux_geometry())
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    loaders = worker._materialized_segment_loader(_dsa_wave(pool))
+    with pytest.raises(ValueError, match="auxiliary Host page"):
+        list(loaders[1].slabs(host_page_ids=FRONTIER_PAGES[:-1],
+                              tokens=BOUNDARY))
+
+
+def test_the_nth_index_key_layer_must_be_indexer_row_n(
+    monkeypatch
+):
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    layers = worker._materialized_pool_index_key_layers(pool)
+    assert [layer.layer_idx for layer in layers] == [0, 2]
+    pool.indexer_row = {0: 1, 2: 0}
+    with pytest.raises(RuntimeError, match="must agree for a prefix load"):
+        worker._materialized_pool_index_key_layers(pool)
+
+
+def test_a_pool_without_indexer_rows_is_refused_by_name(
+    monkeypatch
+):
+    pool = _dsa_pool()
+    worker, _ = _dsa_worker(pool)
+    pool.indexer_row = {}
+    with pytest.raises(RuntimeError, match="pool's indexer rows"):
+        worker._materialized_pool_index_key_layers(pool)

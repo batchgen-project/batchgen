@@ -57,15 +57,26 @@ def _layout_method():
     return namespace["prefill_pool_layout"]
 
 
-def _config():
+def _config(*, dsa_layers=()):
+    """Dense K3 by default; ``dsa_layers`` makes it a K3.1-shaped config.
+
+    ``num_dsa_layers`` is what the layout reads to decide whether the pool
+    carries the expanded heads (dense prefill) or the latent plus index keys
+    (sparse DSA prefill).
+    """
+    dsa = frozenset(int(layer) for layer in dsa_layers)
     cfg = SimpleNamespace(
         num_hidden_layers=NUM_LAYERS,
         num_attention_heads=32,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
+        kv_lora_rank=512,
+        compressed_kv_dim=576,
+        num_dsa_layers=len(dsa),
     )
     cfg.is_mla_layer = lambda layer_idx: layer_idx not in KDA_LAYERS
+    cfg.is_dsa_layer = lambda layer_idx: layer_idx in dsa
     return cfg
 
 
@@ -159,3 +170,70 @@ def test_the_config_derivation_runs_before_the_model_is_touched():
     guard = body.index("if self.model is None")
     touch = body.index("self.model.model.layers[mla_layers[0]]")
     assert derived < guard < touch
+
+
+# --------------------------------------------------------------------------- #
+#  K3.1 (DSA): the pool holds the latent, not the expanded heads              #
+# --------------------------------------------------------------------------- #
+
+MLA_LAYERS = tuple(
+    layer for layer in range(NUM_LAYERS) if layer not in KDA_LAYERS
+)
+
+
+def _dsa_attn(*, kv_lora_rank=512, k_rope=64, wrapped=False):
+    attn = SimpleNamespace(
+        num_heads=4, kv_lora_rank=kv_lora_rank, qk_nope_head_dim=128,
+        qk_rope_head_dim=k_rope, v_head_dim=128,
+    )
+    return SimpleNamespace(module=attn) if wrapped else attn
+
+
+def test_a_dsa_config_pools_the_latent_with_no_v_row():
+    """K3.1's pooled prefill is the sparse absorbed form over the 576-wide
+    latent at page size 1, so the pool row is one latent head and there is no
+    V row to size; the index keys live in the pool's indexer rows instead."""
+    psm = _psm(attn_tp_size=8, cfg=_config(dsa_layers=MLA_LAYERS))
+    assert psm.prefill_pool_layout() == {
+        "num_layers": 4,
+        "layer_map": EXPECTED_MAP,
+        "num_kv_heads": 1,
+        "k_head_dim": 576,
+        "v_head_dim": 0,
+    }
+
+
+def test_the_dsa_latent_row_is_not_sharded_by_attn_tp_size():
+    one = _psm(attn_tp_size=1, cfg=_config(dsa_layers=MLA_LAYERS))
+    eight = _psm(attn_tp_size=8, cfg=_config(dsa_layers=MLA_LAYERS))
+    assert one.prefill_pool_layout() == eight.prefill_pool_layout()
+
+
+def test_a_resident_dsa_module_returns_the_same_latent_layout():
+    cfg = _config(dsa_layers=MLA_LAYERS)
+    without = _psm(attn_tp_size=8, cfg=cfg).prefill_pool_layout()
+    for wrapped in (False, True):
+        with_model = _psm(
+            attn_tp_size=8, cfg=cfg,
+            model=_model(_dsa_attn(wrapped=wrapped)),
+        ).prefill_pool_layout()
+        assert with_model == without
+
+
+def test_a_dsa_module_whose_latent_disagrees_with_the_config_is_refused():
+    psm = _psm(
+        attn_tp_size=8, cfg=_config(dsa_layers=MLA_LAYERS),
+        model=_model(_dsa_attn(kv_lora_rank=256)),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        psm.prefill_pool_layout()
+    assert "k_head_dim module=320 config=576" in str(excinfo.value)
+
+
+def test_a_partly_indexed_dsa_config_is_refused_by_name():
+    """Every MLA layer of a DSA model must be indexer-gated: the pool keeps one
+    latent row per MLA layer and the sparse prefill selects on all of them, so
+    a mixed stack would leave rows nothing could score."""
+    psm = _psm(attn_tp_size=8, cfg=_config(dsa_layers=MLA_LAYERS[:1]))
+    with pytest.raises(RuntimeError, match="indexer-gated"):
+        psm.prefill_pool_layout()
