@@ -108,6 +108,11 @@ _GLM5_DSA_EXTENSIONS = _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS + (
     "batchgen_kernels.attention._C_fast_hadamard_transform",
     "batchgen_kernels.attention._C_fused_rope_hadamard",
     "batchgen_kernels.attention._C_indexer_kv_proj_wgmma",
+    # The decode criticality probe's spin kernel. Loaded only when a batch
+    # requests the probe, but checked here for the same reason as the opt-in
+    # WGMMA MoE set below: it ships in the same kernel wheel, so a partial
+    # build is refused at startup, not at the first probed capture.
+    "batchgen_kernels.common._C_spin_delay",
 )
 
 # The FP8 WGMMA MoE pipeline the DSA models can select. Checked for every
