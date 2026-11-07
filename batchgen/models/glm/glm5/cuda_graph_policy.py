@@ -16,8 +16,13 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
+from batchgen.models.glm.glm5 import releases as glm5_releases
+
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
 GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
+
+# Every GLM-5 release's FP8 checkpoint name, in each spelling users pass.
+_GLM5_FP8_GRAPH_DEFAULT_PATTERNS = glm5_releases.cuda_graph_fp8_default_patterns()
 
 
 def _is_glm_model(model_name: str | None) -> bool:
@@ -26,31 +31,7 @@ def _is_glm_model(model_name: str | None) -> bool:
 
 def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     normalized = (model_name or "").strip().lower()
-    return any(
-        pattern in normalized
-        for pattern in (
-            "zai-org/glm-5-fp8",
-            "zai-org/glm-5.1-fp8",
-            "zai-org/glm-5.2-fp8",
-            "zai-org/glm-5.3-fp8",
-            "glm-5-fp8",
-            "glm_5_fp8",
-            "glm-5.1-fp8",
-            "glm_5.1_fp8",
-            "glm-5.2-fp8",
-            "glm-5.3-fp8",
-            "glm_5.2_fp8",
-            "glm_5.3_fp8",
-            "glm5-fp8",
-            "glm5_fp8",
-            "glm51-fp8",
-            "glm51_fp8",
-            "glm52-fp8",
-            "glm53-fp8",
-            "glm52_fp8",
-            "glm53_fp8",
-        )
-    )
+    return any(pattern in normalized for pattern in _GLM5_FP8_GRAPH_DEFAULT_PATTERNS)
 
 
 def _env_flag_enabled(env: Mapping[str, str], name: str) -> bool:

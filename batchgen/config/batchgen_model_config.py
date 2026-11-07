@@ -57,6 +57,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from batchgen.models.glm.glm5 import releases as glm5_releases
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from batchgen.config.model_config import BaseModelConfig
 
@@ -70,19 +72,12 @@ logger = logging.getLogger(__name__)
 # GLM-5 / GLM-5.1 share the architecturally-identical glm_moe_dsa graph and use
 # GLM5Config. GLM-5.2 and GLM-5.3 get OWN config identities; the model code
 # stays shared, while checkpoint geometry and chat contracts remain explicit.
-_SUPPORTED_VARIANTS: Dict[str, Tuple[str, str]] = {
-    "GLM-5.3-FP8": ("batchgen.models.glm.glm5.config", "GLM53Config"),
-    "GLM-5.3": ("batchgen.models.glm.glm5.config", "GLM53Config"),
-    "GLM-5.2-FP8": ("batchgen.models.glm.glm5.config", "GLM52Config"),
-    "GLM-5.2": ("batchgen.models.glm.glm5.config", "GLM52Config"),
-    "GLM-5.1-FP8": ("batchgen.models.glm.glm5.config", "GLM5Config"),
-    "GLM-5.1": ("batchgen.models.glm.glm5.config", "GLM5Config"),
-    "GLM-5-FP8": ("batchgen.models.glm.glm5.config", "GLM5Config"),
-    "GLM-5": ("batchgen.models.glm.glm5.config", "GLM5Config"),
-}
+# The rows are generated from the release registry in
+# batchgen/models/glm/glm5/releases.py.
+_SUPPORTED_VARIANTS: Dict[str, Tuple[str, str]] = glm5_releases.config_variants()
 
 # Best-effort fallback for an unlisted GLM variant (see resolve()).
-_FALLBACK_VARIANT: Tuple[str, str] = ("batchgen.models.glm.glm5.config", "GLM5Config")
+_FALLBACK_VARIANT: Tuple[str, str] = (glm5_releases.GLM5_CONFIG_MODULE, "GLM5Config")
 
 
 class BatchGenModelConfig:

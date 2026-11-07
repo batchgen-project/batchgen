@@ -923,10 +923,10 @@ class Glm5DsaAttnSegment:
     ) -> torch.Tensor:
         """Score the aux cache and select top-k, dispatching on CACHE FORMAT.
 
-        Page-split FP8 (GLM-5.2) goes to ``deep_gemm.fp8_paged_mqa_logits``,
+        Page-split FP8 (GLM-5.2, 5.3) goes to ``deep_gemm.fp8_paged_mqa_logits``,
         which computes the ReLU-gated GLM-5 aggregation directly from the paged
-        cache. A bf16 AoS cache (GLM-5, 5.1, 5.3) keeps the retired no-ReLU
-        Triton scorer. There is no fallback between them: the FP8 cache is
+        cache. A bf16 AoS cache (GLM-5, 5.1) keeps the retired no-ReLU Triton
+        scorer. There is no fallback between them: the FP8 cache is
         unreadable by the Triton kernel and the bf16 cache is unreadable by
         DeepGEMM, so a mis-detected format fails loud inside the callee.
         """
@@ -1343,10 +1343,10 @@ class Glm5FullDsaAttnSegment:
     ) -> torch.Tensor:
         """Score the aux cache and select top-k, dispatching on CACHE FORMAT.
 
-        Page-split FP8 (GLM-5.2) goes to ``deep_gemm.fp8_paged_mqa_logits``,
+        Page-split FP8 (GLM-5.2, 5.3) goes to ``deep_gemm.fp8_paged_mqa_logits``,
         which computes the ReLU-gated GLM-5 aggregation -- the training-time
         formulation -- directly from the paged cache. A bf16 AoS cache (GLM-5,
-        5.1, 5.3) keeps the retired no-ReLU Triton scorer, because that is the
+        5.1) keeps the retired no-ReLU Triton scorer, because that is the
         formulation those profiles were qualified with. Neither kernel can read
         the other's cache, so there is no fallback edge: a mis-sized cache is
         named by the format discriminator at construction.
