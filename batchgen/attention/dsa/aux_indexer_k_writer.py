@@ -1,7 +1,7 @@
 """The one GPU writer of the DSA indexer (aux) paged K cache.
 
-GLM-5, GLM-5.1 and GLM-5.3 store indexer keys as bf16 token-major records;
-GLM-5.2 stores them in DeepGEMM's page-split FP8 layout (per page: the e4m3
+GLM-5 and GLM-5.1 store indexer keys as bf16 token-major records; GLM-5.2
+and GLM-5.3 store them in DeepGEMM's page-split FP8 layout (per page: the e4m3
 K bytes, then one fp32 scale per token). The same decode code serves all of
 them, so the format is read off the CACHE the KV manager allocated rather than
 re-derived from a model name, and anything that is neither layout fails loud.

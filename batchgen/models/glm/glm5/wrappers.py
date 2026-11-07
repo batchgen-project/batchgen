@@ -26,6 +26,7 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
+from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
@@ -1353,9 +1354,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if AttnWrapperBase.prefill_pool_batch is not None:
             # Pool rows continue pooled prefixes: only the sparse path reads the
             # pool, and it equals dense attention for contexts <= index_topk.
-            if getattr(config, "model_type", None) not in {
-                "glm_moe_dsa_5_2", "glm_moe_dsa_5_3",
-            }:
+            if getattr(config, "model_type", None) not in SPARSE_PREFILL_MODEL_TYPES:
                 raise RuntimeError("the prefill prefix pool needs GLM-5.2 sparse DSA prefill")
             return True
         return sparse_prefill.should_use_glm52_sparse_prefill(
