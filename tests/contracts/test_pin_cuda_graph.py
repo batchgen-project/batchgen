@@ -106,14 +106,17 @@ PINS = {
                 "build_segments",
                 "capture_inputs_for",
                 "capture_signature",
+                "criticality_probe_request",
                 "debug_options",
                 "eligibility",
+                "install_criticality_probe",
                 "is_supported",
                 "prepare_replay_inputs",
                 "release_all",
                 "release_context",
                 "run_eager_reference",
                 "select_buckets",
+                "set_criticality_probe_request",
                 "stage_post_graph_kv",
             ],
             "methods": {
@@ -183,6 +186,19 @@ PINS = {
                 "release_context": {
                     "params": ["self"],
                     "returns": "None",
+                },
+                # Optional decode criticality probe hooks (defaults: no probe).
+                "criticality_probe_request": {
+                    "params": ["self", "batchgen_debug", "graph_enabled"],
+                    "returns": "Optional[Hashable]",
+                },
+                "set_criticality_probe_request": {
+                    "params": ["self", "request"],
+                    "returns": "None",
+                },
+                "install_criticality_probe": {
+                    "params": ["self", "request", "whole_model_segment", "device"],
+                    "returns": "Any",
                 },
             },
         },
