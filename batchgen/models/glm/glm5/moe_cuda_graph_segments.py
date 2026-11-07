@@ -746,6 +746,12 @@ class Glm5MoEGraphBufferPool:
 class Glm5MoEGraphSegment:
     """Graph-capturable full GLM-5 MoE decode module segment."""
 
+    # Decode criticality probe (criticality_probe.py), installed through the
+    # layer segment before capture; DeepEP path only. None, the default,
+    # launches nothing. A class attribute so segments built without __init__
+    # start uninstalled.
+    criticality_probe = None
+
     def __init__(
         self,
         moe,
@@ -857,6 +863,25 @@ class Glm5MoEGraphSegment:
         gate/up GEMM nothing.
         """
         return self._fuse_shared_expert_norm_quant
+
+    def set_criticality_probe(self, probe) -> None:
+        """Install (or clear, with ``None``) the decode criticality probe.
+
+        The NCCL path is refused: its shared expert runs in line on the main
+        stream after the reduce_scatter, so the DeepEP sites (dispatch,
+        combine, the side-stream shared expert) have no counterpart there, and
+        a probe that silently measured a different topology would be read as
+        the DeepEP one.
+        """
+        if probe is not None and not self.deepep_ll:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: the GLM-5 decode criticality probe "
+                "(batchgen_debug.glm5_criticality_probe) supports only the "
+                "DeepEP MoE decode path; this graph uses the NCCL "
+                "all_gather/reduce_scatter path. Start the server with "
+                "--enable-deepep to probe it."
+            )
+        self.criticality_probe = probe
 
     def _shared_expert_fused_x(
         self,
@@ -1364,6 +1389,10 @@ class Glm5MoEGraphSegment:
                     f"{tuple(bufs.shared_out.shape)}/{bufs.shared_out.dtype}); "
                     "the accumulate would read a buffer the side stream never "
                     "wrote.")
+            # Inside the fork: on the side stream, after the shared expert's
+            # last launch and before the event the join waits on.
+            if self.criticality_probe is not None:
+                self.criticality_probe.mark("after_shared_expert", self.moe.layer_idx)
 
         # The top-k runs on this stream while the shared expert's x quant and
         # gate/up GEMM run on the side stream. A GEMM CTA is not placed on an
@@ -1384,6 +1413,11 @@ class Glm5MoEGraphSegment:
             rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
             rows_per_rank=bucket_size,
         )
+        # After the gate, never between it and the router GEMM: the gate is a
+        # programmatic dependent launch behind the GEMM, and a node between
+        # them would break that pairing.
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_router", self.moe.layer_idx)
 
         # Dispatch and combine each run as a SEND kernel followed by a separate
         # RECEIVE kernel, both on this stream (``split_phases``; DeepEP's
@@ -1392,6 +1426,8 @@ class Glm5MoEGraphSegment:
         recv_x, recv_scales, recv_count, handle = exchange.dispatch_fp8(
             padded, bufs.ll_topk_idx, split_phases=True
         )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_dispatch", self.moe.layer_idx)
         # recv_x [e, stride, h] fp8 and recv_scales [e, stride, h/128] f32 are
         # the masked GEMM's A operands AS DELIVERED: the values are already
         # expert-major on a uniform stride, and the scales are already the
@@ -1437,6 +1473,9 @@ class Glm5MoEGraphSegment:
             act_scales=bufs.ll_act_scale,
             out=bufs.expert_out.view(e, stride, self.hidden_size),
         )
+        # After R2, outside the R1 -> activation -> R2 chain.
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_expert_gemm", self.moe.layer_idx)
 
         exchange.combine(
             bufs.expert_out.view(e, stride, self.hidden_size),
@@ -1446,6 +1485,8 @@ class Glm5MoEGraphSegment:
             out=bufs.local_moe_output,
             split_phases=True,
         )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_combine", self.moe.layer_idx)
 
         # JOIN, at the first point that reads the shared output -- the combine
         # above is the last main-stream work the fork can hide behind. There

@@ -1106,6 +1106,12 @@ class Glm5FullDsaAttnSegment:
     # layer never touches the aux cache and takes only the primary slice.
     WRITES_AUX_HOST_KV = True
 
+    # Decode criticality probe (criticality_probe.py), installed through the
+    # layer segment before capture. None, the default, launches nothing. A
+    # class attribute so the reuse-topk subclass, which skips this __init__,
+    # starts uninstalled too.
+    criticality_probe = None
+
     def __init__(
         self,
         *,
@@ -1314,6 +1320,10 @@ class Glm5FullDsaAttnSegment:
         hand the qkv_a GEMM nothing.
         """
         return self._fuse_qkv_a_norm_quant
+
+    def set_criticality_probe(self, probe) -> None:
+        """Install (or clear, with ``None``) the decode criticality probe."""
+        self.criticality_probe = probe
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -2431,6 +2441,11 @@ class Glm5FullDsaAttnSegment:
                     scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
                     num_valid_tokens=num_valid_tokens,
                 )
+            # Inside the fork: this spin node runs on the indexer-K side
+            # stream, after the K path's last launch and before the event the
+            # join waits on.
+            if self.criticality_probe is not None:
+                self.criticality_probe.mark("after_indexer_k_path", self.layer_idx)
 
         # ---- Q path / MLA spine, on the main stream ----------------------
         if not self._indexer_wk_deepgemm:
@@ -2485,6 +2500,8 @@ class Glm5FullDsaAttnSegment:
                 num_valid_tokens=num_valid_tokens,
                 scale_tma_aligned=num_valid_tokens is not None,
             )
+        if self.criticality_probe is not None:
+            self.criticality_probe.mark("after_q_a_norm_quant", self.layer_idx)
         # The q_b projection, in one of its two versions (selected once in
         # __init__), over the layer's ONE blocked quantize of ``q_a_normed``:
         #   merged:   one DeepGEMM over the load-time concatenated
@@ -2628,6 +2645,8 @@ class Glm5FullDsaAttnSegment:
                 num_valid_tokens=num_valid_tokens,
                 paged_mqa_prep_ready=paged_mqa_prep_ready,
             )
+            if self.criticality_probe is not None:
+                self.criticality_probe.mark("after_indexer", self.layer_idx)
 
         absorb_q_out(
             q_nope_strided,
