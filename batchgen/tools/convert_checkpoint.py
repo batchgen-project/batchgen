@@ -86,6 +86,28 @@ Output Format:
         help='Enable verbose debug logging'
     )
     parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=None,
+        help='Shard conversion threads (default: 8, or one per local GPU '
+             'with Marlin repack, whichever is larger)'
+    )
+    parser.add_argument(
+        '--partition-index',
+        type=int,
+        default=0,
+        help='This node\'s partition of the sorted shard list '
+             '(0 <= index < --partition-count)'
+    )
+    parser.add_argument(
+        '--partition-count',
+        type=int,
+        default=1,
+        help='Number of nodes converting this checkpoint concurrently; '
+             'each converts every partition-count-th shard. Run '
+             '--validate-only once after all partitions finished.'
+    )
+    parser.add_argument(
         '--no-marlin',
         action='store_true',
         help='Skip Marlin INT4 repack (default: Marlin repack enabled for K2.5 decode)'
@@ -142,6 +164,9 @@ Output Format:
                 output_dir=output_dir,
                 force=parsed_args.force,
                 marlin=not parsed_args.no_marlin,
+                max_workers=parsed_args.max_workers,
+                partition_index=parsed_args.partition_index,
+                partition_count=parsed_args.partition_count,
             )
 
             logging.info(f"Conversion completed successfully!")

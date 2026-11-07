@@ -1,3 +1,4 @@
+import itertools
 import json
 import safetensors
 from safetensors.torch import load_file
@@ -7,6 +8,13 @@ import logging
 import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+#: Output .bin files are written through a buffer of this size, so the many
+#: small per-tensor writes reach a network filesystem as large sequential
+#: ones instead of thousands of tiny requests per shard.
+WRITE_BUFFER_BYTES = 64 * 1024 * 1024
+
+
 class ckpt_converter:
 	"""
 		Convert .safetesors or .pt checkpoints to a format compatible with BatchGen.
@@ -28,9 +36,28 @@ class ckpt_converter:
 		We save the tensors in a file. And the metadata in a json file.
 	"""
 	def __init__(self):
-		# Serializes the GPU marlin repack across parallel shard workers
-		# (convert_model_directory): single CUDA context, no contention/OOM.
-		self._marlin_lock = threading.Lock()
+		# One repack lock PER GPU: parallel shard workers each repack on
+		# their round-robin device, so all local GPUs work concurrently
+		# while no two workers contend on one device (or its memory).
+		self._repack_locks = {}
+		self._locks_guard = threading.Lock()
+		self._device_rr = itertools.count()
+
+	def _next_repack_device(self):
+		"""Round-robin CUDA device for one shard's repack; None without GPUs."""
+		if not torch.cuda.is_available():
+			return None
+		count = torch.cuda.device_count()
+		if count < 1:
+			return None
+		return f"cuda:{next(self._device_rr) % count}"
+
+	def _repack_lock(self, device):
+		with self._locks_guard:
+			lock = self._repack_locks.get(device)
+			if lock is None:
+				lock = self._repack_locks[device] = threading.Lock()
+			return lock
 
 	def _dtype_to_str(self, dtype):
 		"""
@@ -59,7 +86,7 @@ class ckpt_converter:
 		else:
 			raise ValueError(f"Unsupported dtype: {dtype}")
 		
-	def _apply_marlin_repack(self, ckpt):
+	def _apply_marlin_repack(self, ckpt, device=None):
 		"""Replace INT4 expert weights with Marlin tile layout IN-PLACE using GPU kernel.
 
 		Finds paired weight_packed + weight_scale tensors for routed expert
@@ -80,7 +107,8 @@ class ckpt_converter:
 		k3_pattern = re.compile(
 			r'(.+\.block_sparse_moe\.experts\.\d+\.w[123])\.weight_packed$')
 
-		device = "cuda" if torch.cuda.is_available() else None
+		if device is None:
+			device = "cuda" if torch.cuda.is_available() else None
 		if device is None:
 			logging.warning("[ckpt_converter] No GPU available, skipping Marlin repack")
 			return ckpt
@@ -160,7 +188,7 @@ class ckpt_converter:
 			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections replaced in-place")
 		return ckpt
 
-	def convert(self, ckpt_path, output_dir, marlin=False):
+	def convert(self, ckpt_path, output_dir, marlin=False, repack_device=None):
 		# Check if the file dir exists
 		if not os.path.exists(ckpt_path):
 			raise FileNotFoundError(f"Checkpoint file path {ckpt_path} does not exist.")
@@ -181,10 +209,17 @@ class ckpt_converter:
 		else:
 			ckpt = torch.load(ckpt_path, weights_only=True)
 
-		# Optional: repack INT4 expert weights to Marlin tile layout
+		# Optional: repack INT4 expert weights to Marlin tile layout, on this
+		# shard's device, serialized only against other shards on the SAME
+		# device.
 		if marlin:
-			with self._marlin_lock:
-				ckpt = self._apply_marlin_repack(ckpt)
+			device = repack_device or self._next_repack_device()
+			if device is None:
+				ckpt = self._apply_marlin_repack(ckpt, None)
+			else:
+				with self._repack_lock(device):
+					with torch.cuda.device(device):
+						ckpt = self._apply_marlin_repack(ckpt, device)
 
 		out_file_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".bin")).replace(".pt", ".bin")
 		out_metadata_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".json").replace(".pt", ".json"))	
@@ -195,7 +230,7 @@ class ckpt_converter:
 		total_byte_size = 0
 		
 
-		with open(out_file_name, "wb") as out_file:
+		with open(out_file_name, "wb", buffering=WRITE_BUFFER_BYTES) as out_file:
 			for tensor_name, tensor in ckpt.items():
 				if not isinstance(tensor, torch.Tensor):
 					logging.warning(f"Skipping non-tensor {tensor_name} in checkpoint.")
@@ -306,7 +341,7 @@ class ckpt_converter:
 
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, max_workers=None):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, max_workers=None, partition_index=0, partition_count=1):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -319,6 +354,16 @@ class ckpt_converter:
 			           If None, defaults to <input_dir>/converted_ckpt
 			force: If True, reconvert even if output directory already exists
 			       and contains valid converted files
+			partition_index/partition_count: convert only every
+			       partition_count-th file starting at partition_index (of the
+			       sorted file list), so several nodes convert one checkpoint
+			       concurrently into a shared output directory. Each converted
+			       shard depends only on its source file, so partitions are
+			       disjoint and complete. With partition_count > 1 the
+			       existing-output shortcut and the final whole-directory
+			       validation are skipped (other partitions may still be
+			       running); run --validate once after every partition
+			       finished.
 
 		Returns:
 			Path to the directory containing converted checkpoint files
@@ -339,16 +384,32 @@ class ckpt_converter:
 		if output_dir is None:
 			output_dir = os.path.join(input_dir, "converted_ckpt")
 
+		if partition_count < 1 or not 0 <= partition_index < partition_count:
+			raise ValueError(
+				f"partition_index/partition_count must satisfy 0 <= index < count; "
+				f"got {partition_index}/{partition_count}"
+			)
+
 		# Get list of checkpoint files
 		file_list = self._get_checkpoint_files(input_dir)
 
 		if not file_list:
 			raise ValueError(f"No checkpoint files (.safetensors or .pt) found in {input_dir}")
 
-		logging.info(f"Found {len(file_list)} checkpoint files to convert")
+		if partition_count > 1:
+			file_list = file_list[partition_index::partition_count]
+			logging.info(
+				f"Partition {partition_index}/{partition_count}: converting "
+				f"{len(file_list)} of the checkpoint files"
+			)
+			if not file_list:
+				return output_dir
+		else:
+			logging.info(f"Found {len(file_list)} checkpoint files to convert")
 
-		# Check if already converted
-		if os.path.exists(output_dir) and not force:
+		# Check if already converted (whole-directory shortcut: only
+		# meaningful when this call owns the whole conversion)
+		if partition_count == 1 and os.path.exists(output_dir) and not force:
 			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir)
 			if is_valid:
 				logging.info(f"Converted checkpoint files already exist and are valid in {output_dir}")
@@ -363,12 +424,19 @@ class ckpt_converter:
 		os.makedirs(output_dir, exist_ok=True)
 		logging.info(f"Converting {len(file_list)} checkpoint files to BatchGen format...")
 
-		# Convert shards in PARALLEL. Per-shard cost is dominated by network-filesystem
-		# I/O (safetensors read + .bin write), which overlaps across threads;
-		# the GPU marlin repack is serialized by self._marlin_lock (single CUDA
-		# context) so there is no GPU contention or transient-HBM OOM. A failed
-		# shard re-raises (fail-fast; no partial-output silent success).
-		workers = min(8, len(file_list)) if max_workers is None else int(max_workers)
+		# Convert shards in PARALLEL. Per-shard cost is network-filesystem
+		# I/O (safetensors read + buffered .bin write), which overlaps across
+		# threads, plus the GPU marlin repack, which runs on a round-robin
+		# device with one lock per device, so every local GPU repacks
+		# concurrently with no per-device contention or transient-HBM OOM.
+		# A failed shard re-raises (fail-fast; no partial-output silent
+		# success).
+		if max_workers is None:
+			workers = min(8, len(file_list))
+			if marlin and torch.cuda.is_available():
+				workers = min(max(workers, torch.cuda.device_count()), len(file_list))
+		else:
+			workers = int(max_workers)
 		workers = max(1, workers)
 		try:
 			from tqdm import tqdm
