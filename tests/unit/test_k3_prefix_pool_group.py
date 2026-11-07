@@ -602,6 +602,35 @@ def test_enough_state_slots_keeps_the_pool(monkeypatch):
     assert len(wave.plan.segments) + len(PROMPTS) == 3
 
 
+def test_a_short_slot_budget_pools_the_segments_it_can_fund(monkeypatch):
+    # Two pairs, each sharing its own two-block prefix: two segments plus four
+    # sequences need six slots. With five, the wave used to decline outright;
+    # it now pools the one segment the spare slot funds and recomputes the
+    # other pair's prefix, identically on every rank (group-MIN budget).
+    pair_a = list(range(300, 300 + 2 * PAGE_TOKENS))
+    pair_b = list(range(600, 600 + 2 * PAGE_TOKENS))
+    prompts = [pair_a + [1, 2], pair_a + [3, 4], pair_b + [5, 6], pair_b + [7, 8]]
+    uuids = ["w", "x", "y", "z"]
+    seqs = {
+        uuid: SimpleNamespace(
+            uuid=uuid, global_idx=10 + i, assigned_rank=0, decode_dp_group=0,
+            prompt_length=len(prompt),
+            input_ids=torch.tensor([prompt], dtype=torch.long),
+        )
+        for i, (uuid, prompt) in enumerate(zip(uuids, prompts))
+    }
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker = _plan_worker(free_pages=64, fake_dist=FakeDist(peer_budget=[64, 5]))
+    worker.global_batch = SimpleNamespace(get_sequence=seqs.get)
+
+    wave = worker._plan_prefill_pool_wave(uuids, {})
+
+    assert wave is not None
+    assert len(wave.plan.segments) == 1
+    assert len(wave.plan.segments) + len(prompts) <= 5
+    assert wave.plan.saved_tokens == 2 * PAGE_TOKENS
+
+
 def test_a_model_without_recurrent_state_never_checks_slots(monkeypatch):
     # -1 means "no such state"; the comparison must not fire on it.
     _stub_heavy_modules(monkeypatch, free_state_slots=None)

@@ -13482,6 +13482,12 @@ class BatchGenWorker:
 				self.rank, len(hits),
 			)
 			hits = []
+		# Every computed segment holds a recurrent-state slot for the wave on
+		# top of the wave's own sequences, so the planner pools only as many
+		# (the highest-saving ones) as the group-MIN slot budget leaves spare,
+		# instead of declining the whole wave when the full tree does not fit.
+		if state_slots >= 0:
+			plan_kwargs["max_computed_segments"] = max(0, state_slots - len(prompts))
 		try:
 			plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
 		except PoolMaterializationDoesNotFit as exc:
