@@ -1472,28 +1472,76 @@ def _read_span_digests(
     if buffer is None or len(buffer) < read_buffer_bytes:
         buffer = memoryview(bytearray(read_buffer_bytes))
         _READ_BUFFERS.view = buffer
-    out = []
-    for row, offset, byte_size in spans:
-        hasher = _digest()
-        position, end = offset, offset + byte_size
-        while position < end:
-            want = min(end - position, read_buffer_bytes)
-            got = os.preadv(descriptor, [buffer[:want]], position)
-            if not got:
-                raise EOFError(
-                    f"store ends at {position} B inside metadata row {row}"
-                )
-            chunk = buffer[:got]
-            hasher.update(chunk)
-            if sink is not None:
-                written = 0
-                while written < got:
-                    written += os.pwrite(sink, chunk[written:], position + written)
-            position += got
-        out.append(hasher.digest())
-        if progress is not None:
-            progress(byte_size)
+    out: List[bytes] = []
+    start = 0
+    while start < len(spans):
+        # Back-to-back spans (the store layout has no padding) are read as
+        # one run in full-buffer chunks, so small tensors do not each cost a
+        # read; every tensor is still hashed over exactly its own bytes.
+        stop = start + 1
+        while stop < len(spans) and spans[stop][1] == (
+            spans[stop - 1][1] + spans[stop - 1][2]
+        ):
+            stop += 1
+        _read_run_digests(
+            descriptor, spans[start:stop], buffer[:read_buffer_bytes], sink,
+            progress, out,
+        )
+        start = stop
     return out
+
+
+def _read_run_digests(
+    descriptor: int,
+    run: Sequence[Span],
+    buffer: memoryview,
+    sink: Optional[int],
+    progress: Any,
+    out: List[bytes],
+) -> None:
+    """Append the digests of contiguous ``run`` to ``out``."""
+    index = 0
+    hasher = _digest()
+    remaining = run[0][2]
+
+    def finish_empty_tensors() -> None:
+        nonlocal index, hasher, remaining
+        while remaining == 0 and index < len(run):
+            out.append(hasher.digest())
+            if progress is not None:
+                progress(run[index][2])
+            index += 1
+            if index < len(run):
+                hasher = _digest()
+                remaining = run[index][2]
+
+    finish_empty_tensors()
+    position = run[0][1]
+    end = run[-1][1] + run[-1][2]
+    while position < end:
+        got = os.preadv(
+            descriptor, [buffer[: min(end - position, len(buffer))]], position
+        )
+        if not got:
+            raise EOFError(
+                f"store ends at {position} B inside metadata row "
+                f"{run[index][0]}"
+            )
+        chunk = buffer[:got]
+        if sink is not None:
+            written = 0
+            while written < got:
+                written += os.pwrite(sink, chunk[written:], position + written)
+        consumed = 0
+        while consumed < got:
+            take = min(remaining, got - consumed)
+            if take == 0:  # unreachable: the run's sizes sum to its length
+                raise AssertionError("contiguous run outgrew its spans")
+            hasher.update(chunk[consumed: consumed + take])
+            consumed += take
+            remaining -= take
+            finish_empty_tensors()
+        position += got
 
 
 #: Per-thread read buffers of :func:`_read_span_digests`.

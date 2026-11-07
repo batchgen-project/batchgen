@@ -1509,3 +1509,53 @@ def test_the_exported_fixed_hash_worker_count_stays_an_int():
     # the builder CLI defaults to adaptive.
     assert isinstance(sb.DEFAULT_HASH_WORKERS, int) and sb.DEFAULT_HASH_WORKERS > 0
     assert sb.DEFAULT_COPY_WORKERS is None and sb.DEFAULT_VERIFY_WORKERS is None
+
+
+@pytest.mark.parametrize("buffer_bytes", [1, 3, 7, 64, 1 << 20])
+def test_run_reads_hash_each_span_exactly_like_per_span_reads(tmp_path, buffer_bytes):
+    import random as _random
+
+    rng = _random.Random(7)
+    data = bytes(rng.randrange(256) for _ in range(4096))
+    path = tmp_path / "blob.bin"
+    path.write_bytes(data)
+    # Contiguous runs with zero-length tensors, a gap, and a run that
+    # crosses many buffer boundaries.
+    spans = [
+        (0, 0, 10), (1, 10, 0), (2, 10, 33), (3, 43, 0), (4, 43, 0),
+        (5, 43, 100), (6, 200, 17), (7, 217, 1000), (8, 1217, 0),
+        (9, 3000, 1096),
+    ]
+    sink_path = tmp_path / "sink.bin"
+    descriptor = os.open(path, os.O_RDONLY)
+    sink = os.open(sink_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.ftruncate(sink, len(data))
+    seen = []
+    try:
+        got = sb._read_span_digests(
+            descriptor, spans, buffer_bytes, sink, progress=seen.append
+        )
+    finally:
+        os.close(descriptor)
+        os.close(sink)
+    expected = []
+    for _, offset, size in spans:
+        hasher = sb._digest()
+        hasher.update(data[offset: offset + size])
+        expected.append(hasher.digest())
+    assert got == expected
+    assert seen == [size for _, _, size in spans]
+    copied = sink_path.read_bytes()
+    for _, offset, size in spans:
+        assert copied[offset: offset + size] == data[offset: offset + size]
+
+
+def test_run_read_of_a_truncated_store_names_the_row(tmp_path):
+    path = tmp_path / "short.bin"
+    path.write_bytes(b"x" * 50)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(EOFError, match="metadata row 2"):
+            sb._read_span_digests(descriptor, [(1, 0, 40), (2, 40, 40)], 16)
+    finally:
+        os.close(descriptor)
