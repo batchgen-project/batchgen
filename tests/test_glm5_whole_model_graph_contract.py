@@ -464,3 +464,87 @@ def test_glm5_layer_graph_segment_empty_rank_capture_context():
 
     assert static_inputs["num_valid_tokens"].item() == 0
     assert static_inputs["rank_token_counts"].tolist() == rank_counts.tolist()
+
+
+def _criticality_probe(sites=("after_attention",), layers="all", log=None):
+    from batchgen.models.glm.glm5.criticality_probe import (
+        SITES,
+        CriticalityProbe,
+        CriticalityProbeSpec,
+    )
+
+    spec = CriticalityProbeSpec.parse(
+        {"sites": list(sites), "layers": layers, "schedule": [{"steps": 1}]}
+    )
+    log = [] if log is None else log
+    return CriticalityProbe(
+        spec, torch.device("cpu"),
+        launch=lambda table, site: log.append(SITES[site]),
+    )
+
+
+class _ProbeLayerSegment:
+    def __init__(self):
+        self.criticality_probe = "unset"
+
+    def set_criticality_probe(self, probe):
+        self.criticality_probe = probe
+
+
+def test_glm5_whole_model_segment_hands_the_probe_to_every_layer():
+    layers = [_ProbeLayerSegment(), _ProbeLayerSegment()]
+    segment = _make_segment(layer_segments=layers)
+    assert segment.criticality_probe is None
+    probe = _criticality_probe()
+    segment.set_criticality_probe(probe)
+    assert segment.criticality_probe is probe
+    assert [layer.criticality_probe for layer in layers] == [probe, probe]
+    segment.set_criticality_probe(None)
+    assert segment.criticality_probe is None
+    assert [layer.criticality_probe for layer in layers] == [None, None]
+
+
+def test_glm5_whole_model_segment_rejects_a_probe_it_cannot_install():
+    with pytest.raises(RuntimeError, match="composes none"):
+        _make_segment().set_criticality_probe(_criticality_probe())
+
+    class _NoProbeLayer:
+        pass
+
+    segment = _make_segment(layer_segments=[_ProbeLayerSegment(), _NoProbeLayer()])
+    with pytest.raises(RuntimeError, match="layer 1 .* must expose set_criticality_probe"):
+        segment.set_criticality_probe(_criticality_probe())
+    # The fake model has two layers: layer 2 does not exist.
+    segment = _make_segment(layer_segments=[_ProbeLayerSegment(), _ProbeLayerSegment()])
+    with pytest.raises(ValueError, match="out of range"):
+        segment.set_criticality_probe(_criticality_probe(layers=[0, 2]))
+
+
+def test_glm5_whole_model_forward_counts_the_probe_marks_per_forward():
+    layers = [_ProbeLayerSegment(), _ProbeLayerSegment()]
+    segment = _make_segment(layer_segments=layers)
+    log = []
+    probe = _criticality_probe(log=log)
+    segment.set_criticality_probe(probe)
+    segment._set_moe_bucket_state = lambda bucket_size, rank_token_counts: None
+
+    def run_model_with_probes(**kwargs):
+        for layer_idx in range(2):
+            probe.mark("after_attention", layer_idx)
+        return {"logits": torch.zeros(1, 1)}
+
+    segment.run_model_with_probes = run_model_with_probes
+    inputs = dict(
+        input_ids=torch.zeros(1, 1, dtype=torch.int64),
+        cache_seqlens=torch.zeros(1, dtype=torch.int32),
+        position_ids=torch.zeros(1, 1, dtype=torch.int64),
+        primary_slot_indices=torch.zeros(1, dtype=torch.int32),
+        aux_slot_indices=torch.zeros(1, dtype=torch.int32),
+        rank_token_counts=torch.zeros(16, dtype=torch.int64),
+    )
+    for _ in range(3):   # warmup forwards and the capture forward
+        segment.forward(**inputs)
+    assert log == ["after_attention"] * 6
+    from batchgen.models.glm.glm5.criticality_probe import SITE_INDEX
+
+    assert probe.layer_marks[SITE_INDEX["after_attention"]] == 2

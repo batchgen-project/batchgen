@@ -39,6 +39,11 @@ from batchgen.cuda_graph.graph_manager import (
     CapturableSegment,
     CUDAGraphManager,
 )
+from batchgen.models.glm.glm5.criticality_probe import (
+    DEBUG_KEY as CRITICALITY_PROBE_DEBUG_KEY,
+    CriticalityProbe,
+    CriticalityProbeSpec,
+)
 from batchgen.models.wrappers.attention import AttnWrapperBase
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,15 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
     """
 
     DEFAULT_NUM_BUCKETS = 9
+
+    # The decode criticality probe request of the current round
+    # (criticality_probe.py), or None. Part of the capture signature, so a
+    # graph captured for another request never replays. Class-level defaults
+    # so an adapter built without __init__ starts with no request.
+    _round_criticality_probe_request: Hashable = None
+    _round_criticality_probe_spec: Any = None
+    # One-entry parse cache for criticality_probe_request: (raw flag, spec).
+    _criticality_probe_parsed: Optional[Tuple[Any, Any]] = None
 
     def __init__(
         self,
@@ -216,6 +230,75 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         )
         return bundle
 
+    # ---- Decode criticality probe ----------------------------------------
+
+    def _criticality_probe_spec(self, batchgen_debug: Any):
+        if not isinstance(batchgen_debug, dict):
+            return None
+        raw = batchgen_debug.get(CRITICALITY_PROBE_DEBUG_KEY)
+        if raw is None:
+            return None
+        cached = self._criticality_probe_parsed
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+        spec = CriticalityProbeSpec.parse(raw)
+        self._criticality_probe_parsed = (raw, spec)
+        return spec
+
+    def criticality_probe_request(
+        self, batchgen_debug: Any, *, graph_enabled: bool
+    ) -> Optional[Hashable]:
+        """``batchgen_debug.glm5_criticality_probe`` as a request, or None.
+
+        Raises ``ValueError`` for a malformed request and for any request
+        without the whole-model decode graph it instruments.
+        """
+        spec = self._criticality_probe_spec(batchgen_debug)
+        if spec is None:
+            return None
+        if not graph_enabled:
+            raise ValueError(
+                "batchgen_debug.glm5_criticality_probe instruments the GLM-5 "
+                "whole-model decode CUDA graph; start the server with "
+                "--enable-cuda-graph to use it"
+            )
+        return spec.signature()
+
+    def set_criticality_probe_request(self, request: Optional[Hashable]) -> None:
+        self._round_criticality_probe_request = request
+        # The spec behind the round's request, for install_criticality_probe:
+        # the per-step mid-round parse may move the cache to another request.
+        cached = self._criticality_probe_parsed
+        self._round_criticality_probe_spec = (
+            cached[1]
+            if request is not None and cached is not None
+            and cached[1].signature() == request
+            else None
+        )
+        if request is not None and self._round_criticality_probe_spec is None:
+            raise RuntimeError(
+                "GLM-5 criticality probe request was not produced by this "
+                "adapter's criticality_probe_request"
+            )
+
+    def install_criticality_probe(
+        self,
+        request: Hashable,
+        *,
+        whole_model_segment: Any,
+        device: torch.device,
+    ) -> Any:
+        """Build the request's probe and hand it to every layer segment."""
+        spec = self._round_criticality_probe_spec
+        if spec is None or spec.signature() != request:
+            raise RuntimeError(
+                "GLM-5 criticality probe install for a request that is not "
+                "this round's; set_criticality_probe_request must record it first"
+            )
+        probe = CriticalityProbe(spec, device)
+        whole_model_segment.set_criticality_probe(probe)
+        return probe
+
     # ---- Capture-time ---------------------------------------------------
 
     def capture_signature(
@@ -230,7 +313,9 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         Lifted from `_glm5_whole_model_graph_capture_signature` (worker:9823)
         with the additional invariants required to invalidate the graph on
         any of: world_size change, bucket-set change, max_seqlen change, or
-        head-count change (audit §A finding #5).
+        head-count change (audit §A finding #5), plus the requested decode
+        criticality probe (None without one), whose spin nodes change the
+        captured graph.
         """
         if gpu_kv_manager is None:
             return None
@@ -267,6 +352,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             int(num_heads),
             _table_sig(primary_manager),
             _table_sig(aux_manager),
+            self._round_criticality_probe_request,
         )
 
     def capture_inputs_for(

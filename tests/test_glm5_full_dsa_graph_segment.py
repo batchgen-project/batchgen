@@ -1460,3 +1460,92 @@ def test_indexer_k_path_side_stream_is_joined_before_every_reader(monkeypatch, a
         replayed = snapshot({k: v[:2] for k, v in out.items()})
         for key, value in reference.items():
             assert torch.equal(replayed[key], value), key
+
+
+# --------------------------------------------------------------------------- #
+# Decode criticality probe (GPU runtime; the CPU source contract is in
+# tests/test_glm5_criticality_probe.py)
+# --------------------------------------------------------------------------- #
+
+def _run_selected_forward(segment, device):
+    attn = segment.attn
+    bsz = 2
+    segment.forward(
+        hidden_states=torch.randn(bsz, 1, attn.hidden_size, dtype=torch.bfloat16, device=device),
+        position_ids=torch.tensor([[1], [2]], dtype=torch.int64, device=device),
+        cache_seqlens=torch.tensor([2, 3], dtype=torch.int32, device=device),
+        primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        num_valid_tokens=torch.tensor([bsz], dtype=torch.int32, device=device),
+    )
+    torch.cuda.synchronize()
+
+
+@requires_cuda
+@pytest.mark.parametrize("all_short", [False, True])
+def test_criticality_probe_spins_at_the_dsa_sites_on_the_right_streams(monkeypatch, all_short):
+    """One spin per DSA site, after its op, on the stream the op ran on.
+
+    The probe's launcher is a recorder that notes, per spin, the stub kernels
+    already issued and the current stream. With the probe cleared the segment
+    issues exactly the stub calls it issued with it, minus the spins.
+    """
+    from batchgen.models.glm.glm5.criticality_probe import (
+        SITES,
+        CriticalityProbe,
+        CriticalityProbeSpec,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    recorder: dict = {}
+    segment, _, _ = _build_full_segment(
+        monkeypatch, device, {}, all_short=all_short, recorder=recorder
+    )
+    side = segment._indexer_k_overlap
+    assert isinstance(side, segments._IndexerKPathOverlap)
+    spins = []
+
+    def launch(table, site):
+        spins.append((
+            SITES[site],
+            tuple(recorder["scoring"]),
+            len(recorder["fa3"]),
+            torch.cuda.current_stream() == side.stream,
+        ))
+
+    dsa_sites = ["after_q_a_norm_quant", "after_indexer", "after_indexer_k_path"]
+    probe = CriticalityProbe(
+        CriticalityProbeSpec.parse({"sites": dsa_sites, "schedule": [{"steps": 1}]}),
+        device,
+        launch=launch,
+    )
+    segment.set_criticality_probe(probe)
+    _run_selected_forward(segment, device)
+    with_probe = {key: list(value) for key, value in recorder.items() if key != "fa3"}
+    by_site = {site: (scoring, fa3, on_side) for site, scoring, fa3, on_side in spins}
+    expected_sites = ["after_indexer_k_path", "after_q_a_norm_quant"]
+    if not all_short:
+        expected_sites.append("after_indexer")
+    assert [site for site, *_ in spins] == expected_sites
+    # K-path end: on the side stream, after its last launch.
+    scoring, fa3, on_side = by_site["after_indexer_k_path"]
+    assert on_side
+    assert scoring == (() if all_short else ("head_gates_out",))
+    # q_a norm-quant: main stream, before any Q-path scorer launch.
+    scoring, fa3, on_side = by_site["after_q_a_norm_quant"]
+    assert not on_side and fa3 == 0
+    assert "rope_hadamard_q_out" not in scoring
+    if not all_short:
+        # Indexer: main stream, after the score+top-k, before attention.
+        scoring, fa3, on_side = by_site["after_indexer"]
+        assert not on_side and fa3 == 0
+        assert scoring[-1] == "fused_paged_score_and_topk_with_slots_out"
+
+    for value in recorder.values():
+        value.clear()
+    segment.set_criticality_probe(None)
+    spins.clear()
+    _run_selected_forward(segment, device)
+    assert spins == []
+    assert {key: list(value) for key, value in recorder.items() if key != "fa3"} == with_probe

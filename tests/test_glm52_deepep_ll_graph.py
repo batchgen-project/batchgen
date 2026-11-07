@@ -1140,6 +1140,79 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
     ]
 
 
+def _trace_router_gate_and_gemms(monkeypatch, segment, order):
+    real_router = segment.router_context.router_forward
+    real_gate = glm5_moe_graph.gate_sigmoid_topk_warp_cuda
+    real_masked = dg_masked.masked_gemm_fn()
+
+    def traced_router(*a, **kw):
+        order.append("router_gemm")
+        return real_router(*a, **kw)
+
+    def traced_gate(*a, **kw):
+        order.append("topk")
+        return real_gate(*a, **kw)
+
+    def traced_masked(*a, **kw):
+        order.append("masked_gemm")
+        return real_masked(*a, **kw)
+
+    segment.router_context.router_forward = traced_router
+    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_warp_cuda", traced_gate)
+    monkeypatch.setattr(dg_masked, "masked_gemm_fn", lambda: traced_masked)
+
+
+def test_the_criticality_probe_spins_after_each_moe_site(monkeypatch):
+    """With a probe on every MoE site, each spin node lands right after its op:
+    the shared expert's INSIDE the fork (on the side stream), the router's
+    after the top-k gate (never between the router GEMM and the gate), and
+    the rest between the exchange halves and the GEMM chain. Without a probe
+    the order is exactly the one pinned by the test above."""
+    from batchgen.models.glm.glm5.criticality_probe import (
+        MOE_SITES,
+        SITES,
+        CriticalityProbe,
+        CriticalityProbeSpec,
+    )
+
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
+    order = calls["order"]
+    _trace_router_gate_and_gemms(monkeypatch, segment, order)
+    spec = CriticalityProbeSpec.parse(
+        {"sites": sorted(MOE_SITES), "schedule": [{"steps": 1}]}
+    )
+    probe = CriticalityProbe(
+        spec, torch.device("cpu"),
+        launch=lambda table, site: order.append(f"spin:{SITES[site]}"),
+    )
+    segment.set_criticality_probe(probe)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    probe.begin_forward()
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+    probe.end_forward()
+    assert order == [
+        "router_gemm", "fork_enter", "shared_expert",
+        "spin:after_shared_expert", "fork_exit",
+        "topk", "spin:after_router",
+        "dispatch", "spin:after_dispatch",
+        "masked_gemm", "masked_gemm", "spin:after_expert_gemm",
+        "combine", "spin:after_combine",
+        "join",
+    ]
+    marks = dict(zip(SITES, probe.layer_marks))
+    assert all(marks[site] == 1 for site in MOE_SITES)
+
+    # Cleared again: the uninstrumented order, unchanged.
+    segment.set_criticality_probe(None)
+    del order[:]
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+    assert order == [
+        "router_gemm", "fork_enter", "shared_expert", "fork_exit", "topk",
+        "dispatch", "masked_gemm", "masked_gemm", "combine",
+        "join",
+    ]
+
+
 def test_dispatch_and_combine_run_split_into_send_and_receive(monkeypatch):
     """Both exchanges ask for the send / receive split, once per layer."""
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)

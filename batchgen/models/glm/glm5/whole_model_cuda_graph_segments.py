@@ -140,6 +140,9 @@ class Glm5WholeModelSegment:
         self._no_v_cache = True
         self._capture_inputs: dict[str, torch.Tensor] | None = None
         self._capture_dsa_short_count: int | None = None
+        # Decode criticality probe (criticality_probe.py). None, the default,
+        # adds nothing to the captured graph.
+        self.criticality_probe = None
 
     def set_capture_inputs(self, **inputs: torch.Tensor) -> None:
         required = set(self.get_static_input_specs(self.max_bucket_size))
@@ -302,6 +305,34 @@ class Glm5WholeModelSegment:
                 aux_key=None if aux_buffers is None else aux_buffers["key"],
                 aux_scale=None if aux_buffers is None else aux_buffers.get("scale"),
             )
+
+    def set_criticality_probe(self, probe) -> None:
+        """Hand every layer segment the decode criticality probe.
+
+        Must run before warmup and capture: the probe's spin nodes are issued
+        by the segments' forward, so a graph captured before this call has
+        none. The layer segments pass it on to their attention and MoE
+        segments, and the NCCL MoE path refuses it there.
+        """
+
+        if probe is not None:
+            if not self.layer_segments:
+                raise RuntimeError(
+                    "GLM-5 decode criticality probe marks sites inside the "
+                    "layer segments, but this whole-model segment composes none"
+                )
+            probe.validate_num_layers(self.num_layers)
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            install = getattr(layer_segment, "set_criticality_probe", None)
+            if install is None:
+                raise RuntimeError(
+                    "GLM-5 decode criticality probe is installed per layer "
+                    f"segment, so layer {layer_idx} "
+                    f"({type(layer_segment).__name__}) must expose "
+                    "set_criticality_probe"
+                )
+            install(probe)
+        self.criticality_probe = probe
 
     def release_static_buffers(self, bucket_size: int) -> None:
         for layer_segment in self.layer_segments:
@@ -715,6 +746,9 @@ class Glm5WholeModelSegment:
             GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
             GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
             GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
+            # Count the probe's spin nodes per forward (its slope denominator).
+            if self.criticality_probe is not None:
+                self.criticality_probe.begin_forward()
             outputs = self.run_model_with_probes(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -724,6 +758,8 @@ class Glm5WholeModelSegment:
                 num_valid_tokens=num_valid_tokens,
                 rank_token_counts=rank_token_counts,
             )
+            if self.criticality_probe is not None:
+                self.criticality_probe.end_forward()
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens
             AttnWrapperBase.position_ids = old_position_ids
