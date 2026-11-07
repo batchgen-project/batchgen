@@ -284,3 +284,68 @@ def test_heartbeat_text_drops_the_old_labels():
     positions = [text.index(f"{name} ") for name in DECODE_STEP_SPLIT_SEGMENTS]
     assert positions == sorted(positions)
     assert "gpu_fwd_ms=1.0 gpu_fwd_max=1.0 (n=1)" in text
+
+
+def test_tags_round_trip_through_harvest():
+    ring, events, _ = _ring(4)
+    stream = object()
+    tagged = ring.begin(stream)
+    ring.end(tagged, stream, tag=("level", 3))
+    untagged = ring.begin(stream)
+    ring.end(untagged, stream)
+    for slot, (t0, t1) in ((tagged, (0.0, 2.5)), (untagged, (1.0, 2.0))):
+        start, end = _pair(events, slot)
+        start.complete(t0)
+        end.complete(t1)
+    # Harvested in pending order, each pair with the tag its ``end`` was given.
+    assert ring.harvest() == [(("level", 3), 2.5), (None, 1.0)]
+    # Nothing new completed: nothing returned, and the totals still count both.
+    assert ring.harvest() == []
+    assert ring.take_summary() == " gpu_fwd_ms=1.8 gpu_fwd_max=2.5 (n=2)"
+
+
+def test_harvest_returns_only_completed_pairs_and_keeps_pending_tags():
+    ring, events, _ = _ring(3)
+    stream = object()
+    slots = []
+    for step in range(3):
+        slot = ring.begin(stream)
+        ring.end(slot, stream, tag=step)
+        slots.append(slot)
+    start, end = _pair(events, slots[1])
+    start.complete(0.0)
+    end.complete(4.0)
+    assert ring.harvest() == [(1, 4.0)]
+    # The two still-pending pairs keep their tags until they complete.
+    for slot in (slots[0], slots[2]):
+        start, end = _pair(events, slot)
+        start.complete(0.0)
+        end.complete(1.0)
+    assert ring.harvest() == [(0, 1.0), (2, 1.0)]
+
+
+def test_a_reused_slot_does_not_inherit_the_previous_tag():
+    ring, events, _ = _ring(1)
+    stream = object()
+    slot = ring.begin(stream)
+    ring.end(slot, stream, tag="old")
+    start, end = _pair(events, slot)
+    start.complete(0.0)
+    end.complete(1.0)
+    assert ring.harvest() == [("old", 1.0)]
+    slot = ring.begin(stream)
+    ring.end(slot, stream)
+    start.complete(5.0)
+    end.complete(7.0)
+    assert ring.harvest() == [(None, 2.0)]
+
+
+def test_an_untimed_step_drops_its_tag():
+    ring, _, _ = _ring(1)
+    stream = object()
+    assert ring.begin(stream) is not None
+    # Ring full: the step is not timed, and its tag goes nowhere.
+    slot = ring.begin(stream)
+    assert slot is None
+    ring.end(slot, stream, tag="lost")
+    assert ring.harvest() == []

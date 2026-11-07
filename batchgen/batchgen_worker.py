@@ -1282,6 +1282,14 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		# Decode criticality probe. The model's graph adapter parses the request
+		# from batchgen_debug and builds the probe; the worker only holds the
+		# round's request (set at decode configure), the probe installed in the
+		# resident decode graph, and the one-shot recapture a changed request
+		# arms. All None/False without a request.
+		self._criticality_probe = None
+		self._criticality_probe_request = None
+		self._criticality_probe_recapture = False
 		# Monotonic timestamp of the last "step exceeds the captured span" WARN.
 		self._decode_graph_span_warn_monotonic = None
 		self._nsys_decode_profile_forward_count = 0
@@ -10793,6 +10801,13 @@ class BatchGenWorker:
 				if prewarm_kimi_graphs is not None:
 					prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())
 
+				# The round's criticality probe request. A request that differs
+				# from the probe in the resident decode graph (none is a value)
+				# arms a recapture, which the warmup below then runs.
+				self._configure_criticality_probe(
+					self._active_batchgen_debug_for_sequences(global_decode_sequences)
+				)
+
 				# CUDA Graph Warmup (configure-time, one-time for whole-model GLM).
 				# Whole-model graph captures every configured bucket before decode;
 				# segmented GLM-5 paths retain their existing partial-capture policy.
@@ -10817,7 +10832,9 @@ class BatchGenWorker:
 				)
 				if generic_cuda_graph_warmup_needed or (
 					glm5_whole_graph_requested and self._cuda_graph_manager is None
-				) or self._glm5_whole_model_graph_current_bucket_missing():
+				) or self._glm5_whole_model_graph_current_bucket_missing() or (
+					self._criticality_probe_recapture
+				):
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
@@ -18392,7 +18409,48 @@ class BatchGenWorker:
 		return (
 			_table_sig(primary_manager),
 			_table_sig(aux_manager),
+			# The round's criticality probe request (None without one): its
+			# spin nodes change the graph, so a graph captured for another
+			# request must not replay.
+			getattr(self, "_criticality_probe_request", None),
 		)
+
+	def _configure_criticality_probe(self, debug: Optional[dict]) -> None:
+		"""Decode configure: record the round's criticality probe request.
+
+		The request, its flag and its validation belong to the model's graph
+		adapter; a model without one has no probe and the request is None.
+		The resident decode graph outlives decode rounds, so a request that
+		differs from the installed probe's (None is a value on both sides)
+		arms ONE recapture: the warmup that follows releases the resident
+		graph and captures it again, instrumented for a new request and plain
+		for the first round without one. An equal request keeps the graph.
+		Every rank merges the same global decode sequences, so every rank
+		takes the same decision; the recapture runs behind the capture path's
+		rank barriers.
+		"""
+		adapter = getattr(self, "_cuda_graph_adapter", None)
+		requested = None
+		if adapter is not None:
+			args = getattr(self, "args", None)
+			graph_enabled = bool(getattr(args, "enable_cuda_graph", False)) and not bool(
+				getattr(args, "disable_cuda_graphs", False)
+			)
+			requested = adapter.criticality_probe_request(debug, graph_enabled=graph_enabled)
+			adapter.set_criticality_probe_request(requested)
+		installed_probe = getattr(self, "_criticality_probe", None)
+		installed = None if installed_probe is None else installed_probe.signature()
+		self._criticality_probe_request = requested
+		if installed == requested:
+			return
+		if self.rank == 0:
+			logging.info(
+				"[CRITICALITY_PROBE] decode configure: request changed "
+				"(installed=%s, requested=%s); recapturing the decode graph",
+				"none" if installed is None else "probe",
+				"none" if requested is None else "probe",
+			)
+		self._criticality_probe_recapture = True
 
 	def _glm5_whole_model_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
@@ -18478,6 +18536,9 @@ class BatchGenWorker:
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
+		# The probe belongs to the released graph (its spin nodes bake the
+		# probe's delay table), so it goes with it.
+		self._criticality_probe = None
 		# Phase B: also drop the adapter's reference to the captured segment so
 		# the next worker generation starts from a clean adapter context.
 		if self._cuda_graph_adapter is not None:
@@ -18903,7 +18964,10 @@ class BatchGenWorker:
 				):
 					self._glm5_whole_model_graph_capture_attempted_for_batch = True
 					return
-				if capture_attempted:
+				# A recapture armed by a changed criticality probe request is
+				# the one deliberate exception: it falls through to the stale
+				# graph release below and captures in place.
+				if capture_attempted and not getattr(self, "_criticality_probe_recapture", False):
 					logging.info(
 						f"Rank {self.rank}: GLM-5 whole-model CUDA graph state changed after "
 						"configure-time capture; using eager decode instead of recapturing"
@@ -18914,9 +18978,12 @@ class BatchGenWorker:
 			# Getting here again means their state was torn down; recapturing
 			# would hide that, and it needs model state (fused attention
 			# pointers, MoE pointer tables) a torn-down instance no longer has.
+			# Same exception for the criticality probe's recapture: it
+			# releases only the graph state, never the model state above.
 			if (
 				getattr(self, "_decode_graph_captures", 0) > 0
 				and self._decode_instance_is_reusable()
+				and not getattr(self, "_criticality_probe_recapture", False)
 			):
 				raise RuntimeError(
 					f"Rank {self.rank}: decode graph capture requested again for a "
@@ -19254,6 +19321,17 @@ class BatchGenWorker:
 				f"segment={segment_name} buckets={capture_buckets}, "
 				f"context_capacity={graph_max_seqlen}"
 			)
+			# Criticality probe: installed before warmup and capture, because
+			# its spin nodes are issued by the segments' forward. Without a
+			# request the adapter is not asked and nothing is constructed.
+			self._criticality_probe = None
+			probe_request = getattr(self, "_criticality_probe_request", None)
+			if probe_request is not None:
+				self._criticality_probe = self._cuda_graph_adapter.install_criticality_probe(
+					probe_request,
+					whole_model_segment=whole_seg,
+					device=self.torch_device,
+				)
 			torch.cuda.synchronize(self.torch_device)
 			dist.barrier()
 			self._cuda_graph_manager = manager
@@ -19288,6 +19366,8 @@ class BatchGenWorker:
 				self._glm5_whole_model_capture_input_ids = None
 				self._whole_model_graph = False
 				self._glm5_whole_model_graph = False
+				self._criticality_probe = None
+				self._criticality_probe_recapture = False
 				torch.cuda.empty_cache()
 				if whole_graph_required:
 					raise
@@ -19298,6 +19378,7 @@ class BatchGenWorker:
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
 			self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
+			self._criticality_probe_recapture = False
 			# Phase B: hand the just-captured segment to the adapter so its
 			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
 			# can run against the same captured graph the legacy path uses.
@@ -19836,6 +19917,18 @@ class BatchGenWorker:
 			FORWARD_EVENT_RING_SLOTS,
 			lambda: torch.cuda.Event(enable_timing=True),
 		)
+		# Criticality probe of the resident graph, if this round's configure
+		# installed one. Each replayed step's ring pair is tagged with the
+		# probe's level, so the harvested device times feed it with no wait of
+		# their own. A job admitted mid-round with a different request is
+		# reported once and ignored: the graph is fixed until the next
+		# configure.
+		_probe = getattr(self, "_criticality_probe", None)
+		_probe_adapter = getattr(self, "_cuda_graph_adapter", None)
+		_probe_round_request = getattr(self, "_criticality_probe_request", None)
+		_probe_mismatch_logged = False
+		if _probe is not None:
+			_probe.begin_round()
 
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
@@ -20110,6 +20203,26 @@ class BatchGenWorker:
 			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
 				global_decode_sequences
 			)
+			if (
+				AttnWrapperBase.batchgen_debug is not None
+				and _probe_adapter is not None
+				and not _probe_mismatch_logged
+			):
+				try:
+					_step_probe_request = _probe_adapter.criticality_probe_request(
+						AttnWrapperBase.batchgen_debug, graph_enabled=True
+					)
+				except ValueError as _probe_exc:
+					_step_probe_request = _probe_exc
+				if _step_probe_request != _probe_round_request:
+					_probe_mismatch_logged = True
+					logging.warning(
+						"Rank %s: [CRITICALITY_PROBE] a job admitted mid-round requests a "
+						"different criticality probe (%s); this round keeps the request "
+						"it was configured with until the next decode configure",
+						self.rank,
+						_step_probe_request,
+					)
 			self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
 			self._configure_glm5_dispatch_trace(global_decode_sequences)
 
@@ -20139,6 +20252,8 @@ class BatchGenWorker:
 			# Start marker of this step's device forward+sample time. Takes a
 			# free ring slot or skips timing this step; never waits.
 			_fwd_slot = _fwd_ring.begin(torch.cuda.current_stream(self.torch_device))
+			# Probe level of this step; stays None unless the graph replays.
+			_probe_tag = None
 			with torch.inference_mode():
 				if batch:
 					# Collect context lengths with invariant validation
@@ -20529,6 +20644,10 @@ class BatchGenWorker:
 							batch_state=_adapter_batch_state,
 							segment_name=_wm_seg_name,
 						)
+						# Delay-table update for this step's level: an async copy
+						# on this stream, ahead of the replay that reads it.
+						if _probe is not None:
+							_probe_tag = _probe.before_replay(local_iteration)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
@@ -20598,6 +20717,10 @@ class BatchGenWorker:
 							gpu_manager=gpu_manager,
 							graph_max_seqlen_override=int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
 						)
+						# Delay-table update for this step's level: an async copy
+						# on this stream, ahead of the replay that reads it.
+						if _probe is not None:
+							_probe_tag = _probe.before_replay(local_iteration)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
@@ -20829,7 +20952,7 @@ class BatchGenWorker:
 			new_tokens = new_tokens_out
 			_split_t1 = time.perf_counter()
 			# End marker, queued on the same stream ahead of the token copy below.
-			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device))
+			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device), tag=_probe_tag)
 
 			if _deferred_readback:
 				# [DEFERRED_READBACK] This step is enqueued; only now wait for
@@ -20869,7 +20992,10 @@ class BatchGenWorker:
 						_split_kv, _split_end,
 					),
 				)
-				_fwd_ring.harvest()
+				_harvested = _fwd_ring.harvest()
+				if _probe is not None:
+					for _tag, _elapsed_ms in _harvested:
+						_probe.record(_tag, _elapsed_ms)
 				from batchgen.timing import get_decode_timer
 				_dt = get_decode_timer()
 				if _dt and _dt.enabled:
@@ -21022,7 +21148,10 @@ class BatchGenWorker:
 			)
 			# Non-blocking harvest of finished forward timing pairs; elapsed
 			# time is read only from pairs whose two events already completed.
-			_fwd_ring.harvest()
+			_harvested = _fwd_ring.harvest()
+			if _probe is not None:
+				for _tag, _elapsed_ms in _harvested:
+					_probe.record(_tag, _elapsed_ms)
 
 			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
 			from batchgen.timing import get_decode_timer
@@ -21054,6 +21183,13 @@ class BatchGenWorker:
 				f"[DECODE] interval end: steps={int(_step_split[0])} "
 				f"{format_decode_step_split(_step_split)}{_fwd_ring.take_summary()}"
 			)
+		if _probe is not None:
+			# The loop exits after the last step's readback, so its pair has
+			# completed; this harvest still never waits.
+			for _tag, _elapsed_ms in _fwd_ring.harvest():
+				_probe.record(_tag, _elapsed_ms)
+			if self.rank == 0:
+				logging.info(_probe.report())
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
@@ -22489,6 +22625,8 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		# The probe's spin nodes live in the graphs dropped above.
+		self._criticality_probe = None
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)

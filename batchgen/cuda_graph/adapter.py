@@ -343,6 +343,55 @@ class ModelCudaGraphAdapter(ABC):
         """
         return DebugOpts()
 
+    # ---- Decode criticality probe (optional) ------------------------------
+    #
+    # A probe inserts spin nodes into the captured decode graph and sweeps
+    # their duration across replays to measure how much of each op's time is
+    # on the step's critical path. The request (its batchgen_debug flag, its
+    # validation) and the probe itself are model-specific; the worker only
+    # records the round's request, folds it into the capture decision, and
+    # drives the probe it is handed at replay. Adapters without a probe keep
+    # these defaults: every request is None and nothing is ever installed.
+
+    def criticality_probe_request(
+        self, batchgen_debug: Any, *, graph_enabled: bool
+    ) -> Optional[Hashable]:
+        """The probe a batch's merged ``batchgen_debug`` requests, or None.
+
+        Returns a hashable request (equal requests capture identical graphs).
+        An adapter with a probe raises ``ValueError`` for a malformed request
+        and for one the configuration cannot serve (``graph_enabled`` False).
+        Called once per decode configure and, while a round runs with debug
+        flags, once per step, so it must be cheap for an unchanged request.
+        """
+        return None
+
+    def set_criticality_probe_request(self, request: Optional[Hashable]) -> None:
+        """Record the round's request; an adapter with a probe makes it part
+        of ``capture_signature``. ``None`` is the only request the default
+        accepts."""
+        if request is not None:
+            raise RuntimeError(
+                f"{type(self).__name__} implements no criticality probe but was "
+                "handed a request for one")
+
+    def install_criticality_probe(
+        self,
+        request: Hashable,
+        *,
+        whole_model_segment: Any,
+        device: torch.device,
+    ) -> Any:
+        """Build the probe for ``request`` and install it in the segment.
+
+        Called before warmup and capture. The returned object exposes
+        ``signature()`` (== ``request``), ``begin_round()``,
+        ``before_replay(step) -> tag`` (enqueues no more than an async copy on
+        the current stream), ``record(tag, elapsed_ms)`` and ``report()``.
+        """
+        raise RuntimeError(
+            f"{type(self).__name__} implements no criticality probe")
+
     # ---- Release --------------------------------------------------------
 
     def release_all(self, *, manager: Optional[CUDAGraphManager]) -> None:

@@ -109,6 +109,11 @@ class ForwardEventRing:
 
     Every slot is always in exactly one of: free, open (begun, not ended),
     pending (ended, not yet harvested).
+
+    ``end`` optionally takes a ``tag`` that ``harvest`` hands back with the
+    pair's elapsed time (``None`` when untagged). It is given at ``end``, not
+    at ``begin``, because the decode loop learns whether a step replayed the
+    graph only after its start event is recorded.
     """
 
     def __init__(self, num_slots: int, event_factory: Callable[[], TimingEvent]):
@@ -117,6 +122,7 @@ class ForwardEventRing:
         self._pairs = [(event_factory(), event_factory()) for _ in range(num_slots)]
         self._free: List[int] = list(range(num_slots))
         self._pending: List[int] = []
+        self._tags: List[Any] = [None] * num_slots
         self._sum_ms = 0.0
         self._max_ms = 0.0
         self._count = 0
@@ -141,17 +147,26 @@ class ForwardEventRing:
         self._pairs[slot][0].record(stream)
         return slot
 
-    def end(self, slot: Optional[int], stream: Any) -> None:
-        """Record the end event for a slot from ``begin``; no-op for ``None``."""
+    def end(self, slot: Optional[int], stream: Any, tag: Any = None) -> None:
+        """Record the end event for a slot from ``begin``; no-op for ``None``.
+
+        ``tag`` is stored with the pair and returned by ``harvest``.
+        """
         if slot is None:
             return
         self._pairs[slot][1].record(stream)
+        self._tags[slot] = tag
         self._pending.append(slot)
 
-    def harvest(self) -> None:
-        """Collect every pending pair whose events have both completed."""
+    def harvest(self) -> List[Tuple[Any, float]]:
+        """Collect every pending pair whose events have both completed.
+
+        Returns ``(tag, elapsed_ms)`` for each pair collected by this call, in
+        pending order.
+        """
         if not self._pending:
-            return
+            return []
+        harvested: List[Tuple[Any, float]] = []
         still_pending = []
         for slot in self._pending:
             start, end = self._pairs[slot]
@@ -161,10 +176,13 @@ class ForwardEventRing:
                 self._count += 1
                 if elapsed_ms > self._max_ms:
                     self._max_ms = elapsed_ms
+                harvested.append((self._tags[slot], elapsed_ms))
+                self._tags[slot] = None
                 self._free.append(slot)
             else:
                 still_pending.append(slot)
         self._pending = still_pending
+        return harvested
 
     def take_summary(self) -> str:
         """Return `` gpu_fwd_ms=M gpu_fwd_max=X (n=N)`` and reset the totals.
