@@ -1458,31 +1458,41 @@ def _read_span_digests(
     """Per-tensor digests of ``spans`` read from ``descriptor``.
 
     With ``sink``, every chunk is also written to that descriptor at the same
-    offset, so a copy is hashed from exactly the bytes it wrote.
+    offset, so a copy is hashed from exactly the bytes it wrote. Reads land
+    in a reused per-thread buffer (``os.preadv``) rather than a fresh bytes
+    object per chunk, which would add an allocation and a copy to every
+    read on a path that can be bound by memory bandwidth.
     """
+    buffer = getattr(_READ_BUFFERS, "view", None)
+    if buffer is None or len(buffer) < read_buffer_bytes:
+        buffer = memoryview(bytearray(read_buffer_bytes))
+        _READ_BUFFERS.view = buffer
     out = []
     for row, offset, byte_size in spans:
         hasher = _digest()
         position, end = offset, offset + byte_size
         while position < end:
-            chunk = os.pread(
-                descriptor, min(end - position, read_buffer_bytes), position
-            )
-            if not chunk:
+            want = min(end - position, read_buffer_bytes)
+            got = os.preadv(descriptor, [buffer[:want]], position)
+            if not got:
                 raise EOFError(
                     f"store ends at {position} B inside metadata row {row}"
                 )
+            chunk = buffer[:got]
             hasher.update(chunk)
             if sink is not None:
-                view = memoryview(chunk)
                 written = 0
-                while written < len(chunk):
-                    written += os.pwrite(sink, view[written:], position + written)
-            position += len(chunk)
+                while written < got:
+                    written += os.pwrite(sink, chunk[written:], position + written)
+            position += got
         out.append(hasher.digest())
         if progress is not None:
             progress(byte_size)
     return out
+
+
+#: Per-thread read buffers of :func:`_read_span_digests`.
+_READ_BUFFERS = threading.local()
 
 
 def hash_store_segment(
