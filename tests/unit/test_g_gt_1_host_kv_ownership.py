@@ -23,6 +23,8 @@ from typing import List, Sequence
 
 import pytest
 
+from tests.worker.worker_fakes import attach_identity
+
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
@@ -187,13 +189,15 @@ def _rank(rank, *, attn_tp_size, world_size, seqs, views, fake_dist,
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=world_size,
-        local_world_size=local_world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _prefix_sequence_states={},
         _host_views_by_group=lambda: views,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=local_world_size,
+        decode_group_size=attn_tp_size,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -496,7 +500,6 @@ def _selection_request(attn_tp_size, monkeypatch):
         prefill_order=None,
     )
     worker = SimpleNamespace(
-        rank=0, local_world_size=8,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
         # This test is about the replication factor, not shared-prefix credit:
@@ -504,6 +507,11 @@ def _selection_request(attn_tp_size, monkeypatch):
         # reservation and the factor is the only thing under test.
         _admission_shared_prefix_segments=lambda uuids: {},
         _shared_prefix_credit_applied=False,
+    )
+    attach_identity(
+        worker,
+        rank=0, world_size=8, local_world_size=8,
+        decode_group_size=attn_tp_size,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -662,13 +670,11 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
     )
     seqs = _seqs(group=0)
     worker = SimpleNamespace(
-        rank=rank,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(
             get_sequence=seqs.get,
             get_sequences_by_status=lambda status: [],
         ),
-        _uuid_to_local_map={"a": 0, "b": 1},
         core_engine=SimpleNamespace(host_paged_kv_worker_view=views[0]),
         host_paged_kv_worker_view_aux=views[1],
         _prefix_integrity=False,
@@ -691,6 +697,11 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         # K3 semantics: ONE prefix group (primary); the indexer-key aux region
         # lives outside the groups and is handled by the explicit aux path.
         _host_views_by_group=lambda: {0: views[0]},
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=8, local_world_size=8,
+        decode_group_size=attn_tp_size, bound={"a": 0, "b": 1},
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
