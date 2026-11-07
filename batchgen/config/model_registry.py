@@ -45,6 +45,10 @@ import logging
 import os
 import re
 
+from batchgen.models.glm.glm5.releases import (
+    model_name_patterns as _glm5_model_name_patterns,
+)
+
 from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
 
 if TYPE_CHECKING:
@@ -86,17 +90,10 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     # (754B MoE + DSA, 78 layers, identical config.json apart from transformers_version).
     # GLM-5.2 and GLM-5.3 share the model graph but get OWN config identities
     # (longer context, nested rope, extra DSA indexer knobs, and separate chat
-    # contracts). More-specific patterns must precede the broad GLM-5 entry.
-    "GLM-5.3-FP8": "glm_moe_dsa_5_3",
-    "GLM-5.3": "glm_moe_dsa_5_3",
-    # More-specific patterns first so `GLM-5.2-FP8` doesn't get swallowed by
-    # `GLM-5` (and `GLM-5.1-FP8` not by `GLM-5`).
-    "GLM-5.2-FP8": "glm_moe_dsa_5_2",
-    "GLM-5.2": "glm_moe_dsa_5_2",
-    "GLM-5.1-FP8": "glm_moe_dsa",
-    "GLM-5.1": "glm_moe_dsa",
-    "GLM-5-FP8": "glm_moe_dsa",
-    "GLM-5": "glm_moe_dsa",
+    # contracts). Generated from batchgen/models/glm/glm5/releases.py,
+    # most-specific first so `GLM-5.2-FP8` doesn't get swallowed by the broad
+    # `GLM-5` entry.
+    **_glm5_model_name_patterns(),
     # Kimi-Linear (testbed) + Kimi-K3 family (hybrid KDA + NoPE-MLA MoE).
     # More-specific patterns MUST precede the broad "Kimi-K3": it is a
     # substring of "Kimi-K3.1-Pro", so without the entries below a K3.1

@@ -64,6 +64,9 @@ from batchgen_kernels.triton_prewarm import (  # noqa: F401 - re-exported
     int_class,
 )
 from batchgen.config.graph_span_policy import graph_context_span_cap_tokens
+from batchgen.models.glm.glm5.releases import (  # noqa: F401 - re-exported
+    SPARSE_PREFILL_MODEL_TYPES,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -90,9 +93,6 @@ PAGE_TABLE_COL_WITNESSES = (1, 16, 17)
 
 # FP8 blockwise scale block of every GLM-5 activation cast.
 SCALE_BLOCK = 128
-
-# Packed sparse-attention prefill (``sparse_prefill.should_use_glm52_sparse_prefill``).
-SPARSE_PREFILL_MODEL_TYPES = ("glm_moe_dsa_5_2", "glm_moe_dsa_5_3")
 
 PHASE_PREFILL = "prefill"
 PHASE_DECODE = "decode"

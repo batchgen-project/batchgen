@@ -22,6 +22,8 @@ import torch
 import triton
 import triton.language as tl
 
+from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
+
 _VALIDATED_RUNTIME_DEVICES: set[int] = set()
 
 
@@ -114,7 +116,7 @@ def should_use_glm52_sparse_prefill(
     max_seqlen: int,
     index_topk: int,
 ) -> bool:
-    return model_type in {"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"} and max_seqlen > index_topk
+    return model_type in SPARSE_PREFILL_MODEL_TYPES and max_seqlen > index_topk
 
 
 def build_packed_causal_ranges(
@@ -584,9 +586,9 @@ def validate_glm52_sparse_prefill_runtime() -> None:
         .to(torch.bfloat16)
     )
     rope_positions = torch.tensor([0, 3], dtype=torch.int64, device=device)
-    # BOTH instantiations are gated: GLM-5.2's page-split FP8 indexer runs the
-    # rotation-off arm (upstream v3.2), GLM-5.3's bf16 AoS indexer the
-    # rotation-on arm, and one build serves both model types here.
+    # BOTH instantiations are gated: the page-split FP8 indexer (GLM-5.2 and
+    # GLM-5.3) runs the rotation-off arm (upstream v3.2), a bf16 AoS indexer
+    # the rotation-on arm, and one build serves both cache formats here.
     for apply_hadamard in (True, False):
         rope_out = fused_rope_hadamard(
             rope_input,
@@ -753,10 +755,10 @@ def glm52_sparse_prefill_prepacked(
     latent pool (``latent_pool``, this layer) through slot indices.
 
     ``indexer_applies_hadamard`` is the aux indexer cache's rotation predicate,
-    resolved by the caller: GLM-5.2's page-split FP8 indexer is False (upstream
-    v3.2 semantics, dropped on both q and k), GLM-5.3's bf16 AoS indexer is
-    True. It must match what decode uses -- these keys ARE the cache decode
-    reads back.
+    resolved by the caller: the page-split FP8 indexer of GLM-5.2 and GLM-5.3
+    is False (upstream v3.2 semantics, dropped on both q and k), a bf16 AoS
+    indexer is True. It must match what decode uses -- these keys ARE the
+    cache decode reads back.
     """
 
     try:

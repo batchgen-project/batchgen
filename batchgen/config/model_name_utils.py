@@ -41,20 +41,3 @@ PRE_READINESS_STARTUP_MODEL_IDS = frozenset({
 def runs_startup_before_readiness(model_name: str | None) -> bool:
     """Whether this exact served model id takes the pre-readiness startup."""
     return model_name in PRE_READINESS_STARTUP_MODEL_IDS
-
-
-GLM5_BACKEND_NAME_PATTERNS = (
-    "zai-org/glm-5",
-    "zai-org/glm-5.1",
-    "glm-5",
-    "glm_5",
-    "glm-5.1",
-    "glm_5.1",
-    "glm5",
-    "glm51",
-)
-
-
-def is_glm5_backend_model(model_name: str | None) -> bool:
-    normalized = (model_name or "").strip().lower()
-    return any(pattern in normalized for pattern in GLM5_BACKEND_NAME_PATTERNS)
