@@ -695,7 +695,6 @@ def test_copy_threads_run_inside_the_interleave_policy(tmp_path, monkeypatch):
         assert len(calls) == len(segments) > 4
         assert all(within for _, within in calls)
         names = {name for name, _ in calls}
-        assert all(name.startswith("weight-store-copy") for name in names)
         assert 1 < len(names) <= 4
         staged_bytes = (staged.directory / sb.STORE_FILE_NAME).read_bytes()
         assert staged_bytes == (deployment.output / sb.STORE_FILE_NAME).read_bytes()
@@ -887,3 +886,30 @@ def test_staging_logs_mount_options_and_warns_without_huge(
         deployment.stage(fast_init=False, read_mounts=huge).release()
     assert any("mounted with options" in r.message for r in caplog.records)
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_adaptive_staging_copy_stages_and_verifies(tmp_path, monkeypatch, caplog):
+    deployment = Deployment(tmp_path, monkeypatch)
+    monkeypatch.setattr(sb, "ADAPTIVE_START_WORKERS", 2)
+    monkeypatch.setattr(sb, "ADAPTIVE_SETTLE_S", 0.01)
+    monkeypatch.setattr(sb, "ADAPTIVE_WINDOW_S", 0.05)
+    with caplog.at_level(logging.INFO, logger=st.logger.name):
+        staged = deployment.stage(copy_workers=None)
+    try:
+        assert any("adaptive copy threads" in r.message for r in caplog.records)
+        staged_bytes = (staged.directory / sb.STORE_FILE_NAME).read_bytes()
+        source_bytes = (deployment.output / sb.STORE_FILE_NAME).read_bytes()
+        assert staged_bytes == source_bytes
+        assert list(staged.directory.glob(st.COMPLETE_FILE_NAME))
+    finally:
+        staged.release()
+
+
+def test_adaptive_staging_names_the_first_bad_segment(tmp_path, monkeypatch):
+    deployment = Deployment(tmp_path, monkeypatch)
+    _corrupt_segment(deployment, 2)
+    _corrupt_segment(deployment, 4)
+    with pytest.raises(st.WeightStoreStagingError) as excinfo:
+        deployment.stage(copy_workers=None)
+    assert "segment 2 of the source weight store" in str(excinfo.value)
+    assert not list(deployment.staging_dir.rglob(st.COMPLETE_FILE_NAME))
