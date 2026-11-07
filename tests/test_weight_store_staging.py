@@ -11,6 +11,7 @@ import ast
 import contextlib
 import importlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -861,3 +862,28 @@ def test_worker_restart_never_touches_the_store(monkeypatch, tmp_path):
     manager.restart_workers(timeout_s=1)
     assert "store_release" not in order
     assert isinstance(manager._staged_weight_store, _FakeStaged)
+
+
+def test_staging_logs_mount_options_and_warns_without_huge(
+    tmp_path, monkeypatch, caplog
+):
+    deployment = Deployment(tmp_path, monkeypatch)
+    mountpoint = os.path.realpath(deployment.shm)
+    plain = lambda: _mounts(deployment.shm, options="rw,nosuid,size=100g")  # noqa: E731
+    with caplog.at_level(logging.INFO, logger=st.logger.name):
+        deployment.stage(fast_init=False, read_mounts=plain).release()
+    infos = [r.message for r in caplog.records if "mounted with options" in r.message]
+    assert infos and mountpoint in infos[0] and "size=100g" in infos[0]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "no huge= mount option" in r.message
+        and f"mount -o remount,huge=within_size {mountpoint}" in r.message
+        for r in warnings
+    )
+
+    caplog.clear()
+    huge = lambda: _mounts(deployment.shm, options="rw,huge=within_size")  # noqa: E731
+    with caplog.at_level(logging.INFO, logger=st.logger.name):
+        deployment.stage(fast_init=False, read_mounts=huge).release()
+    assert any("mounted with options" in r.message for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
