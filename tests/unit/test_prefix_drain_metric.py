@@ -18,8 +18,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from batchgen.query_book import release_local_query_slot
+from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
+from tests.worker.worker_fakes import attach_identity
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
@@ -35,7 +36,8 @@ def _method(name):
 _NAMESPACE = {
     "SequenceEntry": SequenceEntry,
     "logging": logging,
-    "release_local_query_slot": release_local_query_slot,
+    "release_query_book_slot": release_query_book_slot,
+    "_release_tokenizer_arenas": lambda **_: None,
     "np": np,
     "torch": torch,
     "time": time,
@@ -72,10 +74,9 @@ class _Worker:
         self._prefix_drain_metric_emitted = False
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
-        self._uuid_to_local_map = {}
-        self._local_to_uuid_map = {}
+        attach_identity(self, rank=self.rank, world_size=self.world_size,
+                        local_world_size=self.world_size)
         self.query_book = {}
-        self._free_local_indices = set()
         self.active_attachments = 0
         # M3 Slice 2: a run that never turned the trajectory flag on has no
         # restorer, so the drain row carries no trajectory fields. Slice 3a

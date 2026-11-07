@@ -37,6 +37,7 @@ from batchgen.prefix_reuse.wave_plan import (
     prefill_plan_work,
     validate_wave_prefix_plan,
 )
+from tests.worker.worker_fakes import attach_identity
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -485,9 +486,6 @@ def _mirror_rank(
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=world_size,
-        local_world_size=world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _prefix_sequence_states={},
@@ -514,6 +512,11 @@ def _mirror_rank(
         _reserve_trajectory_arenas=lambda uuids: {},
         _trajectory_restore_payload=lambda: {},
         _adopt_mirrored_trajectory_arenas=lambda arenas: None,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=world_size,
+        decode_group_size=attn_tp_size,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -689,8 +692,6 @@ def _assign_worker(
         ]
     )
     worker = SimpleNamespace(
-        rank=0,
-        world_size=world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         # The real GlobalBatch is iterable AND resolves by uuid; a
         # SimpleNamespace cannot route dunder lookups, so the batch is its own
@@ -721,6 +722,11 @@ def _assign_worker(
         _trajectory_tokens=lambda seq, length=None: _FakeTokens(
             tokens_by_uuid[seq.uuid][: length if length else None]
         ),
+    )
+    attach_identity(
+        worker,
+        rank=0, world_size=world_size, local_world_size=world_size,
+        decode_group_size=attn_tp_size,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))

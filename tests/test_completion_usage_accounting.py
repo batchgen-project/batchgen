@@ -6,6 +6,7 @@ import torch
 import batchgen.batchgen_worker as worker_module
 from batchgen.batchgen_worker import BatchGenWorker
 from batchgen.sequence import SequenceEntry, SequenceStatus
+from tests.worker.worker_fakes import attach_identity
 
 
 class _TrajectoryBook:
@@ -44,17 +45,14 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
     response_queue = SimpleQueue()
     worker = SimpleNamespace(
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
-        _uuid_to_local_map={},
-        _local_to_uuid_map={},
         query_book={},
-        _free_local_indices=set(),
-        rank=0,
         _response_queue=response_queue,
         _get_finish_reason=lambda _seq: "stop",
         _trajectory_book=_TrajectoryBook(),
         _publish_trajectory_pool_capacity=lambda: None,
         _maybe_emit_prefix_drain_metric=lambda: None,
     )
+    attach_identity(worker, rank=0, world_size=1, local_world_size=1)
 
     BatchGenWorker._report_completion(worker, seq.uuid, gathered_text="answer")
     result = response_queue.get()
@@ -82,12 +80,11 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     # Single rank, G=1: it owns the sequence's host KV and so reports its
     # cached-token count (none here: no prefix state).
-    worker.rank = 0
-    worker._uuid_to_local_map = {seq.uuid: 0}
+    attach_identity(worker, rank=0, world_size=1, local_world_size=1,
+                    bound={seq.uuid: 0})
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
     worker.query_book = {0: SimpleNamespace()}
     worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
-    worker.world_size = 1
     worker.eos_token_ids = {154820, 154827, 154829}
     worker.pad_token_id = 154820
     worker.detokenization_include_special_tokens = False
@@ -120,11 +117,8 @@ def test_report_completion_fallback_applies_stop_token_trimming():
 
     worker = object.__new__(BatchGenWorker)
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
-    worker._uuid_to_local_map = {}
-    worker._local_to_uuid_map = {}
+    attach_identity(worker, rank=0, world_size=1, local_world_size=1)
     worker.query_book = {}
-    worker._free_local_indices = set()
-    worker.rank = 0
     worker._response_queue = SimpleQueue()
     worker.eos_token_ids = {154820, 154827, 154829}
     worker.pad_token_id = 154820

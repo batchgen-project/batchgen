@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 
+from tests.worker.worker_fakes import attach_identity
+
 import batchgen.sequence as sequence_module
 from batchgen.sequence import SequenceEntry, configure_page_buffers
 from batchgen.worker.prefill import (
@@ -178,7 +180,6 @@ def test_prefill_selection_request_uses_the_configured_initial_buffer():
     make_request = _worker_method("_make_prefill_selection_request", namespace)
     seq = _sequence()
     worker = SimpleNamespace(
-        local_world_size=8,
         _decode_attn_tp_size=lambda: 1,
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
         # This test is about the page-buffer constant reaching the snapshot,
@@ -187,6 +188,7 @@ def test_prefill_selection_request_uses_the_configured_initial_buffer():
         _admission_shared_prefix_segments=lambda uuids: {},
         _shared_prefix_credit_applied=False,
     )
+    attach_identity(worker, rank=0, world_size=8, local_world_size=8)
 
     request = make_request(worker, ["a"], [1 << 20], num_nodes=1,
                            chunk_size=CHUNK_TOKENS)

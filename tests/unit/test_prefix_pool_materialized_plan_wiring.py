@@ -30,6 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests.worker.worker_fakes import attach_identity
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -232,10 +234,6 @@ def _worker(
     )
     sequences = _seqs() if seqs is None else seqs
     worker = SimpleNamespace(
-        rank=rank,
-        local_rank=0,
-        world_size=max(1, attn_tp_size),
-        local_world_size=8,
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,
@@ -270,6 +268,11 @@ def _worker(
         ),
         _trajectory_mirrored_restores={},
         _local_to_uuid_map=dict(enumerate(UUIDS)),
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=max(1, attn_tp_size), local_world_size=8,
+        local_rank=0, decode_group_size=max(1, attn_tp_size),
     )
     # ``_owns_host_kv`` is the group-leader predicate; a follower answers no.
     worker._owns_host_kv = lambda seq: bool(owns_host_kv)

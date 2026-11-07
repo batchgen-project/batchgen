@@ -10,7 +10,17 @@ import os
 import socket
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
+from typing import (
+	AbstractSet,
+	Callable,
+	Dict,
+	List,
+	Mapping,
+	Optional,
+	Sequence,
+	Set,
+	Tuple,
+)
 
 import torch
 import torch.multiprocessing as mp
@@ -202,10 +212,12 @@ from batchgen.batch_order import (
 from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBook,
-	bind_local_sequence_to_query_book,
+	bind_query_book_slot,
 	make_query_book_entry,
-	release_local_query_slot,
+	release_query_book_slot,
 )
+from batchgen.worker.rank_context import RankContext, node_of_rank
+from batchgen.worker.sequence_table import SequenceTable
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import (
 	is_kimi_k25_backend_model,
@@ -1580,10 +1592,13 @@ class BatchGenWorker:
 		self.global_batch: Optional[SequenceBatch] = None
 		self.query_book: Optional[Dict] = None
 		self.model_batch_book: Dict = {}
-		self._local_to_uuid_map: Dict[int, str] = {}
-		self._uuid_to_local_map: Dict[str, int] = {}
-		self._free_local_indices: Set[int] = set()  # Track freed indices for O(1) allocation
-		self._next_local_idx: int = 0  # Next index if free list is empty
+		# Local slot binding (both maps) and its free-slot allocator live in
+		# ONE owner; `_local_to_uuid_map` / `_uuid_to_local_map` below are
+		# read-only views of it. Every write goes through `self.seq_table`.
+		self.seq_table = SequenceTable()
+		# Frozen rank identity. Built in `Init` once the parallel strategy
+		# manager exists, because the decode attention TP size G comes from it.
+		self.rank_ctx: Optional[RankContext] = None
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
@@ -1648,6 +1663,28 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
+	# ============ Local slot binding (owned by SequenceTable) ============
+	#
+	# Read-only views. `SequenceTable` is the single writer: bind / unbind /
+	# reset. Mutating one of these raises, which is the point — a stray
+	# `pop`/`[...]=` here used to be how the two maps drifted apart.
+
+	@property
+	def _local_to_uuid_map(self) -> Mapping[int, str]:
+		return self.seq_table.local_to_uuid
+
+	@property
+	def _uuid_to_local_map(self) -> Mapping[str, int]:
+		return self.seq_table.uuid_to_local
+
+	@property
+	def _free_local_indices(self) -> AbstractSet[int]:
+		return self.seq_table.free_local_indices
+
+	@property
+	def _next_local_idx(self) -> int:
+		return self.seq_table.next_local_idx
+
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
 		"""
 		Initialize/reconfigure before the persistent generate() loop starts.
@@ -1690,7 +1727,20 @@ class BatchGenWorker:
 		else:
 			# Just update the num_queries and batch-related config
 			self._update_batch_config(num_queries)
-		
+
+		# Freeze this rank's identity. G (`_decode_attn_tp_size`) reads the
+		# parallel strategy manager, which `_initialize_core_components`
+		# constructs, so this is the earliest point it is knowable. Every
+		# field is stable for the process lifetime, so a re-Init rebuilds an
+		# equal object.
+		self.rank_ctx = RankContext(
+			rank=self.rank,
+			world_size=self.world_size,
+			local_rank=self.local_rank,
+			local_world_size=self.local_world_size,
+			decode_group_size=self._decode_attn_tp_size(),
+		)
+
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
@@ -2352,43 +2402,18 @@ class BatchGenWorker:
 		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
 
 	def _owns_local_sequence(self, seq) -> bool:
-		"""Which ranks bind a sequence into the LOCAL maps (query_book +
-		_uuid_to_local_map) and drive it through prefill/decode.
+		"""Delegate: which ranks bind a sequence into the LOCAL table.
 
-		Pure DP (G==1, the validated path): the single ``assigned_rank`` owns it.
-		Option 1 unified resident TP (G>1): ALL G ranks of the sequence's
-		``decode_dp_group`` hold it — the group runs prefill+decode in TP-G
-		lockstep on identical sequences (replicated attention, head-sharded KDA
-		state), so the o_proj all_reduce couples matching tokens and no
-		prefill->decode reshard is ever needed. Requires ``decode_dp_group`` to
-		be stamped (done at admission / prefill config before binding)."""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return seq.assigned_rank == self.rank
-		from batchgen.decode_dp_group import rank_in_decode_group
-		return rank_in_decode_group(seq.decode_dp_group, self.rank, G)
+		Rule and rationale live on `RankContext.owns_sequence`.
+		"""
+		return self.rank_ctx.owns_sequence(seq)
 
 	def _owns_host_kv(self, seq) -> bool:
-		"""Which SINGLE rank drives the per-node SHARED host-KV region for a seq.
+		"""Delegate: which SINGLE rank drives the shared host-KV region.
 
-		The host paged KV cache is ONE run-namespaced shm region per node,
-		keyed by ``global_idx``, so register /
-		allocate / grow / release must fire EXACTLY once per sequence. This is
-		NARROWER than ``_owns_local_sequence``: G>1 replicates a seq onto all G
-		ranks of its group (they each hold GPU KV + head-sharded KDA state), but
-		only the group LEADER ``decode_dp_group*G`` may touch the shared host
-		region — otherwise the G ranks double-register (G x host reservation) and
-		double-release (2nd releaser hits ``IndexError: Sequence ID ... not found
-		during release``). G==1 is the validated single-owner path: the
-		``assigned_rank`` owner, identical to ``uuid in _uuid_to_local_map``."""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return seq.assigned_rank == self.rank
-		from batchgen.decode_dp_group import host_kv_owner_rank
-		return (
-			seq.decode_dp_group is not None
-			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
-		)
+		Rule and rationale live on `RankContext.owns_host_kv`.
+		"""
+		return self.rank_ctx.owns_host_kv(seq)
 
 	def _mirror_group_host_kv(
 		self,
@@ -2871,41 +2896,16 @@ class BatchGenWorker:
 	def _check_local_binding_matches_group(
 		self, uuids: List[str], where: str
 	) -> None:
-		"""A local row exists iff this rank's group owns the sequence (G>1).
+		"""Delegate: a local row exists iff this rank's group owns the sequence.
 
-		``_get_local_indices_for_uuids`` resolves a wave from
-		``_uuid_to_local_map`` alone and silently skips what it does not find,
-		so a binding that disagrees with the serve-group map is not refused
-		anywhere: the rank prefills or decodes a row its group does not own, or
-		misses one it does. The second form is what raises ``KeyError:
-		Sequence <global_idx> has no KDA state item`` from
-		``prepare_decode_step`` — by then the stamping seam is long gone.
-
-		The invariant is an equivalence, so both directions are checked, and
-		both are local reads: no collective, O(len(uuids)) per call.
+		Rule and rationale live on `SequenceTable.check_binding_matches_group`.
 		"""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return
-		offenders = []
-		for uuid in uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			bound = uuid in self._uuid_to_local_map
-			owns = self._owns_local_sequence(seq)
-			if bound != owns:
-				offenders.append(
-					f"global_idx={seq.global_idx} group={seq.decode_dp_group} "
-					f"bound={int(bound)} owns={int(owns)}"
-				)
-		if offenders:
-			raise RuntimeError(
-				f"Rank {self.rank}: [SCHED_INVARIANT] {where}: "
-				f"{len(offenders)} sequences whose local row disagrees with the "
-				f"serve-group map (G={G}, rank//G={self.rank // G}): "
-				+ "; ".join(offenders[:10])
-			)
+		self.seq_table.check_binding_matches_group(
+			uuids,
+			where,
+			rank_ctx=self.rank_ctx,
+			get_sequence=self.global_batch.get_sequence,
+		)
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -2916,17 +2916,13 @@ class BatchGenWorker:
 		seq = self.global_batch.get_sequence(uuid)
 		if self.query_book is None:
 			self.query_book = {}
-		local_idx, self._next_local_idx = bind_local_sequence_to_query_book(
+		return bind_query_book_slot(
 			uuid,
 			seq,
 			query_book=self.query_book,
-			local_to_uuid_map=self._local_to_uuid_map,
-			uuid_to_local_map=self._uuid_to_local_map,
-			free_local_indices=self._free_local_indices,
-			next_local_idx=self._next_local_idx,
+			table=self.seq_table,
 			local_idx=local_idx,
 		)
-		return local_idx
 
 	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
 		"""Build local query book entries for newly admitted sequences on this rank.
@@ -3090,12 +3086,10 @@ class BatchGenWorker:
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
 		# stray pops with downstream "Missing UUID" errors.
-		local_idx = release_local_query_slot(
+		local_idx = release_query_book_slot(
 			uuid,
-			uuid_to_local_map=self._uuid_to_local_map,
-			local_to_uuid_map=self._local_to_uuid_map,
 			query_book=self.query_book,
-			free_local_indices=self._free_local_indices,
+			table=self.seq_table,
 		)
 		if local_idx is not None:
 			if seq.assigned_rank == self.rank:
@@ -4709,7 +4703,7 @@ class BatchGenWorker:
 				f"{page_tokens}-token page"
 			)
 		storage, memfd = allocate_node_shared_tensor(
-			label=f"{self._query_book_shm_prefix}trajectory_n{self.rank // self.local_world_size}",
+			label=f"{self._query_book_shm_prefix}trajectory_n{node_of_rank(self.rank, self.local_world_size)}",
 			rows=page_count,
 			width=page_tokens,
 			dtype=torch.int32,
@@ -5460,7 +5454,7 @@ class BatchGenWorker:
 
 		# Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
 		# Host KV is shared across all GPUs on a node
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		node_rank_start = node_id * self.local_world_size
 		node_rank_end = min(node_rank_start + self.local_world_size, self.world_size)
 
@@ -5493,7 +5487,7 @@ class BatchGenWorker:
 
 		return {
 			'rank': self.rank,
-			'node_id': self.rank // self.local_world_size,
+			'node_id': self.rank_ctx.node_id,
 			'num_free_pages': free_pages,
 			'num_total_pages': stats.num_total_pages,
 			'num_used_pages': used_pages,
@@ -5524,7 +5518,7 @@ class BatchGenWorker:
 			)
 		else:
 			regions = (("host", view),)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		for name, region_view in regions:
 			logging.info(
 				f"[HOST_KV] node={node_id} "
@@ -6218,9 +6212,10 @@ class BatchGenWorker:
 
 			# Update local mappings on source rank (remove)
 			if self.rank == old_rank:
-				local_idx = self._uuid_to_local_map.pop(uuid, None)
+				# unbind drops both directions and returns the slot to the
+				# free list for O(1) reuse.
+				local_idx = self.seq_table.unbind(uuid)
 				if local_idx is not None:
-					self._local_to_uuid_map.pop(local_idx, None)
 					# A remap can leave `batch` byte-identical while changing
 					# which sequence a row resolves to, so row-keyed state must
 					# be invalidated here and not only where `batch` is rebound.
@@ -6228,8 +6223,6 @@ class BatchGenWorker:
 					self._sequences_with_gpu_kv.discard(uuid)
 					# Remove query_book entry
 					self.query_book.pop(local_idx, None)
-					# Add freed index to free list for O(1) reuse
-					self._free_local_indices.add(local_idx)
 					logging.debug(
 						f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
 						f"{uuid[:8]} (local_idx={local_idx}, from_rank={old_rank}, "
@@ -6238,15 +6231,9 @@ class BatchGenWorker:
 
 			# Update local mappings on dest rank (add)
 			if self.rank == new_rank:
-				# O(1) allocation: prefer reusing freed indices, otherwise use next available
-				if self._free_local_indices:
-					new_local_idx = self._free_local_indices.pop()
-				else:
-					new_local_idx = self._next_local_idx
-					self._next_local_idx += 1
-
-				self._uuid_to_local_map[uuid] = new_local_idx
-				self._local_to_uuid_map[new_local_idx] = uuid
+				# O(1) allocation: prefer reusing freed indices, otherwise use
+				# next available.
+				new_local_idx = self.seq_table.bind(uuid)
 				self._bump_decode_row_epoch()
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
@@ -6648,7 +6635,10 @@ class BatchGenWorker:
 			)
 			gathered = [torch.zeros_like(identity) for _ in range(self.world_size)]
 			dist.all_gather(gathered, identity)
-			creator_rank = (self.rank // self.local_world_size) * self.local_world_size
+			# Pre-`rank_ctx`: this collective runs inside core initialization.
+			creator_rank = (
+				node_of_rank(self.rank, self.local_world_size) * self.local_world_size
+			)
 			creator = gathered[creator_rank]
 			return int(creator[0].item()), int(creator[1].item())
 
@@ -6690,10 +6680,14 @@ class BatchGenWorker:
 	# ============ KV-Driven Batch Preparation ============
 
 	def _get_node_for_rank(self, rank: int) -> int:
-		"""Get physical host-KV node ID for a rank."""
-		if self.world_size <= self.local_world_size:
-			return 0
-		return rank // self.local_world_size
+		"""Delegate: physical host-KV node id of a rank.
+
+		The single definition is `RankContext.node_of`. The old
+		`world_size <= local_world_size -> 0` special case is subsumed by it:
+		every valid rank is < local_world_size in that configuration, so the
+		floor division already yields 0.
+		"""
+		return self.rank_ctx.node_of(rank)
 
 	def _get_num_nodes(self) -> int:
 		"""Get total number of physical host-KV nodes."""
@@ -6837,7 +6831,7 @@ class BatchGenWorker:
 		# would multiply the node demand by G and falsely reject the wave.
 		if owner_requests:
 			local_need += self._prefill_pool_segment_host_pages()
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		local_free = -1
 		local_total = -1
 		snapshot_error = 1 if local_error else 0
@@ -6944,7 +6938,7 @@ class BatchGenWorker:
 			reclaim_prefix_pages_for_host_admission,
 			retire_node_frontiers,
 		)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		failure = 0
 		local_frontier_hook = self._trajectory_frontier_eviction_hook()
 		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
@@ -7459,7 +7453,7 @@ class BatchGenWorker:
 		continuing would make scalar metadata and shared page tables disagree.
 		"""
 		local_need = sum(int(pages) for _, pages in host_grow_requests)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		local_free = -1
 		local_total = -1
 		snapshot_error = 0
@@ -8264,12 +8258,10 @@ class BatchGenWorker:
 			):
 				self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
 				seq._buffer_slot = -1
-			release_local_query_slot(
+			release_query_book_slot(
 				uuid,
-				uuid_to_local_map=self._uuid_to_local_map,
-				local_to_uuid_map=self._local_to_uuid_map,
 				query_book=self.query_book,
-				free_local_indices=self._free_local_indices,
+				table=self.seq_table,
 			)
 			if self.rank == 0 and self._response_queue is not None:
 				self._response_queue.put({
@@ -8635,7 +8627,7 @@ class BatchGenWorker:
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
-			seq_node = seq.assigned_rank // self.local_world_size
+			seq_node = self.rank_ctx.node_of(seq.assigned_rank)
 			G = self._decode_attn_tp_size()
 			if G > 1:
 				if seq.decode_dp_group is None:
@@ -8644,9 +8636,8 @@ class BatchGenWorker:
 						"TP prefill selection"
 					)
 				from batchgen.decode_dp_group import host_kv_owner_rank
-				seq_node = (
+				seq_node = self.rank_ctx.node_of(
 					host_kv_owner_rank(seq.decode_dp_group, G)
-					// self.local_world_size
 				)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
@@ -9355,10 +9346,7 @@ class BatchGenWorker:
 		)
 
 		# Initialize index maps
-		self._local_to_uuid_map = {}
-		self._uuid_to_local_map = {}
-		self._free_local_indices = set()
-		self._next_local_idx = 0
+		self.seq_table.reset()
 		self._bump_decode_row_epoch()
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -12695,12 +12683,10 @@ class BatchGenWorker:
 			)
 		for seq, rank in zip(seqs, ranks):
 			if current_wave and seq.assigned_rank == self.rank and rank != self.rank:
-				local_idx = release_local_query_slot(
+				local_idx = release_query_book_slot(
 					seq.uuid,
-					uuid_to_local_map=self._uuid_to_local_map,
-					local_to_uuid_map=self._local_to_uuid_map,
 					query_book=self.query_book,
-					free_local_indices=self._free_local_indices,
+					table=self.seq_table,
 				)
 				if local_idx is None:
 					raise RuntimeError(

@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import List, Optional, Sequence
 
 import pytest
+
+from tests.worker.worker_fakes import attach_identity
 import torch
 
 from batchgen.prefix_reuse import wave_runtime
@@ -355,9 +357,6 @@ def _plan_worker(
         parallel_manager.prefill_pool_layout = lambda: dict(layout)
         parallel_manager.supports_group_pool_prefill = lambda: True
     worker = SimpleNamespace(
-        rank=rank,
-        local_rank=0,
-        world_size=attn_tp_size,
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,
@@ -385,6 +384,11 @@ def _plan_worker(
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=attn_tp_size, local_world_size=8, local_rank=0,
+        decode_group_size=attn_tp_size,
     )
     worker._trajectory_tokens = (
         lambda seq, length=None, **_: seq.input_ids[0, :length]
@@ -677,9 +681,6 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=2,
-        local_world_size=8,
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         host_paged_kv_worker_view=views[0],
@@ -690,6 +691,8 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
         _pool_sid_members={},
         _pool_sid_counter=0,
     )
+    attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
+                    decode_group_size=2)
     return _bind(worker, methods)
 
 
@@ -785,7 +788,6 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
         ],
     )
     worker = SimpleNamespace(
-        rank=rank,
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         prefix_cache_coordinator=coordinator,
@@ -799,6 +801,8 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
         _pool_sid_members={},
         _host_views_by_group=lambda: views,
     )
+    attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
+                    decode_group_size=2)
     return _bind(worker, methods)
 
 
