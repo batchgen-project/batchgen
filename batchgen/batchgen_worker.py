@@ -293,6 +293,15 @@ from batchgen.worker.kv_manager import (
 	PageTableCapacityRequest,
 	WatermarkTriggerRequest,
 )
+from batchgen.worker.kv_plan import (
+	NodeCapacityReport,
+	credit_reclaimable_pages,
+	effective_chunk_size,
+	host_capacity_due,
+	prefill_owner_demand_pages,
+	provisional_pool_gb,
+	verdict_node_capacity,
+)
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
 from batchgen.worker.step_timing import (
@@ -1746,18 +1755,23 @@ class BatchGenWorker:
 			total_mem_gb = total_mem_bytes / (1024 ** 3)
 			used_mem_gb = total_mem_gb - free_mem_gb
 
-			# Formula: gpu_kv_cache = total * frac - used
+			# Formula: gpu_kv_cache = total * frac - used (single definition:
+			# kv_plan.provisional_pool_gb).
 			# This reserves (1-frac) of GPU memory for activations and overhead
-			gpu_kv_cache_gb = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-
-			# Ensure positive value
-			if gpu_kv_cache_gb <= 0:
+			calculated_gb = provisional_pool_gb(
+				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
+			)
+			# Ensure positive value: a non-positive remainder warns here and is
+			# replaced by the 1 GB floor kv_plan substitutes.
+			gpu_kv_cache_gb = provisional_pool_gb(
+				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=1.0
+			)
+			if calculated_gb <= 0:
 				logging.warning(
-					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
+					f"[GPU-KV] Calculated size is non-positive ({calculated_gb:.2f} GB). "
 					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
 					f"Using minimum 1 GB."
 				)
-				gpu_kv_cache_gb = 1.0
 
 			logging.info(
 				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
@@ -4365,8 +4379,10 @@ class BatchGenWorker:
 					f"status={seq.status.name}"
 				)
 			if required_tokens > int(seq.host_token_capacity):
-				growth_pages = math.ceil(
-					(required_tokens - int(seq.host_token_capacity)) / seq.PAGE_SIZE
+				# The guards above bound required_tokens to the token budget,
+				# so the owner's budget cap never engages here.
+				growth_pages = seq.get_host_growth_pages(
+					required_tokens - int(seq.host_token_capacity)
 				)
 				grow_requests.append((int(global_idx), growth_pages))
 
@@ -5486,8 +5502,7 @@ class BatchGenWorker:
 		growth phase releases them on demand before the fresh capacity
 		preflight. Zero when the prefix cache is off.
 		"""
-		gpus_per_node = self.local_world_size
-		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
+		num_nodes = self.rank_ctx.num_nodes
 		report_free = 0
 		report_total = 0
 		report_reclaimable = -1
@@ -5495,7 +5510,7 @@ class BatchGenWorker:
 		if worker_view is not None and self.local_rank == 0:
 			try:
 				stats = worker_view.get_stats()
-				report_node = self.rank // gpus_per_node
+				report_node = self.rank_ctx.node_of(self.rank)
 				report_free = int(stats.num_free_pages)
 				report_total = int(stats.num_total_pages)
 				report_reclaimable = (
@@ -5594,25 +5609,9 @@ class BatchGenWorker:
 		)
 		if not waiting:
 			return stats
-		releasable = max(0, int(coordinator.count_releasable_pages(0)))
-		if releasable == 0:
-			return stats
-		total = int(stats["num_total_pages"])
-		used = int(stats["num_used_pages"])
-		# A retained page is charged to `used`, so crediting it moves the same
-		# count. Clamped so a stale read can never make `used` negative or
-		# free% exceed 100 -- a watermark fed an impossible snapshot would
-		# preempt decode on every step.
-		credited = min(releasable, used)
-		free = int(stats["num_free_pages"]) + credited
-		updated = dict(stats)
-		updated["num_used_pages"] = used - credited
-		updated["num_free_pages"] = free
-		updated["num_reclaimable_prefix_pages"] = credited
-		updated["free_percent"] = (
-			int((free / total) * 100) if total > 0 else 100
+		return credit_reclaimable_pages(
+			stats, int(coordinator.count_releasable_pages(0))
 		)
-		return updated
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
@@ -6638,8 +6637,11 @@ class BatchGenWorker:
 		return self.rank_ctx.node_of(rank)
 
 	def _get_num_nodes(self) -> int:
-		"""Get total number of physical host-KV nodes."""
-		return max(1, math.ceil(self.world_size / self.local_world_size))
+		"""Delegate: total number of physical host-KV nodes.
+
+		The single definition is `RankContext.num_nodes`.
+		"""
+		return self.rank_ctx.num_nodes
 
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
@@ -6656,14 +6658,12 @@ class BatchGenWorker:
 			chunk = self.adaptive_chunk_sizer.get_chunk_size()
 		else:
 			chunk = self.host_kv_chunk_size
-		# A boundary is the only place where host pages may be allocated.  Keep
-		# one complete decision interval of runway so the next boundary is
-		# reached while the metadata invariant still holds.  This removes the
-		# unsafe post-sample emergency growth path.
-		chunk = max(chunk, self.DECISION_INTERVAL)
-		# Round up to page boundary
-		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
-		return chunk
+		# Clamp + page rounding: single definition in kv_plan.
+		return effective_chunk_size(
+			chunk,
+			decision_interval=self.DECISION_INTERVAL,
+			page_size=SequenceEntry.PAGE_SIZE,
+		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
 		"""Whether a local decode row needs planning before its next forward."""
@@ -6674,7 +6674,9 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or self._is_sequence_completed(seq):
 				continue
-			if int(seq.host_token_capacity) <= int(seq.current_context_length):
+			if host_capacity_due(
+				int(seq.host_token_capacity), int(seq.current_context_length)
+			):
 				return True
 		return False
 
@@ -6766,10 +6768,6 @@ class BatchGenWorker:
 		meaningless, so the caller must not retry on it. Both verdicts are
 		reduced, hence rank-uniform -- the retry branch is collective.
 		"""
-		local_need = sum(
-			math.ceil(int(tokens) / self.PAGE_SIZE)
-			for _, tokens in owner_requests
-		)
 		# Members' demands exclude their shared chains, but the pooled
 		# segments themselves allocate one Host copy (mirrored per group, so
 		# one count). Leaving them out over-admits the wave and the
@@ -6777,8 +6775,13 @@ class BatchGenWorker:
 		# host-KV LEADER allocates segments, so only a rank with owner demand
 		# reports them — at G>1 the followers reporting the same segments
 		# would multiply the node demand by G and falsely reject the wave.
-		if owner_requests:
-			local_need += self._prefill_pool_segment_host_pages()
+		local_need = prefill_owner_demand_pages(
+			[int(tokens) for _, tokens in owner_requests],
+			page_size=self.PAGE_SIZE,
+			pool_segment_pages=(
+				self._prefill_pool_segment_host_pages() if owner_requests else 0
+			),
+		)
 		node_id = self.rank_ctx.node_id
 		local_free = -1
 		local_total = -1
@@ -6818,48 +6821,30 @@ class BatchGenWorker:
 		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
 		dist.all_gather(gathered, report)
 
-		node_needs: Dict[int, int] = {}
-		node_capacity: Dict[int, Tuple[int, int]] = {}
-		ok = True
-		# A rejection that is merely "short of pages" is retryable by reclaim; a
-		# broken snapshot is not, and the two must not be confused.
-		rows_usable = True
-		for item in gathered:
-			reported_node = int(item[0].item())
-			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
-				item[1].item()
-			)
-			if int(item[4].item()) != 0:
-				ok = False
-				rows_usable = False
-			if int(item[2].item()) >= 0:
-				capacity = (int(item[2].item()), int(item[3].item()))
-				previous = node_capacity.get(reported_node)
-				if previous is not None and previous != capacity:
-					ok = False
-					rows_usable = False
-				node_capacity[reported_node] = capacity
-		for node, needed in node_needs.items():
-			free_total = node_capacity.get(node)
-			if free_total is None:
-				ok = False
-				rows_usable = False
-				continue
-			free_pages, total_pages = free_total
-			if needed < 0 or needed > free_pages or needed > total_pages:
-				ok = False
+		verdict = verdict_node_capacity(
+			[
+				NodeCapacityReport(
+					node_id=int(item[0].item()),
+					need=int(item[1].item()),
+					free=int(item[2].item()),
+					total=int(item[3].item()),
+					snapshot_error=int(item[4].item()),
+				)
+				for item in gathered
+			],
+			want_rows=True,
+		)
 
 		decision = torch.tensor(
-			[1 if ok else 0, 1 if rows_usable else 0],
+			[1 if verdict.ok else 0, 1 if verdict.rows_usable else 0],
 			dtype=torch.int32, device=self.torch_device,
 		)
 		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
 		if not int(decision[1].item()):
 			return bool(int(decision[0].item())), None
-		return bool(int(decision[0].item())), {
-			node: (needed, node_capacity[node][0])
-			for node, needed in node_needs.items()
-		}
+		# The reduced rows_usable is the MIN over ranks, so it is 1 only when
+		# this rank's local verdict was usable and carries its rows.
+		return bool(int(decision[0].item())), verdict.rows
 
 	def _reclaim_host_prefix_pages_collective(
 		self,
@@ -7445,33 +7430,22 @@ class BatchGenWorker:
 		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
 		dist.all_gather(gathered, report)
 
-		node_needs: Dict[int, int] = {}
-		node_capacity: Dict[int, Tuple[int, int]] = {}
-		ok = True
-		for item in gathered:
-			reported_node = int(item[0].item())
-			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
-				item[1].item()
-			)
-			if int(item[4].item()) != 0:
-				ok = False
-			if int(item[2].item()) >= 0:
-				capacity = (int(item[2].item()), int(item[3].item()))
-				previous = node_capacity.get(reported_node)
-				if previous is not None and previous != capacity:
-					ok = False
-				node_capacity[reported_node] = capacity
-		for node, needed in node_needs.items():
-			capacity = node_capacity.get(node)
-			if capacity is None:
-				ok = False
-				continue
-			free_pages, total_pages = capacity
-			if needed < 0 or needed > free_pages or needed > total_pages:
-				ok = False
+		verdict = verdict_node_capacity(
+			[
+				NodeCapacityReport(
+					node_id=int(item[0].item()),
+					need=int(item[1].item()),
+					free=int(item[2].item()),
+					total=int(item[3].item()),
+					snapshot_error=int(item[4].item()),
+				)
+				for item in gathered
+			],
+			want_rows=False,
+		)
 
 		decision = torch.tensor(
-			[1 if ok else 0], dtype=torch.int32, device=self.torch_device
+			[1 if verdict.ok else 0], dtype=torch.int32, device=self.torch_device
 		)
 		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
 		return bool(int(decision.item()))
@@ -7518,7 +7492,6 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 
-		gpus_per_node = self.local_world_size
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
 		sequence_limits = self._prefill_sequence_limits()
@@ -7600,7 +7573,7 @@ class BatchGenWorker:
 		# state is per GPU; every rank reports its free count and the scheduler
 		# uses the node minimum. This keeps every rank's selection identical
 		# even if a prior lifecycle bug left one TP group asymmetric.
-		report_node = self.rank // gpus_per_node
+		report_node = self.rank_ctx.node_of(self.rank)
 		report_host_free = local_host_free if self.local_rank == 0 else -1
 		report_host_total = (
 			self._get_host_kv_total_pages() if self.local_rank == 0 else -1
@@ -18682,7 +18655,9 @@ class BatchGenWorker:
 				"measurement (the frac-based final size would have been %.2f GB)",
 				GPU_KV_POOL_HEADROOM_GB,
 				self.gpu_memory_frac,
-				total_mem_gb * self.gpu_memory_frac - steady_used_gb,
+				provisional_pool_gb(
+					total_mem_gb, self.gpu_memory_frac, steady_used_gb, floor_gb=None
+				),
 			)
 
 	def _setup_cuda_graphs(self, gpu_manager):

@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import math
 
+from batchgen.worker.kv_plan import effective_chunk_size
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -108,7 +110,10 @@ def test_effective_host_chunk_covers_one_decode_decision_interval():
     class _Entry:
         PAGE_SIZE = 64
 
-    namespace = {"math": math, "SequenceEntry": _Entry}
+    namespace = {
+        "math": math, "SequenceEntry": _Entry,
+        "effective_chunk_size": effective_chunk_size,
+    }
     exec(compile(source, str(WORKER), "exec"), namespace)
     worker = SimpleNamespace(
         adaptive_chunk_sizer=None,
