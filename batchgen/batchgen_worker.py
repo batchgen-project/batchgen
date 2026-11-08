@@ -295,6 +295,7 @@ from batchgen.worker.step_timing import (
 	format_decode_step_split,
 	new_decode_step_split,
 )
+from batchgen.worker.prefill_fastpath import is_consecutive_prefill
 from batchgen.worker.deferred_readback import (
 	DeferredTokenReadbackError,
 	PendingDecodeStep,
@@ -11228,58 +11229,68 @@ class BatchGenWorker:
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
 		persistent = self._persistent_phase_enabled()
-		if not persistent:
-			# Request reuse BEFORE the FIRST prefill configure, so the prefill
-			# instance this process keeps is the one that configure builds.
-			# Requesting it only at the first decode build left the first
-			# prefill model unkept, and the next decode->prefill switch — the
-			# first one inside a measured batch — paid a second full prefill
-			# build to produce the instance it keeps. Idempotent afterwards.
-			self._request_phase_instance_reuse()
-		reuse = (not persistent) and self._decode_instance_is_reusable()
-		if persistent:
-			self._release_persistent_decode_instance()
-		elif reuse:
-			# Default lifecycle, second and later switches: the decode model,
-			# its CUDA graphs, its kernel/descriptor state and the KV pools all
-			# stay where they are. Only the routed experts give their physical
-			# memory back, at the same virtual addresses, so nothing a graph
-			# baked moves and nothing has to be rebuilt on the way back.
-			self._k3_startup_prefill_ready = False
-			self._release_reused_decode_instance()
-			self._assert_phase_switch_clean("decode_to_prefill", reused=True)
-		elif reuse_startup_prefill:
-			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
-			# decode model has run yet, and this prefill phase — model,
-			# streamed-SP8 buffers, installed H2D schedule — is the one startup
-			# built. deep_free_model_memory() would release those buffers and
-			# strand the weight daemon's preserved cursor. Consumed here, so every
-			# later prefill (which does follow a decode phase) frees normally.
-			self._k3_startup_prefill_ready = False
-			logging.info("Reusing Kimi-K3 startup-prepared prefill model...")
-		elif resident_handoff:
-			# Keep the model and its resident EP shard. Captured decode graphs
-			# bake the GPU KV-pool addresses and the pool is rebuilt below, so
-			# they are released here and re-captured by configure_decoding.
-			self._k3_startup_prefill_ready = False
-			self.parallel_manager.release_decode_graph()
-			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-				resident_token_cap
-			)
-			if torch.cuda.is_available():
-				torch.cuda.synchronize(self.torch_device)
-			logging.info(
-				"[K3] resident-EP prefill handoff: keeping the resident expert "
-				f"shard across the decode->prefill transition, token cap "
-				f"{resident_token_cap}"
-			)
-		else:
-			# Consume a startup handoff that the request cannot reuse (for example,
-			# a diagnostic mode/profile override) before rebuilding that phase.
-			self._k3_startup_prefill_ready = False
-			logging.info("Deep freeing model memory before prefill config...")
-			self.deep_free_model_memory()
-			self._assert_phase_switch_clean("decode_to_prefill", reused=False)
+		consecutive_prefill = is_consecutive_prefill(
+			persistent=persistent,
+			phase=self._phase,
+			has_model=self.model is not None,
+			reuse_startup_prefill=reuse_startup_prefill,
+			manager=self.parallel_manager,
+			prefill_moe_mode=k3_prefill_moe_mode,
+		)
+		reuse = False
+		if not consecutive_prefill:
+			if not persistent:
+				# Request reuse BEFORE the FIRST prefill configure, so the prefill
+				# instance this process keeps is the one that configure builds.
+				# Requesting it only at the first decode build left the first
+				# prefill model unkept, and the next decode->prefill switch — the
+				# first one inside a measured batch — paid a second full prefill
+				# build to produce the instance it keeps. Idempotent afterwards.
+				self._request_phase_instance_reuse()
+			reuse = (not persistent) and self._decode_instance_is_reusable()
+			if persistent:
+				self._release_persistent_decode_instance()
+			elif reuse:
+				# Default lifecycle, second and later switches: the decode model,
+				# its CUDA graphs, its kernel/descriptor state and the KV pools all
+				# stay where they are. Only the routed experts give their physical
+				# memory back, at the same virtual addresses, so nothing a graph
+				# baked moves and nothing has to be rebuilt on the way back.
+				self._k3_startup_prefill_ready = False
+				self._release_reused_decode_instance()
+				self._assert_phase_switch_clean("decode_to_prefill", reused=True)
+			elif reuse_startup_prefill:
+				# EXCEPT on the first admission after the Kimi-K3 startup pass: no
+				# decode model has run yet, and this prefill phase — model,
+				# streamed-SP8 buffers, installed H2D schedule — is the one startup
+				# built. deep_free_model_memory() would release those buffers and
+				# strand the weight daemon's preserved cursor. Consumed here, so every
+				# later prefill (which does follow a decode phase) frees normally.
+				self._k3_startup_prefill_ready = False
+				logging.info("Reusing Kimi-K3 startup-prepared prefill model...")
+			elif resident_handoff:
+				# Keep the model and its resident EP shard. Captured decode graphs
+				# bake the GPU KV-pool addresses and the pool is rebuilt below, so
+				# they are released here and re-captured by configure_decoding.
+				self._k3_startup_prefill_ready = False
+				self.parallel_manager.release_decode_graph()
+				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
+					resident_token_cap
+				)
+				if torch.cuda.is_available():
+					torch.cuda.synchronize(self.torch_device)
+				logging.info(
+					"[K3] resident-EP prefill handoff: keeping the resident expert "
+					"shard across the decode->prefill transition, token cap "
+					f"{resident_token_cap}"
+				)
+			else:
+				# Consume a startup handoff that the request cannot reuse (for example,
+				# a diagnostic mode/profile override) before rebuilding that phase.
+				self._k3_startup_prefill_ready = False
+				logging.info("Deep freeing model memory before prefill config...")
+				self.deep_free_model_memory()
+				self._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
@@ -11290,7 +11301,7 @@ class BatchGenWorker:
 		# keeps its pools mapped by design. Neither may be destroyed here — the
 		# destroy/recreate this call performs is what moves the pool, and the
 		# decode graphs bake its pointers.
-		if not persistent and not reuse:
+		if not consecutive_prefill and not persistent and not reuse:
 			self._destroy_gpu_paged_kv_cache()
 		if not persistent and not reuse and k3_prefill_profile and torch.cuda.is_available():
 			torch.cuda.reset_peak_memory_stats(self.local_rank)
@@ -11342,7 +11353,16 @@ class BatchGenWorker:
 		# STEP 1: Configure model for prefill. The normal first K3 admission
 		# inherits the exact phase installed before readiness; do not re-enter
 		# configure_prefill or stop/restart its H2D pipeline lazily here.
-		if (
+		if consecutive_prefill:
+			self.model, self.weight_copy_task = (
+				self.parallel_manager.reactivate_prefill_in_place()
+			)
+			self.set_phase("prefill")
+			if self.rank == 0:
+				logging.info(
+					"[PREFILL] consecutive-prefill fast path: live instance kept"
+				)
+		elif (
 			(persistent or reuse)
 			and self.parallel_manager.prefill_instance is not None
 		):
