@@ -22,6 +22,19 @@ cycles when exhausted. Without the key nothing in this module runs: the
 segments' hooks are ``is not None`` checks, the spin extension is never
 imported, and the captured graph is exactly the uninstrumented one.
 
+Delay tiers and per-site scaling: the probe resolves ~1 us of injected spin
+(fixed-additive overshoot, calibrated in the GPU test), and small
+perturbations are the honest regime — criticality grows with perturbation
+size (insight ``criticality-depends-on-perturbation-size``), so slopes from
+1/2/4 us per mark are the upper-bound filter, and larger delays only confirm
+serialization. The slope's signal scales with the TOTAL injected time per
+step, ``L_site x delay``, not with the per-mark delay: at equal per-mark
+tiers a site marked on every layer injects several times more total delay
+per step than a site marked on a sparse layer subset, and the sparse site's
+slope fits with proportionally larger stderr. For a low-mark site, scale
+the per-mark delay up by the mark-count ratio so every site in a sweep
+injects a comparable total per step.
+
 Host-sync contract on the steady-state decode path: ``before_replay`` enqueues
 at most one async host->device copy, from a pinned row that is written once at
 construction and never again, on the stream the replay is issued on. Stream
@@ -247,6 +260,38 @@ class CriticalityProbeSpec:
         return (DEBUG_KEY, self.sites, self.layers, self.schedule, self.skip_steps_after_change)
 
 
+def _fit_into(result: Dict[str, Any], points: List[Tuple[float, "_LevelStats"]]) -> None:
+    """Weighted least-squares of step time vs injected ms over ``points``.
+
+    Fills ``slope``, ``intercept_ms``, ``stderr``, ``max_residual_us`` and
+    ``samples`` in ``result``; on an underdetermined fit sets ``reason`` and
+    leaves ``slope`` as ``None``.
+    """
+    n = sum(stats.count for _, stats in points)
+    result["samples"] = n
+    if len({x for x, _ in points}) < 2 or n < 3:
+        result["reason"] = "fewer than two distinct injected delays or three samples"
+        return
+    sum_x = sum(x * stats.count for x, stats in points)
+    sum_y = sum(stats.sum_ms for _, stats in points)
+    mean_x = sum_x / n
+    mean_y = sum_y / n
+    sxx = sum(stats.count * x * x for x, stats in points) - n * mean_x * mean_x
+    sxy = sum(x * stats.sum_ms for x, stats in points) - n * mean_x * mean_y
+    syy = sum(stats.sumsq_ms for _, stats in points) - n * mean_y * mean_y
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    ssr = max(syy - slope * sxy, 0.0)
+    result["slope"] = slope
+    result["intercept_ms"] = intercept
+    result["stderr"] = math.sqrt(ssr / (n - 2) / sxx)
+    # Linearity: how far each level's mean sits off the fitted line.
+    result["max_residual_us"] = max(
+        abs(stats.sum_ms / stats.count - (intercept + slope * x)) * 1000.0
+        for x, stats in points
+    )
+
+
 class _LevelStats:
     __slots__ = ("count", "sum_ms", "sumsq_ms", "min_ms", "max_ms", "skipped")
 
@@ -400,6 +445,35 @@ class CriticalityProbe:
         index = SITE_INDEX[site]
         return self.layer_marks[index] * self.spec.schedule[level][1][index] / 1.0e6
 
+    def total_injected_ms_per_step(self, level: int) -> float:
+        """Sum of ``injected_ms_per_step`` over every site, for one level."""
+        return sum(self.injected_ms_per_step(level, site) for site in self.spec.sites)
+
+    def combined_slope(self) -> Dict[str, Any]:
+        """Least-squares slope of step time vs TOTAL injected delay per step.
+
+        Uses every level, with x = the sum of all sites' injected ms. This is
+        the only defined slope for a multi-site schedule's mixed levels, which
+        ``site_slope`` must exclude; it answers "how critical is this GROUP of
+        positions as scheduled", not any one site. ``slope`` is ``None`` under
+        the same conditions as ``site_slope``.
+        """
+        result: Dict[str, Any] = {
+            "sites": tuple(self.spec.sites), "slope": None, "stderr": None,
+            "intercept_ms": None, "samples": 0, "max_residual_us": None,
+            "reason": "",
+        }
+        if self.layer_marks is None or all(m == 0 for m in self.layer_marks):
+            result["reason"] = "no spin node of any site in the graph"
+            return result
+        points = [
+            (self.total_injected_ms_per_step(level), self._stats[level])
+            for level in range(len(self.spec.schedule))
+            if self._stats[level].count
+        ]
+        _fit_into(result, points)
+        return result
+
     def site_slope(self, site: str) -> Dict[str, Any]:
         """Least-squares slope of step time vs injected delay for ``site``.
 
@@ -428,29 +502,7 @@ class CriticalityProbe:
             if stats.count == 0:
                 continue
             points.append((self.injected_ms_per_step(level, site), stats))
-        n = sum(stats.count for _, stats in points)
-        result["samples"] = n
-        if len({x for x, _ in points}) < 2 or n < 3:
-            result["reason"] = "fewer than two distinct injected delays or three samples"
-            return result
-        sum_x = sum(x * stats.count for x, stats in points)
-        sum_y = sum(stats.sum_ms for _, stats in points)
-        mean_x = sum_x / n
-        mean_y = sum_y / n
-        sxx = sum(stats.count * x * x for x, stats in points) - n * mean_x * mean_x
-        sxy = sum(x * stats.sum_ms for x, stats in points) - n * mean_x * mean_y
-        syy = sum(stats.sumsq_ms for _, stats in points) - n * mean_y * mean_y
-        slope = sxy / sxx
-        intercept = mean_y - slope * mean_x
-        ssr = max(syy - slope * sxy, 0.0)
-        result["slope"] = slope
-        result["intercept_ms"] = intercept
-        result["stderr"] = math.sqrt(ssr / (n - 2) / sxx)
-        # Linearity: how far each level's mean sits off the fitted line.
-        result["max_residual_us"] = max(
-            abs(stats.sum_ms / stats.count - (intercept + slope * x)) * 1000.0
-            for x, stats in points
-        )
+        _fit_into(result, points)
         return result
 
     def report(self) -> str:
@@ -500,6 +552,25 @@ class CriticalityProbe:
             else:
                 lines.append(
                     f"[CRITICALITY_PROBE]   site={site} L_site={fit['marks_per_step']} "
+                    f"slope={fit['slope']:.4f} stderr={fit['stderr']:.4f} "
+                    f"intercept_ms={fit['intercept_ms']:.4f} "
+                    f"max_level_residual_us={fit['max_residual_us']:.2f} "
+                    f"samples={fit['samples']}"
+                )
+        swept = {
+            site for _, delays in self.spec.schedule for site in self.spec.sites
+            if delays[SITE_INDEX[site]]
+        }
+        if len(swept) > 1:
+            fit = self.combined_slope()
+            if fit["slope"] is None:
+                lines.append(
+                    f"[CRITICALITY_PROBE]   combined sites={','.join(self.spec.sites)} "
+                    f"slope=undefined ({fit['reason']}) samples={fit['samples']}"
+                )
+            else:
+                lines.append(
+                    f"[CRITICALITY_PROBE]   combined sites={','.join(self.spec.sites)} "
                     f"slope={fit['slope']:.4f} stderr={fit['stderr']:.4f} "
                     f"intercept_ms={fit['intercept_ms']:.4f} "
                     f"max_level_residual_us={fit['max_residual_us']:.2f} "

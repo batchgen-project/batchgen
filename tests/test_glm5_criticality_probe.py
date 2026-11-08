@@ -320,6 +320,62 @@ def test_zero_marks_report_instead_of_dividing():
     assert "site=after_combine L_site=0 slope=undefined" in report
 
 
+def test_combined_slope_uses_mixed_levels_that_site_slope_must_exclude():
+    raw = _spec(schedule=[
+        {"steps": 4, "delay_us": {}},
+        {"steps": 4, "delay_us": {"after_router": 10, "after_combine": 10}},
+        {"steps": 4, "delay_us": {"after_router": 30, "after_combine": 30}},
+    ])
+    probe, _ = _probe(raw)
+    probe.begin_forward()
+    for layer in range(75):
+        probe.mark("after_router", layer)
+        probe.mark("after_combine", layer)
+    probe.end_forward()
+
+    # Total injected per step: 0 / 150 x 10 us / 150 x 30 us. Step time rises
+    # at 0.4 per injected ms plus a symmetric wobble.
+    def step_ms(step, level):
+        injected_ms = 150 * (0, 10, 30)[level] / 1000.0
+        return 20.0 + 0.4 * injected_ms + (0.01 if step % 2 else -0.01)
+
+    _fill(probe, step_ms, periods=4)
+    fit = probe.combined_slope()
+    assert fit["sites"] == ("after_router", "after_combine")
+    assert fit["slope"] == pytest.approx(0.4, abs=1e-3)
+    assert fit["intercept_ms"] == pytest.approx(20.0, abs=1e-2)
+    assert fit["stderr"] is not None and fit["stderr"] < 0.01
+    # Mixed levels leave each single site with only the zero level.
+    assert probe.site_slope("after_router")["slope"] is None
+    assert probe.site_slope("after_combine")["slope"] is None
+    report = probe.report()
+    assert "combined sites=after_router,after_combine slope=0.4" in report
+
+
+def test_combined_line_absent_for_a_single_swept_site():
+    probe, _ = _probe()  # default schedule sweeps only after_router
+    probe.begin_forward()
+    probe.mark("after_router", 0)
+    probe.mark("after_combine", 0)
+    probe.end_forward()
+    _fill(probe, lambda step, level: 5.0)
+    assert "combined" not in probe.report()
+
+
+def test_combined_slope_without_any_marks_reports_a_reason():
+    raw = _spec(schedule=[
+        {"steps": 4, "delay_us": {}},
+        {"steps": 4, "delay_us": {"after_router": 10, "after_combine": 10}},
+    ])
+    probe, _ = _probe(raw)
+    probe.begin_forward()
+    probe.end_forward()
+    _fill(probe, lambda step, level: 5.0)
+    fit = probe.combined_slope()
+    assert fit["slope"] is None and "no spin node" in fit["reason"]
+    assert "combined sites=after_router,after_combine slope=undefined" in probe.report()
+
+
 def test_a_site_without_its_own_sweep_has_no_slope():
     probe, _ = _probe()
     probe.begin_forward()
