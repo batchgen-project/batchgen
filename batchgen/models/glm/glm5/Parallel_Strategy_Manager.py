@@ -92,6 +92,8 @@ class GLM5ParallelStrategyManager:
         self.reuse_phase_instances = False
         self.prefill_instance = None
         self.decode_instance = None
+        self._prefill_moe_mode = None
+        self._pending_prefill_moe_mode = None
         self._expert_arena = None
         self._expert_copy_pairs = []
         # Device copies of the skeleton's FP8 dequant scales. The scales never
@@ -136,6 +138,11 @@ class GLM5ParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
+        pending_prefill_moe_mode = getattr(
+            self, "_pending_prefill_moe_mode", None
+        )
+        if pending_prefill_moe_mode is not None:
+            self._prefill_moe_mode = pending_prefill_moe_mode
         self.loaded_model_config.phase = "prefill"
         Glm5MoE.reset_prefill_grouped_state()
 
@@ -499,17 +506,37 @@ class GLM5ParallelStrategyManager:
         check_late_compiles(self.global_rank, where,
                             strict=strict_requested(_batch_debug()))
 
-    def activate_prefill(self):
-        """Switch the already-built prefill instance in (persistent instances)."""
-        self._check_late_deepgemm_compiles("activate_prefill")
+    def set_prefill_moe_mode(self, mode):
+        """Record the worker-selected prefill MoE mode for reuse checks."""
+        self._pending_prefill_moe_mode = mode
+
+    def _prepare_prefill_activation(self, instance=None):
         Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "prefill"
-        self.model, self.weight_copy_task = self.prefill_instance
+        if instance is not None:
+            self.model, self.weight_copy_task = instance
         Glm5MoE.init_prefill_grouped_buffers(
             self.loaded_model_config,
             self.engine_config.Basic_Config.device_torch,
         )
         _synchronize_prefill_preloads()
+
+    def reactivate_prefill_in_place_applicable(self, *, prefill_moe_mode):
+        return (
+            getattr(self.loaded_model_config, "phase", None) == "prefill"
+            and self._prefill_moe_mode == prefill_moe_mode
+        )
+
+    def reactivate_prefill_in_place(self):
+        """Reset grouped prefill state while keeping the live model instance."""
+        self._check_late_deepgemm_compiles("reactivate_prefill_in_place")
+        self._prepare_prefill_activation()
+        return self.model, self.weight_copy_task
+
+    def activate_prefill(self):
+        """Switch the already-built prefill instance in (persistent instances)."""
+        self._check_late_deepgemm_compiles("activate_prefill")
+        self._prepare_prefill_activation(self.prefill_instance)
         return self.model, self.weight_copy_task
 
     def activate_decoding(self):
