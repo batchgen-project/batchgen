@@ -548,7 +548,8 @@ _GRAPH_COMPARE_RERUN = (
 )
 UNSTREAMED_FORWARDS = {
     ("decoding_continuous", "self.model.model"): _GRAPH_COMPARE_RERUN,
-    ("decoding_continuous", "self._whole_model_segment.run_model_with_probes"):
+    # S2: same call, new spelling of the captured segment's owner.
+    ("decoding_continuous", "self._graph.whole_model_segment.run_model_with_probes"):
         _GRAPH_COMPARE_RERUN,
 }
 
@@ -616,7 +617,9 @@ def test_the_unstreamed_forwards_only_rerun_a_graph_replay():
             for node in ast.walk(statement) if isinstance(node, ast.Call)
         ]
         assert any(
-            ast.unparse(node.func) == "self._cuda_graph_manager.replay"
+            # S2: the manager handle moved onto GraphRuntime; still the one
+            # replay call inside the `_use_graph` branch.
+            ast.unparse(node.func) == "self._graph.cuda_graph_manager.replay"
             for node in branch_calls
         ), reason
         assert not any(

@@ -152,11 +152,20 @@ def _shutdown_worker_runtime(worker) -> None:
 		"gpu_paged_kv_cache_manager",
 		"host_paged_kv_worker_view",
 		"host_paged_kv_worker_view_aux",
-		"_cuda_graph_adapter",
-		"_cuda_graph_manager",
-		"_glm5_moe_cuda_graph_manager",
-		"_glm5_layer_cuda_graph_manager",
-		"_whole_model_segment",
+	):
+		if hasattr(worker, attr):
+			setattr(worker, attr, None)
+
+	# The decode-graph refs sit here, at the position they held in the list
+	# above: after the KV views and before the buffer pools, and before the
+	# first gc.collect() and the weights_storage release below.  GraphRuntime
+	# drops them in its own order -- adapter first, because its `_ctx` holds
+	# model, segment and KV-manager references.
+	graph = getattr(worker, "_graph", None)
+	if graph is not None:
+		graph.drop_refs_for_shutdown()
+
+	for attr in (
 		"_buffer_pool",
 		"_retired_buffer_pools",
 		"skeleton_state_dict",
