@@ -26,6 +26,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.worker.worker_fakes import make_graph_state
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -220,25 +222,32 @@ def test_prefill_to_decode_invariant_consumes_the_flag():
 def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
     check = _isolated_worker_method("_assert_phase_switch_clean")
     clean = dict(
-        rank=5,
-        _cuda_graph_manager=None,
-        _glm5_moe_cuda_graph_manager=None,
-        _glm5_layer_cuda_graph_manager=None,
-        _whole_model_segment=None,
+        cuda_graph_manager=None,
+        glm5_moe_cuda_graph_manager=None,
+        glm5_layer_cuda_graph_manager=None,
+        whole_model_segment=None,
     )
 
-    check(_rebuild_path_worker(**clean), "decode_to_prefill", reused=False)
+    check(
+        _rebuild_path_worker(rank=5, _graph=make_graph_state(**clean)),
+        "decode_to_prefill",
+        reused=False,
+    )
 
     for name in (
-        "_cuda_graph_manager",
-        "_glm5_moe_cuda_graph_manager",
-        "_glm5_layer_cuda_graph_manager",
-        "_whole_model_segment",
+        "cuda_graph_manager",
+        "glm5_moe_cuda_graph_manager",
+        "glm5_layer_cuda_graph_manager",
+        "whole_model_segment",
     ):
         planted = dict(clean)
         planted[name] = object()
         with pytest.raises(RuntimeError, match=name):
-            check(_rebuild_path_worker(**planted), "decode_to_prefill", reused=False)
+            check(
+                _rebuild_path_worker(rank=5, _graph=make_graph_state(**planted)),
+                "decode_to_prefill",
+                reused=False,
+            )
 
 
 def test_unknown_switch_direction_is_a_programming_error():
@@ -274,8 +283,7 @@ def test_deep_free_drops_the_parallel_manager_model_reference():
         model=model,
         torch_device="cpu",
         parallel_manager=manager,
-        _cuda_graph_adapter=None,
-        _glm5_layer_graph_failed_buckets=set(),
+        _graph=make_graph_state(),
     )
 
     deep_free(worker)
@@ -308,8 +316,7 @@ def test_deep_free_leaves_persistent_instances_alone():
         model=model,
         torch_device="cpu",
         parallel_manager=manager,
-        _cuda_graph_adapter=None,
-        _glm5_layer_graph_failed_buckets=set(),
+        _graph=make_graph_state(),
     )
 
     deep_free(worker)
@@ -337,4 +344,6 @@ def test_all_short_capture_code_is_not_deleted():
         ROOT / "batchgen" / "attention" / "dsa" / "glm5_decode_selector.py"
     ).read_text()
     assert "_run_all_short_fa3" in selector
-    assert "_glm5_whole_model_all_short" in WORKER_SRC
+    # S2 spelling: the flag is a GraphRuntime field now, still read by the
+    # worker's capture code -- which is what "not deleted" means here.
+    assert "glm5_whole_model_all_short" in WORKER_SRC
