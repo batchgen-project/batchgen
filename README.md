@@ -99,13 +99,15 @@ workload builders and the batch driver used for every row.
 
 | Model and hardware | Workload | BatchGen | Reference | Advantage | Measured |
 | --- | --- | ---: | ---: | ---: | --- |
+| [Kimi-K3.1-Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) (2.9T), 4×8 H20 | 512-request diverse batch, mixed contexts, 1,024-token completions | 402.7 s batch wall | SGLang main (0.5.24.dev825) · TP32 tuned throughput arm: 808.8 s | **2.01× faster** | 2026-11-07 · decode ledger |
+| Kimi-K3.1-Pro (2.9T), 4×8 H20 | 512-request batch, 4,096-token completions | 924.6 s batch wall | SGLang main (0.5.24.dev825) · TP32 tuned throughput arm: 2,746.6 s | **2.97× faster** | 2026-11-07 · decode ledger |
 | [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** | 2026-09-03 · `ae374617` |
 | Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8/TP16: 1,202.9 s | **1.61× faster** | 2026-07-10 campaign |
 | [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) (753B), 8× H200 | 8×1M accumulated-token prefill, pure DP8 | 20,648 prompt tok/s | SGLang 0.5.18 · DP8 attention / TP8 MoE, tuned CPU offload + chunk: 12,106 prompt tok/s | **1.71× faster** | 2026-09-23 · `954b2bc6` |
 
 These snapshots come from the latest gated campaigns available to this repository. The GLM-5.2 row is the exact eight-prompt, one-request-per-rank workload; it covers prefill and the first sampled token rather than sustained 1M-context decode.
 
-Measurement provenance: the Measured column gives the campaign date and the BatchGen commit (Kimi-K3: the `ae374617` campaign cohort, 2026-09-03; Kimi-K2.5: the 2026-07-10 long-context campaign, whose engine commit was not recorded in the public note; GLM-5.2: source assembly `954b2bc6` against a bracketed SGLang 0.5.18 chunk/offload sweep from 2026-09-23). The GLM source result still requires final installed-wheel replay. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
+Measurement provenance: the Measured column gives the campaign date and the BatchGen commit (Kimi-K3.1-Pro: the 2026-11-07 decode-ledger cohort — both engines on the same 4×8 H20 group with identical 512-request sets, full per-run manifests in the benchmark ledger, and a baseline arm retuned on-hardware after the ported configuration over-allocated; Kimi-K3: the `ae374617` campaign cohort, 2026-09-03; Kimi-K2.5: the 2026-07-10 long-context campaign, whose engine commit was not recorded in the public note; GLM-5.2: source assembly `954b2bc6` against a bracketed SGLang 0.5.18 chunk/offload sweep from 2026-09-23). The GLM source result still requires final installed-wheel replay. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
 
 The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
 
