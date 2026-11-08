@@ -766,6 +766,22 @@ def test_g2_follower_release_drops_its_mirror_without_freeing_shared_pages(
 # --------------------------------------------------------------------------- #
 
 
+SEQUENCE = Path(__file__).resolve().parents[2] / "batchgen" / "sequence.py"
+
+
+def _sequence_entry_method(name):
+    """Compile one ``SequenceEntry`` method from its source (no batchgen import)."""
+    tree = ast.parse(SEQUENCE.read_text())
+    entry = next(node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and node.name == "SequenceEntry")
+    fn = copy.deepcopy(next(node for node in entry.body
+                            if isinstance(node, ast.FunctionDef) and node.name == name))
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    namespace = {"math": math}
+    exec(compile(module, str(SEQUENCE), "exec"), namespace)
+    return namespace[name]
+
+
 def _append_worker(attn_tp_size, view):
     methods = _worker_methods(
         ["_ensure_host_kv_append_capacity", "_decode_attn_tp_size"],
@@ -778,6 +794,10 @@ def _append_worker(attn_tp_size, view):
         kv_token_budget=64 * PAGE_TOKENS,
         current_context_length=2 * PAGE_TOKENS, decoded_length=64,
         status=SimpleNamespace(name="IN_DECODE"),
+    )
+    # The append path derives growth pages through the SequenceEntry owner.
+    seq.get_host_growth_pages = types.MethodType(
+        _sequence_entry_method("get_host_growth_pages"), seq
     )
     worker = SimpleNamespace(
         rank=1,

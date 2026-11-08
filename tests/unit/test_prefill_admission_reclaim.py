@@ -42,6 +42,11 @@ from batchgen.prefix_reuse.trajectory_commit import (
 from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 import batchgen.sequence as sequence_module
 from batchgen.sequence import SequenceStatus
+from batchgen.worker.kv_plan import (
+    NodeCapacityReport,
+    prefill_owner_demand_pages,
+    verdict_node_capacity,
+)
 from batchgen.worker.prefill import (
     PREFILL_NO_PROGRESS_LIMIT,
     PREFILL_RECLAIM_TARGET_CANDIDATES,
@@ -128,6 +133,9 @@ def _worker_methods(dist):
         "release_query_book_slot": release_query_book_slot,
         "SequenceStatus": SequenceStatus,
         "_sequence_module": sequence_module,
+        "NodeCapacityReport": NodeCapacityReport,
+        "prefill_owner_demand_pages": prefill_owner_demand_pages,
+        "verdict_node_capacity": verdict_node_capacity,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in METHODS}
