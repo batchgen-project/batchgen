@@ -2,11 +2,12 @@
 
 ``RankContext`` is built once, after the parallel strategy manager exists
 (that is when the decode attention TP group size G becomes known), and never
-changes afterwards. It is the single owner of two terms:
+changes afterwards. It is the single owner of three terms:
 
 * "node of a rank": ``node_of_rank`` / ``RankContext.node_of``. Every
   host-KV, trajectory-book and memfd computation that needs a rank's physical
   node goes through it.
+* the physical node COUNT: ``RankContext.num_nodes``.
 * decode-group ownership of a sequence: ``owns_sequence`` (which ranks bind
   the sequence into their local maps) and ``owns_host_kv`` (the single rank
   that drives the per-node shared host-KV region). The decode-group geometry
@@ -19,6 +20,7 @@ module). Nothing else.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from batchgen.decode_dp_group import host_kv_owner_rank, rank_in_decode_group
@@ -58,6 +60,15 @@ class RankContext:
     def node_id(self) -> int:
         """Physical node id of this rank."""
         return node_of_rank(self.rank, self.local_world_size)
+
+    @property
+    def num_nodes(self) -> int:
+        """Number of physical host-KV nodes: ``ceil(world / local_world)``,
+        at least 1.
+
+        An uneven world (a partial last node) still counts that node.
+        """
+        return max(1, math.ceil(self.world_size / self.local_world_size))
 
     def owns_sequence(self, seq) -> bool:
         """Whether this rank binds ``seq`` into its LOCAL maps and drives it

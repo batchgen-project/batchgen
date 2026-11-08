@@ -7,6 +7,7 @@ and ``_owns_host_kv`` unchanged. These tests pin today's behaviour for G=1
 slice that means to change the G>1 rules has to change a test on purpose.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,42 @@ def test_node_of_answers_for_any_rank_not_only_this_one():
 
 def test_node_id_is_this_ranks_node():
     assert _ctx(9, local_world_size=8).node_id == 1
+
+
+# ------------------------------------------------------------ node count
+
+
+@pytest.mark.parametrize(
+    "world_size,local_world_size,expected",
+    [
+        (1, 1, 1),     # single GPU
+        (8, 8, 1),     # one full node (G=8 resident TP lives inside it)
+        (32, 8, 4),    # four full nodes
+        (4, 8, 1),     # a partial single node still counts as one
+        (9, 8, 2),     # uneven: a partial last node is counted
+        (15, 8, 2),
+        (17, 8, 3),
+        (7, 2, 4),
+        (5, 1, 5),     # pure per-GPU "nodes"
+    ],
+)
+def test_num_nodes_is_ceiling_division_at_least_one(world_size, local_world_size, expected):
+    ctx = _ctx(0, world_size=world_size, local_world_size=local_world_size)
+    assert ctx.num_nodes == expected
+    # The old inline worker formula (batchgen_worker.py:6733 / :5610 @ ad4a0942).
+    assert ctx.num_nodes == max(1, math.ceil(world_size / local_world_size))
+
+
+@pytest.mark.parametrize("decode_group_size", [1, 8])
+def test_num_nodes_is_independent_of_the_decode_group_size(decode_group_size):
+    ctx = _ctx(0, world_size=32, local_world_size=8, decode_group_size=decode_group_size)
+    assert ctx.num_nodes == 4
+
+
+def test_every_rank_node_is_below_num_nodes():
+    for world_size, local_world_size in [(32, 8), (9, 8), (7, 2), (1, 1)]:
+        ctx = _ctx(0, world_size=world_size, local_world_size=local_world_size)
+        assert {ctx.node_of(r) for r in range(world_size)} == set(range(ctx.num_nodes))
 
 
 def test_single_node_runs_put_every_rank_on_node_zero():
