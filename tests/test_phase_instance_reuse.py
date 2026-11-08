@@ -41,6 +41,8 @@ from typing import Optional
 
 import pytest
 
+from tests.worker.worker_fakes import make_graph_state
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -204,10 +206,12 @@ def _release_worker(
     worker._destroy_gpu_paged_kv_cache = lambda **kw: calls.append(
         ("destroy_kv", tuple(sorted(kw.items())))
     )
-    worker._cuda_graph_manager = object() if graph else None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_layer_cuda_graph_manager = None
-    worker._whole_model_segment = object() if graph else None
+    worker._graph = make_graph_state(
+        cuda_graph_manager=object() if graph else None,
+        glm5_moe_cuda_graph_manager=None,
+        glm5_layer_cuda_graph_manager=None,
+        whole_model_segment=object() if graph else None,
+    )
     return worker, calls
 
 
@@ -288,13 +292,13 @@ def test_release_tolerates_a_lifetime_that_never_sized_a_pool():
 
 def test_release_leaves_the_captured_graph_state_in_place():
     worker, _ = _release_worker(graph=True)
-    manager = worker._cuda_graph_manager
-    segment = worker._whole_model_segment
+    manager = worker._graph.cuda_graph_manager
+    segment = worker._graph.whole_model_segment
 
     worker._release_reused_decode_instance()
 
-    assert worker._cuda_graph_manager is manager
-    assert worker._whole_model_segment is segment
+    assert worker._graph.cuda_graph_manager is manager
+    assert worker._graph.whole_model_segment is segment
 
 
 # ---------------------------------------------------------------------------
@@ -357,11 +361,13 @@ def _invariant_worker(
         decode_instance=(object(), {}) if reusable else None,
         decode_experts_resident=experts_resident,
     )
-    worker._cuda_graph_manager = object() if graph_present else None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_layer_cuda_graph_manager = None
-    worker._whole_model_segment = None
-    worker._decode_graph_captures = 1 if graph_was_present else 0
+    worker._graph = make_graph_state(
+        cuda_graph_manager=object() if graph_present else None,
+        glm5_moe_cuda_graph_manager=None,
+        glm5_layer_cuda_graph_manager=None,
+        whole_model_segment=None,
+        decode_graph_captures=1 if graph_was_present else 0,
+    )
     worker.model = _decode_model(registered=attn_registered)
     if kv == "absent":
         worker.gpu_paged_kv_cache_manager = None
@@ -478,7 +484,7 @@ def test_rebuild_path_keeps_the_original_invariant():
     """With no reusable instance the old checks still apply, unchanged."""
     worker = _invariant_worker(reusable=False, graph_present=True)
 
-    with pytest.raises(RuntimeError, match="_cuda_graph_manager"):
+    with pytest.raises(RuntimeError, match="cuda_graph_manager"):
         worker._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
     clean = _invariant_worker(reusable=False, graph_present=False)
@@ -1048,7 +1054,7 @@ def test_capture_guard_precedes_any_capture_state():
         node
         for node in ast.walk(method)
         if isinstance(node, ast.If)
-        and "_decode_graph_captures" in ast.unparse(node.test)
+        and "decode_graph_captures" in ast.unparse(node.test)
         and "_decode_instance_is_reusable" in ast.unparse(node.test)
     )
     assert any(isinstance(n, ast.Raise) for n in guard.body)
@@ -1071,10 +1077,10 @@ def test_capture_guard_precedes_any_capture_state():
 def test_capture_episodes_are_counted_after_the_signature_is_recorded():
     src = ast.unparse(_method_ast("_setup_cuda_graphs"))
     sig = src.index(
-        "self._glm5_whole_model_graph_signature = "
+        "self._graph.glm5_whole_model_graph_signature = "
         "self._glm5_whole_model_graph_capture_signature()"
     )
-    count = src.index("self._decode_graph_captures = ")
+    count = src.index("self._graph.decode_graph_captures = ")
     assert sig < count
 
 
@@ -1182,16 +1188,18 @@ def test_batches_with_different_spans_never_invalidate_the_capture():
     worker.core_engine = SimpleNamespace(gpu_paged_kv_manager_aux=aux)
     worker._get_cuda_graph_gpu_manager = lambda: gpu
     worker._glm5_whole_model_graph_requested_for_current_batch = lambda: True
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_all_short = False
-    worker._glm5_whole_model_index_topk = 2048
     # One capture, at the building switch, spanning the KV capacity.
-    worker._cuda_graph_manager = _FakeManager()
-    worker._glm5_whole_model_graph = True
-    worker._whole_model_segment = SimpleNamespace(max_seqlen=200_000)
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_signature = (
+    worker._graph = make_graph_state(
+        glm5_whole_model_graph_unavailable_reason=None,
+        glm5_whole_model_graph_failed_buckets=set(),
+        glm5_whole_model_all_short=False,
+        glm5_whole_model_index_topk=2048,
+        cuda_graph_manager=_FakeManager(),
+        glm5_whole_model_graph=True,
+        whole_model_segment=SimpleNamespace(max_seqlen=200_000),
+        glm5_whole_model_graph_capture_attempted_for_batch=True,
+    )
+    worker._graph.glm5_whole_model_graph_signature = (
         worker._glm5_whole_model_graph_capture_signature()
     )
     policy = _load_policy()
@@ -1203,7 +1211,7 @@ def test_batches_with_different_spans_never_invalidate_the_capture():
         worker._current_decode_max_rank_batch_size = max_bsz
         attn.max_seqlen = span
         warm = policy.should_warmup_cuda_graphs_before_decode(
-            graph_manager_is_initialized=worker._cuda_graph_manager is not None,
+            graph_manager_is_initialized=worker._graph.cuda_graph_manager is not None,
             global_batch_has_queueing=False,
             model_name=worker.model_name,
         ) or worker._glm5_whole_model_graph_current_bucket_missing()
