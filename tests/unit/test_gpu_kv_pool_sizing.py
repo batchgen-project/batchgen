@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 from batchgen.worker.kv_manager import GPU_KV_POOL_HEADROOM_GB, KVCacheManager
+from tests.worker.worker_fakes import make_graph_state
 
 GIB = 1024 ** 3
 
@@ -253,7 +254,14 @@ def _finalize_worker(provisional_gb=PROVISIONAL_GB, max_bucket=128):
         _gpu_kv_sizing_provisional=True,
         _gpu_kv_cached_pool_gb=None,
         gpu_paged_kv_cache_manager=_manager(pages),
-        _whole_model_bucketing=SimpleNamespace(bucket_sizes=[1, 16, 64, max_bucket]),
+        # S2: the capture-time bucketing moved onto the worker's GraphRuntime.
+        # Same value, read through `self._graph` -- the floor still comes from
+        # max(bucket_sizes).
+        _graph=make_graph_state(
+            whole_model_bucketing=SimpleNamespace(
+                bucket_sizes=[1, 16, 64, max_bucket]
+            ),
+        ),
     )
 
 

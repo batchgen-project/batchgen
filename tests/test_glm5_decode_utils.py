@@ -46,6 +46,7 @@ from batchgen.models.glm.glm5.wrappers import (
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 from batchgen.models.wrappers import AttnWrapperBase
+from tests.worker.worker_fakes import make_graph_state
 
 
 def test_glm53_whole_model_graph_requires_explicit_enable():
@@ -1130,9 +1131,10 @@ def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    worker._cuda_graph_manager = None
-    worker._glm5_whole_model_graph = False
+    worker._graph = make_graph_state()
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
+    worker._graph.cuda_graph_manager = None
+    worker._graph.glm5_whole_model_graph = False
 
     assert worker._glm5_whole_model_graph_requested_for_current_batch()
     assert worker._glm5_whole_graph_path_state(1) == ("eager", None, "no_manager")
@@ -1838,16 +1840,17 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     worker._batchgen_debug = {}
     worker._current_decode_max_rank_batch_size = 1
     manager = FakeManager()
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
-    worker._whole_model_bucketing = FakeManager.bucketing
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = ("same",)
-    worker._glm5_whole_model_graph_unavailable_reason = None
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = manager
+    worker._graph.whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
+    worker._graph.whole_model_bucketing = FakeManager.bucketing
+    worker._graph.whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph_failed_buckets = set()
+    worker._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
+    worker._graph.glm5_whole_model_graph_signature = ("same",)
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -1856,12 +1859,12 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 9000, raising=False)
 
     assert not worker._glm5_whole_model_graph_current_bucket_missing()
-    assert worker._cuda_graph_manager is manager
-    assert worker._whole_model_segment is not None
-    assert worker._whole_model_bucketing is FakeManager.bucketing
-    assert worker._whole_model_graph
-    assert worker._glm5_whole_model_graph
-    assert worker._glm5_whole_model_graph_signature == ("same",)
+    assert worker._graph.cuda_graph_manager is manager
+    assert worker._graph.whole_model_segment is not None
+    assert worker._graph.whole_model_bucketing is FakeManager.bucketing
+    assert worker._graph.whole_model_graph
+    assert worker._graph.glm5_whole_model_graph
+    assert worker._graph.glm5_whole_model_graph_signature == ("same",)
     assert manager.dropped == []
     assert worker._glm5_whole_graph_path_state(1) == (
         "eager",
@@ -1886,12 +1889,13 @@ def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
         enable_cuda_graph=True,
     )
     worker._batchgen_debug = {}
-    worker._cuda_graph_manager = FakeManager()
-    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_signature = ("same",)
-    worker._glm5_whole_model_graph_unavailable_reason = None
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = FakeManager()
+    worker._graph.whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph_failed_buckets = set()
+    worker._graph.glm5_whole_model_graph_signature = ("same",)
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
     monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(
         worker,
@@ -1924,15 +1928,16 @@ def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     worker._batchgen_debug = {}
     worker._current_decode_max_rank_batch_size = 3
     manager = FakeManager()
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = ("same",)
-    worker._glm5_whole_model_graph_unavailable_reason = None
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = manager
+    worker._graph.whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
+    worker._graph.whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph_failed_buckets = set()
+    worker._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
+    worker._graph.glm5_whole_model_graph_signature = ("same",)
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -2092,22 +2097,23 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker._current_decode_local_batch_size = 2
     worker._current_decode_max_rank_batch_size = 2
     worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
-    worker._cuda_graph_manager = None
-    worker._cuda_graph_adapter = None
-    worker._whole_model_segment = None
-    worker._whole_model_bucketing = None
-    worker._whole_model_graph = False
-    worker._glm5_whole_model_graph = False
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = False
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = None
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    worker._glm5_whole_model_capture_input_ids = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    worker._glm5_layer_graph_failed_buckets = set()
-    worker._glm5_moe_graph_failed_buckets = set()
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = None
+    worker._graph.cuda_graph_adapter = None
+    worker._graph.whole_model_segment = None
+    worker._graph.whole_model_bucketing = None
+    worker._graph.whole_model_graph = False
+    worker._graph.glm5_whole_model_graph = False
+    worker._graph.glm5_whole_model_graph_failed_buckets = set()
+    worker._graph.glm5_whole_model_graph_capture_attempted_for_batch = False
+    worker._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
+    worker._graph.glm5_whole_model_graph_signature = None
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
+    worker._graph.glm5_whole_model_capture_input_ids = None
+    worker._graph.glm5_dsa_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_moe_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_layer_graph_failed_buckets = set()
+    worker._graph.glm5_moe_graph_failed_buckets = set()
     worker._glm5_whole_model_graph_requested_for_current_batch = lambda: True
     worker._glm5_whole_model_graph_compare_requested_for_current_batch = lambda: False
     worker._glm5_whole_model_graph_timing_requested_for_current_batch = lambda: False
@@ -2148,11 +2154,11 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     assert len(full_segment_kwargs) == 1
     assert full_segment_kwargs[0]["all_short"] is False
     assert reuse_segment_kwargs[0]["all_short"] is False
-    assert worker._glm5_whole_model_all_short is False
+    assert worker._graph.glm5_whole_model_all_short is False
     # The aux staging stream takes the aux pool's dtype (bf16 for an AoS pool).
     assert FakeWholeSegment.instances[-1].kwargs["aux_kv_staging_dtype"] is torch.bfloat16
-    assert worker._glm5_whole_model_graph_capture_attempted_for_batch
-    assert worker._glm5_whole_model_graph_signature == ("sig",)
+    assert worker._graph.glm5_whole_model_graph_capture_attempted_for_batch
+    assert worker._graph.glm5_whole_model_graph_signature == ("sig",)
 
 
 def test_glm5_release_whole_model_graph_state_preserves_capture_inputs():
@@ -2174,25 +2180,26 @@ def test_glm5_release_whole_model_graph_state_preserves_capture_inputs():
     manager = FakeManager()
     capture_ids = object()
     worker.torch_device = torch.device("cpu")
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = object()
-    worker._whole_model_bucketing = FakeBucketing()
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_signature = ("old",)
-    worker._glm5_whole_model_capture_input_ids = capture_ids
-    worker._cuda_graph_adapter = None
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = manager
+    worker._graph.whole_model_segment = object()
+    worker._graph.whole_model_bucketing = FakeBucketing()
+    worker._graph.whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph_signature = ("old",)
+    worker._graph.glm5_whole_model_capture_input_ids = capture_ids
+    worker._graph.cuda_graph_adapter = None
 
     worker._release_glm5_whole_model_graph_state(empty_cuda_cache=False)
 
     assert manager.dropped == [4, 8]
-    assert worker._cuda_graph_manager is None
-    assert worker._whole_model_segment is None
-    assert worker._whole_model_bucketing is None
-    assert not worker._whole_model_graph
-    assert not worker._glm5_whole_model_graph
-    assert worker._glm5_whole_model_graph_signature is None
-    assert worker._glm5_whole_model_capture_input_ids is capture_ids
+    assert worker._graph.cuda_graph_manager is None
+    assert worker._graph.whole_model_segment is None
+    assert worker._graph.whole_model_bucketing is None
+    assert not worker._graph.whole_model_graph
+    assert not worker._graph.glm5_whole_model_graph
+    assert worker._graph.glm5_whole_model_graph_signature is None
+    assert worker._graph.glm5_whole_model_capture_input_ids is capture_ids
 
 
 def test_glm5_layer_signature_uses_stable_page_table_storage():
@@ -2236,40 +2243,41 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
     worker.model = FakeModel()
     worker.torch_device = torch.device("cpu")
     worker.parallel_manager = None
-    worker._cuda_graph_manager = object()
-    worker._glm5_moe_cuda_graph_manager = object()
-    worker._glm5_layer_cuda_graph_manager = object()
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    worker._glm5_layer_graph_capture_attempted_for_batch = True
-    worker._glm5_dsa_graph_page_table_change_after_capture_logged = True
-    worker._whole_model_segment = object()
-    worker._whole_model_bucketing = object()
-    worker._glm5_whole_model_capture_input_ids = object()
-    worker._glm5_moe_graph_failed_buckets = {64}
-    worker._glm5_layer_graph_failed_buckets = {32}
-    worker._glm5_layer_graph_signature = object()
-    worker._glm5_layer_graph_max_seqlen = 8192
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = {64}
-    worker._glm5_whole_model_graph_signature = object()
-    worker._glm5_whole_model_graph_unavailable_reason = "stale"
+    worker._graph = make_graph_state()
+    worker._graph.cuda_graph_manager = object()
+    worker._graph.glm5_moe_cuda_graph_manager = object()
+    worker._graph.glm5_layer_cuda_graph_manager = object()
+    worker._graph.glm5_dsa_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_moe_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_layer_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_dsa_graph_page_table_change_after_capture_logged = True
+    worker._graph.whole_model_segment = object()
+    worker._graph.whole_model_bucketing = object()
+    worker._graph.glm5_whole_model_capture_input_ids = object()
+    worker._graph.glm5_moe_graph_failed_buckets = {64}
+    worker._graph.glm5_layer_graph_failed_buckets = {32}
+    worker._graph.glm5_layer_graph_signature = object()
+    worker._graph.glm5_layer_graph_max_seqlen = 8192
+    worker._graph.whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph_failed_buckets = {64}
+    worker._graph.glm5_whole_model_graph_signature = object()
+    worker._graph.glm5_whole_model_graph_unavailable_reason = "stale"
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     worker.deep_free_model_memory()
 
     assert worker.model is None
-    assert worker._cuda_graph_manager is None
-    assert worker._glm5_moe_cuda_graph_manager is None
-    assert worker._glm5_layer_cuda_graph_manager is None
-    assert not worker._glm5_dsa_graph_capture_attempted_for_batch
-    assert not worker._glm5_moe_graph_capture_attempted_for_batch
-    assert not worker._glm5_layer_graph_capture_attempted_for_batch
-    assert not worker._glm5_dsa_graph_page_table_change_after_capture_logged
-    assert worker._glm5_layer_graph_failed_buckets == set()
-    assert worker._glm5_layer_graph_signature is None
-    assert worker._glm5_layer_graph_max_seqlen is None
+    assert worker._graph.cuda_graph_manager is None
+    assert worker._graph.glm5_moe_cuda_graph_manager is None
+    assert worker._graph.glm5_layer_cuda_graph_manager is None
+    assert not worker._graph.glm5_dsa_graph_capture_attempted_for_batch
+    assert not worker._graph.glm5_moe_graph_capture_attempted_for_batch
+    assert not worker._graph.glm5_layer_graph_capture_attempted_for_batch
+    assert not worker._graph.glm5_dsa_graph_page_table_change_after_capture_logged
+    assert worker._graph.glm5_layer_graph_failed_buckets == set()
+    assert worker._graph.glm5_layer_graph_signature is None
+    assert worker._graph.glm5_layer_graph_max_seqlen is None
 
 
 def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
@@ -2326,11 +2334,12 @@ def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    worker._cuda_graph_manager = types.SimpleNamespace(
+    worker._graph = make_graph_state()
+    worker._graph.glm5_whole_model_graph_unavailable_reason = None
+    worker._graph.cuda_graph_manager = types.SimpleNamespace(
         bucketing=BatchSizeBucketing([1, 2]),
     )
-    worker._glm5_whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
 
     assert worker._glm5_whole_graph_path_state(3) == (
         "eager",

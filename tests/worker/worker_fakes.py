@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Optional, Union
 
+from batchgen.worker.graph_runtime import GraphRuntime
 from batchgen.worker.rank_context import RankContext
 from batchgen.worker.sequence_table import SequenceTable
 
@@ -111,4 +112,33 @@ def attach_identity(
     ):
         if not isinstance(getattr(type(fake), name, None), property):
             setattr(fake, name, view)
+    return fake
+
+
+def make_graph_state(**overrides) -> GraphRuntime:
+    """A real ``GraphRuntime`` with ``overrides`` applied to its fields.
+
+    Field names are the component's own (the worker attribute minus its
+    leading underscore, e.g. ``cuda_graph_manager``). An unknown name is a
+    typo in the test, not a new field, so it raises instead of planting a
+    silent attribute the worker will never read.
+    """
+    graph = GraphRuntime()
+    for name, value in overrides.items():
+        if not hasattr(graph, name):
+            raise AttributeError(f"GraphRuntime has no field {name!r}")
+        setattr(graph, name, value)
+    return graph
+
+
+def attach_graph_state(fake, **overrides):
+    """Set ``_graph`` on ``fake`` to a real ``GraphRuntime``, return ``fake``.
+
+    The decode CUDA-graph state used to be ~29 loose worker attributes that
+    every fake re-declared one by one; worker code now reads it through
+    ``self._graph``. Installing the real component (not a namespace) is what
+    gives a fake the same "absent means falsy" defaults the old getattr sites
+    relied on.
+    """
+    fake._graph = make_graph_state(**overrides)
     return fake
