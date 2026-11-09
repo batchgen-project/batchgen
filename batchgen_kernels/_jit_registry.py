@@ -7,11 +7,38 @@ This mirrors setup.py ext_modules. When adding a new CUDAExtension in
 setup.py, add a corresponding entry here for JIT dev mode support.
 """
 
+import torch
+
+
+def _device_gencode():
+    """Return the exact gencode pair for the active CUDA capability."""
+    if not torch.cuda.is_available():
+        # CPU-only declaration tests still need to inspect the registry. The
+        # runtime path always has a CUDA device before JIT compilation.
+        return ["-gencode", "arch=compute_90a,code=sm_90a"]
+    capability = tuple(torch.cuda.get_device_capability())
+    targets = {
+        (9, 0): "compute_90a,code=sm_90a",
+        (10, 0): "compute_100,code=sm_100",
+        (10, 3): "compute_103,code=sm_103",
+    }
+    try:
+        target = targets[capability]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability {capability}; "
+            "expected 9.0, 10.0, or 10.3"
+        ) from exc
+    return ["-gencode", f"arch={target}"]
+
+
+_ARCH_GENCODE = _device_gencode()
+
 # Common flag sets (mirror setup.py). SM90a code is always selected with the
-# explicit two-item ``-gencode arch=compute_90a,code=sm_90a``: the ``-arch=``
-# shorthand lets torch append its own arch flags and emits a plain compute_90
-# image that ptxas rejects for wgmma.*.
-_SM90A_GENCODE = ["-gencode", "arch=compute_90a,code=sm_90a"]
+# explicit two-item gencode pair: the ``-arch=`` shorthand lets torch append
+# its own arch flags and emits a plain compute image that ptxas rejects for
+# wgmma.*.
+_SM90A_GENCODE = _ARCH_GENCODE
 
 _SM90A_FLAGS = [
     "-std=c++17", *_SM90A_GENCODE, "-O3",
@@ -111,11 +138,21 @@ def get_registry():
                 "src/moe/routing/router_epilogue.cu",
                 "src/moe/routing/gate_sigmoid_topk.cu",
                 "src/moe/routing/glm5_router_gemm.cu",
+            ],
+            "nvcc_flags": [
+                "-O3", "--use_fast_math", "-std=c++17",
+                *_SM90A_GENCODE,
+                "--threads", "4",
+            ],
+        },
+        "batchgen_kernels.moe._C_routing_wgmma": {
+            "sources": [
+                "src/moe/routing/fused_gate_extension.cc",
                 "src/moe/routing/fused_gate.cu",
             ],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
@@ -249,7 +286,7 @@ def get_registry():
             "sources": ["src/attention/fused_kv_norm_rope_cache.cu"],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
@@ -257,7 +294,7 @@ def get_registry():
             "sources": ["src/attention/fused_q_absorb.cu"],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
@@ -265,7 +302,7 @@ def get_registry():
             "sources": ["src/attention/fused_q_split.cu"],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
@@ -274,7 +311,7 @@ def get_registry():
             "sources": ["src/attention/fused_indexer_k_write_fp8.cu"],
             "nvcc_flags": [
                 "-O3", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -283,7 +320,7 @@ def get_registry():
             "sources": ["src/attention/fused_indexer_k_norm_rope_write_fp8.cu"],
             "nvcc_flags": [
                 "-O3", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -292,7 +329,7 @@ def get_registry():
             "sources": ["src/attention/kda_fused_decode.cu"],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],

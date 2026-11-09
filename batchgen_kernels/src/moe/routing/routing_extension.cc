@@ -119,36 +119,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bucket_size"),
           py::arg("world_size"));
 
-    m.def("create_fused_gate_context", &create_fused_gate_context,
-          "Create cached fused gate context (SM90a WGMMA)",
-          py::arg("router_weight"),
-          py::arg("router_bias"),
-          py::arg("topk"));
-
-    m.def("destroy_fused_gate_context", &destroy_fused_gate_context,
-          "Destroy cached fused gate context",
-          py::arg("ctx_ptr"));
-
-    m.def("fused_gate_warmup", &fused_gate_warmup,
-          "Pre-create TMA descriptor for input buffer (call before graph capture)",
-          py::arg("ctx_ptr"),
-          py::arg("hidden_states"));
-
-    m.def("fused_router_forward", &fused_router_forward,
-          "WGMMA router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits (SM90a)",
-          py::arg("ctx_ptr"),
-          py::arg("hidden_states"),
-          py::arg("logits"),
-          py::arg("num_valid_tokens") = -1);
-
-    m.def("fused_gate_forward", &fused_gate_forward,
-          "Fused gate forward: WGMMA GEMM + bias + TopK + Softmax (SM90a)",
-          py::arg("ctx_ptr"),
-          py::arg("hidden_states"),
-          py::arg("logits"),
-          py::arg("topk_indices"),
-          py::arg("topk_weights"),
-          py::arg("num_valid_tokens") = -1);
+    // The WGMMA fused gate (create/destroy/warmup/forward) is bound by its
+    // own extension, _C_routing_wgmma (fused_gate_extension.cc), so this
+    // generic routing module links on every supported architecture.
 
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter_cuda,
           "Reduce: weighted scatter-add (CUDA)",

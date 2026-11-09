@@ -1466,7 +1466,9 @@ __global__ void silu_mul_dual_stride_kernel(
 // K3 MXFP4 version 2 kernels (namespace marlin_v2); needs the helpers above.
 #include "marlin_grouped_mxfp4_v2.cuh"
 // K3 MXFP4 version 3 kernels (namespace marlin_v3); reuses marlin_v2's decode.
+#ifndef BATCHGEN_DISABLE_MARLIN_V3
 #include "marlin_grouped_mxfp4_v3.cuh"
+#endif
 
 // ============================================================================
 // Launchers
@@ -1870,6 +1872,7 @@ std::tuple<int64_t, int64_t> marlin_mxfp4_v2_launch_config(int64_t variant, bool
 // up to the row chunk are not computed). Scale bytes must be <= 128, as v2.
 // variant: 0 = (JW=2, NCAP=64), 1 = (JW=2, NCAP=48), 2 = (JW=4, NCAP=32).
 // ----------------------------------------------------------------------------
+#ifndef BATCHGEN_DISABLE_MARLIN_V3
 #include <cstdint>
 
 static void check_mxfp4_v3_variant(int variant) {
@@ -2078,6 +2081,7 @@ std::tuple<int64_t, int64_t, int64_t> marlin_mxfp4_v3_launch_config(int64_t vari
         default: return mxfp4_v3_cfg<4, 32>(fused);
     }
 }
+#endif
 
 void silu_mul_dual_stride(
     torch::Tensor gate_inplace, torch::Tensor up,
@@ -2111,6 +2115,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Marlin fused S1 v2, MXFP4 (E2M1) weights + SiTU, per-CTA expert row walk");
     m.def("marlin_mxfp4_v2_launch_config", &marlin_mxfp4_v2_launch_config,
           "(stages, dynamic smem bytes) of a Marlin MXFP4 v2 variant");
+#ifndef BATCHGEN_DISABLE_MARLIN_V3
     m.def("grouped_marlin_gemm_m16_mxfp4_v3", &grouped_marlin_gemm_m16_mxfp4_v3,
           "Marlin grouped GEMM v3, MXFP4 (E2M1) weights, swap-AB wgmma (sm_90a)");
     m.def("grouped_marlin_gemm_m16_s1_mxfp4_situ_v3", &grouped_marlin_gemm_m16_s1_mxfp4_situ_v3,
@@ -2119,6 +2124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Expert order by descending row count for the Marlin MXFP4 v3 grid");
     m.def("marlin_mxfp4_v3_launch_config", &marlin_mxfp4_v3_launch_config,
           "(stages, dynamic smem bytes, CTA output columns) of a Marlin MXFP4 v3 variant");
+#endif
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");

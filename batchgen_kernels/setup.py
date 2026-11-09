@@ -15,7 +15,7 @@ Environment variables:
                       With `build_ext --parallel N`, N extensions build at once, each
                       with up to MAX_JOBS ninja jobs; lower MAX_JOBS accordingly.
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
-    BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
+    BUILD_ARCH      — "sm90a" (default), "sm100", "sm103a", or "all". Controls which arch kernels to build
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
@@ -88,11 +88,12 @@ _cache_tool = _setup_ccache()
 
 
 # ── Architecture build gating ──
-# BUILD_ARCH: "sm90a" (default), "sm100", "all"
+# BUILD_ARCH: "sm90a" (default), "sm100", "sm103a", "all"
 
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
+_build_sm103a = _build_arch == "sm103a"
 
 # ── Architecture flag sets ──
 
@@ -106,6 +107,8 @@ if _build_arch == "sm90a":
     _sm80_gencode = ["-gencode", "arch=compute_90a,code=sm_90a"]
 elif _build_arch == "sm100":
     _sm80_gencode = ["-gencode", "arch=compute_100,code=sm_100"]
+elif _build_arch == "sm103a":
+    _sm80_gencode = ["-gencode", "arch=compute_103,code=sm_103"]
 elif _build_arch == "all":
     _sm80_gencode = [
         "-gencode", "arch=compute_80,code=sm_80",
@@ -119,7 +122,7 @@ elif _build_arch == "all":
             _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
 else:
     raise RuntimeError(
-        f"Unsupported BUILD_ARCH={_build_arch!r}; expected sm90a, sm100, or all"
+        f"Unsupported BUILD_ARCH={_build_arch!r}; expected sm90a, sm100, sm103a, or all"
     )
 
 _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
@@ -215,7 +218,9 @@ _sm90a_extensions = [
         sources=["src/attention/qkv_wgmma.cu"],
         extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
     ),
-    # Routing kernels (fused_gate uses WGMMA)
+    # Generic routing kernels; the WGMMA fused gate lives in its own
+    # companion extension below so this module links on every supported
+    # architecture.
     CUDAExtension(
         name="batchgen_kernels.moe._C_routing",
         sources=[
@@ -226,6 +231,19 @@ _sm90a_extensions = [
             "src/moe/routing/router_epilogue.cu",
             "src/moe/routing/gate_sigmoid_topk.cu",
             "src/moe/routing/glm5_router_gemm.cu",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "--threads", _nvcc_threads],
+        },
+    ),
+    # SM90a-only fused routing gate companion (WGMMA).
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_routing_wgmma",
+        sources=[
+            "src/moe/routing/fused_gate_extension.cc",
             "src/moe/routing/fused_gate.cu",
         ],
         extra_compile_args={
@@ -558,10 +576,59 @@ _sm80_extensions = [
     ),
 ]
 
+# The generic CUDA extensions that historically lived in the SM90a list are
+# also valid for Blackwell. Clone their declarations so the sm103a lane can
+# retarget only their gencode without changing the Hopper build.
+_SM103A_GENERIC_NAMES = frozenset({
+    "batchgen_kernels.moe._C_marlin_grouped_gemm",
+    "batchgen_kernels.moe._C_routing",
+    "batchgen_kernels.moe._C_dispatch_scatter_3d",
+    "batchgen_kernels.attention._C_fused_kv_norm_rope",
+    "batchgen_kernels.attention._C_fused_q_absorb",
+    "batchgen_kernels.attention._C_fused_q_split",
+    "batchgen_kernels.attention._C_fused_indexer_k_write_fp8",
+    "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+    "batchgen_kernels.attention._C_kda_fused_decode",
+})
+
+
+def _clone_for_sm103a(extension):
+    clone = copy.copy(extension)
+    clone.sources = list(extension.sources)
+    clone.extra_compile_args = {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in extension.extra_compile_args.items()
+    }
+    nvcc = clone.extra_compile_args["nvcc"]
+    retargeted = []
+    index = 0
+    while index < len(nvcc):
+        flag = nvcc[index]
+        if (flag == "-gencode" and index + 1 < len(nvcc)
+                and nvcc[index + 1] == "arch=compute_90a,code=sm_90a"):
+            retargeted.extend(["-gencode", "arch=compute_103,code=sm_103"])
+            index += 2
+            continue
+        retargeted.append(flag)
+        index += 1
+    if extension.name == "batchgen_kernels.moe._C_marlin_grouped_gemm":
+        retargeted.append("-DBATCHGEN_DISABLE_MARLIN_V3")
+    clone.extra_compile_args["nvcc"] = retargeted
+    return clone
+
+
+_sm103a_extensions = [
+    _clone_for_sm103a(extension)
+    for extension in _sm90a_extensions
+    if extension.name in _SM103A_GENERIC_NAMES
+]
+
 # Assemble final extension list based on build flags
 _ext_modules = []
 if _build_sm90a:
     _ext_modules.extend(_sm90a_extensions)
+elif _build_sm103a:
+    _ext_modules.extend(_sm103a_extensions)
 else:
     print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
 _ext_modules.extend(_sm80_extensions)
