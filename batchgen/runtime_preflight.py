@@ -390,13 +390,25 @@ def _check_core_engine() -> None:
         )
 
 
+# Pinned Torch per CUDA channel. Keep in sync with the check in
+# scripts/build_source_runtime.sh.
+_TORCH_PINS = {"cu128": "2.9.0", "cu130": "2.13.0"}
+
+
 def _check_torch() -> None:
     version = torch.__version__
-    if not version.startswith("2.9.0"):
-        raise RuntimePreflightError(
-            f"Torch {version!r} is unsupported; expected 2.9.0 with the pinned CUDA ABI"
-        )
     expected_channel = os.environ.get("TORCH_CUDA_CHANNEL", "cu128")
+    pinned = _TORCH_PINS.get(expected_channel)
+    if pinned is None:
+        raise RuntimePreflightError(
+            f"TORCH_CUDA_CHANNEL {expected_channel!r} has no pinned Torch; "
+            f"expected one of {sorted(_TORCH_PINS)}"
+        )
+    if not version.startswith(pinned):
+        raise RuntimePreflightError(
+            f"Torch {version!r} is unsupported; expected {pinned} for "
+            f"{expected_channel} with the pinned CUDA ABI"
+        )
     expected_cuda = (
         f"{expected_channel[2:-1]}.{expected_channel[-1]}"
         if expected_channel.startswith("cu") and expected_channel[2:].isdigit()
