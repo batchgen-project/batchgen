@@ -151,7 +151,10 @@ def test_the_batched_helper_does_not_decide_which_rows_are_live():
     # completion check of its own, the skip would live in two places.
     fn = _method("_append_trajectory_tokens")
     assert not _calls(fn, "self._is_sequence_completed")
-    assert len(_calls(fn, "self._trajectory_book.append_tokens")) == 1
+    # S3.5 migration: the helper now appends through the TrajectoryStore
+    # delegate (self._traj.append_tokens), not the raw QueryBook attribute.
+    # migrated: self._trajectory_book.append_tokens -> self._traj.append_tokens, same owner object.
+    assert len(_calls(fn, "self._traj.append_tokens")) == 1
 
 
 # ------------------------------------------------------------- debug scanning

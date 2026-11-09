@@ -41,6 +41,7 @@ from batchgen.worker.step_timing import (
     accumulate_decode_step_split,
     new_decode_step_split,
 )
+from tests.worker.worker_fakes import attach_trajectory_state
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -280,7 +281,6 @@ def _make_worker(ns, seqs, stream, log):
         eos_token_ids=[EOS],
         model_context_length=10_000,
         torch_device="cpu",
-        _trajectory_book=book,
         _local_to_uuid_map={i: s.uuid for i, s in enumerate(seqs)},
         global_batch=SimpleNamespace(get_sequence=by_uuid.get),
         _cohort_shutdown_probe=None,
@@ -288,6 +288,7 @@ def _make_worker(ns, seqs, stream, log):
         _pending_kv_append_tasks=[],
         kv_waits=kv_waits,
     )
+    attach_trajectory_state(worker, trajectory_book=book)
 
     def wait_kv(**kwargs):
         kv_waits.append(kwargs)
@@ -435,7 +436,7 @@ def _drive(mode, *, interval=4, ns=None):
     assert pending is None, "loop left with a deferred step unread"
     return SimpleNamespace(
         seqs=seqs,
-        tokens=worker._trajectory_book.tokens,
+        tokens=worker._traj.trajectory_book.tokens,
         states={s.uuid: s.state() for s in seqs},
         completed_at=completed_at,
         forward_inputs=forward_inputs,
@@ -578,7 +579,8 @@ def test_shutdown_after_the_drain_reads_no_token():
     status = worker._finish_deferred_decode_step(step, ring, overlapped=True)
     assert status == ns["_DECODE_STEP_SHUTDOWN"]
     assert worker.kv_waits == [{"defer_errors": True, "device_sync": False}]
-    assert worker._trajectory_book.tokens["u0"] == [3]  # nothing appended
+    # migrated: worker._trajectory_book -> worker._traj.trajectory_book, same owner object.
+    assert worker._traj.trajectory_book.tokens["u0"] == [3]  # nothing appended
     assert ring.in_flight() == 0
     assert worker._decode_tokens_unread is True
 
@@ -591,7 +593,8 @@ def test_abandoned_wait_neither_drains_nor_reads():
     status = worker._finish_deferred_decode_step(step, ring, overlapped=True)
     assert status == ns["_DECODE_WAIT_ABANDONED"]
     assert worker.kv_waits == []
-    assert worker._trajectory_book.tokens["u0"] == [3]
+    # migrated: worker._trajectory_book -> worker._traj.trajectory_book, same owner object.
+    assert worker._traj.trajectory_book.tokens["u0"] == [3]
     assert ring.in_flight() == 0
 
 
@@ -603,7 +606,8 @@ def test_finish_reports_marks_and_completes():
     status = worker._finish_deferred_decode_step(step, ring, overlapped=False, marks=marks)
     assert status == ns["_DECODE_WAIT_COMPLETED"]
     assert len(marks) == 3 and marks == sorted(marks)
-    assert worker._trajectory_book.tokens["u0"] == [3, 7]
+    # migrated: worker._trajectory_book -> worker._traj.trajectory_book, same owner object.
+    assert worker._traj.trajectory_book.tokens["u0"] == [3, 7]
     assert worker._decode_tokens_unread is False
 
 

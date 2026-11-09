@@ -226,6 +226,16 @@ from batchgen.query_book import (
 	release_query_book_slot,
 )
 from batchgen.worker.graph_runtime import GraphRuntime
+from batchgen.worker.trajectory_store import TrajectoryStore
+from batchgen.worker.prefix_reuse_state import PrefixReuseState
+
+
+def _load_kda_wrapper():
+	# The only model-package import behind TrajectoryStore: batchgen/worker/
+	# must not depend on batchgen.models, so the store receives this loader.
+	# ImportError propagates so each store call site keeps its old handling.
+	from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+	return KimiLinearKDAWrapper
 from batchgen.worker.rank_context import RankContext, node_of_rank
 from batchgen.worker.sequence_table import SequenceTable
 from batchgen.utils import config_torch_module_initializer
@@ -1255,6 +1265,10 @@ class BatchGenWorker:
 		self.rank = args.global_rank # Alias for compatibility
 		self.world_size = args.world_size
 		self.local_world_size = args.local_world_size
+		# S3.5 state owners.  They are created eagerly so flag-off paths are
+		# plain field reads and the pool pseudo-sid seed is unconditional.
+		self._traj = TrajectoryStore(kda_wrapper_loader=_load_kda_wrapper)
+		self._prefix = PrefixReuseState(rank=self.rank, world_size=self.world_size)
 		self.pynccl_port_base = args.pynccl_port_base
 		self.pynccl_port_span = args.pynccl_port_span
 		self._nccl_port = self.pynccl_port_base
@@ -1417,9 +1431,9 @@ class BatchGenWorker:
 		self.prefix_cache_coordinator = None
 		# Edge trigger for the prefix_drain metric: set when the row is
 		# emitted, cleared when admission adds new sequences.
-		self._prefix_drain_metric_emitted = False
-		self._prefix_sequence_states = {}
-		self._active_prefix_materializations = []
+		self._prefix.prefix_drain_metric_emitted = False
+		self._prefix.prefix_sequence_states = {}
+		self._prefix.active_prefix_materializations = []
 		self._prefill_pool_wave = None
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
@@ -1428,9 +1442,7 @@ class BatchGenWorker:
 		self._prefill_pool_base = (0, 0, 0)
 		# Pseudo Host ids must not collide with entries a previous worker of
 		# this node left in the shared Host KV region (hot reload).
-		self._pool_sid_counter = time.time_ns() // 1000
-		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
-		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
+		# ``PrefixReuseState`` seeded and initialized these fields eagerly.
 		# Scheduler-loop hard guard against identical empty prefill waves with
 		# nothing live; _prepare_prefill_batch publishes the rank-identical
 		# admission state (and its selection snapshot) the guard compares.
@@ -1456,21 +1468,21 @@ class BatchGenWorker:
 		# the retry falls back to the full charge, makes progress, and the
 		# latch clears on the next committed reservation. Rank-uniform: both
 		# the rejection and the commit are decided by a collective.
-		self._shared_prefix_credit_suspended = False
-		self._shared_prefix_credit_applied = False
+		self._prefix.shared_prefix_credit_suspended = False
+		self._prefix.shared_prefix_credit_applied = False
 		# global_idx -> cumulative per-page prompt digests, one entry per
 		# SHAREABLE page (a prompt's last page is private by construction, so
 		# every row keeps a tail). Cached because a digest is a property of the
 		# prompt, not of the round: recomputing it on every scheduler iteration
 		# would re-hash the whole candidate set each time.
-		self._prefix_page_digest_cache = {}
+		self._prefix.prefix_page_digest_cache = {}
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
-		self._trajectory_frontier_committer = None
+		self._traj.trajectory_frontier_committer = None
 		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
 		# None otherwise. global_idx -> the live TrajectoryAttachment a hit
 		# took; empty whenever the flag is off, so the restore seam is free.
-		self._trajectory_restorer = None
-		self._trajectory_attachments = {}
+		self._traj.trajectory_restorer = None
+		self._traj.trajectory_attachments = {}
 		# M3 Slice 1c, G>1 only. Both are per-PASS and both are published by
 		# the serve-group leader on the host-KV mirror that already runs in
 		# prefill config, so no new collective exists:
@@ -1480,13 +1492,13 @@ class BatchGenWorker:
 		#   _trajectory_mirrored_restores: global_id -> the leader's frontier
 		#     HIT for this pass, so the group restores on one decision instead
 		#     of G independent ones.
-		self._trajectory_arena_payload = {}
-		self._trajectory_mirrored_restores = {}
+		self._traj.trajectory_arena_payload = {}
+		self._traj.trajectory_mirrored_restores = {}
 		# M3 Slice 3a: the WORLD's session -> owning-group map, folded from
 		# every leader's summary on that same mirror. Built on the first fold,
 		# None whenever the trajectory flag never turned on, so the group
 		# assignment of a flag-off run reads one attribute and moves on.
-		self._trajectory_session_groups = None
+		self._traj.trajectory_session_groups = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -1654,8 +1666,8 @@ class BatchGenWorker:
 		# Legacy pool fields remain only for checkpoint/object compatibility; the
 		# production path uses the fixed trajectory book initialized with the model.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
-		self._trajectory_book = None
-		self._trajectory_memfd: Optional[NodeSharedMemfd] = None
+		self._traj.trajectory_book = None
+		self._traj.trajectory_memfd: Optional[NodeSharedMemfd] = None
 		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
@@ -2146,7 +2158,7 @@ class BatchGenWorker:
 		if not entries:
 			return
 		# New live work: the next drain is a new edge for the prefix_drain row.
-		self._prefix_drain_metric_emitted = False
+		self._prefix.prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2392,7 +2404,7 @@ class BatchGenWorker:
 		# copy the prompt into the same store that will receive decode tokens.
 		# Every rank executes this deterministically so local metadata and the
 		# node-shared storage have identical slot assignments.
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		valid = [
 			(seq, tokenized_by_idx[i])
@@ -2401,11 +2413,11 @@ class BatchGenWorker:
 		]
 		sequence_ids = [seq.uuid for seq, _ in valid]
 		reserved_tokens = [self.model_context_length] * len(valid)
-		reserved_slots = self._trajectory_book.bind_batch(sequence_ids, reserved_tokens)
+		reserved_slots = self._traj.trajectory_book.bind_batch(sequence_ids, reserved_tokens)
 		try:
 			for (seq, item), slot in zip(valid, reserved_slots):
 				actual_prompt_len = int(item["length"])
-				self._trajectory_book.write_prompt(slot, item["input_ids"])
+				self._traj.trajectory_book.write_prompt(slot, item["input_ids"])
 				seq._buffer_slot = slot
 				# Token storage is now accessed through QueryBook; these fields are
 				# intentionally empty so no stale dense view can escape the book.
@@ -2420,8 +2432,8 @@ class BatchGenWorker:
 				seq.clamp_decode_to_context(actual_prompt_len, self.model_context_length)
 		except Exception:
 			for slot in reserved_slots:
-				if slot in self._trajectory_book._records:
-					self._trajectory_book.release(slot)
+				if slot in self._traj.trajectory_book._records:
+					self._traj.trajectory_book.release(slot)
 			raise
 		self._publish_trajectory_pool_capacity()
 
@@ -2533,7 +2545,7 @@ class BatchGenWorker:
 		G>1 replicates a sequence onto all G ranks of its group, but only the
 		leader (``_owns_host_kv``) registers / allocates it in the per-node
 		SHARED host region, so the other G-1 ranks come out of prefill config
-		with an empty worker-view page table and no ``_prefix_sequence_states``
+		with an empty worker-view page table and no prefix state entry
 		entry for sequences they must still read. Both are rank-local views of
 		page ids the leader has already committed, so one object all-gather
 		reproduces them exactly: every follower installs ITS OWN leader's entry.
@@ -2705,7 +2717,7 @@ class BatchGenWorker:
 				},
 			)
 			prefix_states[global_id] = state
-			self._prefix_sequence_states[global_id] = state
+			self._prefix.prefix_sequence_states[global_id] = state
 		if trajectory:
 			# M3 Slice 1c, follower side. Both halves come from the leader: the
 			# arena this rank writes its own shard into, and the hit it must
@@ -2713,23 +2725,23 @@ class BatchGenWorker:
 			# prefill in lockstep -- G independent lookups could disagree, and
 			# a rank that declined while its peers restored would run the same
 			# suffix against a zeroed head shard.
-			self._trajectory_arena_payload = dict(
+			self._traj.trajectory_arena_payload = dict(
 				entry.get("frontier_arenas") or {}
 			)
-			self._trajectory_mirrored_restores = dict(
+			self._traj.trajectory_mirrored_restores = dict(
 				entry.get("frontier_restores") or {}
 			)
 			self._adopt_mirrored_trajectory_arenas(
-				self._trajectory_arena_payload
+				self._traj.trajectory_arena_payload
 			)
-			if self._trajectory_arena_payload or self._trajectory_mirrored_restores:
+			if self._traj.trajectory_arena_payload or self._traj.trajectory_mirrored_restores:
 				logging.info(
 					"[TRAJECTORY_FRONTIER] Rank %s shard=%s adopted %s arena(s) "
 					"and %s mirrored restore(s) from serve-group leader %s",
 					self.rank,
 					self._trajectory_group_geometry()[1],
-					len(self._trajectory_arena_payload),
-					len(self._trajectory_mirrored_restores),
+					len(self._traj.trajectory_arena_payload),
+					len(self._traj.trajectory_mirrored_restores),
 					leader,
 				)
 
@@ -3032,13 +3044,10 @@ class BatchGenWorker:
 			self._bind_local_sequence_to_query_book(uuid)
 
 	def _trajectory_slot(self, seq: SequenceEntry) -> int:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
 		try:
-			# Slot numbers are local to a node's allocator.  Migration can release
-			# and later rebind the same UUID at a different slot, so never trust the
-			# stale process-global ``_buffer_slot`` field as the lookup key.
-			return self._trajectory_book.slot_for(seq.uuid)
+			return self._traj.slot_for(seq.uuid)
 		except KeyError as exc:
 			raise RuntimeError(
 				f"sequence {seq.uuid} has no active trajectory reservation"
@@ -3053,27 +3062,27 @@ class BatchGenWorker:
 		dtype: torch.dtype = torch.int32,
 	) -> torch.Tensor:
 		"""Materialize a trajectory span; no persistent storage view escapes."""
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if dtype not in (torch.int32, torch.int64):
 			raise ValueError(f"unsupported trajectory dtype: {dtype}")
-		valid = self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+		valid = self._traj.metadata(self._trajectory_slot(seq)).token_length
 		if length is None:
 			length = valid - start
 		out = torch.empty(int(length), dtype=torch.int32)
-		self._trajectory_book.copy_span_to(
+		self._traj.copy_span_to(
 			self._trajectory_slot(seq), out, start=int(start), length=int(length)
 		)
 		return out if dtype == torch.int32 else out.to(dtype=torch.int64)
 
 	def _trajectory_decoded_tokens(self, seq: SequenceEntry) -> torch.Tensor:
 		"""Materialize generated tokens for output and repetition checks."""
-		return self._trajectory_book.generated_tokens(self._trajectory_slot(seq))
+		return self._traj.generated_tokens(self._trajectory_slot(seq))
 
 	def _append_trajectory_token(self, seq: SequenceEntry, token_id: int) -> int:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
-		return self._trajectory_book.append_token(self._trajectory_slot(seq), int(token_id))
+		return self._traj.append_token(self._trajectory_slot(seq), int(token_id))
 
 	def _append_trajectory_tokens(
 		self, sequences: Sequence[SequenceEntry], token_ids: Sequence[int]
@@ -3084,7 +3093,7 @@ class BatchGenWorker:
 		decode loop drops retired rows first (see [COMPLETED_ROW_SKIP]), so
 		this helper never decides which rows are live.
 		"""
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if len(sequences) != len(token_ids):
 			raise ValueError(
@@ -3093,12 +3102,12 @@ class BatchGenWorker:
 		if not sequences:
 			return
 		slots = [self._trajectory_slot(seq) for seq in sequences]
-		self._trajectory_book.append_tokens(slots, token_ids)
+		self._traj.append_tokens(slots, token_ids)
 
 	def _append_trajectory_batch(
 		self, batch: Sequence[int], token_ids: torch.Tensor
 	) -> None:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if token_ids.numel() != len(batch):
 			raise ValueError(
@@ -3118,19 +3127,13 @@ class BatchGenWorker:
 	def _sync_trajectory_metadata(
 		self, seq: SequenceEntry, state: Dict[str, object]
 	) -> None:
-		"""Refresh a local QueryBook mirror from the owning rank's lengths.
-
-		The node-shared token pages are written by the sequence owner, while each
-		process keeps its QueryBook allocator metadata locally.  Boundary state
-		contains the owner's logical lengths so non-owning ranks can participate in
-		re-entry bookkeeping without copying the trajectory.
-		"""
-		if self._trajectory_book is None or not self._trajectory_book.has_sequence(seq.uuid):
+		"""Refresh a local QueryBook mirror from the owning rank's lengths."""
+		if not self._traj.has_sequence(seq.uuid):
 			return
 		token_length = state.get("trajectory_token_length")
 		if token_length is None:
 			return
-		self._trajectory_book.synchronize_metadata(
+		self._traj.synchronize_metadata(
 			self._trajectory_slot(seq),
 			prompt_length=int(state["prompt_length"]),
 			token_length=int(token_length),
@@ -3155,8 +3158,8 @@ class BatchGenWorker:
 			return
 		fallback_text = ""
 		trajectory_slot = None
-		if self._trajectory_book is not None and self._trajectory_book.has_sequence(uuid):
-			trajectory_slot = self._trajectory_book.slot_for(uuid)
+		if self._traj.trajectory_book is not None and self._traj.trajectory_book.has_sequence(uuid):
+			trajectory_slot = self._traj.trajectory_book.slot_for(uuid)
 		if (
 			self.rank == 0
 			and gathered_text is None
@@ -3173,7 +3176,7 @@ class BatchGenWorker:
 		# Free the complete trajectory reservation on every rank. This is the
 		# only token-storage release point; multi-turn re-entry keeps the slot.
 		if trajectory_slot is not None:
-			self._trajectory_book.release(trajectory_slot)
+			self._traj.trajectory_book.release(trajectory_slot)
 		self._publish_trajectory_pool_capacity()
 		seq._buffer_slot = -1
 
@@ -3264,7 +3267,7 @@ class BatchGenWorker:
 						text = ""
 					cached = None
 					if self._owns_host_kv(seq):
-						state = self._prefix_sequence_states.get(seq.global_idx)
+						state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 						cached = 0 if state is None else int(state.compute_cached_tokens)
 					my_tokens[uuid] = (text, cached)
 
@@ -4767,7 +4770,7 @@ class BatchGenWorker:
 
 	def _initialize_trajectory_book(self) -> None:
 		"""Create or attach the node-shared fixed input-id trajectory pool."""
-		if self._trajectory_book is not None:
+		if self._traj.trajectory_book is not None:
 			return
 		if self.model_context_length is None:
 			raise RuntimeError("model context must be known before creating QueryBook")
@@ -4789,8 +4792,8 @@ class BatchGenWorker:
 			exchange=self._exchange_node_memfd_identity,
 			barrier=dist.barrier,
 		)
-		self._trajectory_memfd = memfd
-		self._trajectory_book = QueryBook(
+		self._traj.trajectory_memfd = memfd
+		self._traj.trajectory_book = QueryBook(
 			capacity_bytes=page_count * page_bytes,
 			page_tokens=page_tokens,
 			storage=storage,
@@ -4799,27 +4802,27 @@ class BatchGenWorker:
 			"Rank %s: unified trajectory pool ready: budget=%.3f GiB "
 			"pages=%s page_tokens=%s max_context=%s sequence_capacity=%s",
 			self.rank,
-			self._trajectory_book.memory_bytes / (1024 ** 3),
-			self._trajectory_book.page_count,
+			self._traj.trajectory_book.memory_bytes / (1024 ** 3),
+			self._traj.trajectory_book.page_count,
 			page_tokens,
 			self.model_context_length,
-			self._trajectory_book.reservation_total_capacity(self.model_context_length),
+			self._traj.trajectory_book.reservation_total_capacity(self.model_context_length),
 		)
 
 	def _publish_trajectory_pool_capacity(self) -> None:
 		"""Publish derived scheduling capacity once rank zero has a response queue."""
-		if self.rank != 0 or self._response_queue is None or self._trajectory_book is None:
+		if self.rank != 0 or self._response_queue is None or self._traj.trajectory_book is None:
 			return
 		signature = (
-			self._trajectory_book.reservation_total_capacity(self.model_context_length),
-			self._trajectory_book.reservation_free_count(self.model_context_length),
-			self._trajectory_book.free_page_count,
-			self._trajectory_book.active_count,
-			self._trajectory_book.largest_free_extent_pages,
+			self._traj.trajectory_book.reservation_total_capacity(self.model_context_length),
+			self._traj.trajectory_book.reservation_free_count(self.model_context_length),
+			self._traj.trajectory_book.free_page_count,
+			self._traj.trajectory_book.active_count,
+			self._traj.trajectory_book.largest_free_extent_pages,
 		)
-		if getattr(self, "_trajectory_pool_capacity_signature", None) == signature:
+		if self._traj.trajectory_pool_capacity_signature == signature:
 			return
-		self._trajectory_pool_capacity_signature = signature
+		self._traj.trajectory_pool_capacity_signature = signature
 		self._response_queue.put({
 			"type": "trajectory_pool_capacity",
 			# Reject pre-protocol snapshots: the legacy ``capacity`` field
@@ -4834,9 +4837,9 @@ class BatchGenWorker:
 			"free_pages": signature[2],
 			"active_count": signature[3],
 			"largest_free_extent_pages": signature[4],
-			"page_tokens": self._trajectory_book.page_tokens,
+			"page_tokens": self._traj.trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
-			"capacity_bytes": self._trajectory_book.memory_bytes,
+			"capacity_bytes": self._traj.trajectory_book.memory_bytes,
 		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
@@ -5372,14 +5375,7 @@ class BatchGenWorker:
 
 	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
 		"""Release Kimi-Linear KDA state independently of paged GPU KV."""
-		if not global_sequence_ids:
-			return
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-			if KimiLinearKDAWrapper.slot_manager is not None:
-				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
-		except ImportError:
-			pass
+		self._traj.free_kda_sequences(global_sequence_ids)
 
 	def _destroy_gpu_paged_kv_cache(
 		self, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
@@ -6017,13 +6013,13 @@ class BatchGenWorker:
 			# Snapshot the trajectory before releasing any source-side resources.
 			# The destination must acknowledge restoring this exact payload before
 			# the source allocator gives its pages back.
-			if self._trajectory_book is None or not self._trajectory_book.has_sequence(uuid):
+			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: migration source has no trajectory slot for {uuid[:8]}"
 				)
 			trajectory = self._trajectory_tokens(seq, dtype=torch.int32).contiguous()
 			trajectory_slot = self._trajectory_slot(seq)
-			turn_payload = self._trajectory_book.turns_payload(trajectory_slot).contiguous()
+			turn_payload = self._traj.trajectory_book.turns_payload(trajectory_slot).contiguous()
 			header = torch.tensor(
 				[1, trajectory.numel(), seq.prompt_length, seq.decoded_length, turn_payload.shape[0]],
 				dtype=torch.int64,
@@ -6113,17 +6109,17 @@ class BatchGenWorker:
 			turn_payload = torch.empty((turn_count, 6), dtype=torch.int64)
 			dist.recv(tensor=turn_payload, src=from_rank, group=gloo_group)
 			turns = QueryBook.turns_from_payload(turn_payload)
-			if self._trajectory_book is None:
+			if self._traj.trajectory_book is None:
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: trajectory book is unavailable during migration"
 				)
-			if self._trajectory_book.has_sequence(uuid):
-				destination_slot = self._trajectory_book.slot_for(uuid)
+			if self._traj.trajectory_book.has_sequence(uuid):
+				destination_slot = self._traj.trajectory_book.slot_for(uuid)
 			else:
-				destination_slot = self._trajectory_book.bind(
+				destination_slot = self._traj.trajectory_book.bind(
 					uuid, self.model_context_length
 				)
-			self._trajectory_book.restore(
+			self._traj.trajectory_book.restore(
 				destination_slot,
 				trajectory_recv,
 				prompt_length=prompt_length,
@@ -6207,10 +6203,10 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(mig.uuid)
 			if (
 				seq is not None
-				and self._trajectory_book is not None
-				and self._trajectory_book.has_sequence(mig.uuid)
+				and self._traj.trajectory_book is not None
+				and self._traj.trajectory_book.has_sequence(mig.uuid)
 			):
-				self._trajectory_book.release(self._trajectory_book.slot_for(mig.uuid))
+				self._traj.trajectory_book.release(self._traj.trajectory_book.slot_for(mig.uuid))
 				self._publish_trajectory_pool_capacity()
 		if self.rank == 0:
 			logging.info(
@@ -6315,14 +6311,14 @@ class BatchGenWorker:
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
 					seq = self.global_batch.get_sequence(uuid)
-					if self._trajectory_book is None:
+					if self._traj.trajectory_book is None:
 						raise QueryBookPoolCapacityError(
 							f"Rank {self.rank}: trajectory book unavailable for migration receive {uuid[:8]}"
 						)
-					if self._trajectory_book.has_sequence(uuid):
-						destination_slot = self._trajectory_book.slot_for(uuid)
+					if self._traj.trajectory_book.has_sequence(uuid):
+						destination_slot = self._traj.trajectory_book.slot_for(uuid)
 					else:
-						destination_slot = self._trajectory_book.bind(
+						destination_slot = self._traj.trajectory_book.bind(
 							uuid, self.model_context_length
 						)
 					logging.info(
@@ -6331,7 +6327,7 @@ class BatchGenWorker:
 						f"tokens={pending['trajectory'].numel()}"
 					)
 					if not pending.get('restored', False):
-						self._trajectory_book.restore(
+						self._traj.trajectory_book.restore(
 							destination_slot,
 							pending['trajectory'],
 							prompt_length=pending['prompt_length'],
@@ -6487,15 +6483,15 @@ class BatchGenWorker:
 					# pages are node-shared.  Publish the owner's lengths so
 					# non-owning ranks can repair their mirror before re-entry.
 					'trajectory_token_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					'trajectory_decoded_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					# total_decoded_before_eviction: needed so non-owning ranks
@@ -6820,7 +6816,7 @@ class BatchGenWorker:
 			if self._owns_host_kv(seq):
 				private_tokens = tokens
 				state = (
-					self._prefix_sequence_states.get(seq.global_idx)
+					self._prefix.prefix_sequence_states.get(seq.global_idx)
 					if self.enable_prefix_cache
 					else None
 				)
@@ -7109,7 +7105,7 @@ class BatchGenWorker:
 					attached_tokens=int(attached),
 					compute_cached_tokens=int(compute_cached),
 				)
-				self._prefix_sequence_states[seq.global_idx] = state
+				self._prefix.prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
 		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
@@ -7258,12 +7254,12 @@ class BatchGenWorker:
 						self._host_views_by_group(),
 						{
 							self.global_batch.get_sequence(uuid).global_idx:
-							self._prefix_sequence_states[
+							self._prefix.prefix_sequence_states[
 								self.global_batch.get_sequence(uuid).global_idx
 							]
 							for uuid, _ in owner_requests
 							if self.global_batch.get_sequence(uuid).global_idx
-							in self._prefix_sequence_states
+							in self._prefix.prefix_sequence_states
 						},
 					)
 				if self.enable_prefix_cache:
@@ -7273,7 +7269,7 @@ class BatchGenWorker:
 					host_views = self._host_views_by_group()
 					for uuid, _ in owner_requests:
 						seq = self.global_batch.get_sequence(uuid)
-						state = self._prefix_sequence_states.get(seq.global_idx)
+						state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 						if state is None:
 							continue
 						for group_id, view in sorted(host_views.items()):
@@ -7324,9 +7320,9 @@ class BatchGenWorker:
 				# pages), then each pseudo-sid frees and unregisters. Pop only
 				# THIS wave's entries: earlier waves' members still hold refs.
 				for gid in wave.global_ids:
-					self._pool_member_sids.pop(gid, None)
+					self._prefix.pool_member_sids.pop(gid, None)
 				for sid in set(wave.segment_sids.values()):
-					self._pool_sid_members.pop(sid, None)
+					self._prefix.pool_sid_members.pop(sid, None)
 					try:
 						host_view.release_sequence_pages([sid])
 					except Exception:
@@ -7353,7 +7349,7 @@ class BatchGenWorker:
 			# ranks sync this through the boundary metadata exchange.
 			owned = pages
 			state = (
-				self._prefix_sequence_states.get(seq.global_idx)
+				self._prefix.prefix_sequence_states.get(seq.global_idx)
 				if self.enable_prefix_cache
 				else None
 			)
@@ -7363,7 +7359,7 @@ class BatchGenWorker:
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
 		# allocator consumed, so the next round may credit again.
-		self._shared_prefix_credit_suspended = False
+		self._prefix.shared_prefix_credit_suspended = False
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -8175,10 +8171,10 @@ class BatchGenWorker:
 					uuid[:8], needed, total,
 				)
 			if (
-				self._trajectory_book is not None
-				and self._trajectory_book.has_sequence(uuid)
+				self._traj.trajectory_book is not None
+				and self._traj.trajectory_book.has_sequence(uuid)
 			):
-				self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
+				self._traj.trajectory_book.release(self._traj.trajectory_book.slot_for(uuid))
 				seq._buffer_slot = -1
 			release_query_book_slot(
 				uuid,
@@ -8307,165 +8303,60 @@ class BatchGenWorker:
 		return local_passes, global_passes
 
 	def _suspend_shared_prefix_credit(self, reason: str) -> None:
-		"""Fall back to the full per-row charge for the next admission round.
-
-		Called when a wave admitted with the shared-prefix credit is rejected
-		by the reservation transaction. The credit predicts that the wave
-		planner will pool each shared prefix into ONE Host copy; the planner
-		can still decline (an unmeasured or too-small pool budget, the
-		threshold ladder), and then every member really does allocate its own
-		prefix and the wave genuinely does not fit.
-
-		Re-admitting the same credited wave would repeat the same rejection on
-		every iteration, so the retry charges in full, admits the smaller wave
-		that does fit, and makes progress; the latch clears on the next
-		committed reservation. The suspension is logged by name -- it is a
-		measurable prediction miss, not a silent fallback.
-		"""
-		if not self._shared_prefix_credit_applied:
-			return
-		self._shared_prefix_credit_applied = False
-		if self._shared_prefix_credit_suspended:
-			return
-		self._shared_prefix_credit_suspended = True
-		if self.rank == 0:
-			logging.warning(
-				"[PREFILL] shared-prefix admission credit suspended for the "
-				"next round: a credited wave was %s, so the next wave is "
-				"charged per row",
-				reason,
-			)
+		"""Delegate the credit latch while retaining worker logging context."""
+		self._prefix.suspend_shared_prefix_credit(reason, rank=self.rank)
 
 	def _shared_prefix_credit_enabled(self) -> bool:
-		"""Whether this round may charge an in-wave shared prefix once.
-
-		Every condition is a reason the prediction would otherwise be wrong:
-
-		- the credit describes prefix-cache sharing, so it needs the cache on;
-		- only the in-wave prefix POOL gives the wave one Host copy per shared
-		  segment with members attaching it, which is what the credit counts;
-		- the pool declines every wave until its page budget has been measured
-		  (the first wave after startup seeds it), and a declined wave
-		  allocates a full private copy per member;
-		- a previous credited wave that the reservation rejected suspends the
-		  credit for one round so admission makes progress.
-		"""
-		if not self.shared_prefix_admission:
+		"""Whether this round may charge an in-wave shared prefix once."""
+		# Keep the old short-circuit order: with the feature flag off the pool
+		# configuration is intentionally allowed to be absent.
+		if not self.shared_prefix_admission or not self.enable_prefix_cache:
 			return False
-		if not self.enable_prefix_cache:
-			return False
-		if self._shared_prefix_credit_suspended:
+		if self._prefix.shared_prefix_credit_suspended:
 			return False
 		if not self._prefill_prefix_pool_enabled():
 			return False
-		return self._prefill_pool_page_budget is not None
+		return self._prefix.shared_prefix_credit_enabled(
+			shared_prefix_admission=self.shared_prefix_admission,
+			enable_prefix_cache=self.enable_prefix_cache,
+			pool_enabled=True,
+			prefill_pool_page_budget=self._prefill_pool_page_budget,
+		)
 
 	def _prefix_page_digests(self, seq) -> Tuple[int, ...]:
-		"""Cumulative page digests of this sequence's prompt, shareable pages.
-
-		Digest ``k`` identifies the first ``k+1`` pages of the prompt: two
-		sequences hold the same digest at ``k`` exactly when those pages carry
-		the same tokens, hence the same KV, hence one physical copy in the
-		pool. Using the digest itself as the ledger key therefore makes "same
-		key" mean "same physical pages", which is what the charge requires.
-
-		Deterministic across ranks: the digest is a function of the prompt
-		tokens, which every rank reads from the node-shared trajectory store.
-		"""
-		cached = self._prefix_page_digest_cache.get(seq.global_idx)
-		if cached is not None:
-			return cached
-		page_size = int(seq.PAGE_SIZE)
-		# The final page is never shareable, so a fully shared prompt still
-		# pays for the page holding the token it produces logits for.
-		shareable = (int(seq.prompt_length) - 1) // page_size
-		if shareable <= 0:
-			self._prefix_page_digest_cache[seq.global_idx] = ()
-			return ()
-		tokens = self._trajectory_tokens(seq, length=seq.prompt_length)
-		token_array = np.ascontiguousarray(
-			np.asarray(tokens, dtype=np.int64)
+		"""Worker identity wrapper around the shared digest walk."""
+		return self._prefix.prefix_page_digests(
+			global_id=int(seq.global_idx),
+			prompt_length=int(seq.prompt_length),
+			page_size=int(seq.PAGE_SIZE),
+			tokens_for=lambda: self._trajectory_tokens(
+				seq, length=seq.prompt_length
+			).tolist(),
 		)
-		digests = []
-		running = b"\x00" * 16
-		for page in range(shareable):
-			block = token_array[page * page_size:(page + 1) * page_size]
-			running = hashlib.blake2b(
-				running + block.tobytes(), digest_size=16
-			).digest()
-			digests.append(
-				int.from_bytes(running[:8], "big", signed=False)
-			)
-		chain = tuple(digests)
-		self._prefix_page_digest_cache[seq.global_idx] = chain
-		return chain
 
 	def _prune_prefix_page_digest_cache(self) -> None:
-		"""Drop digests of sequences the batch no longer holds."""
-		if not self._prefix_page_digest_cache:
+		"""Pass the live global ids; identity resolution stays on the worker."""
+		if not self._prefix.prefix_page_digest_cache:
 			return
-		live = {
-			seq.global_idx
-			for seq in self.global_batch.sequences.values()
-		}
-		for global_idx in list(self._prefix_page_digest_cache):
-			if global_idx not in live:
-				del self._prefix_page_digest_cache[global_idx]
+		self._prefix.prune_prefix_page_digest_cache(
+			[int(seq.global_idx) for seq in self.global_batch.sequences.values()]
+		)
 
 	def _admission_shared_prefix_segments(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Per candidate, the shared run it reads with an ADJACENT candidate.
-
-		``_stamp_prefix_prefill_order`` sorts the admission by prompt token
-		ids, which on a prefix tree is a depth-first walk: candidates sharing
-		a prefix are contiguous. A candidate's shared run is therefore the
-		longer of its page-granular common prefix with its two neighbours in
-		admission order, and its key is the cumulative digest at the end of
-		that run -- equal for exactly the candidates that share it.
-
-		Conservative by construction: crediting only the deepest adjacent run
-		under-counts a wave whose families themselves share an outer prefix
-		(the outer run is charged once per family rather than once per wave),
-		and under-counting can only admit fewer rows, never over-admit.
-		"""
-		if not self._shared_prefix_credit_enabled():
-			return {}
-		self._prune_prefix_page_digest_cache()
-		ordered = sorted(
+		"""Resolve candidates on the worker, then run the pure store walk."""
+		credit_enabled = self._shared_prefix_credit_enabled()
+		if credit_enabled:
+			self._prune_prefix_page_digest_cache()
+		return self._prefix.admission_shared_prefix_segments(
 			all_candidates,
-			key=lambda uuid: (
-				self._admission_order_key(
-					self.global_batch.get_sequence(uuid)
-				),
-				self.global_batch.get_sequence(uuid).global_idx,
-			),
+			sequence_for=self.global_batch.get_sequence,
+			tokens_for=lambda seq: self._trajectory_tokens(
+				seq, length=seq.prompt_length
+			).tolist(),
+			credit_enabled=credit_enabled,
 		)
-		digests = [
-			self._prefix_page_digests(self.global_batch.get_sequence(uuid))
-			for uuid in ordered
-		]
-
-		def shared_pages(left: int, right: int) -> int:
-			if left < 0 or right >= len(digests):
-				return 0
-			first, second = digests[left], digests[right]
-			limit = min(len(first), len(second))
-			index = 0
-			while index < limit and first[index] == second[index]:
-				index += 1
-			return index
-
-		segments: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for position, uuid in enumerate(ordered):
-			run = max(
-				shared_pages(position - 1, position),
-				shared_pages(position, position + 1),
-			)
-			if run <= 0:
-				continue
-			segments[uuid] = ((digests[position][run - 1], run),)
-		return segments
 
 	def _admission_order_key(self, seq) -> int:
 		"""The order ``select_prefill_batch`` walks QUEUEING candidates in."""
@@ -8480,7 +8371,7 @@ class BatchGenWorker:
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		shared_segments = self._admission_shared_prefix_segments(all_candidates)
-		self._shared_prefix_credit_applied = bool(shared_segments)
+		self._prefix.shared_prefix_credit_applied = bool(shared_segments)
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -9199,7 +9090,7 @@ class BatchGenWorker:
 		self._buffer_pool = None
 		logging.info(
 			f"Rank {self.rank}: unified trajectory pool active "
-			f"(capacity={self._trajectory_book.reservation_total_capacity(self.model_context_length)})"
+			f"(capacity={self._traj.trajectory_book.reservation_total_capacity(self.model_context_length)})"
 		)
 
 		# Initialize index maps
@@ -11011,12 +10902,12 @@ class BatchGenWorker:
 			prev_decoded = seq.total_decoded_before_eviction
 			seq.log_event(SeqEvent.REENTRY_START, self.rank,
 				f"new_prompt_len={seq.prompt_length}, prev_decoded={prev_decoded}")
-			if self._trajectory_book is None or not self._trajectory_book.has_sequence(uuid):
+			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: re-entry of {uuid[:8]} has no trajectory slot"
 				)
 			trajectory_slot = self._trajectory_slot(seq)
-			trajectory_length = self._trajectory_book.metadata(trajectory_slot).token_length
+			trajectory_length = self._traj.trajectory_book.metadata(trajectory_slot).token_length
 			if trajectory_length < seq.prompt_length:
 				raise RuntimeError(
 					f"Rank {self.rank}: trajectory for {uuid[:8]} is shorter than "
@@ -11025,7 +10916,7 @@ class BatchGenWorker:
 			# Record the replayed prompt boundary and make the local QueryBook
 			# metadata agree with the scalar effective prompt length. No token bytes
 			# are copied: the trajectory already contains this prefix.
-			self._trajectory_book.begin_reentry_turn(
+			self._traj.trajectory_book.begin_reentry_turn(
 				trajectory_slot, prompt_length=seq.prompt_length
 			)
 			# Clear the legacy owner-only tensor marker. No token copy occurs.
@@ -11090,8 +10981,8 @@ class BatchGenWorker:
 		# is introduced. The predicate is broadcast-identical (the flag is on
 		# the batch's own sequences and the batch is replicated), so every rank
 		# reaches the gather with the same expectation.
-		self._trajectory_arena_payload = {}
-		self._trajectory_mirrored_restores = {}
+		self._traj.trajectory_arena_payload = {}
+		self._traj.trajectory_mirrored_restores = {}
 		mirror_trajectory = (
 			self._decode_attn_tp_size() > 1
 			and self.enable_prefix_cache
@@ -11104,7 +10995,7 @@ class BatchGenWorker:
 		)
 		self._mirror_group_host_kv(
 			my_prefill_uuids,
-			self._prefix_sequence_states,
+			self._prefix.prefix_sequence_states,
 			trajectory=mirror_trajectory,
 		)
 
@@ -11442,7 +11333,7 @@ class BatchGenWorker:
 		"""True when --persistent-phase-instances keeps both phase instances."""
 		if not getattr(self.args, "persistent_phase_instances", False):
 			return False
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError(
 				"--persistent-phase-instances requires the unified trajectory pool"
 			)
@@ -11540,24 +11431,7 @@ class BatchGenWorker:
 		free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
 		gib = 1024 ** 3
 		pm = getattr(self, "parallel_manager", None)
-		kda_slots = kda_live = -1
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import (
-				KimiLinearKDAWrapper,
-			)
-
-			manager = KimiLinearKDAWrapper.state_manager
-			if manager is not None:
-				# The pools are deliberately kept across a rebuild, so their
-				# slot count must stay FLAT; a growing one would mean the
-				# reuse decision stopped matching.
-				kda_slots = int(manager.config.num_state_items)
-				kda_live = len(manager.sequence_state_items)
-		except Exception:
-			# Observability must not take down the switch it observes: a
-			# half-initialized manager raises AttributeError/TypeError here,
-			# and the -1 sentinel is a readable "unknown" in the line.
-			pass
+		kda_slots, kda_live = self._traj.kda_stats()
 		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
 		logging.info(
 			"[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
@@ -12061,11 +11935,11 @@ class BatchGenWorker:
 		"""
 		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
 			return
-		if self._prefix_drain_metric_emitted:
+		if self._prefix.prefix_drain_metric_emitted:
 			return
 		if not self.global_batch.all_completed():
 			return
-		self._prefix_drain_metric_emitted = True
+		self._prefix.prefix_drain_metric_emitted = True
 		self._emit_prefix_cache_metric(
 			"prefix_drain",
 			**self._prefix_host_resource_fields(),
@@ -12095,7 +11969,7 @@ class BatchGenWorker:
 		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
 
 		_AWB.prefill_prefix_materialization = None
-		if not self._active_prefix_materializations:
+		if not self._prefix.active_prefix_materializations:
 			return
 		try:
 			_AWB.retire_pending_prefill_offloads(
@@ -12107,8 +11981,8 @@ class BatchGenWorker:
 				"Rank %s failed to retire prefix prefill offloads",
 				self.rank,
 			)
-		while self._active_prefix_materializations:
-			materialization = self._active_prefix_materializations.pop()
+		while self._prefix.active_prefix_materializations:
+			materialization = self._prefix.active_prefix_materializations.pop()
 			try:
 				self._close_prefix_materialization(
 					materialization,
@@ -12185,19 +12059,14 @@ class BatchGenWorker:
 		A pooled segment runs as a row of its own under a pseudo sequence id, so
 		it holds one slot for the whole wave on top of the wave's sequences.
 		"""
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-		except ImportError:
-			return -1
-		manager = KimiLinearKDAWrapper.state_manager
-		if KimiLinearKDAWrapper.slot_manager is None or manager is None:
+		manager = self._traj.kda_state_manager()
+		if manager is None:
 			return -1
 		return int(manager.get_stats().num_free_state_items)
 
 	def _next_pool_segment_sid(self) -> int:
 		"""Negative Host sequence ids, rank-strided so no two ranks collide."""
-		self._pool_sid_counter += 1
-		return -(self.rank + 1 + self.world_size * self._pool_sid_counter)
+		return self._prefix.next_pool_segment_sid()
 
 	def _prefix_rank_packing_mode(self, seqs) -> bool:
 		"""True when this batch asked for the predicted-time wave packer."""
@@ -12542,7 +12411,7 @@ class BatchGenWorker:
 		if not self._trajectory_commit_requested(seqs):
 			return [], True, {}
 		digest = self.prefix_cache_runtime_config.namespace_digest
-		index = self._trajectory_session_groups
+		index = self._traj.trajectory_session_groups
 		hits: List[MaterializedPrefix] = []
 		pages: Dict[int, Dict[int, List[int]]] = {}
 		confirmed = True
@@ -12550,7 +12419,7 @@ class BatchGenWorker:
 		for position, seq in enumerate(seqs):
 			if seq is None:
 				continue
-			attachment = self._trajectory_attachments.get(int(seq.global_idx))
+			attachment = self._traj.trajectory_attachments.get(int(seq.global_idx))
 			if group is None:
 				# Own group: no peer to agree with, so the live record is the
 				# only truth there is.
@@ -12606,7 +12475,7 @@ class BatchGenWorker:
 				)
 				confirmed = False
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			attached = 0 if state is None else int(state.attached_tokens)
 			if attached < boundary:
 				# The resident pages the load reads are kept resident by this
@@ -13166,7 +13035,7 @@ class BatchGenWorker:
 				commit_attachment_handles=(handle,) if handle else (),
 			)
 			prefix_states[seq.global_idx] = state
-			self._prefix_sequence_states[seq.global_idx] = state
+			self._prefix.prefix_sequence_states[seq.global_idx] = state
 
 	def _prefill_pool_segment_host_pages(self) -> int:
 		"""Host pages this wave allocates for its segments.
@@ -13205,7 +13074,7 @@ class BatchGenWorker:
 				},
 			)
 			prefix_states[global_id] = state
-			self._prefix_sequence_states[global_id] = state
+			self._prefix.prefix_sequence_states[global_id] = state
 			# A segment's Host pages live until its last member releases. A
 			# materialized segment has no pseudo sequence to refcount: its
 			# pages are the prefix cache's, kept by this sequence's own
@@ -13215,9 +13084,7 @@ class BatchGenWorker:
 				for seg in wave.chains[index]
 				if seg not in wave.materialized
 			)
-			self._pool_member_sids[global_id] = sids
-			for sid in sids:
-				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
+			self._prefix.add_pool_member_refs(global_id, sids)
 
 	def _materialized_pool_layers(self):
 		"""The attention layers that materialize, in Host physical order.
@@ -14125,8 +13992,8 @@ class BatchGenWorker:
 					self.prefix_cache_coordinator.release_attachment(handle)
 			for index, handle in member_handles.items():
 				global_id = wave.global_ids[index]
-				state = self._prefix_sequence_states[global_id]
-				self._prefix_sequence_states[global_id] = replace(
+				state = self._prefix.prefix_sequence_states[global_id]
+				self._prefix.prefix_sequence_states[global_id] = replace(
 					state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
 				)
 		finally:
@@ -14137,22 +14004,10 @@ class BatchGenWorker:
 			self._prefill_pool_wave = None
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
-		"""A pool segment's Host pages outlive its last member, never longer.
-
-		Leader-only by construction: only ``_allocate_prefill_pool_host_pages``
-		fills these maps and only the serve group's host-KV owner runs it, so a
-		follower — which released its mirrored records at the end of the wave —
-		finds nothing here and must not free the leader's pages.
-		"""
-		for sid in self._pool_member_sids.pop(global_id, ()):
-			left = self._pool_sid_members[sid] - 1
-			if left:
-				self._pool_sid_members[sid] = left
-			else:
-				del self._pool_sid_members[sid]
-				for view in self._host_views_by_group().values():
-					view.release_sequence_pages([sid])
-					view.unregister_sequences([sid])
+		"""Release pool pseudo-sids through the PrefixReuseState owner."""
+		self._prefix.release_pool_segment_refs(
+			int(global_id), host_views_provider=self._host_views_by_group
+		)
 
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
@@ -14174,7 +14029,7 @@ class BatchGenWorker:
 		)
 		for sequence_id in global_sequence_ids:
 			self._release_pool_segment_refs(int(sequence_id))
-			state = self._prefix_sequence_states.pop(int(sequence_id), None)
+			state = self._prefix.pop_state(int(sequence_id))
 			if state is None:
 				continue
 			for handle in (*state.commit_attachment_handles, state.attachment_handle):
@@ -14190,11 +14045,7 @@ class BatchGenWorker:
 		rather than read as off -- a mistyped flag would look like a clean run
 		with no frontier committed.
 		"""
-		from batchgen.prefix_reuse.trajectory_commit import (
-			trajectory_commit_enabled,
-		)
-
-		return trajectory_commit_enabled(
+		return self._traj.commit_requested(
 			self._active_batchgen_debug_for_sequences(batch_sequences)
 		)
 
@@ -14208,9 +14059,9 @@ class BatchGenWorker:
 		shard index is simply ``rank % G`` -- the same arithmetic, read from the
 		other end, so there is no second notion of group membership.
 		"""
-		G = self._decode_attn_tp_size()
-		shard_index = int(self.rank % G) if G > 1 else 0
-		return int(G), shard_index, shard_index == 0
+		return self._traj.group_geometry(
+			decode_attn_tp_size=self._decode_attn_tp_size(), rank=self.rank
+		)
 
 	def _get_trajectory_frontier_committer(self):
 		"""One trajectory-frontier committer per rank, built on first use.
@@ -14221,54 +14072,14 @@ class BatchGenWorker:
 		prefix-cache runtime config -- the same ``host_page_bytes_all_layers``
 		the frontier charge is expressed in.
 		"""
-		if self._trajectory_frontier_committer is not None:
-			return self._trajectory_frontier_committer
-		from batchgen.models.moonshotai.kimi_linear.wrappers import (
-			KimiLinearKDAWrapper,
-		)
-		from batchgen.prefix_reuse.trajectory_commit import (
-			HostKVSnapshotArenaAllocator,
-			KDAStateSnapshotReader,
-			TrajectoryFrontierCommitter,
-			TrajectoryStateUnavailable,
-			profile_from_kda_state_config,
-		)
-
-		manager = KimiLinearKDAWrapper.state_manager
-		if manager is None:
-			raise TrajectoryStateUnavailable(
-				"prefix_trajectory_commit needs a live KDA state pool; this "
-				"deployment has none"
-			)
 		runtime = self.prefix_cache_runtime_config
-		page_tokens = int(runtime.group_specs[0].raw_page_tokens)
-		page_bytes = int(runtime.host_page_bytes_all_layers)
-		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
-		self._trajectory_frontier_committer = TrajectoryFrontierCommitter(
+		return self._traj.build_committer(
 			rank=self.rank,
-			page_tokens=page_tokens,
-			host_page_bytes_all_layers=page_bytes,
-			# M3 Slice 1c: at G>1 every rank of the serve group snapshots its
-			# OWN head shard into the leader's one G-wide arena, and the leader
-			# alone keeps the registry -- a follower record would outlive the
-			# arena the leader can evict under it.
-			shard_count=shard_count,
-			shard_index=shard_index,
-			owns_registry=is_leader,
-			arena_allocator=HostKVSnapshotArenaAllocator(
-				host_views_provider=self._host_views_by_group,
-				page_tokens=page_tokens,
-				host_page_bytes_all_layers=page_bytes,
-				next_pseudo_sid=self._next_pool_segment_sid,
-			),
-			snapshot_reader=KDAStateSnapshotReader(
-				state_manager_provider=(
-					lambda: KimiLinearKDAWrapper.state_manager
-				),
-				profile=profile_from_kda_state_config(manager.config),
-			),
+			runtime=runtime,
+			group_geometry=self._trajectory_group_geometry(),
+			host_views_provider=self._host_views_by_group,
+			next_pseudo_sid=self._next_pool_segment_sid,
 		)
-		return self._trajectory_frontier_committer
 
 	def _trajectory_frontier_eviction_hook(self):
 		"""The frontier eviction seam, or None when no frontier is committed.
@@ -14277,7 +14088,7 @@ class BatchGenWorker:
 		prefix eviction path keeps its exact previous behavior on every run
 		that never turned the flag on.
 		"""
-		committer = self._trajectory_frontier_committer
+		committer = self._traj.trajectory_frontier_committer
 		if committer is None:
 			return None
 		return committer.on_prefix_pages_released
@@ -14293,39 +14104,11 @@ class BatchGenWorker:
 		(``_next_pool_segment_sid``), so its read row cannot collide with a
 		pool segment or with an arena being written.
 		"""
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return None
-		if self._trajectory_restorer is not None:
-			return self._trajectory_restorer
-		from batchgen.models.moonshotai.kimi_linear.wrappers import (
-			KimiLinearKDAWrapper,
-		)
-		from batchgen.prefix_reuse.trajectory_restore import (
-			HostKVSnapshotArenaReader,
-			KDAStateSnapshotWriter,
-			TrajectoryRestorer,
-		)
-
-		self._trajectory_restorer = TrajectoryRestorer(
+		return self._traj.build_restorer(
 			rank=self.rank,
-			committer=committer,
-			arena_reader=HostKVSnapshotArenaReader(
-				host_views_provider=self._host_views_by_group,
-				next_pseudo_sid=self._next_pool_segment_sid,
-			),
-			state_writer=KDAStateSnapshotWriter(
-				state_manager_provider=(
-					lambda: KimiLinearKDAWrapper.state_manager
-				),
-				profile=committer.layout.profile,
-			),
-			attention_group_size=committer.shard_count,
-			# WHICH head shard this rank restores: the same index its commit
-			# wrote, read from the committer so the two cannot disagree.
-			shard_index=committer.shard_index,
+			host_views_provider=self._host_views_by_group,
+			next_pseudo_sid=self._next_pool_segment_sid,
 		)
-		return self._trajectory_restorer
 
 	def _trajectory_commit_tokens(self, seq) -> int:
 		"""Page-aligned boundary this sequence would commit at, or 0.
@@ -14337,15 +14120,7 @@ class BatchGenWorker:
 		of the boundary it would claim, so such a sequence gets no arena at all
 		and no rank writes a shard for it.
 		"""
-		runtime = self.prefix_cache_runtime_config
-		if runtime is None:
-			return 0
-		boundary = int(runtime.publish_boundary_tokens)
-		prompt_length = int(getattr(seq, "prompt_length", 0) or 0)
-		commit_tokens = (prompt_length // boundary) * boundary
-		if commit_tokens == 0 or commit_tokens != prompt_length:
-			return 0
-		return commit_tokens
+		return self._traj.commit_tokens(self.prefix_cache_runtime_config, seq)
 
 	def _reserve_trajectory_arenas(self, uuids) -> dict:
 		"""Pre-allocate each committing sequence's G-wide snapshot arena.
@@ -14423,30 +14198,9 @@ class BatchGenWorker:
 		differ across ranks that must run prefill in lockstep.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or not is_leader or not self._trajectory_attachments:
-			return {}
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return {}
-		payload = {}
-		for global_id, attachment in self._trajectory_attachments.items():
-			arena = committer.arena_for(attachment.storage_handle)
-			if arena is None:
-				continue
-			payload[int(global_id)] = {
-				"session_key": str(attachment.session_key),
-				"boundary_tokens": int(attachment.boundary_tokens),
-				"owning_group_id": int(attachment.owning_group_id),
-				"shard_count": int(arena.shard_count),
-				"pseudo_sid": int(arena.pseudo_sid),
-				"pages_per_group": int(arena.pages_per_group),
-				"capacity_bytes": int(arena.capacity_bytes),
-				"pages": {
-					int(group_id): [int(page) for page in pages]
-					for group_id, pages in arena.page_ids_by_group.items()
-				},
-			}
-		return payload
+		return self._traj.restore_payload(
+			shard_count=shard_count, is_leader=is_leader
+		)
 
 	def _trajectory_session_summary(self) -> dict:
 		"""This serve group's committed sessions, for the world map.
@@ -14465,65 +14219,13 @@ class BatchGenWorker:
 		record does not exist until finalize.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or not is_leader:
-			return {}
-		committer = self._trajectory_frontier_committer
-		if committer is None or not committer.owns_registry:
-			return {}
-		sessions = committer.registry.session_group_summary()
-		return {
-			# The group this leader speaks for. An empty ``sessions`` is
-			# meaningful: it says this group now holds no committed session,
-			# so the fold drops the entries it used to publish.
-			"group_id": int(self.rank // shard_count),
-			"sessions": {
-				str(session_key): [
-					int(owning_group_id),
-					int(boundary_tokens),
-					str(index_key),
-				]
-				for session_key, (
-					owning_group_id,
-					boundary_tokens,
-					index_key,
-				) in sessions.items()
-			},
-		}
-
-	def _fold_trajectory_session_groups(self, gathered) -> None:
-		"""Fold every leader's session summary into this rank's map.
-
-		Runs on EVERY rank, in gathered rank order, over the same list on
-		every rank -- that identity is what lets the pin below be part of a
-		replicated assignment. Nothing is built when no leader published a
-		summary, so a flag-on pass before the first commit allocates nothing.
-		"""
-		summaries = [
-			entry.get("frontier_sessions")
-			for entry in gathered
-			if isinstance(entry, dict) and entry.get("frontier_sessions")
-		]
-		if not summaries and self._trajectory_session_groups is None:
-			return
-		from batchgen.prefix_reuse.trajectory_frontier import (
-			TrajectorySessionGroupIndex,
+		return self._traj.session_summary(
+			shard_count=shard_count, is_leader=is_leader, rank=self.rank
 		)
 
-		index = self._trajectory_session_groups
-		if index is None:
-			index = TrajectorySessionGroupIndex()
-			self._trajectory_session_groups = index
-		changed = index.fold(summaries)
-		if changed:
-			logging.info(
-				"[TRAJECTORY_FRONTIER] Rank %s folded %s session-group "
-				"change(s) from %s leader summary/summaries: %s session(s) "
-				"now pinnable",
-				self.rank,
-				changed,
-				len(summaries),
-				len(index),
-			)
+	def _fold_trajectory_session_groups(self, gathered) -> None:
+		"""Delegate the rank-identical fold to the trajectory owner."""
+		self._traj.fold_session_groups(gathered, rank=self.rank)
 
 	def _pin_trajectory_session_groups(self, uuids, *, num_groups: int) -> dict:
 		"""``{uuid: owning group}`` for the flag-on continuations in ``uuids``.
@@ -14539,13 +14241,13 @@ class BatchGenWorker:
 		nothing here re-implements the hashing or the boundary search. A miss
 		returns nothing for that sequence and default assignment is unchanged.
 		"""
-		index = self._trajectory_session_groups
+		index = self._traj.trajectory_session_groups
 		if not index:
 			return {}
 		if not self.enable_prefix_cache:
 			return {}
 		runtime = self.prefix_cache_runtime_config
-		if runtime is None or self._trajectory_book is None:
+		if runtime is None or self._traj.trajectory_book is None:
 			return {}
 		sequences = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		if not self._trajectory_commit_requested(
@@ -14557,7 +14259,7 @@ class BatchGenWorker:
 		for seq in sequences:
 			if seq is None or seq.decode_dp_group is not None:
 				continue
-			if not self._trajectory_book.has_sequence(seq.uuid):
+			if not self._traj.trajectory_book.has_sequence(seq.uuid):
 				# No trajectory reservation: the prompt is not readable yet, so
 				# this sequence is not a continuation this pin can place.
 				continue
@@ -14588,37 +14290,16 @@ class BatchGenWorker:
 			)
 		return pins
 
-	@staticmethod
-	def _trajectory_arena_from_payload(entry: dict):
+	def _trajectory_arena_from_payload(self, entry: dict):
 		"""Rebuild the leader's arena object from its mirrored page ids."""
-		from batchgen.prefix_reuse.trajectory_commit import SnapshotArena
-
-		return SnapshotArena(
-			# The handle is the leader's record-side identity; a follower never
-			# looks an arena up by handle, so a stable placeholder is honest
-			# here and a fake positive handle would not be.
-			storage_handle=0,
-			pseudo_sid=int(entry["pseudo_sid"]),
-			page_ids_by_group={
-				int(group_id): tuple(int(page) for page in pages)
-				for group_id, pages in entry["pages"].items()
-			},
-			pages_per_group=int(entry["pages_per_group"]),
-			capacity_bytes=int(entry["capacity_bytes"]),
-			payload_bytes=0,
-			shard_count=int(entry["shard_count"]),
-		)
+		return self._traj.arena_from_payload(entry)
 
 	def _adopt_mirrored_trajectory_arenas(self, arenas: dict) -> None:
 		"""Follower side: take the leader's arenas for this pass."""
 		if not arenas:
 			return
 		committer = self._get_trajectory_frontier_committer()
-		for global_id, entry in arenas.items():
-			committer.adopt_arena(
-				sequence_id=int(global_id),
-				arena=self._trajectory_arena_from_payload(entry),
-			)
+		self._traj.adopt_mirrored_arenas(arenas, committer=committer)
 
 	def _lookup_trajectory_frontiers(self, uuids) -> None:
 		"""M3 Slice 2 admission lookup, beside the prefix-cache lookup.
@@ -14645,7 +14326,7 @@ class BatchGenWorker:
 			if seq is None or not self._owns_host_kv(seq):
 				continue
 			global_id = int(seq.global_idx)
-			if global_id in self._trajectory_attachments:
+			if global_id in self._traj.trajectory_attachments:
 				# Back-to-back prefill of the same row: the earlier attachment
 				# is still live, so do not take a second reference for it.
 				continue
@@ -14657,7 +14338,7 @@ class BatchGenWorker:
 				sequence_id=global_id,
 			)
 			if attachment is not None:
-				self._trajectory_attachments[global_id] = attachment
+				self._traj.trajectory_attachments[global_id] = attachment
 
 	def _restore_trajectory_frontiers(self, local_indices) -> None:
 		"""Restore every pinned snapshot into its KDA slot before prefill.
@@ -14670,9 +14351,9 @@ class BatchGenWorker:
 		Empty whenever the flag is off -- nothing is attached, so this is a
 		dict lookup and a return.
 		"""
-		if self._trajectory_mirrored_restores:
+		if self._traj.trajectory_mirrored_restores:
 			self._restore_mirrored_trajectory_shards(local_indices)
-		if not self._trajectory_attachments:
+		if not self._traj.trajectory_attachments:
 			return
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
@@ -14686,12 +14367,12 @@ class BatchGenWorker:
 			)
 			if seq is None:
 				continue
-			attachment = self._trajectory_attachments.pop(
+			attachment = self._traj.trajectory_attachments.pop(
 				int(seq.global_idx), None
 			)
 			if attachment is None:
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			restorer.restore(
 				attachment,
 				serving_group_id=int(seq.decode_dp_group or 0),
@@ -14713,7 +14394,7 @@ class BatchGenWorker:
 		leader mirrored for this pass, which is why the whole group restores or
 		recomputes together.
 		"""
-		mirrored = self._trajectory_mirrored_restores
+		mirrored = self._traj.trajectory_mirrored_restores
 		if not mirrored:
 			return
 		# Build the committer FIRST. It is this rank's only source of the
@@ -14743,7 +14424,7 @@ class BatchGenWorker:
 			entry = mirrored.pop(int(seq.global_idx), None)
 			if entry is None:
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			restorer.restore_mirrored_shard(
 				sequence_id=int(seq.global_idx),
 				arena=self._trajectory_arena_from_payload(entry),
@@ -14764,57 +14445,15 @@ class BatchGenWorker:
 		back allocation and a completed sequence all return the live count to
 		zero through the same call.
 		"""
-		if not self._trajectory_attachments:
-			return
-		restorer = self._trajectory_restorer
-		for sequence_id in global_sequence_ids:
-			attachment = self._trajectory_attachments.pop(
-				int(sequence_id), None
-			)
-			if attachment is None or restorer is None:
-				continue
-			try:
-				restorer.release(attachment)
-			except Exception:
-				logging.exception(
-					"Rank %s: releasing the trajectory attachment of sequence "
-					"%s failed; its frontier stays pinned",
-					self.rank,
-					int(sequence_id),
-				)
+		self._traj.release_attachments(global_sequence_ids, rank=self.rank)
 
 	def _rollback_trajectory_reservations(self, global_sequence_ids) -> None:
 		"""Give back any snapshot arena these rows reserved and never used."""
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return
-		for sequence_id in global_sequence_ids:
-			self._trajectory_arena_payload.pop(int(sequence_id), None)
-			self._trajectory_mirrored_restores.pop(int(sequence_id), None)
-			try:
-				committer.rollback_reservation(sequence_id=int(sequence_id))
-			except Exception:
-				logging.exception(
-					"[TRAJECTORY_FRONTIER] Rank %s: could not give back the "
-					"reserved snapshot arena of sequence %s",
-					self.rank,
-					int(sequence_id),
-				)
+		self._traj.rollback_reservations(global_sequence_ids, rank=self.rank)
 
 	def _trajectory_restore_fields(self) -> dict:
 		"""Drain-counter fields, or empty when the path never ran."""
-		fields = {}
-		restorer = self._trajectory_restorer
-		if restorer is not None:
-			fields.update(restorer.counters())
-		# M3 Slice 3a: how many sequences the session map placed. Reported
-		# wherever the map exists, including on a rank that holds no restorer,
-		# because a pin is an admission-side decision; absent on a run that
-		# never turned the flag on.
-		index = self._trajectory_session_groups
-		if index is not None:
-			fields["trajectory_group_pins"] = int(index.pins)
-		return fields
+		return self._traj.restore_fields()
 
 	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
 		"""Resident Host pages backing a committed prefix, per KV group.
@@ -14857,7 +14496,7 @@ class BatchGenWorker:
 		about which frontiers exist.
 		"""
 		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or is_leader or not self._trajectory_arena_payload:
+		if shard_count <= 1 or is_leader or not self._traj.trajectory_arena_payload:
 			return
 		committer = self._get_trajectory_frontier_committer()
 		for local_idx in local_sequence_ids:
@@ -14870,7 +14509,7 @@ class BatchGenWorker:
 			if seq is None:
 				continue
 			global_id = int(seq.global_idx)
-			if global_id not in self._trajectory_arena_payload:
+			if global_id not in self._traj.trajectory_arena_payload:
 				continue
 			commit_tokens = self._trajectory_commit_tokens(seq)
 			if commit_tokens == 0:
@@ -14914,7 +14553,7 @@ class BatchGenWorker:
 		No-op at G==1, where the commit step installs its own record: one rank
 		owns the whole arena and there is nothing to wait for.
 		"""
-		committer = self._trajectory_frontier_committer
+		committer = self._traj.trajectory_frontier_committer
 		if committer is None:
 			return
 		shard_count, _shard_index, _is_leader = self._trajectory_group_geometry()
@@ -14929,7 +14568,7 @@ class BatchGenWorker:
 				self.rank,
 			)
 			return
-		self._trajectory_arena_payload = {}
+		self._traj.trajectory_arena_payload = {}
 		if outcome.installed or outcome.rolled_back_sequence_ids or outcome.failed_sequence_ids:
 			logging.info(
 				"[TRAJECTORY_FRONTIER] Rank %s finalize: installed=%s "
@@ -14951,10 +14590,6 @@ class BatchGenWorker:
 		``host_owned_pages`` is not touched here and nothing is credited back
 		to it when the snapshot is freed.
 		"""
-		from batchgen.prefix_reuse.trajectory_commit import (
-			PREFIX as _FRONTIER_PREFIX,
-		)
-
 		pages = self._resident_frontier_page_ids(
 			token_ids=token_ids, commit_tokens=commit_tokens
 		)
@@ -14963,7 +14598,7 @@ class BatchGenWorker:
 				"[%s] rank=%s seq=%s SKIPPED frontier commit: the coordinator "
 				"does not hold all %s committed tokens as resident pages in "
 				"every KV group",
-				_FRONTIER_PREFIX,
+				self._traj.FRONTIER_PREFIX,
 				self.rank,
 				seq.global_idx,
 				int(commit_tokens),
@@ -15066,13 +14701,13 @@ class BatchGenWorker:
 			if commit_handle:
 				# Keep the new resident pages pinned until this sequence releases
 				# its Host page table, including during back-to-back prefill.
-				state = self._prefix_sequence_states.get(seq.global_idx)
+				state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 				if state is None:
 					self.prefix_cache_coordinator.release_attachment(commit_handle)
 					raise RuntimeError(
 						"prefix commit has no active sequence state"
 					)
-				self._prefix_sequence_states[seq.global_idx] = replace(
+				self._prefix.prefix_sequence_states[seq.global_idx] = replace(
 					state,
 					commit_attachment_handles=(
 						*state.commit_attachment_handles, commit_handle
@@ -15326,7 +14961,7 @@ class BatchGenWorker:
 			# model to "continue" mid-sentence instead of answering. Bind
 			# everything to seq.prompt_length directly.
 			L = seq.prompt_length
-			prefix_state = self._prefix_sequence_states.get(seq.global_idx)
+			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 			compute_cached = (
 				prefix_state.compute_cached_tokens
 				if prefix_state is not None
@@ -15629,7 +15264,7 @@ class BatchGenWorker:
 							.host_page_bytes_all_layers
 						),
 					)
-					self._active_prefix_materializations.append(
+					self._prefix.active_prefix_materializations.append(
 						prefix_materialization
 					)
 
@@ -15879,7 +15514,7 @@ class BatchGenWorker:
 						prefix_materialization,
 						empty_cuda_cache=True,
 					)
-					self._active_prefix_materializations.remove(
+					self._prefix.active_prefix_materializations.remove(
 						prefix_materialization
 					)
 					AttnWrapperBase.prefill_prefix_materialization = None
@@ -16326,15 +15961,15 @@ class BatchGenWorker:
 					# pages are node-shared. Publish the owner's lengths so
 					# non-owning ranks can repair their mirror before re-entry.
 					'trajectory_token_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					'trajectory_decoded_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					# total_decoded_before_eviction: propagated here so the
@@ -16700,7 +16335,7 @@ class BatchGenWorker:
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
 							f"decoded={seq.decoded_length} "
 							f"host_pages={seq.host_pages_allocated} "
-							f"trajectory_tokens={self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length}"
+							f"trajectory_tokens={self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length}"
 						)
 				# Host KV is ONE per-node SHARED shm region keyed by global_idx, so
 				# release/unregister must fire EXACTLY once per sequence. Under G>1
@@ -16757,12 +16392,12 @@ class BatchGenWorker:
 				seq.total_decoded_before_eviction = seq.decoded_length
 				seq.prompt_length = new_reentry_len
 				seq.current_context_length = new_reentry_len
-				if self._trajectory_book is not None and self._trajectory_book.has_sequence(uuid):
-					slot = self._trajectory_book.slot_for(uuid)
+				if self._traj.trajectory_book is not None and self._traj.trajectory_book.has_sequence(uuid):
+					slot = self._traj.trajectory_book.slot_for(uuid)
 					# Record the replayed prompt boundary at eviction time. Re-entry
 					# calls this idempotently, so migration while ON_HOLD carries a
 					# ledger consistent with the scalar prompt length.
-					self._trajectory_book.begin_reentry_turn(
+					self._traj.trajectory_book.begin_reentry_turn(
 						slot, prompt_length=new_reentry_len
 					)
 				saved = new_reentry_len
@@ -20846,11 +20481,11 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
-			if self._trajectory_book is None:
+			if self._traj.trajectory_book is None:
 				continue
 			# Use the turn ledger: later user prompts make the latest generated
 			# token non-contiguous with the original prompt boundary.
-			token = self._trajectory_book.last_generated_token(
+			token = self._traj.trajectory_book.last_generated_token(
 				self._trajectory_slot(seq)
 			).to(dtype=torch.int64).view(1, 1)
 			tokens.append(token)
