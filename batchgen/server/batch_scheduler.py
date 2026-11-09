@@ -593,10 +593,11 @@ class BatchScheduler:
             logger.exception(
                 "Batch %s failed after it was marked in_progress", batch_id
             )
-            self.storage.update_batch_status(
+            # The exception can come after the pool registered the batch, so
+            # its scheduler state is released with the status.
+            self._discard_failed_batch(
                 batch_id,
-                BatchStatus.FAILED,
-                error=f"Batch processing failed: {type(exc).__name__}: {exc}",
+                f"Batch processing failed: {type(exc).__name__}: {exc}",
             )
 
     def _prepare_in_progress_batch(
@@ -1262,35 +1263,62 @@ class BatchScheduler:
         requests: List[BatchRequestItem],
         prompts: List[str],
     ) -> None:
-        """Background task: wait for a batch to complete, then finalize output."""
+        """Background task: wait for a batch to complete, then finalize output.
+
+        A batch whose tracker is gone was discarded by another failure path,
+        which already persisted its status; this task then just ends.
+        """
         import time as _time
         deadline = _time.time() + self._batch_timeout
-        batch_failed = False
 
         while True:
             tracker = self._scheduling_pool.get_batch_tracker(batch_id)
-            if tracker and tracker.is_complete:
+            if tracker is None:
+                return
+            if tracker.is_complete:
                 break
-            if tracker and getattr(tracker, 'error', None):
+            if getattr(tracker, 'error', None):
                 logger.error(f"[POOL] Batch {batch_id} failed: {tracker.error}")
-                batch_failed = True
-                break
+                self._discard_failed_batch(batch_id, str(tracker.error))
+                return
             if _time.time() > deadline:
                 logger.error(f"[POOL] Batch {batch_id} timed out after {self._batch_timeout}s")
-                batch_failed = True
-                break
+                self._discard_failed_batch(
+                    batch_id,
+                    f"timeout: batch did not complete within {self._batch_timeout}s",
+                )
+                return
             await asyncio.sleep(0.5)
 
-        if batch_failed:
-            error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
-            self.storage.update_batch_status(
-                batch_id,
-                BatchStatus.FAILED,
-                error=str(error_msg),
-            )
-            return
-
         self._finalize_batch_output(batch_id, requests, prompts)
+
+    def _discard_failed_batch(self, batch_id: str, error: str) -> None:
+        """Persist a batch as FAILED and release the scheduler state it holds.
+
+        The one place a registered batch is failed: the worker-fatal path
+        (_fail_all_active_batches), the failed or timed-out wait in
+        _wait_and_finalize_batch, and an exception after IN_PROGRESS in
+        _process_batch. It removes the queued intake entries and intake batch
+        info, the batch tracker (with its completion dedup keys) and the
+        per-request output metadata; absent state is skipped, so it is safe
+        before the batch was registered and when called twice.
+
+        Scheduling slots are not freed here. A slot mirrors a sequence the
+        worker still holds; it returns when the worker reports that request
+        (the listener frees the slot and drops the late completion), or all at
+        once in clear_active_slots after a worker fatal.
+        """
+        purged = self._intake_pool.remove_batch_entries(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
+        self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._pool_request_meta.pop(batch_id, None)
+        self.storage.update_batch_status(
+            batch_id, BatchStatus.FAILED, error=error
+        )
+        logger.error(
+            "[POOL] Batch %s marked FAILED: %s (%d queued requests discarded)",
+            batch_id, error, purged,
+        )
 
     async def _drain_intake_to_worker(self) -> None:
         """Background task: run the intake drain; any failure is fatal.
@@ -1458,16 +1486,11 @@ class BatchScheduler:
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
-                # A failed batch must send nothing more to any worker: its
-                # entries still queued in the intake pool would otherwise be
-                # admitted to the next worker generation.
-                purged = self._intake_pool.remove_batch_entries(batch_id)
-                self.storage.update_batch_status(
-                    batch_id, BatchStatus.FAILED, error=f"worker_fatal: {error_msg}"
-                )
-                logger.error(
-                    f"[POOL] Batch {batch_id} marked FAILED: {error_msg} "
-                    f"({purged} queued requests discarded)"
+                # A failed batch must send nothing more to any worker (its
+                # queued intake entries would otherwise be admitted to the
+                # next worker generation) and must hold no scheduler state.
+                self._discard_failed_batch(
+                    batch_id, f"worker_fatal: {error_msg}"
                 )
                 failed += 1
         self._fail_pending_turns(error_msg)
@@ -1565,6 +1588,22 @@ class BatchScheduler:
                             # and no output file.
                             self._resolve_turn(request_id, result)
                             continue
+                        if batch_id:
+                            tracker = self._scheduling_pool.get_batch_tracker(
+                                batch_id
+                            )
+                            if tracker is None or getattr(tracker, "is_failed", False):
+                                # The batch failed or was discarded while the
+                                # worker still ran this request. Its slot is
+                                # freed above; its result must not reach the
+                                # output file of a FAILED batch, nor recreate
+                                # completion state for a removed tracker.
+                                logger.warning(
+                                    "[POOL] Dropping late completion of %s: "
+                                    "batch %s is failed or discarded",
+                                    request_id, batch_id,
+                                )
+                                continue
                         # Write output JSONL line
                         if batch_id and request_id:
                             self._write_pool_completion(batch_id, request_id, result)

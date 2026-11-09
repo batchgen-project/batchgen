@@ -28,10 +28,18 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
         created_at=1,
         expires_at=2,
     ))
+    trackers = {"batch-test": tracker}
+    removed = []
     scheduler = object.__new__(BatchScheduler)
     scheduler._scheduling_pool = SimpleNamespace(
-        get_batch_tracker=lambda batch_id: tracker,
+        get_batch_tracker=trackers.get,
+        remove_batch_tracker=lambda batch_id: trackers.pop(batch_id, None),
     )
+    scheduler._intake_pool = SimpleNamespace(
+        remove_batch_entries=lambda batch_id: removed.append(batch_id) or 0,
+        remove_batch_info=lambda batch_id: None,
+    )
+    scheduler._pool_request_meta = {"batch-test": {}}
     scheduler.storage = storage
     scheduler._batch_timeout = 60
 
@@ -47,6 +55,10 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     assert persisted is not None
     assert persisted.status == BatchStatus.FAILED
     assert persisted.error == str(tracker.error)
+    # The failed batch holds no scheduler state afterwards.
+    assert trackers == {}
+    assert scheduler._pool_request_meta == {}
+    assert removed == ["batch-test"]
 
 
 def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
