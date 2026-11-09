@@ -1120,3 +1120,9 @@ class GptOssParallelStrategyManager:
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
         if mode not in (ExitMode.SUSPEND, ExitMode.RETIRE):
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+
+    def holds_instance(self, phase: str) -> bool:
+        """Build-always manager retains no phase instance."""
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"holds_instance: unsupported phase {phase!r}")
+        return False

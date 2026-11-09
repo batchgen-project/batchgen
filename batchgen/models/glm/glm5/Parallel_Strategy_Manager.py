@@ -527,18 +527,6 @@ class GLM5ParallelStrategyManager:
         )
         _synchronize_prefill_preloads()
 
-    def reactivate_prefill_in_place_applicable(self, *, prefill_moe_mode):
-        return (
-            getattr(self.loaded_model_config, "phase", None) == "prefill"
-            and self._prefill_moe_mode == prefill_moe_mode
-        )
-
-    def reactivate_prefill_in_place(self):
-        """Reset grouped prefill state while keeping the live model instance."""
-        self._check_late_deepgemm_compiles("reactivate_prefill_in_place")
-        self._prepare_prefill_activation()
-        return self.model, self.weight_copy_task
-
     def activate_prefill(self):
         """Switch the already-built prefill instance in (persistent instances)."""
         self._check_late_deepgemm_compiles("activate_prefill")
@@ -634,6 +622,12 @@ class GLM5ParallelStrategyManager:
             # The worker's lifecycle orchestration performs the retire
             # mechanics (deep_free_model_memory, GPU KV destroy); this manager
             # owns no further state to free.
+            if key.phase == "prefill":
+                self.prefill_instance = None
+            else:
+                self.decode_instance = None
+            self.model = None
+            self.weight_copy_task = {}
             return
         if mode is not ExitMode.SUSPEND:
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
@@ -647,6 +641,14 @@ class GLM5ParallelStrategyManager:
                 "decode instance; a rank without one must RETIRE"
             )
         self.release_decode_routed_experts()
+
+    def holds_instance(self, phase: str) -> bool:
+        """Return whether a resumable instance is retained for ``phase``."""
+        if phase == "prefill":
+            return self.prefill_instance is not None
+        if phase == "decode":
+            return self.decode_instance is not None
+        raise ValueError(f"holds_instance: unsupported phase {phase!r}")
 
     @staticmethod
     def _copy_expert_pairs(pairs):
