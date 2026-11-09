@@ -10079,8 +10079,10 @@ class BatchGenWorker:
 			(1, 64, 1, 576), dtype=torch.bfloat16, device=device
 		)
 		block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+		from batchgen.attention.mla.flashmla_compat import dense_decode_kwargs
+
 		tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-			cache_seqlens, 12, 1
+			cache_seqlens, 12, 1, **dense_decode_kwargs()
 		)
 		flash_mla.flash_mla_with_kvcache(
 			query,
@@ -10091,6 +10093,7 @@ class BatchGenWorker:
 			tile_scheduler_metadata,
 			num_splits,
 			causal=True,
+			**dense_decode_kwargs(),
 		)
 		torch.cuda.synchronize(device)
 

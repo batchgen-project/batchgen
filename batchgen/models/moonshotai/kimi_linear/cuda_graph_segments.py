@@ -209,6 +209,7 @@ def _mla_decode_graph_safe(
     # unused legacy FP8/FA3 backend and its DeepGEMM dependency.
     from flash_mla import flash_mla_with_kvcache
 
+    from batchgen.attention.mla.flashmla_compat import dense_decode_kwargs
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
     bsz = hidden_states.shape[0]
@@ -282,7 +283,7 @@ def _mla_decode_graph_safe(
         from flash_mla import get_mla_metadata
 
         tile_scheduler_metadata, num_splits = get_mla_metadata(
-            cache_seqlens, attn.num_heads, 1
+            cache_seqlens, attn.num_heads, 1, **dense_decode_kwargs()
         )
     else:
         tile_scheduler_metadata = flashmla_metadata
@@ -297,6 +298,7 @@ def _mla_decode_graph_safe(
         num_splits,
         attn.scaling,
         True,
+        **dense_decode_kwargs(),
     )
 
     attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)

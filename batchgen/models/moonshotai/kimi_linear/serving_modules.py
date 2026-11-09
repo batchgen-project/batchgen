@@ -481,8 +481,11 @@ def mla_decoding_nope_with_pagekv(
     query_states[:, :, :, self.kv_lora_rank :] = q_pe
     query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
+    from batchgen.attention.mla.flashmla_compat import dense_decode_kwargs
+
+    _dense_kwargs = dense_decode_kwargs()
     tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, self.num_heads, 1
+        cache_seqlens, self.num_heads, 1, **_dense_kwargs
     )
     attn_out, _ = flash_mla_with_kvcache(
         query_states,
@@ -494,6 +497,7 @@ def mla_decoding_nope_with_pagekv(
         num_splits,
         self.scaling,
         True,
+        **_dense_kwargs,
     )
 
     attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
