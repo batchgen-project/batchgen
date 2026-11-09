@@ -69,12 +69,23 @@ PY
 
 # Optional compile cache: identical sources in another worktree hit the cache
 # because CCACHE_BASEDIR makes this checkout's absolute paths relative.
+# CXX must name ONE executable: torch >= 2.15 runs CXX as a single program and
+# prepends its own launcher, so "ccache g++" turns into `ccache 'ccache g++'`.
+# scripts/cache_cxx.sh carries the launcher on every torch version, and
+# TORCH_NO_COMPILER_WRAPPER stops newer torch from adding a second one.
+if [[ "${CXX:-}" == *[[:space:]]* ]]; then
+    die "CXX='$CXX' names more than one program; unset it or set one compiler executable"
+fi
 if command -v ccache >/dev/null; then
     export CCACHE_BASEDIR="$ROOT"
     export CCACHE_NOHASHDIR=true
-    export CXX="${CXX:-ccache g++}"
+    if [[ -z "${CXX:-}" ]]; then
+        export CXX="$ROOT/scripts/cache_cxx.sh"
+        export CACHE_CXX_LAUNCHER=ccache
+        export TORCH_NO_COMPILER_WRAPPER=1
+    fi
     export PYTORCH_NVCC="${PYTORCH_NVCC:-$ROOT/scripts/cache_nvcc.sh ccache $(command -v nvcc)}"
-    log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default}"
+    log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default} CXX=$CXX"
 fi
 
 # 2. In-place AOT builds. setuptools only recompiles extensions whose sources

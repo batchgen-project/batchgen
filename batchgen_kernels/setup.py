@@ -68,21 +68,23 @@ if not os.environ.get("CUDA_HOME"):
 def _setup_ccache():
     """Detect and configure ccache/sccache for faster incremental builds.
 
-    CC must stay a plain compiler: torch passes it to nvcc as `-ccbin`, and
-    nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC and
-    scripts/cache_nvcc.sh, which rewrites torch's dependency flags for ccache.
-    For reuse across checkouts, callers set CCACHE_BASEDIR to the checkout.
+    CXX becomes the single executable scripts/cache_cxx.sh and nvcc goes
+    through scripts/cache_nvcc.sh; see _compile_cache.py for why a multi-word
+    CXX cannot work on torch >= 2.15. For reuse across checkouts, callers set
+    CCACHE_BASEDIR to the checkout.
     """
-    for tool in ("sccache", "ccache"):
-        if shutil.which(tool):
-            os.environ.setdefault("CXX", f"{tool} g++")
-            nvcc = os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")
-            wrapper = os.path.join(_this_dir, "..", "scripts", "cache_nvcc.sh")
-            if os.path.isfile(wrapper):  # absent when built outside the repo
-                os.environ.setdefault("PYTORCH_NVCC", f"{wrapper} {tool} {nvcc}")
-            print(f"[batchgen_kernels] Using {tool} for compilation cache")  # noqa: hygiene - build output
-            return tool
-    return None
+    path = os.path.join(_this_dir, "_compile_cache.py")
+    ns = {"__file__": path, "__name__": "batchgen_kernels_compile_cache"}
+    with open(path) as f:
+        exec(f.read(), ns)
+    tool = ns["configure_compile_cache"](
+        os.environ,
+        scripts_dir=os.path.join(_this_dir, "..", "scripts"),
+        cuda_home=os.environ["CUDA_HOME"],
+    )
+    if tool is not None:
+        print(f"[batchgen_kernels] Using {tool} for compilation cache")  # noqa: hygiene - build output
+    return tool
 
 _cache_tool = _setup_ccache()
 
