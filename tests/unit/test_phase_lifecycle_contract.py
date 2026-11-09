@@ -24,12 +24,16 @@ class _Conforming:
     def phase_exit(self, key, mode):
         return None
 
+    def holds_instance(self, phase: str) -> bool:
+        return False
+
 
 def _manager_with(**overrides):
     body = {
         "phase_enter": _Conforming.phase_enter,
         "admit": _Conforming.admit,
         "phase_exit": _Conforming.phase_exit,
+        "holds_instance": _Conforming.holds_instance,
     }
     for name, member in overrides.items():
         if member is None:
@@ -95,7 +99,9 @@ def test_inherited_hooks_conform():
     assert verify_phase_contract(_Derived()) == []
 
 
-@pytest.mark.parametrize("name", ["phase_enter", "admit", "phase_exit"])
+@pytest.mark.parametrize(
+    "name", ["phase_enter", "admit", "phase_exit", "holds_instance"]
+)
 def test_missing_hook_is_reported(name):
     errors = verify_phase_contract(_manager_with(**{name: None}))
     assert errors == [f"Manager.{name}: required phase hook is missing"]
@@ -107,6 +113,18 @@ def test_every_missing_hook_is_reported_separately():
         "object.phase_enter: required phase hook is missing",
         "object.admit: required phase hook is missing",
         "object.phase_exit: required phase hook is missing",
+        "object.holds_instance: required phase hook is missing",
+    ]
+
+
+def test_holds_instance_requires_typed_exact_signature():
+    def holds_instance(self, phase):
+        return False
+
+    errors = verify_phase_contract(_manager_with(holds_instance=holds_instance))
+    assert errors == [
+        "Manager.holds_instance: parameter 'phase' must be annotated str",
+        "Manager.holds_instance: return must be annotated bool",
     ]
 
 

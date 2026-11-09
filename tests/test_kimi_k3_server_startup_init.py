@@ -14,6 +14,7 @@ import copy
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from batchgen.phase_lifecycle import PhaseKey
 
 import pytest
 
@@ -311,11 +312,6 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
         prepare_resident_ep_prefill_output=lambda n: trace.append(("prefill_output", n)),
     )
 
-    def configure_prefill():
-        trace.append(("configure_prefill",))
-        return "prefill-model", {"routed_expert": ["e0"]}
-
-    manager.configure_prefill = configure_prefill
     worker = SimpleNamespace(
         rank=0,
         comm="pynccl",
@@ -323,7 +319,6 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
         weight_copy_task=None,
         parallel_manager=manager,
         _k3_startup_completed=False,
-        _k3_startup_prefill_ready=False,
     )
     worker.Init = lambda *args, **kwargs: trace.append(("Init", args, kwargs))
     worker._preload_kimi_k3_runtime_extensions = lambda: trace.append(
@@ -333,6 +328,12 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
     worker._load_decode_model = lambda bsz, comm=None: trace.append(
         ("load_decode_model", bsz, comm)
     )
+    def transition(key):
+        trace.append(("phase_enter", key.phase, key.prefill_moe_mode))
+        worker.model = "prefill-model"
+        worker.weight_copy_task = {"routed_expert": ["e0"]}
+        return True, False
+    worker._transition_phase = transition
     worker.set_phase = lambda phase: trace.append(("set_phase", phase))
     worker._install_prefill_weight_copy_pipeline = lambda k3_prefill_profile: trace.append(
         ("install_h2d", k3_prefill_profile)
@@ -356,6 +357,7 @@ def _bind_startup(worker):
                 WORKER, "_K3_STARTUP_MAX_DECODING_LENGTH"
             ),
             "_MAX_DECODE_RANK_BSZ": 128,
+            "PhaseKey": PhaseKey,
         },
     ).__get__(worker)
 
@@ -382,15 +384,13 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
         # Then the topology's own prefill mode, so the first admission finds
         # the streamed-SP8 buffers already attached.
         ("set_prefill_moe_mode", "streamed_sp8"),
-        ("configure_prefill",),
+        ("phase_enter", "prefill", "streamed_sp8"),
         ("set_phase", "prefill"),
         ("install_h2d", False),
     ]
     assert worker.model == "prefill-model"
     assert worker.weight_copy_task == {"routed_expert": ["e0"]}
     assert worker._k3_startup_completed
-    assert worker._k3_startup_prefill_ready
-    assert worker._k3_startup_prefill_mode == "streamed_sp8"
 
 
 class _FlashMLAStub(ModuleType):
@@ -869,65 +869,6 @@ def test_startup_and_per_batch_prefill_share_one_installer():
         assert "set_weight_copy_queue" not in source
         assert "_streamed_sp8_h2d_installed" not in source
 
-
-# --------------------------------------------------------------------------- #
-#  (5) the first real prefill inherits the startup-prepared phase
-# --------------------------------------------------------------------------- #
-
-
-def test_first_prefill_after_startup_does_not_free_the_prepared_model():
-    config = _function(WORKER, "_config_prefill_for_batch", "BatchGenWorker")
-    guard = next(
-        node
-        for node in ast.walk(config)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "reuse_startup_prefill"
-    )
-
-    # Startup-prepared phase: keep model, streamed-SP8 buffers and the daemon
-    # cursor; configure_prefill below re-enters idempotently.
-    assert "deep_free_model_memory" not in _calls(guard.test)
-    kept = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
-    assert "deep_free_model_memory" not in kept
-    # ...and the flag is consumed here, exactly once.
-    assert "self._k3_startup_prefill_ready = False" in kept
-
-    # Every later prefill follows a decode phase and frees normally.
-    freed = ast.unparse(ast.Module(body=guard.orelse, type_ignores=[]))
-    assert "self.deep_free_model_memory()" in freed
-
-    # That guarded call is the only deep free in the whole method. The normal
-    # handoff also skips the otherwise-idempotent configure/H2D reinstall so
-    # no workload-independent phase work leaks back onto first admission.
-    assert len(_calls(config)["deep_free_model_memory"]) == 1
-    source = _body_source(config)
-    assert "if not reuse_startup_prefill:" in source
-    for call in ("configure_prefill", "_install_prefill_weight_copy_pipeline"):
-        assert len(_calls(config)[call]) == 1
-        call_line = _calls(config)[call][0]
-        enclosing = [
-            node for node in ast.walk(config)
-            if isinstance(node, ast.If)
-            and ast.unparse(node.test) == "not reuse_startup_prefill"
-            and node.lineno < call_line <= max(
-                getattr(
-                    child,
-                    "end_lineno",
-                    getattr(child, "lineno", node.lineno),
-                )
-                or getattr(child, "lineno", node.lineno)
-                for child in ast.walk(node)
-            )
-        ]
-        assert enclosing, call
-
-
-def test_startup_prefill_handoff_flag_starts_false():
-    init = _function(WORKER, "__init__", "BatchGenWorker")
-    source = ast.unparse(init)
-    assert "self._k3_startup_completed = False" in source
-    assert "self._k3_startup_prefill_ready = False" in source
-    assert "self._k3_startup_prefill_mode = None" in source
 
 
 # --------------------------------------------------------------------------- #

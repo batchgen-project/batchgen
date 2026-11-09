@@ -26,7 +26,7 @@ def _isolated_manager_class():
         if isinstance(node, ast.ClassDef)
         and node.name == "MiniMaxM25ParallelStrategyManager"
     )
-    hooks = {"phase_enter", "admit", "phase_exit"}
+    hooks = {"phase_enter", "admit", "phase_exit", "holds_instance"}
     methods = [
         node
         for node in source_class.body
@@ -78,6 +78,12 @@ def test_isolated_hooks_satisfy_contract():
     manager = _Recorder()
     assert verify_phase_contract(manager) == []
     assert manager.calls == []
+
+
+def test_holds_instance_is_false_for_both_phases():
+    manager = _Recorder()
+    assert manager.holds_instance("prefill") is False
+    assert manager.holds_instance("decode") is False
 
 
 def test_prefill_enter_delegates_and_preserves_identity():
