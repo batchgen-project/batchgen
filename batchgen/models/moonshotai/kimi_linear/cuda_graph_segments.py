@@ -1289,6 +1289,18 @@ class KimiLinearDecodeGraph:
         if AttnWrapperBase.phase != "decode":
             self._fallback("decode graph prewarm requested outside decode")
             return False
+        # The K3 MoE graph build is an EP-WORLD collective (NVSHMEM pool
+        # setup + the DeepEP self-check exchange across every rank), while
+        # everything below this point is shaped by THIS rank's local batch.
+        # It therefore runs before any batch-shaped early return: a rank
+        # whose attention group holds no decode rows still joins the build
+        # in the same global order as its peers, then skips the per-batch
+        # capture. Gating it behind ``bsz == 0`` deadlocked the cohort when
+        # the first decode batch left any group empty — the rowed ranks
+        # blocked inside the self-check LL dispatch waiting for peers that
+        # had already returned, and the dispatch kernel timed out.
+        if mode == "graph":
+            self._ensure_moe_built()
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         bsz = len(seq_ids)
         if bsz == 0:
@@ -1328,6 +1340,8 @@ class KimiLinearDecodeGraph:
         # only a subset of the transformer.
         whole_bucket = None
         if mode == "graph":
+            # The collective build already ran above, before the batch-shaped
+            # early returns; this resolves to the cached result.
             self._ensure_moe_built()
             if self._moe_all_ranks_nonempty():
                 whole_bucket = self._whole_model_bucket_for_step()
