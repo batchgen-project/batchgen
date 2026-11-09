@@ -25,7 +25,7 @@ PSM = (
     / "Parallel_Strategy_Manager.py"
 )
 
-HOOKS = ("phase_enter", "admit", "phase_exit")
+HOOKS = ("phase_enter", "admit", "phase_exit", "holds_instance")
 
 
 def _isolated_manager_class():
@@ -75,6 +75,12 @@ def test_prefill_enter_always_builds():
     out = m.phase_enter(key, PhaseEnterContext())
     assert out is m._prefill_result
     assert m.calls == [("configure_prefill",)]
+
+
+def test_holds_instance_is_false_for_both_phases():
+    m = _Recorder()
+    assert m.holds_instance("prefill") is False
+    assert m.holds_instance("decode") is False
 
 
 def test_decode_enter_forwards_ctx_and_requires_fields():

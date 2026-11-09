@@ -322,7 +322,7 @@ class KimiLinearParallelStrategyManager:
         """Whether the decode instance's routed experts are resident AND active.
 
         The worker treats a resident decode instance as the active one
-        (``_decode_instance_is_active``) and skips the prefill->decode switch.
+        and skips the prefill->decode switch while the instance is active.
         A resident-EP prefill also builds the shard, so the shard alone would
         keep the model in prefill mode through decode.
         """
@@ -2663,6 +2663,12 @@ class KimiLinearParallelStrategyManager:
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
         if mode is ExitMode.RETIRE:
+            if key.phase == "prefill":
+                self.prefill_instance = None
+            else:
+                self.decode_instance = None
+            self.model = None
+            self.weight_copy_task = {}
             return
         if mode is not ExitMode.SUSPEND:
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
@@ -2676,3 +2682,11 @@ class KimiLinearParallelStrategyManager:
                 "a rank without one must RETIRE"
             )
         self.release_decode_routed_experts()
+
+    def holds_instance(self, phase: str) -> bool:
+        """Return whether a resumable instance is retained for ``phase``."""
+        if phase == "prefill":
+            return self.prefill_instance is not None
+        if phase == "decode":
+            return self.decode_instance is not None
+        raise ValueError(f"holds_instance: unsupported phase {phase!r}")

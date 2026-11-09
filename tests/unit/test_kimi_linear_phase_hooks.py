@@ -31,6 +31,7 @@ _EXTRACTED = {
     "phase_enter",
     "admit",
     "phase_exit",
+    "holds_instance",
     "decode_experts_resident",
 }
 _STUBBED = {
@@ -115,7 +116,9 @@ def test_production_manager_source_imports_the_contract_types():
         and node.module == phase_lifecycle.__name__
         for alias in node.names
     }
-    assert {"AdmitContext", "ExitMode", "PhaseEnterContext", "PhaseKey"} <= imported
+    assert {
+        "AdmitContext", "ExitMode", "PhaseEnterContext", "PhaseKey"
+    } <= imported
 
 
 def test_prefill_enter_builds_when_no_instance_is_kept():
@@ -123,6 +126,16 @@ def test_prefill_enter_builds_when_no_instance_is_kept():
     result = psm.phase_enter(PREFILL, PhaseEnterContext())
     assert result is results["configure_prefill"]
     assert calls == [("configure_prefill", (), {})]
+
+
+@pytest.mark.parametrize(
+    "phase,attr", [("prefill", "prefill_instance"), ("decode", "decode_instance")]
+)
+def test_holds_instance_reports_the_retained_phase_instance(phase, attr):
+    psm, _, _ = _isolated_psm()
+    assert psm.holds_instance(phase) is False
+    setattr(psm, attr, (object(), {}))
+    assert psm.holds_instance(phase) is True
 
 
 def test_prefill_enter_resumes_the_kept_instance():

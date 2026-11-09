@@ -344,3 +344,8 @@ class MiniMaxM25ParallelStrategyManager:
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
         # The worker resident guard is at lines 12076-12079;
         # this manager has no release-for-reuse seam, so SUSPEND is a no-op.
+    def holds_instance(self, phase: str) -> bool:
+        """Build-always manager retains no phase instance."""
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"holds_instance: unsupported phase {phase!r}")
+        return False
