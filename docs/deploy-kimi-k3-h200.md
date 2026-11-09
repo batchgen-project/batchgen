@@ -185,6 +185,13 @@ python -m batchgen.launch_http_server \
 > (this build reads the `PYTORCH_CUDA_ALLOC_CONF` name, not `PYTORCH_ALLOC_CONF`) so fragmented reserved
 > HBM is reusable, so the resident-expert repack fits within the per-GPU budget alongside the KV cache.
 
+> **Prefill mode is fixed for the server.** Every prefill wave, including waves admitted after
+> decode has started, runs streamed: on this topology `streamed_sp8`, chosen once at startup. A
+> wave that follows decode releases the resident decode experts, prefills streamed, and the
+> experts are rebuilt when decode resumes. Resident-EP prefill runs only for a batch that asks
+> for it with `"batchgen_debug": {"k3_prefill_moe_mode": "resident_ep"}`, and only for that
+> batch's wave.
+
 Start node 0 first or together with node 1: node 1 waits a bounded time for node 0's control
 store. On two nodes `--cluster-fail-fast` is on by default, so a fatal worker error on either
 node, or the loss of either node, stops both servers with a nonzero exit and a CRITICAL

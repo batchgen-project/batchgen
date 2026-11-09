@@ -139,6 +139,7 @@ def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     manager = type("Manager", (), {})()
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed"
+    manager._latent_tp_planned = False
     manager.set_prefill_moe_mode = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
     ).__get__(manager)
@@ -173,6 +174,7 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
     manager._distributed_weight_sharded = True
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed_sp8"
+    manager._latent_tp_planned = False
     default_mode = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
@@ -365,6 +367,7 @@ def test_resident_prefill_is_refused_for_non_k3():
     manager = type("Manager", (), {})()
     manager._is_k3 = False
     manager._prefill_moe_mode = "streamed"
+    manager._latent_tp_planned = False
     manager.set_prefill_moe_mode = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
     ).__get__(manager)
