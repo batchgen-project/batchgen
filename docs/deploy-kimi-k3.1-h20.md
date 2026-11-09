@@ -75,9 +75,10 @@ Notes:
   this release).
 - Before readiness every worker preloads the family extensions **and** the DSA indexer
   extensions; a build missing them fails at startup, not at the first request.
-- All other H20 notes (watermark, `/dev/shm` sizing with `huge=within_size`, port
-  reservations, cluster fail-fast, Triton prewarm) apply unchanged from the
-  [Kimi-K3 H20 guide](deploy-kimi-k3-h20.md).
+- All other H20 notes (watermark, `/dev/shm` sized to `MemTotal` minus 300 GiB with
+  `huge=within_size`, port reservations, cluster fail-fast, Triton prewarm) apply unchanged
+  from the [Kimi-K3 H20 guide](deploy-kimi-k3-h20.md); the per-boot host settings are listed in
+  [Host prerequisites checked on every boot](deploy-kimi-k3-h200.md#host-prerequisites-checked-on-every-boot).
 
 ## 4. Submit Jobs
 

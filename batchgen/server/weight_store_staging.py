@@ -74,6 +74,10 @@ PARTIAL_STORE_NAME = STORE_FILE_NAME + ".partial"
 REMOVING_PREFIX = ".removing-"
 #: ``huge=`` values under which a tmpfs backs files with transparent huge pages.
 HUGE_MOUNT_OPTIONS = ("within_size", "always")
+#: Host memory left outside the weight/KV tmpfs for the OS and other data. The
+#: tmpfs is sized to MemTotal minus this reserve, rounded down to a whole GiB.
+SHM_HOST_RESERVE_GIB = 300
+_GIB = 1 << 30
 
 # How long a start waits for a peer that holds the current id's lock only for
 # the instant between checking for COMPLETE and taking LOCK_EX. A peer that is
@@ -172,7 +176,7 @@ def check_staging_mount(
                 f"--fast-init requires the weight store staging tmpfs "
                 f"{entry.mountpoint} to be mounted huge=within_size or "
                 f"huge=always (it is huge={huge}). Remount it with: "
-                f"mount -o remount,huge=within_size {shlex.quote(entry.mountpoint)}"
+                f"{shm_remount_command(entry.mountpoint)}"
             )
     return entry
 
@@ -180,6 +184,32 @@ def check_staging_mount(
 def free_bytes(path: Path) -> int:
     stats = os.statvfs(path)
     return stats.f_bavail * stats.f_frsize
+
+
+def shm_remount_command(
+    mountpoint: str = "/dev/shm", memtotal_bytes: Optional[int] = None
+) -> str:
+    """The command that sizes the weight/KV tmpfs ``mountpoint`` by the host
+    rule: MemTotal - ``SHM_HOST_RESERVE_GIB`` GiB, rounded down to a whole GiB,
+    mounted ``huge=within_size``. ``memtotal_bytes`` defaults to this host's
+    physical memory (the kernel's MemTotal). On a host with no memory beyond
+    the reserve the rule gives no size, and the command says so and sets only
+    ``huge=within_size``."""
+    if memtotal_bytes is None:
+        memtotal_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    if memtotal_bytes <= 0:
+        raise ValueError(f"MemTotal must be positive, not {memtotal_bytes} B")
+    size_gib = memtotal_bytes // _GIB - SHM_HOST_RESERVE_GIB
+    if size_gib <= 0:
+        return (
+            f"mount -o remount,huge=within_size {shlex.quote(mountpoint)} (no "
+            f"size advised: this host's {memtotal_bytes / _GIB:.1f} GiB of memory "
+            f"does not exceed the {SHM_HOST_RESERVE_GIB} GiB host reserve)"
+        )
+    return (
+        f"mount -o remount,size={size_gib}G,huge=within_size "
+        f"{shlex.quote(mountpoint)}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +433,9 @@ class _Stager:
         self.config = config
         self.residency = self.config["store_residency"]
         self.staging_dir = Path(self.config["store_staging_dir"])
+        #: The tmpfs mount point holding ``staging_dir``, set by
+        #: ``stage_weight_store`` from the mount gate before any copy.
+        self.mountpoint: Optional[str] = None
         self.runtime_dir = runtime_dir
         self.read_buffer_bytes = read_buffer_bytes
         self.copy_workers = copy_workers
@@ -507,11 +540,13 @@ class _Stager:
         needed = store_bytes + len(metadata) + len(self.manifest_bytes)
         available = self.free_bytes_of(self.directory)
         if available < needed:
+            if self.mountpoint is None:
+                raise AssertionError("the staging mount gate did not run before the copy")
             raise WeightStoreStagingError(
                 f"the weight store staging tmpfs holding {self.staging_dir} has "
                 f"{available} B free but the staged store needs {needed} B; "
-                "free it or remount it larger (mount -o remount,size=<bytes> "
-                "<mountpoint>) before starting"
+                f"free it or remount it to the host size "
+                f"({shm_remount_command(self.mountpoint)}) before starting"
             )
 
         source_path = str(self.config["store_path"])
@@ -632,6 +667,7 @@ def stage_distributed_weight_store(
     mount = check_staging_mount(
         stager.staging_dir, fast_init=fast_init, read_mounts=read_mounts
     )
+    stager.mountpoint = mount.mountpoint
     logger.info(
         "weight store staging tmpfs %s is mounted with options %s",
         mount.mountpoint,
@@ -647,10 +683,9 @@ def stage_distributed_weight_store(
         logger.warning(
             "the staging tmpfs %s has no huge= mount option; the staged "
             "store stays on small pages and the copy's concurrent writes "
-            "serialize. Remount it before launch: "
-            "mount -o remount,huge=within_size %s",
+            "serialize. Remount it before launch: %s",
             mount.mountpoint,
-            shlex.quote(mount.mountpoint),
+            shm_remount_command(mount.mountpoint),
         )
     stager.staging_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     sweep_idle_stores(stager.staging_dir, keep=stager.staged_id)

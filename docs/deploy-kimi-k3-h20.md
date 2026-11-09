@@ -54,9 +54,11 @@ RDMA rail devices (`--rail-devices`; the default names the H200 rails, so pass t
 fabric's RDMA device names). Write the store to **persistent storage** (local disk or shared
 storage): it is built once per checkpoint and node layout and is never deleted by the server.
 At start each server copies its node's store into a tmpfs directory it owns (default
-`/dev/shm/batchgen-weight-stores`, mounted `huge=within_size` so the copy is
-transparent-hugepage-backed for NIC memory registration), verifying every segment as it
-copies; `--store-residency resident` keeps that copy for the next start. See the
+`/dev/shm/batchgen-weight-stores`; `/dev/shm` sized to `MemTotal` minus 300 GiB, rounded down
+to a whole GiB, and mounted `huge=within_size` so the copy is transparent-hugepage-backed for
+NIC memory registration, see
+[Host prerequisites checked on every boot](deploy-kimi-k3-h200.md#host-prerequisites-checked-on-every-boot)),
+verifying every segment as it copies; `--store-residency resident` keeps that copy for the next start. See the
 "Staged copy and its lifetime" note in the [H200 guide](deploy-kimi-k3-h200.md). Do not copy
 the store into `/dev/shm` by hand.
 

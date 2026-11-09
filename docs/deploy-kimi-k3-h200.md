@@ -56,6 +56,39 @@ Kimi-K3's KDA (Kimi Delta Attention) needs `fla-core>=0.5.0` (flash-linear-atten
 
 ## 4. Start the Server (2 × 8 H200)
 
+### Host prerequisites checked on every boot
+
+These host settings reset when a node reboots or its container restarts, so apply them on every
+node before every launch. The other deploy guides refer to this list.
+
+- **`/dev/shm` size and huge pages.** Size the tmpfs to the host's `MemTotal` minus 300 GiB,
+  rounded down to a whole GiB, and mount it `huge=within_size`. The 300 GiB stays with the OS and
+  other data; the rest holds the staged weight store and host KV. The size caps the tmpfs without
+  reserving memory, and a remount keeps every existing file.
+
+  ```bash
+  SHM_GIB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 - 300 ))
+  sudo mount -o remount,size=${SHM_GIB}G,huge=within_size /dev/shm
+  grep ' /dev/shm ' /proc/mounts   # size=<SHM_GIB x 1048576>k and huge=within_size
+  ```
+
+  When the server finds the staging tmpfs too small or without `huge=`, it prints this command
+  with the size computed for the host.
+- **Transparent huge pages for shared memory.** `transparent_hugepage/shmem_enabled` returns to
+  `never` on every boot:
+
+  ```bash
+  echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+  ```
+- **CUDA toolkit symlink.** A CUDA runfile installer repoints `/usr/local/cuda` at the toolkit it
+  installed. After installing another toolkit, restore the link to the version BatchGen was built
+  against and check it:
+
+  ```bash
+  sudo ln -sfn /usr/local/cuda-<version> /usr/local/cuda
+  readlink -f /usr/local/cuda
+  ```
+
 ### Host memory for the weights
 
 With the replicated parameter server, each node holds the **full converted checkpoint** in host
@@ -289,17 +322,19 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   builds whatever their residency, so switching builds never strands one; a copy another server
   is still using is never removed. A config written before these keys existed keeps mapping
   `store_path` directly. The staging tmpfs needs room for the whole store; if it is too small the
-  server refuses before copying and names the shortfall
-  (`sudo mount -o remount,size=<bytes> /dev/shm`).
+  server refuses before copying, names the shortfall and prints the remount command sized for the
+  host (`MemTotal` minus 300 GiB, see
+  [Host prerequisites checked on every boot](#host-prerequisites-checked-on-every-boot)).
 
   > **`--fast-init` requires a huge-page tmpfs.** The daemon and the workers advise the staged
   > mapping with `MADV_HUGEPAGE`, but a tmpfs backs files with transparent huge pages only when it
   > is mounted with `huge=within_size` or `huge=always`. Without that the store stays on 4 KB pages
   > and NIC key registration (`ibv_reg_mr`) dominates startup, so under `--fast-init` the server
-  > refuses to start and prints the remount command for the staging mount:
+  > refuses to start and prints the remount command for the staging mount, with `<N>` computed
+  > as `MemTotal` minus 300 GiB, rounded down to a whole GiB:
   >
   > ```bash
-  > sudo mount -o remount,huge=within_size /dev/shm
+  > sudo mount -o remount,size=<N>G,huge=within_size /dev/shm
   > ```
   >
   > Without `--fast-init` any tmpfs is accepted — but check the mount anyway. On a tmpfs
@@ -310,13 +345,8 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   >
   > A fresh node or a restarted container typically comes up with a small `/dev/shm`, no
   > `huge=` option and `transparent_hugepage/shmem_enabled=never`, silently reverting any
-  > earlier remount. Make the remount part of the node's pre-launch routine, not a one-time
-  > setup:
-  >
-  > ```bash
-  > sudo mount -o remount,size=<fits the node store>,huge=within_size /dev/shm
-  > echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
-  > ```
+  > earlier remount. Make both settings part of the node's pre-launch routine; the commands are in
+  > [Host prerequisites checked on every boot](#host-prerequisites-checked-on-every-boot).
 
 ## 7. Startup Triton Prewarm
 

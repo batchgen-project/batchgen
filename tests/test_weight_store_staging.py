@@ -258,6 +258,41 @@ def test_non_tmpfs_staging_dir_refused(tmp_path, monkeypatch):
     assert deployment.interleaved == 0
 
 
+GIB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    "memtotal_bytes, size_gib",
+    [
+        (3021 * GIB + 412 * (1 << 20), 2721),  # 3021 GiB host
+        (2163380224 * 1024, 1763),  # ~2 TiB host (2063.16 GiB)
+        (2048 * GIB, 1748),
+        (2048 * GIB - 1, 1747),  # rounds down to a whole GiB
+        (955 * GIB + 700 * (1 << 20), 655),  # ~955 GiB host
+        (301 * GIB, 1),
+    ],
+)
+def test_shm_remount_command_is_memtotal_minus_reserve(memtotal_bytes, size_gib):
+    assert st.SHM_HOST_RESERVE_GIB == 300
+    assert st.shm_remount_command("/dev/shm", memtotal_bytes) == (
+        f"mount -o remount,size={size_gib}G,huge=within_size /dev/shm"
+    )
+
+
+def test_shm_remount_command_edges():
+    for memtotal_bytes in (300 * GIB, 300 * GIB + GIB - 1, 64 * GIB):
+        advice = st.shm_remount_command("/dev/shm", memtotal_bytes)
+        assert advice.startswith("mount -o remount,huge=within_size /dev/shm (no size advised"), advice
+        assert "300 GiB host reserve" in advice
+    for memtotal_bytes in (0, -1):
+        with pytest.raises(ValueError, match="MemTotal must be positive"):
+            st.shm_remount_command("/dev/shm", memtotal_bytes)
+    assert st.shm_remount_command("/mnt/a b", 400 * GIB).endswith(" '/mnt/a b'")
+    # The default is this host's physical memory.
+    physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    assert st.shm_remount_command() == st.shm_remount_command("/dev/shm", physical)
+
+
 def test_fast_init_requires_huge_tmpfs_and_names_the_remount_command(tmp_path, monkeypatch):
     deployment = Deployment(tmp_path, monkeypatch)
     plain = lambda: _mounts(deployment.shm, options="rw,nosuid,size=100g")  # noqa: E731
@@ -266,7 +301,8 @@ def test_fast_init_requires_huge_tmpfs_and_names_the_remount_command(tmp_path, m
         deployment.stage(fast_init=True, read_mounts=plain)
     message = str(excinfo.value)
     assert "it is huge=never" in message
-    assert message.endswith(f"mount -o remount,huge=within_size {mountpoint}")
+    assert message.endswith(st.shm_remount_command(mountpoint))
+    assert f"huge=within_size {mountpoint}" in message
     assert not deployment.staging_dir.exists()
 
     advise = lambda: _mounts(deployment.shm, options="rw,huge=advise")  # noqa: E731
@@ -711,8 +747,9 @@ def test_free_space_shortfall_is_refused_before_copying(tmp_path, monkeypatch):
         seen.append(path)
         return store_bytes - 1
 
-    with pytest.raises(st.WeightStoreStagingError, match=r"has \d+ B free but the staged store needs"):
+    with pytest.raises(st.WeightStoreStagingError, match=r"has \d+ B free but the staged store needs") as excinfo:
         deployment.stage(free_bytes_of=free)
+    assert st.shm_remount_command(os.path.realpath(deployment.shm)) in str(excinfo.value)
     assert seen == [deployment.staging_dir / deployment.staged_id()]
     assert deployment.interleaved == 0
     assert list(deployment.staging_dir.iterdir()) == []
@@ -876,7 +913,7 @@ def test_staging_logs_mount_options_and_warns_without_huge(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
         "no huge= mount option" in r.message
-        and f"mount -o remount,huge=within_size {mountpoint}" in r.message
+        and st.shm_remount_command(mountpoint) in r.message
         for r in warnings
     )
 
