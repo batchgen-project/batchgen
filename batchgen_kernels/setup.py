@@ -100,6 +100,12 @@ _build_sm103a = _build_arch == "sm103a"
 # Explicit -gencode (not bare -arch=sm_90a): bare -arch makes torch cpp_extension
 # append its own arch flags (GPU-detection/TORCH_CUDA_ARCH_LIST based), which crashes
 # on no-GPU hosts and adds a plain compute_90 pass that ptxas rejects for wgmma.*.
+# C++ standard: Torch >= 2.15 headers require C++20; older lanes keep C++17.
+import torch as _torch_for_std
+_CXX_STD = "-std=c++17"
+if tuple(int(x) for x in _torch_for_std.__version__.split("+")[0].split(".")[:2]) >= (2, 15):
+    _CXX_STD = "-std=c++20"
+
 _sm90a_flags = [_CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "--ptxas-options=-v",
                 "-lineinfo", "--threads", _nvcc_threads]
 
@@ -126,11 +132,6 @@ else:
     )
 
 
-# C++ standard: Torch >= 2.15 headers require C++20; older lanes keep C++17.
-import torch as _torch_for_std
-_CXX_STD = "-std=c++17"
-if tuple(int(x) for x in _torch_for_std.__version__.split("+")[0].split(".")[:2]) >= (2, 15):
-    _CXX_STD = "-std=c++20"
 
 _sm80_flags = [_CXX_STD, "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
