@@ -27,6 +27,12 @@ import torch
 import torch.distributed as dist
 
 from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
+from batchgen.phase_lifecycle import (
+    AdmitContext,
+    ExitMode,
+    PhaseEnterContext,
+    PhaseKey,
+)
 
 from .model import (
     Glm5ForCausalLM,
@@ -577,6 +583,70 @@ class GLM5ParallelStrategyManager:
             self.rank,
             time.perf_counter() - start,
         )
+
+    def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
+        """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
+
+        Resumes the instance this process keeps for the phase, otherwise
+        builds it. A prefill build uses the mode recorded by
+        set_prefill_moe_mode.
+        """
+        if key.phase == "prefill":
+            if self.prefill_instance is not None:
+                return self.activate_prefill()
+            return self.configure_prefill()
+        if key.phase == "decode":
+            if ctx.comm is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.comm"
+                )
+            if ctx.max_num_seq is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.max_num_seq"
+                )
+            if self.decode_instance is not None:
+                return self.activate_decoding()
+            return self.configure_decoding(
+                padding_bsz=ctx.max_num_seq, comm=ctx.comm
+            )
+        raise ValueError(f"phase_enter: unsupported phase {key.phase!r}")
+
+    def admit(self, key: PhaseKey, ctx: AdmitContext) -> None:
+        """Prepare the live phase instance for one admission wave.
+
+        Prefill resets the grouped prefill state and re-initializes its
+        buffers on the live model. Decode has no manager-side admission work:
+        KV allocation and local-row resolution are worker-owned.
+        """
+        if key.phase == "prefill":
+            self._check_late_deepgemm_compiles("admit")
+            self._prepare_prefill_activation()
+            return
+        if key.phase == "decode":
+            return
+        raise ValueError(f"admit: unsupported phase {key.phase!r}")
+
+    def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
+        """Leave ``key.phase`` in ``mode`` (see ExitMode)."""
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
+        if mode is ExitMode.RETIRE:
+            # The worker's lifecycle orchestration performs the retire
+            # mechanics (deep_free_model_memory, GPU KV destroy); this manager
+            # owns no further state to free.
+            return
+        if mode is not ExitMode.SUSPEND:
+            raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+        if key.phase == "prefill":
+            # Prefill keeps no manager-owned state to suspend; the worker
+            # stops the H2D worker and releases the ring.
+            return
+        if not self.decode_experts_resident:
+            raise RuntimeError(
+                f"rank {self.rank}: decode SUSPEND needs a resident reusable "
+                "decode instance; a rank without one must RETIRE"
+            )
+        self.release_decode_routed_experts()
 
     @staticmethod
     def _copy_expert_pairs(pairs):
