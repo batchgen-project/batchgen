@@ -58,7 +58,7 @@ channel = sys.argv[1]
 cuda = f"{channel[2:-1]}.{channel[-1]}"
 # Pinned Torch per CUDA channel. Keep in sync with
 # batchgen/runtime_preflight.py::_TORCH_PINS.
-pins = {"cu128": "2.9.0", "cu130": "2.13.0"}
+pins = {"cu128": "2.9.0", "cu132": "2.15.0"}
 pin = pins.get(channel)
 print(f"[build-source-runtime] python={sys.executable} torch={torch.__version__} cuda={torch.version.cuda}")
 if pin is None:

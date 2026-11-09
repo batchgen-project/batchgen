@@ -468,7 +468,7 @@ def _check_core_engine() -> None:
 
 # Pinned Torch per CUDA channel. Keep in sync with the check in
 # scripts/build_source_runtime.sh.
-_TORCH_PINS = {"cu128": "2.9.0", "cu130": "2.13.0"}
+_TORCH_PINS = {"cu128": "2.9.0", "cu132": "2.15.0"}
 
 
 def _check_torch() -> None:
