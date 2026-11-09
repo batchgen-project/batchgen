@@ -567,7 +567,44 @@ class BatchScheduler:
         self.storage.update_batch_status(
             batch_id, BatchStatus.IN_PROGRESS, started_at=started_at
         )
+        # From here on the batch is IN_PROGRESS and only this method can move
+        # it to a terminal status: _run's handler only logs. Any exception
+        # below therefore ends here as FAILED with the error recorded;
+        # otherwise the client polls an in_progress batch forever.
+        try:
+            prepared = self._prepare_in_progress_batch(batch_id, batch, input_path)
+            if prepared is None:
+                return
+            requests, prompts, per_request_max_tokens, sampling_params = prepared
+            await self._process_batch_pool_mode(
+                batch_id, batch, requests, prompts,
+                per_request_max_tokens, sampling_params,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Batch %s failed after it was marked in_progress", batch_id
+            )
+            self.storage.update_batch_status(
+                batch_id,
+                BatchStatus.FAILED,
+                error=f"Batch processing failed: {type(exc).__name__}: {exc}",
+            )
 
+    def _prepare_in_progress_batch(
+        self, batch_id: str, batch: Any, input_path: Any,
+    ) -> Optional[
+        Tuple[List[BatchRequestItem], List[str], List[int], List[Dict[str, Any]]]
+    ]:
+        """Parse and render a batch already marked IN_PROGRESS.
+
+        Returns (requests, prompts, per_request_max_tokens, sampling_params),
+        or None after an expected rejection has set FAILED with its own
+        message. Anything raised is turned into FAILED by _process_batch. A
+        request the prompt construction rejects (an unknown chat role, a
+        conversation the tokenizer cannot render faithfully, a malformed tool
+        call) still fails the whole batch; per-request rejection at admission
+        is a follow-up.
+        """
         with input_path.open("rb") as handle:
             content = handle.read()
 
@@ -578,36 +615,16 @@ class BatchScheduler:
             self.storage.update_batch_status(
                 batch_id, BatchStatus.FAILED, error=error_message
             )
-            return
+            return None
 
-        try:
-            prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
-                requests, batch
-            )
-        except Exception as exc:
-            # Prompt construction can reject a request: an unknown chat role, a
-            # conversation the tokenizer cannot render faithfully, a malformed
-            # tool call. Without this the exception propagates to _run's bare
-            # `except Exception: logger.exception(...)`, which never sets a
-            # terminal status -- and the batch was already marked IN_PROGRESS
-            # above, so every request in it is lost and the client polls
-            # forever.
-            #
-            # NOTE this still fails the whole batch on one bad request.
-            # Per-request rejection at admission is the proper fix and is left
-            # as a follow-up; this only makes the failure visible and terminal.
-            logger.exception("Batch %s: prompt construction failed", batch_id)
-            self.storage.update_batch_status(
-                batch_id,
-                BatchStatus.FAILED,
-                error=f"Prompt construction failed: {type(exc).__name__}: {exc}",
-            )
-            return
+        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
+            requests, batch
+        )
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
         default_max = batch.max_decoding_length
         if default_max is None:
             missing_ids = [
-                requests[i].get("custom_id", f"request-{i}")
+                requests[i].custom_id or f"request-{i}"
                 for i, mt in enumerate(per_request_max_tokens)
                 if mt is None
             ]
@@ -622,7 +639,7 @@ class BatchScheduler:
                 self.storage.update_batch_status(
                     batch_id, BatchStatus.FAILED, error=error_message
                 )
-                return
+                return None
         per_request_max_tokens = [
             mt if mt is not None else default_max
             for mt in per_request_max_tokens
@@ -636,10 +653,7 @@ class BatchScheduler:
                 f"serve as defaults only; per-request values take priority"
             )
 
-        await self._process_batch_pool_mode(
-            batch_id, batch, requests, prompts,
-            per_request_max_tokens, sampling_params,
-        )
+        return requests, prompts, per_request_max_tokens, sampling_params
 
     def _convert_requests_to_worker_inputs(
         self, requests: List[BatchRequestItem], batch=None,
