@@ -21,6 +21,7 @@ from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.config.config import detect_gpu_arch
 from batchgen.gemm.deepgemm_pdl_policy import apply_deepgemm_pdl
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
@@ -951,7 +952,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
-	gpu_arch: str = "hopper"
+	gpu_arch: Optional[str] = None
 	# EP with offloading settings
 	enable_ep_with_offloading: bool = False
 	ep_offloading_ratio: float = 0.0
@@ -964,6 +965,8 @@ class InputArguments:
 			self.max_prompt_length = self.padding_length
 		elif self.max_prompt_length is not None:
 			self.padding_length = self.max_prompt_length
+		if self.gpu_arch is None:
+			self.gpu_arch = detect_gpu_arch()
 
 	def get(self, key, default=None):
 		return getattr(self, key, default)

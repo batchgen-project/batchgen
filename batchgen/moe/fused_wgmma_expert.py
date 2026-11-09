@@ -54,8 +54,8 @@ def _check_wgmma_support() -> bool:
     # Check compute capability (need SM90 for WGMMA)
     device = torch.cuda.current_device()
     cc = torch.cuda.get_device_capability(device)
-    if cc[0] < 9:
-        logging.debug(f"WGMMA requires SM90+, found SM{cc[0]}{cc[1]}")
+    if cc[0] != 9:
+        logging.debug(f"WGMMA requires compute capability 9.x, found {cc[0]}.{cc[1]}")
         return False
 
     return True
