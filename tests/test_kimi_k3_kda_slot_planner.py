@@ -309,3 +309,20 @@ def test_resident_prefill_cap_is_h200_tp8_only():
     assert k3_resident_prefill_token_cap(
         gpu_total_memory_bytes=None, attention_group_size=8
     ) == 0
+
+
+def test_blackwell_decode_runs_eager_when_kernel_not_capturable():
+    config = EngineConfig()
+    config.Basic_Config.kv_dtype = "bfloat16"
+    config.Basic_Config.set_max_prompt_length(8192)
+    config.Basic_Config.max_decoding_length = 128
+    config.Basic_Config.world_size = 8
+    planner = KimiLinearPlanner(
+        is_k3=True,
+        stream_all_modules=False,
+        attention_group_size=8,
+        gpu_total_memory_bytes=268 * GIB,
+        decode_graph_capturable=False,
+    )
+    config = planner.generate_config(config)
+    assert config.Basic_Config.decode_graph_mode == "eager"
