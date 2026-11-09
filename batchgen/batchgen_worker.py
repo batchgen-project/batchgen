@@ -18080,6 +18080,46 @@ class BatchGenWorker:
 
 		return updated_uuids, updated_batch
 
+	def _integrate_pending_async_load(
+		self,
+		pending_async_task: Optional[object],
+		pending_load_uuids: List[str],
+		pending_load_local_indices: List[int],
+		pending_load_global_ids: List[int],
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager,
+	) -> Tuple[List[str], List[int]]:
+		"""Complete an in-flight boundary GPU-KV load and fold its rows in.
+
+		A launched boundary load has already allocated GPU pages -- and
+		registered their shared-page keys -- for rows that are NOT yet in
+		``decode_uuids``; only the finalize step moves them in. Every decode
+		exit that drops its pending-load state must therefore run this first:
+		an exit that forgets the pending rows strands their GPU pages (no
+		later path frees pages for a row outside ``decode_uuids``), and the
+		next load of such a row finds its own stale keyed pages still mapped
+		and fails the writable-page sharing guard, which the collective
+		converts into a cohort-fatal SCHED_INVARIANT.
+
+		All ranks hold identical ``pending_load_uuids`` and reach this from
+		broadcast boundary decisions, so the wait/barrier/finalize protocol
+		stays rank-aligned.
+		"""
+		if pending_async_task is not None:
+			pending_async_task.wait()
+			torch.cuda.synchronize(self.torch_device)
+		dist.barrier()
+		return self._finalize_async_load_minimal(
+			pending_async_task,
+			pending_load_uuids,
+			pending_load_local_indices,
+			pending_load_global_ids,
+			decode_uuids,
+			batch,
+			gpu_manager,
+		)
+
 	def _ensure_decode_metadata_capacity(self, batch_size: int) -> None:
 		"""Allocate reusable decode metadata buffers sized for the local batch."""
 		current = self._decode_cache_seqlens_i32
@@ -20235,6 +20275,23 @@ class BatchGenWorker:
 							f"before putting sequences ON_HOLD"
 						)
 
+					# An in-flight boundary load must be integrated before the
+					# hold: its rows are not in decode_uuids yet, but they
+					# already hold GPU pages with registered shared-page keys.
+					# Dropping them here strands those pages and the row's
+					# next load trips the writable-page sharing guard
+					# (cohort-fatal SCHED_INVARIANT).
+					if pending_load_uuids:
+						decode_uuids, batch = self._integrate_pending_async_load(
+							pending_async_task, pending_load_uuids,
+							pending_load_local, pending_load_global,
+							decode_uuids, batch, gpu_manager,
+						)
+						pending_async_task = None
+						pending_load_uuids = []
+						pending_load_local = []
+						pending_load_global = []
+
 					logging.info(
 						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
 						f"sequences ON_HOLD, will trigger prefill"
@@ -20322,15 +20379,10 @@ class BatchGenWorker:
 				if not decode_uuids:
 					# Check for pending loads
 					if pending_load_uuids:
-						if pending_async_task is not None:
-							pending_async_task.wait()
-							torch.cuda.synchronize(self.torch_device)
-						dist.barrier()
-						
-						decode_uuids, batch = self._finalize_async_load_minimal(
+						decode_uuids, batch = self._integrate_pending_async_load(
 							pending_async_task, pending_load_uuids,
 							pending_load_local, pending_load_global,
-							decode_uuids, batch, gpu_manager
+							decode_uuids, batch, gpu_manager,
 						)
 						self._rebuild_page_table_for_batch(batch, gpu_manager)
 						self._sync_decode_moe_rank_counts(
