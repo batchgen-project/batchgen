@@ -207,9 +207,18 @@ def _mla_decode_graph_safe(
     # K3's graph path uses the same pure-BF16 FlashMLA entry points as the
     # eager path.  Import them directly so graph capture does not pull in the
     # unused legacy FP8/FA3 backend and its DeepGEMM dependency.
+    if torch.cuda.get_device_capability()[0] != 9:
+        # The graph path bakes flash_mla's precomputed scheduler metadata into
+        # the capture. The Blackwell decode kernel (flashinfer trtllm-gen)
+        # needs a per-bucket plan made outside capture instead; until that
+        # graph-safe variant exists, Blackwell decode must run eager.
+        raise NotImplementedError(
+            "graph-captured Kimi MLA decode is Hopper-only; run decode_graph_mode "
+            "'eager' on Blackwell (sub-project batchgen-k3-b300-single-node)"
+        )
     from flash_mla import flash_mla_with_kvcache
 
-    from batchgen.attention.mla.flashmla_compat import dense_decode_kwargs
+    from batchgen.attention.mla.paged_decode import flashmla_dense_kwargs as dense_decode_kwargs
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
     bsz = hidden_states.shape[0]

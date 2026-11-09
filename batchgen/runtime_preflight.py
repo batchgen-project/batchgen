@@ -309,7 +309,9 @@ _KIMI_MODEL_TYPES = frozenset(
 
 _BLACKWELL_KIMI_CONTRACTS = {
     model_type: RuntimeContract(
-        modules=("flash_mla",),
+        # flash_mla: graph/legacy entry points; flashinfer: the Blackwell
+        # dense paged MLA decode and varlen prefill kernels.
+        modules=("flash_mla", "flashinfer"),
         extensions=_SM103A_EXTENSIONS,
         require_deepgemm=contract.require_deepgemm,
     )
