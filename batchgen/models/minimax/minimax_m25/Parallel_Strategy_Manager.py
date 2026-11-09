@@ -26,6 +26,13 @@ import torch
 import gc
 import os
 
+from batchgen.phase_lifecycle import (
+    AdmitContext,
+    ExitMode,
+    PhaseEnterContext,
+    PhaseKey,
+)
+
 NUM_TOTAL_EXPERTS = 256
 
 
@@ -305,3 +312,35 @@ class MiniMaxM25ParallelStrategyManager:
 
     def _config_unembedding_hook(self):
         self.model.lm_head.register_forward_pre_hook(self._unembedding_forward_pre_hook)
+
+    def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
+        """Enter a phase by building its model and copy task."""
+        if key.phase == "prefill":
+            return self.configure_prefill()
+        if key.phase == "decode":
+            if ctx.comm is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.comm"
+                )
+            if ctx.max_num_seq is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.max_num_seq"
+                )
+            return self.configure_decoding(
+                padding_bsz=ctx.max_num_seq, comm=ctx.comm
+            )
+        raise ValueError(f"phase_enter: unsupported phase {key.phase!r}")
+
+    def admit(self, key: PhaseKey, ctx: AdmitContext) -> None:
+        """No manager-side admission work; worker-owned state handles each wave."""
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"admit: unsupported phase {key.phase!r}")
+
+    def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
+        """Leave a phase; this build-always manager has no reusable state."""
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
+        if mode not in (ExitMode.SUSPEND, ExitMode.RETIRE):
+            raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+        # The worker resident guard is at lines 12076-12079;
+        # this manager has no release-for-reuse seam, so SUSPEND is a no-op.

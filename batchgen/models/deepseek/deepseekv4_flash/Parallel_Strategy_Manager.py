@@ -20,6 +20,12 @@ import time
 
 import torch
 
+from batchgen.phase_lifecycle import (
+    AdmitContext,
+    ExitMode,
+    PhaseEnterContext,
+    PhaseKey,
+)
 from .model import DeepSeekV4FlashForCausalLM
 from .tensor_contract import build_v4_weight_contract, model_key_to_checkpoint_key
 from .wrappers import DeepSeekV4FlashAttnWrapper, DeepSeekV4FlashExpertWrapper
@@ -172,3 +178,30 @@ class DeepSeekV4FlashParallelStrategyManager:
 
     def _config_lm_head_hook(self) -> None:
         self.model.lm_head.register_forward_pre_hook(self._lm_head_forward_pre_hook)
+
+    def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
+        """Enter a phase by building its model and copy task."""
+        if key.phase == "prefill":
+            return self.configure_prefill()
+        if key.phase == "decode":
+            if ctx.comm is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.comm"
+                )
+            # configure_decoding deletes padding_bsz and does not size from it.
+            return self.configure_decoding(comm=ctx.comm)
+        raise ValueError(f"phase_enter: unsupported phase {key.phase!r}")
+
+    def admit(self, key: PhaseKey, ctx: AdmitContext) -> None:
+        """No manager-side admission work; worker-owned state handles each wave."""
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"admit: unsupported phase {key.phase!r}")
+
+    def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
+        """Leave a phase; this build-always manager has no reusable state."""
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
+        if mode not in (ExitMode.SUSPEND, ExitMode.RETIRE):
+            raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+        # The worker resident guard is at lines 12076-12079;
+        # this manager has no release-for-reuse seam, so SUSPEND is a no-op.
