@@ -14469,6 +14469,18 @@ class BatchGenWorker:
 			AttnWrapperBase.prepack_seq_lengths = None
 			torch.cuda.empty_cache()
 		work = prefill_plan_work(wave.plan)
+		new_tokens = torch.stack([tokens_by_index[index] for index in order])
+		# Ledger-contract fields the prepacked path already carries
+		# (prefill_metrics_proposal.md): without seq_len_* a single-S run
+		# cannot bind its FLOPs model, and without the sampled ids a pooled
+		# wave has no determinism witness, so pooled waves were falling out
+		# of prefill_report entirely. The wave is complete and the barrier
+		# above has drained the compute stream, so the tolist() is a
+		# wave-boundary scalar transfer, same as the prepacked emission.
+		wave_seq_lens = [
+			int(self.global_batch.get_sequence(uuid).prompt_length)
+			for uuid in wave.uuids
+		]
 		logging.info("[METRICS] " + json.dumps({
 			"component": "prefix_pool",
 			"phase": "prefill",
@@ -14489,8 +14501,13 @@ class BatchGenWorker:
 			"workspace_peak_bytes": workspace_peak,
 			"reserved_peak_bytes": reserved_peak,
 			"prefill_s": prefill_s,
+			"seq_len_min": min(wave_seq_lens) if wave_seq_lens else 0,
+			"seq_len_max": max(wave_seq_lens) if wave_seq_lens else 0,
+			"world_size": self.world_size,
+			"first_sampled_token_ids": (
+				new_tokens.reshape(-1).tolist()[:16]
+			),
 		}, separators=(",", ":")))
-		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
 
 	def _pool_probe_debug(self, wave):
