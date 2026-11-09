@@ -257,9 +257,11 @@ class KimiLinearParallelStrategyManager:
         self._comm = None
         self._resident_ep_built = False
         self._streamed_sp8_buffer = None
-        self._prefill_moe_mode = (
-            "streamed_sp8" if self._distributed_weight_sharded else "streamed"
-        )
+        # Whether the build TP-shards the LatentMoE projections. Fixed by the
+        # planner and the topology, so the server prefill mode below is known
+        # before any model exists.
+        self._latent_tp_planned = self._plans_latent_tp_sharding()
+        self._prefill_moe_mode = self.default_prefill_moe_mode()
         self._decode_graph = None
         # Worker phase-instance reuse protocol (default lifecycle). The worker
         # sets ``reuse_phase_instances``; ``_instances_are_reused`` decides
@@ -296,26 +298,13 @@ class KimiLinearParallelStrategyManager:
     def _instances_are_reused(self):
         """Whether the worker's reuse request is honoured for this deployment.
 
-        Honoured only with resident-EP decode and no resident-EP prefill
-        handoff. Streamed decode keeps a non-empty routed-expert decode task,
-        which the reuse activation refuses. A positive
-        ``k3_resident_prefill_token_cap`` selects the handoff, whose worker
-        branch sits after the reuse branch: publishing ``decode_instance``
-        there would release the resident shard every wave and rebuild it from
-        the node store for the resident prefill. Those deployments decline
-        and keep the rebuild lifecycle. Remove the handoff decline once the
-        resident shard lives at fixed addresses and the handoff is integrated
-        into this protocol.
+        Honoured only with resident-EP decode. Streamed decode keeps a
+        non-empty routed-expert decode task, which the reuse activation
+        refuses.
         """
         if not self.reuse_phase_instances:
             return False
-        if self._decode_moe_mode() != "resident_ep":
-            return False
-        resident_token_cap = int(getattr(
-            self.engine_config.Module_Batching_Config,
-            "k3_resident_prefill_token_cap", 0,
-        ) or 0)
-        return resident_token_cap <= 0
+        return self._decode_moe_mode() == "resident_ep"
 
     @property
     def decode_experts_resident(self):
@@ -463,6 +452,14 @@ class KimiLinearParallelStrategyManager:
             raise ValueError(
                 f"{value} prefill is implemented only for Kimi-K3"
             )
+        if value == "streamed" and self._latent_tp_planned:
+            # The streamed path would hand each rank's latent column slice to
+            # full-width experts (activation contract violation 93 layers in).
+            raise ValueError(
+                "k3_prefill_moe_mode='streamed' needs unsharded LatentMoE "
+                "projections; with TP-sharded projections use 'streamed_sp8' "
+                "or 'resident_ep'"
+            )
         if (
             getattr(self, "_distributed_weight_sharded", False)
             and value != "streamed_sp8"
@@ -480,28 +477,24 @@ class KimiLinearParallelStrategyManager:
         self._prefill_moe_mode = value
 
     def default_prefill_moe_mode(self):
-        """Return the safe batch default for this weight-source topology."""
-        return "streamed_sp8" if self._distributed_weight_sharded else "streamed"
+        """Return the server prefill MoE mode for this weight topology.
+
+        The worker reads it once and uses it for every prefill wave; only a
+        batch-level ``batchgen_debug.k3_prefill_moe_mode`` overrides it, for
+        that batch alone. ``streamed`` feeds each rank's full-width latent
+        into full-width experts, so it is only valid while the LatentMoE
+        projections are unsharded. Once they are TP-sharded (planner
+        ``k3_shard_latent_projections``, TP8 K3, single node or not) each rank
+        holds a column slice and prefill must go through ``streamed_sp8``,
+        which rebuilds the full projections per phase. Distributed host
+        weights force ``streamed_sp8`` for the same reason plus ingress.
+        """
+        if self._distributed_weight_sharded or self._latent_tp_planned:
+            return "streamed_sp8"
+        return "streamed"
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"
-
-    def resident_ep_prefill_available(self):
-        """True once a decode phase has materialized the resident EP shard.
-
-        A later admission wave can then prefill through the resident experts
-        (EP collectives, chunked by the resident token cap) instead of
-        releasing the ~84 GiB shard for streamed-SP8 and rebuilding it from
-        the node store afterwards — measured at 22-139 s per rank per wave
-        on H200 (the repack reads 8 x 84 GiB through the page cache), the
-        slowest rank gating every rank at the decode barrier.
-        """
-        return bool(
-            self._is_k3
-            and self._resident_ep_built
-            and self._attn_tp_size > 1
-            and not self._stream_all_modules
-        )
 
     def release_decode_graph(self):
         """Drop captured decode graphs; they bake GPU KV-pool addresses."""
@@ -2056,6 +2049,22 @@ class KimiLinearParallelStrategyManager:
     def _latent_projections_sharded(self):
         return bool(getattr(self, "_latent_tp_sharded", False))
 
+    def _plans_latent_tp_sharding(self):
+        """Whether ``_shard_latent_projections`` shards this deployment.
+
+        A function of the planner flag ``k3_shard_latent_projections`` and the
+        attention TP degree only, so the prefill mode can be chosen before
+        the model is built.
+        """
+        return bool(
+            self._is_k3
+            and getattr(
+                self.engine_config.Module_Batching_Config,
+                "k3_shard_latent_projections", False,
+            )
+            and self._attn_tp_size > 1
+        )
+
     def _shard_vocab_parallel(self):
         """Replace ``embed_tokens`` / ``lm_head`` by vocab-parallel modules that
         keep this rank's ``[c*V/G, (c+1)*V/G)`` rows (planner
@@ -2124,12 +2133,14 @@ class KimiLinearParallelStrategyManager:
         self._latent_tp_sharded = False
         self._latent_full_host = {}
         G = self._attn_tp_size
-        want = bool(getattr(
-            self.engine_config.Module_Batching_Config,
-            "k3_shard_latent_projections", False,
-        ))
-        if not (self._is_k3 and want and G > 1 and self._attn_tp_group is not None):
+        if not self._latent_tp_planned:
             return
+        if self._attn_tp_group is None:
+            raise RuntimeError(
+                "latent projections are planned TP-sharded, but the attention "
+                "TP group was not built; the prefill mode was chosen for "
+                "sharded projections"
+            )
         device = self.engine_config.Basic_Config.device_torch
         c = self._attn_tp_rank
         n_layers = 0

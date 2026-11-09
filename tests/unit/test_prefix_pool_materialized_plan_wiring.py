@@ -83,6 +83,10 @@ METHODS = (
     "_new_pool_kernel_dump_recorder",
     "_active_batchgen_debug_for_sequences",
     "_debug_flag_enabled",
+    "_planned_prefill_token_cap",
+    "_prefill_moe_mode_for_debug",
+    "_prefill_token_cap_for_mode",
+    "_server_prefill_moe_mode",
 )
 
 
@@ -216,6 +220,8 @@ def _worker(
         _prefix_sequence_states=dict(states or {}),
         _prefill_pool_base=(0, 0, 0),
         _prefill_pool_page_budget=free_pages,
+        # Startup resolved the server prefill mode: every wave is streamed.
+        _resolved_server_prefill_moe_mode="streamed",
         _batchgen_debug=None,
         _any_sequence_batchgen_debug=True,
         _trajectory_attachments=dict(attachments or {}),

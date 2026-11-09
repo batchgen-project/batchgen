@@ -1316,6 +1316,10 @@ class BatchGenWorker:
 		# flag makes that pass idempotent; the second hands the prepared prefill
 		# phase to the first real admission so it is not torn down and rebuilt.
 		self._k3_startup_completed = False
+		# The prefill MoE mode of every wave of this server (see
+		# _server_prefill_moe_mode); a batch-level override changes its own
+		# wave only.
+		self._resolved_server_prefill_moe_mode = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -2746,9 +2750,7 @@ class BatchGenWorker:
 			self._prefix_rank_cost_profile_disabled(seqs)
 		)
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		chunk_tokens = int(
-			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-		)
+		chunk_tokens = self._planned_prefill_token_cap(seqs)
 
 		def pinned_load(seq):
 			# Length-only: a re-entry's tokens are readable on one node only.
@@ -8509,10 +8511,7 @@ class BatchGenWorker:
 		(``_measure_prefill_prefix_kv_budget``) and the micro-batch splits
 		until the transient fits.
 		"""
-		token_cap = (
-			self.engine_config.Module_Batching_Config
-			.prefill_micro_batch_token_cap
-		)
+		token_cap = self._live_prefill_token_cap()
 		use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 		single_sequence_only = (
 			token_cap > 0
@@ -9990,14 +9989,14 @@ class BatchGenWorker:
 		# here: the decode phase key carries it, and a None here against the
 		# startup mode below would turn the resumable decode exit into RETIRE,
 		# which leaves the resident shard mapped and OOMs the prefill build.
-		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
+		startup_prefill_mode = self._server_prefill_moe_mode()
 		self._prefill_moe_mode_in_effect = startup_prefill_mode
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 
-		# Then hand the built model to the prefill mode this weight topology
-		# will actually use, so the first admission inherits this phase directly
-		# instead of rebuilding the streamed-SP8 buffers itself.
+		# Then hand the built model to the server prefill mode every wave uses,
+		# so the first admission inherits this phase directly instead of
+		# rebuilding the streamed-SP8 buffers itself.
 		with self._startup_phase("prefill-configure"):
 			self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
 			prefill_key = PhaseKey("prefill", startup_prefill_mode, ())
@@ -11121,32 +11120,11 @@ class BatchGenWorker:
 			prefill_debug.get("weight_pass_end_delay")
 		)
 		AttnWrapperBase.batchgen_debug = prefill_debug or None
-		_default_k3_prefill_mode = "streamed"
-		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
-			_default_k3_prefill_mode = (
-				self.parallel_manager.default_prefill_moe_mode()
-			)
-		k3_prefill_moe_mode = prefill_debug.get(
-			"k3_prefill_moe_mode", _default_k3_prefill_mode
-		)
-		resident_token_cap = int(getattr(
-			self.engine_config.Module_Batching_Config,
-			"k3_resident_prefill_token_cap", 0,
-		) or 0)
-		resident_handoff = (
-			"k3_prefill_moe_mode" not in prefill_debug
-			and resident_token_cap > 0
-			and hasattr(self.parallel_manager, "resident_ep_prefill_available")
-			and self.parallel_manager.resident_ep_prefill_available()
-		)
-		if resident_handoff:
-			k3_prefill_moe_mode = "resident_ep"
+		k3_prefill_moe_mode = self._prefill_moe_mode_for_debug(prefill_debug)
 		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
 			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)
 		self._phase_prefill_debug = prefill_debug
 		self._phase_k3_prefill_profile = k3_prefill_profile
-		self._phase_resident_handoff = resident_handoff
-		self._phase_resident_token_cap = resident_token_cap
 		self._phase_profile_overrides = (
 			(("k3_prefill_profile", k3_prefill_profile),)
 			if "k3_prefill_profile" in prefill_debug
@@ -11154,6 +11132,69 @@ class BatchGenWorker:
 		)
 		return PhaseKey(
 			"prefill", k3_prefill_moe_mode, self._phase_profile_overrides
+		)
+
+	def _server_prefill_moe_mode(self) -> str:
+		"""The prefill MoE mode every wave of this server runs in.
+
+		Read once from the parallel manager and kept for the process: prefill
+		parallelism never changes inside a server. Managers without a choice
+		run ``streamed``. Only a batch-level
+		``batchgen_debug.k3_prefill_moe_mode`` departs from it, for that
+		batch's wave alone (``_prefill_moe_mode_for_debug``).
+		"""
+		mode = getattr(self, "_resolved_server_prefill_moe_mode", None)
+		if mode is None:
+			choose = getattr(self.parallel_manager, "default_prefill_moe_mode", None)
+			mode = choose() if choose is not None else "streamed"
+			self._resolved_server_prefill_moe_mode = mode
+			logging.info(
+				"Rank %s: server prefill MoE mode is %s for every wave",
+				self.rank,
+				mode,
+			)
+		return mode
+
+	def _prefill_moe_mode_for_debug(self, debug: Optional[dict]) -> str:
+		"""The prefill MoE mode of a wave whose batch debug flags are ``debug``."""
+		return (debug or {}).get(
+			"k3_prefill_moe_mode", self._server_prefill_moe_mode()
+		)
+
+	def _prefill_token_cap_for_mode(self, mode: Optional[str]) -> int:
+		"""Per-micro-batch prefill token cap of a wave in prefill MoE ``mode``.
+
+		The planner's ``prefill_micro_batch_token_cap`` bounds every streamed
+		wave. A resident-EP wave preallocates its FP32 MoE output from its
+		cap, so it runs under ``k3_resident_prefill_token_cap`` when the
+		planner set one (0 plans no separate bound). The config fields are
+		never written after the planner; every cap reader comes through here.
+		"""
+		batching = self.engine_config.Module_Batching_Config
+		if mode == "resident_ep":
+			resident_cap = int(
+				getattr(batching, "k3_resident_prefill_token_cap", 0) or 0
+			)
+			if resident_cap > 0:
+				return resident_cap
+		return int(batching.prefill_micro_batch_token_cap)
+
+	def _live_prefill_token_cap(self) -> int:
+		"""Token cap of the prefill wave whose phase is live."""
+		live = self._live_phase_key
+		if live is None or live.phase != "prefill":
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill token cap read while the live phase "
+				f"is {live!r}; the cap belongs to a live prefill wave"
+			)
+		return self._prefill_token_cap_for_mode(live.prefill_moe_mode)
+
+	def _planned_prefill_token_cap(self, sequences) -> int:
+		"""Token cap the wave holding ``sequences`` will prefill under."""
+		return self._prefill_token_cap_for_mode(
+			self._prefill_moe_mode_for_debug(
+				self._active_batchgen_debug_for_sequences(sequences)
+			)
 		)
 
 	def _verify_manager_phase_contract(self) -> None:
@@ -11276,8 +11317,6 @@ class BatchGenWorker:
 		]
 		prefill_debug = self._phase_prefill_debug
 		k3_prefill_profile = self._phase_k3_prefill_profile
-		resident_handoff = self._phase_resident_handoff
-		resident_token_cap = self._phase_resident_token_cap
 		persistent = self._persistent_phase_enabled()
 		if not persistent:
 			self._request_phase_instance_reuse()
@@ -11320,12 +11359,6 @@ class BatchGenWorker:
 		if phase_changed and not resumed:
 			self._log_phase_memory_ledger("after_configure_prefill")
 		if phase_changed:
-			if resident_handoff:
-				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-					resident_token_cap
-				)
-				if torch.cuda.is_available():
-					torch.cuda.synchronize(self.torch_device)
 			self.set_phase("prefill")
 			if self.enable_prefix_cache:
 				self._measure_prefill_prefix_kv_budget()
@@ -11350,10 +11383,7 @@ class BatchGenWorker:
 				for seq in prefill_sequences
 				if self._owns_local_sequence(seq)
 			]
-			token_cap = (
-				self.engine_config.Module_Batching_Config
-				.prefill_micro_batch_token_cap
-			)
+			token_cap = self._live_prefill_token_cap()
 			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 			predicted_batches, _ = build_prefill_micro_batches(
 				local_lengths,
@@ -11902,11 +11932,7 @@ class BatchGenWorker:
 			pm.set_comm(self.comm)
 		if hasattr(pm, "share_skeleton_on_device"):
 			pm.share_skeleton_on_device()
-		prefill_mode = (
-			pm.default_prefill_moe_mode()
-			if hasattr(pm, "default_prefill_moe_mode")
-			else "streamed"
-		)
+		prefill_mode = self._server_prefill_moe_mode()
 		prefill_key = PhaseKey("prefill", prefill_mode, ())
 		self._phase_profile_overrides = ()
 		if hasattr(pm, "set_prefill_moe_mode"):
@@ -12907,9 +12933,7 @@ class BatchGenWorker:
 				self._prefix_rank_cost_profile_disabled(seqs)
 			)
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-			chunk_tokens = int(
-				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-			)
+			chunk_tokens = self._planned_prefill_token_cap(seqs)
 
 			def pinned_load(seq):
 				# Length-only on purpose: a pinned sequence's token storage may
@@ -13275,8 +13299,9 @@ class BatchGenWorker:
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-		batching = self.engine_config.Module_Batching_Config
-		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
+		# Planned before this wave's phase transition: the live phase may still
+		# be the previous wave's or decode, so the cap comes from the wave.
+		chunk_tokens = self._planned_prefill_token_cap(seqs)
 		state_slots = self._prefill_pool_free_state_slots()
 		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
 		# replicated data so every rank of the group has the same set, plus
@@ -15986,8 +16011,8 @@ class BatchGenWorker:
 
 		# Split sequences into micro-batches based on TOKEN count (not sequence count)
 		# This prevents OOM when sequences have varying lengths
-		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
-		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		# The planner sets the cap per prefill mode; the live wave's mode picks it.
+		MAX_TOKENS_PER_MICRO_BATCH = self._live_prefill_token_cap()
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 

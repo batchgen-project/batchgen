@@ -96,9 +96,10 @@ class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
     # Token-based prefill config (for prepack mode, always recommended)
     prefill_micro_batch_token_cap: int = 131_072  # Max tokens per prefill micro-batch (= max_position_embeddings)
-    # Kimi-K3: token cap for admission waves prefilled through the resident
-    # EP experts after the first decode phase (0 = always release the shard
-    # and prefill streamed). Set by the planner; see resident_ep_prefill_available.
+    # Kimi-K3: per-micro-batch token cap of a prefill wave a batch runs
+    # resident-EP (batchgen_debug.k3_prefill_moe_mode); 0 = no separate bound,
+    # the wave uses prefill_micro_batch_token_cap. Set by the planner. Server
+    # prefill waves always use prefill_micro_batch_token_cap.
     k3_resident_prefill_token_cap: int = 0
     k3_resident_prefill_chunk_rows: int = 0  # 0 = the 256-row large-pass clamp
     # Kimi-K3: TP-shard routed_expert_down/up_proj across the attention TP

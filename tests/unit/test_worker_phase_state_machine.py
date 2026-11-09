@@ -2,8 +2,10 @@
 
 import ast
 import copy
+import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -24,6 +26,11 @@ def _isolated_worker_class():
     )
     names = {
         "_desired_phase_key",
+        "_server_prefill_moe_mode",
+        "_prefill_moe_mode_for_debug",
+        "_prefill_token_cap_for_mode",
+        "_live_prefill_token_cap",
+        "_planned_prefill_token_cap",
         "_phase_exit_mode",
         "_prepare_phase_exit",
         "_transition_phase",
@@ -49,6 +56,8 @@ def _isolated_worker_class():
     )
     namespace = {
         "AttnWrapperBase": SimpleNamespace(batchgen_debug=None),
+        "Optional": Optional,
+        "logging": logging,
         "ExitMode": ExitMode,
         "PhaseEnterContext": PhaseEnterContext,
         "PhaseKey": PhaseKey,
@@ -103,38 +112,77 @@ def _worker(manager, events):
     return worker
 
 
-class _DesiredPhaseManager:
-    def __init__(self, available):
-        self.available = available
-        self._prefill_moe_mode = "streamed"
+STREAMED_CAP = 524_288
+RESIDENT_CAP = 16_384
+
+
+class _ServerManager:
+    """Records mode selections and phase entries; holds every instance."""
+
+    def __init__(self, events, default_mode="streamed_sp8"):
+        self.events = events
+        self.default_mode = default_mode
+        self.default_calls = 0
+        self._prefill_moe_mode = default_mode
         self.set_modes = []
 
     def default_prefill_moe_mode(self):
-        return "streamed"
-
-    def resident_ep_prefill_available(self):
-        return self.available
+        self.default_calls += 1
+        return self.default_mode
 
     def set_prefill_moe_mode(self, mode):
         self.set_modes.append(mode)
         self._prefill_moe_mode = mode
 
+    def holds_instance(self, phase):
+        return True
 
-def _desired_phase_worker(*, cap, available, debug):
-    worker = _isolated_worker_class()()
-    worker.parallel_manager = _DesiredPhaseManager(available)
+    def phase_exit(self, key, mode):
+        self.events.append(("exit", key.phase, key.prefill_moe_mode, mode))
+
+    def phase_enter(self, key, ctx):
+        self.events.append(("enter", key.phase, key.prefill_moe_mode))
+        return object(), {}
+
+
+def _server_worker(*, resident_cap=RESIDENT_CAP, default_mode="streamed_sp8"):
+    events = []
+    worker = _worker(_ServerManager(events, default_mode), events)
+    worker.rank = 0
+    worker._resolved_server_prefill_moe_mode = None
     worker._phase_request_uuids = ()
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: None)
-    worker._active_batchgen_debug_for_sequences = lambda sequences: debug
+    worker._wave_debug = None
+    worker._active_batchgen_debug_for_sequences = (
+        lambda sequences: worker._wave_debug
+    )
     worker._debug_flag_enabled = lambda value: bool(value)
     worker._weight_pass_end_delay = lambda value: 0.0
-    worker._weight_passes = SimpleNamespace(end_delay_s=None)
+    worker._weight_passes = SimpleNamespace(
+        end_delay_s=None, close=lambda: events.append("weight_close")
+    )
     worker.engine_config = SimpleNamespace(
         Module_Batching_Config=SimpleNamespace(
-            k3_resident_prefill_token_cap=cap
+            prefill_micro_batch_token_cap=STREAMED_CAP,
+            k3_resident_prefill_token_cap=resident_cap,
         )
     )
-    return worker
+    return worker, events
+
+
+def _run_prefill_wave(worker, debug=None):
+    """Plan, transition and read caps the way one admission wave does."""
+    worker._wave_debug = debug
+    planned_cap = worker._planned_prefill_token_cap([])
+    key = worker._desired_phase_key("prefill")
+    worker._transition_phase(key)
+    return key, planned_cap, worker._live_prefill_token_cap()
+
+
+def _run_decode(worker):
+    worker._transition_phase(
+        worker._desired_phase_key("decode"), comm="comm", max_num_seq=8
+    )
 
 
 def test_same_key_runs_no_transition_work():
@@ -238,25 +286,120 @@ def test_prepare_phase_exit_orders_cleanup_before_manager_exit_and_resets_only_f
     assert "reset_decode" not in events
 
 
-def test_desired_phase_key_requires_positive_cap_and_available_resident_ep():
-    worker = _desired_phase_worker(cap=8, available=True, debug={})
-    assert worker._desired_phase_key("prefill").prefill_moe_mode == "resident_ep"
-    assert worker.parallel_manager.set_modes == ["resident_ep"]
+def test_every_prefill_wave_uses_the_server_mode_across_decode_phases():
+    worker, events = _server_worker()
+    # Startup resolves the server mode once and enters prefill in it.
+    startup_mode = worker._server_prefill_moe_mode()
+    worker._transition_phase(PhaseKey("prefill", startup_mode, ()))
 
-    worker = _desired_phase_worker(cap=8, available=False, debug={})
-    assert worker._desired_phase_key("prefill").prefill_moe_mode == "streamed"
+    keys = []
+    for wave in range(3):
+        key, planned_cap, live_cap = _run_prefill_wave(worker)
+        keys.append(key)
+        assert planned_cap == live_cap == STREAMED_CAP
+        if wave < 2:
+            _run_decode(worker)
 
-
-def test_desired_phase_key_explicit_mode_wins_and_zero_cap_disables_resident_ep():
-    worker = _desired_phase_worker(
-        cap=8, available=True, debug={"k3_prefill_moe_mode": "streamed_sp8"}
+    assert {key.prefill_moe_mode for key in keys} == {"streamed_sp8"}
+    assert worker.parallel_manager.set_modes == ["streamed_sp8"] * 3
+    # Decided once for the process, never re-read per wave.
+    assert worker.parallel_manager.default_calls == 1
+    prefill_entries = [e for e in events if e[:2] == ("enter", "prefill")]
+    assert {e[2] for e in prefill_entries} == {"streamed_sp8"}
+    assert worker.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap == (
+        STREAMED_CAP
     )
-    assert worker._desired_phase_key("prefill").prefill_moe_mode == "streamed_sp8"
-    assert worker.parallel_manager.set_modes == ["streamed_sp8"]
 
-    worker = _desired_phase_worker(cap=0, available=True, debug={})
-    assert worker._desired_phase_key("prefill").prefill_moe_mode == "streamed"
-    assert worker.parallel_manager.set_modes == ["streamed"]
+
+def test_batch_override_applies_to_its_own_wave_only():
+    worker, _ = _server_worker()
+    worker._transition_phase(
+        PhaseKey("prefill", worker._server_prefill_moe_mode(), ())
+    )
+    _run_decode(worker)
+
+    key, planned_cap, live_cap = _run_prefill_wave(
+        worker, {"k3_prefill_moe_mode": "resident_ep"}
+    )
+    assert key.prefill_moe_mode == "resident_ep"
+    assert planned_cap == live_cap == RESIDENT_CAP
+    _run_decode(worker)
+
+    key, planned_cap, live_cap = _run_prefill_wave(worker)
+    assert key.prefill_moe_mode == "streamed_sp8"
+    assert planned_cap == live_cap == STREAMED_CAP
+    assert worker.parallel_manager.set_modes == ["resident_ep", "streamed_sp8"]
+    # The resident wave never rewrites the planner's shared streamed cap.
+    batching = worker.engine_config.Module_Batching_Config
+    assert batching.prefill_micro_batch_token_cap == STREAMED_CAP
+    assert batching.k3_resident_prefill_token_cap == RESIDENT_CAP
+
+
+def test_resident_override_without_a_planned_resident_cap_uses_the_streamed_cap():
+    worker, _ = _server_worker(resident_cap=0)
+    assert worker._prefill_token_cap_for_mode("resident_ep") == STREAMED_CAP
+    for mode in ("streamed", "streamed_sp8", None):
+        assert worker._prefill_token_cap_for_mode(mode) == STREAMED_CAP
+
+
+def test_manager_without_a_choice_runs_streamed():
+    worker, _ = _server_worker()
+    worker.parallel_manager = SimpleNamespace()
+    assert worker._server_prefill_moe_mode() == "streamed"
+    assert worker._prefill_moe_mode_for_debug(None) == "streamed"
+    assert worker._prefill_moe_mode_for_debug(
+        {"k3_prefill_moe_mode": "streamed_sp8"}
+    ) == "streamed_sp8"
+
+
+def test_live_cap_refuses_a_read_outside_a_live_prefill_phase():
+    worker, _ = _server_worker()
+    with pytest.raises(RuntimeError, match="live prefill wave"):
+        worker._live_prefill_token_cap()
+    worker._live_phase_key = PhaseKey("decode", "streamed_sp8")
+    with pytest.raises(RuntimeError, match="live prefill wave"):
+        worker._live_prefill_token_cap()
+
+
+def _worker_function_nodes():
+    tree = ast.parse(WORKER.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    )
+    return [node for node in cls.body if isinstance(node, ast.FunctionDef)]
+
+
+def test_every_cap_reader_goes_through_the_mode_accessor():
+    readers = sorted(
+        node.name
+        for node in _worker_function_nodes()
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Attribute)
+        and sub.attr in ("prefill_micro_batch_token_cap", "k3_resident_prefill_token_cap")
+    )
+    assert readers == ["_prefill_token_cap_for_mode"]
+    # String getattr reads count too: only the accessor names the fields.
+    named = sorted(
+        node.name
+        for node in _worker_function_nodes()
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant)
+        and sub.value in ("prefill_micro_batch_token_cap", "k3_resident_prefill_token_cap")
+    )
+    assert named == ["_prefill_token_cap_for_mode"]
+
+
+def test_no_resident_prefill_handoff_remains_in_the_worker():
+    source = WORKER.read_text()
+    for name in (
+        "resident_handoff",
+        "_phase_resident_handoff",
+        "_phase_resident_token_cap",
+        "resident_ep_prefill_available",
+    ):
+        assert name not in source
 
 
 def test_startup_gate_raises_with_bad_manager():

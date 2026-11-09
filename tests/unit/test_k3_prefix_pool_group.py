@@ -334,6 +334,11 @@ def _plan_worker(
             "_trajectory_commit_requested",
             "_owns_host_kv",
             "_debug_flag_enabled",
+            # The wave's prefill token cap, chosen by its prefill MoE mode.
+            "_planned_prefill_token_cap",
+            "_prefill_moe_mode_for_debug",
+            "_prefill_token_cap_for_mode",
+            "_server_prefill_moe_mode",
         ],
         {
             "torch": _fake_torch(free_pages * K3_PAGE_BYTES),
@@ -382,6 +387,8 @@ def _plan_worker(
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
+        # Startup resolved the server prefill mode: every wave is streamed.
+        _resolved_server_prefill_moe_mode="streamed",
     )
     worker._trajectory_tokens = (
         lambda seq, length=None, **_: seq.input_ids[0, :length]
