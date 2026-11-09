@@ -312,14 +312,28 @@ _KIMI_MODEL_TYPES = frozenset(
     if identifier.startswith("Kimi")
 )
 
-_BLACKWELL_KIMI_CONTRACTS = {
-    model_type: RuntimeContract(
-        # flash_mla: graph/legacy entry points; flashinfer: the Blackwell
-        # dense paged MLA decode and varlen prefill kernels.
+def _blackwell_kimi_contract(contract: RuntimeContract) -> RuntimeContract:
+    """The Blackwell form of one Kimi contract.
+
+    flash_mla: legacy dense/sparse-prefill entry points (the K3.1 sparse
+    prefill); flashinfer: the dense paged MLA decode, varlen prefill and the
+    trtllm-gen sparse MLA decode. The generic sm103a lane set replaces the
+    Hopper extension set; the model's DSA indexer extensions and its DeepGEMM
+    requirement (paged and causal MQA logits, SM100-family kernels) carry over.
+    """
+    dsa = tuple(
+        name for name in _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS
+        if name in contract.extensions and name not in _SM103A_EXTENSIONS
+    )
+    return RuntimeContract(
         modules=("flash_mla", "flashinfer"),
-        extensions=_SM103A_EXTENSIONS,
+        extensions=_SM103A_EXTENSIONS + dsa,
         require_deepgemm=contract.require_deepgemm,
     )
+
+
+_BLACKWELL_KIMI_CONTRACTS = {
+    model_type: _blackwell_kimi_contract(contract)
     for model_type, contract in _CONTRACTS.items()
     if model_type in _KIMI_MODEL_TYPES
 }

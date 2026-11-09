@@ -44,7 +44,7 @@ sys.path.insert(0, str(ROOT))
 
 from tests.kimi_k31_dsa_refs import (  # noqa: E402
     QUANT,
-    fa3_ref,
+    install_sparse_attention_ref,
     head_gates_ref,
     install_fla_shim,
     install_flash_attn_varlen,
@@ -88,8 +88,7 @@ def seams(monkeypatch):
     recorder = TopkRecorder()
     monkeypatch.setattr(sp, "_prefill_index_topk", lambda: recorder)
     monkeypatch.setattr(sp, "_head_gates", lambda: head_gates_ref)
-    monkeypatch.setattr(sp, "_fa3_with_kvcache", lambda: fa3_ref)
-    monkeypatch.setattr(sp, "_sparse_fa3_num_splits", lambda: 1)
+    install_sparse_attention_ref(monkeypatch)
     monkeypatch.setattr(rot, "_hadamard_predicate", lambda: QUANT.indexer_applies_hadamard)
     monkeypatch.setattr(
         dsa_prefill, "_quantize_indexer_k_fp8", lambda: QUANT.quantize_indexer_k_fp8)

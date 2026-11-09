@@ -152,14 +152,19 @@ class KimiLinearInitializer:
             G = 8
         else:
             G = requested_G
-        from batchgen.attention.mla.paged_decode import graph_capturable
+        from batchgen.attention.mla import paged_decode, sparse_dispatch
 
+        # A captured decode span runs the dense MLA kernel on every layer and,
+        # for K3.1, the sparse one on its DSA layers: both must capture.
+        decode_graph_capturable = paged_decode.graph_capturable() and (
+            not self.is_k31 or sparse_dispatch.graph_capturable()
+        )
         self.planner = KimiLinearPlanner(
             is_k3=self.is_k3,
             attention_group_size=G,
             gpu_total_memory_bytes=self.gpu_total_memory_bytes,
             enable_deepep=getattr(input_arguments, "enable_deepep", False),
-            decode_graph_capturable=graph_capturable(),
+            decode_graph_capturable=decode_graph_capturable,
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")

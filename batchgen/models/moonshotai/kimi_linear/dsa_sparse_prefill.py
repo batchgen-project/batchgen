@@ -20,12 +20,12 @@ short row, exact top-2048 for a long one) and an offset to packed-global key
 indices. Kimi-K3.1's indexer weights are bf16, so the activations are
 quantized with ``act_quant`` instead of reusing FP8 weight scales.
 
-Attention runs on the SAME kernel as Kimi-K3.1's sparse decode: FlashAttention-3
-with ``qv`` (the absorbed query) over a page-size-1 view of this chunk's
-latent, every query token its own row and its packed-global selection its
-page table. That keeps one sparse-attention kernel and one set of plumbing
-for prefill and decode, and imposes no head-count constraint — K3 runs 12
-query heads per rank under TP8.
+Attention runs through the same seam as Kimi-K3.1's sparse decode
+(``batchgen.attention.mla.sparse_dispatch``) with the absorbed query over this
+chunk's latent rows, every query token its own row and its packed-global
+selection its token rows: FlashAttention-3 ``qv`` on Hopper (no head-count
+constraint; K3 runs 12 query heads per rank under TP8), flash_mla's sparse
+prefill on Blackwell (heads zero-padded to its 64-head tile).
 
 Everything else is the dense prefill's own statement: the projections, the
 NoPE latent written to the Host cache, the absorbed query and out-absorb, the
@@ -52,7 +52,9 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from .dsa_decode import _fa3_with_kvcache, _head_gates, _sparse_fa3_num_splits
+from batchgen.attention.mla.sparse_dispatch import sparse_mla_prefill
+
+from .dsa_decode import _head_gates
 from .dsa_index_rotation import check_index_head_dim, index_q_rows
 from .serving_modules import _reduce_mla_tp_output
 
@@ -192,7 +194,7 @@ def _score_and_select_prefill(
         )
     import deep_gemm
 
-    from batchgen.attention.mla.fa3_backend import act_quant
+    from batchgen.quantization.act_quant import act_quant
     from batchgen_kernels.attention.dsa.fast_topk_cuda import fast_topk_2048_out
 
     total = q_idx.shape[0]
@@ -317,31 +319,27 @@ def dsa_sparse_prefill(
     )
     selected = (ends - starts).clamp(max=topk).to(torch.int32).contiguous()
 
-    # ---- attention: FA3 qv over the latent, one row per query ----
+    # ---- attention: the sparse seam over the latent, one row per query ----
     kv_b = module.kv_b_proj.weight.view(heads, -1, lora)
     q_absorb = kv_b[:, : module.qk_nope_head_dim, :]
     out_absorb = kv_b[:, module.qk_nope_head_dim:, :]
     q_latent = torch.einsum("thd,hdc->thc", q_nope, q_absorb)
     if pool is None:
-        flat_kv = offload_kv.view(total, 1, 1, offload_kv.shape[-1])
+        kv_rows = offload_kv.view(total, offload_kv.shape[-1])
     else:
         latent_flat = latent_pool.view(-1, offload_kv.shape[-1])
         latent_flat[pool.slots] = offload_kv.to(latent_flat.dtype)
-        # Pool slots ARE the page-size-1 page ids of the selection, so the
-        # kernel's KV source is the whole pool row.
-        flat_kv = latent_flat.view(-1, 1, 1, offload_kv.shape[-1])
+        # Pool slots ARE the token rows of the selection, so the kernel's KV
+        # source is the whole pool row.
+        kv_rows = latent_flat
         indices = map_topk_to_pool_slots(indices, pool.key_slots)
-    attn_latent = _fa3_with_kvcache()(
-        q=q_pe.reshape(total, 1, heads, module.qk_rope_head_dim).contiguous(),
-        k_cache=flat_kv[..., lora:],
-        v_cache=flat_kv[..., :lora],
-        qv=q_latent.reshape(total, 1, heads, lora).to(q_pe.dtype).contiguous(),
-        page_table=indices.to(torch.int32),
-        cache_seqlens=selected,
-        softmax_scale=float(module.scaling),
-        causal=True,
-        num_splits=_sparse_fa3_num_splits(),
-        return_softmax_lse=False,
+    attn_latent = sparse_mla_prefill(
+        q_pe.reshape(total, 1, heads, module.qk_rope_head_dim).contiguous(),
+        q_latent.reshape(total, 1, heads, lora).to(q_pe.dtype).contiguous(),
+        kv_rows,
+        indices.to(torch.int32),
+        selected,
+        float(module.scaling),
     )
     attn_heads = torch.einsum("thc,hdc->thd", attn_latent[:, 0], out_absorb)
 
