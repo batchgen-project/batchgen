@@ -34,6 +34,14 @@ from .model import GptOss
 from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper, log_gpu_memory
 
 
+from batchgen.phase_lifecycle import (
+    AdmitContext,
+    ExitMode,
+    PhaseEnterContext,
+    PhaseKey,
+)
+
+
 class GptOssParallelStrategyManager:
     """Manage parallel execution strategy for GPT-OSS-120B.
 
@@ -1072,3 +1080,43 @@ class GptOssParallelStrategyManager:
             f"Pre-dequantized {dequant_count} experts to BF16 "
             f"({self.num_local_expert_per_layer} experts × {self.model_config.num_hidden_layers} layers)"
         )
+    def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
+        """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
+
+        This manager keeps no suspended phase instance (experts are resident
+        and every transition rebuilds), so entering a phase always builds it.
+        """
+        if key.phase == "prefill":
+            return self.configure_prefill()
+        if key.phase == "decode":
+            if ctx.comm is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.comm"
+                )
+            if ctx.max_num_seq is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.max_num_seq"
+                )
+            return self.configure_decoding(
+                padding_bsz=ctx.max_num_seq, comm=ctx.comm
+            )
+        raise ValueError(f"phase_enter: unsupported phase {key.phase!r}")
+
+    def admit(self, key: PhaseKey, ctx: AdmitContext) -> None:
+        """No manager-side admission work: experts are resident, there is no
+        per-wave streamed state to reset, and KV allocation is worker-owned.
+        """
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"admit: unsupported phase {key.phase!r}")
+
+    def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
+        """Leave ``key.phase``; both modes are manager-side no-ops.
+
+        Nothing resumable is kept between phases (no stored instances, no
+        routed-expert release seam), and the retire mechanics
+        (deep_free_model_memory, GPU KV destroy) are worker-owned.
+        """
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
+        if mode not in (ExitMode.SUSPEND, ExitMode.RETIRE):
+            raise ValueError(f"phase_exit: unsupported mode {mode!r}")

@@ -40,6 +40,12 @@ import types
 import torch
 
 from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.phase_lifecycle import (
+    AdmitContext,
+    ExitMode,
+    PhaseEnterContext,
+    PhaseKey,
+)
 
 from .block_residual import (
     BlockResidualCarrier,
@@ -2605,3 +2611,68 @@ class KimiLinearParallelStrategyManager:
             return types.SimpleNamespace(logits=logits)
 
         model.forward = types.MethodType(forward_with_logits, model)
+
+    def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
+        """Enter ``key.phase`` and return its ``(model, weight_copy_task)``.
+
+        A kept phase instance is activated in place; otherwise the existing
+        configure method builds it. Decode context is validated before either
+        path so a caller cannot silently build buffers with missing sizing.
+        """
+        if key.phase == "prefill":
+            if self.prefill_instance is not None:
+                return self.activate_prefill()
+            return self.configure_prefill()
+        if key.phase == "decode":
+            if ctx.comm is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.comm"
+                )
+            if ctx.max_num_seq is None:
+                raise ValueError(
+                    "decode phase_enter requires PhaseEnterContext.max_num_seq"
+                )
+            if self.decode_instance is not None:
+                return self.activate_decoding()
+            return self.configure_decoding(
+                padding_bsz=ctx.max_num_seq, comm=ctx.comm
+            )
+        raise ValueError(f"phase_enter: unsupported phase {key.phase!r}")
+
+    def admit(self, key: PhaseKey, ctx: AdmitContext) -> None:
+        """Prepare one admission wave for the live phase instance.
+
+        Kimi-Linear has no manager-owned per-wave reset or buffer-init helper;
+        its streamed prefill buffer is phase-enter state and is initialized by
+        ``_enter_prefill``. Decode admission is worker-owned because KV
+        allocation and local row placement do not belong to this manager.
+        """
+        if key.phase == "prefill":
+            return
+        if key.phase == "decode":
+            return
+        raise ValueError(f"admit: unsupported phase {key.phase!r}")
+
+    def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
+        """Leave ``key.phase`` in ``mode`` while retaining reusable state.
+
+        RETIRE mechanics remain worker-owned. On decode SUSPEND, only routed
+        experts are released; KDA state pools are manager-owned and survive so
+        the next activation keeps recurrent and convolution state intact.
+        """
+        if key.phase not in ("prefill", "decode"):
+            raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
+        if mode is ExitMode.RETIRE:
+            return
+        if mode is not ExitMode.SUSPEND:
+            raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+        if key.phase == "prefill":
+            return
+        # Worker guard at ``batchgen/batchgen`` + ``_worker.py:12076`` requires
+        # a kept decode instance with resident experts before release.
+        if not self.decode_experts_resident:
+            raise RuntimeError(
+                "decode SUSPEND needs a resident reusable decode instance; "
+                "a rank without one must RETIRE"
+            )
+        self.release_decode_routed_experts()
