@@ -1,17 +1,19 @@
 """Required manager contract of the phase-lifecycle refactor.
 
-Every parallel strategy manager implements exactly three hooks:
+Every parallel strategy manager implements exactly four hooks:
 
     phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext)
         -> tuple[object, dict]          # (model, weight_copy_task)
     admit(self, key: PhaseKey, ctx: AdmitContext) -> None
     phase_exit(self, key: PhaseKey, mode: ExitMode) -> None
+    holds_instance(self, phase: str) -> bool
 
 ``phase_enter`` runs only on a phase transition and returns the
 ``(model, weight_copy_task)`` pair the worker installs; whether the manager
 builds a fresh instance or resumes a suspended one is its private strategy.
 ``admit`` runs once per admission wave inside a live phase. ``phase_exit``
-leaves the live phase in one of the two ``ExitMode`` s.
+leaves the live phase in one of the two ``ExitMode`` s. ``holds_instance``
+reports whether the manager retains a resumable instance for the named phase.
 
 The hooks are required, not optional capabilities: ``verify_phase_contract``
 reports every missing or drifted hook so a nonconforming manager fails at
@@ -24,9 +26,9 @@ worker stop and ring release, GPU KV destroy and remap,
 ``deep_free_model_memory``, CUDA-graph handling -- stay worker methods and
 are orchestrated by the worker in a fixed order around these hooks.
 
-Nothing calls these hooks yet. Each manager implements them first; the
-worker loop switches to them, and the existing phase-switch ladders are
-deleted, in one later change.
+The worker calls these hooks at phase transitions and admission waves. The
+manager owns phase-instance state while the worker owns the surrounding
+device mechanics.
 """
 
 from __future__ import annotations
@@ -82,10 +84,10 @@ class ExitMode(enum.Enum):
     ``phase_enter`` of the same key resumes without rebuilding. This is
     today's implicit decode suspend: the reused-instance switch keeps the
     decode graphs, KV pools and their addresses
-    (batchgen_worker.py:11253-11258, ``_release_reused_decode_instance``),
+    (the worker's decode suspend orchestration),
     the persistent switch keeps the pool buffers and releases only the
     routed experts (batchgen_worker.py:12075-12081,
-    ``_release_persistent_decode_instance``), and the prefill H2D ring is
+    and the prefill H2D ring is
     released before decode builds (batchgen_worker.py:11603-11608).
 
     RETIRE: full deep free; nothing of the instance survives. This is
@@ -133,6 +135,7 @@ _HOOK_PARAMETERS = {
     "phase_enter": ("self", "key", "ctx"),
     "admit": ("self", "key", "ctx"),
     "phase_exit": ("self", "key", "mode"),
+    "holds_instance": ("self", "phase"),
 }
 
 
@@ -181,8 +184,9 @@ def _signature_errors(owner, name, member, expected):
 def verify_phase_contract(manager) -> list[str]:
     """Return one readable error per contract violation of ``manager``.
 
-    Inspects ``type(manager)`` for exactly ``phase_enter``, ``admit`` and
-    ``phase_exit`` with the contract's parameter names and kinds. An empty
+    Inspects ``type(manager)`` for exactly ``phase_enter``, ``admit``,
+    ``phase_exit`` and ``holds_instance`` with the contract's parameter names
+    and kinds. An empty
     list means the manager conforms.
     """
     cls = type(manager)
@@ -195,4 +199,17 @@ def verify_phase_contract(manager) -> list[str]:
             errors.append(f"{owner}.{name}: required phase hook is missing")
             continue
         errors.extend(_signature_errors(owner, name, member, expected))
+        if name == "holds_instance" and inspect.isfunction(member):
+            signature = inspect.signature(member, follow_wrapped=False)
+            params = list(signature.parameters.values())
+            if len(params) == 2 and params[1].name == "phase":
+                if params[1].annotation not in (str, "str"):
+                    errors.append(
+                        f"{owner}.holds_instance: parameter 'phase' must be "
+                        "annotated str"
+                    )
+            if signature.return_annotation not in (bool, "bool"):
+                errors.append(
+                    f"{owner}.holds_instance: return must be annotated bool"
+                )
     return errors

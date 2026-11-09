@@ -334,7 +334,7 @@ def test_capture_path_admits_only_the_armed_recapture():
         node for node in ast.walk(setup)
         if isinstance(node, ast.If)
         and (
-            "_decode_instance_is_reusable" in ast.unparse(node.test)
+            "holds_instance" in ast.unparse(node.test)
             or ast.unparse(node.test).startswith("capture_attempted")
         )
         and any(isinstance(n, (ast.Raise, ast.Return)) for n in node.body)
