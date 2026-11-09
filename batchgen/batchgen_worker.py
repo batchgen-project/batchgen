@@ -16145,11 +16145,12 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
+				# Pinned source + non_blocking: a pageable H2D here blocks the
+				# host until the copy lands, i.e. once per micro-batch.
 				batch_cu_seqlens = torch.tensor(
 					prefill_sequence_spans_to_cu_seqlens(batch_spans),
 					dtype=torch.int32,
-					device=self.torch_device,
-				)
+				).pin_memory().to(self.torch_device, non_blocking=True)
 				batch_max_seqlen = max(batch_seq_lengths)
 				prefix_materialization = None
 				if any(tokens > 0 for tokens in batch_compute_cached):
@@ -16461,18 +16462,6 @@ class BatchGenWorker:
 					)
 					AttnWrapperBase.prefill_prefix_materialization = None
 
-				# The FIRST generated token, straight out of prefill. A
-				# max_tokens=1 request is now completed right after prefill
-				# (PREFILL_PLAN C4, _finish_prefill_completed_sequences) and
-				# the token reaches the client through the normal response
-				# path, so this log is a cross-check of that path rather than
-				# the only way to see the token. Rank 0 only; ids only (the
-				# worker has no tokenizer -- decode them client-side).
-				if self.rank == 0:
-					_ids = batch_new_tokens.reshape(-1).tolist()
-					logging.info(
-						"[PREFILL] first sampled token ids: %s ... last: %s (n=%d)",
-						_ids[:16], _ids[-8:], len(_ids))
 
 		# Keep the historical host-enqueue boundary for backwards-compatible
 		# diagnostics, then establish two stronger completion boundaries. A host
@@ -16482,6 +16471,16 @@ class BatchGenWorker:
 		_prefill_forward_host_s = time.perf_counter() - _prefill_forward_t0
 		torch.cuda.current_stream(self.torch_device).synchronize()
 		_prefill_forward_gpu_complete_s = time.perf_counter() - _prefill_forward_t0
+		# The FIRST generated tokens, straight out of prefill: a cross-check
+		# of the response path (max_tokens=1 requests complete right after
+		# prefill). Read once per wave after the completion boundary above,
+		# never per micro-batch, so it adds no host-device sync. Rank 0 only;
+		# ids only (the worker has no tokenizer -- decode them client-side).
+		if self.rank == 0 and output_tokens:
+			_ids = torch.cat([t.reshape(-1) for t in output_tokens]).tolist()
+			logging.info(
+				"[PREFILL] first sampled token ids: %s ... last: %s (n=%d)",
+				_ids[:16], _ids[-8:], len(_ids))
 		_num_final_kv_tasks = AttnWrapperBase.retire_pending_prefill_offloads(
 			device=self.torch_device,
 			reason="prefill metrics KV-ready boundary",
