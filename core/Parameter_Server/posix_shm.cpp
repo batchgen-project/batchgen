@@ -274,13 +274,11 @@ void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, siz
  * 2.  Base page memfd: the only other strategy, and the fallback when the huge
  * page pool cannot satisfy the request.
  * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM.
- * If pin_for_cuda is true, memory is also registered with cudaHostRegister for DMA.
+ * CUDA registration is the owner's job (see plan_host_registration_segments).
  * * @param shm_name A label for logging; no filesystem object carries it.
  * @param size The desired size of the allocation in bytes.
  * @param create True if the caller is the server (creates the segment), false for workers.
  * @param enable_hugetlbfs If true, attempts a huge page memfd for allocation.
- * @param pin_for_cuda If true, register memory with cudaHostRegister for GPU DMA access.
- *                     Server should pass false (no GPU access needed), workers pass true.
  * @param enable_thp If true, hint transparent huge pages and prefault them.
  * @param memfd_creator_pid Creator of the memfd a worker attaches to.
  * @param memfd_fd_arg The creator's fd number for that memfd.
@@ -292,7 +290,6 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                                     int64_t size,
                                     bool create,
                                     bool enable_hugetlbfs,
-                                    bool pin_for_cuda,
                                     bool enable_thp,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
@@ -514,40 +511,6 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
         }
     }
 
-    // STAGE 3: Register the successfully allocated memory with CUDA (only if pin_for_cuda is true)
-    // Server process skips this to avoid GPU memory usage from page tables
-    if (pin_for_cuda) {
-        try {
-            logger->info("Registering {:.3f}GB with CUDA...", size / (1024.0 * 1024.0 * 1024.0));
-            auto cuda_start = std::chrono::high_resolution_clock::now();
-
-            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-
-            auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::high_resolution_clock::now() - cuda_start);
-
-            if (err != cudaSuccess) {
-                logger->error("cudaHostRegister failed on {:.3f}GB: {}",
-                              size / (1024.0 * 1024.0 * 1024.0),
-                              cudaGetErrorString(err));
-                throw std::runtime_error("cudaHostRegister failed: " + std::string(cudaGetErrorString(err)));
-            }
-
-            logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
-        } catch (const std::exception& e) {
-            // Clean up memory and rethrow if CUDA registration fails. Closing
-            // the creator's fd is the whole release in both modes.
-            munmap(ptr, allocated_size);
-            if (create && *out_memfd_fd >= 0) {
-                close(*out_memfd_fd);
-                *out_memfd_fd = -1;
-            }
-            throw;
-        }
-    } else {
-        logger->info("Skipping CUDA registration (server mode, no GPU access needed)");
-    }
-
     logger->info("Memory allocation completed successfully using {} pages.",
                using_huge_pages ? "huge" : "regular");
 
@@ -557,21 +520,106 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
 }
 
 
-void free_shared_pinned_memory(const std::string& log_level, void* ptr,
-                               int64_t size) {
+void unmap_shared_memory(const std::string& log_level, void* ptr,
+                         int64_t size) {
     const auto logger = init_logger(log_level, kShmLoggerName);
     const auto start = std::chrono::steady_clock::now();
-    const cudaError_t unregister_result = cudaHostUnregister(ptr);
-    const auto unregister_done = std::chrono::steady_clock::now();
     const int unmap_result = munmap(ptr, size);
-    const auto unmap_done = std::chrono::steady_clock::now();
-    logger->info(
-        "shared memory release: cudaHostUnregister={} elapsed={:.3f}s, "
-        "munmap={} elapsed={:.3f}s",
-        static_cast<int>(unregister_result),
-        std::chrono::duration<double>(unregister_done - start).count(),
-        unmap_result,
-        std::chrono::duration<double>(unmap_done - unregister_done).count());
+    logger->info("shared memory release: munmap={} elapsed={:.3f}s",
+                 unmap_result,
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - start)
+                     .count());
+}
+
+std::vector<std::pair<int64_t, int64_t>> plan_host_registration_segments(
+    std::vector<std::pair<int64_t, int64_t>> tensor_extents,
+    int64_t total_bytes, int64_t max_segment_bytes, int64_t page_bytes) {
+    if (total_bytes <= 0 || max_segment_bytes <= 0 || page_bytes <= 0 ||
+        max_segment_bytes % page_bytes != 0) {
+        throw std::runtime_error(
+            "host registration plan: invalid sizes (total=" +
+            std::to_string(total_bytes) + ", max_segment=" +
+            std::to_string(max_segment_bytes) + ", page=" +
+            std::to_string(page_bytes) + ")");
+    }
+    // A cut at p is admissible iff no extent has begin < p < end. Merge the
+    // extents as OPEN intervals: (a, b) and (b, c) leave b admissible, so
+    // only a strict overlap joins two of them.
+    std::vector<std::pair<int64_t, int64_t>> blocked;
+    blocked.reserve(tensor_extents.size());
+    for (const auto& extent : tensor_extents) {
+        if (extent.first < 0 || extent.second > total_bytes ||
+            extent.second < extent.first) {
+            throw std::runtime_error(
+                "host registration plan: tensor extent [" +
+                std::to_string(extent.first) + ", " +
+                std::to_string(extent.second) + ") lies outside the " +
+                std::to_string(total_bytes) + "-byte region");
+        }
+        if (extent.second - extent.first > max_segment_bytes) {
+            throw std::runtime_error(
+                "host registration plan: one tensor of " +
+                std::to_string(extent.second - extent.first) +
+                " bytes exceeds the per-registration ceiling of " +
+                std::to_string(max_segment_bytes) + " bytes");
+        }
+        if (extent.second - extent.first > 1) {
+            blocked.push_back(extent);
+        }
+    }
+    std::sort(blocked.begin(), blocked.end());
+    std::vector<std::pair<int64_t, int64_t>> merged;
+    for (const auto& range : blocked) {
+        if (!merged.empty() && range.first < merged.back().second) {
+            merged.back().second = std::max(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> segments;
+    int64_t start = 0;
+    size_t first_blocked = 0;  // first merged interval ending after start
+    while (start < total_bytes) {
+        if (total_bytes - start <= max_segment_bytes) {
+            segments.emplace_back(start, total_bytes);
+            break;
+        }
+        const int64_t limit = start + max_segment_bytes;  // page aligned
+        // Largest page-aligned p in (start, limit] outside every open blocked
+        // interval. Walk the blocked intervals that intersect (start, limit]
+        // from the right; a candidate inside one moves to its begin, floored.
+        while (first_blocked < merged.size() &&
+               merged[first_blocked].second <= start) {
+            ++first_blocked;
+        }
+        int64_t cut = limit;
+        size_t index = first_blocked;
+        while (index < merged.size() && merged[index].first < limit) {
+            ++index;
+        }
+        // merged[first_blocked, index) start before limit; scan them downward.
+        while (index > first_blocked) {
+            const auto& range = merged[index - 1];
+            if (cut > range.first && cut < range.second) {
+                cut = (range.first / page_bytes) * page_bytes;
+            }
+            if (cut >= range.second) {
+                break;  // cut lies right of this interval, hence of all lower
+            }
+            --index;
+        }
+        if (cut <= start) {
+            throw std::runtime_error(
+                "host registration plan: no tensor-free page boundary within " +
+                std::to_string(max_segment_bytes) + " bytes of offset " +
+                std::to_string(start));
+        }
+        segments.emplace_back(start, cut);
+        start = cut;
+    }
+    return segments;
 }
 
 // -----------------------------------------------------------------------------

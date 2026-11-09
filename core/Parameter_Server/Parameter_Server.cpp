@@ -489,7 +489,7 @@ void Parameter_Server::Init(
     int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(this->log_level_,
                                                weight_shm_name, byte_size, true,
-                                               this->enable_hugetlbfs, false,
+                                               this->enable_hugetlbfs,
                                                this->enable_thp_, -1, -1,
                                                &memfd_fd_out,
                                                &mapped_size);
@@ -664,8 +664,9 @@ Parameter_Server::Parameter_Server(const std::string& log_level,
 
 Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->log_level_, this->weight_ptr_,
-                                  this->mapped_size_);
+        // The server never registers the weights with CUDA; workers do.
+        unmap_shared_memory(this->log_level_, this->weight_ptr_,
+                            this->mapped_size_);
     }
     // Closing the memfds drops the last reference the kernel needs: no name
     // survives this process in any mode, hugetlbfs included, so nothing is left
