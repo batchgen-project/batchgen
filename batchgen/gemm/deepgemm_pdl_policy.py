@@ -29,7 +29,14 @@ def apply_deepgemm_pdl() -> bool:
 	"""
 	if not DEEPGEMM_PDL:
 		return False
-	import deep_gemm
+	try:
+		import deep_gemm
+	except ImportError:
+		# No DeepGEMM in this environment: nothing to toggle. Models whose
+		# runtime contract requires DeepGEMM are refused by the preflight
+		# before this point, so a missing module here means the model does
+		# not use DeepGEMM at all.
+		return False
 
 	set_pdl = getattr(deep_gemm, "set_pdl", None)
 	get_pdl = getattr(deep_gemm, "get_pdl", None)
