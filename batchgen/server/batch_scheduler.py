@@ -185,6 +185,12 @@ class _TurnWaiter:
 class BatchScheduler:
     """Async scheduler that executes batches sequentially."""
 
+    # Response-channel items after which a worker generation sends nothing
+    # more: the pump forwards one and exits. ``None`` (end-of-stream) is
+    # terminal too. Every other item, including a per-request completion that
+    # carries an ``error``, keeps the pump reading.
+    _PUMP_TERMINAL_TYPES = frozenset({"pool_shutdown", "channel_error"})
+
     def __init__(
         self,
         storage: StorageManager,
@@ -426,7 +432,10 @@ class BatchScheduler:
 
         Owns the only blocking read of ``response_queue``.  It exits when the
         scheduler stops, when it is superseded by a later generation, or once
-        it has forwarded a terminal message.  A pump whose read never returns
+        it has forwarded a terminal item (``None``, ``pool_shutdown`` or
+        ``channel_error``).  A completion that reports one request's error is
+        not terminal: it is that request's result, and the generation keeps
+        serving every other request.  A pump whose read never returns
         leaks one idle daemon thread and nothing else: it holds no lock, it
         cannot touch a later generation's queue, and whatever it forwards
         after supersession is dropped.
@@ -468,7 +477,7 @@ class BatchScheduler:
                     break
                 terminal = item is None or (
                     isinstance(item, dict)
-                    and (item.get("type") == "pool_shutdown" or "error" in item)
+                    and item.get("type") in self._PUMP_TERMINAL_TYPES
                 )
                 self._forward_completion(generation, item)
                 if terminal:
@@ -1511,11 +1520,18 @@ class BatchScheduler:
                     if msg_type == "completion":
                         request_id = result.get("request_id")
                         batch_id = result.get("batch_id")
-                        if request_id:
-                            try:
-                                self._scheduling_pool.free_slot(request_id)
-                            except KeyError:
-                                pass
+                        if not request_id:
+                            # A completion that names no request cannot be
+                            # routed or counted against any batch.
+                            self._fail_on_unknown_item(generation, result)
+                            continue
+                        # A completion carrying ``error`` is that one request's
+                        # result (e.g. context_length_exceeded); it is routed
+                        # like any other and written as an error item.
+                        try:
+                            self._scheduling_pool.free_slot(request_id)
+                        except KeyError:
+                            pass
                         # DIAG: Periodic slot status after completions
                         if not hasattr(self, '_completion_count'):
                             self._completion_count = 0
@@ -1607,12 +1623,10 @@ class BatchScheduler:
                             result.get("free_pages"),
                             result.get("page_tokens"),
                         )
-                    elif "error" in result:
-                        logger.error(f"[POOL] Worker error: {result}")
-                        continue
                     else:
-                        # Anything else is a protocol error from the worker
-                        logger.warning(f"[POOL] Unexpected result: {type(result)}")
+                        self._fail_on_unknown_item(generation, result)
+                else:
+                    self._fail_on_unknown_item(generation, result)
             except Exception:
                 logger.exception(
                     "[POOL] Completion listener failed to route an item of "
@@ -1622,6 +1636,28 @@ class BatchScheduler:
                 )
 
         logger.info("[POOL] Completion listener stopped")
+
+    def _fail_on_unknown_item(self, generation: int, item: Any) -> None:
+        """Fail the live generation on a response item outside the protocol.
+
+        A worker generation sends completions (each naming its request), the
+        trajectory-pool capacity snapshot and pool_shutdown; the pump adds
+        channel_error and the end-of-stream ``None``.  Any other item means
+        the server and the worker disagree on the protocol, so the in-flight
+        requests can no longer be accounted for: the active batches are
+        persisted as failed and the generation is reported down, the same
+        handling as an incompatible capacity snapshot.  Ignoring the item
+        would leave those batches in_progress with nothing to finish them.
+        """
+        reason = (
+            f"Worker generation {generation} sent a response item of unknown "
+            f"shape: {item!r:.500}"
+        )
+        logger.error("[POOL] %s", reason)
+        self._fail_all_active_batches(reason)
+        # Persisted above; persisted=True keeps monitor reconciliation from
+        # persisting the same failure a second time.
+        self.worker.report_worker_fatal(reason, persisted=True)
 
     def _write_pool_completion(
         self, batch_id: str, request_id: str, result: dict
