@@ -61,7 +61,7 @@ sys.path.insert(0, str(ROOT))
 from tests.kimi_k31_dsa_refs import (  # noqa: E402
     PML,
     QUANT,
-    fa3_ref,
+    install_sparse_attention_ref,
     head_gates_ref,
     install_fla_shim,
 )
@@ -205,6 +205,12 @@ def _install_flash_mla(monkeypatch):
     module.get_mla_metadata = get_mla_metadata
     module.flash_mla_with_kvcache = flash_mla_with_kvcache
     monkeypatch.setitem(sys.modules, "flash_mla", module)
+    # The dense seam resolves its backend from the device; pin the Hopper
+    # flash_mla backend (this stub has no use_legacy parameter).
+    from batchgen.attention.mla import paged_decode
+
+    monkeypatch.setattr(paged_decode, "_BACKEND", "flashmla")
+    monkeypatch.setattr(paged_decode, "_FLASHMLA_DENSE_KWARGS", None)
 
 
 @pytest.fixture()
@@ -214,8 +220,7 @@ def writer(monkeypatch):
     monkeypatch.setattr(dsa_decode, "_paged_scorer", lambda: paged_scorer_ref)
     monkeypatch.setattr(dsa_decode, "_head_gates", lambda: head_gates_ref)
     monkeypatch.setattr(dsa_decode, "_selected_positions", lambda: transform_ref)
-    monkeypatch.setattr(dsa_decode, "_fa3_with_kvcache", lambda: fa3_ref)
-    monkeypatch.setattr(dsa_decode, "_sparse_fa3_num_splits", lambda: 1)
+    install_sparse_attention_ref(monkeypatch)
     monkeypatch.setattr(rot, "_hadamard_predicate", lambda: QUANT.indexer_applies_hadamard)
     _install_flash_mla(monkeypatch)
     return ref

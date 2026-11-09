@@ -397,9 +397,10 @@ class KimiLinearPlanner(BasePlanner):
         self.attention_group_size = int(attention_group_size)
         # Kimi-K3 decode MoE exchange (server --enable-deepep): False=NCCL, True=DeepEP
         self.enable_deepep = bool(enable_deepep)
-        # Whether the dense MLA decode kernel on this device can be captured
-        # (batchgen.attention.mla.paged_decode.graph_capturable; the
-        # initializer passes the live value, Hopper-era callers keep True).
+        # Whether every MLA decode kernel the model runs on this device can be
+        # captured: paged_decode.graph_capturable, and for K3.1 also
+        # sparse_dispatch.graph_capturable (the initializer passes the live
+        # value, Hopper-era callers keep True).
         self.decode_graph_capturable = bool(decode_graph_capturable)
         self.gpu_total_memory_bytes = (
             None
