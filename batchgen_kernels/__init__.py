@@ -102,10 +102,12 @@ def get_device_arch() -> str:
     if not torch.cuda.is_available():
         raise RuntimeError("batchgen_kernels requires CUDA")
     cc = torch.cuda.get_device_capability()
-    if cc[0] >= 10:
+    if cc == (10, 3):
+        return "sm103"
+    elif cc == (10, 0):
         return "sm100"
-    elif cc[0] >= 9:
+    elif cc == (9, 0):
         return "sm90a"
     raise RuntimeError(
-        f"batchgen_kernels requires SM90+ GPU, got compute capability {cc[0]}.{cc[1]}"
+        f"unsupported CUDA compute capability {cc[0]}.{cc[1]}"
     )
