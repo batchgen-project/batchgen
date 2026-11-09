@@ -1465,6 +1465,13 @@ def main():
         run_v1 = not (args.v2 or args.v3)
         run_v2 = run_v1 or args.v2
         run_v3 = run_v1 or args.v3
+        if run_v3 and not mgm.is_marlin_mxfp4_available(3):
+            if args.v3:
+                print("FATAL: --v3 requested but the v3 entries are not "
+                      "built (sm_90a-only wgmma kernels).")
+                sys.exit(2)
+            print("SKIP v3 ladder: v3 entries are built only for sm_90a")
+            run_v3 = False
         if run_v1:
             t1_decode_bitexact()
             t2_m16_parity()
