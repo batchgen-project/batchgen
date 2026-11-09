@@ -1,13 +1,15 @@
-"""Tests for :func:`batchgen.server.gpu_arch.detect_gpu_arch`.
+"""Tests for :func:`batchgen.config.config.detect_gpu_arch`.
 
-These exercise the new Blackwell (sm_100) branch added in Phase 1 of the
-Blackwell-support effort, plus the existing Hopper and Ampere branches and
-the unsupported-arch error path.
+These exercise the Blackwell (sm_10x) branch, the Hopper and Ampere branches
+and the unsupported-arch error path. ``detect_gpu_arch`` lives in
+``batchgen.config.config`` (moved from ``batchgen.server.gpu_arch``, which is
+now a re-export shim) so the scheduler and worker can import it without the
+``batchgen.server.__init__`` FastAPI chain.
 
 The module is loaded via ``importlib.util.spec_from_file_location`` so the
-test does not trigger ``batchgen.server.__init__`` (which imports
-``http_server`` → ``uvicorn`` and the rest of the FastAPI stack). This mirrors
-the standalone-module-load pattern used by ``tests/test_engine_config.py``.
+test exercises exactly the module that owns the ``torch`` reference being
+monkeypatched. This mirrors the standalone-module-load pattern used by
+``tests/test_engine_config.py``.
 """
 
 from __future__ import annotations
@@ -22,11 +24,11 @@ def _load_gpu_arch_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "batchgen"
-        / "server"
-        / "gpu_arch.py"
+        / "config"
+        / "config.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "_batchgen_server_gpu_arch", module_path
+        "_batchgen_config_config", module_path
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

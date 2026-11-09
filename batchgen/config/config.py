@@ -23,6 +23,32 @@ import torch
 import logging
 
 
+def detect_gpu_arch() -> str:
+    """Return the architecture family for the active CUDA device."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA devices available for GPU architecture detection")
+
+    major, minor = torch.cuda.get_device_capability(0)
+    if major == 10:
+        arch = "blackwell"
+    elif major == 9:
+        arch = "hopper"
+    elif major == 8:
+        arch = "ampere"
+    else:
+        raise RuntimeError(
+            f"Unsupported GPU architecture: compute capability {major}.{minor}"
+        )
+
+    logging.getLogger(__name__).info(
+        "Auto-detected GPU architecture: %s (compute capability %d.%d)",
+        arch,
+        major,
+        minor,
+    )
+    return arch
+
+
 # Basic configuration section
 @dataclass
 class BasicConfig:

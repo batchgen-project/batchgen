@@ -162,6 +162,35 @@ _KDA_HOPPER_EXTENSIONS = _ext(
     "moe._C_routing",
 )
 
+# Generic CUDA extensions selected by BUILD_ARCH=sm103a.  The Blackwell Kimi
+# contracts use this set so a partial lane build fails before model startup.
+_SM103A_EXTENSIONS = (
+    _COMMON_EXTENSIONS
+    + (
+        "batchgen_kernels.conv1d._C_causal_conv1d",
+        "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
+        "batchgen_kernels.moe._C_mxfp4_dequant_cute",
+        "batchgen_kernels.moe._C_mxfp4_dequant",
+        "batchgen_kernels.common._C_rmsnorm",
+        "batchgen_kernels.common._C_cuda_rmsnorm",
+        "batchgen_kernels.common._C_spin_delay",
+        "batchgen_kernels.common._C_mgn_ops",
+        "batchgen_kernels.moe._C_fused_moe_token_permutation",
+        "batchgen_kernels.attention._C_dsa_fast_topk",
+        "batchgen_kernels.attention._C_fast_hadamard_transform",
+        "batchgen_kernels.attention._C_fused_rope_hadamard",
+        "batchgen_kernels.moe._C_marlin_grouped_gemm",
+        "batchgen_kernels.moe._C_routing",
+        "batchgen_kernels.moe._C_dispatch_scatter_3d",
+        "batchgen_kernels.attention._C_fused_kv_norm_rope",
+        "batchgen_kernels.attention._C_fused_q_absorb",
+        "batchgen_kernels.attention._C_fused_q_split",
+        "batchgen_kernels.attention._C_fused_indexer_k_write_fp8",
+        "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+        "batchgen_kernels.attention._C_kda_fused_decode",
+    )
+)
+
 # These are exact model-type contracts, not family-wide fallback rules.  A new
 # model type must be added here before it can enter the production server path.
 _CONTRACTS: dict[str, RuntimeContract] = {
@@ -264,6 +293,53 @@ _CONTRACTS: dict[str, RuntimeContract] = {
         ),
     ),
 }
+
+_KIMI_MODEL_TYPES = frozenset(
+    model_type
+    for identifier, model_type in _KNOWN_IDENTIFIER_PATTERNS
+    if identifier.startswith("Kimi")
+)
+
+_BLACKWELL_KIMI_CONTRACTS = {
+    model_type: RuntimeContract(
+        modules=("flash_mla",),
+        extensions=_SM103A_EXTENSIONS,
+        require_deepgemm=contract.require_deepgemm,
+    )
+    for model_type, contract in _CONTRACTS.items()
+    if model_type in _KIMI_MODEL_TYPES
+}
+
+
+def _detect_runtime_capability() -> tuple[tuple[int, int], int | None]:
+    """Return one capability snapshot for backend and contract selection."""
+    if not torch.cuda.is_available():
+        return (9, 0), None
+    capability = tuple(torch.cuda.get_device_capability())
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return capability, properties.multi_processor_count
+
+
+def _decode_backend_for_capability(
+    capability: tuple[int, int], sm_count: int | None
+) -> str:
+    """Map the detected capability to the single decode backend table."""
+    if capability == (9, 0):
+        return "wgmma" if sm_count == 78 else "fa3"
+    if capability[0] == 10:
+        return "flashmla"
+    raise RuntimePreflightError(
+        f"unsupported CUDA compute capability {capability}; no decode backend"
+    )
+
+
+def _contract_for_capability(
+    model_type: str, capability: tuple[int, int]
+) -> RuntimeContract:
+    """Select the exact model contract from the one capability snapshot."""
+    if capability[0] == 10 and model_type in _BLACKWELL_KIMI_CONTRACTS:
+        return _BLACKWELL_KIMI_CONTRACTS[model_type]
+    return _CONTRACTS[model_type]
 
 
 def _site_roots() -> tuple[Path, ...]:
@@ -517,15 +593,9 @@ def run_runtime_preflight(server_args: object) -> str:
         )
     _check_torch()
     model_type = _resolve_model_type(model)
-    contract = _CONTRACTS[model_type]
-    # H20 = sm_90 with 78 SMs; device names are not reliable across SKUs.
-    decode_backend = (
-        "wgmma"
-        if torch.cuda.is_available()
-        and torch.cuda.get_device_capability() == (9, 0)
-        and torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count == 78
-        else "fa3"
-    )
+    capability, sm_count = _detect_runtime_capability()
+    contract = _contract_for_capability(model_type, capability)
+    decode_backend = _decode_backend_for_capability(capability, sm_count)
     _check_tokenizer(model)
 
     for module_name in contract.modules:
@@ -538,9 +608,7 @@ def run_runtime_preflight(server_args: object) -> str:
         if module_name == "libucx":
             _check_ucx(module)
 
-    hopper = (
-        torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
-    )
+    hopper = capability == (9, 0) and sm_count is not None
     extensions = contract.extensions + (contract.hopper_extensions if hopper else ())
     for extension_name in extensions:
         _import_required(extension_name, origin=_ORIGIN_BATCHGEN)

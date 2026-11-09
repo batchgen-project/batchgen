@@ -11,13 +11,20 @@ Usage:
     )
 """
 
+import logging
+
 import torch
+import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pre-compiled at pip install time, loaded lazily on first kernel call
 # ──────────────────────────────────────────────────────────────────────────────
 
 _cuda_ext = None
+_fused_gate_ext = None
+_fused_gate_fallback_logged = False
 
 
 def _get_ext():
@@ -26,6 +33,32 @@ def _get_ext():
         import batchgen_kernels
         _cuda_ext = batchgen_kernels.load_extension("batchgen_kernels.moe._C_routing")
     return _cuda_ext
+
+
+def _get_fused_gate_ext():
+    global _fused_gate_ext
+    if _fused_gate_ext is None:
+        import batchgen_kernels
+        _fused_gate_ext = batchgen_kernels.load_extension(
+            "batchgen_kernels.moe._C_routing_wgmma", allow_dev_jit=False
+        )
+    return _fused_gate_ext
+
+
+def is_fused_gate_available() -> bool:
+    """Return whether the compute capability 9.x WGMMA fused gate is available."""
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() != (9, 0):
+        return False
+    try:
+        return all(hasattr(_get_fused_gate_ext(), name) for name in (
+            "create_fused_gate_context",
+            "fused_gate_forward",
+            "fused_router_forward",
+        ))
+    except (ImportError, RuntimeError):
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -428,7 +461,21 @@ class FusedGateContext:
             router_bias: [E] BF16 (or empty tensor if no bias)
             topk: number of top experts (2, 4, or 8)
         """
-        ext = _get_ext()
+        self._fallback = not is_fused_gate_available()
+        self._topk = int(topk)
+        self._router_weight = router_weight
+        self._router_bias = router_bias
+        if self._fallback:
+            global _fused_gate_fallback_logged
+            if not _fused_gate_fallback_logged:
+                logger.warning(
+                    "WGMMA fused gate unavailable; using the generic routing path"
+                )
+                _fused_gate_fallback_logged = True
+            self._ctx = None
+            self._ext = None
+            return
+        ext = _get_fused_gate_ext()
         bias = router_bias if router_bias is not None else torch.empty(
             0, dtype=torch.bfloat16, device=router_weight.device)
         self._ctx = ext.create_fused_gate_context(router_weight, bias, topk)
@@ -445,6 +492,8 @@ class FusedGateContext:
         Args:
             base_buffer: [WB_max, H] BF16 — the full allocated buffer
         """
+        if self._fallback:
+            return
         self._ext.fused_gate_warmup(self._ctx, base_buffer)
 
     def forward(self, hidden_states, logits=None, topk_indices=None,
@@ -462,6 +511,17 @@ class FusedGateContext:
             topk_indices: [N, K] int32
             topk_weights: [N, K] FP32
         """
+        if self._fallback:
+            logits = F.linear(
+                hidden_states, self._router_weight, self._router_bias
+            )
+            return gate_topk_softmax_cuda(
+                logits,
+                topk_indices=topk_indices,
+                topk_weights=topk_weights,
+                k=self._topk,
+                num_valid_tokens=num_valid_tokens,
+            )
         _empty = torch.empty(0)
         result = self._ext.fused_gate_forward(
             self._ctx,
@@ -475,6 +535,14 @@ class FusedGateContext:
 
     def router_forward(self, hidden_states, logits=None, num_valid_tokens=-1):
         """Run only the BF16 tensor-core router GEMM and return FP32 logits."""
+        if self._fallback:
+            result = F.linear(
+                hidden_states, self._router_weight, self._router_bias
+            ).float()
+            if logits is not None:
+                logits.copy_(result)
+                return logits
+            return result
         result = self._ext.fused_router_forward(
             self._ctx,
             hidden_states,
@@ -484,7 +552,8 @@ class FusedGateContext:
         return result
 
     def __del__(self):
-        if hasattr(self, '_ctx') and hasattr(self, '_ext'):
+        if (hasattr(self, '_ctx') and self._ctx is not None
+                and hasattr(self, '_ext')):
             self._ext.destroy_fused_gate_context(self._ctx)
 
 
