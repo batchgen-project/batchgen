@@ -643,9 +643,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // .def("get_tensor", &BatchGen::get_tensor,py::return_value_policy::take_ownership)
         .def("get_tensor", &BatchGen::get_tensor)
         .def("start_h2d_worker", &BatchGen::start_h2d_worker)
-        .def("set_global_routed_experts_data_ptr",
-             &BatchGen::set_global_routed_experts_data_ptr)
-        .def("cuda_enable_peer_access", &BatchGen::cuda_enable_peer_access)
         .def("save_compressed_kv", &BatchGen::save_compressed_kv)
         .def("set_weight_copy_queue", &BatchGen::set_weight_copy_queue)
         .def("reset_weight_stream_profile",

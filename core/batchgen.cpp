@@ -452,20 +452,6 @@ void BatchGen::start_h2d_worker() {
 }
 
 
-void BatchGen::set_global_routed_experts_data_ptr(
-    const py::dict& experts_IPC_handles,
-    const py::dict& expert_location_map)
-{
-    this->h2d_engine_.set_global_routed_experts_data_ptr(
-        experts_IPC_handles,
-        expert_location_map
-    );
-}
-
-void BatchGen::cuda_enable_peer_access(int rank, int world_size){
-    this->h2d_engine_.cuda_enable_peer_access(rank, world_size);
-}
-
 void BatchGen::save_compressed_kv(){
     this->kv_storage_.save_compressed_kv();
 }
