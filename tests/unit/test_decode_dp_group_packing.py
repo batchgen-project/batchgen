@@ -31,6 +31,7 @@ from batchgen.prefix_reuse.rank_packing import (
     unit_features,
 )
 from batchgen.prefix_reuse.wave_plan import _build_tree
+from tests.worker.worker_fakes import attach_trajectory_state
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -128,13 +129,12 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
         ),
         _decode_attn_tp_size=lambda: G,
-        # No trajectory session map: the pin is inert for these batches.
-        _trajectory_session_groups=None,
         _prefill_prefix_pool_enabled=lambda: pool,
         _trajectory_tokens=lambda seq, length=None, **_: torch.tensor(
             seq.tokens[:length], dtype=torch.int32
         ),
     )
+    attach_trajectory_state(worker, trajectory_session_groups=None)
     for name, method in _worker_methods(*_METHODS).items():
         setattr(worker, name, MethodType(method, worker))
     return worker

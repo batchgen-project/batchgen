@@ -25,6 +25,7 @@ reproduced from the worker's own branch conditions (``batchgen_worker.py``
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from tests.worker.worker_fakes import attach_trajectory_state
 
 import pytest
 import torch
@@ -641,9 +642,9 @@ def test_the_worker_flag_gate_fails_at_its_first_call(monkeypatch, recorder):
     gate = _worker_method("_persistent_phase_enabled")
     worker = SimpleNamespace(
         args=SimpleNamespace(persistent_phase_instances=True),
-        _trajectory_book=object(),
         parallel_manager=_psm(monkeypatch, recorder),
     )
+    attach_trajectory_state(worker, trajectory_book=object())
 
     with pytest.raises(
         RuntimeError, match="does not support --persistent-phase-instances"

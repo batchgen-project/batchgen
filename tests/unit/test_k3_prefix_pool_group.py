@@ -29,7 +29,11 @@ from typing import List, Optional, Sequence
 
 import pytest
 
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 from batchgen.prefix_reuse import wave_runtime
@@ -367,11 +371,8 @@ def _plan_worker(
         host_paged_kv_worker_view=object(),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         prefix_cache_coordinator=RecordingCoordinator(),
-        _prefix_sequence_states={},
         _prefill_pool_base=(0, 0, 0),
         # No trajectory frontier in play: no attachment, no mirrored index.
-        _trajectory_attachments={},
-        _trajectory_session_groups=None,
         # No worker-wide batchgen_debug: the batch-level flags are the only
         # source, and none of these sequences sets one.
         _batchgen_debug=None,
@@ -386,6 +387,12 @@ def _plan_worker(
         worker,
         rank=rank, world_size=attn_tp_size, local_world_size=8, local_rank=0,
         decode_group_size=attn_tp_size,
+    )
+    attach_prefix_state(worker, prefix_sequence_states={})
+    attach_trajectory_state(
+        worker,
+        trajectory_attachments={},
+        trajectory_session_groups=None,
     )
     worker._trajectory_tokens = (
         lambda seq, length=None, **_: seq.input_ids[0, :length]
@@ -591,7 +598,8 @@ def test_too_few_state_slots_drops_the_pool_on_every_rank(monkeypatch, rank):
     assert worker._plan_prefill_pool_wave(UUIDS, {}) is None
     # A declined plan leaves the lookup states untouched; the CALLER releases
     # the hits for a pool-only model (K3), uniformly across the group.
-    assert worker._prefix_sequence_states == {}
+    # migrated: worker._prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states == {}
 
 
 def test_enough_state_slots_keeps_the_pool(monkeypatch):
@@ -681,15 +689,19 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         host_paged_kv_worker_view=views[0],
-        _prefix_sequence_states=states if states is not None else {},
         _host_views_by_group=lambda: views,
         _prefill_pool_wave=wave,
-        _pool_member_sids={},
-        _pool_sid_members={},
-        _pool_sid_counter=0,
     )
     attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
                     decode_group_size=2)
+    attach_prefix_state(
+        worker,
+        prefix_sequence_states=states if states is not None else {},
+        pool_member_sids={},
+        pool_sid_members={},
+        pool_sid_counter=0,
+    )
+    attach_trajectory_state(worker)
     return _bind(worker, methods)
 
 
@@ -740,7 +752,8 @@ def test_follower_installs_the_leaders_segment_pages(monkeypatch):
     assert len(views_by_rank[0][0].table[sid]) == len(SHARED) // PAGE_TOKENS
     # Nothing was allocated a second time: the follower only set a page table.
     assert views_by_rank[1][0].backend is views_by_rank[0][0].backend
-    assert workers[1]._pool_member_sids == {}
+    # migrated: workers[1]._pool_member_sids -> workers[1]._prefix.pool_member_sids, same owner object.
+    assert workers[1]._prefix.pool_member_sids == {}
     # The follower also took the leader's chain for each member sequence.
     for global_id in GLOBAL_IDS:
         assert workers[1].states[global_id].shared_page_ids_for_group(0) == tuple(
@@ -792,14 +805,17 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
             namespace_digest=(1, 2, 3, 4), publish_boundary_tokens=PAGE_TOKENS,
             max_nodes=64,
         ),
-        _prefix_sequence_states=states,
         _prefill_pool_wave=wave,
-        _pool_member_sids={},
-        _pool_sid_members={},
         _host_views_by_group=lambda: views,
     )
     attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
                     decode_group_size=2)
+    attach_prefix_state(
+        worker,
+        prefix_sequence_states=states,
+        pool_member_sids={},
+        pool_sid_members={},
+    )
     return _bind(worker, methods)
 
 
@@ -878,8 +894,8 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     worker = _finish_worker(
         0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
     )
-    worker._pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
-    worker._pool_sid_members = {-1: 2}
+    worker._prefix.pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
+    worker._prefix.pool_sid_members = {-1: 2}
 
     worker._release_pool_segment_refs(GLOBAL_IDS[0])
     assert backend.released == []  # one member still reads the segment

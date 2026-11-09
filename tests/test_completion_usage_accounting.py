@@ -6,7 +6,11 @@ import torch
 import batchgen.batchgen_worker as worker_module
 from batchgen.batchgen_worker import BatchGenWorker
 from batchgen.sequence import SequenceEntry, SequenceStatus
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 
 
 class _TrajectoryBook:
@@ -48,11 +52,12 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
         query_book={},
         _response_queue=response_queue,
         _get_finish_reason=lambda _seq: "stop",
-        _trajectory_book=_TrajectoryBook(),
         _publish_trajectory_pool_capacity=lambda: None,
         _maybe_emit_prefix_drain_metric=lambda: None,
     )
     attach_identity(worker, rank=0, world_size=1, local_world_size=1)
+    attach_trajectory_state(worker, trajectory_book=_TrajectoryBook())
+    attach_prefix_state(worker)
 
     BatchGenWorker._report_completion(worker, seq.uuid, gathered_text="answer")
     result = response_queue.get()
@@ -82,14 +87,16 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
     # cached-token count (none here: no prefix state).
     attach_identity(worker, rank=0, world_size=1, local_world_size=1,
                     bound={seq.uuid: 0})
+    attach_trajectory_state(worker)
+    attach_prefix_state(worker)
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
     worker.query_book = {0: SimpleNamespace()}
-    worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
+    worker._traj.trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
     worker.eos_token_ids = {154820, 154827, 154829}
     worker.pad_token_id = 154820
     worker.detokenization_include_special_tokens = False
     worker.tokenizer = Tokenizer()
-    worker._prefix_sequence_states = {}
+    worker._prefix.prefix_sequence_states = {}
 
     def gather(output, local):
         output[0] = local
@@ -118,6 +125,8 @@ def test_report_completion_fallback_applies_stop_token_trimming():
     worker = object.__new__(BatchGenWorker)
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
     attach_identity(worker, rank=0, world_size=1, local_world_size=1)
+    attach_trajectory_state(worker)
+    attach_prefix_state(worker)
     worker.query_book = {}
     worker._response_queue = SimpleQueue()
     worker.eos_token_ids = {154820, 154827, 154829}
@@ -125,7 +134,7 @@ def test_report_completion_fallback_applies_stop_token_trimming():
     worker.detokenization_include_special_tokens = False
     worker.tokenizer = Tokenizer()
     worker._get_finish_reason = lambda _seq: "stop"
-    worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
+    worker._traj.trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
     worker._publish_trajectory_pool_capacity = lambda: None
     worker.enable_prefix_cache = False
 
@@ -133,4 +142,5 @@ def test_report_completion_fallback_applies_stop_token_trimming():
 
     assert worker._response_queue.get()["text"] == "answer"
     # Completion is the single release point of the trajectory reservation.
-    assert worker._trajectory_book.released == [0]
+    # migrated: worker._trajectory_book -> worker._traj.trajectory_book, same owner object.
+    assert worker._traj.trajectory_book.released == [0]
