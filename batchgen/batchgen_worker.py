@@ -11281,6 +11281,17 @@ class BatchGenWorker:
 		self._live_phase_key = desired
 		return True, resumed
 
+	def _log_prefill_entry_hbm(self, when: str) -> None:
+		if not torch.cuda.is_available():
+			return
+		free_mem, _ = torch.cuda.mem_get_info(self.local_rank)
+		allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+		reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
+		logging.info(
+			f"[HBM] Rank {self.rank} {when} configure_prefill: "
+			f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
+		)
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
@@ -11329,7 +11340,11 @@ class BatchGenWorker:
 			torch.cuda.synchronize(self.torch_device)
 
 		self._assign_decode_dp_groups(prefill_uuids)
+		if self._live_phase_key != desired_key:
+			self._log_prefill_entry_hbm("BEFORE")
 		phase_changed, resumed = self._transition_phase(desired_key)
+		if phase_changed:
+			self._log_prefill_entry_hbm("AFTER")
 		if phase_changed and not resumed:
 			self._log_phase_memory_ledger("after_configure_prefill")
 		if phase_changed:
@@ -11386,15 +11401,6 @@ class BatchGenWorker:
 			)
 			self.parallel_manager.prepare_resident_ep_prefill_output(
 				self.world_size * moe_ntp
-			)
-
-		if torch.cuda.is_available():
-			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
-			allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
-			reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
-			logging.info(
-				f"[HBM] Rank {self.rank} BEFORE configure_prefill: "
-				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
 			)
 
 		# STEP 3: Prepare evicted sequences for re-entry (before host KV allocation)
