@@ -171,6 +171,37 @@ def test_whole_model_prewarm_captures_on_empty_rank():
     assert ("capture_whole", WHOLE_BUCKET) in calls
 
 
+def _graph_attention_functions():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(cgs.__file__).read_text())
+    wanted = {"_mla_decode_graph_safe", "_graph_attention"}
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+
+
+def test_graph_attention_reads_cache_without_an_active_page_table():
+    # An empty rank captures the whole-model graph before it has ever built
+    # an active GPU page table; the graph brings its own static table, so the
+    # graph attention may read only the cache tensors.
+    import ast
+
+    functions = _graph_attention_functions()
+    assert {f.name for f in functions} == {"_mla_decode_graph_safe", "_graph_attention"}
+    for function in functions:
+        called = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "get_layer_kv_with_page_table" not in called, function.name
+        assert "get_layer_kv_cache" in called, function.name
+
+
 def test_legacy_moe_capture_only_when_every_rank_has_rows():
     calls = _calls("prewarm", [101], whole_available=False, all_nonempty=True)
     assert ("capture_moe", WHOLE_BUCKET) in calls

@@ -242,10 +242,10 @@ def _mla_decode_graph_safe(
     # `data_ptr + layer * num_pages * page_stride`, so a re-init with a
     # different num_pages moves it even when data_ptr is reused. That is why
     # `_signature` must carry the cache shape/stride, not just the pointer.
-    blocked_k, _, _ = (
-        AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
-            layer_idx=layer_idx
-        )
+    # The graph brings its own static page table, so only the cache tensor is
+    # read here; an empty rank captures before it ever builds an active table.
+    blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
+        layer_idx
     )
     run_paged_kv_token_update_fused(
         k_cache=blocked_k,
@@ -561,14 +561,14 @@ class KimiLinearSpanSegment:
             return attn_out, {}
         if self.is_dsa:
             # FlashMLA's schedule is unused here: the sparse attention runs on
-            # FA3 over the selected tokens.
-            blocked_k, _, _ = (
-                AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
-                    layer_idx=self.layer_idx
-                )
+            # FA3 over the selected tokens. Both page tables come from the
+            # graph's static buffer, so only the cache tensors are read; an
+            # empty rank captures before it ever builds an active table.
+            blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
+                self.layer_idx
             )
-            aux_blocked_k, _, _ = (
-                AttnWrapperBase.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
+            aux_blocked_k, _ = (
+                AttnWrapperBase.gpu_paged_kv_manager_aux.get_layer_kv_cache(
                     self.layer_idx
                 )
             )
