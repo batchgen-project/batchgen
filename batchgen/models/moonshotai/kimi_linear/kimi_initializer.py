@@ -152,11 +152,14 @@ class KimiLinearInitializer:
             G = 8
         else:
             G = requested_G
+        from batchgen.attention.mla.paged_decode import graph_capturable
+
         self.planner = KimiLinearPlanner(
             is_k3=self.is_k3,
             attention_group_size=G,
             gpu_total_memory_bytes=self.gpu_total_memory_bytes,
             enable_deepep=getattr(input_arguments, "enable_deepep", False),
+            decode_graph_capturable=graph_capturable(),
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")

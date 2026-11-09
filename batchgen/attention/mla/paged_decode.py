@@ -44,6 +44,16 @@ def _backend() -> str:
     return _BACKEND
 
 
+def graph_capturable() -> bool:
+    """Whether the selected decode kernel can be captured in a CUDA graph.
+
+    flash_mla decode takes precomputed scheduler metadata and captures; the
+    flashinfer trtllm-gen path plans per call and has no graph-safe variant
+    in BatchGen yet, so decode on Blackwell runs eager.
+    """
+    return _backend() == "flashmla"
+
+
 def flashmla_dense_kwargs() -> dict:
     """Extra kwargs a flash_mla dense-decode call needs for the installed package."""
     global _FLASHMLA_DENSE_KWARGS
