@@ -11218,6 +11218,30 @@ class BatchGenWorker:
 			if not self._streamed_sp8_h2d_installed:
 				self.core_engine.reset_decoding_buffer()
 
+	def _release_suspended_decode_kv_pool(self) -> None:
+		"""Return the suspended decode KV pool's physical pages, keep its addresses.
+
+		The decode graphs baked the pool bases, page-pointer tables and
+		page-table storage, so a resumable decode instance must find them at
+		the same virtual addresses; only the physical memory goes back to the
+		driver for the prefill phase, and ``_remap_reused_kv_pool`` maps it
+		again on resume.
+		"""
+		self._assert_kv_pool_addresses_are_fixed("decode->prefill")
+		manager = self.gpu_paged_kv_cache_manager
+		pages = manager.get_stats().num_total_pages if manager is not None else 0
+		start = time.perf_counter()
+		self._destroy_gpu_paged_kv_cache()
+		if manager is not None:
+			logging.info(
+				"[GPU-KV] rank=%d released the reserved KV pool's physical "
+				"pages in %.3fs (%d pages, %.2f GB)",
+				self.rank,
+				time.perf_counter() - start,
+				pages,
+				self.gpu_kv_cache_size_gb,
+			)
+
 	def _transition_phase(
 		self, desired: PhaseKey, *, comm=None, max_num_seq: int | None = None
 	) -> tuple[bool, bool]:
@@ -11234,13 +11258,14 @@ class BatchGenWorker:
 				and self.parallel_manager.holds_instance("decode")
 			)
 			self._prepare_phase_exit(live, desired)
-			self.parallel_manager.phase_exit(live, exit_mode)
 			if live.phase == "decode":
-				keep_buffers = bool(
-					getattr(self.args, "persistent_phase_instances", False)
-					and exit_mode is ExitMode.SUSPEND
-				)
-				self._destroy_gpu_paged_kv_cache(keep_buffers=keep_buffers)
+				if exit_mode is ExitMode.RETIRE:
+					self._destroy_gpu_paged_kv_cache()
+				elif self._persistent_phase_enabled():
+					self._destroy_gpu_paged_kv_cache(keep_buffers=True)
+				else:
+					self._release_suspended_decode_kv_pool()
+			self.parallel_manager.phase_exit(live, exit_mode)
 			if exit_mode is ExitMode.RETIRE:
 				if live.phase != "decode":
 					self._destroy_gpu_paged_kv_cache()
@@ -11318,9 +11343,12 @@ class BatchGenWorker:
 			if self._prefill_prefix_pool_enabled():
 				self._measure_prefill_pool_budget()
 			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
-		self.parallel_manager.admit(
-			desired_key, AdmitContext(uuids=list(prefill_uuids))
-		)
+		else:
+			# phase_enter readies the instance for the first wave of a phase;
+			# admit prepares every later wave of the same live phase.
+			self.parallel_manager.admit(
+				desired_key, AdmitContext(uuids=list(prefill_uuids))
+			)
 
 		if phase_changed and not persistent and k3_prefill_profile and torch.cuda.is_available():
 			torch.cuda.reset_peak_memory_stats(self.local_rank)
@@ -11563,9 +11591,6 @@ class BatchGenWorker:
 			desired_key, comm=comm, max_num_seq=padding_bsz
 		)
 		if not phase_changed:
-			self.parallel_manager.admit(
-				desired_key, AdmitContext(uuids=[], local_indices=[])
-			)
 			return
 		if resumed:
 			self._remap_reused_kv_pool()

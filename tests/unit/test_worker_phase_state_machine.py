@@ -92,6 +92,10 @@ def _worker(manager, events):
     worker._destroy_gpu_paged_kv_cache = lambda **kwargs: events.append(
         ("destroy_kv", kwargs)
     )
+    worker._persistent_phase_enabled = lambda: worker.args.persistent_phase_instances
+    worker._release_suspended_decode_kv_pool = lambda: events.append(
+        "release_kv_pool"
+    )
     worker.deep_free_model_memory = lambda: events.append("deep_free")
     worker.init_nvshmem = lambda: events.append("init_nvshmem")
     worker.model = None
@@ -170,10 +174,40 @@ def test_unheld_outgoing_instance_uses_retire_mechanics():
     worker._transition_phase(PhaseKey("prefill", "streamed"))
 
     exit_index = events.index(("exit", "decode", ExitMode.RETIRE))
-    assert exit_index < events.index(("destroy_kv", {"keep_buffers": False}))
-    assert events.index("deep_free") < events.index(
+    assert events.index(("destroy_kv", {})) < exit_index
+    assert exit_index < events.index("deep_free") < events.index(
         ("enter", "prefill", None, None)
     )
+    assert "release_kv_pool" not in events
+
+
+def test_suspended_decode_releases_pool_pages_before_manager_exit():
+    events = []
+    manager = _Manager(events, {"decode": True})
+    worker = _worker(manager, events)
+    worker._live_phase_key = PhaseKey("decode", "streamed")
+
+    worker._transition_phase(PhaseKey("prefill", "streamed"))
+
+    exit_index = events.index(("exit", "decode", ExitMode.SUSPEND))
+    assert events.index("release_kv_pool") < exit_index
+    assert "deep_free" not in events
+    assert not [e for e in events if isinstance(e, tuple) and e[0] == "destroy_kv"]
+
+
+def test_persistent_suspended_decode_keeps_kv_buffers():
+    events = []
+    manager = _Manager(events, {"decode": True})
+    worker = _worker(manager, events)
+    worker.args.persistent_phase_instances = True
+    worker._live_phase_key = PhaseKey("decode", "streamed")
+
+    worker._transition_phase(PhaseKey("prefill", "streamed"))
+
+    exit_index = events.index(("exit", "decode", ExitMode.SUSPEND))
+    assert events.index(("destroy_kv", {"keep_buffers": True})) < exit_index
+    assert "release_kv_pool" not in events
+    assert "deep_free" not in events
 
 
 def test_prepare_phase_exit_orders_cleanup_before_manager_exit_and_resets_only_for_unstreamed_prefill_to_decode():
