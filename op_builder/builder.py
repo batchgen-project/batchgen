@@ -32,6 +32,8 @@ import distutils.ccompiler
 import distutils.log
 import distutils.sysconfig
 import os
+import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -46,6 +48,24 @@ from typing import List
 YELLOW = "\033[93m"
 END = "\033[0m"
 WARNING = f"{YELLOW} [WARNING] {END}"
+
+# Kernel machine name (`uname -m`, lscpu "Architecture") -> py-cpuinfo arch name.
+_MACHINE_TO_CPUINFO_ARCH = {
+    "x86_64": "X86_64",
+    "amd64": "X86_64",
+    "aarch64": "ARM_8",
+    "arm64": "ARM_8",
+    "ppc64le": "PPC_64",
+}
+
+
+class UnsupportedCPUArchError(RuntimeError):
+    """The host CPU architecture has no known native-tuning compiler flag."""
+
+
+def _cpuinfo_arch(machine):
+    """py-cpuinfo arch name for a machine name; unknown names pass through upper-cased."""
+    return _MACHINE_TO_CPUINFO_ARCH.get(machine.lower(), machine.upper())
 
 DEFAULT_TORCH_EXTENSION_PATH = "/tmp/torch_extensions"
 DEFAULT_COMPUTE_CAPABILITIES = "6.0;6.1;7.0"
@@ -411,28 +431,36 @@ class OpBuilder(ABC):
         return [x for x in args if len(x) > 0]
 
     def cpu_arch(self):
+        arch = self._cpu_info()["arch"]
+        if arch == "X86_64":
+            return "-march=native"
+        if arch.startswith("ARM_") or arch.startswith("PPC_"):
+            # GCC's AArch64 and PowerPC idiom: -mcpu=native picks the ISA
+            # extensions and the tuning of the host core.
+            return "-mcpu=native"
+        raise UnsupportedCPUArchError(
+            f"{self.name}: unsupported host CPU architecture {arch!r}; "
+            f"supported: {sorted(set(_MACHINE_TO_CPUINFO_ARCH.values()))}"
+        )
+
+    def _cpu_info(self):
+        """Host CPU as ``{"arch": <py-cpuinfo arch name>, "flags": ...}``.
+
+        py-cpuinfo when it is installed and reports an architecture, else lscpu,
+        else the kernel's machine name, so ``arch`` is never None.
+        """
         try:
             from cpuinfo import get_cpu_info
-        except ImportError:
-            cpu_info = self._backup_cpuinfo()
-            if cpu_info is None:
-                return "-march=native"
 
-        try:
-            cpu_info = get_cpu_info()
-        except Exception as e:
-            # self.warning(
-            #     f"{self.name} attempted to use `py-cpuinfo` but failed (exception type: {type(e)}, {e}), "
-            #     "falling back to `lscpu` to get this information."
-            # )
-            cpu_info = self._backup_cpuinfo()
-            if cpu_info is None:
-                return "-march=native"
-
-        if cpu_info["arch"].startswith("PPC_"):
-            # gcc does not provide -march on PowerPC, use -mcpu instead
-            return "-mcpu=native"
-        return "-march=native"
+            info = get_cpu_info()
+            if info.get("arch"):
+                return {"arch": info["arch"], "flags": info.get("flags", [])}
+        except Exception:
+            pass
+        info = self._backup_cpuinfo()
+        if info is not None:
+            return info
+        return {"arch": _cpuinfo_arch(platform.machine()), "flags": ""}
 
     def is_cuda_enable(self):
         try:
@@ -447,52 +475,32 @@ class OpBuilder(ABC):
         return "-D__DISABLE_CUDA__"
 
     def _backup_cpuinfo(self):
-        # Construct cpu_info dict from lscpu that is similar to what py-cpuinfo provides
+        """cpu_info dict like py-cpuinfo's, from lscpu; None without lscpu."""
         if not self.command_exists("lscpu"):
             self.warning(
                 f"{self.name} attempted to query 'lscpu' after failing to use py-cpuinfo "
                 "to detect the CPU architecture. 'lscpu' does not appear to exist on "
-                "your system, will fall back to use -march=native and non-vectorized execution."
+                "your system; using the kernel machine name and non-vectorized execution."
             )
             return None
         result = subprocess.check_output("lscpu", shell=True)
         result = result.decode("utf-8").strip().lower()
 
-        cpu_info = {}
-        cpu_info["arch"] = None
-        cpu_info["flags"] = ""
-        if "genuineintel" in result or "authenticamd" in result:
-            cpu_info["arch"] = "X86_64"
+        match = re.search(r"^architecture:\s*(\S+)", result, re.MULTILINE)
+        machine = match.group(1) if match else platform.machine()
+        cpu_info = {"arch": _cpuinfo_arch(machine), "flags": ""}
+        if cpu_info["arch"] == "X86_64":
             if "avx512" in result:
                 cpu_info["flags"] += "avx512,"
             elif "avx512f" in result:
                 cpu_info["flags"] += "avx512f,"
             if "avx2" in result:
                 cpu_info["flags"] += "avx2"
-        elif "ppc64le" in result:
-            cpu_info["arch"] = "PPC_"
 
         return cpu_info
 
     def simd_width(self):
-        try:
-            from cpuinfo import get_cpu_info
-        except ImportError:
-            cpu_info = self._backup_cpuinfo()
-            if cpu_info is None:
-                return "-D__SCALAR__"
-
-        try:
-            cpu_info = get_cpu_info()
-        except Exception as e:
-            # self.warning(
-            #     f"{self.name} attempted to use `py-cpuinfo` but failed (exception type: {type(e)}, {e}), "
-            #     "falling back to `lscpu` to get this information."
-            # )
-            cpu_info = self._backup_cpuinfo()
-            if cpu_info is None:
-                return "-D__SCALAR__"
-
+        cpu_info = self._cpu_info()
         if cpu_info["arch"] == "X86_64":
             if "avx512" in cpu_info["flags"] or "avx512f" in cpu_info["flags"]:
                 return "-D__AVX512__"
