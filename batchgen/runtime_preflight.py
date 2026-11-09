@@ -164,8 +164,15 @@ _KDA_HOPPER_EXTENSIONS = _ext(
 
 # Generic CUDA extensions selected by BUILD_ARCH=sm103a.  The Blackwell Kimi
 # contracts use this set so a partial lane build fails before model startup.
+# _C_gqa_mha_decode_bf16 is excluded: it is a sourceless prebuilt binary for
+# the Hopper decode path (its consumer falls back on any non-(9,0) device),
+# so it cannot be rebuilt for this lane and is not reachable on it.
 _SM103A_EXTENSIONS = (
-    _COMMON_EXTENSIONS
+    tuple(
+        extension
+        for extension in _COMMON_EXTENSIONS
+        if extension != "batchgen_kernels.attention._C_gqa_mha_decode_bf16"
+    )
     + (
         "batchgen_kernels.conv1d._C_causal_conv1d",
         "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
