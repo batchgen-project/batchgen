@@ -299,7 +299,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         if (!size_aligned) alignment_info += "total_size NOT aligned, ";
         if (dest_aligned && size_aligned) alignment_info += "both aligned, ";
         this->logger->debug("");
-        this->logger->info(alignment_info + "using direct I/O for {} bytes", 
+        // Literal format string: C++20 fmt checks the format at compile time,
+        // so the runtime-assembled prefix is passed as an argument instead.
+        this->logger->info("{}using direct I/O for {} bytes", alignment_info,
                         dest_aligned ? metadata.total_byte_size : 0);
 
         if (!dest_aligned) {
