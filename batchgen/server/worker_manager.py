@@ -2659,12 +2659,14 @@ class WorkerManager:
 
             # Warn if /dev/shm is limiting
             if shm_free_gb < host_mem_budget:
+                from batchgen.server.weight_store_staging import shm_remount_command
+
                 logger.warning(
                     "Host KV cache size limited by /dev/shm free space (%d GB). "
-                    "For full utilization, mount /dev/shm with host memory size: "
-                    "sudo mount -o remount,size=%dG /dev/shm",
+                    "For full utilization, size /dev/shm to host memory minus "
+                    "the OS reserve: sudo %s",
                     shm_free_gb,
-                    int(mem.total / (1024**3)),
+                    shm_remount_command("/dev/shm", mem.total),
                 )
 
             logger.info(

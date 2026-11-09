@@ -447,7 +447,8 @@ class LaunchReadinessProbe:
                 f"the tmpfs holding {staging_dir} has {available} B free but "
                 f"staging this store needs {needed} B (store {config['store_bytes']} B "
                 f"plus {STAGING_HEADROOM_BYTES} B headroom); free it or remount "
-                f"it larger before launching",
+                f"it to the host size ({staging.shm_remount_command(entry.mountpoint)}) "
+                f"before launching",
             )
         return CheckResult(
             name,

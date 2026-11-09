@@ -198,6 +198,9 @@ def test_staging_tmpfs_refuses_a_mount_too_small_for_the_store(tmp_path):
     ).check_staging_tmpfs()
     assert result.status == STATUS_FAIL
     assert str(STORE_BYTES + STAGING_HEADROOM_BYTES) in result.evidence
+    # The advice names the host-sized remount (MemTotal - 300 GiB, whole GiB).
+    assert "mount -o remount," in result.evidence
+    assert "huge=within_size {}".format(tmp_path / "shm") in result.evidence
 
 
 def test_staging_tmpfs_sizes_the_mount_that_will_hold_a_missing_directory(tmp_path):
