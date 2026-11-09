@@ -37,6 +37,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from batchgen.attention.varlen_dispatch import varlen_attention_func
 from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 
 from .config import is_k3_model_type
@@ -200,10 +201,6 @@ def mla_prefill_nope_prepacked(
     chunk (``same_chunk_ancestors``). The 576-wide latent is returned either
     way: the Host cache keeps the latent, never the expanded heads.
     """
-    # FA3 (flash_attn_interface); FA2 `flash_attn` is not installed on the
-    # H20 node. Same kwargs; the tuple return is normalized below.
-    from flash_attn_interface import flash_attn_varlen_func
-
     total_tokens = hidden_states_2d.shape[0]
 
     if self.q_lora_rank is not None:
@@ -242,7 +239,7 @@ def mla_prefill_nope_prepacked(
     value_states = value_states.contiguous()
 
     if pool_batch is None:
-        attn_output = flash_attn_varlen_func(
+        attn_output = varlen_attention_func(
             query_states,
             key_states,
             value_states,

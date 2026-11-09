@@ -750,6 +750,11 @@ class DeepseekV3ParallelStrategyManager:
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			if self.engine_config.Basic_Config.gpu_arch in ("hopper", "blackwell"):
+				if self.engine_config.Basic_Config.gpu_arch == "blackwell":
+					raise NotImplementedError(
+						"DeepSeek-V3 attention on Blackwell is unsupported pending "
+						"sub-project work"
+					)
 				from ....attention.mla.fa3_backend import (
 					mla_prefill_flashattention3,
 					mla_prefill_flashattention3_w8a16_deepgemm,
