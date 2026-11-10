@@ -584,10 +584,12 @@ class BatchScheduler:
             prepared = self._prepare_in_progress_batch(batch_id, batch, input_path)
             if prepared is None:
                 return
-            requests, prompts, per_request_max_tokens, sampling_params = prepared
+            (requests, prompts, per_request_max_tokens, sampling_params,
+             rejections) = prepared
             await self._process_batch_pool_mode(
                 batch_id, batch, requests, prompts,
                 per_request_max_tokens, sampling_params,
+                rejections=rejections,
             )
         except Exception as exc:
             logger.exception(
@@ -603,17 +605,20 @@ class BatchScheduler:
     def _prepare_in_progress_batch(
         self, batch_id: str, batch: Any, input_path: Any,
     ) -> Optional[
-        Tuple[List[BatchRequestItem], List[str], List[int], List[Dict[str, Any]]]
+        Tuple[
+            List[BatchRequestItem], List[Optional[str]], List[Optional[int]],
+            List[Dict[str, Any]], Dict[int, str],
+        ]
     ]:
         """Parse and render a batch already marked IN_PROGRESS.
 
-        Returns (requests, prompts, per_request_max_tokens, sampling_params),
-        or None after an expected rejection has set FAILED with its own
-        message. Anything raised is turned into FAILED by _process_batch. A
-        request the prompt construction rejects (an unknown chat role, a
-        conversation the tokenizer cannot render faithfully, a malformed tool
-        call) still fails the whole batch; per-request rejection at admission
-        is a follow-up.
+        Returns (requests, prompts, per_request_max_tokens, sampling_params,
+        rejections), or None after an expected rejection has set FAILED with
+        its own message. Anything raised is turned into FAILED by
+        _process_batch. A request the prompt construction rejects (an unknown
+        chat role, a conversation the tokenizer cannot render faithfully, a
+        malformed tool call) is in ``rejections`` by index and fails alone;
+        the rest of the batch is served.
         """
         with input_path.open("rb") as handle:
             content = handle.read()
@@ -627,8 +632,8 @@ class BatchScheduler:
             )
             return None
 
-        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
-            requests, batch
+        prompts, per_request_max_tokens, sampling_params, rejections = (
+            self._convert_requests_to_worker_inputs(requests, batch)
         )
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
         default_max = batch.max_decoding_length
@@ -636,7 +641,7 @@ class BatchScheduler:
             missing_ids = [
                 requests[i].custom_id or f"request-{i}"
                 for i, mt in enumerate(per_request_max_tokens)
-                if mt is None
+                if mt is None and i not in rejections
             ]
             if missing_ids:
                 error_message = (
@@ -663,90 +668,50 @@ class BatchScheduler:
                 f"serve as defaults only; per-request values take priority"
             )
 
-        return requests, prompts, per_request_max_tokens, sampling_params
+        return (
+            requests, prompts, per_request_max_tokens, sampling_params,
+            rejections,
+        )
 
     def _convert_requests_to_worker_inputs(
         self, requests: List[BatchRequestItem], batch=None,
-    ) -> Tuple[List[str], List[int], List[Dict[str, Any]]]:
+    ) -> Tuple[
+        List[Optional[str]], List[Optional[int]], List[Dict[str, Any]],
+        Dict[int, str],
+    ]:
         """Convert batch requests to worker inputs with per-request sampling params.
 
         Returns:
-            (prompts, per_request_max_tokens, sampling_params) where
-            per_request_max_tokens is a per-sequence list of max output token limits,
-            and sampling_params is a list of dicts with keys: temperature, top_p, top_k.
-            Per-request values take priority; batch-level values serve as defaults.
+            (prompts, per_request_max_tokens, sampling_params, rejections)
+            where per_request_max_tokens is a per-sequence list of max output
+            token limits, sampling_params is a list of dicts with keys:
+            temperature, top_p, top_k (per-request values take priority;
+            batch-level values serve as defaults), and rejections maps the
+            index of each request whose prompt cannot be constructed (a
+            ValueError from validation or the chat template) to the reason.
+            A rejected request's prompt is None; it fails on its own and
+            never reaches a worker.
         """
-        prompts: List[str] = []
-        per_request_max_tokens: List[int] = []
+        prompts: List[Optional[str]] = []
+        per_request_max_tokens: List[Optional[int]] = []
         sampling_params: List[Dict[str, Any]] = []
+        rejections: Dict[int, str] = {}
 
         # Batch-level defaults (fallback when per-request is None)
         batch_temp = batch.temperature if batch else None
         batch_top_p = batch.top_p if batch else None
         batch_top_k = batch.top_k if batch else None
 
-        for request in requests:
+        for index, request in enumerate(requests):
             body = request.body
-            if isinstance(body, ChatCompletionRequest):
-                model_lower = body.model.lower()
-                if "glm-5.3" in model_lower:
-                    if body.enable_thinking is False or body.thinking is False:
-                        raise ValueError(
-                            "GLM-5.3 does not support enable_thinking=false; "
-                            "use reasoning_effort=low/high/max with thinking enabled."
-                        )
-                    if body.reasoning_effort == "medium":
-                        raise ValueError(
-                            "GLM-5.3 reasoning_effort must be low, high, or max; "
-                            "medium is unsupported."
-                        )
-                # Inject reasoning_effort into system message for GPT-OSS models
-                messages = self._inject_reasoning_effort(
-                    [m.dict(exclude_none=True) for m in body.messages],
-                    body.model,
-                    body.reasoning_effort,
-                )
-                # Forward extra kwargs (thinking, tools) to chat template.
-                # The GLM-5 / SGLang convention is `enable_thinking`; older
-                # callers may send `thinking`. Prefer `enable_thinking` when
-                # both are set, and forward BOTH names so templates written
-                # against either convention work.
-                template_kwargs = {}
-                thinking_val = (
-                    body.enable_thinking
-                    if body.enable_thinking is not None
-                    else body.thinking
-                )
-                if thinking_val is not None:
-                    template_kwargs["enable_thinking"] = thinking_val
-                    template_kwargs["thinking"] = thinking_val
-                if body.tools is not None:
-                    template_kwargs["tools"] = body.tools
-                if body.reasoning_effort is not None and "glm-5.3" in model_lower:
-                    template_kwargs["reasoning_effort"] = body.reasoning_effort
-                if body.clear_thinking is not None:
-                    template_kwargs["clear_thinking"] = body.clear_thinking
-                if body.preserve_thinking is not None:
-                    template_kwargs["preserve_thinking"] = body.preserve_thinking
-                try:
-                    prompt = self._format_chat_messages(
-                        messages, body.model, **template_kwargs
-                    )
-                except Exception as exc:
-                    # Attach the custom_id. The caller fails the batch; without
-                    # the id there is no way to tell which of N requests did it.
-                    custom_id = request.custom_id or "<no custom_id>"
-                    raise ValueError(
-                        f"request {custom_id!r}: the chat template rejected "
-                        f"this conversation: {type(exc).__name__}: {exc}"
-                    ) from exc
-                # Priority: max_completion_tokens > max_tokens > None
-                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
-            elif isinstance(body, CompletionRequest):
-                prompt = completion_prompt_to_text(body.prompt)
-                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
-            else:
-                raise ValueError("Unsupported request body type")
+            current_max_tokens = getattr(body, "max_completion_tokens", None)
+            if current_max_tokens is None:
+                current_max_tokens = getattr(body, "max_tokens", None)
+            try:
+                prompt = self._construct_prompt(request)
+            except ValueError as exc:
+                prompt = None
+                rejections[index] = f"{type(exc).__name__}: {exc}"
 
             prompts.append(prompt)
             per_request_max_tokens.append(current_max_tokens)
@@ -767,7 +732,68 @@ class BatchScheduler:
                 'top_k': effective_top_k,
             })
 
-        return prompts, per_request_max_tokens, sampling_params
+        return prompts, per_request_max_tokens, sampling_params, rejections
+
+    def _construct_prompt(self, request: BatchRequestItem) -> str:
+        """The worker prompt for one request; ValueError rejects the request."""
+        body = request.body
+        if isinstance(body, ChatCompletionRequest):
+            model_lower = body.model.lower()
+            if "glm-5.3" in model_lower:
+                if body.enable_thinking is False or body.thinking is False:
+                    raise ValueError(
+                        "GLM-5.3 does not support enable_thinking=false; "
+                        "use reasoning_effort=low/high/max with thinking enabled."
+                    )
+                if body.reasoning_effort == "medium":
+                    raise ValueError(
+                        "GLM-5.3 reasoning_effort must be low, high, or max; "
+                        "medium is unsupported."
+                    )
+            # Inject reasoning_effort into system message for GPT-OSS models
+            messages = self._inject_reasoning_effort(
+                [m.dict(exclude_none=True) for m in body.messages],
+                body.model,
+                body.reasoning_effort,
+            )
+            # Forward extra kwargs (thinking, tools) to chat template.
+            # The GLM-5 / SGLang convention is `enable_thinking`; older
+            # callers may send `thinking`. Prefer `enable_thinking` when
+            # both are set, and forward BOTH names so templates written
+            # against either convention work.
+            template_kwargs = {}
+            thinking_val = (
+                body.enable_thinking
+                if body.enable_thinking is not None
+                else body.thinking
+            )
+            if thinking_val is not None:
+                template_kwargs["enable_thinking"] = thinking_val
+                template_kwargs["thinking"] = thinking_val
+            if body.tools is not None:
+                template_kwargs["tools"] = body.tools
+            if body.reasoning_effort is not None and "glm-5.3" in model_lower:
+                template_kwargs["reasoning_effort"] = body.reasoning_effort
+            if body.clear_thinking is not None:
+                template_kwargs["clear_thinking"] = body.clear_thinking
+            if body.preserve_thinking is not None:
+                template_kwargs["preserve_thinking"] = body.preserve_thinking
+            try:
+                prompt = self._format_chat_messages(
+                    messages, body.model, **template_kwargs
+                )
+            except Exception as exc:
+                # Attach the custom_id: the request fails with this reason,
+                # and the id says which of N requests it was.
+                custom_id = request.custom_id or "<no custom_id>"
+                raise ValueError(
+                    f"request {custom_id!r}: the chat template rejected "
+                    f"this conversation: {type(exc).__name__}: {exc}"
+                ) from exc
+            return prompt
+        if isinstance(body, CompletionRequest):
+            return completion_prompt_to_text(body.prompt)
+        raise ValueError("Unsupported request body type")
 
     def _inject_reasoning_effort(
         self,
@@ -938,7 +964,7 @@ class BatchScheduler:
             body=body,
         )
         try:
-            prompts, max_tokens, sampling_params = (
+            prompts, max_tokens, sampling_params, rejections = (
                 self._convert_requests_to_worker_inputs([item])
             )
         except Exception as exc:
@@ -946,6 +972,11 @@ class BatchScheduler:
                 400, "invalid_request",
                 f"prompt construction failed: {type(exc).__name__}: {exc}",
             ) from exc
+        if rejections:
+            raise TurnError(
+                400, "invalid_request",
+                f"prompt construction failed: {rejections[0]}",
+            )
         if max_tokens[0] is None:
             raise TurnError(
                 400, "max_tokens_required",
@@ -1162,16 +1193,24 @@ class BatchScheduler:
         batch_id: str,
         batch: Any,
         requests: List[BatchRequestItem],
-        prompts: List[str],
-        per_request_max_tokens: List[int],
+        prompts: List[Optional[str]],
+        per_request_max_tokens: List[Optional[int]],
         sampling_params: List[Dict[str, Any]],
+        rejections: Optional[Dict[int, str]] = None,
     ) -> None:
         """Process a batch in pool mode: push to IntakePool for async processing.
 
         All batches (including the first) go through IntakePool → drain task → worker.
         The drain task sends an "init" message on first drain, then admission messages.
+        A request in ``rejections`` (index -> reason) never reaches the pool:
+        it completes at once as a Batch API error item, and the rest of the
+        batch is served.
         """
-        max_tokens = max(per_request_max_tokens)
+        rejections = dict(rejections or {})
+        admitted = [i for i in range(len(requests)) if i not in rejections]
+        max_tokens = max(
+            (per_request_max_tokens[i] for i in admitted), default=0
+        )
 
         # Register batch for completion tracking
         self._scheduling_pool.register_batch(
@@ -1194,7 +1233,8 @@ class BatchScheduler:
 
         # Build IntakeEntry objects and push to IntakePool
         entries = []
-        for idx, req in enumerate(requests):
+        for idx in admitted:
+            req = requests[idx]
             entries.append(IntakeEntry(
                 request_id=request_ids[idx],
                 batch_id=batch_id,
@@ -1209,7 +1249,10 @@ class BatchScheduler:
                 },
                 priority=Priority.NORMAL,
             ))
-        accepted = self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+        accepted = (
+            self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+            if entries else True
+        )
         if not accepted:
             current = self._intake_pool.size()
             cap = self._intake_pool.max_capacity
@@ -1245,6 +1288,18 @@ class BatchScheduler:
         if incr_dir:
             from pathlib import Path
             Path(incr_dir).mkdir(parents=True, exist_ok=True)
+
+        # A request whose prompt could not be constructed fails alone, as the
+        # Batch API error item a worker-side rejection also produces.
+        for idx, reason in sorted(rejections.items()):
+            self._write_pool_completion(
+                batch_id,
+                request_ids[idx],
+                {"error": {"code": "invalid_prompt", "message": reason}},
+            )
+            self._scheduling_pool.mark_request_completed(
+                request_ids[idx], batch_id
+            )
 
         logger.info(
             f"[POOL] Batch {batch_id}: {len(entries)} requests pushed to IntakePool "

@@ -180,10 +180,13 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
         tools=[{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}],
     )
 
-    prompts, max_tokens, sampling_params = scheduler._convert_requests_to_worker_inputs(
-        [SimpleNamespace(body=request)],
-        None,
+    prompts, max_tokens, sampling_params, rejections = (
+        scheduler._convert_requests_to_worker_inputs(
+            [SimpleNamespace(body=request)],
+            None,
+        )
     )
+    assert rejections == {}
 
     assert prompts == ["formatted-prompt"]
     assert max_tokens == [None]

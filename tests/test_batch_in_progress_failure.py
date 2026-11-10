@@ -123,7 +123,7 @@ def test_a_batch_default_covers_requests_without_max_tokens(tmp_path):
     submitted = {}
 
     async def record_submit(batch_id, batch, requests, prompts,
-                            per_request_max_tokens, sampling_params):
+                            per_request_max_tokens, sampling_params, **kwargs):
         submitted["max_tokens"] = per_request_max_tokens
 
     scheduler._process_batch_pool_mode = record_submit
@@ -167,7 +167,8 @@ def test_an_exception_after_pool_registration_releases_the_batch_state(tmp_path)
     scheduler, updates = _scheduler(tmp_path, [_line("req-1", 16)])
 
     async def register_then_fail(batch_id, batch, requests, prompts,
-                                 per_request_max_tokens, sampling_params):
+                                 per_request_max_tokens, sampling_params,
+                                 **kwargs):
         scheduler._scheduling_pool.register_batch(batch_id, total_requests=1)
         scheduler._intake_pool.submit_batch(batch_id, [bs.IntakeEntry(
             request_id=f"req-1@{batch_id}",

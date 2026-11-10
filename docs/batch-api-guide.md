@@ -203,6 +203,11 @@ Each line in the output file corresponds to one input request:
 }
 ```
 
+A request whose prompt cannot be built (the chat template or the model's
+tokenizer refuses the conversation, or a request option the model does not
+accept) fails the same way with code `invalid_prompt` and the reason in
+`message`; the other requests of the batch are still served.
+
 ## Incremental Results
 
 Results are written to disk **as each sequence completes**, not when the entire batch finishes. This means:
