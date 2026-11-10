@@ -286,6 +286,7 @@ from batchgen.worker.step_timing import (
 	ForwardEventRing,
 	accumulate_decode_step_split,
 	format_decode_step_split,
+	format_gpu_kv_steady_state,
 	new_decode_step_split,
 )
 from batchgen.phase_lifecycle import (
@@ -20035,6 +20036,32 @@ class BatchGenWorker:
 					f"active={len(decode_uuids)} finished={_hb_finished} "
 					f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
 				)
+				# Steady-state GPU-KV occupancy on the same heartbeat cadence
+				# (parsing contract with the benchmark recorder; see
+				# format_gpu_kv_steady_state). Exact host-side allocator
+				# counters only — get_stats() on the plain manager reads two
+				# Python ints and never touches the device. The dual (DSA)
+				# coordinator's get_stats() walks every sequence for its
+				# mirror assertion, so read the primary's counters directly:
+				# a liveness log line must not add O(sequences) work or turn
+				# a mirror divergence into a heartbeat crash. Pool page
+				# occupancy is identical on the two halves by construction.
+				_kv_stats_mgr = (
+					gpu_manager.primary
+					if isinstance(gpu_manager, DualKVCacheCoordinator)
+					else gpu_manager
+				)
+				if _kv_stats_mgr is not None and _kv_stats_mgr.is_initialized:
+					_kv_stats = _kv_stats_mgr.get_stats()
+					logging.info(
+						format_gpu_kv_steady_state(
+							_kv_stats.num_used_pages,
+							_kv_stats.num_total_pages,
+							len(self.global_batch.get_sequences_by_status(
+								SequenceStatus.QUEUEING
+							)),
+						)
+					)
 				# The sampling fallback count is now accumulated on device so
 				# the step path never reads it back. Drain it here, where the
 				# sampled-token readback has already caught the device up, so an

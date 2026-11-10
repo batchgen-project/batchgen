@@ -21,6 +21,7 @@ logic is testable on CPU with fake events.
 
 from __future__ import annotations
 
+import operator
 from typing import Any, Callable, List, Optional, Protocol, Sequence, Tuple
 
 
@@ -199,3 +200,39 @@ class ForwardEventRing:
         self._max_ms = 0.0
         self._count = 0
         return text
+
+
+def format_gpu_kv_steady_state(
+    pages_in_use: int,
+    pages_total: int,
+    queued_sequences: Optional[int] = None,
+) -> str:
+    """Render the steady-state GPU-KV occupancy heartbeat line.
+
+    The shape is a parsing contract with the benchmark recorder
+    (batchgen-benchmark decode-run verdict, schema v2.1): the recorder
+    proves "machine full" only from ``[GPU-KV] ... pages_in_use=`` lines
+    plus a positive ``queued_sequences=`` observation, and fails closed
+    without them. Field order and spelling are therefore fixed:
+
+        [GPU-KV] pages_in_use=<n> pages_total=<N> queued_sequences=<q>
+
+    Inputs are exact host-side allocator/scheduler counters the caller
+    already holds; this function never touches the device. ``pages_total``
+    is mandatory so each snapshot carries its own denominator (the pool is
+    immutable after initialization, but the recorder must not have to join
+    lines to compute a ratio). ``queued_sequences`` is optional: a caller
+    without visibility into the admission queue omits the field rather
+    than logging a guess.
+
+    Counters go through ``operator.index`` (exact accounting): an integral
+    type renders exactly, while a float that would silently truncate is a
+    caller bug and raises instead.
+    """
+    line = (
+        f"[GPU-KV] pages_in_use={operator.index(pages_in_use)} "
+        f"pages_total={operator.index(pages_total)}"
+    )
+    if queued_sequences is not None:
+        line += f" queued_sequences={operator.index(queued_sequences)}"
+    return line
