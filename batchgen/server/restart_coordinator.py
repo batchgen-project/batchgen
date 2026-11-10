@@ -40,11 +40,15 @@ PHASE_TORN_DOWN = "P1"
 PHASE_READY = "P2"
 RESTART_PHASES = (PHASE_ARMED, PHASE_TORN_DOWN, PHASE_READY)
 
-# A peer's control store exists only once its server process is up, and a
-# server spends minutes loading weights before that.  The connect budget is
-# therefore the one the daemon readiness wait already uses, not a
-# network-level timeout.
-_STORE_CONNECT_TIMEOUT_S = 600.0
+# How long one store operation may block (a ``get`` of a missing key, a
+# ``wait``): the store's own timeout once a connection exists.
+_STORE_OP_TIMEOUT_S = 600.0
+# A peer connects to node 0's store in attempts of this length, so a node 0
+# that is down or never launched is reported within one attempt of the join
+# budget below instead of after the client's own connect timeout, which the
+# store client retries in full after a backoff, so one 600 s attempt blocked
+# a peer for about twice that.
+_STORE_CONNECT_ATTEMPT_S = 10.0
 # Node 0 bumps the epoch and then writes the request describing it, so a
 # follower can observe the new epoch a moment before that description exists.
 # Only this publication gap is waited out; a request still missing afterwards
@@ -68,6 +72,9 @@ _RUN_IDENTITY_WAIT_S = 60.0
 # is still starting -- connecting to node 0's store and staging weights can
 # take minutes -- so its absence turns fatal only JOIN_GRACE_S after this
 # node's watch began, which is also what bounds a peer that never starts.
+# The same grace bounds the other direction: node 0 opens its store first
+# thing in its start-up, so a peer that cannot connect to it for JOIN_GRACE_S
+# fails its start-up naming node 0.
 # Node 0 owns the store in its own process, so no store call succeeding for
 # CONTROL_DEAD_S means node 0 is gone.
 HEARTBEAT_S = 2.0
@@ -167,22 +174,29 @@ def _short_reason(reason: str) -> str:
     return collapsed or "unspecified"
 
 
+class ControlStoreUnreachableError(RuntimeError):
+    """A peer could not connect to node 0's control store within its budget."""
+
+
 def create_tcp_store(
     host: str,
     port: int,
     nnodes: int,
     node_rank: int,
     connect_timeout_s: float,
+    *,
+    op_timeout_s: float = _STORE_OP_TIMEOUT_S,
 ):
     """The default control store: node 0 hosts it, every peer connects.
 
     ``wait_for_workers`` is off because node 0 must be able to serve while a
-    peer is still loading weights; the peers' own constructors carry the
-    connect budget.
+    peer is still loading weights. ``connect_timeout_s`` bounds one connect
+    attempt (the coordinator retries); once connected, operations block for
+    at most ``op_timeout_s``.
     """
     import torch.distributed as dist
 
-    return dist.TCPStore(
+    store = dist.TCPStore(
         host,
         port,
         world_size=nnodes,
@@ -190,6 +204,8 @@ def create_tcp_store(
         timeout=timedelta(seconds=connect_timeout_s),
         wait_for_workers=False,
     )
+    store.set_timeout(timedelta(seconds=op_timeout_s))
+    return store
 
 
 class RestartCoordinator:
@@ -204,7 +220,8 @@ class RestartCoordinator:
         *,
         store_factory: Optional[Callable[..., Any]] = None,
         poll_interval_s: float = 0.5,
-        connect_timeout_s: float = _STORE_CONNECT_TIMEOUT_S,
+        connect_attempt_s: float = _STORE_CONNECT_ATTEMPT_S,
+        op_timeout_s: float = _STORE_OP_TIMEOUT_S,
         request_wait_s: float = _REQUEST_PUBLISH_WAIT_S,
         error_backoff_s: float = _CONTROL_ERROR_BACKOFF_S,
         run_identity_wait_s: float = _RUN_IDENTITY_WAIT_S,
@@ -221,7 +238,8 @@ class RestartCoordinator:
         self._port = int(port)
         self._store_factory = store_factory or create_tcp_store
         self._poll_interval_s = float(poll_interval_s)
-        self._connect_timeout_s = float(connect_timeout_s)
+        self._connect_attempt_s = float(connect_attempt_s)
+        self._op_timeout_s = float(op_timeout_s)
         self._request_wait_s = float(request_wait_s)
         self._error_backoff_s = float(error_backoff_s)
         self._run_identity_wait_s = float(run_identity_wait_s)
@@ -286,16 +304,20 @@ class RestartCoordinator:
         return self._control_error
 
     def start(self) -> None:
-        """Open the control store; node 0 hosts it for the server's whole life."""
+        """Open the control store; node 0 hosts it for the server's whole life.
+
+        A peer connects in attempts of ``connect_attempt_s`` until
+        ``join_grace_s`` has passed, then raises
+        :class:`ControlStoreUnreachableError` naming node 0's address, so a
+        node 0 that is down or was never launched fails this start-up within
+        one attempt of the same grace node 0 gives a peer to join.
+        """
         if not self.enabled or self._store is not None:
             return
-        self._store = self._store_factory(
-            self._host,
-            self._port,
-            self._nnodes,
-            self._node_rank,
-            self._connect_timeout_s,
-        )
+        if self._node_rank == 0:
+            self._store = self._open_store()
+        else:
+            self._store = self._connect_to_node0()
         logger.info(
             "Restart control store %s at %s:%d (node %d of %d)",
             "hosted" if self._node_rank == 0 else "connected",
@@ -304,6 +326,45 @@ class RestartCoordinator:
             self._node_rank,
             self._nnodes,
         )
+
+    def _open_store(self) -> Any:
+        return self._store_factory(
+            self._host,
+            self._port,
+            self._nnodes,
+            self._node_rank,
+            self._connect_attempt_s,
+            op_timeout_s=self._op_timeout_s,
+        )
+
+    def _connect_to_node0(self) -> Any:
+        started = self._clock()
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return self._open_store()
+            except Exception as exc:
+                waited = self._clock() - started
+                if waited >= self._join_grace_s:
+                    raise ControlStoreUnreachableError(
+                        f"node {self._node_rank}: node 0's restart control store "
+                        f"at {self._host}:{self._port} accepted no connection "
+                        f"in {waited:.0f}s ({attempts} attempts); node 0 is down "
+                        f"or was not launched: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Node %d: node 0's restart control store at %s:%d not "
+                    "reachable yet (%.0fs of %.0fs): %s",
+                    self._node_rank,
+                    self._host,
+                    self._port,
+                    waited,
+                    self._join_grace_s,
+                    exc,
+                )
+                # A refusal that returns at once must not become a busy loop.
+                self._follower_stop.wait(self._error_backoff_s)
 
     def close(self) -> None:
         self._follower_stop.set()
