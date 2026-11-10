@@ -1,5 +1,5 @@
 import os
-import time
+import socket
 import traceback
 from datetime import timedelta
 
@@ -11,9 +11,15 @@ import torch.multiprocessing as mp
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
-def setup_dist(rank, world_size, backend="gloo"):
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def setup_dist(rank, world_size, port, backend="gloo"):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(12355 + int(time.time()) % 1000)
+    os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
         backend=backend,
         rank=rank,
@@ -27,9 +33,9 @@ def cleanup_dist():
         dist.destroy_process_group()
 
 
-def _test_nccl_worker(rank, world_size, return_dict):
+def _test_nccl_worker(rank, world_size, port, return_dict):
     try:
-        setup_dist(rank, world_size, backend="gloo")
+        setup_dist(rank, world_size, port, backend="gloo")
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
 
@@ -103,13 +109,18 @@ def _test_nccl_worker(rank, world_size, return_dict):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_nccl_communicator(world_size):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} CUDA devices")
     mp.set_start_method("spawn", force=True)
+    # One port, chosen by the parent: every rank must rendezvous on the same
+    # one, and two concurrent runs must not share it.
+    port = _free_port()
     manager = mp.Manager()
     return_dict = manager.dict()
 
     mp.spawn(
         _test_nccl_worker,
-        args=(world_size, return_dict),
+        args=(world_size, port, return_dict),
         nprocs=world_size,
         join=True,
     )
