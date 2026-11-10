@@ -16,224 +16,57 @@ assert _config_spec.loader is not None
 _config_spec.loader.exec_module(_config_module)
 EngineConfig = _config_module.EngineConfig
 
-from batchgen.models.moonshotai.kimi_linear.planner import (
+from batchgen.hardware.machine_family import (  # noqa: E402
+    DeviceFacts,
+    UnknownMachineFamilyError,
+)
+from batchgen.models.moonshotai.kimi_linear.machine_profile import (  # noqa: E402
+    UnsupportedK3TopologyError,
+)
+from batchgen.models.moonshotai.kimi_linear.planner import (  # noqa: E402
     KimiLinearPlanner,
-    k3_kda_state_slots,
-    k3_prefill_collective_stripe_threshold_rows,
-    k3_prefill_grouped_chunk_rows,
-    k3_prefill_micro_batch_token_cap,
-    k3_resident_prefill_token_cap,
-    k3_shard_latent_projections,
 )
 
 
 GIB = 1024 ** 3
+MIB = 1024 ** 2
+
+# CUDA-reported facts of each machine family (observed totals).
+FACTS = {
+    "h20": DeviceFacts((9, 0), 78, 97_871 * MIB, "x86_64"),
+    "h200": DeviceFacts((9, 0), 132, int(139.81 * GIB), "x86_64"),
+    "b200": DeviceFacts((10, 0), 148, 182_640 * MIB, "x86_64"),
+    "b300": DeviceFacts((10, 3), 148, int(267.68 * GIB), "x86_64"),
+    "gb300": DeviceFacts((10, 3), 152, 283_270 * MIB, "aarch64"),
+}
 
 
-def test_h20_tp8_unsharded_keeps_four_user_slots():
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=96 * GIB,
-        attention_group_size=8,
-    ) == 4
-
-
-def test_h20_tp8_sharded_layout_funds_the_wide_tier():
-    """H20 tier (measured 2026-10-29, 4x8 H20 world32): the sharded latent
-    layout funds 128 slots/node, latent-only (vocab-parallel corrupts
-    outputs on this tier — sub-project
-    batchgen-k3-vocab-parallel-h20-corruption — and the slot count holds
-    either way)."""
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=96 * GIB, attention_group_size=8,
-        sharded_latent=True,
-    ) == 128
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=96 * GIB, attention_group_size=8,
-        sharded_latent=True, sharded_vocab=True,
-    ) == 128
-    # the gate now includes H20-class memory ...
-    assert k3_shard_latent_projections(
-        gpu_total_memory_bytes=96 * GIB, attention_group_size=8)
-    # ... but not smaller GPUs or non-TP8 topologies
-    assert not k3_shard_latent_projections(
-        gpu_total_memory_bytes=79 * GIB, attention_group_size=8)
-    assert not k3_shard_latent_projections(
-        gpu_total_memory_bytes=96 * GIB, attention_group_size=1)
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=79 * GIB, attention_group_size=8,
-        sharded_latent=True, sharded_vocab=True,
-    ) == 4
-    # the tier is a memory contract, keyed like the H200 tier: exactly
-    # 80 GiB enters the H20 tier, exactly 120 GiB enters the H200 tier
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=80 * GIB, attention_group_size=8,
-        sharded_latent=True,
-    ) == 128
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=119 * GIB, attention_group_size=8,
-        sharded_latent=True,
-    ) == 128
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=120 * GIB, attention_group_size=8,
-        sharded_latent=True,
-    ) == 160
-
-
-def test_sub_h20_plan_keeps_failsafe_and_eager_decode():
-    config = _plan_k3(79 * GIB)
-    # 4 fail-safe user slots + 1 graph scratch (no prefix-pool reserve)
-    assert config.GPU_Buffer_Config.kda_state_slots == 5
-    assert config.Module_Batching_Config.k3_shard_latent_projections is False
-    assert config.Module_Batching_Config.k3_shard_vocab_parallel is False
-    assert config.Basic_Config.decode_graph_mode != "graph"
-
-
-def test_h200_tp8_sharded_latent_uses_160_user_slots():
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=140 * GIB, attention_group_size=8, sharded_latent=True,
-    ) == 160
-    # + vocab-parallel embed/lm_head (slice 2, -3.84 GiB/rank) -> 256 slots/node
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=140 * GIB, attention_group_size=8,
-        sharded_latent=True, sharded_vocab=True,
-    ) == 256
-    # vocab sharding alone does not fund the slots (latent slice is the big one)
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=140 * GIB, attention_group_size=8, sharded_vocab=True,
-    ) == 96
-    assert k3_shard_latent_projections(gpu_total_memory_bytes=140 * GIB, attention_group_size=8)
-    # H20-class memory now shards too (see test_h20_tp8_sharded_layout_...)
-    assert k3_shard_latent_projections(gpu_total_memory_bytes=96 * GIB, attention_group_size=8)
-    assert not k3_shard_latent_projections(gpu_total_memory_bytes=140 * GIB, attention_group_size=1)
-
-
-def test_h200_tp8_uses_96_user_slots():
-    """H200's slot count IS the per-node decode admission cap, and it competes
-    with GPU KV for the ~20 GB left after the resident expert shard (MEASURED:
-    configure_decoding grows 44.94 -> 136.45 GB). 256 slots cost 13.8 GB and
-    starved KV to ~20 admitted sequences; 128 costs 6.7 GB and leaves room for
-    the matched decode corpus' ~56 MB/seq of MLA KV."""
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=8,
-    ) == 96
-
-
-def test_h20_tp8_keeps_single_long_prompt_prefill_cap():
-    assert k3_prefill_micro_batch_token_cap(
-        gpu_total_memory_bytes=96 * GIB,
-        attention_group_size=8,
-    ) == 16_384
-
-
-def test_h200_tp8_batches_eight_exact_64k_prompts_per_model_pass():
-    assert k3_prefill_micro_batch_token_cap(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=8,
-    ) == 8 * 65_536
-
-
-def test_h20_tp8_keeps_striped_streamed_prefill_collectives():
-    assert k3_prefill_collective_stripe_threshold_rows(
-        gpu_total_memory_bytes=96 * GIB,
-        attention_group_size=8,
-    ) == 32_768
-
-
-def test_h200_tp8_uses_one_wide_exact64_node_collective():
-    assert k3_prefill_collective_stripe_threshold_rows(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=8,
-    ) == 8 * 65_536
-
-
-def test_h20_tp8_keeps_2k_grouped_expert_chunks():
-    assert k3_prefill_grouped_chunk_rows(
-        gpu_total_memory_bytes=96 * GIB,
-        attention_group_size=8,
-    ) == 2_048
-
-
-def test_h200_tp8_uses_32k_grouped_expert_chunks():
-    assert k3_prefill_grouped_chunk_rows(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=8,
-    ) == 32_768
-
-
-def test_h200_non_tp8_fails_safe_to_four_slots():
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=1,
-    ) == 4
-
-    assert k3_prefill_micro_batch_token_cap(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=1,
-    ) == 16_384
-    assert k3_prefill_collective_stripe_threshold_rows(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=1,
-    ) == 32_768
-    assert k3_prefill_grouped_chunk_rows(
-        gpu_total_memory_bytes=140 * GIB,
-        attention_group_size=1,
-    ) == 2_048
-
-
-def test_unknown_memory_fails_safe_to_four_slots():
-    assert k3_kda_state_slots(
-        gpu_total_memory_bytes=None,
-        attention_group_size=8,
-    ) == 4
-    assert k3_prefill_micro_batch_token_cap(
-        gpu_total_memory_bytes=None,
-        attention_group_size=8,
-    ) == 16_384
-    assert k3_prefill_collective_stripe_threshold_rows(
-        gpu_total_memory_bytes=None,
-        attention_group_size=8,
-    ) == 32_768
-    assert k3_prefill_grouped_chunk_rows(
-        gpu_total_memory_bytes=None,
-        attention_group_size=8,
-    ) == 2_048
-
-
-@pytest.mark.parametrize(
-    ("memory_bytes", "group_size"),
-    [(0, 8), (-1, 8), (96 * GIB, 0), (96 * GIB, -1)],
-)
-def test_invalid_capacity_inputs_fail_closed(memory_bytes, group_size):
-    with pytest.raises(ValueError):
-        k3_kda_state_slots(
-            gpu_total_memory_bytes=memory_bytes,
-            attention_group_size=group_size,
-        )
-    with pytest.raises(ValueError):
-        k3_prefill_grouped_chunk_rows(
-            gpu_total_memory_bytes=memory_bytes,
-            attention_group_size=group_size,
-        )
-
-
-def _plan_k3(gpu_memory_bytes):
+def _plan(
+    family,
+    *,
+    world_size,
+    group_size=8,
+    is_k3=True,
+    capturable=True,
+    facts=None,
+):
     config = EngineConfig()
     config.Basic_Config.kv_dtype = "bfloat16"
     config.Basic_Config.set_max_prompt_length(8192)
     config.Basic_Config.max_decoding_length = 128
-    config.Basic_Config.world_size = 16
+    config.Basic_Config.world_size = world_size
     planner = KimiLinearPlanner(
-        is_k3=True,
+        is_k3=is_k3,
         stream_all_modules=False,
-        attention_group_size=8,
-        gpu_total_memory_bytes=gpu_memory_bytes,
+        attention_group_size=group_size,
+        device_facts=FACTS[family] if facts is None and family else facts,
+        decode_graph_capturable=capturable,
     )
     return planner.generate_config(config)
 
 
 def test_h20_plan_funds_128_slots_latent_only_with_graphs():
-    config = _plan_k3(96 * GIB)
+    config = _plan("h20", world_size=32)
 
     # 128 user slots + 1 graph scratch + the prefix-pool segment reserve,
     # which prefill_sequence_limits holds back so admission sees exactly 128.
@@ -249,14 +82,24 @@ def test_h20_plan_funds_128_slots_latent_only_with_graphs():
     # H20 keeps the release-and-stream admission cycle (resident handoff off)
     assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 0
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 0
-    # latent shards; vocab-parallel stays behind the H200 gate until
+    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 16_384
+    assert (
+        config.Module_Batching_Config.k3_prefill_collective_stripe_threshold_rows
+        == 32_768
+    )
+    assert config.Module_Batching_Config.k3_prefill_grouped_chunk_rows == 2_048
+    assert (
+        config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+        == 24 * GIB
+    )
+    # latent shards; vocab-parallel stays off until
     # batchgen-k3-vocab-parallel-h20-corruption is fixed
     assert config.Module_Batching_Config.k3_shard_latent_projections is True
     assert config.Module_Batching_Config.k3_shard_vocab_parallel is False
 
 
 def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
-    config = _plan_k3(140 * GIB)
+    config = _plan("h200", world_size=16)
 
     # TP8-sharded latent projections (8.3 GiB) + vocab-parallel embed/lm_head (3.84 GiB) -> 256 KDA slots/node
     assert config.Module_Batching_Config.k3_shard_latent_projections is True
@@ -271,7 +114,6 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     assert config.Basic_Config.decode_graph_buckets == [
         1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256,
     ]
-    assert config.Basic_Config.decode_graph_buckets[-1] == 256
     # whole-model CUDA-graph decode on H200 (SGLang: cuda-graph-backend-decode full)
     assert config.Basic_Config.decode_graph_mode == "graph"
     assert (
@@ -287,42 +129,93 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
         config.Module_Batching_Config.k3_prefill_grouped_chunk_rows
         == 32_768
     )
-    # admission waves after the first decode phase prefill through the
-    # resident EP shard in SGLang-sized chunks instead of dropping and
-    # rebuilding the 84 GiB shard per wave
     assert (
         config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
     )
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
+    assert (
+        config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+        == 40 * GIB
+    )
 
 
-def test_resident_prefill_cap_is_h200_tp8_only():
-    assert k3_resident_prefill_token_cap(
-        gpu_total_memory_bytes=140 * GIB, attention_group_size=8
-    ) == 16_384
-    assert k3_resident_prefill_token_cap(
-        gpu_total_memory_bytes=96 * GIB, attention_group_size=8
-    ) == 0
-    assert k3_resident_prefill_token_cap(
-        gpu_total_memory_bytes=140 * GIB, attention_group_size=1
-    ) == 0
-    assert k3_resident_prefill_token_cap(
-        gpu_total_memory_bytes=None, attention_group_size=8
-    ) == 0
+def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
+    config = _plan("b300", world_size=8)
+
+    # 360 user slots (kv-solve on the measured single-node decode memory) +
+    # 1 graph scratch + 16 prefix segments.
+    assert config.GPU_Buffer_Config.kda_state_slots == 360 + 1 + 16
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 360
+    assert config.Basic_Config.decode_graph_buckets == [
+        1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256, 320, 360,
+    ]
+    assert config.Module_Batching_Config.k3_shard_latent_projections is True
+    assert config.Module_Batching_Config.k3_shard_vocab_parallel is True
+    # prefill keeps the values the machine ran under the retired tiers
+    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 524_288
+    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
+    assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
 
 
 def test_blackwell_decode_runs_eager_when_kernel_not_capturable():
-    config = EngineConfig()
-    config.Basic_Config.kv_dtype = "bfloat16"
-    config.Basic_Config.set_max_prompt_length(8192)
-    config.Basic_Config.max_decoding_length = 128
-    config.Basic_Config.world_size = 8
-    planner = KimiLinearPlanner(
-        is_k3=True,
-        stream_all_modules=False,
-        attention_group_size=8,
-        gpu_total_memory_bytes=268 * GIB,
-        decode_graph_capturable=False,
-    )
-    config = planner.generate_config(config)
+    config = _plan("b300", world_size=8, capturable=False)
     assert config.Basic_Config.decode_graph_mode == "eager"
+
+
+def test_gb300_two_tray_plan_carries_the_inherited_values():
+    config = _plan("gb300", world_size=8)
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
+    assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
+
+
+@pytest.mark.parametrize(
+    ("family", "world_size"),
+    [
+        ("h20", 16),   # an EP16 shard does not fit an H20 GPU
+        ("h200", 8),   # the EP8 shard does not fit an H200 GPU
+        ("h200", 32),  # never measured
+        ("b300", 16),  # never measured
+        ("gb300", 4),  # one tray cannot hold the routed expert set
+        ("b200", 8),   # no K3 row
+    ],
+)
+def test_k3_tp8_without_a_profile_row_is_refused_by_name(family, world_size):
+    with pytest.raises(UnsupportedK3TopologyError, match=family):
+        _plan(family, world_size=world_size)
+
+
+def test_k3_tp8_on_an_unknown_machine_is_refused_by_name():
+    unknown = DeviceFacts((9, 0), 132, 80 * GIB, "x86_64")
+    with pytest.raises(UnknownMachineFamilyError):
+        _plan(None, world_size=16, facts=unknown)
+
+
+def test_tp8_plan_without_device_facts_is_refused():
+    for is_k3 in (True, False):
+        with pytest.raises(ValueError, match="machine family"):
+            _plan(None, world_size=16, is_k3=is_k3)
+
+
+@pytest.mark.parametrize("family", [None, "h20", "h200", "b300"])
+def test_non_tp8_k3_plan_is_machine_independent(family):
+    config = _plan(family, world_size=8, group_size=1)
+    # 4 user slots + 1 graph scratch, no prefix pool, unsharded, eager
+    assert config.GPU_Buffer_Config.kda_state_slots == 5
+    assert config.GPU_Buffer_Config.kda_prefix_segment_slots == 0
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 4
+    assert config.Module_Batching_Config.k3_shard_latent_projections is False
+    assert config.Module_Batching_Config.k3_shard_vocab_parallel is False
+    assert config.Basic_Config.decode_graph_mode == "eager"
+    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 262_144
+    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 0
+
+
+def test_head_parallel_non_tp8_k3_keeps_the_single_prompt_cap():
+    config = _plan(None, world_size=8, group_size=4)
+    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 16_384
+    assert config.GPU_Buffer_Config.kda_state_slots == 5
+
+
+def test_nonpositive_group_size_is_refused():
+    with pytest.raises(ValueError):
+        _plan("h200", world_size=16, group_size=0)
