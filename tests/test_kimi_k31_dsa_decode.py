@@ -281,6 +281,9 @@ class FakePagedKV:
     def get_layer_kv_with_page_table(self, layer_idx):
         return self.blocked, None, self.page_table
 
+    def get_layer_kv_cache(self, layer_idx):
+        return self.blocked, None
+
     def update_layer_decode_new_token(self, *, k_tensor, v_tensor, sequence_lengths,
                                       layer_idx, batch_slice=None, slot_indices=None):
         assert slot_indices is None and batch_slice is None

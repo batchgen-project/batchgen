@@ -39,14 +39,25 @@ def test_whole_model_step_does_not_wait_for_every_rank_to_be_non_empty():
 
 
 def test_empty_whole_step_arms_zero_rows_on_the_synced_bucket():
-    src = _method("_begin_empty_whole_step")
-    assert "self._whole_model_bucket_for_step()" in src
-    assert "self._capture_whole_bucket(whole_bucket)" in src
-    assert "self._refresh_statics(whole_bucket, 0, [], None)" in src
-    assert "self._bsz = 0" in src
-    assert "self._whole_step_active = True" in src
+    # The collective half (build, capture, zero-row refresh) is shared with
+    # decode prewarm so an empty rank issues the same EP collectives at both.
+    collective = _method("_prepare_empty_whole_bucket")
+    assert "self._whole_model_bucket_for_step()" in collective
+    assert "self._capture_whole_bucket(whole_bucket)" in collective
+    assert "self._refresh_statics(whole_bucket, 0, [], None)" in collective
     # the KV-storage signature check must not be skipped on the empty rank
-    assert "self._signature(kv_manager)" in src
+    assert "self._signature(kv_manager)" in collective
+    step = _method("_begin_empty_whole_step")
+    assert "self._prepare_empty_whole_bucket()" in step
+    assert "self._bsz = 0" in step
+    assert "self._whole_step_active = True" in step
+
+
+def test_prewarm_runs_the_empty_rank_collective_half():
+    src = _method("prewarm_decode_graphs")
+    empty = src[src.index("if bsz == 0:"):]
+    empty = empty[: empty.index("kv_manager = AttnWrapperBase.gpu_paged_kv_manager")]
+    assert "self._prepare_empty_whole_bucket()" in empty
 
 
 def test_refresh_statics_handles_zero_rows_without_wrapper_batch_tensors():

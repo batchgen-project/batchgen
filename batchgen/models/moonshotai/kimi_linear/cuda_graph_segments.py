@@ -242,10 +242,10 @@ def _mla_decode_graph_safe(
     # `data_ptr + layer * num_pages * page_stride`, so a re-init with a
     # different num_pages moves it even when data_ptr is reused. That is why
     # `_signature` must carry the cache shape/stride, not just the pointer.
-    blocked_k, _, _ = (
-        AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
-            layer_idx=layer_idx
-        )
+    # The graph brings its own static page table, so only the cache tensor is
+    # read here; an empty rank captures before it ever builds an active table.
+    blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
+        layer_idx
     )
     run_paged_kv_token_update_fused(
         k_cache=blocked_k,
@@ -561,14 +561,14 @@ class KimiLinearSpanSegment:
             return attn_out, {}
         if self.is_dsa:
             # FlashMLA's schedule is unused here: the sparse attention runs on
-            # FA3 over the selected tokens.
-            blocked_k, _, _ = (
-                AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
-                    layer_idx=self.layer_idx
-                )
+            # FA3 over the selected tokens. Both page tables come from the
+            # graph's static buffer, so only the cache tensors are read; an
+            # empty rank captures before it ever builds an active table.
+            blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
+                self.layer_idx
             )
-            aux_blocked_k, _, _ = (
-                AttnWrapperBase.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
+            aux_blocked_k, _ = (
+                AttnWrapperBase.gpu_paged_kv_manager_aux.get_layer_kv_cache(
                     self.layer_idx
                 )
             )
@@ -1289,10 +1289,30 @@ class KimiLinearDecodeGraph:
         if AttnWrapperBase.phase != "decode":
             self._fallback("decode graph prewarm requested outside decode")
             return False
+        # Prewarm is a rehearsal of this rank's FIRST decode step and must
+        # issue the same EP-world collectives in the same order as that step
+        # (``_begin_step`` / ``_begin_empty_whole_step``); every decision
+        # below reuses theirs. The K3 MoE build (exchange pool setup + the
+        # DeepEP self-check across every rank) runs first on all ranks,
+        # before anything shaped by this rank's local batch.
+        if mode == "graph":
+            self._ensure_moe_built()
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         bsz = len(seq_ids)
         if bsz == 0:
-            return False
+            # Empty DP rank: capture the peers' whole-model bucket exactly as
+            # its first step will replay it. Returning without it left the
+            # rowed ranks alone inside the capture's EP collectives (cohort
+            # deadlock whenever the first decode batch left a group empty).
+            if mode != "graph":
+                return False
+            whole_bucket = self._prepare_empty_whole_bucket()
+            logger.info(
+                "[KIMI_DECODE_GRAPH] rank=%s empty-rank prewarm complete: "
+                "whole_bucket=%s",
+                self.rank, whole_bucket,
+            )
+            return whole_bucket is not None
         kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         if kv_manager is None:
             self._fallback("decode graph prewarm has no gpu_paged_kv_manager")
@@ -1326,11 +1346,12 @@ class KimiLinearDecodeGraph:
         # mode deliberately retains the proven per-layer compare path until a
         # whole-stack eager reference is wired; it must not silently compare
         # only a subset of the transformer.
-        whole_bucket = None
-        if mode == "graph":
-            self._ensure_moe_built()
-            if self._moe_all_ranks_nonempty():
-                whole_bucket = self._whole_model_bucket_for_step()
+        # Same decision as ``_begin_step``: the whole-model bucket follows the
+        # synchronized post-TP count alone, with empty peers replaying it, so
+        # it does NOT wait for every EP rank to hold rows.
+        whole_bucket = (
+            self._whole_model_bucket_for_step() if mode == "graph" else None
+        )
         if whole_bucket is not None and self._ensure_whole_built():
             self._bucket_statics(whole_bucket)
             statics = self._statics[whole_bucket]
@@ -1353,7 +1374,10 @@ class KimiLinearDecodeGraph:
         if bucket not in self._captured:
             self._capture_bucket(bucket)
 
-        moe_ready = self._ensure_moe_built()
+        # Same gate as ``_begin_step``: the legacy per-layer MoE graph holds
+        # EP-world collectives that an empty peer never issues, so it is
+        # captured only when every EP rank holds rows.
+        moe_ready = self._ensure_moe_built() and self._moe_all_ranks_nonempty()
         moe_bucket = (
             self._moe_group_bucket_for_step() if moe_ready else None
         )
@@ -2034,9 +2058,30 @@ class KimiLinearDecodeGraph:
         rank that cannot take this path returns silently to eager exactly as
         before; its peers then fall back through the same synced decision.
         """
+        whole_bucket = self._prepare_empty_whole_bucket()
+        if whole_bucket is None:
+            return
+        self._whole_bucket = whole_bucket
+        self._bucket = whole_bucket
+        self._bsz = 0
+        self.step += 1
+        self._step_active = True
+        self._whole_step_active = True
+
+    def _prepare_empty_whole_bucket(self) -> Optional[int]:
+        """The collective half of an empty DP rank's decode step.
+
+        Builds (once) and captures (if new) the peers' synchronized
+        whole-model bucket, then refreshes its statics with zero valid rows.
+        Both ``_begin_empty_whole_step`` and ``prewarm_decode_graphs`` run
+        exactly this, so an empty rank joins the same EP collectives at
+        prewarm as at steady state. Returns the bucket, or ``None`` when the
+        whole-model path is unavailable (the peers' synced decision then
+        keeps them off it as well).
+        """
         kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         if kv_manager is None or not self._ensure_built(kv_manager):
-            return
+            return None
         signature = self._signature(kv_manager)
         if signature != self._kv_signature:
             if self._kv_signature is not None:
@@ -2045,17 +2090,12 @@ class KimiLinearDecodeGraph:
         self._ensure_moe_built()
         whole_bucket = self._whole_model_bucket_for_step()
         if whole_bucket is None or not self._ensure_whole_built():
-            return
+            return None
         self._bucket_statics(whole_bucket)
         if whole_bucket not in self._whole_captured:
             self._capture_whole_bucket(whole_bucket)
         self._refresh_statics(whole_bucket, 0, [], None)
-        self._whole_bucket = whole_bucket
-        self._bucket = whole_bucket
-        self._bsz = 0
-        self.step += 1
-        self._step_active = True
-        self._whole_step_active = True
+        return whole_bucket
 
     def _refresh_statics(self, bucket, bsz, seq_ids, page_table,
                          aux_page_table=None) -> None:

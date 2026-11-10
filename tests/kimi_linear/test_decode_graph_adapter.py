@@ -166,6 +166,9 @@ class FakePagedKV:
     def get_layer_kv_with_page_table(self, layer_idx):
         return self._k[layer_idx], None, self._table[: self._active_rows]
 
+    def get_layer_kv_cache(self, layer_idx):
+        return self._k[layer_idx], None
+
     # -- API used by the eager serving path --------------------------------
     def update_layer_decode_new_token(self, k_tensor, v_tensor, sequence_lengths,
                                       layer_idx, batch_slice=None,
