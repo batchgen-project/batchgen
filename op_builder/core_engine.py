@@ -4,6 +4,14 @@ from .builder import CUDAOpBuilder
 
 BATCHGEN_CORE_ROOT = "core/"
 
+# The CPU attention kernel of attention modes 0 and 2 is written in AVX2
+# intrinsics (<immintrin.h>), so it exists only in x86_64 builds. On any other
+# host the source is left out and Hetero_Attn.cpp, guarded by __x86_64__,
+# refuses those modes with CPUAttentionUnavailableError.
+X86_CPU_ATTENTION_SOURCE = (
+    f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp"
+)
+
 
 def _torch_cxx_std() -> str:
     """C++ standard required by the active Torch (>=2.15 headers need C++20)."""
@@ -48,6 +56,9 @@ class CoreEngineBuilder(CUDAOpBuilder):
         return f"batchgen.core_engine"
 
     def sources(self):
+        x86_cpu_attention = (
+            [X86_CPU_ATTENTION_SOURCE] if self._cpu_info()["arch"] == "X86_64" else []
+        )
         return [
             f"{BATCHGEN_CORE_ROOT}/utils.cpp",
             f"{BATCHGEN_CORE_ROOT}/batchgen_Binding.cpp",
@@ -69,7 +80,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_kv_page_table.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/uva_copy_kernel.cu",
-            f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
+            *x86_cpu_attention,
             f"{BATCHGEN_CORE_ROOT}/allocator.cpp",
         ]
 

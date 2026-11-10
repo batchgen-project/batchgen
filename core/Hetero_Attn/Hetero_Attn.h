@@ -50,6 +50,15 @@
 #include "../data_structures.h"
 #include "../utils.h"
 
+// Attention modes 0 and 2 run the AVX2 CPU attention kernel, which only x86_64
+// builds compile. A build for any other architecture refuses those modes with
+// this error. pybind11 maps it to RuntimeError; the message starts with the
+// class name.
+class CPUAttentionUnavailableError : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+
 class Hetero_Attn {
 public:
     Hetero_Attn(const EngineConfig& engine_config,

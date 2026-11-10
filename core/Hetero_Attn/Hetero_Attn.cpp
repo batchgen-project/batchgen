@@ -49,6 +49,22 @@
 #include "CPU_Kernels/cpu_kernels.h"
 #include "Hetero_Attn.h"
 
+#if !defined(__x86_64__)
+namespace {
+// The AVX2 CPU attention kernel of modes 0 and 2 is compiled into x86_64
+// builds only (op_builder/core_engine.py). Elsewhere those modes are refused,
+// never rerouted to another mode.
+[[noreturn]] void throw_cpu_attention_unavailable(int64_t attn_mode) {
+    throw CPUAttentionUnavailableError(
+        "CPUAttentionUnavailableError: attn_mode " +
+        std::to_string(attn_mode) +
+        " runs the AVX2 CPU attention kernel, which only x86_64 builds "
+        "contain; this core_engine was built for another architecture. "
+        "Use attn_mode 1 or 3.");
+}
+}  // namespace
+#endif
+
 constexpr float FP8_MAX = 448.0f;
 std::tuple<torch::Tensor, torch::Tensor> compressed_kv_bf16_to_fp8_per_token(torch::Tensor x) {
     /*
@@ -222,6 +238,15 @@ Hetero_Attn::Hetero_Attn(const EngineConfig& engine_config,
         "Hetero_Attn" +
             std::to_string(this->engine_config_.basic_config.device));
     this->attn_mode_ = this->engine_config_.basic_config.attn_mode;
+#if !defined(__x86_64__)
+    if (this->attn_mode_ == 0 || this->attn_mode_ == 2) {
+        this->logger_->error(
+            "attn_mode {} needs the AVX2 CPU attention kernel, which this "
+            "non-x86_64 build does not contain",
+            this->attn_mode_);
+        throw_cpu_attention_unavailable(this->attn_mode_);
+    }
+#endif
 };
 
 torch::Tensor Hetero_Attn::attn(
@@ -323,6 +348,7 @@ torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
     torch::Tensor attn_output;
     try {
         auto kernel_start = std::chrono::high_resolution_clock::now();
+#if defined(__x86_64__)
         attn_output = grouped_query_attention_cpu_avx2(
             query_states, k_ptrs, v_ptrs, attention_mask,
             attention_mask.size(-1),
@@ -333,6 +359,9 @@ torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
             this->model_config_.head_dim,
             this->engine_config_.basic_config.num_threads,
             this->engine_config_.basic_config.log_level);
+#else
+        throw_cpu_attention_unavailable(0);
+#endif
         auto kernel_end = std::chrono::high_resolution_clock::now();
         auto kernel_duration =
             std::chrono::duration_cast<std::chrono::microseconds>(kernel_end -
@@ -748,6 +777,7 @@ std::future<torch::Tensor> Hetero_Attn::CPU_attn_mechanism(
             auto v_ptrs = this->kv_storage_.get_v_ptrs(layer_idx, batch);
             auto start = std::chrono::high_resolution_clock::now();
             this->logger_->debug("Calling CPU kernel.");
+#if defined(__x86_64__)
             auto attn_output = grouped_query_attention_cpu_avx2(
                 query_states, k_ptrs, v_ptrs, attention_mask,
                 attention_mask.size(-1),
@@ -758,6 +788,10 @@ std::future<torch::Tensor> Hetero_Attn::CPU_attn_mechanism(
                 this->model_config_.head_dim,
                 this->engine_config_.basic_config.num_threads,
                 this->engine_config_.basic_config.log_level);
+#else
+            torch::Tensor attn_output;
+            throw_cpu_attention_unavailable(2);
+#endif
             // attn_output =
             // this->h2d_engine_.tensor_on_demand_copy(attn_output);
             attn_output =

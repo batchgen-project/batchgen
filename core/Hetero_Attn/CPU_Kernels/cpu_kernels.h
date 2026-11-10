@@ -46,7 +46,11 @@
         @return
                 torch::Tensor, [bsz, num_attn_head, 1, head_dim]. Attention
    output.
+
+        AVX2 only: the kernel is compiled into x86_64 builds alone (see
+   op_builder/core_engine.py), so it is declared only there.
 */
+#if defined(__x86_64__)
 torch::Tensor grouped_query_attention_cpu_avx2(
     const torch::Tensor& query_states,
     const std::vector<c10::BFloat16*>& key_states,
@@ -54,6 +58,7 @@ torch::Tensor grouped_query_attention_cpu_avx2(
     const torch::Tensor& attention_mask, int64_t cache_length,
     int64_t group_size, int64_t num_attention_heads, int64_t num_kv_head,
     int64_t head_dim, int64_t num_threads, const std::string& log_level);
+#endif  // defined(__x86_64__)
 
 // torch::Tensor grouped_query_attention_cpu_avx2_deepseekv2(
 //     const torch::Tensor& query_states,
