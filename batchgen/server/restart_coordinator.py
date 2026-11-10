@@ -24,7 +24,6 @@ immediately, so its restart keeps exactly the phases and timings it had.
 from __future__ import annotations
 
 import json
-import json
 import logging
 import threading
 import time
