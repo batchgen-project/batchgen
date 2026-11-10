@@ -1531,6 +1531,20 @@ class KimiLinearParallelStrategyManager:
                 "streamed-SP8 prefill requires a positive routed-expert "
                 "prefill ring depth"
             )
+        # Both bounds come from the planner (the machine profile row on TP8);
+        # a missing value is a planning error, never a default.
+        batching = self.engine_config.Module_Batching_Config
+        planned_rows = {}
+        for name in (
+            "k3_prefill_grouped_chunk_rows",
+            "k3_prefill_collective_stripe_threshold_rows",
+        ):
+            planned_rows[name] = int(getattr(batching, name, 0) or 0)
+            if planned_rows[name] <= 0:
+                raise RuntimeError(
+                    f"streamed-SP8 prefill requires a planned positive "
+                    f"Module_Batching_Config.{name}; the planner did not set it"
+                )
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
@@ -1605,16 +1619,10 @@ class KimiLinearParallelStrategyManager:
                     if self._latent_projections_sharded()
                     else moe.routed_expert_up_proj
                 ),
-                chunk_rows=int(getattr(
-                    self.engine_config.Module_Batching_Config,
-                    "k3_prefill_grouped_chunk_rows",
-                    2_048,
-                )),
-                collective_stripe_threshold_rows=int(getattr(
-                    self.engine_config.Module_Batching_Config,
-                    "k3_prefill_collective_stripe_threshold_rows",
-                    32_768,
-                )),
+                chunk_rows=planned_rows["k3_prefill_grouped_chunk_rows"],
+                collective_stripe_threshold_rows=planned_rows[
+                    "k3_prefill_collective_stripe_threshold_rows"
+                ],
             )
             shared = getattr(moe, "shared_experts", None)
             if shared is not None:

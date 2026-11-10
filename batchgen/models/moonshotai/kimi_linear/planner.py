@@ -11,144 +11,41 @@
 
 """Kimi-Linear specific planner for BatchGen configuration."""
 
+from batchgen.hardware.machine_family import (
+    DeviceFacts,
+    MachineFamily,
+    classify_machine_family,
+)
+from batchgen.models.moonshotai.kimi_linear.machine_profile import (
+    K3_PROFILE_ATTENTION_GROUP_SIZE,
+    KL48_PREFIX_POOL_WORKSPACE_BYTES,
+    K3EngineProfile,
+    k3_engine_profile,
+)
 from batchgen.planner.base_planner import BasePlanner
 
 
-_GIB = 1024 ** 3
-_K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
-_K3_H20_PREFILL_TOKEN_CAP = 16_384
-_K3_H200_PREFILL_TOKEN_CAP = 524_288
-# Admission waves after the first decode phase prefill through the resident
-# EP shard (kept on the GPU) in chunks of this many tokens — SGLang's
-# max-prefill-tokens for the matched baseline. The 84 GiB shard leaves
-# ~25 GB for prefill scratch on H200; the global FP32 MoE output alone is
-# world_size x cap x hidden x 4 B = 7.5 GB at 16K.
-_K3_H200_RESIDENT_PREFILL_TOKEN_CAP = 16_384
-# Resident-prefill expert chunk for passes above 16K global rows. 2048 rows
-# is ~3-4 GiB of dispatched/intermediate/expert_out + FP32 combine scratch
-# against the ~18 GB free at an H200 handoff prefill; the 256-row default
-# was a tight-HBM rule and costs 8x the grouped-Marlin launches.
-_K3_H200_RESIDENT_PREFILL_CHUNK_ROWS = 2048
-_K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
-_K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 524_288
-_K3_H20_PREFILL_GROUPED_CHUNK_ROWS = 2_048
-_K3_H200_PREFILL_GROUPED_CHUNK_ROWS = 32_768
-# Device memory the in-wave prefill prefix pool must leave free for the K3
-# prefill forward; the pool takes what is left of mem_get_info. Sized from the
-# measured chunk-sweep peaks of the segmented KDA layer (resident token stream
-# plus chunk_kda scratch at the largest supported chunk, see
-# kda_prefill_serving) and the streamed-SP8 grouped MoE's global FP32 output at
-# the expert-chunk row cap, plus margin; the KDA term scales with the chunk.
-# Provisional until a pool run measures its chunk peak, like the GLM budget.
-_K3_H200_PREFIX_POOL_WORKSPACE_BYTES = 40 * _GIB
-# 48B-family reserve for H20-class TP8 (>= the threshold below, < the H200
-# one). The 48B's pool temporaries are strictly smaller than K3's (same
-# per-head widths, 27 vs 93 layers, resident instead of streamed experts), and
-# its weights leave ~90 GB free per H20 GPU, so a 24 GiB forward reserve holds
-# the measured chunk peaks with margin. Validated live on a 2x8 H20 serve
-# group: full in-wave pool + trajectory materialization matrix, zero OOM and
-# the per-wave token accounting identity exact.
-_KL48_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
-_KL48_H20_MIN_MEMORY_BYTES = 90 * _GIB
-# K3 reserve for H20-class TP8. H20 caps a K3 prefill micro-batch at
-# _K3_H20_PREFILL_TOKEN_CAP tokens with _K3_H20_PREFILL_GROUPED_CHUNK_ROWS-row
-# grouped MoE chunks, so the forward's pool-side temporaries stop growing once
-# a wave spans more than one capped micro-batch (the peak is per-pass). Sized
-# from a measured full in-wave pool matrix on a 4-node TP8 serve group
-# (3,424 rank-waves, prefix_pool prefill METRICS): workspace_peak_bytes
-# plateaus just under 13.5 GiB at and beyond the token cap, and the per-wave
-# token accounting identity was exact with zero OOM. This value keeps the
-# measured peak with >= 1.5x margin.
-_K3_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
+# Plan values of the machine-independent topologies (attention TP group size
+# other than 8): nothing on them depends on the machine, so they need no
+# profile row. K3 keeps the four-slot plan and the H20-validated prefill
+# bounds there; the 48B keeps its single-shard defaults.
+_K3_NON_TP8_KDA_USER_SLOTS = 4
+_K3_NON_TP8_HEAD_PARALLEL_PREFILL_TOKEN_CAP = 16_384
+_KIMI_DEFAULT_PREFILL_TOKEN_CAP = 262_144
+_KIMI_DEFAULT_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
+_KIMI_DEFAULT_PREFILL_GROUPED_CHUNK_ROWS = 2_048
 # KDA state slots held back from admission for pooled prefix segments: each
 # segment row holds one slot for its wave, and a wave that admits the full
 # sequence cap would otherwise leave none and decline the pool; a wave needing
 # more segments takes the unpooled path.
 _K3_PREFIX_SEGMENT_STATE_SLOTS = 16
-# Per-node decode admission cap on H200 (= KDA state slots). See
-# k3_kda_state_slots for the HBM budget behind this number.
-#
-# MEASURED (2026-09-05, world16 resident-EP decode, 143.8 GB/GPU): configure_
-# decoding grows allocation 44.94 -> 136.45 GB (+91.5 GB for the resident expert
-# shard), so only ~20 GB is left for KDA state + GPU KV. The cap must be sized
-# against BOTH, because slots and KV compete for the same remainder:
-#   slot cost 53.57 MiB/seq; MLA KV ~56 MB/seq at the matched decode corpus
-#   256 -> 13.8 GB slots + 14.3 GB KV = 28 GB > 20  -> KV starved; the engine
-#          admitted only 20 sequences and decode collapsed under eviction
-#   128 ->  6.7 GB slots +  7.2 GB KV = 14 GB < 20  -> fits with headroom
-# Raising this number does NOT raise concurrency once KV is the binding
-# constraint; it lowers it.
-#
-# But it must ALSO exceed the concurrency GPU KV can fund, because a slot is
-# held by every DECODING sequence AND by every sequence in an in-flight prefill
-# wave. At 128 a 120-seq prefill wave arriving beside 136 decoding sequences
-# overran the pool and killed the batch with "Insufficient free KDA state
-# items" (a FATAL allocator error), instead of being throttled by KV
-# back-pressure (graceful). Size slots so the graceful limiter binds first:
-#   at gpu_memory_frac 0.97 the budget is 135.6 GB and the non-slot base is
-#   119.66 GB, so KV = 15.94 - 0.0523*S GB and KV concurrency ~= KV / 0.056 GB.
-#   S = 192 -> slots 10.05 GB, KV 5.89 GB -> ~105 KV-funded concurrent, leaving
-#   ~87 slots of headroom for prefill waves. Slots > KV concurrency by design.
-#
-# MEASURED at S=192 (r14): that headroom is WASTED. A slot is held from prefill
-# until completion, so 192 slots parked 289 PREFILLED sequences that GPU KV
-# could never decode, while in_decode COLLAPSED 98 -> 68 and node throughput
-# fell 382 -> 219 tok/s. The earlier balance used the corpus AVERAGE (~56 MB/seq
-# of KV); sequences grow toward max_tokens, so solve it at FULL length instead
-# (4096 tok ~ 110 MB/seq):
-#   KV = 15.94 - 0.0523*S GB ; concurrency = KV / 0.110
-#   S = (15.94 - 0.0523*S)/0.110  ->  S ~= 98
-# S = 96 -> slots 5.02 GB, KV 10.9 GB -> ~99 concurrent SUSTAINED to full
-# length, versus 192 slots decaying to 68. Slots much above the KV-funded
-# concurrency buy parked sequences, not throughput.
-_K3_H200_KDA_STATE_SLOTS = 96
-# With the LatentMoE projections TP8-sharded (DECODE_CONCURRENCY_PLAN.md,
-# -8.3 GiB/rank) the same KV-funded solve gives S ~ 150 at full length; 160
-# is a multiple of the TP size and leaves a ~15.8 GB KV pool (slots are
-# 53.57 MiB each on TP8).
-_K3_H200_KDA_STATE_SLOTS_SHARDED = 160
-# With the vocab-parallel embed/lm_head as well (-3.84 GiB/rank) the planner
-# funds 256 persistent slots per node: every D512 request in flight from
-# wave 1 (no mid-run waves, long requests admitted at t=0). Slot cost ~36 MB.
-_K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
-# H20 tier (MEASURED on the 4x8 H20 world32 diagnostic run, 2026-10-29,
-# sub-project batchgen-k3-h20-decode-residency). H20 is 95.6 GB (~89.0 GiB);
-# at gpu-memory-frac 0.95 the budget is ~84.6 GiB. The unsharded resident
-# decode footprint measured 71.7 GiB/rank (resident expert shard ~42 GiB at
-# world32 + replicated latent projections 9.5 GiB + vocab 3.84 GiB +
-# dense/KDA/skeleton ~15 GiB), which funded only the fail-safe 4-slot plan
-# and degraded a 512-request batch into 16-wide decode waves with a phase
-# switch per wave. TP8-sharded latent projections (-8.3 GiB) bring the
-# residency to ~63 GiB, leaving ~21 GiB of headroom; minus ~2 GiB of graph
-# scratch, the same KV-funded solve as the H200 constants (full length
-# 4096 tok ~ 110 MB/seq KV + 53.57 MiB/slot = 163.6 MB per sustained
-# sequence) funds S = 128 per node — an existing decode graph bucket —
-# i.e. 512 sequences resident on a 4-node cluster.
-_K3_H20_MIN_MEMORY_BYTES = 80 * _GIB
-# MEASURED 2026-10-29 on a 4-node deployment, latent-only (replicated vocab):
-# a 512-request batch prefills in one wave, decode configures once and runs a
-# single resident phase at 128 rows/node with 15.5 GiB of driver headroom
-# after configure (PHASE_MEM), so the solve's reserve absorbs the ~3.8 GiB
-# the replicated vocab keeps resident.
-_K3_H20_KDA_STATE_SLOTS_SHARDED = 128
-
-
-def k3_shard_latent_projections(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
-) -> bool:
-    """TP-shard routed_expert_down/up_proj across the attention TP group on
-    TP8 topologies (H200 and H20): the replicated pair is 9.5 GiB/rank of
-    the residency that competes with the KV pool and KDA slots. The sharded
-    paths are topology-based (group_size == 8) and H200-validated; on H20
-    they are what funds a usable KDA slot budget at all."""
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    return bool(
-        group_size == 8
-        and gpu_total_memory_bytes is not None
-        and int(gpu_total_memory_bytes) >= _K3_H20_MIN_MEMORY_BYTES
-    )
+# Candidate per-node decode graph buckets; a plan takes those at or below its
+# admission cap plus the cap itself. The 24 bucket avoids padding a 17--24 row
+# TP8 group to 32 (ceil(24/8)=3 vs ceil(32/8)=4 rows/rank once the grouped MoE
+# joins capture).
+_DECODE_GRAPH_BUCKET_CANDIDATES = (
+    1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256,
+)
 
 
 def k3_deepep_low_latency(*, sharded_latent: bool, enable_deepep: bool = False) -> bool:
@@ -156,200 +53,48 @@ def k3_deepep_low_latency(*, sharded_latent: bool, enable_deepep: bool = False) 
     resident-EP decode graph (slice 3). ``enable_deepep`` is the server
     ``--enable-deepep`` flag: False (default) uses the NCCL path (the
     SGLang-baseline-equivalent exchange); True requires the DeepEP low-latency
-    exchange and raises when the sharded-latent gate (H200 TP8) or the K3 DeepEP
-    build is unavailable (no silent NCCL fallback). The graph build fails fast
-    if the exchange cannot be constructed."""
+    exchange and raises when the sharded-latent gate (TP8 profile) or the K3
+    DeepEP build is unavailable (no silent NCCL fallback). The graph build
+    fails fast if the exchange cannot be constructed."""
     if not enable_deepep:
         return False
     from batchgen.moe.deepep_ll import deepep_available
     if not (sharded_latent and deepep_available()):
         raise RuntimeError(
-            "--enable-deepep requires the TP-sharded latent (H200 TP8) and the "
+            "--enable-deepep requires the TP-sharded latent (TP8 profile) and the "
             "K3 DeepEP build on PYTHONPATH (deep_ep/K3_BUILD marker)")
     return True
 
 
-def k3_kda_state_slots(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int,
-    sharded_latent: bool = False,
-    sharded_vocab: bool = False,
-) -> int:
-    """Return K3's user-visible KDA sequence capacity for this GPU class.
-
-    The distributed K3 topology uses TP8 KDA, so each rank stores only 1/8
-    of every sequence's recurrent/conv state (53.57 MiB per slot). H20 with
-    the sharded latent+vocab layout funds 128 slots per node (see the
-    _K3_H20_* constants); unsharded H20 keeps the fail-safe four-slot plan.
-    The planner allocates one additional physical item for CUDA-graph
-    scratch.
-
-    H200 budget (2026-09-04). This value IS the per-node decode admission cap,
-    so it sets decode concurrency and therefore decode throughput: every step
-    re-reads the whole 84 GiB resident expert shard regardless of how many
-    sequences are in flight, so each extra admitted sequence rides on weight
-    traffic already paid for. At 256 slots the routed rows per expert are still
-    only 256*16/896 = 4.6, far below the M~16 efficiency shoulder measured in
-    the Phase-0 cost model, so the added concurrency is close to free.
-
-        resident expert shard   84.0 GiB   (measured, released during prefill)
-        KDA state, 256 slots    13.4 GiB   (256 x 53.57 MiB)
-        skeleton/dense/MLA/etc  ~15   GiB
-                               ---------
-                                ~112  GiB  against 143 GB of H200 HBM
-
-    The prior value was 32 (1.674 GiB/rank), chosen only to lift the H20
-    four-sequence ceiling "without consuming the H200 KV-cache headroom" —
-    conservative, never tuned for throughput. K3 offloads its MLA KV to host
-    paged memory, so GPU KV headroom is not the binding constraint that
-    reasoning assumed.
-
-    Unknown memory and non-TP8 configurations fail safe to the validated
-    four-slot plan.
-    """
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    if gpu_total_memory_bytes is None:
-        return 4
-    memory_bytes = int(gpu_total_memory_bytes)
-    if memory_bytes <= 0:
-        raise ValueError("gpu_total_memory_bytes must be positive")
-    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
-        if sharded_latent and sharded_vocab:
-            return _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED
-        if sharded_latent:
-            return _K3_H200_KDA_STATE_SLOTS_SHARDED
-        return _K3_H200_KDA_STATE_SLOTS
-    if (
-        group_size == 8
-        and memory_bytes >= _K3_H20_MIN_MEMORY_BYTES
-        and sharded_latent
-    ):
-        # H20 tier: funded only by the sharded latent layout (see the
-        # _K3_H20_* derivation above); the unsharded H20 footprint cannot
-        # hold more than the fail-safe plan. The measured plan ships
-        # latent-only (vocab-parallel is gated off on H20 until
-        # batchgen-k3-vocab-parallel-h20-corruption is fixed) and the same
-        # slot count holds either way.
-        return _K3_H20_KDA_STATE_SLOTS_SHARDED
-    return 4
-
-
-def k3_resident_prefill_token_cap(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
-) -> int:
-    """Token cap for resident-EP prefill of admission waves after the first
-    decode phase; 0 disables the resident handoff (H20 keeps the validated
-    release-and-stream cycle, its shard is small and its HBM is not)."""
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    if (
-        group_size == 8
-        and gpu_total_memory_bytes is not None
-        and int(gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
-    ):
-        return _K3_H200_RESIDENT_PREFILL_TOKEN_CAP
-    return 0
-
-
-def k3_prefill_prefix_pool_workspace_bytes(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int,
-    is_k3: bool = True,
+def kimi_prefix_pool_workspace_bytes(
+    *, machine_family: MachineFamily | None, attention_group_size: int,
+    is_k3: bool, world_size: int,
 ) -> int:
     """Return the forward's reserve under the in-wave prefill prefix pool.
 
-    0 leaves the pool off. The H200-class TP8 reserve was sized on K3 and
-    bounds the whole family. H20-class TP8 has one row per family: the 48B's
-    and K3's own, which is sized under K3's H20 prefill token cap. K3 prefix
-    reuse has no cross-wave materialization path, so it runs on the pool or
-    not at all; refusing an unsized layout at admission (the caller's named
-    error) beats guessing.
+    0 leaves the pool off; only attention-TP8 layouts run the pool. K3 takes
+    its profile row's reserve; the 48B takes its per-family reserve. K3
+    prefix reuse has no cross-wave materialization path, so it runs on the
+    pool or not at all.
     """
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")
-    if gpu_total_memory_bytes is None or group_size != 8:
+    if group_size != K3_PROFILE_ATTENTION_GROUP_SIZE:
         return 0
-    memory = int(gpu_total_memory_bytes)
-    if memory >= _K3_H200_MIN_MEMORY_BYTES:
-        return _K3_H200_PREFIX_POOL_WORKSPACE_BYTES
-    if memory >= _KL48_H20_MIN_MEMORY_BYTES:
-        if is_k3:
-            return _K3_H20_PREFIX_POOL_WORKSPACE_BYTES
-        return _KL48_H20_PREFIX_POOL_WORKSPACE_BYTES
-    return 0
+    family = _require_family(machine_family)
+    if is_k3:
+        return k3_engine_profile(family, world_size).prefix_pool_workspace_bytes
+    return KL48_PREFIX_POOL_WORKSPACE_BYTES[family]
 
 
-def k3_prefill_micro_batch_token_cap(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
-) -> int:
-    """Return the TP8 K3 prefill token cap for the current GPU class.
-
-    H20 keeps the validated single-long-sequence guard. H200 can release the
-    84-GiB resident decode expert shard while streamed-SP8 prefill is active,
-    leaving enough HBM to combine all eight 64K node-local prompts into one
-    layer-wise model pass. Unknown memory and non-TP8 layouts fail safe to the
-    H20 cap.
-    """
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    if gpu_total_memory_bytes is None:
-        return _K3_H20_PREFILL_TOKEN_CAP
-    memory_bytes = int(gpu_total_memory_bytes)
-    if memory_bytes <= 0:
-        raise ValueError("gpu_total_memory_bytes must be positive")
-    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
-        return _K3_H200_PREFILL_TOKEN_CAP
-    return _K3_H20_PREFILL_TOKEN_CAP
-
-
-def k3_prefill_collective_stripe_threshold_rows(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
-) -> int:
-    """Return the node-row threshold above which streamed-SP8 is striped.
-
-    H20 keeps the validated 256-row stripe path. H200 streamed prefill first
-    releases the 84-GiB resident decode shard, so the exact64 node batch can
-    use one wide latent gather/reduce instead of issuing four collectives for
-    each 256-row stripe. Unknown memory and non-TP8 layouts fail safe to the
-    H20 threshold.
-    """
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    if gpu_total_memory_bytes is None:
-        return _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
-    memory_bytes = int(gpu_total_memory_bytes)
-    if memory_bytes <= 0:
-        raise ValueError("gpu_total_memory_bytes must be positive")
-    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
-        return _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
-    return _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
-
-
-def k3_prefill_grouped_chunk_rows(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
-) -> int:
-    """Return the routed-expert token chunk for streamed-SP8 prefill.
-
-    H20 retains the validated 2K-row bound. H200 has enough temporary HBM for
-    32K node rows, which gives each expert hundreds rather than tens of rows
-    per grouped Marlin launch and cuts the exact64 loop from 256 to 16 chunks
-    per layer. Unknown memory and non-TP8 layouts fail safe to the H20 bound.
-    """
-    group_size = int(attention_group_size)
-    if group_size <= 0:
-        raise ValueError("attention_group_size must be positive")
-    if gpu_total_memory_bytes is None:
-        return _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
-    memory_bytes = int(gpu_total_memory_bytes)
-    if memory_bytes <= 0:
-        raise ValueError("gpu_total_memory_bytes must be positive")
-    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
-        return _K3_H200_PREFILL_GROUPED_CHUNK_ROWS
-    return _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
+def _require_family(machine_family: MachineFamily | None) -> MachineFamily:
+    if machine_family is None:
+        raise ValueError(
+            "an attention-TP8 Kimi plan is machine-dependent and needs the "
+            "machine family (pass device_facts to KimiLinearPlanner)"
+        )
+    return MachineFamily(machine_family)
 
 
 class KimiLinearPlanner(BasePlanner):
@@ -370,7 +115,7 @@ class KimiLinearPlanner(BasePlanner):
 
     def __init__(self, is_k3: bool = False, stream_all_modules: bool = None,
                  attention_group_size: int = 1,
-                 gpu_total_memory_bytes: int | None = None,
+                 device_facts: DeviceFacts | None = None,
                  enable_deepep: bool = False,
                  decode_graph_capturable: bool = True):
         """``is_k3`` selects the K3 (2.8T, 93L/896E) branch of the plan.
@@ -391,6 +136,11 @@ class KimiLinearPlanner(BasePlanner):
         (attn_tp sub-group), each rank owning ``kda_num_heads // G`` heads and
         summing the o_proj partials with an all_reduce; the PSM derives the
         sub-group layout from this value.
+
+        ``device_facts`` identifies the machine (``detect_device_facts``).
+        Attention-TP8 plans are machine-dependent: they classify it into a
+        machine family and read that family's profile row, and refuse to plan
+        without facts. Other group sizes plan machine-independent values.
         """
         super().__init__()
         self.is_k3 = is_k3
@@ -402,10 +152,9 @@ class KimiLinearPlanner(BasePlanner):
         # sparse_dispatch.graph_capturable (the initializer passes the live
         # value, Hopper-era callers keep True).
         self.decode_graph_capturable = bool(decode_graph_capturable)
-        self.gpu_total_memory_bytes = (
-            None
-            if gpu_total_memory_bytes is None
-            else int(gpu_total_memory_bytes)
+        self.device_facts = device_facts
+        self.machine_family = (
+            None if device_facts is None else classify_machine_family(device_facts)
         )
         # M2b: G>1 runs head-parallel KDA, whose RESIDENT load path (M2a)
         # requires stream_all_modules OFF -- the streamed-KDA head-shard seam
@@ -430,75 +179,83 @@ class KimiLinearPlanner(BasePlanner):
     def __version__(self):
         return "0.1.0"
 
+    def _k3_profile(self) -> K3EngineProfile | None:
+        """The K3 profile row of this plan, or None for a layout without one.
+
+        K3 at attention TP8 is the machine-dependent layout; it needs the
+        machine family and a row for (family, world size), and refuses by
+        name otherwise. The 48B and non-TP8 K3 plans are machine-independent.
+        """
+        if not (
+            self.is_k3
+            and self.attention_group_size == K3_PROFILE_ATTENTION_GROUP_SIZE
+        ):
+            return None
+        return k3_engine_profile(
+            _require_family(self.machine_family), self.world_size
+        )
+
     def _adjust_config_for_model(self):
         """Kimi-Linear specific config adjustments."""
         # Modern paged-KV decode path (decoding_continuous), same as K2.5.
         self.config.Basic_Config.attn_mode = 3
 
-        # In-wave prefill prefix pool reserve; 0 leaves the pool off. At G > 1
-        # the 48B runs the same resident head-parallel KDA and NoPE-MLA seams
-        # as K3 with identical per-head widths (192 K, 128 V, 576 latent), so
-        # on H200-class memory one K3-sized reserve gates both (it bounds the
-        # 48B's strictly smaller temporaries). On H20-class memory each family
-        # has its own row (is_k3 keys the branch).
-        self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
-            k3_prefill_prefix_pool_workspace_bytes(
-                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+        # Machine-dependent knobs come from the K3 profile row of this
+        # (machine family, world size) at attention TP8; every other layout
+        # plans machine-independent values.
+        k3_profile = self._k3_profile()
+        batching = self.config.Module_Batching_Config
+
+        # In-wave prefill prefix pool reserve; 0 leaves the pool off.
+        batching.prefill_prefix_pool_workspace_bytes = (
+            kimi_prefix_pool_workspace_bytes(
+                machine_family=self.machine_family,
                 attention_group_size=self.attention_group_size,
                 is_k3=self.is_k3,
+                world_size=self.world_size,
             )
         )
         pool_segment_slots = (
             _K3_PREFIX_SEGMENT_STATE_SLOTS
-            if self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes > 0
+            if batching.prefill_prefix_pool_workspace_bytes > 0
             else 0
         )
         self.config.GPU_Buffer_Config.kda_prefix_segment_slots = pool_segment_slots
 
-        # Kimi-Linear context: model_max_length=1048576. The TP8 K3 path
-        # keeps only four persistent KDA state slots on H20 (each slot is
-        # ~428.6 MiB unsharded; the distributed TP8-KDA path shards it to
-        # 53.57 MiB/rank, see the budget note below).
-        # The admission scheduler enforces that persistent sequence limit;
-        # this token cap is a separate bound on temporary prefill scratch and
-        # must not be mistaken for a KDA-slot limit.
-        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-            k3_prefill_micro_batch_token_cap(
-                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-                attention_group_size=self.attention_group_size,
+        # Kimi-Linear context: model_max_length=1048576. The admission
+        # scheduler enforces the persistent KDA sequence limit; this token cap
+        # is a separate bound on temporary prefill scratch and must not be
+        # mistaken for a KDA-slot limit.
+        if k3_profile is not None:
+            batching.prefill_micro_batch_token_cap = (
+                k3_profile.prefill_micro_batch_token_cap
             )
-            if self.is_k3 and self.attention_group_size > 1
-            else 262_144
-        )
-        self.config.Module_Batching_Config.k3_resident_prefill_token_cap = (
-            k3_resident_prefill_token_cap(
-                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-                attention_group_size=self.attention_group_size,
+            batching.resident_ep_prefill_token_cap = (
+                k3_profile.resident_ep_prefill_token_cap
             )
-            if self.is_k3
-            else 0
-        )
-        self.config.Module_Batching_Config.k3_resident_prefill_chunk_rows = (
-            _K3_H200_RESIDENT_PREFILL_CHUNK_ROWS
-            if self.config.Module_Batching_Config.k3_resident_prefill_token_cap > 0
-            else 0
-        )
-        self.config.Module_Batching_Config.k3_prefill_collective_stripe_threshold_rows = (
-            k3_prefill_collective_stripe_threshold_rows(
-                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-                attention_group_size=self.attention_group_size,
+            batching.k3_resident_prefill_chunk_rows = (
+                k3_profile.resident_prefill_chunk_rows
             )
-            if self.is_k3 and self.attention_group_size > 1
-            else _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
-        )
-        self.config.Module_Batching_Config.k3_prefill_grouped_chunk_rows = (
-            k3_prefill_grouped_chunk_rows(
-                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-                attention_group_size=self.attention_group_size,
+            batching.k3_prefill_collective_stripe_threshold_rows = (
+                k3_profile.prefill_collective_stripe_threshold_rows
             )
-            if self.is_k3 and self.attention_group_size > 1
-            else _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
-        )
+            batching.k3_prefill_grouped_chunk_rows = (
+                k3_profile.prefill_grouped_chunk_rows
+            )
+        else:
+            batching.prefill_micro_batch_token_cap = (
+                _K3_NON_TP8_HEAD_PARALLEL_PREFILL_TOKEN_CAP
+                if self.is_k3 and self.attention_group_size > 1
+                else _KIMI_DEFAULT_PREFILL_TOKEN_CAP
+            )
+            batching.resident_ep_prefill_token_cap = 0
+            batching.k3_resident_prefill_chunk_rows = 0
+            batching.k3_prefill_collective_stripe_threshold_rows = (
+                _KIMI_DEFAULT_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
+            )
+            batching.k3_prefill_grouped_chunk_rows = (
+                _KIMI_DEFAULT_PREFILL_GROUPED_CHUNK_ROWS
+            )
 
         # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":
         # base_planner's kv_element_size check and the engine dtype map
@@ -575,11 +332,11 @@ class KimiLinearPlanner(BasePlanner):
         self.config.Basic_Config.attention_group_size = self.attention_group_size
 
         if self.is_k3:
-            self._adjust_config_for_k3()
+            self._adjust_config_for_k3(k3_profile)
         if self.stream_all_modules:
             self._configure_streamed_rings()
 
-    def _adjust_config_for_k3(self):
+    def _adjust_config_for_k3(self, profile: K3EngineProfile | None):
         """K3 (93 layers, 896 experts, MXFP4) overrides. Runs last.
 
         The 48B keeps attn/kda_attn/shared_expert resident. K3 cannot: at
@@ -596,35 +353,24 @@ class KimiLinearPlanner(BasePlanner):
         types is what makes 8xH20 possible at all.
         """
         # KDA conv/recurrent state pools. At K3 dimensions, an unsharded slot
-        # is 428.6 MiB. Distributed K3 uses TP8 KDA, making it 53.57 MiB/rank.
-        # Preserve 4 user sequences on H20 and 32 on H200, then allocate one
-        # separate physical item for CUDA-graph padding/warmup. The graph
-        # reserves that item before readiness, so admission still sees exactly
-        # the user capacity instead of silently losing one sequence.
-        shard_latent = k3_shard_latent_projections(
-            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-            attention_group_size=self.attention_group_size,
-        )
+        # is 428.6 MiB; TP8 KDA makes it 53.57 MiB/rank. The profile row sets
+        # the user-visible sequence capacity (the non-TP8 plan keeps four),
+        # then one separate physical item is allocated for CUDA-graph
+        # padding/warmup. The graph reserves that item before readiness, so
+        # admission still sees exactly the user capacity instead of silently
+        # losing one sequence.
+        if profile is not None:
+            shard_latent = profile.shard_latent_projections
+            shard_vocab = profile.shard_vocab_parallel
+            sequence_slots = profile.kda_user_slots
+        else:
+            shard_latent = False
+            shard_vocab = False
+            sequence_slots = _K3_NON_TP8_KDA_USER_SLOTS
         self.config.Module_Batching_Config.k3_shard_latent_projections = shard_latent
-        # Vocab-parallel embed_tokens / lm_head stays behind the H200 gate:
-        # on the H20 world32 tier it corrupts decode outputs (token soup with
-        # malformed XTML markers; measured 2026-10-29, sub-project
-        # batchgen-k3-vocab-parallel-h20-corruption). The H20 tier therefore
-        # runs latent-only until that seam is fixed.
-        shard_vocab = (
-            shard_latent
-            and self.gpu_total_memory_bytes is not None
-            and int(self.gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
-        )
         self.config.Module_Batching_Config.k3_shard_vocab_parallel = shard_vocab
         self.config.Module_Batching_Config.k3_deepep_ll = k3_deepep_low_latency(
             sharded_latent=shard_latent, enable_deepep=self.enable_deepep,
-        )
-        sequence_slots = k3_kda_state_slots(
-            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
-            attention_group_size=self.attention_group_size,
-            sharded_latent=shard_latent,
-            sharded_vocab=shard_vocab,
         )
         self.config.GPU_Buffer_Config.kda_state_slots = (
             sequence_slots + 1
@@ -633,9 +379,7 @@ class KimiLinearPlanner(BasePlanner):
 
         # This is a per-node sequence cap under TP8: every rank in the node
         # holds the same sequence set. Keep the graph top bucket equal to that
-        # cap. The 24 bucket avoids padding a 17--24 row TP8 group to 32; that
-        # distinction becomes load-bearing when the grouped MoE joins capture
-        # because ceil(24/8)=3 while ceil(32/8)=4 rows/rank.
+        # cap.
         self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
             sequence_slots
         )
@@ -644,7 +388,7 @@ class KimiLinearPlanner(BasePlanner):
         # graph path fell back to eager for the whole run.
         self.config.Basic_Config.decode_graph_buckets = sorted({
             bucket
-            for bucket in (1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256)
+            for bucket in _DECODE_GRAPH_BUCKET_CANDIDATES
             if bucket <= sequence_slots
         } | {int(sequence_slots)})
         # Whole-model capture (collectives included) -- the analogue of
@@ -653,18 +397,11 @@ class KimiLinearPlanner(BasePlanner):
         # of launches + per-layer NCCL), so the long-generation tail of a
         # 512x4096 run cost r20 ~20 min at 72/192 occupancy. Falls back to
         # eager per step when any EP rank is empty. Batch-level override:
-        # batchgen_debug.kimi_decode_graph_mode. TP8 tiers only (H200 and the
-        # sharded H20 plan): the unsharded four-slot plan keeps its validated
-        # eager path, but a 128-row H20 decode would be launch-latency-bound
-        # eager exactly like the H200 measurement above.
+        # batchgen_debug.kimi_decode_graph_mode. Every TP8 profile row takes
+        # it; the non-TP8 four-slot plan keeps its validated eager path.
         # The captured path also needs a graph-capturable dense MLA decode
         # kernel (paged_decode.graph_capturable: Hopper today).
-        if (
-            self.attention_group_size == 8
-            and self.gpu_total_memory_bytes is not None
-            and int(self.gpu_total_memory_bytes) >= _K3_H20_MIN_MEMORY_BYTES
-            and self.decode_graph_capturable
-        ):
+        if profile is not None and self.decode_graph_capturable:
             self.config.Basic_Config.decode_graph_mode = "graph"
 
     def _configure_streamed_rings(self):
