@@ -17,14 +17,20 @@ import os
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 import batchgen.sequence as _sequence_module
 from batchgen.continuous_batching import AdaptiveChunkSizer
 from batchgen.query_book import release_local_query_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry
 from batchgen.worker.prefill import compute_prefill_host_reservation
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_functions, load_worker_methods
+
+_admitted_prompt_ids = load_worker_functions(
+    ["_admitted_prompt_ids"], {"np": np, "torch": torch}
+)["_admitted_prompt_ids"]
 
 _METHODS = load_worker_methods(
     [
@@ -37,6 +43,7 @@ _METHODS = load_worker_methods(
     ],
     {
         "SequenceEntry": SequenceEntry,
+        "_admitted_prompt_ids": _admitted_prompt_ids,
         "compute_prefill_host_reservation": compute_prefill_host_reservation,
         "_sequence_module": _sequence_module,
         "release_local_query_slot": release_local_query_slot,
@@ -94,10 +101,10 @@ class _Worker:
     def _update_batch_config(self, num_queries):
         pass
 
-    def _tokenize_admitted_sequences(self, uuids):
-        for uuid in uuids:
+    def _bind_admitted_prompts(self, uuids, prompt_ids):
+        for uuid, ids in zip(uuids, prompt_ids):
             seq = self.global_batch.get_sequence(uuid)
-            seq.prompt_length = len(seq.text)
+            seq.prompt_length = len(ids)
             seq.original_prompt_length = seq.prompt_length
             seq.kv_token_budget = seq.prompt_length + seq.max_decode_length
             seq.assigned_rank = 0
@@ -177,6 +184,10 @@ def test_short_request_after_long_first_batch_reserves_only_its_budget(adaptive)
     assert growth == []
 
 
+def _ids(length):
+    return np.zeros(length, dtype=np.int32)
+
+
 def _admit(worker, entries):
     worker._admit_sequences_from_message({"entries": entries})
 
@@ -184,8 +195,8 @@ def _admit(worker, entries):
 def test_admission_uses_each_entry_budget():
     worker = _pool_worker(128, adaptive=False)
     _admit(worker, [
-        {"request_id": "long", "text": "x" * 40, "max_tokens": 32768, "batch_id": "b"},
-        {"request_id": "short", "text": "y" * 40, "max_tokens": 16, "batch_id": "b"},
+        {"request_id": "long", "input_ids": _ids(40), "max_tokens": 32768, "batch_id": "b"},
+        {"request_id": "short", "input_ids": _ids(40), "max_tokens": 16, "batch_id": "b"},
     ])
     long_seq = worker.global_batch.get_sequence("long")
     short_seq = worker.global_batch.get_sequence("short")
@@ -197,8 +208,8 @@ def test_admission_without_a_budget_fails_before_admitting_anything():
     worker = _pool_worker(128, adaptive=False)
     with pytest.raises(ValueError, match="no max_tokens"):
         _admit(worker, [
-            {"request_id": "ok", "text": "x", "max_tokens": 8, "batch_id": "b"},
-            {"request_id": "bare", "text": "y", "batch_id": "b"},
+            {"request_id": "ok", "input_ids": _ids(1), "max_tokens": 8, "batch_id": "b"},
+            {"request_id": "bare", "input_ids": _ids(1), "batch_id": "b"},
         ])
     assert len(worker.global_batch) == 0
 

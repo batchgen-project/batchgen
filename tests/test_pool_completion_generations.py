@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pytest
 
 
@@ -204,7 +205,6 @@ def _scheduler(tmp_path: Path):
                 # A non-chat endpoint keeps the tokenizer out of this test.
                 "url": "/v1/completions",
                 "model": "test-model",
-                "prompt_text": "prompt",
             }
             for request_id in ("req-1", "req-2")
         }
@@ -804,7 +804,9 @@ def _intake_entries(module, batch_id: str, count: int) -> List[Any]:
         module.IntakeEntry(
             request_id=f"req-{idx}@{batch_id}",
             batch_id=batch_id,
-            raw_request={"text": "prompt", "max_tokens": 4},
+            raw_request={
+                "input_ids": np.arange(4, dtype=np.int32), "max_tokens": 4,
+            },
             priority=module.Priority.NORMAL,
         )
         for idx in range(count)
@@ -934,7 +936,7 @@ def test_a_timed_out_batch_releases_its_state_and_drops_late_completions(
         intake_calls = _recording_intake(scheduler)
         scheduler._batch_timeout = 0
 
-        await scheduler._wait_and_finalize_batch("batch-1", [], [])
+        await scheduler._wait_and_finalize_batch("batch-1", [])
 
         [(batch_id, status, kwargs)] = scheduler.storage.statuses
         assert (batch_id, status) == ("batch-1", "failed")
@@ -970,7 +972,7 @@ def test_a_worker_fatal_discards_batch_state_once(tmp_path):
         intake_calls = _recording_intake(scheduler)
         scheduler._batch_timeout = 60
         waiter = asyncio.create_task(
-            scheduler._wait_and_finalize_batch("batch-1", [], [])
+            scheduler._wait_and_finalize_batch("batch-1", [])
         )
         await asyncio.sleep(0)
 

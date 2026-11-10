@@ -167,6 +167,8 @@ def test_scheduler_fails_the_batch_before_rendering(tmp_path):
     def must_not_render(*args, **kwargs):
         raise AssertionError("a mismatched request reached prompt rendering")
 
+    scheduler._get_tokenizer = must_not_render
+    scheduler._build_prompts = must_not_render
     scheduler._convert_requests_to_worker_inputs = must_not_render
     asyncio.run(scheduler._process_batch("batch_k3"))
 

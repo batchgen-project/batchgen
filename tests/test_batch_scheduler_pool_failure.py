@@ -47,7 +47,6 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
         scheduler._wait_and_finalize_batch(
             "batch-test",
             requests=[],
-            prompts=[],
         )
     )
 

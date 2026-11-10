@@ -76,10 +76,11 @@ loudly.
 
 The string seam, and why rendering is VERIFIED rather than scanned
 ------------------------------------------------------------------
-BatchGen has no pre-tokenized prompt path. The scheduler renders chat to a
-*string* (``server/batch_scheduler.py``, ``tokenize=False``) and the worker
-re-encodes that whole string (``batchgen_worker.py`` -> :meth:`__call__` ->
-:meth:`encode`). Flattening to a string discards K3's per-segment
+BatchGen serving carries token ids: the scheduler calls
+``apply_chat_template(tokenize=True)`` (``server/batch_scheduler.py``) and the
+worker receives those ids, so serving never takes the string path below. A
+direct caller of ``tokenize=False`` that re-encodes the string with
+:meth:`encode` does take it. Flattening to a string discards K3's per-segment
 ``allow_special`` distinction, and there are TWO ways the re-encoded ids can then
 differ from what HuggingFace's ``tokenize=True`` would have produced:
 
@@ -107,8 +108,8 @@ by CONCATENATING marker-free content parts.
 
 Instead, ``apply_chat_template(tokenize=False)`` renders the string and then
 **re-encodes it with this tokenizer's own :meth:`encode` -- the exact function
-the worker will call -- and requires the result to equal the reference segment
-ids**. That is not a heuristic; it is the property we actually need, checked
+a consumer of the string would call -- and requires the result to equal the
+reference segment ids**. That is not a heuristic; it is the property we actually need, checked
 directly. It catches (1) and (2) uniformly, has no blind spots, and needs no
 marker table.
 
@@ -718,8 +719,8 @@ class KimiK3Tokenizer(BaseTokenizer):
                 ``add_special_tokens=False``) report a rendered K3 prompt as 32
                 tokens where the worker really produces 12.
             allow_special_tokens: the real switch, and the seam that keeps the
-                string path faithful. ``True`` (default, and what the worker
-                does to ``seq.text``) encodes the four structural markers in
+                string path faithful. ``True`` (default, and what a consumer of
+                a rendered string does) encodes the four structural markers in
                 :data:`KIMI_K3_STRUCTURAL_MARKERS` as control ids and everything
                 else as ordinary BPE. ``False`` encodes all of them as ordinary
                 BPE, the mode K3 uses for user/tool content.
@@ -1134,8 +1135,8 @@ class KimiK3Tokenizer(BaseTokenizer):
 
         This is the whole safety story for ``tokenize=False``, and it is a
         direct check of the property that matters rather than a proxy for it:
-        the string is re-encoded with :meth:`encode` -- the very function the
-        worker will call on it -- and compared elementwise against the segment
+        the string is re-encoded with :meth:`encode` -- the very function a
+        consumer of the string would call -- and compared elementwise against the segment
         ids that HuggingFace's ``tokenize=True`` produces.
 
         It catches control-marker forgery in *any* caller-supplied position
@@ -1162,7 +1163,7 @@ class KimiK3Tokenizer(BaseTokenizer):
                          if any(m in s.text for s in segments if not s.allow_special))
         raise ValueError(
             f"Kimi-K3: {where}this conversation cannot be rendered faithfully "
-            f"through BatchGen's string prompt seam. The reference tokenizer "
+            f"as a prompt string. The reference tokenizer "
             f"produces {len(reference_ids)} ids, but re-encoding the rendered "
             f"string produces {len(actual)}; they first differ at index {index}."
             + (
@@ -1179,9 +1180,8 @@ class KimiK3Tokenizer(BaseTokenizer):
             )
             + (f" Newly introduced special ids: {forged}." if forged else "")
             + f" Near: {context!r}. "
-            f"BatchGen renders chat to text in the scheduler and re-encodes it "
-            f"in the worker, which cannot represent K3's per-segment "
-            f"allow_special split. Refusing to serve a prompt that differs from "
+            f"Re-encoding a rendered string cannot represent K3's per-segment "
+            f"allow_special split. Refusing to return a prompt that differs from "
             f"the reference implementation. Fix the offending string, or call "
             f"apply_chat_template(tokenize=True), which is exact for any input."
         )
