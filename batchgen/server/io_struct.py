@@ -209,6 +209,31 @@ class BatchStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+# batchgen_debug keys the server no longer accepts, each with the reason a
+# request that carries it is refused. Admission refuses them (HTTP 400 on
+# /v1/batches and /v1/turns, a failed batch for one already stored), so they
+# never reach a worker, where nothing reads them any more.
+RETIRED_BATCHGEN_DEBUG_KEYS: Dict[str, str] = {
+    "k3_prefill_moe_mode": (
+        "the prefill MoE mode is fixed for the server's lifetime and no batch "
+        "can change it; start a server with --prefill-moe-mode "
+        "{streamed,streamed_sp8,resident_ep} to run another mode"
+    ),
+}
+
+
+def retired_batchgen_debug_error(debug: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The refusal message for a ``batchgen_debug`` carrying a retired key."""
+    retired = sorted(set(debug or {}) & RETIRED_BATCHGEN_DEBUG_KEYS.keys())
+    if not retired:
+        return None
+    return "; ".join(
+        f"batchgen_debug.{key} is no longer accepted: "
+        f"{RETIRED_BATCHGEN_DEBUG_KEYS[key]}"
+        for key in retired
+    )
+
+
 class CreateBatchRequest(BaseModel):
     input_file_id: str
     endpoint: BatchEndpoint = BatchEndpoint.CHAT_COMPLETIONS

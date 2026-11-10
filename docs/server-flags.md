@@ -335,6 +335,7 @@ This allows serving more concurrent sequences than the host KV cache can hold at
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable-prepack` | `true` | Enable prepack optimization for efficient prefill batching (always on) |
+| `--prefill-moe-mode` | model default | Prefill MoE mode of every prefill wave of this server: `streamed`, `streamed_sp8` or `resident_ep`, on models that declare prefill MoE modes (Kimi-K3). Unset, the model picks its streaming mode for the weight topology. The mode is fixed for the server's lifetime: no batch can change it, and a batch or turn that sends the retired `batchgen_debug.k3_prefill_moe_mode` is refused with HTTP 400. The model refuses a mode its topology cannot run at startup; a model without prefill MoE modes refuses the flag. `resident_ep` cannot be combined with `--enable-prefix-cache`. |
 
 Prepack optimization packs multiple sequences into a single batch for efficient prefill. This is always enabled.
 

@@ -40,6 +40,7 @@ from batchgen.server.io_struct import (
     ListModelsResponse,
     ModelObject,
     build_batch_object_from_create_request,
+    retired_batchgen_debug_error,
 )
 from batchgen.deprecation import (
     LEGACY_INFERENCE_ERROR_CODE,
@@ -456,6 +457,12 @@ def create_app(
         storage: StorageManager = request.app.state.storage
         scheduler: BatchScheduler = request.app.state.scheduler
         worker_manager: WorkerManager = request.app.state.worker
+
+        # A request error, refused whatever the pool state: it would be
+        # refused again on retry.
+        retired_debug = retired_batchgen_debug_error(body.batchgen_debug)
+        if retired_debug is not None:
+            raise HTTPException(status_code=400, detail=retired_debug)
 
         # Admission control: a batch may only be created while the worker pool
         # is serving. Accepting one during a restart or while the pool is down

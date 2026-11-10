@@ -29,12 +29,9 @@ def _isolated_worker_class():
     names = {
         "_desired_phase_key",
         "_server_prefill_moe_mode",
-        "_prefill_moe_mode_for_debug",
         "_begin_prefill_wave",
-        "_prefill_token_cap_for_mode",
-        "_live_prefill_token_cap",
-        "_wave_prefill_token_cap",
-        "_placement_prefill_token_cap",
+        "_server_prefill_token_cap",
+        "_require_server_prefill_moe_mode",
         "_phase_exit_mode",
         "_retire_kept_phase_instances",
         "_require_resumable_instance",
@@ -99,6 +96,9 @@ def _worker(manager, events):
     worker.rank = 0
     worker._live_phase_key = None
     worker._kept_phase_keys = {}
+    # The prefill MoE mode the server was started in (see _server_worker
+    # for resolution from a manager).
+    worker._server_prefill_moe_mode_resolved = ("streamed",)
     worker.parallel_manager = manager
     worker.args = SimpleNamespace(persistent_phase_instances=False)
     worker._streamed_sp8_h2d_installed = False
@@ -126,7 +126,6 @@ def _worker(manager, events):
 
 STREAMED_CAP = 524_288
 RESIDENT_CAP = 16_384
-RESIDENT_DEBUG = {"k3_prefill_moe_mode": "resident_ep"}
 
 
 class _ServerManager:
@@ -218,20 +217,18 @@ def _server_worker(*, resident_cap=RESIDENT_CAP, manager=None):
 
 
 def _run_prefill_wave(worker, *debugs):
-    """Resolve, plan, transition and read caps the way one wave does.
+    """Resolve, plan and transition the way one wave does.
 
-    Returns the wave's key and the caps its readers see: placement (receipt
-    and wave-time packing), the pre-transition pool plan and the live wave.
+    Returns the wave's key and the token cap its readers (receipt placement,
+    the pre-transition pool plan and the live prefill) all use.
     """
     worker._sequences = _sequences(*(debugs or (None,)))
     uuids = list(worker._sequences)
     worker._begin_prefill_wave(uuids)
-    placement_cap = worker._placement_prefill_token_cap()
-    pool_cap = worker._wave_prefill_token_cap()
     worker._phase_request_uuids = tuple(uuids)
     key = worker._desired_phase_key("prefill")
     worker._transition_phase(key)
-    return key, placement_cap, pool_cap, worker._live_prefill_token_cap()
+    return key, worker._server_prefill_token_cap()
 
 
 def _run_decode(worker):
@@ -367,63 +364,80 @@ def test_every_prefill_wave_uses_the_server_mode_across_decode_phases():
 
     keys = []
     for wave in range(3):
-        key, placement_cap, pool_cap, live_cap = _run_prefill_wave(worker)
+        key, cap = _run_prefill_wave(worker)
         keys.append(key)
-        assert placement_cap == pool_cap == live_cap == STREAMED_CAP
+        assert cap == STREAMED_CAP
         if wave < 2:
             _run_decode(worker)
 
     assert {key.prefill_moe_mode for key in keys} == {"streamed_sp8"}
-    assert worker.parallel_manager.set_modes == ["streamed_sp8"] * 3
+    # The worker never re-selects the mode per wave; startup installs it.
+    assert worker.parallel_manager.set_modes == []
     # Decided once for the process, never re-read per wave, even though the
     # manager offers a built, available resident shard after every decode.
     assert worker.parallel_manager.default_calls == 1
-    prefill_entries = [e for e in events if e[:2] == ("enter", "prefill")]
-    assert {e[2] for e in prefill_entries} == {"streamed_sp8"}
-    assert worker.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap == (
-        STREAMED_CAP
+    entries = [e for e in events if e[0] == "enter"]
+    assert {e[2] for e in entries} == {"streamed_sp8"}
+
+
+def test_a_resident_ep_server_runs_every_wave_resident_from_the_first():
+    worker, events = _server_worker(
+        manager=_ServerManager([], default_mode="resident_ep")
     )
+    _start(worker)
+    for _ in range(2):
+        key, cap = _run_prefill_wave(worker)
+        assert key.prefill_moe_mode == "resident_ep"
+        assert cap == RESIDENT_CAP
+        _run_decode(worker)
+    assert worker._desired_phase_key("decode").prefill_moe_mode == "resident_ep"
+    assert {e[2] for e in events if e[0] == "enter"} == {"resident_ep"}
 
 
-def test_batch_override_applies_to_its_own_wave_only():
+def test_a_retired_mode_debug_key_never_changes_the_wave_mode():
+    # Admission refuses the key; even if one reached a worker it selects
+    # nothing: the wave runs the server mode.
     worker, _ = _server_worker()
     _start(worker)
     _run_decode(worker)
-
-    key, placement_cap, pool_cap, live_cap = _run_prefill_wave(
-        worker, RESIDENT_DEBUG
-    )
-    assert key.prefill_moe_mode == "resident_ep"
-    assert pool_cap == live_cap == RESIDENT_CAP
-    # Placement scores the same at receipt and at wave time: server mode.
-    assert placement_cap == STREAMED_CAP
-    _run_decode(worker)
-
-    key, placement_cap, pool_cap, live_cap = _run_prefill_wave(worker)
+    key, cap = _run_prefill_wave(worker, {"k3_prefill_moe_mode": "resident_ep"})
     assert key.prefill_moe_mode == "streamed_sp8"
-    assert placement_cap == pool_cap == live_cap == STREAMED_CAP
-    assert worker.parallel_manager.set_modes == ["resident_ep", "streamed_sp8"]
-    # The resident wave never rewrites the planner's shared streamed cap.
-    batching = worker.engine_config.Module_Batching_Config
-    assert batching.prefill_micro_batch_token_cap == STREAMED_CAP
-    assert batching.resident_ep_prefill_token_cap == RESIDENT_CAP
+    assert cap == STREAMED_CAP
+    assert worker.parallel_manager.set_modes == []
 
 
-def test_a_mixed_debug_wave_plans_and_executes_under_one_mode():
-    # One request asks for resident-EP, one carries no flag. The wave mode is
-    # resolved once from both; a group serving only the plain request plans
-    # its pool with the wave's cap, not a mode re-derived from its subset.
+def test_profile_overrides_are_the_only_key_field_that_varies_between_waves():
     worker, _ = _server_worker()
     _start(worker)
+    plain, _ = _run_prefill_wave(worker)
     _run_decode(worker)
-    key, _, pool_cap, live_cap = _run_prefill_wave(worker, None, RESIDENT_DEBUG)
-    assert key.prefill_moe_mode == "resident_ep"
-    assert pool_cap == live_cap == RESIDENT_CAP
+    profiled, _ = _run_prefill_wave(worker, {"k3_prefill_profile": True})
+    assert plain.prefill_moe_mode == profiled.prefill_moe_mode == "streamed_sp8"
+    assert plain.profile_overrides == ()
+    assert profiled.profile_overrides == (("k3_prefill_profile", True),)
 
 
-def test_pool_plan_cap_is_the_wave_cap_for_every_group_subset():
+def test_phase_enter_refuses_a_key_with_another_mode_and_names_both():
+    events = []
+    manager = _Manager(events, {"prefill": True, "decode": True})
+    worker = _worker(manager, events)
+    live = PhaseKey("decode", "streamed")
+    worker._live_phase_key = live
+    worker._kept_phase_keys = {"decode": live}
+    with pytest.raises(
+        RuntimeError, match="'resident_ep', but this server runs 'streamed'"
+    ):
+        worker._transition_phase(PhaseKey("prefill", "resident_ep"))
+    # Refused before the live phase is left: nothing exited or entered.
+    assert events == []
+    assert worker._live_phase_key == live
+    with pytest.raises(RuntimeError, match="no wave changes it"):
+        worker._transition_phase(PhaseKey("decode", None))
+
+
+def test_pool_plan_cap_is_the_server_cap_for_every_group_subset():
     source = _method_source("_plan_prefill_pool_wave")
-    assert "self._wave_prefill_token_cap()" in source
+    assert "self._server_prefill_token_cap()" in source
     assert "_active_batchgen_debug_for_sequences" not in source
 
 
@@ -433,15 +447,16 @@ def test_phase_key_refuses_a_wave_that_was_not_resolved():
     worker._phase_request_uuids = ("u0",)
     with pytest.raises(RuntimeError, match="did not resolve"):
         worker._desired_phase_key("prefill")
-    with pytest.raises(RuntimeError, match="before _begin_prefill_wave"):
-        worker._wave_prefill_token_cap()
 
 
-def test_resident_override_without_a_planned_resident_cap_uses_the_streamed_cap():
-    worker, _ = _server_worker(resident_cap=0)
-    assert worker._prefill_token_cap_for_mode("resident_ep") == STREAMED_CAP
-    for mode in ("streamed", "streamed_sp8", None):
-        assert worker._prefill_token_cap_for_mode(mode) == STREAMED_CAP
+def test_a_resident_ep_server_without_a_planned_resident_cap_uses_the_streamed_cap():
+    worker, _ = _server_worker(
+        resident_cap=0, manager=_ServerManager([], default_mode="resident_ep")
+    )
+    assert worker._server_prefill_token_cap() == STREAMED_CAP
+    for mode in ("streamed", "streamed_sp8"):
+        worker, _ = _server_worker(manager=_ServerManager([], default_mode=mode))
+        assert worker._server_prefill_token_cap() == STREAMED_CAP
 
 
 class _NoModeManager(_ServerManager):
@@ -465,11 +480,23 @@ def test_a_manager_without_prefill_moe_modes_runs_mode_none():
     worker, _ = _server_worker(manager=_NoModeManager([]))
     assert worker._server_prefill_moe_mode() is None
     _start(worker)
-    key, placement_cap, pool_cap, live_cap = _run_prefill_wave(worker)
+    key, cap = _run_prefill_wave(worker)
     assert key.prefill_moe_mode is None
-    assert placement_cap == pool_cap == live_cap == STREAMED_CAP
+    assert cap == STREAMED_CAP
+
+
+def test_the_server_option_on_a_manager_without_modes_is_refused():
+    worker, _ = _server_worker(manager=_NoModeManager([]))
+    worker.args.prefill_moe_mode = "resident_ep"
     with pytest.raises(ValueError, match="has no prefill MoE modes"):
-        worker._prefill_moe_mode_for_debug(RESIDENT_DEBUG)
+        worker._server_prefill_moe_mode()
+
+
+def test_a_manager_that_does_not_honour_the_server_option_is_refused():
+    worker, _ = _server_worker()
+    worker.args.prefill_moe_mode = "resident_ep"
+    with pytest.raises(RuntimeError, match="started with --prefill-moe-mode"):
+        worker._server_prefill_moe_mode()
 
 
 def test_a_manager_declaring_half_the_mode_capability_is_refused():
@@ -483,13 +510,14 @@ def test_a_manager_declaring_half_the_mode_capability_is_refused():
         worker._server_prefill_moe_mode()
 
 
-def test_live_cap_refuses_a_read_outside_a_live_prefill_phase():
-    worker, _ = _server_worker()
-    with pytest.raises(RuntimeError, match="live prefill wave"):
-        worker._live_prefill_token_cap()
-    worker._live_phase_key = PhaseKey("decode", "streamed_sp8")
-    with pytest.raises(RuntimeError, match="live prefill wave"):
-        worker._live_prefill_token_cap()
+def test_no_per_batch_prefill_mode_selection_remains_in_the_worker():
+    source = WORKER.read_text()
+    for name in (
+        "k3_prefill_moe_mode",
+        "_prefill_moe_mode_for_debug",
+        "_prefill_wave_moe_mode",
+    ):
+        assert name not in source
 
 
 def _class_function_nodes(path, class_name):
@@ -825,7 +853,7 @@ def _assert_freed(ref):
 
 
 def test_k3_profile_key_change_after_decode_cycles_retires_every_kept_instance():
-    # The r4 failure shape on the key field that still varies between waves:
+    # The reported failure shape on the key field that still varies between waves:
     # after server-mode decode cycles, a profile_overrides change makes the
     # decode exit a RETIRE. Before the fix the K3 RETIRE dropped only the
     # decode tuple, the prefill instance kept from the earlier waves held the
@@ -928,12 +956,12 @@ def test_retire_retires_every_kept_instance_under_its_own_key_before_deep_free()
     events = []
     manager = _Manager(events, {"prefill": True, "decode": True})
     worker = _worker(manager, events)
-    old_prefill = PhaseKey("prefill", None, (("k3_prefill_profile", False),))
-    live = PhaseKey("decode", None, (("k3_prefill_profile", False),))
+    old_prefill = PhaseKey("prefill", "streamed", (("k3_prefill_profile", False),))
+    live = PhaseKey("decode", "streamed", (("k3_prefill_profile", False),))
     worker._live_phase_key = live
     worker._kept_phase_keys = {"prefill": old_prefill, "decode": live}
 
-    desired = PhaseKey("prefill", None, (("k3_prefill_profile", True),))
+    desired = PhaseKey("prefill", "streamed", (("k3_prefill_profile", True),))
     worker._transition_phase(desired)
 
     live_exit = events.index(("exit", "decode", ExitMode.RETIRE))
@@ -983,5 +1011,5 @@ def test_a_retire_that_keeps_its_instance_is_refused():
     worker._live_phase_key = live
     worker._kept_phase_keys = {"prefill": live}
     with pytest.raises(RuntimeError, match="still holds a prefill instance"):
-        worker._transition_phase(PhaseKey("prefill", "resident_ep"))
+        worker._transition_phase(PhaseKey("prefill", "streamed", (("k3_prefill_profile", True),)))
     assert "deep_free" not in events

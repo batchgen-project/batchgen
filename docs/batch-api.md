@@ -176,7 +176,7 @@ Create a batch job from an uploaded input file.
 | `temperature` | float | No | None | Default sampling temperature. Per-request values override. |
 | `top_p` | float | No | None | Default nucleus sampling threshold. Per-request values override. |
 | `top_k` | int | No | None | Default top-k filtering. Per-request values override. |
-| `batchgen_debug` | object | No | None | Batch-level debug flags, applied to every request of the batch and echoed in the `BatchObject`. Intended for diagnostics and acceptance runs, for example `{"k3_triton_strict": true}` (Kimi-K3) or `{"glm5_triton_strict": true}` (GLM-5 family), which make a Triton compile after the startup prewarm raise. |
+| `batchgen_debug` | object | No | None | Batch-level debug flags, applied to every request of the batch and echoed in the `BatchObject`. Intended for diagnostics and acceptance runs, for example `{"k3_triton_strict": true}` (Kimi-K3) or `{"glm5_triton_strict": true}` (GLM-5 family), which make a Triton compile after the startup prewarm raise. A batch that carries the retired key `k3_prefill_moe_mode` is refused with `400`: the prefill MoE mode is chosen per server with `--prefill-moe-mode`. |
 
 `POST /v1/batches` answers `503` with `Retry-After: 30` while the worker pool
 is not serving (during a worker-pool restart or after the pool went down), and
@@ -392,6 +392,7 @@ worker rank that owns the sequence.
 | `messages` | 8192 entries | `400 too_many_messages` |
 | `tools` | 1024 entries | `400 too_many_tools` |
 | `batchgen_debug` | 64 KiB as JSON | `413 batchgen_debug_too_large` |
+| `batchgen_debug` keys | no retired key (`k3_prefill_moe_mode`: the prefill MoE mode is chosen per server with `--prefill-moe-mode`) | `400 retired_batchgen_debug_key` |
 
 The batch path has no request-size limit of its own; prompt plus output
 beyond the context is still rejected per request by the worker

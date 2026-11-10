@@ -3708,32 +3708,6 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     assert "static constexpr std::chrono::seconds kStallTimeout{300};" in header
 
 
-def test_worker_reads_batch_level_mode_before_configure_prefill():
-    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
-    function = _function(
-        worker_path, "BatchGenWorker", "_config_prefill_for_batch"
-    )
-    calls = [
-        (
-            node.lineno,
-            (
-                node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else node.func.id if isinstance(node.func, ast.Name) else None
-            ),
-        )
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-    ]
-    set_mode = min(
-        line for line, name in calls if name == "set_prefill_moe_mode"
-    )
-    configure = min(
-        line for line, name in calls if name == "configure_prefill"
-    )
-    assert set_mode < configure
-
-
 def test_prefill_sync_happens_before_decoder_layers():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(worker_path, "BatchGenWorker", "prefill_prepacked")
