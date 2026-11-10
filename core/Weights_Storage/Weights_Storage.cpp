@@ -24,8 +24,11 @@
 #include "spdlog/spdlog.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <utility>
+#include <vector>
 #include <fstream>
 #include <string>
 #include <sys/mman.h>
@@ -242,23 +245,24 @@ Weights_Storage::Weights_Storage(int device_id,
 };
 
 Weights_Storage::~Weights_Storage() {
-    // The ordinary Init() path registers and maps the whole weight SHM in this
-    // worker, so it has to release exactly that mapping once. weight_ptr_ is
-    // set only after a successful Init(), and the distributed path never sets
-    // it, so this cannot fire twice or on a hierarchical_gdr instance.
-    if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->log_level_, this->weight_ptr_,
-                                  this->mapped_size_);
-        this->weight_ptr_ = nullptr;
-    }
-    // Unregister exactly what was registered. A hierarchical_gdr worker pins a
-    // few slot-local ranges instead of the whole mapping, and a failed
-    // InitDistributed can leave any prefix of them behind.
+    // Unregister exactly what was registered, before any mapping goes away.
+    // Init() pins the weight mapping in segments, a hierarchical_gdr worker
+    // pins a few slot-local ranges instead, and a failed InitDistributed can
+    // leave any prefix of them behind.
     for (auto range = this->registered_ranges_.rbegin();
          range != this->registered_ranges_.rend(); ++range) {
         cudaHostUnregister(range->first);
     }
     this->registered_ranges_.clear();
+    // The ordinary Init() path maps the whole weight SHM in this worker, so it
+    // has to release exactly that mapping once. weight_ptr_ is set only after
+    // a successful Init(), and the distributed path never sets it, so this
+    // cannot fire twice or on a hierarchical_gdr instance.
+    if (this->weight_ptr_ != nullptr) {
+        unmap_shared_memory(this->log_level_, this->weight_ptr_,
+                            this->mapped_size_);
+        this->weight_ptr_ = nullptr;
+    }
     if (this->compact_ptr_ != nullptr) {
         munmap(this->compact_ptr_, this->compact_bytes_);
     }
@@ -712,11 +716,10 @@ void Weights_Storage::Init(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);
 
-    // Worker process: register with CUDA for DMA access (pin_for_cuda=true)
     int64_t mapped_size = 0;
     void* weight_ptr =
         allocate_shared_pinned_memory(this->log_level_, shm_name, byte_size,
-                                      false, enable_hugetlbfs, true,
+                                      false, enable_hugetlbfs,
                                       enable_thp, memfd_creator_pid, memfd_fd_arg,
                                       nullptr, &mapped_size);
 
@@ -725,6 +728,59 @@ void Weights_Storage::Init(
         this->logger->error("Failed to allocate shared pinned memory.");
         throw std::runtime_error("Failed to allocate shared pinned memory.");
     }
+
+    // Register for DMA in segments no larger than one cudaHostRegister can
+    // take, cut only between tensors: a copy whose source spans two
+    // registrations fails with cudaErrorInvalidValue.
+    std::vector<std::pair<int64_t, int64_t>> extents;
+    for (const auto& [module_key, tensor_map] : weights_map) {
+        for (const auto& [tensor_key, meta] : tensor_map) {
+            extents.emplace_back(meta.offset, meta.offset + meta.byte_size);
+        }
+    }
+    std::vector<std::pair<int64_t, int64_t>> segments;
+    try {
+        segments = plan_host_registration_segments(
+            std::move(extents), byte_size, kMaxHostRegistrationBytes,
+            static_cast<int64_t>(sysconf(_SC_PAGESIZE)));
+    } catch (...) {
+        unmap_shared_memory(this->log_level_, weight_ptr, mapped_size);
+        throw;
+    }
+    this->logger->info(
+        "Registering {:.3f} GiB with CUDA in {} segment(s) of at most {} GiB",
+        byte_size / (1024.0 * 1024.0 * 1024.0), segments.size(),
+        kMaxHostRegistrationBytes >> 30);
+    const auto register_start = std::chrono::steady_clock::now();
+    // Reserve first so recording a successful pin cannot throw and strand it.
+    this->registered_ranges_.reserve(this->registered_ranges_.size() +
+                                     segments.size());
+    for (const auto& [begin, end] : segments) {
+        void* address = static_cast<char*>(weight_ptr) + begin;
+        const size_t bytes = static_cast<size_t>(end - begin);
+        const cudaError_t err =
+            cudaHostRegister(address, bytes, cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+            this->logger->error(
+                "cudaHostRegister failed on segment [{}, {}) ({:.3f} GiB): {}",
+                begin, end, bytes / (1024.0 * 1024.0 * 1024.0),
+                cudaGetErrorString(err));
+            for (auto range = this->registered_ranges_.rbegin();
+                 range != this->registered_ranges_.rend(); ++range) {
+                cudaHostUnregister(range->first);
+            }
+            this->registered_ranges_.clear();
+            unmap_shared_memory(this->log_level_, weight_ptr, mapped_size);
+            throw std::runtime_error("cudaHostRegister failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+        this->registered_ranges_.emplace_back(address, bytes);
+    }
+    this->logger->info(
+        "CUDA registration completed in {:.2f}s",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      register_start)
+            .count());
 
     // Publish the mapping only once it is fully established: the destructor
     // releases it based on weight_ptr_.
