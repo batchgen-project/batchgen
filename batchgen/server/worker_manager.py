@@ -658,15 +658,13 @@ class WorkerManager:
                     self.host_kv_manager = result
                     self.host_kv_aux_manager = None
             except Exception as exc:
-                if self.args.enable_prefix_cache:
-                    # Prefix reuse stores shared pages in Host KV; serving
-                    # without it would silently disable the feature.
-                    raise RuntimeError(
-                        "Host KV allocation is required for prefix cache reuse"
-                    ) from exc
-                logger.warning("Host KV cache allocation failed: %s", exc)
-                self.host_kv_manager = None
-                self.host_kv_aux_manager = None
+                # --host-kv-cache-size asked for a host KV cache; serving
+                # without it (or, for a DSA model, without its indexer
+                # region) would be a different server than the one launched.
+                raise RuntimeError(
+                    f"Host KV cache allocation failed for --model "
+                    f"{self.args.model!r}: {exc}"
+                ) from exc
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
 
