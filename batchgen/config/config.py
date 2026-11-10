@@ -42,6 +42,7 @@ class BasicConfig:
     max_prompt_length: Optional[int] = None
     padding_length: Optional[int] = None  # Deprecated alias; use max_prompt_length.
     max_decoding_length: Optional[int] = None
+    max_model_len: Optional[int] = None
     num_queries: Optional[int] = None
     rank: Optional[int] = None
     world_size: Optional[int] = None

@@ -267,6 +267,9 @@ from batchgen.worker.shared_prefix_charge import (
 	SharedPrefixLedger,
 	plan_shared_runs,
 )
+from batchgen.config.max_model_len import (
+	SequenceLengthCapacity, resolve_max_model_len, verify_max_model_len,
+)
 from batchgen.worker.kv_manager import (
 	GPU_KV_POOL_HEADROOM_GB,
 	KVCacheManager,
@@ -1054,6 +1057,7 @@ class BatchGenWorkerArgs:
 	enable_decode_preemption: bool = True
 	# GPU memory fraction for KV cache calculation (default: 0.9)
 	gpu_memory_frac: float = 0.9
+	max_model_len: Optional[int] = None
 	# GPU page buffer settings for decode scheduling
 	initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
 	extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
@@ -4758,17 +4762,12 @@ class BatchGenWorker:
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
-		client_max = getattr(self, 'max_context_length', None)
-		# Model's native context window is the only hard cap.
-		# Batch-level max_context_length should NOT override per-request max_tokens.
-		# Per-request values are ground truth (docs/input-format.md).
-		self.model_context_length = model_max
+		self.model_context_length = resolve_max_model_len(
+			getattr(self.args, "max_model_len", None), model_max
+		)
 		if self.rank == 0:
-			logging.info(
-				f"Model context length set to {self.model_context_length} "
-				f"(model_config={model_max}, client_max_context_length={client_max})"
-			)
-		
+			logging.info("Deployment max_model_len requested: %s", self.model_context_length)
+
 		# Load tokenizer using BatchGen's tokenizer abstraction
 		# This removes the dependency on transformers.AutoTokenizer
 		# Pass model identifier for pattern matching; tokenizer loads from package dir
@@ -4832,6 +4831,7 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
+		self.engine_config.Basic_Config.max_model_len = self.model_context_length
 		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
 		# Pull the cuda-graph adapter from the initializer (None if the model
 		# does not implement one).
@@ -5007,6 +5007,7 @@ class BatchGenWorker:
 			"largest_free_extent_pages": signature[4],
 			"page_tokens": self._trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
+			"max_model_len": self.model_context_length,
 			"capacity_bytes": self._trajectory_book.memory_bytes,
 		})
 
@@ -9933,6 +9934,79 @@ class BatchGenWorker:
 			)
 		return _find_available_port(host, start_port, remaining)
 
+	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
+		"""Collect every region before allocating GPU pages or publishing L."""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			_resolve_profile, _resolve_indexer_profile, is_dsa_model,
+		)
+
+		profiles = [_resolve_profile(self.huggingface_ckpt_name)]
+		if is_dsa_model(self.huggingface_ckpt_name):
+			profiles.append(_resolve_indexer_profile(self.huggingface_ckpt_name))
+		page_bytes = [p.bytes_per_page() * p.num_layers for p in profiles]
+		# This is the same split used by _initialize_gpu_kv_manager_fixed_size:
+		# all regions have equal page counts, each page spans its physical layers.
+		gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
+		node = self.rank // self.local_world_size
+		capacities = []
+		host_views = self._host_views_by_group()
+		for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
+			capacities.append(SequenceLengthCapacity(
+				"GPU KV", str(region), node, self.rank,
+				profile.page_size, size, gpu_pages,
+			))
+			if self.local_rank == 0:
+				capacities.append(SequenceLengthCapacity(
+					"host KV", str(region), node, self.rank,
+					profile.page_size, size,
+					int(host_views[region].get_stats().num_total_pages),
+					copies=self._decode_attn_tp_size(),
+				))
+		if self.local_rank == 0:
+			book = self._trajectory_book
+			capacities.append(SequenceLengthCapacity(
+				"input IDs", "trajectory", node, self.rank,
+				book.page_tokens, book.page_tokens * QueryBook.TOKEN_BYTES, book.page_count,
+			))
+		all_capacities = [None] * self.world_size
+		dist.all_gather_object(all_capacities, capacities)
+		length = verify_max_model_len(
+			self.model_context_length,
+			[capacity for rank_capacities in all_capacities for capacity in rank_capacities],
+			auto_fit=(
+				getattr(self.args, "max_model_len", None) == -1
+				and not getattr(self, "_deployment_length_verified", False)
+			),
+		)
+		self.model_context_length = length
+		self.engine_config.Basic_Config.max_model_len = length
+		self._deployment_length_verified = True
+
+	def prepare_deployment(self) -> None:
+		"""Resolve and verify L against decode residency before worker readiness.
+
+		The measured provisional budget is retained for every model and mode;
+		it reserves the configured fraction's slack for later allocations. A
+		measured per-cap eager transient reservation is a separate requirement.
+		"""
+		with self._startup_phase("model-build"):
+			if not self._core_initialized:
+				self.Init(None, 1, 0)
+		with self._startup_phase("communicator-init"):
+			self._ensure_pynccl_communicator()
+		with self._startup_phase("decode-shard-build"):
+			if self._persistent_phase_enabled():
+				self._build_persistent_phase_instances()
+			else:
+				prefill_key = self._desired_phase_key("prefill")
+				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
+				self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+				self._init_gpu_kv_with_actual_size()
+				self._transition_phase(prefill_key)
+				self.set_phase("prefill")
+				self._install_prefill_weight_copy_pipeline(False)
+		logging.info("Deployment max_model_len verified: %s", self.model_context_length)
+
 	def prepare_kimi_k3_startup(self) -> None:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
 
@@ -12078,7 +12152,7 @@ class BatchGenWorker:
 			self._remap_reused_kv_pool()
 			return
 
-		# Measure-once-cache: once the post-capture steady state has been
+		# Measure-once-cache: once startup decode residency has been
 		# measured, every later pool (re)creation reuses the cached size —
 		# never a fresh measurement (contract invariant 1: the pool is
 		# identical across decode rounds of the same server).
@@ -12089,19 +12163,13 @@ class BatchGenWorker:
 			# GENERAL cache's all-free segments (prefill transients) too, so
 			# the full-size cudaMalloc below sees the maximum free memory. The
 			# collection first drops tensors still held only by cycles, so
-			# empty_cache can return their segments: with the pool margin now
-			# an explicit 2 GB rather than (1 - frac) of the device, retained
-			# segments are the difference between fitting and fail-loud.
+			# empty_cache can return their segments.
 			torch.cuda.synchronize(self.torch_device)
 			gc.collect()
 			torch.cuda.empty_cache()
-			# The cached size is the device total minus the measured steady
-			# residency minus the explicit headroom, so what is free here must
-			# be the pool plus that headroom. Anything less is residency that
-			# grew after the measurement: name it instead of letting the pool's
-			# torch.zeros raise a bare CUDA OOM, and never re-measure (a fresh
-			# measurement is exactly the round-dependent squeeze this path
-			# removes).
+			# Later residency may consume the fraction's reserved slack, but
+			# the verified pool itself must still fit. Name any shortfall
+			# instead of silently shrinking the deployment's capacity.
 			free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
 			KVCacheManager.check_cached_pool_fits(
 				self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
@@ -12109,8 +12177,7 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(
 					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
-					f"(measure-once-cache; {free_mem_gb:.2f} GB free, headroom "
-					f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB)"
+					f"(startup budget; {free_mem_gb:.2f} GB free)"
 				)
 			self._initialize_gpu_kv_manager_fixed_size()
 			if self.rank == 0:
@@ -12121,14 +12188,9 @@ class BatchGenWorker:
 				)
 			return
 
-		# First time: PROVISIONAL size from the post-weights measurement. The
-		# graph pools, their static buffers and the collective/JIT first-touch
-		# caches are not allocated yet, so (1 - gpu_memory_frac) of the device
-		# is the only thing covering them here — that is the one place the
-		# fraction is load-bearing. The final size is fixed by
-		# _finalize_gpu_kv_pool_after_capture once the graph warmup has
-		# materialized every persistent allocation, and from there the explicit
-		# GPU_KV_POOL_HEADROOM_GB replaces the fraction's slack.
+		# First startup decode entry: measure after weights are resident. The
+		# remaining fraction is reserved for graph and eager allocations; it
+		# is not counted as KV capacity. Every later entry uses the cache.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -12137,34 +12199,24 @@ class BatchGenWorker:
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_gb
 
-		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-		if new_gpu_kv_cache_size > 0:
-			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
-		else:
-			# Fail-loud (contract invariant 3): a non-positive remainder is a
-			# configuration error, never a silently accepted minimum.
-			raise RuntimeError(
-				f"[GPU-KV] Calculated pool size non-positive "
-				f"({new_gpu_kv_cache_size:.2f} GB): total {total_mem_gb:.2f} GB "
-				f"x frac {self.gpu_memory_frac} - used {used_mem_gb:.2f} GB. "
-				"Lower resident memory or raise gpu_memory_frac."
-			)
-		self._gpu_kv_sizing_provisional = True
-
-		if self.rank == 0:
-			logging.info(
-				f"[GPU-KV] Provisional size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
-			)
-
-		# Broadcast to ensure all ranks use same value
-		size_tensor = torch.tensor([self.gpu_kv_cache_size_gb], dtype=torch.float32, device=self.torch_device)
-		dist.broadcast(size_tensor, src=0)
+		local_pool_gb = KVCacheManager.provisional_pool_gb(
+			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		)
+		self._verify_deployment_max_model_len(local_pool_gb)
+		# Identical page counts are required by decode admission. The tightest
+		# rank supplies the common pool, rather than rank zero's residency.
+		size_tensor = torch.tensor([local_pool_gb], dtype=torch.float64, device=self.torch_device)
+		dist.all_reduce(size_tensor, op=dist.ReduceOp.MIN)
 		self.gpu_kv_cache_size_gb = float(size_tensor.item())
+		# Freeze the measured startup pool for every mode before capture. A
+		# lazy capture must not change it after L has been published. The
+		# fraction's slack covers graph/eager allocations until startup can
+		# measure those allocations at the per-rank cap.
+		self._gpu_kv_sizing_provisional = False
 
 		# Initialize GPU KV manager with actual size
 		self._initialize_gpu_kv_manager_fixed_size()
+		self._gpu_kv_cached_pool_gb = self.gpu_kv_cache_size_gb
 
 		if self.rank == 0:
 			stats = self.gpu_paged_kv_cache_manager.get_stats()

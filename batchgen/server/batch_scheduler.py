@@ -256,6 +256,8 @@ class BatchScheduler:
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
         self._scheduling_pool = SchedulingPool(capacity=0)
         self._trajectory_pool_info: Optional[Dict[str, Any]] = None
+        self.max_model_len: Optional[int] = None
+        self._deployment_ready = asyncio.Event()
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -311,6 +313,10 @@ class BatchScheduler:
             self._drain_intake_to_worker()
         )
 
+    async def wait_for_deployment(self) -> None:
+        """Wait until the current worker generation publishes its verified L."""
+        await self._deployment_ready.wait()
+
     async def stop(self) -> None:
         if not self._task:
             return
@@ -358,9 +364,14 @@ class BatchScheduler:
     def quiesce(self) -> None:
         """Stop dispatching new work while retaining the upstream queues."""
         self._quiesced.set()
+        self._call_on_loop(self._clear_deployment, "retire deployment capacity")
         if self._loop is not None and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
             self._quiesce_ack.wait(timeout=5)
+
+    def _clear_deployment(self) -> None:
+        self.max_model_len = None
+        self._deployment_ready.clear()
 
     def resume(self) -> None:
         self._quiesced.clear()
@@ -582,6 +593,7 @@ class BatchScheduler:
             except asyncio.CancelledError:
                 break
             try:
+                await self.wait_for_deployment()
                 await self._process_batch(batch_id)
             except Exception:
                 logger.exception("Batch %s failed", batch_id)
@@ -693,31 +705,6 @@ class BatchScheduler:
             self._convert_requests_to_worker_inputs(requests, built, batch)
         )
         del built
-        # Apply batch-level max_decoding_length as fallback for requests without explicit value
-        default_max = batch.max_decoding_length
-        if default_max is None:
-            missing_ids = [
-                requests[i].custom_id or f"request-{i}"
-                for i, mt in enumerate(per_request_max_tokens)
-                if mt is None and i not in rejections
-            ]
-            if missing_ids:
-                error_message = (
-                    f"Batch {batch_id}: {len(missing_ids)}/{len(per_request_max_tokens)} requests "
-                    f"have no max_completion_tokens or max_tokens, and no batch-level "
-                    f"max_decoding_length is set. Set one of these to proceed. "
-                    f"First missing: {missing_ids[:5]}"
-                )
-                logger.error(error_message)
-                self.storage.update_batch_status(
-                    batch_id, BatchStatus.FAILED, error=error_message
-                )
-                return None
-        per_request_max_tokens = [
-            mt if mt is not None else default_max
-            for mt in per_request_max_tokens
-        ]
-
         # Log batch-level sampling param defaults
         if batch.temperature is not None or batch.top_p is not None or batch.top_k is not None:
             logger.warning(
@@ -826,8 +813,27 @@ class BatchScheduler:
             current_max_tokens = getattr(body, "max_completion_tokens", None)
             if current_max_tokens is None:
                 current_max_tokens = getattr(body, "max_tokens", None)
+            if current_max_tokens is None and batch is not None:
+                current_max_tokens = batch.max_decoding_length
+            if reason is None:
+                length = self.max_model_len
+                if length is None:
+                    raise RuntimeError("worker has not published deployment max_model_len")
+                prompt_length = len(prompt)
+                if prompt_length >= length:
+                    reason = (
+                        f"prompt has {prompt_length} tokens; deployment max_model_len={length} "
+                        "must leave room for at least one completion token"
+                    )
+                else:
+                    remaining = length - prompt_length
+                    current_max_tokens = (
+                        remaining if current_max_tokens is None
+                        else min(current_max_tokens, remaining)
+                    )
             if reason is not None:
                 rejections[index] = reason
+                prompt = None
 
             prompts.append(prompt)
             per_request_max_tokens.append(current_max_tokens)
@@ -1089,6 +1095,8 @@ class BatchScheduler:
                 400, "unsupported_n",
                 f"a turn returns exactly one choice; n={body.n} is not supported",
             )
+        if self.max_model_len is None:
+            raise TurnError(503, "workers_not_ready", "deployment capacity is not ready")
         mismatch = tokenizer_family_mismatch(body.model, self.server_args.model)
         if mismatch is not None:
             raise TurnError(400, "model_mismatch", mismatch)
@@ -1114,11 +1122,6 @@ class BatchScheduler:
             raise TurnError(
                 400, "invalid_request",
                 f"prompt construction failed: {rejections[0]}",
-            )
-        if max_tokens[0] is None:
-            raise TurnError(
-                400, "max_tokens_required",
-                "a turn needs max_completion_tokens or max_tokens",
             )
         session = body.session
         entry = IntakeEntry(
@@ -1432,7 +1435,7 @@ class BatchScheduler:
             self._write_pool_completion(
                 batch_id,
                 request_ids[idx],
-                {"error": {"code": "invalid_prompt", "message": reason}},
+                {"error": {"code": "invalid_prompt", "message": reason, "status_code": 400}},
             )
             self._scheduling_pool.mark_request_completed(
                 request_ids[idx], batch_id
@@ -1540,6 +1543,9 @@ class BatchScheduler:
                 self._quiesce_ack.set()
                 await asyncio.sleep(0.05)
                 continue
+            if not self._deployment_ready.is_set():
+                await asyncio.sleep(0.05)
+                continue
             if self._intake_pool.is_empty():
                 self._intake_wakeup.clear()
                 try:
@@ -1593,7 +1599,7 @@ class BatchScheduler:
                 admit_entries.append({
                     "request_id": entry.request_id,
                     "input_ids": entry.raw_request["input_ids"],
-                    "max_tokens": entry.raw_request.get("max_tokens", 4096),
+                    "max_tokens": entry.raw_request["max_tokens"],
                     "batch_id": entry.batch_id,
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
@@ -1827,6 +1833,11 @@ class BatchScheduler:
                         else:
                             logger.info("[POOL] Worker shutdown signal received")
                         continue
+                    elif msg_type == "deployment_capacity":
+                        self.max_model_len = int(result["max_model_len"])
+                        if self.max_model_len < 2:
+                            raise ValueError("worker published invalid max_model_len")
+                        self._deployment_ready.set()
                     elif msg_type == "trajectory_pool_capacity":
                         # ``total_capacity`` is immutable token-pool capacity and
                         # sizes SchedulingPool.  ``free_reservations`` changes on
@@ -1943,6 +1954,7 @@ class BatchScheduler:
                     "error": {
                         "code": error.get("code", "worker_error"),
                         "message": error.get("message", ""),
+                        **({"status_code": error["status_code"]} if "status_code" in error else {}),
                     },
                 },
             )

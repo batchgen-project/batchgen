@@ -295,6 +295,7 @@ class ListBatchesResponse(BaseModel):
 class BatchError(BaseModel):
     code: str
     message: str
+    status_code: Optional[int] = None
 
 
 class Usage(BaseModel):
@@ -447,7 +448,10 @@ class ModelObject(BaseModel):
     created: int
     owned_by: str = "batchgen"
     max_context_length: int = Field(
-        description="Maximum context length (prompt + completion tokens)"
+        description="Deployment prompt + completion limit (alias of max_model_len)"
+    )
+    max_model_len: Optional[int] = Field(
+        default=None, description="Verified deployment prompt + completion limit"
     )
 
 

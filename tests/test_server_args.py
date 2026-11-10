@@ -257,3 +257,27 @@ def test_log_options_resolved_absolute_with_info_default(tmp_path, monkeypatch):
     )
     assert explicit.log_dir == os.path.join(cwd, "logs", "run")
     assert explicit.log_level == "WARNING"
+
+
+@pytest.mark.parametrize("value", ["-1", "4096"])
+def test_max_model_len_cli(value):
+    parsed = server_args_module._build_parser().parse_args([
+        "--model", "test-model", "--max-model-len", value,
+    ])
+    assert parsed.max_model_len == int(value)
+
+
+def test_max_model_len_cli_default_is_model_context():
+    assert server_args_module._build_parser().parse_args([
+        "--model", "test-model",
+    ]).max_model_len is None
+
+
+@pytest.mark.parametrize("value", [0, 1, -2])
+def test_max_model_len_rejects_invalid_values(tmp_path, value):
+    args = ServerArgs(
+        model="gpt-oss-120b", storage_path=tmp_path,
+        host_kv_cache_size=1, max_model_len=value,
+    )
+    with pytest.raises(ValueError, match="max_model_len"):
+        validate_server_args(args)
