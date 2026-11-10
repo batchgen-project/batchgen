@@ -71,6 +71,15 @@ MODEL_BYTE_SIZES = {
     "zai-org/GLM-5.3": 1400 * 1024**3,
 }
 
+
+def _model_byte_size_index():
+    from batchgen.config import model_identity
+
+    return model_identity.build_index(MODEL_BYTE_SIZES)
+
+
+_MODEL_BYTE_SIZE_INDEX = _model_byte_size_index()
+
 # Default byte_size when model not in lookup (700GB for backwards compatibility)
 DEFAULT_MODEL_BYTE_SIZE = 700 * 1024**3
 
@@ -84,9 +93,15 @@ def get_model_byte_size(model_name: str) -> int:
     Returns:
         Byte size for the model. Returns DEFAULT_MODEL_BYTE_SIZE if not found.
     """
-    # Try exact match first
+    # Exact match first, then the registered id the value names (a local
+    # directory named after it, or a Base/Instruct/dated variant of it).
     if model_name in MODEL_BYTE_SIZES:
         return MODEL_BYTE_SIZES[model_name]
+    from batchgen.config import model_identity
+
+    named = model_identity.lookup(_MODEL_BYTE_SIZE_INDEX, model_name)
+    if named is not None:
+        return named
 
     # Try case-insensitive partial match
     model_lower = model_name.lower()

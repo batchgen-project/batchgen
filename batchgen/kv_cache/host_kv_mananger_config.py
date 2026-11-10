@@ -6,6 +6,7 @@ from typing import Any, Dict, Sequence
 
 import torch
 
+from batchgen.config import model_identity
 from batchgen.eventlog.process import native_log_level
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.native_loader import core_engine as bg_lib
@@ -434,10 +435,20 @@ for canonical, aliases in {
 		_INDEXER_PROFILE_ALIASES[alias.lower()] = canonical
 
 
+# The alias tables keyed the way model_identity resolves any --model value:
+# a registered id, a local checkpoint directory named after one, or a release
+# variant (Base/Instruct/dated) of one.
+_PROFILE_INDEX = model_identity.build_index(_PROFILE_ALIASES)
+_INDEXER_PROFILE_INDEX = model_identity.build_index(_INDEXER_PROFILE_ALIASES)
+
+
 def _resolve_indexer_profile(model_name: str) -> _HostKVModelProfile | None:
-	"""Maps a model name to its DSA indexer profile, or None if not a DSA model."""
-	alias = model_name.strip().lower()
-	canonical = _INDEXER_PROFILE_ALIASES.get(alias)
+	"""Maps a model name to its DSA indexer profile, or None if not a DSA model.
+
+	Only meaningful for a model whose primary profile resolves: an identifier
+	that names no registered model fails in :func:`_resolve_profile`.
+	"""
+	canonical = model_identity.lookup(_INDEXER_PROFILE_INDEX, model_name)
 	if canonical is None:
 		return None
 	return _PROFILE_REGISTRY[canonical]
@@ -472,12 +483,14 @@ def apply_page_format(config: Any, page_format: str) -> None:
 def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 	"""Maps a user supplied model name to a cached profile."""
 
-	if not isinstance(model_name, str):
-		raise ValueError("model_name must be a string")
-	alias = model_name.strip().lower()
-	if alias not in _PROFILE_ALIASES:
-		raise ValueError(f"Unsupported model '{model_name}' for host KV cache")
-	return _PROFILE_REGISTRY[_PROFILE_ALIASES[alias]]
+	canonical = model_identity.lookup(_PROFILE_INDEX, model_name)
+	if canonical is None:
+		raise ValueError(
+			f"Unsupported model '{model_name}' for host KV cache: it names no "
+			"registered model id (a local path must be a directory named after "
+			"the released id, e.g. .../<org>/<released-name>)"
+		)
+	return _PROFILE_REGISTRY[canonical]
 
 
 def build_host_kv_config(
