@@ -1086,6 +1086,7 @@ def test_worker_monitor_does_not_invoke_context_auto_kill():
     manager._join_lock = nullcontext()
     manager._monitor_interval_s = 1
     manager._collect_worker_exit_reason = lambda: None
+    manager._distributed_weight_daemon_failure = lambda: None
 
     manager._monitor_worker_processes()
 
