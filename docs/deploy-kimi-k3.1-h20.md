@@ -28,8 +28,9 @@ with the substitutions below.
   fp32 scale per token, 132 bytes per token per layer). The host-KV and GPU-KV pools
   split the budget automatically; size `--host-kv-cache-size` as for Kimi-K3 and the
   index-key region rides along.
-- **Prefix cache is not supported for Kimi-K3.1 in this release**: a launch with
-  `--enable-prefix-cache` is refused at argument validation. Launch without it.
+- **Prefix cache works as for Kimi-K3.** `--enable-prefix-cache` reuses shared prompt
+  prefixes inside a planned prefill wave; a cached page carries both regions (the MLA
+  latent and the FP8 index keys).
 - **Long prompts take the sparse path automatically.** Prompts longer than the model's
   `index_topk` (2,048 tokens) attend only to their indexer-selected tokens during
   prefill; shorter prompts stay dense. Decode scores every step through the paged FP8
@@ -71,8 +72,7 @@ Notes:
 
 - `--gpu-memory-frac 0.90` is the validated bring-up setting for K3.1 on H20; raise it
   only if the resident-expert repack, both KV regions and the capture headroom still fit.
-- Do not pass `--enable-deepep` or `--enable-prefix-cache` (unsupported for this model in
-  this release).
+- Do not pass `--enable-deepep` (unsupported for this model in this release).
 - Before readiness every worker preloads the family extensions **and** the DSA indexer
   extensions; a build missing them fails at startup, not at the first request.
 - All other H20 notes (watermark, `/dev/shm` sized to `MemTotal` minus 300 GiB with
