@@ -9,14 +9,16 @@
 #                  http://www.apache.org/licenses/license-2.0                   #
 # ---------------------------------------------------------------------------- #
 
-"""Per-machine Kimi engine profiles (K3 TP8 rows, Kimi-Linear-48B reserve).
+"""Per-machine Kimi engine profiles (K3 DP-attention rows, Kimi-Linear-48B reserve).
 
 Every machine-dependent K3 knob lives in one row keyed by machine family
-(``batchgen.hardware.machine_family``) and topology (node count; attention
-TP group size 8). Each value carries its source in ``sources``: a dated
-measurement, a stated derivation, or "provisional". The planner reads the
-row and nothing else; a (family, topology) pair without a row is refused by
-name instead of borrowing another machine's constants.
+(``batchgen.hardware.machine_family``), world size and the DP-attention rank
+size G (``attention_group_size``: attention, KDA and the shared expert run
+TP-G inside one DP rank, the routed experts run EP over every GPU of the
+job). Each value carries its source in ``sources``: a dated measurement, a
+stated derivation, or "provisional". The planner reads the row and nothing
+else; a (family, world size, G) triple without a row is refused by name
+instead of borrowing another machine's constants.
 
 The physical inputs behind the rows (``K3_GEOMETRY``, ``K3_FAMILY_RATES``
 and each row's ``decode_budget``) are recorded next to the rows so the unit
@@ -25,9 +27,11 @@ weight-stream crossover and the HBM budget, the resident prefill cap against
 the HBM beside the resident shard, and the KDA slot count against the GPU
 KV solve.
 
-Every row prefills in a streamed mode by default: all TP8 rows shard the
+Every row prefills in a streamed mode by default: all rows shard the
 LatentMoE projections, so the parallel strategy manager's server prefill
-mode is ``streamed_sp8``; resident-EP prefill stays a batch-level override.
+mode is ``streamed_sp8`` (layer-wise expert streaming over the row's
+``prefill_stream_span``); resident-EP prefill for every wave is an explicit
+server option (``--prefill-moe-mode resident_ep``).
 """
 
 from __future__ import annotations
@@ -40,10 +44,6 @@ from batchgen.hardware.machine_family import MachineFamily, signature_for
 
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
-
-#: The attention TP group size every K3 profile row is planned for.
-K3_PROFILE_ATTENTION_GROUP_SIZE = 8
-
 
 class UnsupportedK3TopologyError(ValueError):
     """No K3 profile row exists for this machine family and topology."""
@@ -59,31 +59,64 @@ class K3Geometry:
     mla_layers: int = 24
     mla_latent_width: int = 576  # kv_lora_rank 512 + rope 64, BF16
     hidden_size: int = 7168
-    kda_slot_bytes: int = int(53.57 * _MIB)  # TP8 conv + recurrent state per sequence per rank
+    #: KDA conv + recurrent state of one sequence, all heads (MEASURED at TP8
+    #: as 53.57 MiB per rank; the state is head-sharded, so it scales 1/G).
+    kda_slot_bytes_unsharded: int = 8 * int(53.57 * _MIB)
+    #: Decode parameters that are TP-sharded across the DP-attention rank,
+    #: summed over the rank (module sizes from the released index): 69 KDA x
+    #: 846.67 MiB + 24 MLA x 442.88 MiB + 92 shared experts x 252.00 MiB +
+    #: 92 LatentMoE down/up projections x 98.00 MiB + vocab-parallel
+    #: embed/lm_head 2 x 163,840 x 7,168 x 2 B.
+    tp_sharded_decode_bytes: int = int(
+        (69 * 846.67 + 24 * 442.88 + 92 * 252.00 + 92 * 98.00) * _MIB
+        + 2 * 163_840 * 7_168 * 2
+    )
 
     @property
     def kv_bytes_per_token(self) -> int:
-        """GPU MLA KV per token per rank (the latent is replicated under TP8)."""
+        """GPU MLA KV per token per rank (the latent is replicated under TP-G)."""
         return self.mla_layers * self.mla_latent_width * 2
+
+    def kda_slot_bytes(self, group_size: int) -> int:
+        """KDA state of one sequence per rank at DP-attention rank size G."""
+        return self.kda_slot_bytes_unsharded // int(group_size)
+
+    def tp_sharded_decode_gib(self, group_size: int) -> float:
+        """Per-rank share of the TP-sharded decode parameters at size G."""
+        return self.tp_sharded_decode_bytes / int(group_size) / _GIB
 
     def resident_shard_bytes(self, world_size: int) -> int:
         """Resident EP shard of the routed experts per rank."""
         return self.moe_layers * (self.routed_experts // world_size) * self.routed_expert_bytes
 
-    def stream_bytes_per_layer(self, node_gpus: int = 8) -> int:
-        """Routed-expert bytes one rank streams per MoE layer in streamed_sp8."""
-        return (self.routed_experts // node_gpus) * self.routed_expert_bytes
+    def stream_bytes_per_layer(self, stream_span: int = 8) -> int:
+        """Routed-expert bytes one rank streams per MoE layer in streamed_sp8.
+
+        The ``stream_span`` ranks of one span hold one copy of the layer's
+        experts between them, so each streams ``experts / stream_span``.
+        """
+        return (self.routed_experts // stream_span) * self.routed_expert_bytes
 
 
 K3_GEOMETRY = K3Geometry()
 
-#: Activation bytes per node row per rank of a streamed K3 prefill pass.
-#: ESTIMATED lower bound from the H200 out-of-memory record of a 518,718-row
-#: pass: 134.10 GiB in use + 6.93 GiB requested against 42.91 GB at the first
-#: iteration.
+#: Activation bytes per node row per rank of a streamed K3 prefill pass at
+#: G=8. ESTIMATED lower bound from the H200 out-of-memory record of a
+#: 518,718-row pass: 134.10 GiB in use + 6.93 GiB requested against 42.91 GB
+#: at the first iteration.
 K3_PREFILL_ACTIVATION_BYTES_PER_ROW = (
     (134.10 + 6.93) * _GIB - 42.91e9
 ) / 518_718
+
+
+def k3_prefill_activation_bytes_per_row(group_size: int) -> float:
+    """Activation bytes per DP-rank row per rank at DP-attention size G.
+
+    ESTIMATED: the measured G=8 figure scaled by 8/G, because each rank of a
+    TP-G rank carries 1/G of the rank's rows through the row-sharded body and
+    1/G of the heads through attention.
+    """
+    return K3_PREFILL_ACTIVATION_BYTES_PER_ROW * 8 / int(group_size)
 
 
 @dataclass(frozen=True)
@@ -169,6 +202,7 @@ def solve_kda_user_slots(
     budget: K3DecodeBudget,
     *,
     extra_physical_slots: int,
+    attention_group_size: int,
     geometry: K3Geometry = K3_GEOMETRY,
 ) -> float:
     """Sequences the decode budget sustains to full length.
@@ -176,10 +210,11 @@ def solve_kda_user_slots(
     Slots and GPU KV compete for the memory above the non-slot base. A slot
     is held from prefill until completion, so the count is solved at FULL
     length: ``S * (slot + kv(full_length)) = budget - base - graph reserve -
-    extra physical slots``. Returns the real-valued solution; a row takes a
-    TP-size multiple at or below it.
+    extra physical slots``. The KDA slot is head-sharded over the
+    DP-attention rank of size ``attention_group_size``. Returns the
+    real-valued solution; a row takes a G multiple at or below it.
     """
-    slot_gib = geometry.kda_slot_bytes / _GIB
+    slot_gib = geometry.kda_slot_bytes(attention_group_size) / _GIB
     kv_gib = geometry.kv_bytes_per_token * budget.full_length_tokens / _GIB
     free_gib = (
         budget.budget_gib
@@ -192,13 +227,16 @@ def solve_kda_user_slots(
 
 @dataclass(frozen=True)
 class K3EngineProfile:
-    """Every machine-dependent K3 knob for one (family, node count) at TP8."""
+    """Every machine-dependent K3 knob for one (family, node count, G)."""
 
     family: MachineFamily
     num_nodes: int
+    #: DP-attention rank size G: attention, KDA and the shared expert run
+    #: TP-G inside one DP rank; the routed experts run EP over the world.
+    attention_group_size: int
     shard_latent_projections: bool
     shard_vocab_parallel: bool
-    #: Per-node decode admission cap (= user-visible KDA state slots).
+    #: Per-DP-rank decode admission cap (= user-visible KDA state slots).
     kda_user_slots: int
     #: How ``kda_user_slots`` was chosen: "kv-solve" (``solve_kda_user_slots``
     #: on ``decode_budget``) or "measured: ..." / "inherited: ...".
@@ -208,6 +246,10 @@ class K3EngineProfile:
     resident_prefill_chunk_rows: int
     prefill_grouped_chunk_rows: int
     prefill_collective_stripe_threshold_rows: int
+    #: Ranks that hold one copy of a layer's routed experts between them in
+    #: streamed prefill (a multiple of G dividing the world): each streams
+    #: ``experts / span`` and the layer's latent rows are gathered over it.
+    prefill_stream_span: int
     prefix_pool_workspace_bytes: int
     decode_budget: K3DecodeBudget
     #: Source of every knob above, keyed by field name.
@@ -223,8 +265,8 @@ class K3EngineProfile:
 
 def k3_profile_knob_names() -> tuple[str, ...]:
     """The K3 knobs every row must source."""
-    skip = {"family", "num_nodes", "decode_budget", "sources", "derivation_exceptions",
-            "kda_slots_basis"}
+    skip = {"family", "num_nodes", "attention_group_size", "decode_budget",
+            "sources", "derivation_exceptions", "kda_slots_basis"}
     return tuple(f.name for f in fields(K3EngineProfile) if f.name not in skip)
 
 
@@ -238,6 +280,16 @@ _H200_RESIDENT_CHUNK_ROWS = 2_048
 _H200_GROUPED_CHUNK_ROWS = 32_768
 _H200_STRIPE_THRESHOLD_ROWS = 524_288
 _H200_PREFIX_POOL_BYTES = 40 * _GIB
+
+_NODE_STREAM_SPAN = (
+    "validated streamed-SP8 layout: the node's eight ranks hold one copy of "
+    "each layer's experts (112 each) and gather latent rows inside the node"
+)
+_JOB_STREAM_SPAN = (
+    "POIS 2026-11-10: streaming over the EP span; every rank of the job "
+    "streams the 112 experts it owns as an EP8 rank and the latent rows of "
+    "every DP rank are gathered over the eight ranks"
+)
 
 _INHERITED_H200 = (
     "inherited from the h200 row (the value this machine ran under the "
@@ -259,6 +311,7 @@ _INHERITED_H200 = (
 _H20_W32 = K3EngineProfile(
     family=MachineFamily.H20,
     num_nodes=4,
+    attention_group_size=8,
     shard_latent_projections=True,
     shard_vocab_parallel=False,
     kda_user_slots=128,
@@ -271,6 +324,7 @@ _H20_W32 = K3EngineProfile(
     resident_prefill_chunk_rows=0,
     prefill_grouped_chunk_rows=2_048,
     prefill_collective_stripe_threshold_rows=32_768,
+    prefill_stream_span=8,
     prefix_pool_workspace_bytes=24 * _GIB,
     decode_budget=K3DecodeBudget(
         device_total_gib=89.05,
@@ -297,6 +351,7 @@ _H20_W32 = K3EngineProfile(
         "resident_prefill_chunk_rows": "0: no resident-EP prefill planned",
         "prefill_grouped_chunk_rows": "validated 2K-row bound",
         "prefill_collective_stripe_threshold_rows": "validated 256-row stripe path above 32K rows",
+        "prefill_stream_span": _NODE_STREAM_SPAN,
         "prefix_pool_workspace_bytes": (
             "measured: full in-wave pool matrix on a 4-node serve group, "
             "workspace peak plateaus under 13.5 GiB; 24 GiB keeps >= 1.5x"
@@ -322,6 +377,7 @@ _H20_W32 = K3EngineProfile(
 _H200_W16 = K3EngineProfile(
     family=MachineFamily.H200,
     num_nodes=2,
+    attention_group_size=8,
     shard_latent_projections=True,
     shard_vocab_parallel=True,
     kda_user_slots=256,
@@ -334,6 +390,7 @@ _H200_W16 = K3EngineProfile(
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
     prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
+    prefill_stream_span=8,
     prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
     decode_budget=K3DecodeBudget(
         device_total_gib=139.81,
@@ -368,6 +425,7 @@ _H200_W16 = K3EngineProfile(
         "prefill_collective_stripe_threshold_rows": (
             "one wide latent gather/reduce with the resident shard released"
         ),
+        "prefill_stream_span": _NODE_STREAM_SPAN,
         "prefix_pool_workspace_bytes": (
             "provisional: segmented KDA chunk-sweep peaks plus the streamed "
             "grouped MoE FP32 output at the chunk cap, plus margin"
@@ -403,6 +461,7 @@ _H200_W16 = K3EngineProfile(
 _B300_W8 = K3EngineProfile(
     family=MachineFamily.B300,
     num_nodes=1,
+    attention_group_size=8,
     shard_latent_projections=True,
     shard_vocab_parallel=True,
     kda_user_slots=360,
@@ -412,6 +471,7 @@ _B300_W8 = K3EngineProfile(
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
     prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
+    prefill_stream_span=8,
     prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
     decode_budget=K3DecodeBudget(
         device_total_gib=267.68,
@@ -440,88 +500,200 @@ _B300_W8 = K3EngineProfile(
         "resident_prefill_chunk_rows": _INHERITED_H200,
         "prefill_grouped_chunk_rows": _INHERITED_H200,
         "prefill_collective_stripe_threshold_rows": _INHERITED_H200,
+        "prefill_stream_span": _NODE_STREAM_SPAN,
         "prefix_pool_workspace_bytes": _INHERITED_H200,
     }),
 )
 
-# GB300, 2 trays x 4 GPUs in one NVLink domain (world 8). One tray cannot
-# hold the routed expert set, so the single-tray topology has no row.
-# Every value is the one this machine ran under the retired memory tiers;
-# nothing on this row is measured yet.
-_GB300_W8 = K3EngineProfile(
+# DP-attention rank size 4 (TP4 attention/KDA/shared inside a DP rank, EP8
+# routed experts over the world). Shared derivation for the G=4 rows:
+#
+# KDA state is head-sharded, so a slot is 8 x 53.57 / 4 = 107.14 MiB per rank.
+# The TP-sharded decode parameters (``K3Geometry.tp_sharded_decode_bytes``,
+# 103.25 GiB summed over the rank) cost 25.81 GiB per rank at G=4 against
+# 12.91 GiB at G=8, so the non-slot base is the MEASURED B300 G=8 base
+# (193.85 GiB: resident EP8 shard 168.39 + decode parameters 16.06 + CUDA
+# context and collectives) plus 12.91 GiB. The MLA latent stays replicated, so
+# GPU KV per token is unchanged. Streamed prefill activations per DP-rank row
+# per rank scale 8/G (``k3_prefill_activation_bytes_per_row``), so the
+# streamed cap is the G=8 value halved and the resident cap is the largest
+# power of two whose activations and FP32 output fit beside the shard.
+_G4_BASE_DELTA_GIB = (
+    K3_GEOMETRY.tp_sharded_decode_gib(4) - K3_GEOMETRY.tp_sharded_decode_gib(8)
+)
+_B300_G8_MEASURED_BASE_GIB = 208.13 - 273 * 53.57 / 1024
+_G4_SLOT_GIB = K3_GEOMETRY.kda_slot_bytes(4) / _GIB
+
+
+def _g4_prefill_non_expert_gib(user_slots: int) -> float:
+    """First-iteration streamed-prefill use at G=4 (shard released).
+
+    ESTIMATED: the measured H200 G=8 first-iteration use (39.96 GiB) plus the
+    extra TP-sharded parameters of G=4 plus this row's KDA state pool.
+    """
+    return 39.96 + _G4_BASE_DELTA_GIB + (user_slots + 17) * _G4_SLOT_GIB
+
+
+# GB300, 2 trays x 4 GPUs (world 8), one DP rank per tray. One tray (4 x
+# 276.6 GiB) cannot hold the routed expert set, so the routed experts run EP8
+# over both trays. Device total: nvidia-smi reports 284,208 MiB (MEASURED
+# 2026-11-09); CUDA reports 938 MiB less on this generation (the B300 offset),
+# 283,270 MiB = 276.63 GiB. At frac 0.95 the budget is 262.80 GiB; minus the
+# 206.76 GiB G=4 base, a 2 GiB graph reserve and 17 non-user slots (1.78 GiB),
+# 52.26 GiB remain. One sequence held to 4,096 tokens costs 107.14 MiB of KDA
+# state + 4,096 x 27,648 B of MLA KV = 0.2101 GiB, so S = 248.7; the largest
+# multiple of G=4 below it is 248. PROVISIONAL until measured on GB300.
+_GB300_W8_G4 = K3EngineProfile(
     family=MachineFamily.GB300,
     num_nodes=2,
+    attention_group_size=4,
     shard_latent_projections=True,
     shard_vocab_parallel=True,
-    kda_user_slots=256,
-    kda_slots_basis="inherited: " + _INHERITED_H200,
-    prefill_micro_batch_token_cap=_H200_STREAMED_CAP,
+    kda_user_slots=248,
+    kda_slots_basis="kv-solve",
+    prefill_micro_batch_token_cap=_H200_STREAMED_CAP // 2,
     resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
     prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
+    prefill_stream_span=8,
     prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
     decode_budget=K3DecodeBudget(
-        device_total_gib=277.5,
+        device_total_gib=283_270 / 1024,
         gpu_memory_frac=0.95,
-        non_slot_base_gib=193.85,
-        prefill_non_expert_gib=39.96,
+        non_slot_base_gib=_B300_G8_MEASURED_BASE_GIB + _G4_BASE_DELTA_GIB,
+        prefill_non_expert_gib=_g4_prefill_non_expert_gib(248),
         graph_reserve_gib=2.0,
         full_length_tokens=4096,
-        source="ESTIMATED: the B300 single-node base (same EP8 shard and layout)",
+        source=(
+            "nvidia-smi total MEASURED 2026-11-09 (CUDA total ESTIMATED with "
+            "the B300 offset); base ESTIMATED as the measured B300 G=8 base "
+            "plus the G=4 share of the TP-sharded decode parameters"
+        ),
     ),
     sources=MappingProxyType({
-        name: _INHERITED_H200
-        for name in (
-            "shard_latent_projections",
-            "shard_vocab_parallel",
-            "kda_user_slots",
-            "prefill_micro_batch_token_cap",
-            "resident_ep_prefill_token_cap",
-            "resident_prefill_chunk_rows",
-            "prefill_grouped_chunk_rows",
-            "prefill_collective_stripe_threshold_rows",
-            "prefix_pool_workspace_bytes",
-        )
+        "shard_latent_projections": (
+            "derivation: every DP-attention row shards the LatentMoE "
+            "projections over its TP-G rank (streamed default)"
+        ),
+        "shard_vocab_parallel": "provisional: vocab-parallel over the TP4 rank",
+        "kda_user_slots": "provisional kv-solve (see the row comment)",
+        "prefill_micro_batch_token_cap": (
+            "provisional: the H200 cap scaled by G/8 for the per-rank "
+            "activation of a TP4 rank"
+        ),
+        "resident_ep_prefill_token_cap": (
+            "provisional: largest power of two whose activations and FP32 "
+            "output fit beside the resident EP8 shard"
+        ),
+        "resident_prefill_chunk_rows": _INHERITED_H200,
+        "prefill_grouped_chunk_rows": _INHERITED_H200,
+        "prefill_collective_stripe_threshold_rows": _INHERITED_H200,
+        "prefill_stream_span": _JOB_STREAM_SPAN,
+        "prefix_pool_workspace_bytes": _INHERITED_H200,
     }),
 )
 
-K3_PROFILES: Mapping[tuple[MachineFamily, int], K3EngineProfile] = MappingProxyType({
-    (row.family, row.world_size): row
-    for row in (_H20_W32, _H200_W16, _B300_W8, _GB300_W8)
+# B300, 1 node x 8 as two TP4 DP ranks (world 8). Same G=4 derivation on the
+# measured B300 device total: budget 254.30 GiB; minus the 206.76 GiB base, the
+# graph reserve and 17 non-user slots, 43.76 GiB remain, S = 208.3 -> 208.
+# The resident cap halves (8,192): the 16,384-row activations plus FP32
+# output do not fit beside the shard in this budget. PROVISIONAL.
+_B300_W8_G4 = K3EngineProfile(
+    family=MachineFamily.B300,
+    num_nodes=1,
+    attention_group_size=4,
+    shard_latent_projections=True,
+    shard_vocab_parallel=True,
+    kda_user_slots=208,
+    kda_slots_basis="kv-solve",
+    prefill_micro_batch_token_cap=_H200_STREAMED_CAP // 2,
+    resident_ep_prefill_token_cap=_H200_RESIDENT_CAP // 2,
+    resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
+    prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
+    prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
+    prefill_stream_span=8,
+    prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
+    decode_budget=K3DecodeBudget(
+        device_total_gib=267.68,
+        gpu_memory_frac=0.95,
+        non_slot_base_gib=_B300_G8_MEASURED_BASE_GIB + _G4_BASE_DELTA_GIB,
+        prefill_non_expert_gib=_g4_prefill_non_expert_gib(208),
+        graph_reserve_gib=2.0,
+        full_length_tokens=4096,
+        source=(
+            "ESTIMATED: the measured B300 G=8 base plus the G=4 share of the "
+            "TP-sharded decode parameters"
+        ),
+    ),
+    sources=MappingProxyType({
+        "shard_latent_projections": (
+            "derivation: every DP-attention row shards the LatentMoE "
+            "projections over its TP-G rank (streamed default)"
+        ),
+        "shard_vocab_parallel": "provisional: vocab-parallel over the TP4 rank",
+        "kda_user_slots": "provisional kv-solve (see the row comment)",
+        "prefill_micro_batch_token_cap": (
+            "provisional: the H200 cap scaled by G/8 for the per-rank "
+            "activation of a TP4 rank"
+        ),
+        "resident_ep_prefill_token_cap": (
+            "provisional: largest power of two whose activations and FP32 "
+            "output fit beside the resident EP8 shard"
+        ),
+        "resident_prefill_chunk_rows": _INHERITED_H200,
+        "prefill_grouped_chunk_rows": _INHERITED_H200,
+        "prefill_collective_stripe_threshold_rows": _INHERITED_H200,
+        "prefill_stream_span": _JOB_STREAM_SPAN,
+        "prefix_pool_workspace_bytes": _INHERITED_H200,
+    }),
+)
+
+K3ProfileKey = tuple[MachineFamily, int, int]
+
+K3_PROFILES: Mapping[K3ProfileKey, K3EngineProfile] = MappingProxyType({
+    (row.family, row.world_size, row.attention_group_size): row
+    for row in (_H20_W32, _H200_W16, _B300_W8, _B300_W8_G4, _GB300_W8_G4)
 })
 
 
-def k3_engine_profile(family: MachineFamily, world_size: int) -> K3EngineProfile:
-    """The K3 TP8 profile row of ``family`` at ``world_size`` GPUs.
+def k3_engine_profile(
+    family: MachineFamily, world_size: int, attention_group_size: int,
+) -> K3EngineProfile:
+    """The K3 profile row of ``family`` at ``world_size`` GPUs and DP-attention
+    rank size ``attention_group_size``.
 
-    Raises ``UnsupportedK3TopologyError`` for a pair without a row.
+    Raises ``UnsupportedK3TopologyError`` for a triple without a row.
     """
-    row = K3_PROFILES.get((MachineFamily(family), int(world_size)))
+    key = (MachineFamily(family), int(world_size), int(attention_group_size))
+    row = K3_PROFILES.get(key)
     if row is None:
         supported = ", ".join(
-            f"{fam.value} x {world}" for fam, world in sorted(
-                K3_PROFILES, key=lambda key: (key[0].value, key[1]))
+            f"{fam.value} x {world} G={group}" for fam, world, group in sorted(
+                K3_PROFILES, key=lambda k: (k[0].value, k[1], k[2]))
         )
         raise UnsupportedK3TopologyError(
-            f"no K3 TP8 profile for machine family {MachineFamily(family).value!r} "
-            f"at world_size={int(world_size)}; supported: {supported}"
+            f"no K3 profile for machine family {key[0].value!r} at "
+            f"world_size={key[1]} with attention_group_size={key[2]}; "
+            f"supported: {supported}"
         )
     return row
 
 
-# Kimi-Linear-48B in-wave prefix-pool reserve at attention TP8. The 48B runs
-# the same resident head-parallel KDA and NoPE-MLA seams as K3 with identical
-# per-head widths and strictly smaller temporaries (27 vs 93 layers, resident
-# experts), so the K3 reserve of the same machine bounds it. The h20 row was
-# validated live on a 2x8 serve group (full in-wave pool + trajectory
-# materialization matrix, zero out-of-memory, exact per-wave token
-# accounting). The Blackwell rows carry the value they ran under the retired
-# memory tiers and are provisional.
-KL48_PREFIX_POOL_WORKSPACE_BYTES: Mapping[MachineFamily, int] = MappingProxyType({
-    MachineFamily.H20: 24 * _GIB,
-    MachineFamily.H200: 40 * _GIB,
-    MachineFamily.B200: 40 * _GIB,
-    MachineFamily.B300: 40 * _GIB,
-    MachineFamily.GB300: 40 * _GIB,
+# Kimi-Linear-48B in-wave prefix-pool reserve, keyed by (machine family,
+# DP-attention rank size G). The pool is an optional optimization: a layout
+# without an entry runs with the pool off (reserve 0), never with another
+# layout's reserve. The 48B runs the same resident head-parallel KDA and
+# NoPE-MLA seams as K3 with identical per-head widths and strictly smaller
+# temporaries (27 vs 93 layers, resident experts), so the K3 reserve of the
+# same machine bounds it. The h20 G=8 entry was validated live on a 2x8 serve
+# group (full in-wave pool + trajectory materialization matrix, zero
+# out-of-memory, exact per-wave token accounting). The Blackwell entries carry
+# the value they ran under the retired memory tiers and are provisional.
+KL48_PREFIX_POOL_WORKSPACE_BYTES: Mapping[tuple[MachineFamily, int], int] = MappingProxyType({
+    (MachineFamily.H20, 8): 24 * _GIB,
+    (MachineFamily.H200, 8): 40 * _GIB,
+    (MachineFamily.B200, 8): 40 * _GIB,
+    (MachineFamily.B300, 8): 40 * _GIB,
+    (MachineFamily.GB300, 8): 40 * _GIB,
 })

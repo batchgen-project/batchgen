@@ -162,10 +162,39 @@ def test_blackwell_decode_runs_eager_when_kernel_not_capturable():
     assert config.Basic_Config.decode_graph_mode == "eager"
 
 
-def test_gb300_two_tray_plan_carries_the_inherited_values():
-    config = _plan("gb300", world_size=8)
-    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
-    assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
+def test_gb300_two_tray_g4_plan_takes_its_kv_solved_row():
+    config = _plan("gb300", world_size=8, group_size=4)
+    batching = config.Module_Batching_Config
+    # 248 user slots per DP rank (kv-solve at G=4) + 1 graph scratch + 16
+    # prefix segments.
+    assert batching.MoE_decoding_micro_batch_size == 248
+    assert config.GPU_Buffer_Config.kda_state_slots == 248 + 1 + 16
+    assert config.Basic_Config.decode_graph_buckets[-1] == 248
+    assert config.Basic_Config.decode_graph_mode == "graph"
+    assert config.Basic_Config.attention_group_size == 4
+    assert batching.k3_shard_latent_projections is True
+    assert batching.k3_shard_vocab_parallel is True
+    assert batching.k3_prefill_stream_span == 8
+    assert batching.prefill_micro_batch_token_cap == 262_144
+    assert batching.resident_ep_prefill_token_cap == 16_384
+    assert batching.prefill_prefix_pool_workspace_bytes == 40 * GIB
+
+
+def test_b300_g4_plan_takes_its_own_row():
+    config = _plan("b300", world_size=8, group_size=4)
+    batching = config.Module_Batching_Config
+    assert batching.MoE_decoding_micro_batch_size == 208
+    assert batching.resident_ep_prefill_token_cap == 8_192
+    assert batching.k3_prefill_stream_span == 8
+
+
+@pytest.mark.parametrize(
+    ("family", "world_size"),
+    [("h20", 32), ("h200", 16), ("b300", 8)],
+)
+def test_tp8_rows_stream_over_the_node(family, world_size):
+    config = _plan(family, world_size=world_size)
+    assert config.Module_Batching_Config.k3_prefill_stream_span == 8
 
 
 @pytest.mark.parametrize(
@@ -176,12 +205,20 @@ def test_gb300_two_tray_plan_carries_the_inherited_values():
         ("h200", 32),  # never measured
         ("b300", 16),  # never measured
         ("gb300", 4),  # one tray cannot hold the routed expert set
+        ("gb300", 8),  # a G=8 DP rank would span the two trays
         ("b200", 8),   # no K3 row
     ],
 )
 def test_k3_tp8_without_a_profile_row_is_refused_by_name(family, world_size):
     with pytest.raises(UnsupportedK3TopologyError, match=family):
         _plan(family, world_size=world_size)
+
+
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_k3_dp_attention_without_a_row_is_refused_not_given_h20_bounds(group_size):
+    # No group size falls back to machine-independent bounds any more.
+    with pytest.raises(UnsupportedK3TopologyError, match="attention_group_size"):
+        _plan("h200", world_size=16, group_size=group_size)
 
 
 def test_k3_tp8_on_an_unknown_machine_is_refused_by_name():
@@ -210,10 +247,9 @@ def test_non_tp8_k3_plan_is_machine_independent(family):
     assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 0
 
 
-def test_head_parallel_non_tp8_k3_keeps_the_single_prompt_cap():
-    config = _plan(None, world_size=8, group_size=4)
-    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 16_384
-    assert config.GPU_Buffer_Config.kda_state_slots == 5
+def test_k3_dp_attention_plan_without_device_facts_is_refused():
+    with pytest.raises(ValueError, match="machine family"):
+        _plan(None, world_size=8, group_size=4)
 
 
 def test_nonpositive_group_size_is_refused():

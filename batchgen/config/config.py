@@ -134,6 +134,10 @@ class ModuleBatchingConfig:
     # group (DECODE_CONCURRENCY_PLAN.md). Set by the planner.
     k3_shard_latent_projections: bool = False
     k3_shard_vocab_parallel: bool = False  # vocab-parallel embed_tokens / lm_head across the attention TP group
+    # Kimi-K3 streamed prefill: ranks that hold one copy of a layer's routed
+    # experts between them (a multiple of the attention TP size dividing the
+    # world). 0 = no streamed-SP8 layout planned. Set by the planner.
+    k3_prefill_stream_span: int = 0
     # Kimi-K3 slice 3: DeepEP low-latency EP exchange in the decode graph (needs the
     # K3 DeepEP build + NVSHMEM env; planner-set, see batchgen/moe/deepep_ll.py).
     k3_deepep_ll: bool = False

@@ -42,19 +42,37 @@ def test_h20_tp8_sizes_each_family_with_its_own_row():
 def test_k3_h20_reserve_is_sized_and_below_the_h200_reserve():
     # The H20 token cap shrinks K3's peak terms, so its reserve must be a
     # positive value strictly below the H200 one.
-    h20 = k3_engine_profile(MachineFamily.H20, 32).prefix_pool_workspace_bytes
-    h200 = k3_engine_profile(MachineFamily.H200, 16).prefix_pool_workspace_bytes
+    h20 = k3_engine_profile(MachineFamily.H20, 32, 8).prefix_pool_workspace_bytes
+    h200 = k3_engine_profile(MachineFamily.H200, 16, 8).prefix_pool_workspace_bytes
     assert 0 < h20 < h200
 
 
-def test_every_family_has_a_48b_row():
-    assert set(KL48_PREFIX_POOL_WORKSPACE_BYTES) == set(MachineFamily)
+def test_every_family_has_a_48b_row_at_g8():
+    assert set(KL48_PREFIX_POOL_WORKSPACE_BYTES) == {
+        (family, 8) for family in MachineFamily
+    }
 
 
-def test_non_tp8_layouts_are_pool_off_without_a_machine_family():
-    for group in (1, 2, 4, 16):
+def test_pure_dp_layouts_are_pool_off_without_a_machine_family():
+    for is_k3 in (True, False):
+        assert _reserve(None, is_k3=is_k3, group=1) == 0
+
+
+def test_dp_attention_layouts_need_the_machine_family():
+    for group in (2, 4, 16):
         for is_k3 in (True, False):
-            assert _reserve(None, is_k3=is_k3, group=group) == 0
+            with pytest.raises(ValueError, match="machine family"):
+                _reserve(None, is_k3=is_k3, group=group)
+
+
+def test_k3_g4_reserve_comes_from_its_profile_row():
+    assert _reserve(MachineFamily.GB300, is_k3=True, group=4, world=8) == (
+        k3_engine_profile(MachineFamily.GB300, 8, 4).prefix_pool_workspace_bytes
+    )
+
+
+def test_48b_without_a_recorded_reserve_runs_pool_off():
+    assert _reserve(MachineFamily.GB300, is_k3=False, group=4, world=8) == 0
 
 
 def test_tp8_reserve_needs_the_machine_family():

@@ -17,7 +17,6 @@ from batchgen.hardware.machine_family import (
     classify_machine_family,
 )
 from batchgen.models.moonshotai.kimi_linear.machine_profile import (
-    K3_PROFILE_ATTENTION_GROUP_SIZE,
     KL48_PREFIX_POOL_WORKSPACE_BYTES,
     K3EngineProfile,
     k3_engine_profile,
@@ -25,12 +24,12 @@ from batchgen.models.moonshotai.kimi_linear.machine_profile import (
 from batchgen.planner.base_planner import BasePlanner
 
 
-# Plan values of the machine-independent topologies (attention TP group size
-# other than 8): nothing on them depends on the machine, so they need no
-# profile row. K3 keeps the four-slot plan and the H20-validated prefill
-# bounds there; the 48B keeps its single-shard defaults.
-_K3_NON_TP8_KDA_USER_SLOTS = 4
-_K3_NON_TP8_HEAD_PARALLEL_PREFILL_TOKEN_CAP = 16_384
+# Plan values of the machine-independent topologies: K3 at G=1 (pure DP,
+# every module streamed) and every 48B layout. Nothing on them depends on the
+# machine, so they need no profile row. K3 at G=1 keeps the four-slot plan;
+# the 48B keeps its single-shard defaults. K3 at any G > 1 is a DP-attention
+# layout and is planned from its profile row.
+_K3_PURE_DP_KDA_USER_SLOTS = 4
 _KIMI_DEFAULT_PREFILL_TOKEN_CAP = 262_144
 _KIMI_DEFAULT_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
 _KIMI_DEFAULT_PREFILL_GROUPED_CHUNK_ROWS = 2_048
@@ -72,27 +71,31 @@ def kimi_prefix_pool_workspace_bytes(
 ) -> int:
     """Return the forward's reserve under the in-wave prefill prefix pool.
 
-    0 leaves the pool off; only attention-TP8 layouts run the pool. K3 takes
-    its profile row's reserve; the 48B takes its per-family reserve. K3
+    0 leaves the pool off; the pool runs only on DP-attention layouts (G > 1).
+    K3 takes its profile row's reserve; the 48B takes the reserve recorded for
+    its (family, G) and runs without the pool where none is recorded. K3
     prefix reuse has no cross-wave materialization path, so it runs on the
     pool or not at all.
     """
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")
-    if group_size != K3_PROFILE_ATTENTION_GROUP_SIZE:
+    if group_size == 1:
         return 0
     family = _require_family(machine_family)
     if is_k3:
-        return k3_engine_profile(family, world_size).prefix_pool_workspace_bytes
-    return KL48_PREFIX_POOL_WORKSPACE_BYTES[family]
+        return k3_engine_profile(
+            family, world_size, group_size
+        ).prefix_pool_workspace_bytes
+    return KL48_PREFIX_POOL_WORKSPACE_BYTES.get((family, group_size), 0)
 
 
 def _require_family(machine_family: MachineFamily | None) -> MachineFamily:
     if machine_family is None:
         raise ValueError(
-            "an attention-TP8 Kimi plan is machine-dependent and needs the "
-            "machine family (pass device_facts to KimiLinearPlanner)"
+            "a DP-attention Kimi plan (attention_group_size > 1) is "
+            "machine-dependent and needs the machine family (pass "
+            "device_facts to KimiLinearPlanner)"
         )
     return MachineFamily(machine_family)
 
@@ -138,9 +141,10 @@ class KimiLinearPlanner(BasePlanner):
         sub-group layout from this value.
 
         ``device_facts`` identifies the machine (``detect_device_facts``).
-        Attention-TP8 plans are machine-dependent: they classify it into a
-        machine family and read that family's profile row, and refuse to plan
-        without facts. Other group sizes plan machine-independent values.
+        DP-attention plans (G > 1) are machine-dependent: they classify it
+        into a machine family and read the profile row of (family, world size,
+        G), and refuse to plan without facts. G = 1 plans
+        machine-independent values.
         """
         super().__init__()
         self.is_k3 = is_k3
@@ -182,17 +186,17 @@ class KimiLinearPlanner(BasePlanner):
     def _k3_profile(self) -> K3EngineProfile | None:
         """The K3 profile row of this plan, or None for a layout without one.
 
-        K3 at attention TP8 is the machine-dependent layout; it needs the
-        machine family and a row for (family, world size), and refuses by
-        name otherwise. The 48B and non-TP8 K3 plans are machine-independent.
+        K3 at any DP-attention rank size G > 1 is machine-dependent; it needs
+        the machine family and a row for (family, world size, G), and refuses
+        by name otherwise. The 48B and the pure-DP (G = 1) K3 plan are
+        machine-independent.
         """
-        if not (
-            self.is_k3
-            and self.attention_group_size == K3_PROFILE_ATTENTION_GROUP_SIZE
-        ):
+        if not (self.is_k3 and self.attention_group_size > 1):
             return None
         return k3_engine_profile(
-            _require_family(self.machine_family), self.world_size
+            _require_family(self.machine_family),
+            self.world_size,
+            self.attention_group_size,
         )
 
     def _adjust_config_for_model(self):
@@ -201,8 +205,8 @@ class KimiLinearPlanner(BasePlanner):
         self.config.Basic_Config.attn_mode = 3
 
         # Machine-dependent knobs come from the K3 profile row of this
-        # (machine family, world size) at attention TP8; every other layout
-        # plans machine-independent values.
+        # (machine family, world size, G); every other layout plans
+        # machine-independent values.
         k3_profile = self._k3_profile()
         batching = self.config.Module_Batching_Config
 
@@ -242,12 +246,12 @@ class KimiLinearPlanner(BasePlanner):
             batching.k3_prefill_grouped_chunk_rows = (
                 k3_profile.prefill_grouped_chunk_rows
             )
+            batching.k3_prefill_stream_span = k3_profile.prefill_stream_span
         else:
             batching.prefill_micro_batch_token_cap = (
-                _K3_NON_TP8_HEAD_PARALLEL_PREFILL_TOKEN_CAP
-                if self.is_k3 and self.attention_group_size > 1
-                else _KIMI_DEFAULT_PREFILL_TOKEN_CAP
+                _KIMI_DEFAULT_PREFILL_TOKEN_CAP
             )
+            batching.k3_prefill_stream_span = 0
             batching.resident_ep_prefill_token_cap = 0
             batching.k3_resident_prefill_chunk_rows = 0
             batching.k3_prefill_collective_stripe_threshold_rows = (
@@ -353,8 +357,8 @@ class KimiLinearPlanner(BasePlanner):
         types is what makes 8xH20 possible at all.
         """
         # KDA conv/recurrent state pools. At K3 dimensions, an unsharded slot
-        # is 428.6 MiB; TP8 KDA makes it 53.57 MiB/rank. The profile row sets
-        # the user-visible sequence capacity (the non-TP8 plan keeps four),
+        # is 428.6 MiB; TP-G KDA makes it 428.6/G MiB per rank. The profile
+        # row sets the user-visible sequence capacity (pure DP keeps four),
         # then one separate physical item is allocated for CUDA-graph
         # padding/warmup. The graph reserves that item before readiness, so
         # admission still sees exactly the user capacity instead of silently
@@ -366,7 +370,7 @@ class KimiLinearPlanner(BasePlanner):
         else:
             shard_latent = False
             shard_vocab = False
-            sequence_slots = _K3_NON_TP8_KDA_USER_SLOTS
+            sequence_slots = _K3_PURE_DP_KDA_USER_SLOTS
         self.config.Module_Batching_Config.k3_shard_latent_projections = shard_latent
         self.config.Module_Batching_Config.k3_shard_vocab_parallel = shard_vocab
         self.config.Module_Batching_Config.k3_deepep_ll = k3_deepep_low_latency(
@@ -377,9 +381,8 @@ class KimiLinearPlanner(BasePlanner):
             + self.config.GPU_Buffer_Config.kda_prefix_segment_slots
         )
 
-        # This is a per-node sequence cap under TP8: every rank in the node
-        # holds the same sequence set. Keep the graph top bucket equal to that
-        # cap.
+        # This is a per-DP-rank sequence cap: every rank of a TP-G rank holds
+        # the same sequence set. Keep the graph top bucket equal to that cap.
         self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
             sequence_slots
         )
@@ -397,8 +400,8 @@ class KimiLinearPlanner(BasePlanner):
         # of launches + per-layer NCCL), so the long-generation tail of a
         # 512x4096 run cost r20 ~20 min at 72/192 occupancy. Falls back to
         # eager per step when any EP rank is empty. Batch-level override:
-        # batchgen_debug.kimi_decode_graph_mode. Every TP8 profile row takes
-        # it; the non-TP8 four-slot plan keeps its validated eager path.
+        # batchgen_debug.kimi_decode_graph_mode. Every profile row takes it;
+        # the pure-DP four-slot plan keeps its validated eager path.
         # The captured path also needs a graph-capturable dense MLA decode
         # kernel (paged_decode.graph_capturable: Hopper today).
         if profile is not None and self.decode_graph_capturable:
