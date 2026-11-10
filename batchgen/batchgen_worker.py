@@ -1685,7 +1685,11 @@ class BatchGenWorker:
 			max_input_length: Maximum input length hint. If None, will be determined dynamically
 			                  during tokenization as the longest prompt in the batch.
 			                  For first initialization, a default of 8192 is used if None.
-			max_decoding_length: Maximum number of tokens to decode.
+			max_decoding_length: Decode-budget hint for init-time sizing. In
+			                     pool mode it is the budget of the first batch the
+			                     server saw, so nothing may cap a sequence with it:
+			                     each admission entry carries that sequence's own
+			                     budget (``kv_token_budget``).
 			num_queries: Number of queries in the global batch.
 			max_context_length: Maximum total context length (prompt + decode). None = use model max.
 		"""
@@ -1699,12 +1703,6 @@ class BatchGenWorker:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
 		self.max_context_length = max_context_length
-
-		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
-		if self.adaptive_chunk_sizer is not None and max_decoding_length > 0:
-			capped_max = min(self.adaptive_chunk_sizer.max_chunk, max_decoding_length)
-			capped_max = math.ceil(capped_max / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
-			self.adaptive_chunk_sizer.max_chunk = capped_max
 
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		
@@ -2111,6 +2109,19 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# Each entry's own budget is the only decode cap. The worker-wide
+		# max_decoding_length is the first pool batch's budget, so defaulting
+		# to it would silently truncate a later request. Checked before any
+		# entry is created so a malformed message admits nothing.
+		missing_budget = [
+			entry.get("request_id") for entry in entries
+			if entry.get("max_tokens") is None
+		]
+		if missing_budget:
+			raise ValueError(
+				f"admission entries {missing_budget!r} carry no max_tokens; every "
+				"admitted sequence must carry its own decode budget"
+			)
 		# New live work: the next drain is a new edge for the prefix_drain row.
 		self._prefix_drain_metric_emitted = False
 
@@ -2125,7 +2136,7 @@ class BatchGenWorker:
 		new_uuids = []
 		for i, entry in enumerate(entries):
 			global_idx = start_idx + i
-			max_dec = entry.get("max_tokens", self.max_decoding_length)
+			max_dec = int(entry["max_tokens"])
 			seq = SequenceEntry(
 				uuid=entry["request_id"],
 				global_idx=global_idx,
@@ -7085,17 +7096,18 @@ class BatchGenWorker:
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
 
-		The chunk size is capped by max_decoding_length since allocating more
-		than the maximum possible decode tokens is wasteful. The result is
-		always rounded up to a page boundary (multiple of PAGE_SIZE=64).
+		The value is worker-wide; every consumer bounds it by the sequence's
+		own ``kv_token_budget`` (``compute_prefill_host_reservation`` for the
+		initial reservation, ``SequenceEntry.get_host_growth_pages`` for
+		growth), so a short sequence never reserves past its budget. Capping it
+		by the worker-wide ``max_decoding_length`` instead would size every
+		later pool-mode batch by the first batch's budget. The result is always
+		rounded up to a page boundary (multiple of PAGE_SIZE=64).
 		"""
 		if self.adaptive_chunk_sizer is not None:
 			chunk = self.adaptive_chunk_sizer.get_chunk_size()
 		else:
 			chunk = self.host_kv_chunk_size
-		# Cap by max_decoding_length — no point reserving more than max decode
-		if self.max_decoding_length > 0:
-			chunk = min(chunk, self.max_decoding_length)
 		# A boundary is the only place where host pages may be allocated.  Keep
 		# one complete decision interval of runway so the next boundary is
 		# reached while the metadata invariant still holds.  This removes the
