@@ -5859,11 +5859,18 @@ class BatchGenWorker:
 		Host KV is shared by ranks on the same node, not globally. Rank 0 uses
 		these per-node stats to plan dynamic host growth against the same pool
 		that each owner rank will later allocate from.
+
+		Each record also carries the retained prefix pages the node can reclaim
+		right now (resident, no live attachment, no pending load): growth may
+		consume them exactly as prefill admission does, and the boundary's
+		growth phase releases them on demand before the fresh capacity
+		preflight. Zero when the prefix cache is off.
 		"""
 		gpus_per_node = self.local_world_size
 		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
 		report_free = 0
 		report_total = 0
+		report_reclaimable = -1
 		report_node = -1
 		if worker_view is not None and self.local_rank == 0:
 			try:
@@ -5871,6 +5878,14 @@ class BatchGenWorker:
 				report_node = self.rank // gpus_per_node
 				report_free = int(stats.num_free_pages)
 				report_total = int(stats.num_total_pages)
+				report_reclaimable = (
+					max(0, int(self.prefix_cache_coordinator.count_releasable_pages(0)))
+					if (
+						self.enable_prefix_cache
+						and self.prefix_cache_coordinator is not None
+					)
+					else 0
+				)
 			except Exception:
 				# Carry a rank-local stats failure through the collective so
 				# peers do not block while this rank raises before all-gather.
@@ -5878,9 +5893,10 @@ class BatchGenWorker:
 				report_node = -2
 				report_free = -1
 				report_total = -1
+				report_reclaimable = -1
 
 		stats_tensor = torch.tensor(
-			[report_node, report_free, report_total],
+			[report_node, report_free, report_total, report_reclaimable],
 			dtype=torch.int64,
 			device=self.torch_device,
 		)
@@ -5900,6 +5916,7 @@ class BatchGenWorker:
 					'node_id': node_id,
 					'num_free_pages': int(item[1].item()),
 					'num_total_pages': int(item[2].item()),
+					'num_reclaimable_pages': int(item[3].item()),
 				}
 
 		for node in range(num_nodes):
@@ -5907,6 +5924,7 @@ class BatchGenWorker:
 				'node_id': node,
 				'num_free_pages': 0,
 				'num_total_pages': 0,
+				'num_reclaimable_pages': 0,
 			}))
 
 		return per_node_stats
@@ -7193,27 +7211,25 @@ class BatchGenWorker:
 			for node, needed in node_needs.items()
 		}
 
-	def _retry_prefill_host_capacity_after_reclaim(
+	def _reclaim_host_prefix_pages_collective(
 		self,
-		owner_requests: List[Tuple[str, int]],
-		capacity_rows: Dict[int, Tuple[int, int]],
-	) -> bool:
-		"""Reclaim this node's host-page deficit once, then re-check capacity.
+		page_target: Callable[[], int],
+		*,
+		reason: str,
+	) -> int:
+		"""Reclaim retained prefix pages on each node leader; all ranks align.
 
-		Exactly one attempt: a wave sized against free + reclaimable pages can
-		be short only by what is retained, and this releases it. A second
-		shortfall is a real capacity change (a concurrent decode grew, a peer
-		node is the short one and has nothing cold left), which the caller
-		rejects exactly as before.
+		The node leader evaluates ``page_target()`` (the Host pages this node is
+		short) and releases up to that many cold retained prefix pages -- only
+		pages with no live attachment and no pending load, so nothing a running
+		row or an attached wave reads is touched. Every other rank of the node
+		then retires the trajectory frontiers standing on the released pages.
 
-		Safe by construction: the wave's prefix attachments are already held,
-		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
-		keeps it -- only cold retained pages go, which is precisely the supply
-		the admission budget counted.
-
-		Collective discipline (same as the admission reclaim): every rank
-		reaches every collective, a leader-side failure becomes a MAX-reduced
-		flag, and no rank raises before that flag is reduced.
+		Collective discipline: every rank reaches every collective, a
+		leader-side failure (including in ``page_target``) becomes a MAX-reduced
+		flag, and no rank raises before that flag is reduced. ``reason`` names
+		the caller in logs, the ``prefix_reclaim`` metric and errors. Returns
+		the largest page count any leader reclaimed.
 		"""
 		from batchgen.prefix_reuse.eviction import (
 			EvictedPageRecorder,
@@ -7226,36 +7242,34 @@ class BatchGenWorker:
 		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
 		if self.local_rank == 0:
 			try:
-				page_target = prefill_host_reserve_page_deficit(
-					capacity_rows, node_id
-				)
-				if page_target:
+				target = int(page_target())
+				if target:
 					released = reclaim_prefix_pages_for_host_admission(
 						core_engine_module=core_engine,
 						coordinator=self.prefix_cache_coordinator,
 						worker_views_by_group=self._host_views_by_group(),
 						group_id=0,
-						page_target=page_target,
+						page_target=target,
 						max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
 						frontier_hook=reclaimed_pages,
 					)
 					logging.info(
-						"[PREFIX_CACHE] reserve reclaimed %s Host pages on node %s "
+						"[PREFIX_CACHE] %s reclaimed %s Host pages on node %s "
 						"(free=%s, target=%s)",
-						released, node_id, self._get_host_kv_free_pages(),
-						page_target,
+						reason, released, node_id, self._get_host_kv_free_pages(),
+						target,
 					)
 					if self.prefix_cache_debug_stats:
 						self._emit_prefix_cache_metric(
 							"prefix_reclaim",
-							reason="host_reserve",
+							reason=reason,
 							node=int(node_id),
-							page_target=int(page_target),
+							page_target=int(target),
 							released_pages=int(released),
 							**self._prefix_host_resource_fields(),
 						)
 			except Exception:
-				logging.exception("[PREFIX_CACHE] reserve eviction failed")
+				logging.exception("[PREFIX_CACHE] %s eviction failed", reason)
 				failure = 1
 		reclaimed_page_count = reclaimed_pages.page_count
 		if self.world_size > 1:
@@ -7267,7 +7281,7 @@ class BatchGenWorker:
 			failure = int(failed[0].item())
 			reclaimed_page_count = int(failed[1].item())
 		if failure != 0:
-			raise RuntimeError("prefix cache reserve eviction failed on a worker")
+			raise RuntimeError(f"prefix cache {reason} eviction failed on a worker")
 		# The leader already retired its own frontiers inside the release. Any
 		# other rank of the node may own frontier records standing on the
 		# reclaimed pages (G=1, or several serve groups per node), so every rank
@@ -7292,8 +7306,8 @@ class BatchGenWorker:
 					)
 				except Exception:
 					logging.exception(
-						"[PREFIX_CACHE] frontier retirement after reserve reclaim "
-						"failed"
+						"[PREFIX_CACHE] frontier retirement after %s reclaim "
+						"failed", reason,
 					)
 					frontier_failure = 1
 			retired = torch.tensor(
@@ -7302,11 +7316,89 @@ class BatchGenWorker:
 			dist.all_reduce(retired, op=dist.ReduceOp.MAX)
 			if int(retired.item()) != 0:
 				raise RuntimeError(
-					"trajectory frontier retirement after reserve reclaim failed "
-					"on a worker"
+					f"trajectory frontier retirement after {reason} reclaim "
+					"failed on a worker"
 				)
+		return reclaimed_page_count
+
+	def _retry_prefill_host_capacity_after_reclaim(
+		self,
+		owner_requests: List[Tuple[str, int]],
+		capacity_rows: Dict[int, Tuple[int, int]],
+	) -> bool:
+		"""Reclaim this node's host-page deficit once, then re-check capacity.
+
+		Exactly one attempt: a wave sized against free + reclaimable pages can
+		be short only by what is retained, and this releases it. A second
+		shortfall is a real capacity change (a concurrent decode grew, a peer
+		node is the short one and has nothing cold left), which the caller
+		rejects exactly as before.
+
+		Safe by construction: the wave's prefix attachments are already held,
+		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
+		keeps it -- only cold retained pages go, which is precisely the supply
+		the admission budget counted.
+
+		Collective discipline is ``_reclaim_host_prefix_pages_collective``'s:
+		every rank reaches every collective, and the deficit is computed on the
+		leader inside its MAX-reduced failure flag.
+		"""
+		node_id = self.rank // self.local_world_size
+		self._reclaim_host_prefix_pages_collective(
+			lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
+			reason="host_reserve",
+		)
 		capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
 		return capacity_ok
+
+	def _reclaim_host_prefix_pages_for_growth(
+		self,
+		growth_entries: List[Tuple[str, int, object]],
+		worker_view: Optional[object],
+	) -> int:
+		"""Release the retained prefix pages this boundary's growth plan counted.
+
+		The rank-0 growth plan covers each node's growth debt with free pages,
+		completed/evicted releases and the node's reclaimable retained prefix
+		pages. After every rank has released (the caller's barrier), the node
+		leader reads the physical free count and reclaims exactly the part of
+		this node's growth the free pages do not cover:
+		``max(0, node_growth_pages - free_after_releases)``. A shortfall the
+		reclaim cannot close is left to the fresh collective preflight, which
+		fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
+		list, identical on every rank.
+		"""
+		node_id = self.rank // self.local_world_size
+		group_size = self._decode_attn_tp_size()
+
+		def node_growth_deficit() -> int:
+			from batchgen.decode_dp_group import host_kv_owner_rank
+
+			node_growth_pages = 0
+			for uuid, growth_pages, seq in growth_entries:
+				if seq is None:
+					raise RuntimeError(f"growth sequence {uuid} is not in global_batch")
+				if group_size > 1:
+					if seq.decode_dp_group is None:
+						raise RuntimeError(
+							f"growth sequence {uuid} has no decode_dp_group for "
+							f"attn_tp_size={group_size}"
+						)
+					owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
+				else:
+					owner = seq.assigned_rank
+				if int(owner) // self.local_world_size == node_id:
+					node_growth_pages += int(growth_pages)
+			if node_growth_pages == 0:
+				return 0
+			if worker_view is None:
+				raise RuntimeError("host-KV worker view is unavailable")
+			free_after_releases = int(worker_view.get_stats().num_free_pages)
+			return max(0, node_growth_pages - free_after_releases)
+
+		return self._reclaim_host_prefix_pages_collective(
+			node_growth_deficit, reason="host_growth",
+		)
 
 	def _attach_prefix_cache_for_prefill(self, prefill_uuids: List[str]) -> None:
 		"""Attach page-aligned cached prefixes for sequences this rank owns.
@@ -17392,6 +17484,16 @@ class BatchGenWorker:
 				# GPU/KDA state, but only the host-KV owner may mutate its page table.
 				if self._owns_host_kv(seq):
 					host_grow_requests.append((seq.global_idx, growth_pages))
+
+			# The growth plan counted each node's reclaimable retained prefix
+			# pages as supply; release the part free pages do not cover now,
+			# after every rank's releases and before the fresh preflight.
+			# Gated on the rank-uniform prefix-cache config so every rank
+			# reaches the reclaim's collectives.
+			if self.enable_prefix_cache:
+				self._reclaim_host_prefix_pages_for_growth(
+					growth_entries, worker_view
+				)
 
 			# The rank-0 planner's stats are an admission snapshot.  Recheck the
 			# node-shared allocator after all releases have completed and before any
