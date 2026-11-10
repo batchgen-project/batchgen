@@ -437,13 +437,19 @@ class RestartCoordinator:
 
     # ---------------------- Node 0: requesting ----------------------
     def begin_restart(self, timeout_s: float) -> RestartRequest:
-        """Claim the next epoch and publish what every node must run."""
+        """Claim the next epoch and publish what every node must run.
+
+        The epoch also names the cohort the restart brings up, so a
+        single-node server, which has no store, still counts its epochs here.
+        """
         requested_at = time.time()
-        request = RestartRequest(
-            epoch=0, timeout_s=float(timeout_s), requested_at=requested_at
-        )
         if not self.enabled:
-            return request
+            self._epoch += 1
+            return RestartRequest(
+                epoch=self._epoch,
+                timeout_s=float(timeout_s),
+                requested_at=requested_at,
+            )
         store = self._require_store()
         epoch = int(store.add(_EPOCH_KEY, 1))
         request = RestartRequest(

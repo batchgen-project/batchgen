@@ -210,6 +210,9 @@ def _manager(monkeypatch):
     # Single node: the real coordinator is built, and every call through it
     # must be a no-op, so these tests also pin the unchanged local path.
     manager._restart_coordinator = _single_node_coordinator()
+    # Generation 3 is the cohort restart epoch 2 brought up; a generation is
+    # always its epoch + 1, so the next restart (epoch 3) serves generation 4.
+    manager._restart_coordinator._epoch = 2
     manager._last_restart_error = None
     manager._coordinated_phase = None
     manager._cluster_fail_fast = False
@@ -799,7 +802,9 @@ def test_failing_scheduler_hook_leaves_workers_down_not_serving(monkeypatch, hoo
     manager._resume_hook = lambda: None
     manager.restart_workers(timeout_s=1)
     assert manager.state == "serving"
-    assert manager.generation == 4
+    # The failed restart consumed epoch 3 on every node, so the retry's
+    # cohort is epoch 4's: generation 5.
+    assert manager.generation == 5
 
 
 def test_scheduler_hooks_run_before_the_serving_flip(monkeypatch):
