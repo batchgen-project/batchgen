@@ -153,7 +153,7 @@ python -m batchgen.launch_http_server \
     --replicated-weights \
     --kv-dtype bf16 \
     --host-kv-cache-size 512 \
-    --gpu-memory-frac 0.85 \
+    --gpu-memory-frac 0.95 \
     --parse-thinking \
     --storage-path /shared/storage
 ```
@@ -172,18 +172,20 @@ python -m batchgen.launch_http_server \
     --replicated-weights \
     --kv-dtype bf16 \
     --host-kv-cache-size 512 \
-    --gpu-memory-frac 0.85 \
+    --gpu-memory-frac 0.95 \
     --parse-thinking \
     --storage-path /shared/storage
 ```
 
-> **HBM headroom for K3 (`--gpu-memory-frac` + allocator).** K3 materializes its routed experts as
-> resident MXFP4 Marlin shards in HBM during `configure_decoding`. At `--gpu-memory-frac 0.9` the KV
-> cache claims enough HBM that this expert repack OOMs on H200 (141 GiB) — the worker dies at
-> `build_resident_ep_mxfp4_layers → _repack_projection → .to(device)` and takes the whole distributed
-> job down. Use **`--gpu-memory-frac 0.85`** and export **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**
-> (this build reads the `PYTORCH_CUDA_ALLOC_CONF` name, not `PYTORCH_ALLOC_CONF`) so fragmented reserved
-> HBM is reusable, so the resident-expert repack fits within the per-GPU budget alongside the KV cache.
+> **HBM headroom for K3 (`--gpu-memory-frac` + allocator).** K3 keeps its routed experts resident
+> in HBM as MXFP4 Marlin shards for decode, built during startup before the server reports ready.
+> The GPU KV pool is `total HBM x --gpu-memory-frac` minus that decode residency, so on H200 the
+> fraction must stay high: use **`--gpu-memory-frac 0.95`**. A lower value can leave no KV pool at
+> all; the server measures the decode residency right after building the resident shards and
+> refuses to start with `[GPU-KV] Calculated pool size non-positive`, naming the residency and the
+> smallest fraction that leaves a pool. Also export
+> **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (this build reads the
+> `PYTORCH_CUDA_ALLOC_CONF` name, not `PYTORCH_ALLOC_CONF`) so fragmented reserved HBM stays reusable.
 
 Start node 0 first or together with node 1: node 1 waits a bounded time for node 0's control
 store. On two nodes `--cluster-fail-fast` is on by default, so a fatal worker error on either

@@ -91,7 +91,7 @@ python -m batchgen.launch_http_server \
     --dist-init-addr node0-ip:12355 \
     --kv-dtype bf16 \
     --host-kv-cache-size 512 \
-    --gpu-memory-frac 0.80 \
+    --gpu-memory-frac 0.95 \
     --parse-thinking \
     --storage-path /shared/storage
 ```
@@ -101,10 +101,11 @@ H20-specific notes (the rest matches the H200 guide):
 - **`--model` must be the registered id `moonshotai/Kimi-K3`, not a local path** — same
   requirement and failure mode as the H200 guide (both the config registry and the host-KV
   profile key on the id).
-- **`--gpu-memory-frac` is lower than on H200.** H20's smaller HBM leaves less room for the
-  resident MXFP4 experts, so start conservatively (shown: `0.80`) and raise only if the
-  resident-expert repack and KV cache still fit; if a worker dies at
-  `build_resident_ep_mxfp4_layers … .to(device)` with a CUDA OOM, lower it further.
+- **`--gpu-memory-frac 0.95`, as on H200.** The resident MXFP4 expert shards take most of each
+  H20's HBM, and the GPU KV pool is `total HBM x --gpu-memory-frac` minus that decode residency,
+  so a lower fraction such as `0.80` leaves no pool at all. The server measures the residency
+  during startup and refuses an unservable fraction before it reports ready, with
+  `[GPU-KV] Calculated pool size non-positive` naming the smallest fraction that leaves a pool.
 - **Distributed weights are the practical path on H20** (the replicated store does not fit);
   spreading the model across 4 nodes (EP over 32 GPUs) is what makes the 2.8T model fit.
 - `--host-kv-cache-size` is required and positive; K3 sizes its host paged-KV view from it.

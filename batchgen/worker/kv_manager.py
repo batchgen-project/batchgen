@@ -540,6 +540,32 @@ class KVCacheManager:
     # Measure-once-cache pool sizing (pure helpers; the worker applies them)
     # ------------------------------------------------------------------
     @staticmethod
+    def provisional_pool_gb(
+        total_gb: float, used_gb: float, gpu_memory_frac: float
+    ) -> float:
+        """Pre-capture pool size, ``total * frac - used``; fails when <= 0.
+
+        ``used_gb`` is the decode-time residency (weights, the resident decode
+        shard, runtime buffers) measured after draining the allocator cache.
+        A non-positive remainder means ``gpu_memory_frac`` can never serve
+        this model on this device, so the error names the residency and the
+        smallest fraction that leaves a pool at all.
+        """
+        size = total_gb * gpu_memory_frac - used_gb
+        if size > 0:
+            return size
+        # Fail-loud (contract invariant 3): a non-positive remainder is a
+        # configuration error, never a silently accepted minimum.
+        raise RuntimeError(
+            f"[GPU-KV] Calculated pool size non-positive ({size:.2f} GB): "
+            f"total {total_gb:.2f} GB x frac {gpu_memory_frac} - used "
+            f"{used_gb:.2f} GB. The decode residency is {used_gb:.2f} GB, so "
+            f"--gpu-memory-frac must exceed {used_gb / total_gb:.3f} on this "
+            "device for any GPU KV pool to exist; raise it or lower resident "
+            "memory."
+        )
+
+    @staticmethod
     def compute_final_pool_gb(
         total_gb: float,
         used_gb: float,
