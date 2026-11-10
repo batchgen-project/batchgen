@@ -58,7 +58,6 @@ class _Worker:
     rank = 1
     world_size = 1
     max_input_length = 1 << 20
-    max_decoding_length = 64
     _trajectory_book = None
     _response_queue = None
 
@@ -109,7 +108,8 @@ class _Worker:
 
 def _admit(worker, *request_ids):
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": rid, "input_ids": np.zeros(4, dtype=np.int32), "batch_id": "b"}
+        {"request_id": rid, "input_ids": np.zeros(4, dtype=np.int32), "batch_id": "b",
+         "max_tokens": 64}
         for rid in request_ids
     ]})
 

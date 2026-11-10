@@ -56,7 +56,6 @@ def _ids(length):
 class _Worker:
     world_size = 2
     max_input_length = 1 << 20
-    max_decoding_length = 64
     _trajectory_book = None
 
     _admit_sequences_from_message = _METHODS["_admit_sequences_from_message"]
@@ -130,7 +129,8 @@ def test_admit_stores_the_identity_next_to_batch_id(caplog):
     with caplog.at_level(logging.INFO):
         worker._admit_sequences_from_message({"entries": [
             _TURN_ENTRY,
-            {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1"},
+            {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1",
+             "max_tokens": 64},
         ]})
     turn = worker.global_batch.get_sequence("turn_abc")
     assert (turn.batch_id, turn.traj_id, turn.session_id, turn.parent_session_id) == (
@@ -204,7 +204,8 @@ def test_completion_reports_cached_computed_and_stamps(caplog):
 def test_batch_completion_without_prefix_cache_reports_zero_cached():
     worker = _Worker(rank=0)
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1"},
+        {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1",
+             "max_tokens": 64},
     ]})
     _complete(worker, "r@batch_1")
     worker._report_completion("r@batch_1", gathered_text="answer")

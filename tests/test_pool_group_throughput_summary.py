@@ -32,7 +32,6 @@ def _method(name):
 class _Worker:
     rank = 1
     world_size = 1
-    max_decoding_length = 64
     max_input_length = 1 << 20
 
     def __init__(self):
@@ -76,7 +75,8 @@ _Worker._group_token_totals = namespace["_group_token_totals"]
 def _admit(worker, batch_id, prompt_lengths):
     worker._admit_sequences_from_message({"entries": [
         {"request_id": f"{batch_id}-{i}",
-         "input_ids": np.zeros(length, dtype=np.int32), "batch_id": batch_id}
+         "input_ids": np.zeros(length, dtype=np.int32), "batch_id": batch_id,
+         "max_tokens": 64}
         for i, length in enumerate(prompt_lengths)]})
 
 
