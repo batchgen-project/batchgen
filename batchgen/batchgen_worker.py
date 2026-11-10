@@ -10028,6 +10028,9 @@ class BatchGenWorker:
 		# buffers are already sized for the largest batch that can be admitted.
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+		# The decode residency now exists: a fraction it leaves no pool under
+		# fails here, not at the first batch that decodes.
+		self._require_servable_gpu_kv_pool()
 
 		# Then hand the built model to the prefill mode this weight topology
 		# will actually use, so the first admission inherits this phase directly
@@ -12164,18 +12167,9 @@ class BatchGenWorker:
 		used_mem_gb = total_mem_gb - free_mem_gb
 
 		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-		if new_gpu_kv_cache_size > 0:
-			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
-		else:
-			# Fail-loud (contract invariant 3): a non-positive remainder is a
-			# configuration error, never a silently accepted minimum.
-			raise RuntimeError(
-				f"[GPU-KV] Calculated pool size non-positive "
-				f"({new_gpu_kv_cache_size:.2f} GB): total {total_mem_gb:.2f} GB "
-				f"x frac {self.gpu_memory_frac} - used {used_mem_gb:.2f} GB. "
-				"Lower resident memory or raise gpu_memory_frac."
-			)
+		self.gpu_kv_cache_size_gb = KVCacheManager.provisional_pool_gb(
+			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		)
 		self._gpu_kv_sizing_provisional = True
 
 		if self.rank == 0:
@@ -12195,6 +12189,38 @@ class BatchGenWorker:
 		if self.rank == 0:
 			stats = self.gpu_paged_kv_cache_manager.get_stats()
 			logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
+
+	def _require_servable_gpu_kv_pool(self) -> None:
+		"""Refuse, before readiness, a gpu_memory_frac the decode residency
+		leaves no GPU KV pool under.
+
+		Runs right after the startup pass materialized the decode residency
+		(the resident expert shard included) with the same measurement and
+		formula the first decode batch sizes its pool with, so a fraction that
+		can never serve this model fails the launch instead of the first batch
+		that decodes. Collective: every rank fails with the largest residency
+		any rank measured.
+		"""
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+		total_mem_gb = total_mem_bytes / (1024 ** 3)
+		used = torch.tensor(
+			[(total_mem_bytes - free_mem_bytes) / (1024 ** 3)],
+			dtype=torch.float64,
+			device=self.torch_device,
+		)
+		dist.all_reduce(used, op=dist.ReduceOp.MAX)
+		used_mem_gb = float(used.item())
+		pool_gb = KVCacheManager.provisional_pool_gb(
+			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		)
+		if self.rank == 0:
+			logging.info(
+				f"[GPU-KV] Servable at startup: {pool_gb:.2f} GB provisional pool "
+				f"(total {total_mem_gb:.2f} GB x frac {self.gpu_memory_frac} - "
+				f"decode residency {used_mem_gb:.2f} GB, largest over ranks)"
+			)
 
 	def _config_decoding_for_batch(
 		self,

@@ -338,8 +338,17 @@ def test_finalize_does_not_pass_the_memory_fraction_to_the_sizing_helper():
 def test_the_provisional_measurement_still_bounds_itself_with_the_fraction():
     # Before the capture the graph footprint is unallocated, so (1 - frac) is
     # the only thing covering it; that is the one load-bearing use of frac.
-    body = ast.unparse(_method("_init_gpu_kv_with_actual_size"))
-    assert "total_mem_gb * self.gpu_memory_frac - used_mem_gb" in body
+    # The formula lives in KVCacheManager.provisional_pool_gb, shared with the
+    # startup servability check so the two can never disagree.
+    for name in ("_init_gpu_kv_with_actual_size", "_require_servable_gpu_kv_pool"):
+        body = ast.unparse(_method(name))
+        assert (
+            "KVCacheManager.provisional_pool_gb(total_mem_gb, used_mem_gb, "
+            "self.gpu_memory_frac)" in body
+        ), name
+    import inspect
+    helper = inspect.getsource(KVCacheManager.provisional_pool_gb)
+    assert "total_gb * gpu_memory_frac - used_gb" in helper
 
 
 def _cached_path_worker(cached_gb):
@@ -397,3 +406,94 @@ def test_a_cached_pool_that_no_longer_fits_fails_loud_instead_of_shrinking():
         init(worker)
     assert "no longer fits" in str(excinfo.value)
     assert created == []  # no pool was created at a silently smaller size
+
+
+# ---------------------------------------------------------------------------
+# An unservable gpu_memory_frac fails at launch, not at the first decode
+# ---------------------------------------------------------------------------
+
+# A device whose decode residency (resident expert shard included) needs a
+# fraction above 0.85 to leave any pool.
+K3_TOTAL_GB = 140.0
+K3_DECODE_USED_GB = 124.0
+
+
+def test_provisional_pool_is_total_times_frac_minus_used():
+    size = KVCacheManager.provisional_pool_gb(K3_TOTAL_GB, K3_DECODE_USED_GB, 0.95)
+    assert abs(size - (K3_TOTAL_GB * 0.95 - K3_DECODE_USED_GB)) < 1e-9
+
+
+def test_unservable_frac_names_the_residency_and_the_minimum_frac():
+    with pytest.raises(RuntimeError) as excinfo:
+        KVCacheManager.provisional_pool_gb(K3_TOTAL_GB, K3_DECODE_USED_GB, 0.85)
+    message = str(excinfo.value)
+    assert "non-positive (-5.00 GB)" in message
+    assert "decode residency is 124.00 GB" in message
+    assert "must exceed 0.886" in message
+
+
+class _Reduced:
+    def __init__(self, values, seen):
+        self.values = list(values)
+        self._seen = seen
+
+    def item(self):
+        return self.values[0]
+
+
+def _startup_check(free_gb, total_gb, peer_used_gb):
+    """The startup method against fakes; the all-reduce returns the larger
+    of this rank's residency and a peer's."""
+    module = ast.fix_missing_locations(
+        ast.Module(body=[_method("_require_servable_gpu_kv_pool")], type_ignores=[])
+    )
+    recorder = _Recorder()
+    reduced = []
+    torch = _fake_torch(free_gb, total_gb)
+    torch.float64 = "float64"
+    torch.tensor = lambda values, dtype=None, device=None: _Reduced(values, reduced)
+
+    def all_reduce(tensor, op=None):
+        reduced.append(op)
+        tensor.values = [max(tensor.values[0], peer_used_gb)]
+
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(
+            all_reduce=all_reduce, ReduceOp=SimpleNamespace(MAX="max")
+        ),
+        "logging": recorder,
+        "KVCacheManager": KVCacheManager,
+    }
+    exec(compile(module, str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        rank=0, local_rank=0, torch_device="cuda:0", gpu_memory_frac=0.85
+    )
+    return namespace["_require_servable_gpu_kv_pool"], worker, recorder, reduced
+
+
+def test_startup_check_refuses_a_frac_the_decode_residency_leaves_no_pool():
+    check, worker, _, reduced = _startup_check(
+        K3_TOTAL_GB - K3_DECODE_USED_GB, K3_TOTAL_GB, peer_used_gb=0.0
+    )
+    with pytest.raises(RuntimeError, match="must exceed 0.886"):
+        check(worker)
+    assert reduced == ["max"]
+
+
+def test_startup_check_fails_every_rank_on_the_largest_peer_residency():
+    # This rank alone would fit at 0.85; a peer's residency does not.
+    check, worker, _, _ = _startup_check(
+        K3_TOTAL_GB - 100.0, K3_TOTAL_GB, peer_used_gb=K3_DECODE_USED_GB
+    )
+    with pytest.raises(RuntimeError, match="decode residency is 124.00 GB"):
+        check(worker)
+
+
+def test_startup_check_passes_and_logs_a_servable_frac():
+    check, worker, recorder, _ = _startup_check(
+        K3_TOTAL_GB - K3_DECODE_USED_GB, K3_TOTAL_GB, peer_used_gb=0.0
+    )
+    worker.gpu_memory_frac = 0.95
+    check(worker)
+    assert "Servable at startup: 9.00 GB" in "\n".join(recorder.lines)

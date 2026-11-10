@@ -328,6 +328,9 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
     worker._load_decode_model = lambda bsz, comm=None: trace.append(
         ("load_decode_model", bsz, comm)
     )
+    worker._require_servable_gpu_kv_pool = lambda: trace.append(
+        ("require_servable_gpu_kv_pool",)
+    )
     def transition(key):
         trace.append(("phase_enter", key.phase, key.prefill_moe_mode))
         worker.model = "prefill-model"
@@ -381,6 +384,9 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
         # Resident decode materializes the stacked MXFP4 EP shard, sized for
         # the largest per-rank batch the runtime decode path can admit.
         ("load_decode_model", 128, "pynccl"),
+        # With the decode residency in place, an unservable gpu_memory_frac
+        # fails the launch here instead of the first batch that decodes.
+        ("require_servable_gpu_kv_pool",),
         # Then the topology's own prefill mode, so the first admission finds
         # the streamed-SP8 buffers already attached.
         ("set_prefill_moe_mode", "streamed_sp8"),
