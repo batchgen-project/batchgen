@@ -83,7 +83,7 @@ def test_graph_span_decodes_through_the_seam_on_blackwell(monkeypatch):
     bucket, pages = 4, 6
     blocked_k = torch.zeros(pages, PAGE, 1, LORA + ROPE, dtype=torch.bfloat16)
     manager = SimpleNamespace(
-        get_layer_kv_with_page_table=lambda layer_idx: (blocked_k, None, None)
+        get_layer_kv_cache=lambda layer_idx: (blocked_k, None)
     )
     monkeypatch.setattr(cgs.AttnWrapperBase, "gpu_paged_kv_manager", manager,
                         raising=False)
