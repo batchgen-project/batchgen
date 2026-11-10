@@ -82,6 +82,20 @@ compiles no BatchGen C++/CUDA code at launch and needs no nvcc / `CUDA_HOME`:
 
 See the [Install Guide](INSTALL.md) for prerequisites and options.
 
+### Tokenizer encoding
+
+GPT-OSS tokenizes with tiktoken's `o200k_base` ranks. The server never downloads
+them: both install paths stage a SHA-256-verified copy under
+`<python prefix>/share/batchgen/tokenizer-assets/`, and the runtime preflight refuses
+to start when it is missing or altered, naming the command below. On a node
+without internet access, copy `o200k_base.tiktoken` from a connected machine and
+stage it:
+
+```bash
+python -m batchgen.config.tokenizer_assets stage --from /path/to/o200k_base.tiktoken
+python -m batchgen.config.tokenizer_assets check
+```
+
 ### Run Container
 
 ```bash
