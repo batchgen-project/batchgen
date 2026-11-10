@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_worker_pool_restart import _manager
+from tests.test_worker_pool_restart import _manager
 
 ROOT = Path(__file__).resolve().parents[1]
 
