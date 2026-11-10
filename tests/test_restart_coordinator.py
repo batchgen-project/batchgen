@@ -1444,7 +1444,7 @@ def test_a_shutdown_does_not_wait_out_an_open_restart_request():
     tree = _http_tree()
     calls = [
         node for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "uvicorn.run"
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "uvicorn.Config"
     ]
     assert len(calls) == 1
     keywords = {kw.arg: kw.value for kw in calls[0].keywords}

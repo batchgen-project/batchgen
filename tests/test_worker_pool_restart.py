@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -32,11 +32,27 @@ RESTART_COORDINATOR_PATH = ROOT / "batchgen/server/restart_coordinator.py"
 # module itself so a test exercising teardown uses the real values rather than
 # a copy that can drift.
 _MANAGER_CONSTANTS = (
-    "_WORKER_SENTINEL_GRACE_S",
+    "_WORKER_SENTINEL_GRACE_FLOOR_S",
+    "_PINNED_RELEASE_BYTES_PER_S",
     "_PRE_RENDEZVOUS_SENTINEL_GRACE_S",
-    "_WORKER_KILL_REAP_TIMEOUT_S",
+    "_WORKER_KILL_REAP_FLOOR_S",
     "_WORKER_EXIT_PATH_SIGNAL",
 )
+# Module functions the real _stop_workers calls, lifted the same way.
+_MANAGER_FUNCTIONS = ("worker_teardown_budget_s",)
+
+
+def _load_lifecycle():
+    """Import batchgen.server.lifecycle alone (stdlib only)."""
+    spec = importlib.util.spec_from_file_location(
+        "_batchgen_server_lifecycle", ROOT / "batchgen/server/lifecycle.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lifecycle = _load_lifecycle()
 
 
 def load_restart_coordinator():
@@ -77,8 +93,16 @@ def _load_worker_manager_class():
         )
     ]
     assert len(constants) == len(_MANAGER_CONSTANTS)
+    functions = [
+        item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name in _MANAGER_FUNCTIONS
+    ]
+    assert len(functions) == len(_MANAGER_FUNCTIONS)
     namespace = {
         "Any": Any,
+        "Tuple": Tuple,
+        "StopRequest": lifecycle.StopRequest,
+        "StartupCancelled": lifecycle.StartupCancelled,
         "Callable": Callable,
         "Dict": Dict,
         "List": List,
@@ -106,7 +130,7 @@ def _load_worker_manager_class():
             exit_process=_unexpected_exit,
         ),
     }
-    module = ast.Module(body=constants + [node], type_ignores=[])
+    module = ast.Module(body=constants + functions + [node], type_ignores=[])
     exec(compile(module, str(WORKER_MANAGER_PATH), "exec"), namespace)
     return namespace["WorkerManager"]
 
@@ -919,11 +943,54 @@ def test_restart_result_reports_all_phase_timings(monkeypatch):
 
 def test_teardown_budgets_cover_pinned_page_release():
     """Ordered release of a large cudaHostRegister'd footprint takes minutes,
-    and a SIGKILL'd worker is unreapable until the kernel unpins it."""
-    source = (ROOT / "batchgen/server/worker_manager.py").read_text()
-    assert "_WORKER_SENTINEL_GRACE_S = 180.0" in source
-    assert "_WORKER_KILL_REAP_TIMEOUT_S = 900.0" in source
-    assert "deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S" in source
+    and a SIGKILL'd worker is unreapable until the kernel unpins it, so both
+    budgets grow with the pinned bytes instead of being fixed."""
+    namespace = _load_worker_manager_class().__init__.__globals__
+    budget = namespace["worker_teardown_budget_s"]
+    floor = namespace["_WORKER_SENTINEL_GRACE_FLOOR_S"]
+    rate = namespace["_PINNED_RELEASE_BYTES_PER_S"]
+    reap_floor = namespace["_WORKER_KILL_REAP_FLOOR_S"]
+
+    assert budget(0) == (floor, reap_floor)
+    small_grace, small_reap = budget(64 << 30)
+    large_grace, large_reap = budget(800 << 30)
+    assert small_grace == pytest.approx(floor + (64 << 30) / rate)
+    assert large_grace == pytest.approx(floor + (800 << 30) / rate)
+    # A large footprint gets more than the fixed 180 s the grace used to be.
+    assert large_grace > 180.0 and large_grace > small_grace
+    assert large_reap == pytest.approx(max(reap_floor, 3 * large_grace))
+    assert large_reap >= large_grace
+    source = WORKER_MANAGER_PATH.read_text()
+    assert "deadline = time.monotonic() + reap_timeout_s" in source
+
+
+def test_sentinel_grace_follows_the_pinned_host_bytes(monkeypatch):
+    """The grace one ordered exit gets is derived from the weight mapping plus
+    the host KV cache every rank pinned."""
+    manager = _manager(monkeypatch)
+    namespace = type(manager).__init__.__globals__
+    waits: List[float] = []
+
+    class _Proc:
+        pid = 2002
+        exitcode = None
+
+        def join(self, timeout=None):
+            waits.append(timeout)
+            self.exitcode = 0
+
+    manager._join_lock = threading.Lock()
+    manager.worker_process = SimpleNamespace(processes=[_Proc()])
+    manager.model_info = {"parameter_server_size": 700 << 30}
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(shm_prefix="run.", runtime_dir="/tmp/x"),
+        host_kv_cache_size=100,
+    )
+    del manager._stop_workers
+    manager._stop_workers()
+
+    expected, _ = namespace["worker_teardown_budget_s"]((700 << 30) + (100 << 30))
+    assert waits[0] == pytest.approx(expected, abs=0.5)
 
 
 def test_legacy_reload_symbols_are_absent():
@@ -1863,10 +1930,10 @@ def test_spawn_hands_the_cohort_flag_to_every_worker():
 
 def test_sentinel_grace_is_unchanged_by_the_abort_watchdog():
     """The watchdog shortens the expected teardown; the grace stays the
-    unchanged safety net and must not be tuned down in this change."""
+    safety net, derived from the pinned bytes, whenever the sentinel went."""
     source = WORKER_MANAGER_PATH.read_text()
-    assert "_WORKER_SENTINEL_GRACE_S = 180.0" in source
-    assert "_WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0" in source
+    assert "grace_s, reap_timeout_s = worker_teardown_budget_s(pinned_bytes)" in source
+    assert "if not sentinel_sent:\n                    grace_s = 0.0" in source
 
 
 def test_a_cohort_parked_before_its_rendezvous_gets_the_short_grace(monkeypatch):
@@ -1912,7 +1979,9 @@ def test_a_cohort_parked_before_its_rendezvous_gets_the_short_grace(monkeypatch)
     source = WORKER_MANAGER_PATH.read_text()
     assert "_PRE_RENDEZVOUS_SENTINEL_GRACE_S = 5.0" in source
     assert pre_rendezvous == pytest.approx(5.0, abs=0.5)
-    assert post_rendezvous == pytest.approx(180.0, abs=0.5)
+    # Nothing pinned in this manager: the derived grace is its floor.
+    floor = type(manager).__init__.__globals__["_WORKER_SENTINEL_GRACE_FLOOR_S"]
+    assert post_rendezvous == pytest.approx(floor, abs=0.5)
 
 
 def test_the_rendezvous_flag_is_cohort_scoped_and_lock_free(monkeypatch):

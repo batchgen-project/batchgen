@@ -421,8 +421,12 @@ def test_runtime_modules_have_no_basicconfig_and_uvicorn_log_config_none():
     for path, tree in trees.items():
         assert not _calls(tree, "logging.basicConfig"), path
 
-    (run_call,) = _calls(trees["batchgen/server/http_server.py"], "uvicorn.run")
-    keywords = {kw.arg: kw.value for kw in run_call.keywords}
+    # The server is built from one uvicorn.Config (run by the stop-lifecycle
+    # server subclass); uvicorn.run is not called at all.
+    http_tree = trees["batchgen/server/http_server.py"]
+    assert not _calls(http_tree, "uvicorn.run")
+    (config_call,) = _calls(http_tree, "uvicorn.Config")
+    keywords = {kw.arg: kw.value for kw in config_call.keywords}
     for name in ("log_config", "log_level"):
         value = keywords[name]
         assert isinstance(value, ast.Constant) and value.value is None, name

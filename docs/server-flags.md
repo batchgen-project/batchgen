@@ -84,6 +84,15 @@ While the pool is restarting or down, `/health` answers `503` and
 `POST /v1/batches` answers `503` with `Retry-After`. The earlier `/v1/reload`
 endpoint no longer exists.
 
+**Stopping.** `SIGTERM`/`SIGINT` while serving tears the workers down with HTTP
+still up: `/health` answers `503` with `"status": "shutting_down"`, the pool
+state is `stopping`, and batch creation and restarts are refused. Each worker
+first gets an ordered exit whose grace is derived from the host memory every
+rank pinned (the weight mapping plus the host KV cache), so a large model is
+not killed mid-unpin and a small one is not held for minutes; only then does
+the signal fallback run. A signal during start-up cancels it before any worker
+is spawned.
+
 ### Coordinated worker-pool restart
 
 A worker cohort is one `torch.distributed` world spanning every node, so
@@ -222,7 +231,9 @@ when the last process using it exits, however the processes stop, and workers
 are killed when their server process dies. After an abnormal exit, the only
 BatchGen objects that can remain are the per-run runtime directory under the
 temp directory, a staged distributed weight store (see
-`--distributed-weight-config`; the next start reuses or removes it) and, if the
+`--distributed-weight-config`; the next start reuses or removes it, and
+`python -m batchgen.server.weight_store_staging --reclaim <store_staging_dir>`
+removes idle `run` and incomplete copies without a start) and, if the
 whole process group was killed at once, Python's `sem.mp-*` semaphores. The next
 start of the same instance removes a previous run's runtime directory once its
 run lock proves every process of that run has exited, and refuses to start while
