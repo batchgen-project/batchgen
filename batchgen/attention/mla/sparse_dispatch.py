@@ -38,13 +38,12 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from batchgen.attention.mla import trtllm_gen_mla
+
 _BACKEND: Optional[str] = None
 #: Phases already announced in this process (one INFO line each, so a log
 #: shows which sparse kernel served a run without per-call logging).
 _ANNOUNCED: set = set()
-_FI_WORKSPACES: dict = {}
-#: trtllm-gen MLA scratch per device; zero-initialized once (semaphore state).
-_FI_WORKSPACE_BYTES = 128 * 1024 * 1024
 #: flash_mla sparse prefill runs only 64- or 128-head query tiles.
 _FLASHMLA_PREFILL_HEAD_TILES = (64, 128)
 #: The legacy SM10x sparse prefill consumes the top-k in blocks of this width.
@@ -57,14 +56,14 @@ _FLASHMLA_PREFILL_ROW_CHUNK = 8192
 SITE_SYMBOLS: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "fa3": {"flash_attn_interface": ("flash_attn_with_kvcache",)},
     "blackwell": {
-        "flashinfer.mla": ("trtllm_batch_decode_with_kv_cache_mla",),
+        **trtllm_gen_mla.SITE_SYMBOLS,
         "flash_mla": ("flash_mla_sparse_fwd",),
     },
 }
 
-
-class SparseMlaShapeError(ValueError):
-    """An input the selected sparse MLA kernel cannot run."""
+#: An input the selected sparse MLA kernel cannot run (the error the shared
+#: trtllm-gen launch raises too).
+SparseMlaShapeError = trtllm_gen_mla.MlaShapeError
 
 
 def _backend() -> str:
@@ -94,9 +93,9 @@ def graph_capturable() -> bool:
     launch over a process-lifetime workspace with device-side lengths and a
     static ``max_seq_len`` (the top-k width): no per-call plan and no host
     synchronization; a captured replay on sm_103 matched the eager call
-    bitwise on new inputs at K3.1 shapes. The Kimi decode span on Blackwell nevertheless runs eager
-    while the dense seam (``paged_decode.graph_capturable``) is not
-    capturable; the planner requires both.
+    bitwise on new inputs at K3.1 shapes. The dense seam
+    (``paged_decode.graph_capturable``) runs the same launch
+    (``trtllm_gen_mla``); the planner requires both.
     """
     return _backend() in ("fa3", "blackwell")
 
@@ -139,46 +138,20 @@ def _fa3_sparse(q_pe, q_latent, flat_kv, token_rows, lengths, softmax_scale):
 # --------------------------------------------------------------------------- #
 
 
-def _fi_workspace(device: torch.device) -> torch.Tensor:
-    key = (device.type, device.index)
-    workspace = _FI_WORKSPACES.get(key)
-    if workspace is None:
-        workspace = torch.zeros(_FI_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        _FI_WORKSPACES[key] = workspace
-    return workspace
-
-
 def _trtllm_sparse_decode(q_pe, q_latent, blocked_k, token_rows, lengths, softmax_scale):
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    batch, _, num_heads, lora = q_latent.shape
-    rope = q_pe.shape[-1]
-    pages, page_size, kv_heads, width = blocked_k.shape
-    if kv_heads != 1 or width != lora + rope:
-        raise SparseMlaShapeError(
-            f"blocked_k must be [P, S, 1, {lora + rope}], got {tuple(blocked_k.shape)}"
-        )
-    query = torch.cat([q_latent, q_pe], dim=-1)
-    out = trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=blocked_k.view(pages, page_size, width),
-        workspace_buffer=_fi_workspace(query.device),
-        # A runner-cache key only (flashinfer marks it for removal); the
-        # absorbed latent query has no separate nope part.
-        qk_nope_head_dim=lora,
+    lora = q_latent.shape[-1]
+    topk = int(token_rows.shape[1])
+    # A length-0 padding row runs as length 1 over its -1 slot: output 0.
+    return trtllm_gen_mla.trtllm_gen_mla_decode(
+        torch.cat([q_latent, q_pe], dim=-1),
+        blocked_k,
+        token_rows.unsqueeze(1),
+        lengths,
         kv_lora_rank=lora,
-        qk_rope_head_dim=rope,
-        block_tables=token_rows.unsqueeze(1),
-        # A zero-length row yields NaN; length 1 over its -1 slot yields 0.
-        # Such rows are graph padding whose output nothing reads.
-        seq_lens=lengths.clamp(min=1),
-        max_seq_len=int(token_rows.shape[1]),
-        sparse_mla_top_k=int(token_rows.shape[1]),
-        bmm1_scale=float(softmax_scale),
-        bmm2_scale=1.0,
-        backend="trtllm-gen",
+        max_seq_len=topk,
+        softmax_scale=softmax_scale,
+        sparse_top_k=topk,
     )
-    return out.view(batch, 1, num_heads, lora)
 
 
 def _flashmla_sparse_prefill(q_pe, q_latent, kv_rows, token_rows, lengths, softmax_scale):

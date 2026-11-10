@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from batchgen.attention.mla import sparse_dispatch as sd
+from batchgen.attention.mla import trtllm_gen_mla
 
 H, LORA, ROPE, PAGE = 12, 512, 64, 64
 
@@ -22,7 +23,7 @@ H, LORA, ROPE, PAGE = 12, 512, 64, 64
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     monkeypatch.setattr(sd, "_BACKEND", None)
-    monkeypatch.setattr(sd, "_FI_WORKSPACES", {})
+    monkeypatch.setattr(trtllm_gen_mla, "_FI_WORKSPACES", {})
     monkeypatch.setattr(sd, "_ANNOUNCED", set())
 
 
@@ -111,7 +112,7 @@ def test_blackwell_decode_adapts_to_trtllm_gen_sparse(monkeypatch):
     _capability(monkeypatch, (10, 3))
     calls = []
     _install_flashinfer(monkeypatch, calls)
-    monkeypatch.setattr(sd, "_FI_WORKSPACE_BYTES", 64)
+    monkeypatch.setattr(trtllm_gen_mla, "_FI_WORKSPACE_BYTES", 64)
     q_pe, q_latent, blocked_k, rows, lengths = _inputs()
     out = sd.sparse_mla_decode(q_pe, q_latent, blocked_k, rows, lengths, 0.07)
     assert out.shape == (3, 1, H, LORA)
@@ -129,6 +130,8 @@ def test_blackwell_decode_adapts_to_trtllm_gen_sparse(monkeypatch):
     assert kw["bmm1_scale"] == 0.07 and kw["bmm2_scale"] == 1.0
     assert kw["kv_lora_rank"] == LORA and kw["qk_rope_head_dim"] == ROPE
     assert kw["backend"] == "trtllm-gen"
+    # the shared process-lifetime workspace of this device
+    assert kw["workspace_buffer"] is trtllm_gen_mla._FI_WORKSPACES[("cpu", None)]
 
 
 def test_blackwell_decode_rejects_a_foreign_cache_row(monkeypatch):
