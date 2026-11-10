@@ -42,9 +42,9 @@ _K3_PREFIX_SEGMENT_STATE_SLOTS = 16
 # Candidate per-node decode graph buckets; a plan takes those at or below its
 # admission cap plus the cap itself. The 24 bucket avoids padding a 17--24 row
 # TP8 group to 32 (ceil(24/8)=3 vs ceil(32/8)=4 rows/rank once the grouped MoE
-# joins capture).
+# joins capture); 320 halves the padding between 256 and a cap above it.
 _DECODE_GRAPH_BUCKET_CANDIDATES = (
-    1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256,
+    1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256, 320,
 )
 
 

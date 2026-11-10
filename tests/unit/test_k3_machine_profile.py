@@ -137,6 +137,19 @@ def test_resident_shard_geometry_matches_the_measured_shards():
     assert K3_GEOMETRY.resident_shard_bytes(16) / GIB == pytest.approx(84.19, abs=0.01)
 
 
+def test_b300_slot_solve_reproduces_the_stated_derivation():
+    row = k3_engine_profile(MachineFamily.B300, 8)
+    budget = row.decode_budget
+    # measured at frac 0.85 with 273 physical slots: 208.13 GiB in use
+    assert budget.non_slot_base_gib == pytest.approx(193.85, abs=0.01)
+    assert budget.budget_gib == pytest.approx(254.30, abs=0.01)
+    assert K3_GEOMETRY.kv_bytes_per_token * 4096 / GIB == pytest.approx(0.1055, abs=1e-4)
+    solved = solve_kda_user_slots(budget, extra_physical_slots=17)
+    assert solved == pytest.approx(364.8, abs=0.1)
+    assert row.kda_user_slots == 360
+    assert "provisional" in row.sources["kda_user_slots"]
+
+
 def test_profile_lookup_refuses_unknown_pairs_by_name():
     with pytest.raises(UnsupportedK3TopologyError, match="b200"):
         k3_engine_profile(MachineFamily.B200, 8)
