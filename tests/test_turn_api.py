@@ -647,8 +647,9 @@ def test_e2e_turns_coexist_with_a_running_batch(tmp_path):
         assert ok, error
         batch = SimpleNamespace(batchgen_debug=None, max_context_length=None,
                                 temperature=None, top_p=None, top_k=None)
-        prompts, max_tokens, sampling = scheduler._convert_requests_to_worker_inputs(
-            requests, batch)
+        prompts, max_tokens, sampling, rejections = (
+            scheduler._convert_requests_to_worker_inputs(requests, batch))
+        assert rejections == {}
         for sid in ("a", "b"):
             await client.post("/v1/sessions", json={"traj_id": f"traj-{sid}", "session_id": sid})
         await scheduler._process_batch_pool_mode(
