@@ -9923,13 +9923,19 @@ class BatchGenWorker:
 		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
 		# the runtime decode path applies to its own estimate, so the padded MoE
 		# buffers are already sized for the largest batch that can be admitted.
+		# This decode entry precedes any prefill entry, so the worker's record
+		# of the prefill mode these instances are built for must be primed
+		# here: the decode phase key carries it, and a None here against the
+		# startup mode below would turn the resumable decode exit into RETIRE,
+		# which leaves the resident shard mapped and OOMs the prefill build.
+		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
+		self._prefill_moe_mode_in_effect = startup_prefill_mode
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 
 		# Then hand the built model to the prefill mode this weight topology
 		# will actually use, so the first admission inherits this phase directly
 		# instead of rebuilding the streamed-SP8 buffers itself.
-		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
 		with self._startup_phase("prefill-configure"):
 			self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
 			prefill_key = PhaseKey("prefill", startup_prefill_mode, ())
