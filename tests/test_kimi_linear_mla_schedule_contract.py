@@ -1,8 +1,9 @@
-"""Static contract for K3 whole-model FlashMLA scheduler reuse.
+"""Static contract for K3 whole-model dense MLA decode schedule reuse.
 
-The CUDA path is exercised on the remote H200 gate.  This CPU-only contract
-prevents a later edit from moving metadata generation back inside every MLA
-layer of the whole-model graph.
+The CUDA path is exercised on the remote GPU gates.  This CPU-only contract
+prevents a later edit from moving schedule generation back inside every MLA
+layer of the whole-model graph, or from calling a decode kernel around the
+capability-selected seam (``batchgen.attention.mla.paged_decode``).
 """
 
 import ast
@@ -32,12 +33,26 @@ def _call_names(node, name):
     ]
 
 
-def test_whole_model_generates_one_flashmla_metadata_pair_per_forward():
+def _kernel_imports(tree):
+    """Modules of the decode-kernel packages a source imports directly."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+    return {
+        name for name in names
+        if name.split(".")[0] in ("flash_mla", "flashinfer")
+    }
+
+
+def test_whole_model_generates_one_mla_schedule_per_forward():
     source = (_MODEL_ROOT / "whole_model_cuda_graph_segments.py").read_text()
     tree = ast.parse(source)
     forward = _method(tree, "KimiLinearWholeModelSegment", "forward")
-    metadata = _method(
-        tree, "KimiLinearWholeModelSegment", "_get_flashmla_metadata"
+    schedule = _method(
+        tree, "KimiLinearWholeModelSegment", "_get_mla_schedule"
     )
 
     assert len(
@@ -46,10 +61,12 @@ def test_whole_model_generates_one_flashmla_metadata_pair_per_forward():
             for call in ast.walk(forward)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_get_flashmla_metadata"
+            and call.func.attr == "_get_mla_schedule"
         ]
     ) == 1
-    assert len(_call_names(metadata, "get_mla_metadata")) == 1
+    assert len(_call_names(schedule, "decode_schedule")) == 1
+    # The schedule is the seam's: no kernel package is reached directly.
+    assert _kernel_imports(tree) == set()
 
 
 def test_whole_model_reuses_one_static_kda_cu_vector_per_bucket():
@@ -82,7 +99,7 @@ def test_whole_model_reuses_one_static_kda_cu_vector_per_bucket():
     ) == 1
 
 
-def test_layer_graph_keeps_standalone_flashmla_fallback():
+def test_layer_graph_decodes_through_the_seam_with_an_optional_schedule():
     source = (_MODEL_ROOT / "cuda_graph_segments.py").read_text()
     tree = ast.parse(source)
     mla = _method(tree, "KimiLinearSpanSegment", "_graph_attention")
@@ -93,14 +110,15 @@ def test_layer_graph_keeps_standalone_flashmla_fallback():
         and node.name == "_mla_decode_graph_safe"
     )
 
-    # Standalone per-layer captures still own metadata.  The whole-model path
-    # supplies both optional arguments and therefore takes the shared branch.
+    # The whole-model path hands its shared schedule through; a standalone
+    # per-layer capture passes None and the seam records its own.
     assert any(
-        isinstance(node, ast.Name) and node.id == "flashmla_metadata"
+        isinstance(node, ast.Name) and node.id == "mla_schedule"
         for node in ast.walk(mla)
     )
-    assert any(
-        isinstance(node, ast.Name) and node.id == "flashmla_num_splits"
-        for node in ast.walk(mla)
-    )
-    assert len(_call_names(mla_safe, "get_mla_metadata")) == 1
+    (decode,) = _call_names(mla_safe, "mla_paged_decode")
+    assert [kw.arg for kw in decode.keywords] == ["schedule"]
+    # Golden rule 7: the seam alone picks the kernel by capability.
+    assert "get_device_capability" not in source
+    assert _kernel_imports(tree) == set()
+    assert "NotImplementedError" not in ast.unparse(mla_safe)
