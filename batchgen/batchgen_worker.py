@@ -296,6 +296,7 @@ from batchgen.worker.step_timing import (
 	new_decode_step_split,
 )
 from batchgen.phase_lifecycle import (
+	PHASES,
 	AdmitContext,
 	ExitMode,
 	PhaseEnterContext,
@@ -1594,6 +1595,9 @@ class BatchGenWorker:
 		# Compatibility key for the currently entered manager phase.
 		self._phase = None
 		self._live_phase_key = None
+		# PhaseKey each instance the manager keeps was entered with, by phase;
+		# the live phase's entry included. See _transition_phase.
+		self._kept_phase_keys: dict[str, PhaseKey] = {}
 		# Whole-model decode graph capture episodes completed by this process.
 		# On the reuse lifecycle it must stay at 1: the switch invariants and
 		# the capture-once guard in _setup_cuda_graphs read it.
@@ -11308,17 +11312,66 @@ class BatchGenWorker:
 			)
 
 	def _phase_exit_mode(self, live: PhaseKey, desired: PhaseKey) -> ExitMode:
-		"""Select suspend only when the outgoing instance can resume safely."""
+		"""SUSPEND only when the outgoing instance can be resumed as is.
+
+		The outgoing instance is resumable only when its key fields equal the
+		incoming key's (the next entry of its phase derives its key from this
+		wave). Otherwise the transition RETIREs, and
+		``_retire_kept_phase_instances`` retires every kept instance with it,
+		so every instance a SUSPEND leaves kept shares the live key's fields;
+		``_require_resumable_instance`` refuses any other by name.
+		"""
 		key_fields_unchanged = (
 			live.prefill_moe_mode == desired.prefill_moe_mode
 			and live.profile_overrides == desired.profile_overrides
 		)
-		if (
-			key_fields_unchanged
-			and self.parallel_manager.holds_instance(live.phase)
-		):
+		if key_fields_unchanged and self.parallel_manager.holds_instance(live.phase):
 			return ExitMode.SUSPEND
 		return ExitMode.RETIRE
+
+	def _retire_kept_phase_instances(self, live: PhaseKey) -> None:
+		"""After ``phase_exit(live, RETIRE)``, retire every other kept instance.
+
+		RETIRE is followed by ``deep_free_model_memory``: an instance kept past
+		it would reference a model the worker freed (Kimi-K3 serves both phases
+		from one model) or carry state built for a key no later entry asks for.
+		Each kept instance is retired under the key it was entered with.
+		"""
+		manager = self.parallel_manager
+		self._kept_phase_keys.pop(live.phase, None)
+		if manager.holds_instance(live.phase):
+			raise RuntimeError(
+				f"Rank {self.rank}: {type(manager).__name__}.phase_exit"
+				f"({live!r}, RETIRE) still holds a {live.phase} instance"
+			)
+		for phase in PHASES:
+			kept = self._kept_phase_keys.pop(phase, None)
+			if not manager.holds_instance(phase):
+				continue
+			if kept is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: {type(manager).__name__} holds a {phase} "
+					"instance the worker never entered"
+				)
+			manager.phase_exit(kept, ExitMode.RETIRE)
+			if manager.holds_instance(phase):
+				raise RuntimeError(
+					f"Rank {self.rank}: {type(manager).__name__}.phase_exit"
+					f"({kept!r}, RETIRE) still holds a {phase} instance"
+				)
+
+	def _require_resumable_instance(self, desired: PhaseKey) -> None:
+		"""A kept instance is resumed only under the key it was entered with."""
+		manager = self.parallel_manager
+		if not manager.holds_instance(desired.phase):
+			return
+		kept = self._kept_phase_keys.get(desired.phase)
+		if kept != desired:
+			raise RuntimeError(
+				f"Rank {self.rank}: entering {desired!r} would resume the "
+				f"{desired.phase} instance kept under {kept!r}; an instance is "
+				"resumed only under its own key and is retired otherwise"
+			)
 
 	def _prepare_phase_exit(self, live: PhaseKey, desired: PhaseKey) -> None:
 		"""Stop worker-owned consumers before the manager exit hook."""
@@ -11356,17 +11409,25 @@ class BatchGenWorker:
 	def _transition_phase(
 		self, desired: PhaseKey, *, comm=None, max_num_seq: int | None = None
 	) -> tuple[bool, bool]:
-		"""Run one worker phase transition and return (changed, resumed)."""
+		"""Run one worker phase transition and return (changed, resumed).
+
+		Invariant: a kept phase instance is resumed only under the PhaseKey it
+		was entered with, and a RETIRE leaves no kept instance behind, so no
+		instance outlives the model ``deep_free_model_memory`` drops. Once the
+		outgoing phase has exited nothing is live, so a failed entry leaves
+		``_live_phase_key`` None and the next transition only enters.
+		"""
 		live = self._live_phase_key
 		if live == desired:
 			return False, False
+		manager = self.parallel_manager
 		resumed = False
 		if live is not None:
 			exit_mode = self._phase_exit_mode(live, desired)
 			resumed = (
 				desired.phase == "decode"
 				and exit_mode is ExitMode.SUSPEND
-				and self.parallel_manager.holds_instance("decode")
+				and manager.holds_instance("decode")
 			)
 			self._prepare_phase_exit(live, desired)
 			if live.phase == "decode":
@@ -11385,20 +11446,27 @@ class BatchGenWorker:
 					# which reads the pool. A kept graph replays only after
 					# _remap_reused_kv_pool maps the pool back.
 					self._release_suspended_decode_kv_pool()
-			self.parallel_manager.phase_exit(live, exit_mode)
+			manager.phase_exit(live, exit_mode)
 			if exit_mode is ExitMode.RETIRE:
+				self._retire_kept_phase_instances(live)
 				if live.phase != "decode":
 					self._destroy_gpu_paged_kv_cache()
 				self.deep_free_model_memory()
+			self._live_phase_key = None
+		self._require_resumable_instance(desired)
 		if desired.phase == "decode":
 			self.init_nvshmem()
-		elif hasattr(self.parallel_manager, "set_comm"):
-			self.parallel_manager.set_comm(self.comm)
-		self.model, self.weight_copy_task = self.parallel_manager.phase_enter(
+		elif hasattr(manager, "set_comm"):
+			manager.set_comm(self.comm)
+		self.model, self.weight_copy_task = manager.phase_enter(
 			desired,
 			PhaseEnterContext(comm=comm, max_num_seq=max_num_seq),
 		)
 		self._live_phase_key = desired
+		if manager.holds_instance(desired.phase):
+			self._kept_phase_keys[desired.phase] = desired
+		else:
+			self._kept_phase_keys.pop(desired.phase, None)
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:

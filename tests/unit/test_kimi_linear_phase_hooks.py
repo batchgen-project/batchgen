@@ -40,6 +40,8 @@ _STUBBED = {
     "activate_prefill",
     "activate_decoding",
     "release_decode_routed_experts",
+    "_release_streamed_sp8_prefill",
+    "_release_resident_ep_decode",
 }
 
 PREFILL = PhaseKey("prefill", "streamed")
@@ -215,12 +217,27 @@ def test_prefill_suspend_makes_no_delegate_call():
 
 
 @pytest.mark.parametrize("key", [PREFILL, DECODE], ids=["prefill", "decode"])
-def test_retire_makes_no_delegate_call(key):
+def test_retire_releases_the_model_attachments_and_both_instances(key):
+    # One model serves both phases: retiring either phase retires the model,
+    # so its attachments are released while it is reachable and neither
+    # instance tuple may keep referencing it.
     psm, calls, _ = _isolated_psm()
+    model = object()
+    psm.model = model
+    psm.weight_copy_task = {"routed_expert": ["x"]}
+    psm.prefill_instance = (model, {})
+    psm.decode_instance = (model, {})
     psm._resident_ep_built = True
     psm._active_phase = "decode"
     assert psm.phase_exit(key, ExitMode.RETIRE) is None
-    assert calls == []
+    assert calls == [
+        ("_release_streamed_sp8_prefill", (), {}),
+        ("_release_resident_ep_decode", (), {}),
+    ]
+    assert psm.prefill_instance is None and psm.decode_instance is None
+    assert psm.model is None and psm.weight_copy_task == {}
+    assert not psm.holds_instance("prefill")
+    assert not psm.holds_instance("decode")
 
 
 def test_unsupported_mode_is_rejected():
