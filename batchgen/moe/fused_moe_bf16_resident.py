@@ -142,9 +142,14 @@ class ResidentEPMoELayer:
         padded = x_local.new_zeros((ntp, H))
         if num_tokens > 0:
             padded[:num_tokens].copy_(x_local)
-        all_tokens = x_local.new_empty((num_global, H))
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(all_tokens, padded)
+        if self.world_size == 1:
+            # Degenerate collective schedule: the gather of one rank is the
+            # padded local rows themselves.
+            all_tokens = padded
+        else:
+            all_tokens = x_local.new_empty((num_global, H))
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(all_tokens, padded)
 
         # Router on the global tokens (identical on every rank).
         gate_out = gate(all_tokens.view(num_global, 1, H))
@@ -166,8 +171,9 @@ class ResidentEPMoELayer:
         # Combine expert shards: SUM over ranks in the global layout (BF16
         # over NCCL, K2.5-class numerics; per-rank top-k accumulation above
         # is fp32 inside moe_weighted_sum).
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(partial, op=ReduceOp.SUM)
+        if self.world_size > 1:
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(partial, op=ReduceOp.SUM)
 
         start = self.rank * ntp
         return partial[start:start + num_tokens]
