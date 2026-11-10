@@ -1933,6 +1933,23 @@ struct DistributedWeightDaemon::Impl {
         return cohort_epoch;
     }
 
+    // The failure state the server's liveness monitor polls, so a latched
+    // daemon is reported as soon as it latches instead of at the next worker
+    // fetch. Takes failure_mutex, then cohort_mutex, one at a time.
+    std::string Health() {
+        nlohmann::json health;
+        health["transport_failed"] = failed.load();
+        health["failure"] = FailureMessage();
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            health["cohort_epoch"] = cohort_epoch;
+            health["cohort_state"] = cohort_state_name(cohort_state);
+            health["cohort_faulted"] = cohort_faulted;
+            health["cohort_fault"] = cohort_fault;
+        }
+        return health.dump();
+    }
+
     std::uint64_t BeginCohortSwap() {
         if (!started.load()) {
             fail("distributed weights daemon is not started");
@@ -2213,6 +2230,8 @@ void DistributedWeightDaemon::WaitReady(double timeout_seconds) {
 std::uint64_t DistributedWeightDaemon::CohortEpoch() {
     return impl_->CohortEpoch();
 }
+
+std::string DistributedWeightDaemon::Health() { return impl_->Health(); }
 
 std::uint64_t DistributedWeightDaemon::BeginCohortSwap() {
     return impl_->BeginCohortSwap();

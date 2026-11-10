@@ -29,6 +29,10 @@ class DistributedWeightDaemon {
     // transport failure is never cleared: Finish then throws and only a cold
     // restart recovers.
     std::uint64_t CohortEpoch();
+    // JSON: transport_failed, failure (the permanent transport latch) and
+    // cohort_epoch, cohort_state, cohort_faulted, cohort_fault (the current
+    // cohort's recoverable fault).
+    std::string Health();
     std::uint64_t BeginCohortSwap();
     std::string FinishCohortSwap(double timeout_seconds);
     void PrepareStop();

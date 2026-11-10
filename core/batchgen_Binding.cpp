@@ -727,6 +727,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("timeout_seconds"),
              py::call_guard<py::gil_scoped_release>())
         .def("cohort_epoch", &DistributedWeightDaemon::CohortEpoch)
+        .def("health", &DistributedWeightDaemon::Health,
+             py::call_guard<py::gil_scoped_release>())
         .def("begin_cohort_swap", &DistributedWeightDaemon::BeginCohortSwap,
              py::call_guard<py::gil_scoped_release>())
         .def("finish_cohort_swap",
