@@ -328,7 +328,24 @@ def test_wgmma_pipeline_flags_match_between_setup_and_registry():
             assert _gencode_targets(nvcc) == ["arch=compute_90a,code=sm_90a"], nvcc
             assert [f for f in nvcc if f.startswith("-DNUM_STAGES")] == stages, nvcc
             assert "--use_fast_math" not in nvcc, nvcc
+        # The C++ standard is derived from the active Torch at evaluation
+        # time (>= 2.15 needs C++20). The AST view of setup.py resolves its
+        # static default (c++17) while the imported registry resolves the
+        # live Torch, so compare the std token against the live rule and
+        # normalize it out of the positional comparison.
+        import torch as _torch
+
+        expected_std = (
+            "-std=c++20"
+            if tuple(int(x) for x in _torch.__version__.split("+")[0].split(".")[:2]) >= (2, 15)
+            else "-std=c++17"
+        )
+        assert [f for f in registry_flags if f.startswith("-std=")] == [expected_std], name
+
+        def _normalize_std(nvcc):
+            return ["-std=<torch>" if f.startswith("-std=c++") else f for f in nvcc]
+
         # Identical up to the NVCC_THREADS value, which setup.py reads from
         # the environment and the registry pins to 4.
-        assert flags[name][:-1] == registry_flags[:-1], name
+        assert _normalize_std(flags[name][:-1]) == _normalize_std(registry_flags[:-1]), name
         assert flags[name][-2] == "--threads", name
