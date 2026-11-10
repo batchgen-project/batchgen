@@ -17,8 +17,23 @@ sets ``store_residency``, the server maps a copy it owns instead:
   source under ``LOCK_EX`` with the copying thread interleaving its pages
   across all NUMA nodes;
 * a ``run`` copy is removed when its server stops; a ``resident`` copy stays
-  for the next start. A copy left by a killed server is reused by the next
-  start of the same build or swept by a start of another.
+  for the next start. A stop requested while the copy runs cancels it between
+  segments and removes the partial directory.
+
+Residue after a forced exit (SIGKILL, OOM, node loss). A tmpfs file is never
+reclaimed by the kernel, so the policy is explicit and every rule is proven by
+``use.lock``, whose ``LOCK_SH`` the kernel drops with the last holder:
+
+* a copy without ``COMPLETE`` (a copy that was killed part-way) is never
+  mapped: the next start of the same build copies it again from scratch, a
+  start of another build removes it;
+* a ``run`` copy of a dead server is reused by the next start of the same
+  build (it is verified, so this is safe) or removed by a start of another;
+* without a next start, ``python -m batchgen.server.weight_store_staging
+  --reclaim <store_staging_dir>`` removes every idle ``run`` copy and every
+  incomplete one, and keeps idle ``resident`` copies (the declared cache;
+  ``--include-resident`` removes them too). A copy some server still maps is
+  never removed.
 
 The daemon and the workers stay path-based: they receive an effective config,
 written into the run's runtime directory, that names the staged files.
@@ -41,6 +56,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, ContextManager, Iterator, List, Optional, Tuple
+
+from batchgen.server.lifecycle import StopRequest
 
 from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
     DistributedMetadataError,
@@ -89,6 +106,10 @@ _MPOL_DEFAULT = 0
 _MPOL_INTERLEAVE = 3
 _SYS_SET_MEMPOLICY = {"x86_64": 238, "amd64": 238, "aarch64": 237, "arm64": 237}
 _NODE_ONLINE_PATH = "/sys/devices/system/node/online"
+
+
+#: The startup phase name a cancelled staging copy reports.
+STAGING_PHASE = "store-staging"
 
 
 class WeightStoreStagingError(RuntimeError):
@@ -427,7 +448,9 @@ class _Stager:
         copy_workers: Optional[int],
         free_bytes_of: Callable[[Path], int],
         interleave: Callable[[], ContextManager[None]],
+        stop: Optional[StopRequest] = None,
     ) -> None:
+        self.stop = stop
         self.config_path = config_path
         self.raw_config = json.loads(config_path.read_text())
         self.config = config
@@ -510,9 +533,14 @@ class _Stager:
                 + rebuild_command(self.config_path, self.config, manifest=manifest)
             )
 
+    def raise_if_stop_requested(self) -> None:
+        if self.stop is not None:
+            self.stop.raise_if_set(STAGING_PHASE)
+
     def copy(self) -> None:
         """Copy and verify the source into this id's directory (``LOCK_EX``
-        held). Leaves ``COMPLETE`` absent on any failure."""
+        held). Leaves ``COMPLETE`` absent on any failure, and stops between
+        segments once a stop is requested."""
         (self.directory / COMPLETE_FILE_NAME).unlink(missing_ok=True)
         for entry in list(self.directory.iterdir()):
             if entry.name == USE_LOCK_NAME:
@@ -584,6 +612,10 @@ class _Stager:
                     # start inside interleave() and so inherit its mempolicy.
                     def copy_segment(item, progress):
                         index, spans = item
+                        # The cancellation point: a stop request fails the
+                        # next segment, the runner admits no further one, and
+                        # the caller removes the partial copy.
+                        self.raise_if_stop_requested()
                         try:
                             digest = hash_store_segment(
                                 source,
@@ -643,6 +675,7 @@ def stage_distributed_weight_store(
     interleave: Callable[[], ContextManager[None]] = interleave_all_nodes,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
     copy_workers: Optional[int] = None,
+    stop: Optional[StopRequest] = None,
 ) -> Optional[StagedWeightStore]:
     """Stage the store ``config_path`` names; None for a legacy config.
 
@@ -663,6 +696,7 @@ def stage_distributed_weight_store(
         copy_workers=copy_workers,
         free_bytes_of=free_bytes_of,
         interleave=interleave,
+        stop=stop,
     )
     mount = check_staging_mount(
         stager.staging_dir, fast_init=fast_init, read_mounts=read_mounts
@@ -709,6 +743,7 @@ def stage_distributed_weight_store(
 
     busy_retries = 0
     while True:
+        stager.raise_if_stop_requested()
         # A peer that is copying holds LOCK_EX; this waits it out.
         fd = _lock_use(stager.directory, fcntl.LOCK_SH, create=True)
         try:
@@ -767,3 +802,78 @@ def stage_distributed_weight_store(
             "downgraded; staging it again",
             stager.directory,
         )
+
+
+# --------------------------------------------------------------------------- #
+#  Residue reclaim                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def reclaim_idle_stores(
+    staging_dir: Path | str, *, include_resident: bool = False
+) -> List[str]:
+    """Remove the staged copies no live server maps, by the residue policy in
+    the module docstring: every incomplete copy and every ``run`` copy, plus
+    ``resident`` copies when ``include_resident``. Returns the removed names.
+
+    The proof that a copy is idle is taking its ``use.lock`` ``LOCK_EX``
+    without blocking; a server that maps a copy holds ``LOCK_SH`` for its
+    whole life, and the kernel drops that hold however the server exits.
+    """
+    staging_dir = Path(staging_dir)
+    removed: List[str] = []
+    if not staging_dir.is_dir():
+        return removed
+    for entry in sorted(staging_dir.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if entry.name.startswith(REMOVING_PREFIX):
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry.name)
+            continue
+        fd = _lock_use(entry, fcntl.LOCK_EX | fcntl.LOCK_NB, create=False)
+        if fd is None:
+            logger.info("keeping staged weight store %s: in use", entry)
+            continue
+        complete = (entry / COMPLETE_FILE_NAME).is_file()
+        try:
+            residency = (entry / RESIDENCY_FILE_NAME).read_text().strip()
+        except OSError:
+            residency = None
+        if complete and residency == "resident" and not include_resident:
+            os.close(fd)
+            logger.info("keeping resident staged weight store %s", entry)
+            continue
+        _remove_locked(entry, fd)
+        logger.info(
+            "reclaimed idle staged weight store %s (%s, residency=%s)",
+            entry,
+            "complete" if complete else "incomplete",
+            residency,
+        )
+        removed.append(entry.name)
+    return removed
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Operator entry: reclaim what a killed server left in the staging dir."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Remove staged weight-store copies no live server maps."
+    )
+    parser.add_argument("--reclaim", required=True, metavar="STORE_STAGING_DIR")
+    parser.add_argument(
+        "--include-resident",
+        action="store_true",
+        help="also remove idle complete copies declared resident",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    removed = reclaim_idle_stores(args.reclaim, include_resident=args.include_resident)
+    logger.info("reclaimed %d staged weight store(s): %s", len(removed), removed)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

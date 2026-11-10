@@ -38,6 +38,7 @@ from batchgen.server.runtime_locks import (
     reclaim_dead_runs,
     release_run_lock,
 )
+from batchgen.server.lifecycle import StartupCancelled, StopRequest
 from batchgen.server.runtime_lease import LaneLease
 from batchgen.server.restart_coordinator import RestartCoordinator
 from batchgen.server.server_args import (
@@ -59,11 +60,17 @@ PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 # A sentinel reaches the worker's ordered C++/Python teardown path.  That path
 # must be allowed to finish before the signal fallback can invoke os._exit and
 # skip the destructors it exists to run.  The bound still keeps a blocked
-# worker from holding server shutdown indefinitely.  Releasing a large
-# cudaHostRegister'd weight footprint takes on the order of minutes, so the
-# grace must cover that or the fallback kills workers mid-unpin into
-# uninterruptible D state.
-_WORKER_SENTINEL_GRACE_S = 180.0
+# worker from holding server shutdown indefinitely.  The dominant cost of that
+# teardown is unregistering the cudaHostRegister'd host memory every rank
+# pinned -- the weight mapping and the host KV cache -- and it grows with
+# those bytes, so the grace is derived from them (worker_teardown_budget_s):
+# a fixed grace either kills a large cohort mid-unpin into uninterruptible D
+# state or makes a small one wait minutes for nothing.
+_WORKER_SENTINEL_GRACE_FLOOR_S = 60.0
+# A conservative lower bound on the rate at which a rank releases pinned host
+# memory, set well below the rate observed for large footprints so the derived
+# grace leaves margin.
+_PINNED_RELEASE_BYTES_PER_S = float(2 << 30)
 # A cohort still parked in its rendezvous has built no engine and mapped no
 # weights -- BatchGenWorker is constructed only after the process group and the
 # NCCL warmup are done -- so there is nothing for an ordered teardown to
@@ -74,16 +81,22 @@ _PRE_RENDEZVOUS_SENTINEL_GRACE_S = 5.0
 # A SIGKILL'd worker still cannot be reaped until the kernel finishes
 # unpinning its registered pages, which again takes minutes for a large
 # cohort.  Proceeding while an owned PID is alive is never safe, so the
-# reap wait is long and loud rather than short and fatal.  Observed
-# teardowns of a large pinned footprint finished only just inside the
-# previous budget, leaving no usable margin, so the budget now covers
-# several times the time such a teardown is expected to need.
-_WORKER_KILL_REAP_TIMEOUT_S = 900.0
+# reap wait is long and loud rather than short and fatal: at least this
+# floor, and several times the derived release time of the pinned bytes.
+_WORKER_KILL_REAP_FLOOR_S = 900.0
 # A worker that needed SIGTERM/SIGKILL cannot name its own exit path: it is
 # force-killed while a native collective holds its thread, so no Python runs in
 # it again.  The marker is therefore emitted here, by the only process that
 # knows a signal replaced an ordered exit.
 _WORKER_EXIT_PATH_SIGNAL = "signal-fallback"
+
+
+def worker_teardown_budget_s(pinned_bytes: int) -> Tuple[float, float]:
+    """``(sentinel grace, SIGKILL reap timeout)`` for a cohort whose ranks
+    each pinned ``pinned_bytes`` of host memory."""
+    release_s = max(0, int(pinned_bytes)) / _PINNED_RELEASE_BYTES_PER_S
+    grace_s = _WORKER_SENTINEL_GRACE_FLOOR_S + release_s
+    return grace_s, max(_WORKER_KILL_REAP_FLOOR_S, 3.0 * grace_s)
 
 
 def _resolve_local_world_size(
@@ -219,13 +232,19 @@ class WorkerManager:
     # including on a manager whose construction never reached __init__.
     _startup_phases: Optional[StartupPhaseRecord] = None
     _startup_phase_watchdog: Optional[StartupPhaseWatchdog] = None
+    # The server's stop request (see batchgen.server.lifecycle). Start-up
+    # observes it at every phase boundary; once set the pool reports
+    # "stopping" and no restart or spawn begins.
+    _stop_request: Optional[StopRequest] = None
 
     def __init__(
         self,
         server_args: ServerArgs,
         worker_exit_state: Optional[WorkerExitState] = None,
+        stop_request: Optional[StopRequest] = None,
     ):
         self.args = server_args
+        self._stop_request = stop_request or StopRequest()
         try:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
@@ -380,8 +399,22 @@ class WorkerManager:
     # ---------------------- Public API ----------------------
     @property
     def state(self) -> str:
+        if self._stop_requested():
+            return "stopping"
         with self._lock:
             return self._state
+
+    def _stop_requested(self) -> bool:
+        return self._stop_request is not None and self._stop_request.is_set()
+
+    def _raise_if_stop_requested(self, phase: str) -> None:
+        """A start-up phase boundary: unwind once the server is asked to stop."""
+        if self._stop_request is not None:
+            self._stop_request.raise_if_set(phase)
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        return self._stop_request.reason if self._stop_request is not None else None
 
     @property
     def generation(self) -> int:
@@ -610,6 +643,7 @@ class WorkerManager:
         # is ready (or by stop() on a failed start-up).
         self._start_startup_phase_watchdog()
 
+        self._raise_if_stop_requested("admission")
         # Opened before the long model-loading phases: a peer connects to node
         # 0's store as soon as its own process starts, and every node spends
         # minutes loading weights before it would otherwise be reachable.
@@ -626,6 +660,7 @@ class WorkerManager:
 
         if self.args.distributed_weight_config is not None:
             self._stage_distributed_weight_store()
+            self._raise_if_stop_requested("store-staging")
             self._start_distributed_weight_daemon()
 
         if self.args.enable_hugetlbfs:
@@ -640,6 +675,7 @@ class WorkerManager:
         _diag(">>> config_torch_module_initializer")
         config_torch_module_initializer()
         _diag("<<< config_torch_module_initializer")
+        self._raise_if_stop_requested("host-kv-allocation")
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
             try:
@@ -668,6 +704,7 @@ class WorkerManager:
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
 
+        self._raise_if_stop_requested("model-load")
         model_start = _time.monotonic()
         _diag(">>> _load_model_resources")
         self._load_model_resources()
@@ -692,6 +729,9 @@ class WorkerManager:
                 float(bootstrap_timeout_s + 420)
             )
             _diag("<<< distributed_weight_daemon.wait_ready")
+        # The last boundary before any worker exists: after a stop request
+        # nothing is spawned, so the rollback never has a live cohort to reap.
+        self._raise_if_stop_requested("spawn")
         try:
             self._spawn_workers()
             _diag("<<< _spawn_workers")
@@ -699,7 +739,9 @@ class WorkerManager:
             self._start_worker_monitor()
             _diag("<<< _start_worker_monitor")
             _diag(">>> _wait_for_workers_ready")
-            self._wait_for_workers_ready()
+            self._wait_for_workers_ready(
+                peer_check=lambda: self._raise_if_stop_requested("worker-ready")
+            )
             _diag("<<< _wait_for_workers_ready")
         except Exception:
             self._shutdown_prefix_cache_owner()
@@ -960,7 +1002,17 @@ class WorkerManager:
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-                grace_s = _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
+                pinned_bytes = self._pinned_host_bytes()
+                grace_s, reap_timeout_s = worker_teardown_budget_s(pinned_bytes)
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker teardown budget: pinned_bytes=%d "
+                    "sentinel_grace=%.1fs reap_timeout=%.1fs",
+                    pinned_bytes,
+                    grace_s,
+                    reap_timeout_s,
+                )
+                if not sentinel_sent:
+                    grace_s = 0.0
                 # A cohort that never got past its rendezvous holds nothing an
                 # ordered exit has to release, and no rank is reading the
                 # queue, so the sentinel cannot be consumed at all.  See
@@ -1016,7 +1068,7 @@ class WorkerManager:
                     logger.warning("Workers did not exit gracefully, force-killing...")
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGKILL)
-                deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S
+                deadline = time.monotonic() + reap_timeout_s
                 next_progress_log = time.monotonic() + 30
                 while remaining and time.monotonic() < deadline:
                     for proc, _ in remaining:
@@ -1077,6 +1129,16 @@ class WorkerManager:
                 for _, pidfd in pidfds:
                     if pidfd is not None:
                         os.close(pidfd)
+
+    def _pinned_host_bytes(self) -> int:
+        """Host bytes each rank of the cohort registers with CUDA: the weight
+        mapping (replicated or the node's distributed store) and, when
+        allocated, the host KV cache."""
+        model_info = getattr(self, "model_info", None) or {}
+        pinned = int(model_info.get("parameter_server_size") or 0)
+        if getattr(self, "host_kv_manager", None) is not None:
+            pinned += int(getattr(self.args, "host_kv_cache_size", 0) or 0) << 30
+        return pinned
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
@@ -1213,7 +1275,7 @@ class WorkerManager:
         returns, while ``started`` stays False from then on; checking both
         covers a restart phase that outlasted the whole of ``stop()``.
         """
-        if self._stopping or not self.started:
+        if self._stopping or not self.started or self._stop_requested():
             raise RuntimeError("worker restart aborted: server is stopping")
 
     @staticmethod
@@ -1387,7 +1449,9 @@ class WorkerManager:
         following = epoch is not None
         conflict: Optional[str] = None
         with self._lock:
-            if self._state not in {"serving", "workers_down"}:
+            if self._stop_requested():
+                conflict = "worker restart conflict: state=stopping"
+            elif self._state not in {"serving", "workers_down"}:
                 conflict = f"worker restart conflict: state={self._state}"
             else:
                 self._state = "restarting"
@@ -2366,6 +2430,7 @@ class WorkerManager:
                 self.args.distributed_weight_config,
                 self.args.runtime_identity.runtime_dir,
                 fast_init=self.args.fast_init,
+                stop=self._stop_request,
             )
         self._staged_weight_store = staged
         self._distributed_weight_config_path = (

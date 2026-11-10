@@ -950,3 +950,85 @@ def test_adaptive_staging_names_the_first_bad_segment(tmp_path, monkeypatch):
         deployment.stage(copy_workers=None)
     assert "segment 2 of the source weight store" in str(excinfo.value)
     assert not list(deployment.staging_dir.rglob(st.COMPLETE_FILE_NAME))
+
+
+# --------------------------------------------------------------------------- #
+#  Stop requests and residue reclaim                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stop_request_cancels_the_copy_between_segments(tmp_path, monkeypatch):
+    """A SIGTERM during staging used to let the whole store copy run on; the
+    copy now stops at the next segment and removes its partial directory."""
+    from batchgen.server.lifecycle import StartupCancelled, StopRequest
+
+    deployment = Deployment(tmp_path, monkeypatch)
+    stop = StopRequest()
+    copied = []
+    real = st.hash_store_segment
+
+    def copy_then_stop(*args, **kwargs):
+        copied.append(1)
+        if len(copied) == 2:
+            stop.request("SIGTERM")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(st, "hash_store_segment", copy_then_stop)
+    segments = len(json.loads(
+        (deployment.output / sb.MANIFEST_FILE_NAME).read_text()
+    )["store"]["segments"])
+    assert segments > 3
+    with pytest.raises(StartupCancelled, match="store-staging.*SIGTERM"):
+        deployment.stage(copy_workers=1, stop=stop)
+    assert len(copied) < segments
+    assert not (deployment.staging_dir / deployment.staged_id()).exists()
+
+    monkeypatch.setattr(st, "hash_store_segment", real)
+    staged = deployment.stage()
+    assert not staged.reused
+    staged.release()
+
+
+def test_a_stop_requested_before_staging_copies_nothing(tmp_path, monkeypatch):
+    from batchgen.server.lifecycle import StartupCancelled, StopRequest
+
+    deployment = Deployment(tmp_path, monkeypatch)
+    stop = StopRequest()
+    stop.request("SIGINT")
+    with pytest.raises(StartupCancelled):
+        deployment.stage(stop=stop)
+    assert deployment.interleaved == 0
+
+
+def test_reclaim_removes_idle_run_and_incomplete_copies_only(tmp_path):
+    staging = tmp_path / "stores"
+    run_copy = _fake_staged_dir(staging, "node0-run", residency="run")
+    resident = _fake_staged_dir(staging, "node0-resident", residency="resident")
+    incomplete = _fake_staged_dir(staging, "node0-partial", residency="resident")
+    (incomplete / st.COMPLETE_FILE_NAME).unlink()
+    mapped = _fake_staged_dir(staging, "node1-run", residency="run")
+    removing = staging / f"{st.REMOVING_PREFIX}node0-old-1-abc"
+    removing.mkdir()
+    holder = _hold_lock(mapped / st.USE_LOCK_NAME, mkdir=False)
+    try:
+        removed = st.reclaim_idle_stores(staging)
+    finally:
+        _drop(holder)
+    assert sorted(removed) == sorted(
+        [run_copy.name, incomplete.name, removing.name]
+    )
+    assert resident.is_dir() and mapped.is_dir()
+    assert not run_copy.exists() and not incomplete.exists()
+
+    assert st.reclaim_idle_stores(staging, include_resident=True) == sorted(
+        [mapped.name, resident.name]
+    )
+    assert list(staging.iterdir()) == []
+
+
+def test_reclaim_cli_after_a_kill9(tmp_path, monkeypatch):
+    node0 = Deployment(tmp_path, monkeypatch, residency="run")
+    leftover = _stage_then_kill9(node0)
+    assert (leftover / st.COMPLETE_FILE_NAME).is_file()
+    assert st.main(["--reclaim", str(node0.staging_dir)]) == 0
+    assert not leftover.exists()

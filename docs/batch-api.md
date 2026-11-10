@@ -423,6 +423,16 @@ Returns server health status.
 
 **Response (unhealthy):** `503 Service Unavailable`
 
+**Response (stopping):** `503 Service Unavailable` with
+`{"status": "shutting_down", "reason": "server is stopping (SIGTERM)"}`. After
+`SIGTERM` or `SIGINT` a serving server keeps answering HTTP while it tears its
+workers down, refuses `POST /v1/batches` with `503`, and closes the listener
+only once teardown has finished; a second signal closes the listener at once
+(teardown still completes before the process exits). A signal during start-up
+cancels it at the next phase boundary (between staging segments, before model
+loading, before the workers are spawned, while waiting for readiness) and rolls
+back what start-up created; a native weight load in progress finishes first.
+
 ---
 
 ## Removed: /v1/inference

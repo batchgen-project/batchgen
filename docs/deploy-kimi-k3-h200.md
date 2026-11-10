@@ -312,11 +312,25 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   into `node${RANK}.json`) chooses how long the copy lives:
 
   - `run` (default) — the copy is removed when the server stops, like every other run resource.
-    A copy left by a killed server is reused by the next start of the same build or removed by
-    the next start of another build.
+    A stop requested while the copy runs cancels it between segments and removes the partial
+    copy.
   - `resident` — the copy stays in the tmpfs after the server stops, so the next start of the
     same build maps it without copying the source again (a fast cold restart). It still uses
     tmpfs memory between runs.
+
+  **After a forced exit** (`kill -9`, OOM, node loss) the kernel does not reclaim a tmpfs file,
+  so the residue is handled by these rules, each proven by the copy's `use.lock`, which every
+  server mapping the copy holds shared and the kernel releases with the process:
+
+  - a copy without `COMPLETE` (killed part-way) is never mapped; the next start of the same
+    build copies it again, a start of another build removes it;
+  - a complete `run` copy of a dead server is reused by the next start of the same build or
+    removed by a start of another build;
+  - to free the memory without starting a server, run
+    `python -m batchgen.server.weight_store_staging --reclaim /dev/shm/batchgen-weight-stores`
+    (or your `store_staging_dir`): it removes every idle `run` copy and every incomplete copy and
+    keeps idle `resident` copies (`--include-resident` removes those too). A copy a live server
+    maps is never removed.
 
   A worker-pool restart never touches the staged copy. Each start removes idle copies of other
   builds whatever their residency, so switching builds never strands one; a copy another server

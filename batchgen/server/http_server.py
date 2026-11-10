@@ -46,6 +46,7 @@ from batchgen.deprecation import (
     LEGACY_INFERENCE_MESSAGE,
 )
 from batchgen.server.health import ServerHealthState
+from batchgen.server.lifecycle import StartupCancelled, StopRequest
 from batchgen.eventlog.process import exit_process
 from batchgen.server.restart_coordinator import PeerRestartError
 from batchgen.server.server_args import (
@@ -162,13 +163,96 @@ def make_main_thread_dispatcher(loop):
     return dispatch_on_main_thread
 
 
+class ServingShutdown:
+    """Turns a stop signal into a teardown that runs while HTTP keeps serving.
+
+    Bound by the lifespan once start-up is complete. The first stop request
+    then schedules the lifespan's teardown on the event loop and the caller
+    is told to keep the listener open; ``on_done`` runs once teardown has
+    finished and lets the HTTP server exit. Before binding (start-up) and for
+    any later request the caller exits at once: start-up observes the stop
+    request itself, and a second signal means "stop answering now".
+    """
+
+    def __init__(self, stop_request: StopRequest) -> None:
+        self.stop_request = stop_request
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._teardown = None
+        self._task: Optional[asyncio.Future] = None
+
+    def bind(self, loop: asyncio.AbstractEventLoop, teardown) -> None:
+        with self._lock:
+            self._loop, self._teardown = loop, teardown
+
+    def unbind(self) -> None:
+        with self._lock:
+            self._loop = self._teardown = None
+
+    def begin(self, reason: str, on_done) -> bool:
+        """Record the stop; True when teardown now runs with HTTP serving."""
+        first = self.stop_request.request(reason)
+        with self._lock:
+            loop, teardown = self._loop, self._teardown
+        if not first or loop is None:
+            return False
+
+        async def teardown_then_exit():
+            try:
+                await teardown()
+            except Exception:
+                logger.exception("[shutdown] teardown failed")
+            finally:
+                on_done()
+
+        def schedule():
+            # Held here: the event loop keeps only a weak reference to a task.
+            self._task = asyncio.ensure_future(teardown_then_exit())
+
+        loop.call_soon_threadsafe(schedule)
+        logging.getLogger("uvicorn.error").info(
+            "[shutdown] %s: tearing down while HTTP keeps serving", reason
+        )
+        return True
+
+
+class _BatchGenServer(uvicorn.Server):
+    """uvicorn's server with BatchGen's stop lifecycle.
+
+    uvicorn replaces the process's SIGINT/SIGTERM handlers for its whole run
+    and only records that it should exit, which nothing inside a running
+    lifespan start-up sees. Every stop signal is routed through
+    :class:`ServingShutdown` first, so start-up can cancel and serving can
+    tear down with HTTP still answering.
+    """
+
+    def __init__(self, config: uvicorn.Config, shutdown: ServingShutdown) -> None:
+        super().__init__(config)
+        self._shutdown = shutdown
+
+    def handle_exit(self, sig, frame) -> None:  # noqa: D401 - uvicorn hook
+        import signal as _signal
+
+        try:
+            reason = _signal.Signals(sig).name
+        except ValueError:
+            reason = f"signal {sig}"
+        if self._shutdown.begin(
+            reason, lambda: uvicorn.Server.handle_exit(self, sig, None)
+        ):
+            return
+        super().handle_exit(sig, frame)
+
+
 def create_app(
     server_args: ServerArgs,
     worker_exit_state: Optional[WorkerExitState] = None,
     health_state: Optional[ServerHealthState] = None,
+    shutdown: Optional[ServingShutdown] = None,
 ) -> FastAPI:
     worker_exit_state = worker_exit_state or WorkerExitState()
     health_state = health_state or ServerHealthState()
+    shutdown = shutdown or ServingShutdown(StopRequest())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -193,11 +277,49 @@ def create_app(
                     "process: %s",
                     len(orphaned), orphaned,
                 )
-        worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
+        worker = WorkerManager(
+            server_args,
+            worker_exit_state=worker_exit_state,
+            stop_request=shutdown.stop_request,
+        )
         app.state.server_args = server_args
         app.state.worker = worker
         scheduler = None
         scheduler_started = False
+        teardown_task: Optional[asyncio.Future] = None
+
+        async def teardown_once():
+            shutdown_start = time.monotonic()
+            logging.getLogger("uvicorn.error").info("[shutdown] scheduler stop begin")
+            try:
+                if scheduler_started:
+                    await scheduler.stop()
+            finally:
+                scheduler_stop_end = time.monotonic()
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] scheduler stop elapsed=%.3fs",
+                    scheduler_stop_end - shutdown_start,
+                )
+                try:
+                    # Off the event loop: reaping a cohort that pinned a large
+                    # host footprint takes minutes, and /health must answer
+                    # "shutting_down" for all of them.
+                    await asyncio.to_thread(worker.stop)
+                finally:
+                    logging.getLogger("uvicorn.error").info(
+                        "[shutdown] worker stop elapsed=%.3fs total=%.3fs",
+                        time.monotonic() - scheduler_stop_end,
+                        time.monotonic() - shutdown_start,
+                    )
+
+        async def teardown():
+            # One teardown per server: the stop signal's task and the
+            # lifespan exit share it, whichever comes first.
+            nonlocal teardown_task
+            if teardown_task is None:
+                teardown_task = asyncio.ensure_future(teardown_once())
+            await asyncio.shield(teardown_task)
+
         try:
             worker._acquire_runtime_admission()
             storage = StorageManager(server_args.storage_path)
@@ -239,35 +361,32 @@ def create_app(
             worker.set_main_thread_dispatcher(
                 make_main_thread_dispatcher(asyncio.get_running_loop())
             )
-            worker.start()
-            await scheduler.start()
-            scheduler_started = True
-            health_state.mark_startup_complete()
-            e2e_elapsed = time.monotonic() - e2e_start
-            logger.info(
-                "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
-            )
+            cancelled = False
+            try:
+                worker.start()
+            except StartupCancelled as exc:
+                # A worker failure during start-up also stops the server (it
+                # signals this process); that stays a start-up failure.
+                if worker_exit_state.is_failed():
+                    raise
+                # worker.start() already rolled every resource back.
+                logging.getLogger("uvicorn.error").warning(
+                    "[shutdown] %s; start-up rolled back", exc
+                )
+                cancelled = True
+            if not cancelled:
+                await scheduler.start()
+                scheduler_started = True
+                health_state.mark_startup_complete()
+                shutdown.bind(asyncio.get_running_loop(), teardown)
+                e2e_elapsed = time.monotonic() - e2e_start
+                logger.info(
+                    "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
+                )
             yield
         finally:
-            shutdown_start = time.monotonic()
-            logging.getLogger("uvicorn.error").info("[shutdown] scheduler stop begin")
-            try:
-                if scheduler_started:
-                    await scheduler.stop()
-            finally:
-                scheduler_stop_end = time.monotonic()
-                logging.getLogger("uvicorn.error").info(
-                    "[shutdown] scheduler stop elapsed=%.3fs",
-                    scheduler_stop_end - shutdown_start,
-                )
-                try:
-                    worker.stop()
-                finally:
-                    logging.getLogger("uvicorn.error").info(
-                        "[shutdown] worker stop elapsed=%.3fs total=%.3fs",
-                        time.monotonic() - scheduler_stop_end,
-                        time.monotonic() - shutdown_start,
-                    )
+            shutdown.unbind()
+            await teardown()
 
     app = FastAPI(title="BatchGen OpenAI-Compatible API", lifespan=lifespan)
     app.state.worker_exit_state = worker_exit_state
@@ -672,8 +791,17 @@ def create_app(
         worker_exit: WorkerExitState = request.app.state.worker_exit_state
         worker_manager: WorkerManager = request.app.state.worker
 
-        if worker_manager.state in {"workers_down", "restarting"}:
-            if worker_manager.state == "restarting":
+        pool_state = worker_manager.state
+        if pool_state == "stopping":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "shutting_down",
+                    "reason": f"server is stopping ({worker_manager.stop_reason})",
+                },
+            )
+        if pool_state in {"workers_down", "restarting"}:
+            if pool_state == "restarting":
                 reason = worker_exit.reason or "Worker restart in progress."
             else:
                 reason = worker_exit.reason or "Worker pool is down."
@@ -720,7 +848,8 @@ def launch_server(server_args: ServerArgs) -> None:
 
     worker_exit_state = WorkerExitState()
     health_state = ServerHealthState()
-    app = create_app(server_args, worker_exit_state, health_state)
+    shutdown = ServingShutdown(StopRequest())
+    app = create_app(server_args, worker_exit_state, health_state, shutdown)
     shutdown_requested = False
 
     # Startup timeout: if the server doesn't become ready in time, log error
@@ -767,7 +896,7 @@ def launch_server(server_args: ServerArgs) -> None:
 
     try:
         logger.info("Starting BatchGen HTTP server.")
-        uvicorn.run(
+        config = uvicorn.Config(
             app,
             host=server_args.listen_ip,
             port=server_args.listen_port,
@@ -785,6 +914,7 @@ def launch_server(server_args: ServerArgs) -> None:
             timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
             loop="uvloop",
         )
+        _BatchGenServer(config, shutdown).run()
     except KeyboardInterrupt:
         if shutdown_requested:
             logger.info("Graceful shutdown initiated by signal.")
