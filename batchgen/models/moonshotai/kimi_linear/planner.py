@@ -230,7 +230,7 @@ class KimiLinearPlanner(BasePlanner):
             batching.prefill_micro_batch_token_cap = (
                 k3_profile.prefill_micro_batch_token_cap
             )
-            batching.resident_ep_prefill_token_cap = (
+            batching.k3_resident_prefill_token_cap = (
                 k3_profile.resident_ep_prefill_token_cap
             )
             batching.k3_resident_prefill_chunk_rows = (
@@ -248,7 +248,7 @@ class KimiLinearPlanner(BasePlanner):
                 if self.is_k3 and self.attention_group_size > 1
                 else _KIMI_DEFAULT_PREFILL_TOKEN_CAP
             )
-            batching.resident_ep_prefill_token_cap = 0
+            batching.k3_resident_prefill_token_cap = 0
             batching.k3_resident_prefill_chunk_rows = 0
             batching.k3_prefill_collective_stripe_threshold_rows = (
                 _KIMI_DEFAULT_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
