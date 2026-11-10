@@ -384,18 +384,29 @@ _H200_W16 = K3EngineProfile(
 )
 
 # B300, 1 node x 8 (world 8): the whole EP8 expert set resident on one node.
-# Every value is the one this machine ran under the retired memory tiers.
-# MEASURED 2026-11-09 on the single-node deployment at frac 0.85 with 273
-# physical slots: device total 267.68 GiB, 208.13 GiB in use after decode
-# configure (199.80 GiB allocated: resident EP shard 168.39 GiB, decode
-# parameters 16.06 GiB, KDA state 273 x 53.57 MiB = 14.28 GiB).
+#
+# KDA slots (PROVISIONAL, kv-solve): MEASURED 2026-11-09 on the single-node
+# deployment at frac 0.85 with 273 physical slots (256 user + 1 graph
+# scratch + 16 prefix segments): device total 267.68 GiB, 208.13 GiB in use
+# after decode configure (199.80 GiB allocated: resident EP shard 168.39 GiB,
+# decode parameters 16.06 GiB, KDA state 273 x 53.57 MiB = 14.28 GiB). The
+# non-slot base is 208.13 - 14.28 = 193.85 GiB. At frac 0.95 the budget is
+# 254.30 GiB; minus the base, a 2 GiB graph reserve and 17 non-user slots
+# (0.89 GiB), 57.56 GiB remain for user slots and GPU KV. One sequence held
+# to 4,096 tokens costs 53.57 MiB of KDA state + 4,096 x 27,648 B of MLA KV
+# = 0.1578 GiB, so S = 57.56 / 0.1578 = 364.8; the largest TP-size multiple
+# below it is 360. A K3.1 run at frac 0.95 peaked at 254.65 GiB in use
+# (2026-11-10), so the 0.95 budget leaves ~13 GiB of the device untouched.
+# Every prefill knob keeps the value this machine ran under the retired
+# memory tiers; streamed waves of 448K tokens prefilled without running out
+# of memory (2026-11-10).
 _B300_W8 = K3EngineProfile(
     family=MachineFamily.B300,
     num_nodes=1,
     shard_latent_projections=True,
     shard_vocab_parallel=True,
-    kda_user_slots=256,
-    kda_slots_basis="inherited: " + _INHERITED_H200,
+    kda_user_slots=360,
+    kda_slots_basis="kv-solve",
     prefill_micro_batch_token_cap=_H200_STREAMED_CAP,
     resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
@@ -406,13 +417,13 @@ _B300_W8 = K3EngineProfile(
         device_total_gib=267.68,
         gpu_memory_frac=0.95,
         non_slot_base_gib=208.13 - 273 * 53.57 / 1024,
-        prefill_non_expert_gib=39.96,
+        prefill_non_expert_gib=39.96 + (360 + 17 - 273) * 53.57 / 1024,
         graph_reserve_gib=2.0,
         full_length_tokens=4096,
         source=(
             "MEASURED 2026-11-09 decode configure (see the row comment); "
             "prefill non-expert ESTIMATED as the measured H200 first-iteration "
-            "use (same 273 physical slots)"
+            "use plus the extra KDA slots of this row"
         ),
     ),
     sources=MappingProxyType({
@@ -421,7 +432,7 @@ _B300_W8 = K3EngineProfile(
             "passed the accuracy gate"
         ),
         "shard_vocab_parallel": "measured 2026-11-09/10: same runs, vocab-parallel on",
-        "kda_user_slots": _INHERITED_H200,
+        "kda_user_slots": "provisional kv-solve on measured memory (see the row comment)",
         "prefill_micro_batch_token_cap": (
             _INHERITED_H200 + "; 448K-token streamed waves ran 2026-11-10"
         ),
