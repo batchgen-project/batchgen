@@ -44,6 +44,7 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
     seq.status = SequenceStatus.PREFILLED
     seq.assigned_rank = 1
     seq.host_pages_allocated = pages
+    seq.host_owned_pages = pages
     seq.host_token_capacity = 6087
 
     with pytest.raises(RuntimeError, match="host_token_capacity=6087"):
@@ -79,6 +80,7 @@ def test_terminal_decode_boundary_allows_only_the_final_capacity_gap():
     seq.decoded_length = 3357
     seq.current_context_length = 3457
     seq.host_pages_allocated = 54
+    seq.host_owned_pages = 54
     seq.host_token_capacity = 3456
     seq.gpu_pages_allocated = 54
     seq.eos_reached = True
