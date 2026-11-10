@@ -761,6 +761,21 @@ class WeightSlotTable {
         slot.reclaim_frame = frame;
     }
 
+    // Arm the gate on a slot that is still FILLING/PRESENT/LEASED: a
+    // HostShared producer arms at landing, long before the consumer's
+    // release turns the slot PENDING_RELEASE. The gate survives until
+    // reclaim resets the slot.
+    void arm_reclaim_gate(const std::string& module_type, int64_t index,
+                          int64_t frame) {
+        Slot& slot = this->slot_at(module_type, index);
+        if (slot.state == WeightSlotState::kFree) {
+            throw this->transition_error("arm reclaim gate", slot.name,
+                                         slot.state, module_type, index);
+        }
+        slot.reclaim_gate = true;
+        slot.reclaim_frame = frame;
+    }
+
     /* Routing-informed skip, in the current pass */
 
     // Throws exactly when skip(module_name) would, without changing state.

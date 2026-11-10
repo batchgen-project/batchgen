@@ -23,8 +23,10 @@
 #include "pybind11/stl.h"
 #include "spdlog/spdlog.h"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <future>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -35,6 +37,8 @@
 
 #include "../GPU_KV_Buffer/GPU_KV_Buffer.h"
 #include "../GPU_Weight_Buffer/GPU_Weight_Buffer.h"
+#include "../GPU_Weight_Buffer/replica_control_block.h"
+#include "../GPU_Weight_Buffer/weight_replica_plan.h"
 #include "../KV_Storage/KV_Storage.h"
 #include "../Weights_Storage/Weights_Storage.h"
 #include "../data_structures.h"
@@ -90,6 +94,34 @@ class HtoD_Engine {
     WeightPassAbort abort_weight_passes();
     // Un-parks the producer: a pass was armed or a task was queued.
     void wake_producer();
+
+    /* Node replica transport (spec v4 slice 2). Installed per prefill phase
+       by the worker when the replica group has more than one member; the
+       uninstalled engine behaves as the single-member group (every record
+       HostPrivate). Install and uninstall run only while the producer is
+       stopped. */
+    struct ReplicaModuleInstall {
+        std::string module_type;
+        std::string module;
+        uint8_t kind = 1;          // WeightRecordKind: 0 shared 1 private 2 replica
+        int32_t owner_member = 0;  // index into the ordered group
+        uint32_t layer_position = 0;
+        uint32_t record_index = 0;  // within one frame, identical on every member
+    };
+    void install_replica_plan(
+        int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+        uint32_t records_per_frame,
+        const std::vector<uint32_t>& owned_per_position,
+        const std::vector<ReplicaModuleInstall>& modules,
+        torch::Tensor control_block,
+        const std::unordered_map<std::string,
+                                 std::vector<torch::Tensor>>& peer_segments,
+        const std::unordered_map<std::string, int64_t>& strides);
+    // Syncs and destroys the pull streams, drops the imported segments and
+    // the control-block view, clears the reclaim gate. The caller has run
+    // the group barrier first.
+    void uninstall_replica_plan();
+    bool replica_plan_installed() const { return this->replica_plan_ != nullptr; }
     // Throws when the node daemon still leases this worker a module of pass
     // or an earlier one. A lease of the module in flight for a later
     // (carried) pass is allowed.
@@ -173,6 +205,7 @@ class HtoD_Engine {
     std::unordered_map<std::string, uint64_t> copied_modules_;
     std::unordered_map<std::string, uint64_t> skipped_modules_;
     std::unordered_map<std::string, uint64_t> released_on_landing_modules_;
+    std::unordered_map<std::string, uint64_t> replica_pulled_modules_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};
@@ -184,4 +217,32 @@ class HtoD_Engine {
     std::thread HtoD_worker_;
     void HtoD_Worker();
     void blocking_copy_(void* dst, void* src, int64_t size);
+
+    /* Replica transport runtime. Written only while the producer is stopped;
+       read by the producer thread. */
+    struct ReplicaPlanRuntime {
+        int64_t member_index = 0;
+        int64_t group_size = 1;
+        uint64_t layers_per_pass = 0;
+        uint32_t records_per_frame = 0;
+        std::vector<uint32_t> owned_per_position;
+        std::unordered_map<std::string, ReplicaModuleInstall> modules;
+        ReplicaControlBlock block;
+        torch::Tensor block_backing;  // keep-alive of the shared mapping view
+        // per type: per member, base pointer of their single ring segment
+        std::unordered_map<std::string, std::vector<void*>> segment_base;
+        std::unordered_map<std::string, int64_t> stride;
+        std::vector<torch::Tensor> keepalive;  // imported segment tensors
+        std::vector<cudaStream_t> pull_streams;  // one per member
+        // frame bookkeeping, producer thread only
+        std::map<uint64_t, uint32_t> owned_landed;
+        std::map<uint64_t, uint32_t> terminal;
+        std::map<uint64_t, std::chrono::steady_clock::time_point> wait_since;
+        ReplicaPlanRuntime(ReplicaControlBlock attached)
+            : block(attached) {}
+    };
+    std::unique_ptr<ReplicaPlanRuntime> replica_plan_;
+    // Producer-side frame hooks; no-ops without an installed plan.
+    void replica_mark_terminal_(uint64_t flat_frame);
+    void replica_mark_owned_landed_(uint64_t flat_frame);
 };

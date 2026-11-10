@@ -211,9 +211,11 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
     cancelled = weights.index("if (!fetched.has_value()) {")
     cancel_end = weights.index("break;", cancelled)
     cancel_path = weights[cancelled:cancel_end]
-    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
-    pop = weights.index(".try_pop(module_name)")
-    push = weights.index(".push(module_name)")
+    # The replica branch above the host flow has its own claim/pop/push;
+    # the host-path invariant is anchored after the host fetch.
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(", fetch)
+    pop = weights.index(".try_pop(module_name)", fetch)
+    push = weights.index(".push(module_name)", fetch)
     # Peek before the fetch; claim, pop and push back only after it
     # succeeded, once per module of every pass.
     assert peek < fetch < cancelled < claim < pop < push
@@ -236,9 +238,10 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
 def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     weights = _weight_section()
     fetch = weights.index("get_module_weights_storage(")
-    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(", fetch)
     assert fetch < claim
-    skipped = weights[claim:weights.index("this->set_producer_state_(ProducerState::kCopying")]
+    skipped = weights[claim:weights.index(
+        "this->set_producer_state_(ProducerState::kCopying", claim)]
     # A skipped remote module is acquired and released without a copy, so the
     # daemon FIFO still advances, and it goes back on the tail. The cursor
     # moves past it only after the lease is released.
@@ -271,7 +274,12 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
 
 def test_lease_is_released_before_the_copy_lands():
     weights = _weight_section()
-    copying = weights.index("ProducerState::kCopying")
+    # Anchor on the HOST copy state, after the host fetch; the replica
+    # branch earlier in the loop lands without any lease to release.
+    copying = weights.index(
+        "ProducerState::kCopying",
+        weights.index("get_module_weights_storage("),
+    )
     release = weights.index("this->weights_storage_.release_module(module_name);", copying)
     complete = weights.index("this->gpu_weight_buffer_.weights_copy_complete(", copying)
     # No FILLING slot of a pass implies no daemon lease of it.

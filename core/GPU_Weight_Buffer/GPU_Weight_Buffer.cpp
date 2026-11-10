@@ -141,6 +141,10 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false);
     const torch::Tensor storage = torch::zeros({count * stride}, options);
+    // The replica transport exports whole segments to the node's peers, so
+    // the segment tensor and the shared per-slot stride stay addressable.
+    this->segments_[module_type].push_back(storage);
+    this->segment_strides_[module_type] = stride;
     buffers.reserve(buffers.size() + static_cast<size_t>(count));
     for (int64_t index = 0; index < count; ++index) {
         module_weight_tensor_map slot;
@@ -187,13 +191,19 @@ void GPU_Weight_Buffer::synchronizePendingReleasesLocked() {
 }
 
 void GPU_Weight_Buffer::drainPendingReleasesLocked() {
+    // Teardown path: the caller has already run the group barrier, so a
+    // still-armed peer gate has no peer left to wait for.
     while (!this->pending_releases_.empty()) {
         PendingRelease& pending = this->pending_releases_.front();
-        CUDA_CHECK(cudaEventSynchronize(pending.event));
-        for (const auto& [module_type, buffer_idx] : pending.slots) {
-            this->slots_.reclaim(module_type, buffer_idx);
+        if (pending.event != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(pending.event));
+            CUDA_CHECK(cudaEventDestroy(pending.event));
+            pending.event = nullptr;
         }
-        CUDA_CHECK(cudaEventDestroy(pending.event));
+        for (const auto& [module_type, buffer_idx] : pending.slots) {
+            this->slots_.reclaim(module_type, buffer_idx,
+                                 [](int64_t) { return true; });
+        }
         this->pending_releases_.pop_front();
     }
 }
@@ -236,20 +246,52 @@ void GPU_Weight_Buffer::waitWithoutStallLocked(
     }
 }
 
+void GPU_Weight_Buffer::set_peer_release_gate(
+    std::function<bool(int64_t)> gate) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->peer_release_gate_ = std::move(gate);
+}
+
+void GPU_Weight_Buffer::arm_peer_release_gate(const std::string& module_type,
+                                              int64_t index, int64_t frame) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.arm_reclaim_gate(module_type, index, frame);
+}
+
 void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
     for (auto it = this->pending_releases_.begin();
          it != this->pending_releases_.end();) {
-        const cudaError_t status = cudaEventQuery(it->event);
-        if (status == cudaErrorNotReady) {
-            ++it;
-            continue;
+        if (it->event != nullptr) {
+            const cudaError_t status = cudaEventQuery(it->event);
+            if (status == cudaErrorNotReady) {
+                ++it;
+                continue;
+            }
+            CUDA_CHECK(status);
+            CUDA_CHECK(cudaEventDestroy(it->event));
+            it->event = nullptr;
         }
-        CUDA_CHECK(status);
+        // The event completed. A peer-gated slot (a HostShared module whose
+        // frame some member has not finished reading) stays PENDING_RELEASE
+        // until the gate passes; the entry is kept with event == nullptr.
+        std::vector<std::pair<std::string, int64_t>> still_gated;
         for (const auto& [module_type, buffer_idx] : it->slots) {
-            this->slots_.reclaim(module_type, buffer_idx);
+            static const std::function<bool(int64_t)> kUngated =
+                [](int64_t) { return true; };
+            const bool reclaimed = this->slots_.reclaim(
+                module_type, buffer_idx,
+                this->peer_release_gate_ ? this->peer_release_gate_
+                                         : kUngated);
+            if (!reclaimed) {
+                still_gated.emplace_back(module_type, buffer_idx);
+            }
         }
-        CUDA_CHECK(cudaEventDestroy(it->event));
-        it = this->pending_releases_.erase(it);
+        if (still_gated.empty()) {
+            it = this->pending_releases_.erase(it);
+        } else {
+            it->slots = std::move(still_gated);
+            ++it;
+        }
     }
 }
 
@@ -284,6 +326,7 @@ void GPU_Weight_Buffer::Init() {
     for (auto& [module_type, num_buffer] : num_buffers) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->buffers_[module_type].clear();
+        this->segments_[module_type].clear();
         this->slots_.reset_type(module_type, num_buffer);
         this->append_ring_slots_(module_type, num_buffer);
     }
@@ -565,6 +608,20 @@ GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::skip_modules(
     return counts;
 }
 
+std::vector<torch::Tensor> GPU_Weight_Buffer::ring_segments(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segments_.find(module_type);
+    return found == this->segments_.end() ? std::vector<torch::Tensor>{}
+                                          : found->second;
+}
+
+int64_t GPU_Weight_Buffer::ring_stride(const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_strides_.find(module_type);
+    return found == this->segment_strides_.end() ? 0 : found->second;
+}
+
 GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
     std::lock_guard<std::mutex> lock(this->mutex_);
     SlotSnapshot snapshot;
@@ -772,6 +829,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            this->segments_["routed_expert"].clear();
 
             // Optional: Force memory cleanup for routed_expert tensors only
             if (torch::cuda::is_available()) {
@@ -996,6 +1054,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            this->segments_["routed_expert"].clear();
 
             // Optional: Force memory cleanup
             if (torch::cuda::is_available()) {

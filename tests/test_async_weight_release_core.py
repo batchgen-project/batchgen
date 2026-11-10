@@ -34,9 +34,13 @@ def test_async_release_keeps_slots_pending_until_consumer_event_completes():
     query = reclaim.index("cudaEventQuery(it->event)")
     not_ready = reclaim.index("status == cudaErrorNotReady")
     # PENDING_RELEASE -> FREE only once the consumer's event completed.
-    reusable = reclaim.index("this->slots_.reclaim(module_type, buffer_idx)")
+    # The reclaim now carries the peer-release gate: FREE still needs the
+    # consumer event, and a HostShared slot additionally needs barrier B.
+    reusable = reclaim.index("this->slots_.reclaim(\n                module_type, buffer_idx,")
     destroy = reclaim.index("cudaEventDestroy(it->event)")
-    assert query < not_ready < reusable < destroy
+    # The completed event is destroyed (and nulled) first; FREE still only
+    # happens afterwards, and a peer-gated slot stays pending even then.
+    assert query < not_ready < destroy < reusable
     assert "this->reclaimCompletedReleasesLocked();" in acquire
     assert "this->slots_.reserve(module_type)" in acquire
 
@@ -106,7 +110,7 @@ def test_pass_end_drains_and_reclaims_every_pending_release():
     ]
     # Unlike the reset drain, the slots return to FREE in the table.
     assert drain.index("cudaEventSynchronize(pending.event)") < drain.index(
-        "this->slots_.reclaim(module_type, buffer_idx)"
+        "this->slots_.reclaim(module_type, buffer_idx,"
     )
     wait = source[
         source.index("void GPU_Weight_Buffer::wait_pass_drained(int64_t pass)") :

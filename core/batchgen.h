@@ -109,6 +109,21 @@ class BatchGen {
         // std::string module_key);
     py::dict get_tensor(std::string module_key);
     void start_h2d_worker();
+    // Node replica transport (spec v4 slice 2): plan install/uninstall and
+    // the ring-segment surface python shares across the cohort.
+    void install_replica_plan(
+        int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+        uint32_t records_per_frame,
+        const std::vector<uint32_t>& owned_per_position,
+        const std::vector<std::tuple<std::string, std::string, int64_t,
+                                     int64_t, int64_t, int64_t>>& modules,
+        torch::Tensor control_block,
+        const std::unordered_map<std::string,
+                                 std::vector<torch::Tensor>>& peer_segments,
+        const std::unordered_map<std::string, int64_t>& strides);
+    void uninstall_replica_plan();
+    std::vector<torch::Tensor> ring_segments(const std::string& module_type);
+    int64_t ring_stride(const std::string& module_type);
     void save_compressed_kv();
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&

@@ -257,6 +257,11 @@ void HtoD_Engine::fail_producer_(const std::string& module_type,
     std::string failure = module_name.empty()
                               ? message
                               : module_name + ": " + message;
+    if (this->replica_plan_ != nullptr) {
+        // Peers polling this member's barriers fail fast on the abort word
+        // instead of waiting out the stall timeout.
+        this->replica_plan_->block.abort(this->replica_plan_->member_index);
+    }
     if (leased) {
         try {
             this->weights_storage_.release_module(module_name);
@@ -294,7 +299,8 @@ py::dict HtoD_Engine::weight_stream_status() {
         std::unordered_set<std::string> module_types;
         for (const auto* counter :
              {&this->copied_modules_, &this->skipped_modules_,
-              &this->released_on_landing_modules_}) {
+              &this->released_on_landing_modules_,
+              &this->replica_pulled_modules_}) {
             for (const auto& [module_type, count] : *counter) {
                 module_types.insert(module_type);
             }
@@ -312,6 +318,7 @@ py::dict HtoD_Engine::weight_stream_status() {
             entry["skipped"] = count(this->skipped_modules_);
             entry["released_on_landing"] =
                 count(this->released_on_landing_modules_);
+            entry["replica_pulled"] = count(this->replica_pulled_modules_);
             by_type[module_type.c_str()] = entry;
         }
         result["by_type"] = by_type;
@@ -377,6 +384,135 @@ py::dict HtoD_Engine::weight_stream_status() {
     result["passes"] = passes;
     result["schedule_lost"] = snapshot.schedule_lost;
     return result;
+}
+
+void HtoD_Engine::install_replica_plan(
+    int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+    uint32_t records_per_frame,
+    const std::vector<uint32_t>& owned_per_position,
+    const std::vector<ReplicaModuleInstall>& modules,
+    torch::Tensor control_block,
+    const std::unordered_map<std::string, std::vector<torch::Tensor>>&
+        peer_segments,
+    const std::unordered_map<std::string, int64_t>& strides) {
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "install_replica_plan requires a stopped producer");
+    }
+    if (group_size < 2) {
+        throw std::runtime_error(
+            "a single-member group installs no plan; the uninstalled engine "
+            "is that group");
+    }
+    if (owned_per_position.size() != layers_per_pass) {
+        throw std::runtime_error(
+            "owned_per_position must list every layer position");
+    }
+    auto runtime = std::make_unique<ReplicaPlanRuntime>(
+        ReplicaControlBlock::attach(control_block.data_ptr(),
+                                    static_cast<size_t>(
+                                        control_block.nbytes())));
+    if (runtime->block.members() != static_cast<size_t>(group_size) ||
+        runtime->block.records_per_frame() !=
+            static_cast<size_t>(records_per_frame)) {
+        throw std::runtime_error(
+            "control block geometry does not match the installed plan");
+    }
+    runtime->member_index = member_index;
+    runtime->group_size = group_size;
+    runtime->layers_per_pass = layers_per_pass;
+    runtime->records_per_frame = records_per_frame;
+    runtime->owned_per_position = owned_per_position;
+    runtime->block_backing = std::move(control_block);
+    for (const auto& module : modules) {
+        runtime->modules[module.module] = module;
+    }
+    for (const auto& [module_type, segments] : peer_segments) {
+        if (segments.size() != static_cast<size_t>(group_size)) {
+            throw std::runtime_error(
+                "peer segments of " + module_type +
+                " must hold one tensor per member");
+        }
+        auto stride = strides.find(module_type);
+        if (stride == strides.end() || stride->second <= 0) {
+            throw std::runtime_error("missing ring stride for " + module_type);
+        }
+        auto& bases = runtime->segment_base[module_type];
+        for (const torch::Tensor& segment : segments) {
+            if (!segment.defined() || !segment.is_cuda()) {
+                throw std::runtime_error(
+                    "peer segment of " + module_type + " is not a CUDA tensor");
+            }
+            bases.push_back(segment.data_ptr());
+            runtime->keepalive.push_back(segment);
+        }
+        runtime->stride[module_type] = stride->second;
+    }
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    runtime->pull_streams.resize(group_size, nullptr);
+    for (int64_t member = 0; member < group_size; ++member) {
+        if (member == member_index) {
+            continue;
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&runtime->pull_streams[member],
+                                             cudaStreamNonBlocking));
+    }
+    ReplicaControlBlock block = runtime->block;
+    const int64_t self = member_index;
+    this->gpu_weight_buffer_.set_peer_release_gate(
+        [block, self](int64_t frame) mutable -> bool {
+            return block.first_waiting(ReplicaControlBlock::Barrier::B,
+                                       static_cast<uint64_t>(frame)) ==
+                   block.members();
+        });
+    this->replica_plan_ = std::move(runtime);
+    this->logger_->info(
+        "Replica plan installed: member {} of {}, {} records/frame, {} "
+        "layer positions",
+        member_index, group_size, records_per_frame, layers_per_pass);
+}
+
+void HtoD_Engine::uninstall_replica_plan() {
+    if (this->replica_plan_ == nullptr) {
+        return;
+    }
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "uninstall_replica_plan requires a stopped producer");
+    }
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    for (cudaStream_t stream : this->replica_plan_->pull_streams) {
+        if (stream != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+        }
+    }
+    this->gpu_weight_buffer_.set_peer_release_gate(nullptr);
+    this->replica_plan_.reset();
+    this->logger_->info("Replica plan uninstalled");
+}
+
+void HtoD_Engine::replica_mark_owned_landed_(uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    const uint32_t landed = ++plan.owned_landed[flat_frame];
+    const uint32_t owned = plan.owned_per_position[flat_frame %
+                                                   plan.layers_per_pass];
+    if (landed == owned) {
+        plan.block.advance(plan.member_index,
+                           ReplicaControlBlock::Barrier::A, flat_frame);
+        plan.owned_landed.erase(flat_frame);
+    }
+}
+
+void HtoD_Engine::replica_mark_terminal_(uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    const uint32_t terminal = ++plan.terminal[flat_frame];
+    if (terminal == plan.records_per_frame) {
+        plan.block.advance(plan.member_index,
+                           ReplicaControlBlock::Barrier::B, flat_frame);
+        plan.terminal.erase(flat_frame);
+        plan.wait_since.erase(flat_frame);
+    }
 }
 
 void HtoD_Engine::HtoD_Worker() {
@@ -543,6 +679,84 @@ void HtoD_Engine::HtoD_Worker() {
                 continue;
             }
             weights_parked = false;
+            // Record kind under the installed replica plan. Without a plan
+            // (single-member group, decode, daemon sources) every module is
+            // HostPrivate and the flow below is exactly the historic one.
+            const ReplicaModuleInstall* role = nullptr;
+            uint64_t flat = 0;
+            if (this->replica_plan_ != nullptr) {
+                auto found = this->replica_plan_->modules.find(
+                    next.module_name);
+                if (found == this->replica_plan_->modules.end()) {
+                    this->fail_producer_(module_type, -1, next.module_name,
+                                         false,
+                                         "module is absent from the installed "
+                                         "replica plan");
+                    break;
+                }
+                role = &found->second;
+                flat = flat_frame(static_cast<uint64_t>(next.pass),
+                                  role->layer_position,
+                                  this->replica_plan_->layers_per_pass);
+            }
+            if (role != nullptr &&
+                role->kind ==
+                    static_cast<uint8_t>(WeightRecordKind::Replica) &&
+                next.kind == WeightProduction::kCopy) {
+                ReplicaPlanRuntime& plan = *this->replica_plan_;
+                // A frame this member owns nothing of still posts A once.
+                const uint32_t owned =
+                    plan.owned_per_position[flat % plan.layers_per_pass];
+                const uint64_t own_a = plan.block.passed(
+                    plan.member_index, ReplicaControlBlock::Barrier::A);
+                if (owned == 0 && (own_a == ReplicaControlBlock::kNone ||
+                                   own_a < flat)) {
+                    plan.block.advance(plan.member_index,
+                                       ReplicaControlBlock::Barrier::A, flat);
+                }
+                const uint64_t owner_a = plan.block.passed(
+                    static_cast<size_t>(role->owner_member),
+                    ReplicaControlBlock::Barrier::A);
+                const bool owner_ready =
+                    owner_a != ReplicaControlBlock::kNone && owner_a >= flat;
+                if (plan.block.aborted(
+                        static_cast<size_t>(role->owner_member))) {
+                    this->fail_producer_(module_type, -1, next.module_name,
+                                         false,
+                                         "peer member " +
+                                             std::to_string(
+                                                 role->owner_member) +
+                                             " aborted its weight pass");
+                    break;
+                }
+                if (!owner_ready) {
+                    auto waiting =
+                        plan.wait_since.emplace(
+                                flat, std::chrono::steady_clock::now())
+                            .first;
+                    const auto waited =
+                        std::chrono::steady_clock::now() - waiting->second;
+                    if (waited >= GPU_Weight_Buffer::kStallTimeout) {
+                        this->fail_producer_(
+                            module_type, -1, next.module_name, false,
+                            "peer member " +
+                                std::to_string(role->owner_member) +
+                                " has not passed barrier A of frame " +
+                                std::to_string(flat) + " for " +
+                                std::to_string(
+                                    std::chrono::duration_cast<
+                                        std::chrono::seconds>(waited)
+                                        .count()) +
+                                " s (module " + next.module_name + ")");
+                        break;
+                    }
+                    // Not an error and not progress: the loop goes on to
+                    // serve the on-demand and KV queues, then backs off.
+                    progressed = false;
+                    continue;
+                }
+                plan.wait_since.erase(flat);
+            }
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
             std::optional<std::reference_wrapper<module_weight_tensor_map>>
@@ -575,6 +789,65 @@ void HtoD_Engine::HtoD_Worker() {
                         module_type + " is not its cursor module " +
                         next.module_name);
                 }
+                if (role != nullptr &&
+                    role->kind ==
+                        static_cast<uint8_t>(WeightRecordKind::Replica)) {
+                    // Pull the owner's landed slot over NVLink. No host
+                    // acquisition and no daemon lease on this path.
+                    ReplicaPlanRuntime& plan = *this->replica_plan_;
+                    const auto claim = this->gpu_weight_buffer_.claim_for_copy(
+                        module_type, buffer_idx, module_name);
+                    queue.try_pop(module_name);
+                    queue.push(module_name);
+                    if (claim == WeightProduction::kSkip) {
+                        this->gpu_weight_buffer_.retire_skip(module_type,
+                                                             module_name);
+                        this->count_module_(this->skipped_modules_,
+                                            module_type);
+                        this->replica_mark_terminal_(flat);
+                        this->set_producer_state_(ProducerState::kIdle, "");
+                        continue;
+                    }
+                    this->set_producer_state_(ProducerState::kCopying,
+                                              module_name, next.pass);
+                    const uint64_t slot_index = plan.block.owned_slot(
+                        static_cast<size_t>(role->owner_member), flat,
+                        role->record_index);
+                    if (slot_index == ReplicaControlBlock::kNone) {
+                        throw std::runtime_error(
+                            "owner passed barrier A of frame " +
+                            std::to_string(flat) + " without publishing " +
+                            module_name);
+                    }
+                    const int64_t stride = plan.stride.at(module_type);
+                    char* src = static_cast<char*>(
+                                    plan.segment_base.at(module_type)
+                                        [role->owner_member]) +
+                                static_cast<int64_t>(slot_index) * stride;
+                    char* dst = static_cast<char*>(
+                                    plan.segment_base.at(module_type)
+                                        [plan.member_index]) +
+                                buffer_idx * stride;
+                    cudaStream_t stream =
+                        plan.pull_streams[role->owner_member];
+                    CUDA_CHECK(cudaMemcpyAsync(dst, src,
+                                               static_cast<size_t>(stride),
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    const bool present =
+                        this->gpu_weight_buffer_.weights_copy_complete(
+                            module_type, module_name, buffer_idx);
+                    this->count_module_(this->replica_pulled_modules_,
+                                        module_type);
+                    if (!present) {
+                        this->count_module_(
+                            this->released_on_landing_modules_, module_type);
+                    }
+                    this->replica_mark_terminal_(flat);
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                    continue;
+                }
                 this->set_producer_state_(ProducerState::kAcquiring,
                                           module_name, next.pass);
                 auto fetched =
@@ -601,6 +874,19 @@ void HtoD_Engine::HtoD_Worker() {
                 queue.try_pop(module_name);
                 queue.push(module_name);
                 if (claim == WeightProduction::kSkip) {
+                    if (role != nullptr &&
+                        role->kind == static_cast<uint8_t>(
+                                          WeightRecordKind::HostShared)) {
+                        // Produce-only (copy for the peers, release without
+                        // a consumer) is not wired yet, and no enabled
+                        // configuration can reach it: replicated schedules
+                        // never skip. Fail loud rather than strand peers.
+                        throw std::runtime_error(
+                            "routing-informed skip of HostShared module " +
+                            module_name +
+                            " needs the produce-only path, which this "
+                            "transport slice does not implement");
+                    }
                     // No copy, but the daemon lease is still released so the
                     // node FIFO advances. The cursor moves past the module
                     // only after that, so its pass cannot end while the lease
@@ -610,6 +896,9 @@ void HtoD_Engine::HtoD_Worker() {
                     this->gpu_weight_buffer_.retire_skip(module_type,
                                                          module_name);
                     this->count_module_(this->skipped_modules_, module_type);
+                    if (role != nullptr) {
+                        this->replica_mark_terminal_(flat);
+                    }
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
                 }
@@ -694,6 +983,27 @@ void HtoD_Engine::HtoD_Worker() {
                     this->count_module_(this->released_on_landing_modules_,
                                         module_type);
                 }
+                if (role != nullptr &&
+                    role->kind == static_cast<uint8_t>(
+                                      WeightRecordKind::HostShared)) {
+                    if (!present) {
+                        throw std::runtime_error(
+                            "HostShared module " + module_name +
+                            " was released on landing; the produce-only "
+                            "path is not implemented in this slice");
+                    }
+                    ReplicaPlanRuntime& plan = *this->replica_plan_;
+                    this->gpu_weight_buffer_.arm_peer_release_gate(
+                        module_type, buffer_idx, static_cast<int64_t>(flat));
+                    plan.block.publish_slot(plan.member_index, flat,
+                                            role->record_index,
+                                            static_cast<uint64_t>(
+                                                buffer_idx));
+                    this->replica_mark_owned_landed_(flat);
+                }
+                if (role != nullptr) {
+                    this->replica_mark_terminal_(flat);
+                }
                 this->set_producer_state_(ProducerState::kIdle, "");
             } catch (const std::exception& error) {
                 // Never rethrow: an exception leaving this thread is
@@ -761,6 +1071,7 @@ void HtoD_Engine::set_weight_copy_queue(
         this->copied_modules_.clear();
         this->skipped_modules_.clear();
         this->released_on_landing_modules_.clear();
+        this->replica_pulled_modules_.clear();
         if (this->producer_state_ == static_cast<int>(ProducerState::kFailed)) {
             this->producer_state_ = static_cast<int>(
                 this->HtoD_worker_.joinable() ? ProducerState::kIdle

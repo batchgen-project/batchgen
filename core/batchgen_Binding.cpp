@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include "GPU_Weight_Buffer/replica_control_block.h"
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
 #include "KV_Storage/host_prefix_cache_coordinator.h"
@@ -612,6 +613,23 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Cohort replica control block helpers: python owns the shared host
+    // mapping (a node memfd tensor); rank 0 initializes the header once and
+    // the engine attaches at plan install.
+    m.def("replica_control_block_bytes",
+          [](int64_t members, int64_t records_per_frame) {
+              return static_cast<int64_t>(ReplicaControlBlock::bytes_required(
+                  static_cast<size_t>(members),
+                  static_cast<size_t>(records_per_frame)));
+          });
+    m.def("replica_control_block_initialize",
+          [](torch::Tensor mapping, int64_t members,
+             int64_t records_per_frame) {
+              ReplicaControlBlock::initialize(
+                  mapping.data_ptr(), static_cast<size_t>(mapping.nbytes()),
+                  static_cast<size_t>(members),
+                  static_cast<size_t>(records_per_frame));
+          });
     py::class_<BatchGen>(m, "batchgen")
         .def(py::init<py::object, py::object, Weights_Storage&>())
         .def("Init", &BatchGen::Init)
@@ -637,6 +655,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("set_phase", &BatchGen::set_phase)
         .def("clear_kv_storage", &BatchGen::clear_kv_storage)
         .def("clear_kv_copy_queue", &BatchGen::clear_kv_copy_queue)
+        .def("install_replica_plan", &BatchGen::install_replica_plan)
+        .def("uninstall_replica_plan", &BatchGen::uninstall_replica_plan)
+        .def("ring_segments", &BatchGen::ring_segments)
+        .def("ring_stride", &BatchGen::ring_stride)
         .def("clear_kv_buffer", &BatchGen::clear_kv_buffer)
         .def("reset_prefill_buffer", &BatchGen::reset_prefill_buffer)
         .def("create_fake_kv_storage", &BatchGen::create_fake_kv_storage)

@@ -1592,6 +1592,10 @@ class BatchGenWorker:
 		# Prefill MoE mode of the most recent prefill entry; see
 		# _desired_phase_key("decode").
 		self._prefill_moe_mode_in_effect = None
+		# Node replica weight transport (spec v4 slice 2): True while a plan
+		# is installed in the core engine for the live prefill phase.
+		self._replica_plan_installed = False
+		self._replica_block_cache = {}
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -11006,6 +11010,226 @@ class BatchGenWorker:
 			for module_type, names in sorted((weight_copy_task or {}).items())
 		)
 
+	def _uninstall_replica_transport(self) -> None:
+		"""Tear the replica plan down in the spec v4 order (4.5).
+
+		The producer is already stopped by every caller. The group barrier
+		orders every member's last pull before any member drops its imports
+		or rebuilds its ring; a group of one passes it trivially.
+		"""
+		if not getattr(self, "_replica_plan_installed", False):
+			return
+		dist.barrier()
+		self.core_engine.uninstall_replica_plan()
+		self._replica_plan_installed = False
+
+	def _install_replica_transport(self) -> None:
+		"""Install the node replica weight transport for this prefill phase.
+
+		Forms the replica group from per-rank topology records, derives the
+		frame layout from the installed task's module names, and hands the
+		engine the plan, the cohort control block and every member's ring
+		segments. A rank that cannot participate (no frame grammar, daemon
+		or hierarchical source, no peer access, group of one) runs the
+		degenerate single-member group: the uninstalled engine, which is the
+		same record state machine with every record HostPrivate.
+		"""
+		from batchgen.weight_replica_group import (
+			RankRecord,
+			compute_replica_groups,
+			derive_frame_plan,
+			derive_owner_map,
+			install_record_kinds,
+		)
+
+		def _decline(reason: str) -> None:
+			if self.rank == 0:
+				logging.info(
+					"[REPLICA] transport not installed: %s", reason
+				)
+
+		if not dist.is_initialized():
+			_decline("torch.distributed is not initialized")
+			return
+		if getattr(self.args, "distributed_weight_config", None):
+			_decline("daemon-backed weight source (spec v4, 4.1)")
+			return
+		transport = getattr(
+			self.parallel_manager, "_distributed_weight_transport", None
+		)
+		if transport == "hierarchical_gdr":
+			_decline("hierarchical_gdr weight source (spec v4, 4.1)")
+			return
+		plan = derive_frame_plan(self.weight_copy_task)
+		if plan is None:
+			_decline("installed task does not fit the layer grammar")
+			return
+		with open("/proc/sys/kernel/random/boot_id") as handle:
+			boot_id = handle.read().strip()
+		record = RankRecord(
+			node_identity=f"{boot_id}:{socket.gethostname()}",
+			device_index=self.local_rank,
+			peer_access_row=[
+				bool(torch.cuda.can_device_access_peer(self.local_rank, j))
+				if j != self.local_rank else True
+				for j in range(self.local_world_size)
+			],
+			list_fingerprint=str(
+				self._weight_copy_task_fingerprint(self.weight_copy_task)
+			),
+			weight_source_kind="local",
+			rank=self.rank,
+		)
+		gathered = [None] * self.world_size
+		dist.all_gather_object(gathered, record)
+		groups = compute_replica_groups({r.rank: r for r in gathered})
+		group = sorted(groups[self.rank])
+		if len(group) < 2:
+			_decline("replica group has one member")
+			return
+		owners = derive_owner_map(group, self.weight_copy_task, plan)
+		kinds = install_record_kinds(self.rank, group, owners)
+		member_index = group.index(self.rank)
+		layers_per_pass = len(plan.layer_sequence)
+		# Record indices: one frame's records in (sorted type, in-frame
+		# position) order, identical on every member.
+		type_offsets = {}
+		offset = 0
+		for module_type in sorted(plan.frame_size):
+			type_offsets[module_type] = offset
+			offset += plan.frame_size[module_type]
+		records_per_frame = offset
+		modules = []
+		owned_per_position = [0] * layers_per_pass
+		for module_type in sorted(self.weight_copy_task):
+			names = self.weight_copy_task[module_type]
+			if not names:
+				continue
+			ring_slots = int(
+				self.engine_config.GPU_Buffer_Config
+				.num_prefill_module_buffer[module_type]
+			)
+			if ring_slots < 2 * plan.frame_size[module_type]:
+				# A ring that cannot hold the two-frame rendezvous cannot
+				# replicate; the model keeps its single-member behaviour.
+				_decline(
+					f"ring capacity for {module_type} is {ring_slots} "
+					f"slots, the two-frame rendezvous needs "
+					f"{2 * plan.frame_size[module_type]}"
+				)
+				return
+			for name in names:
+				layer_position, expert = plan.position[name]
+				record_index = type_offsets[module_type] + (
+					0 if expert is None else expert
+				)
+				owner_member = group.index(owners[name])
+				kind = {"HostShared": 0, "HostPrivate": 1, "Replica": 2}[
+					kinds[name]
+				]
+				modules.append(
+					(
+						module_type,
+						name,
+						kind,
+						owner_member,
+						layer_position,
+						record_index,
+					)
+				)
+				if owners[name] == self.rank:
+					owned_per_position[layer_position] += 1
+		# owned_per_position counted every pass-wide module once per layer
+		# position already (each name is one record of its frame).
+		owned_per_position = [
+			count // 1 for count in owned_per_position
+		]
+		# The control block: one shared node mapping per geometry, reused
+		# across installs of the same shape.
+		key = (len(group), records_per_frame)
+		cached = self._replica_block_cache.get(key)
+		if cached is None:
+			nbytes = int(
+				core_engine.replica_control_block_bytes(
+					len(group), records_per_frame
+				)
+			)
+			storage, memfd = allocate_node_shared_tensor(
+				label=(
+					f"{self._query_book_shm_prefix}replica_block_"
+					f"{len(group)}x{records_per_frame}"
+				),
+				rows=nbytes,
+				width=1,
+				dtype=torch.uint8,
+				is_creator=self.local_rank == 0,
+				exchange=self._exchange_node_memfd_identity,
+				barrier=dist.barrier,
+			)
+			cached = (storage.view(-1), memfd)
+			self._replica_block_cache[key] = cached
+		block_tensor = cached[0]
+		if member_index == 0:
+			core_engine.replica_control_block_initialize(
+				block_tensor, len(group), records_per_frame
+			)
+		dist.barrier()
+		# Ring segments: every member exports each type's single segment.
+		from torch.multiprocessing.reductions import reduce_tensor
+
+		local_segments = {}
+		handles = {}
+		strides = {}
+		for module_type in sorted(plan.frame_size):
+			segments = self.core_engine.ring_segments(module_type)
+			if len(segments) != 1:
+				raise RuntimeError(
+					f"Rank {self.rank}: {module_type} ring holds "
+					f"{len(segments)} segments; the replica transport "
+					"expects the single prefill segment"
+				)
+			local_segments[module_type] = segments[0]
+			handles[module_type] = reduce_tensor(segments[0])
+			strides[module_type] = int(
+				self.core_engine.ring_stride(module_type)
+			)
+		gathered_handles = [None] * self.world_size
+		dist.all_gather_object(gathered_handles, handles)
+		peer_segments = {}
+		for module_type in sorted(plan.frame_size):
+			per_member = []
+			for member_rank in group:
+				if member_rank == self.rank:
+					per_member.append(local_segments[module_type])
+				else:
+					rebuild, args = gathered_handles[member_rank][
+						module_type
+					]
+					per_member.append(rebuild(*args))
+			peer_segments[module_type] = per_member
+		self.core_engine.install_replica_plan(
+			member_index,
+			len(group),
+			layers_per_pass,
+			records_per_frame,
+			owned_per_position,
+			modules,
+			block_tensor,
+			peer_segments,
+			strides,
+		)
+		self._replica_plan_installed = True
+		if self.rank == group[0]:
+			logging.info(
+				"[REPLICA] installed: group=%s member=%d records/frame=%d "
+				"layers/pass=%d fingerprint=%s",
+				group,
+				member_index,
+				records_per_frame,
+				layers_per_pass,
+				record.list_fingerprint[:16],
+			)
+
 	def _install_prefill_weight_copy_pipeline(self, k3_prefill_profile: bool) -> None:
 		"""Point the H2D copy engine at the prefill weight-copy schedule.
 
@@ -11028,6 +11252,7 @@ class BatchGenWorker:
 		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
 		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
+		self._uninstall_replica_transport()
 		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
 		if sp8_reentry:
 			# configure_prefill rebuilt the task from scratch, but the
@@ -11051,6 +11276,8 @@ class BatchGenWorker:
 			)
 			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		if not streamed_sp8 and any(self.weight_copy_task.values()):
+			self._install_replica_transport()
 		if any(self.weight_copy_task.values()):
 			self.core_engine.start_h2d_worker()
 		self._streamed_sp8_h2d_installed = streamed_sp8
@@ -11224,6 +11451,7 @@ class BatchGenWorker:
 		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
+		self._uninstall_replica_transport()
 		if live.phase == "prefill" and desired.phase == "decode":
 			if not self._streamed_sp8_h2d_installed:
 				self.core_engine.reset_decoding_buffer()

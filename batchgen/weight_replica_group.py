@@ -195,3 +195,133 @@ def ordered_replica_group(
 
 replica_groups = compute_replica_groups
 
+
+
+# ---------------------------------------------------------------------------
+# Frame derivation from the installed task's module names (spec v4, 4.3/4.7).
+#
+# The names follow the grammar the daemon and Weights_Storage already parse:
+#   routed_expert_<layer>_<expert>, attn_<layer>, shared_expert_<layer>.
+# Per type, consecutive entries group by layer; every type must yield the
+# SAME ordered layer sequence with a constant per-type frame size. A task
+# that does not fit forms single-member groups (every record HostPrivate):
+# the same record state machine with trivial barriers, never a second path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FramePlan:
+    """Frame layout derived from one installed weight-copy task."""
+
+    layer_sequence: tuple[int, ...]
+    frame_size: dict[str, int]
+    # module name -> (layer_position, expert index or None)
+    position: dict[str, tuple[int, int | None]]
+
+
+def _parse_module_name(module_type: str, name: str) -> tuple[int, int | None] | None:
+    prefix = f"{module_type}_"
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix):].split("_")
+    try:
+        numbers = [int(part) for part in tail]
+    except ValueError:
+        return None
+    if len(numbers) == 1:
+        return numbers[0], None
+    if len(numbers) == 2:
+        return numbers[0], numbers[1]
+    return None
+
+
+def derive_frame_plan(task: Mapping[str, Sequence[str]]) -> FramePlan | None:
+    """Derive the frame layout, or None when the task does not fit the grammar."""
+    layer_sequences: dict[str, list[int]] = {}
+    frame_size: dict[str, int] = {}
+    position: dict[str, tuple[int, int | None]] = {}
+    for module_type, names in task.items():
+        if not names:
+            continue
+        layers: list[int] = []
+        counts: list[int] = []
+        experts_seen: list[int | None] = []
+        for name in names:
+            parsed = _parse_module_name(module_type, name)
+            if parsed is None:
+                return None
+            layer, expert = parsed
+            if not layers or layer != layers[-1]:
+                layers.append(layer)
+                counts.append(0)
+            elif layers.count(layer) > 1:
+                return None  # a layer resumed after another layer: not frames
+            counts[-1] += 1
+            experts_seen.append(expert)
+        if len(set(layers)) != len(layers):
+            return None
+        if len(set(counts)) != 1:
+            return None  # ragged frames
+        frame_size[module_type] = counts[0]
+        layer_sequences[module_type] = layers
+        for name in names:
+            layer, expert = _parse_module_name(module_type, name)  # type: ignore[misc]
+            position[name] = (layers.index(layer), expert)
+    if not frame_size:
+        return None
+    sequences = {tuple(seq) for seq in layer_sequences.values()}
+    if len(sequences) != 1:
+        return None  # types disagree on the layer sequence
+    return FramePlan(
+        layer_sequence=next(iter(sequences)),
+        frame_size=dict(frame_size),
+        position=position,
+    )
+
+
+def derive_owner_map(
+    ordered_group: Sequence[int],
+    task: Mapping[str, Sequence[str]],
+    plan: FramePlan,
+) -> dict[str, int]:
+    """Owner rank per module: contiguous expert blocks for routed experts,
+    layer round-robin for single-module types (spec v4, 4.1)."""
+    group = list(ordered_group)
+    owners: dict[str, int] = {}
+    for module_type, names in task.items():
+        if not names:
+            continue
+        experts = plan.frame_size[module_type]
+        for name in names:
+            layer_position, expert = plan.position[name]
+            if expert is None:
+                owners[name] = group[layer_position % len(group)]
+            else:
+                if experts % len(group) != 0:
+                    raise ValueError(
+                        f"{module_type} frame size {experts} is not divisible "
+                        f"by the replica group size {len(group)}"
+                    )
+                owners[name] = group[expert // (experts // len(group))]
+    return owners
+
+
+def install_record_kinds(
+    rank: int,
+    ordered_group: Sequence[int],
+    owners: Mapping[str, int],
+) -> dict[str, str]:
+    """Record kind per module for `rank`. Within a replica group every
+    member's list is identical, so the readers are the whole group."""
+    group = list(ordered_group)
+    if rank not in group:
+        raise ValueError(f"rank {rank} is not in the replica group {group}")
+    kinds: dict[str, str] = {}
+    for module, owner in owners.items():
+        if owner == rank:
+            kinds[module] = (
+                "HostShared" if len(group) > 1 else "HostPrivate"
+            )
+        else:
+            kinds[module] = "Replica"
+    return kinds

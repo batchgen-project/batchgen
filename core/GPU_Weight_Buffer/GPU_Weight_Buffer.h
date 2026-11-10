@@ -137,6 +137,13 @@ class GPU_Weight_Buffer {
 
     static constexpr std::chrono::seconds kStallTimeout{300};
 
+    // Node replica transport: the reclaim gate for HostShared slots. The
+    // engine installs a predicate over the cohort control block's barrier
+    // B; nullptr means no gate (every reclaim proceeds on its event alone).
+    void set_peer_release_gate(std::function<bool(int64_t)> gate);
+    void arm_peer_release_gate(const std::string& module_type, int64_t index,
+                               int64_t frame);
+
    private:
     struct PendingRelease {
         cudaEvent_t event;
@@ -145,6 +152,16 @@ class GPU_Weight_Buffer {
 
     // Appends count slots of module_type carved from one allocation.
     void append_ring_slots_(const std::string& module_type, int64_t count);
+
+   public:
+    // The segment tensors backing a type's ring, in grow order, and the
+    // shared per-slot stride. Every rank lays a type out identically, so a
+    // peer addresses slot i of segment s as base + i * stride.
+    std::vector<torch::Tensor> ring_segments(
+        const std::string& module_type) const;
+    int64_t ring_stride(const std::string& module_type) const;
+
+   private:
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
     // Waits for every pending release and returns its slots to FREE.
@@ -163,6 +180,8 @@ class GPU_Weight_Buffer {
     std::shared_ptr<spdlog::logger> logger_;
 
     std::unordered_map<std::string, weight_buffers> buffers_;
+    std::unordered_map<std::string, std::vector<torch::Tensor>> segments_;
+    std::unordered_map<std::string, int64_t> segment_strides_;
     /* Thread safe buffers management */
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -171,6 +190,7 @@ class GPU_Weight_Buffer {
     std::optional<std::string> producer_failure_;  // under mutex_
     uint64_t progress_epoch_ = 0;                  // under mutex_
     std::deque<PendingRelease> pending_releases_;
+    std::function<bool(int64_t)> peer_release_gate_;  // under mutex_
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

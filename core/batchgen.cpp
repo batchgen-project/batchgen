@@ -451,6 +451,48 @@ void BatchGen::start_h2d_worker() {
     this->h2d_engine_.Start();
 }
 
+void BatchGen::install_replica_plan(
+    int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+    uint32_t records_per_frame,
+    const std::vector<uint32_t>& owned_per_position,
+    const std::vector<std::tuple<std::string, std::string, int64_t, int64_t,
+                                 int64_t, int64_t>>& modules,
+    torch::Tensor control_block,
+    const std::unordered_map<std::string, std::vector<torch::Tensor>>&
+        peer_segments,
+    const std::unordered_map<std::string, int64_t>& strides) {
+    std::vector<HtoD_Engine::ReplicaModuleInstall> installs;
+    installs.reserve(modules.size());
+    for (const auto& [module_type, module, kind, owner, layer_position,
+                      record_index] : modules) {
+        HtoD_Engine::ReplicaModuleInstall install;
+        install.module_type = module_type;
+        install.module = module;
+        install.kind = static_cast<uint8_t>(kind);
+        install.owner_member = static_cast<int32_t>(owner);
+        install.layer_position = static_cast<uint32_t>(layer_position);
+        install.record_index = static_cast<uint32_t>(record_index);
+        installs.push_back(std::move(install));
+    }
+    this->h2d_engine_.install_replica_plan(
+        member_index, group_size, layers_per_pass, records_per_frame,
+        owned_per_position, installs, std::move(control_block),
+        peer_segments, strides);
+}
+
+void BatchGen::uninstall_replica_plan() {
+    this->h2d_engine_.uninstall_replica_plan();
+}
+
+std::vector<torch::Tensor> BatchGen::ring_segments(
+    const std::string& module_type) {
+    return this->gpu_weight_buffer_.ring_segments(module_type);
+}
+
+int64_t BatchGen::ring_stride(const std::string& module_type) {
+    return this->gpu_weight_buffer_.ring_stride(module_type);
+}
+
 
 void BatchGen::save_compressed_kv(){
     this->kv_storage_.save_compressed_kv();
