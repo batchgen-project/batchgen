@@ -15,7 +15,7 @@ import itertools
 import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
@@ -55,8 +55,8 @@ def _worker_methods(*names):
               if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(wanted) == len(names), [node.name for node in wanted]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
-    namespace = {"List": List, "torch": torch, "SequenceStatus": SequenceStatus,
-                 "logging": logging}
+    namespace = {"List": List, "Optional": Optional, "torch": torch,
+                 "SequenceStatus": SequenceStatus, "logging": logging}
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in names}
 
@@ -72,6 +72,9 @@ _METHODS = (
     # The A/B arm the packer call sites resolve per batch; these fakes carry no
     # batchgen_debug, so it is always the default (profile) arm.
     "_prefix_rank_cost_profile_disabled",
+    # Placement scores with the server mode's prefill token cap.
+    "_server_prefill_token_cap",
+    "_server_prefill_moe_mode",
 )
 
 
@@ -124,6 +127,8 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             group_specs=[SimpleNamespace(raw_page_tokens=B)]),
         engine_config=SimpleNamespace(
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=CHUNK)),
+        # Startup resolved the server prefill mode: every wave is streamed.
+        _server_prefill_moe_mode_resolved=("streamed",),
         _active_batchgen_debug_for_sequences=lambda batch_sequences: (
             {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
         ),

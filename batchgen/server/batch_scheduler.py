@@ -26,6 +26,7 @@ from batchgen.server.io_struct import (
     FileStatus,
     ToolCall,
     ToolCallFunction,
+    retired_batchgen_debug_error,
 )
 from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.scheduling_pool import SchedulingPool
@@ -596,6 +597,17 @@ class BatchScheduler:
         if batch.status in {BatchStatus.CANCELLED, BatchStatus.CANCELLING}:
             logger.info(
                 "Batch %s already cancelled, skipping execution", batch_id
+            )
+            return
+
+        # POST /v1/batches refuses these keys; a batch stored before the
+        # refusal existed (the store survives restarts) fails here, before
+        # any of its requests reaches a worker.
+        retired_debug = retired_batchgen_debug_error(batch.batchgen_debug)
+        if retired_debug is not None:
+            logger.error("Batch %s: %s", batch_id, retired_debug)
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=retired_debug
             )
             return
 

@@ -185,6 +185,16 @@ python -m batchgen.launch_http_server \
 > (this build reads the `PYTORCH_CUDA_ALLOC_CONF` name, not `PYTORCH_ALLOC_CONF`) so fragmented reserved
 > HBM is reusable, so the resident-expert repack fits within the per-GPU budget alongside the KV cache.
 
+> **Prefill mode is fixed for the server.** Every prefill wave, including waves admitted after
+> decode has started, runs the one prefill MoE mode chosen at startup with
+> `--prefill-moe-mode {streamed,streamed_sp8,resident_ep}`. Unset, it is the streaming default
+> for the weight topology: on this topology `streamed_sp8`, where a wave that follows decode
+> releases the resident decode experts, prefills streamed, and the experts are rebuilt when
+> decode resumes. `--prefill-moe-mode resident_ep` runs every wave, the first included, against
+> the resident EP shard; it cannot be combined with `--enable-prefix-cache`. To run another
+> mode, start a server in that mode: no batch can change it, and a batch or turn that still
+> sends `batchgen_debug.k3_prefill_moe_mode` is refused with HTTP 400.
+
 Start node 0 first or together with node 1: node 1 waits a bounded time for node 0's control
 store. On two nodes `--cluster-fail-fast` is on by default, so a fatal worker error on either
 node, or the loss of either node, stops both servers with a nonzero exit and a CRITICAL

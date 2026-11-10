@@ -29,6 +29,13 @@ are orchestrated by the worker in a fixed order around these hooks.
 The worker calls these hooks at phase transitions and admission waves. The
 manager owns phase-instance state while the worker owns the surrounding
 device mechanics.
+
+Phase state is keyed by ``(phase, prefill_moe_mode, profile_overrides)``.
+The prefill MoE mode is fixed per server: it is chosen once at start
+(``--prefill-moe-mode``, else the manager's default), every ``PhaseKey`` the
+worker enters carries it, and the worker refuses an entry that carries
+another mode, naming both. No batch or debug flag changes it; only
+``profile_overrides`` may differ between waves.
 """
 
 from __future__ import annotations
@@ -48,10 +55,15 @@ class PhaseKey:
     equal key never rebuilds, while a key that differs from the live one
     forces ``phase_exit(RETIRE)`` followed by ``phase_enter``.
 
+    ``prefill_moe_mode`` is the server's prefill MoE mode, the same in every
+    key of a server's lifetime (see the module docstring); it is part of the
+    key so that keys compare whole, never to switch modes between waves.
+
     ``profile_overrides`` is the normalized projection of the batch-level
     debug/profile selections that change which instance is valid, as sorted
-    ``(name, value)`` pairs. The only selection that feeds phase selection
-    today is ``(("k3_prefill_profile", bool),)``.
+    ``(name, value)`` pairs, and the only field that may differ between
+    waves. The only selection that feeds phase selection today is
+    ``(("k3_prefill_profile", bool),)``.
     """
 
     phase: str
@@ -90,11 +102,26 @@ class ExitMode(enum.Enum):
     and the prefill H2D ring is
     released before decode builds (batchgen_worker.py:11603-11608).
 
+    A hold (a kept instance) may stay across the prefill-decode switch
+    only while the model it references is live: holding never pins a model
+    past its retirement. ``deep_free_model_memory`` is that retirement and
+    refuses to run under any hold, and a manager must not build a new
+    model skeleton while it still holds an instance of the previous one --
+    a hold that coexisted with the next ``_load_model_skeleton`` kept the
+    prior instances' device memory mapped under the new build and OOMed
+    the K3.1 4-node H20 startup. Release (RETIRE) every hold first.
+
     RETIRE: full deep free; nothing of the instance survives. This is
     today's rebuild path: ``deep_free_model_memory()`` before a prefill or
     decode rebuild (batchgen_worker.py:11291-11292, :11633) and the GPU KV
-    destroy (batchgen_worker.py:11295-11305). Used on a key mismatch,
-    cohort end, memory pressure and shutdown.
+    destroy (batchgen_worker.py:11295-11305). Used on a key mismatch (a
+    ``profile_overrides`` change; the prefill MoE mode never changes inside
+    a server), cohort end, memory pressure and shutdown.
+
+    The worker keeps the key every held instance was entered with: a held
+    instance is resumed only under that exact key, and a RETIRE retires
+    every held instance (each under its own key) before the deep free, so
+    no instance outlives the model it references.
     """
 
     SUSPEND = "suspend"

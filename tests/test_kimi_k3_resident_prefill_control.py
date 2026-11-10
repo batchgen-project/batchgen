@@ -46,6 +46,30 @@ def _isolated_method(path, class_name, function_name, globals_=None):
     return getattr(namespace["Isolated"], function_name)
 
 
+def _bind_prefill_mode_validator(manager, path):
+    """Bind the K3 manager's mode validator, which set/default delegate to."""
+    manager._resident_ep_built = getattr(manager, "_resident_ep_built", False)
+    manager._validated_prefill_moe_mode = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "_validated_prefill_moe_mode",
+        {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
+    ).__get__(manager)
+
+
+def _prefill_moe_modes(path):
+    """``PREFILL_MOE_MODES`` as the K3 manager module declares it."""
+    tree = ast.parse(path.read_text())
+    node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            getattr(target, "id", None) == "PREFILL_MOE_MODES"
+            for target in node.targets
+        )
+    )
+    return ast.literal_eval(node.value)
+
+
 def _call_guards(function):
     """Map each ``obj.name()`` call to the ``if`` tests enclosing it.
 
@@ -139,8 +163,11 @@ def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     manager = type("Manager", (), {})()
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed"
+    manager._latent_tp_planned = False
+    _bind_prefill_mode_validator(manager, path)
     manager.set_prefill_moe_mode = _isolated_method(
-        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
+        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode",
+        {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
     ).__get__(manager)
     manager.prefill_uses_resident_ep = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "prefill_uses_resident_ep"
@@ -173,6 +200,11 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
     manager._distributed_weight_sharded = True
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed_sp8"
+    manager._latent_tp_planned = False
+    manager.engine_config = SimpleNamespace(
+        Basic_Config=SimpleNamespace(prefill_moe_mode=None)
+    )
+    _bind_prefill_mode_validator(manager, path)
     default_mode = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
@@ -182,6 +214,7 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
         path,
         "KimiLinearParallelStrategyManager",
         "set_prefill_moe_mode",
+        {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
     ).__get__(manager)
 
     assert default_mode() == "streamed_sp8"
@@ -365,8 +398,11 @@ def test_resident_prefill_is_refused_for_non_k3():
     manager = type("Manager", (), {})()
     manager._is_k3 = False
     manager._prefill_moe_mode = "streamed"
+    manager._latent_tp_planned = False
+    _bind_prefill_mode_validator(manager, path)
     manager.set_prefill_moe_mode = _isolated_method(
-        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
+        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode",
+        {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
     ).__get__(manager)
     with pytest.raises(ValueError, match="only for Kimi-K3"):
         manager.set_prefill_moe_mode("resident_ep")
@@ -3675,32 +3711,6 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
         ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.h"
     ).read_text()
     assert "static constexpr std::chrono::seconds kStallTimeout{300};" in header
-
-
-def test_worker_reads_batch_level_mode_before_configure_prefill():
-    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
-    function = _function(
-        worker_path, "BatchGenWorker", "_config_prefill_for_batch"
-    )
-    calls = [
-        (
-            node.lineno,
-            (
-                node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else node.func.id if isinstance(node.func, ast.Name) else None
-            ),
-        )
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-    ]
-    set_mode = min(
-        line for line, name in calls if name == "set_prefill_moe_mode"
-    )
-    configure = min(
-        line for line, name in calls if name == "configure_prefill"
-    )
-    assert set_mode < configure
 
 
 def test_prefill_sync_happens_before_decoder_layers():
