@@ -2956,9 +2956,9 @@ class BatchGenWorker:
 		if self._trajectory_book is None:
 			raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
 		try:
-			# Slot numbers are local to a node's allocator.  Migration can release
-			# and later rebind the same UUID at a different slot, so never trust the
-			# stale process-global ``_buffer_slot`` field as the lookup key.
+			# Slot numbers are local to a node's allocator, so the same UUID holds
+			# different slots on different nodes; never trust the process-global
+			# ``_buffer_slot`` field (last set on another node) as the lookup key.
 			return self._trajectory_book.slot_for(seq.uuid)
 		except KeyError as exc:
 			raise RuntimeError(
@@ -6342,9 +6342,10 @@ class BatchGenWorker:
 				f"in {(time.perf_counter()-t0)*1000:.1f}ms"
 			)
 
-			# Receive and restore the complete trajectory into a destination
-			# reservation. The destination binds by UUID rather than trusting the
-			# source's stale integer slot (which may have been reused locally).
+			# Receive and restore the complete trajectory into the reservation
+			# admission made for this UUID on every rank of every node. Migration
+			# moves token content only; it never binds or releases a reservation,
+			# so the allocators of all ranks sharing this node's store stay equal.
 			header = torch.empty(5, dtype=torch.int64)
 			dist.recv(tensor=header, src=from_rank, group=gloo_group)
 			version, trajectory_length, prompt_length, decoded_length, turn_count = [
@@ -6364,12 +6365,12 @@ class BatchGenWorker:
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: trajectory book is unavailable during migration"
 				)
-			if self._trajectory_book.has_sequence(uuid):
-				destination_slot = self._trajectory_book.slot_for(uuid)
-			else:
-				destination_slot = self._trajectory_book.bind(
-					uuid, self.model_context_length
+			if not self._trajectory_book.has_sequence(uuid):
+				raise QueryBookPoolCapacityError(
+					f"Rank {self.rank}: migration destination has no admission "
+					f"reservation for {uuid[:8]}"
 				)
+			destination_slot = self._trajectory_book.slot_for(uuid)
 			self._trajectory_book.restore(
 				destination_slot,
 				trajectory_recv,
@@ -6441,23 +6442,10 @@ class BatchGenWorker:
 		migration_start = time.perf_counter()
 		self._execute_kv_migrations_parallel(migrations)
 		migration_end = time.perf_counter()
-		# Each node has its own trajectory allocator metadata. The migration round
-		# returns only after the destination has validated and restored the payload;
-		# release the source-node copy only then. Lookup is by UUID because a local
-		# slot number may have been reused by another sequence.
-		for mig in migrations:
-			if self._get_node_for_rank(mig.from_rank) == self._get_node_for_rank(mig.to_rank):
-				continue
-			if self._get_node_for_rank(self.rank) != self._get_node_for_rank(mig.from_rank):
-				continue
-			seq = self.global_batch.get_sequence(mig.uuid)
-			if (
-				seq is not None
-				and self._trajectory_book is not None
-				and self._trajectory_book.has_sequence(mig.uuid)
-			):
-				self._trajectory_book.release(self._trajectory_book.slot_for(mig.uuid))
-				self._publish_trajectory_pool_capacity()
+		# Trajectory reservations are not touched here: every rank of every node
+		# keeps the reservation admission made until completion or rejection
+		# releases it everywhere, so re-entry finds it on every rank and the
+		# allocators sharing one node store never diverge.
 		if self.rank == 0:
 			logging.info(
 				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
@@ -6563,8 +6551,8 @@ class BatchGenWorker:
 				self._bump_decode_row_epoch()
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
-				# Restore trajectory bytes into a destination reservation. The source
-				# slot number is node-local and may have been reused, so bind by UUID.
+				# Trajectory bytes go into the reservation admission made for this
+				# UUID; slot numbers are node-local, so look it up by UUID.
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
 					seq = self.global_batch.get_sequence(uuid)
@@ -6572,12 +6560,12 @@ class BatchGenWorker:
 						raise QueryBookPoolCapacityError(
 							f"Rank {self.rank}: trajectory book unavailable for migration receive {uuid[:8]}"
 						)
-					if self._trajectory_book.has_sequence(uuid):
-						destination_slot = self._trajectory_book.slot_for(uuid)
-					else:
-						destination_slot = self._trajectory_book.bind(
-							uuid, self.model_context_length
+					if not self._trajectory_book.has_sequence(uuid):
+						raise QueryBookPoolCapacityError(
+							f"Rank {self.rank}: migration destination has no admission "
+							f"reservation for {uuid[:8]}"
 						)
+					destination_slot = self._trajectory_book.slot_for(uuid)
 					logging.info(
 						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
 						f"restoring slot={destination_slot}, "
