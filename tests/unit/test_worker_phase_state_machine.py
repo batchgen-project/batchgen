@@ -697,6 +697,9 @@ def _k3_manager_class():
             self._latent_tp_planned = True
             self._stream_all_modules = False
             self._attn_tp_size = 8
+            # A planned stream span, as every K3 DP-attention profile row
+            # carries: the merged validator refuses streamed_sp8 without one.
+            self._stream_span = 8
             self.engine_config = SimpleNamespace(
                 EP_Config=SimpleNamespace(decode_moe_mode="resident_ep"),
                 Basic_Config=SimpleNamespace(prefill_moe_mode=None),
