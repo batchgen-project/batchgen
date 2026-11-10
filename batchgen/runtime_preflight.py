@@ -146,6 +146,7 @@ _DSA_FP8_HOPPER_EXTENSIONS = _ext(
     "moe._C_fp8_blockwise_gemm",
     "moe._C_fp8_blockwise_ops",
     "moe._C_routing",
+    "moe._C_routing_wgmma",
     "attention._C_fused_indexer_k_write_fp8",
     "attention._C_fused_q_split",
     "attention._C_qkv_wgmma",
@@ -160,6 +161,7 @@ _KDA_HOPPER_EXTENSIONS = _ext(
     "moe._C_dispatch_scatter_3d",
     "moe._C_marlin_grouped_gemm",
     "moe._C_routing",
+    "moe._C_routing_wgmma",
 )
 
 # Generic CUDA extensions selected by BUILD_ARCH=sm103a.  The Blackwell Kimi
@@ -208,6 +210,7 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_expert_mxfp4_wgmma",
             "moe._C_grouped_mxfp4_wgmma",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "attention._C_qkv_wgmma",
         ),
         require_deepgemm=True,
@@ -260,6 +263,7 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_fp8_blockwise_gemm",
             "moe._C_fp8_blockwise_ops",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "attention._C_fused_q_split",
             "attention._C_qkv_wgmma",
         ),
@@ -295,6 +299,7 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_marlin_grouped_gemm",
             "moe._C_marlin_transform",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "moe._C_single_expert_int4_wgmma",
             "attention._C_fused_q_split",
         ),
