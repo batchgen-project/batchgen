@@ -23,9 +23,9 @@ This page is the README-specific map of current model support. It is deliberatel
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
 
-### Known limitations in v1.2.0
+### Known limitations in v1.1.2
 
-- Kimi-K3.1-Pro does not support the prefix cache in this release; a launch with `--enable-prefix-cache` is refused.
+- Kimi-K3.1-Pro supports the prefix cache (`--enable-prefix-cache`) for reuse inside a planned prefill wave, as Kimi-K3 does; the cached pages carry both KV regions (MLA latent and FP8 index keys).
 - Kimi-K3.1-Pro's sparse-attention extensions are Hopper (sm90a) builds; an SM100 build is refused by the runtime preflight.
 - Kimi-K3.1-Pro with `--enable-deepep` is unsupported, as for Kimi-K3.
 
