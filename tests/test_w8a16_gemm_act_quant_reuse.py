@@ -448,7 +448,6 @@ FOLDED_SITES = [
 # they must keep their own per-call quantize and must NOT grow a pair.
 UNFOLDED_SITES = [
     ("batchgen/models/glm/glm5/model.py", "Glm5Indexer.compute_indexer_kv"),
-    ("batchgen/models/glm/glm5/model.py", "Glm5Indexer.score_and_select"),
     (
         "batchgen/models/glm/glm5/model.py",
         "Glm5Indexer.score_and_select_relu_gated",

@@ -225,6 +225,37 @@ def cuda_wq_b_proj_out(
 # ============================================================
 
 @triton.jit
+def _relu_gated_head_sum(
+    agg,               # [BLOCK_S] FP32 running aggregate (-inf where masked)
+    k_tile,            # [BLOCK_S, BLOCK_D] FP32, zero where masked
+    Q_ptr,
+    q_base,
+    GATES_ptr,
+    gates_base,
+    d_offs,
+    s_mask,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """THE GLM-5 indexer formula: ``agg[t] += sum_h g_h * relu(q_h . k_t)``.
+
+    This is the reference (HF modeling) and DeepGEMM ``fp8_paged_mqa_logits``
+    form; every Triton scorer below accumulates through this one helper so the
+    bf16 AoS profiles (GLM-5, GLM-5.1) and the page-split FP8 profiles
+    (GLM-5.2, GLM-5.3) select candidates by the same formula. The gates may
+    carry folded POSITIVE scales (``n_heads**-0.5 * head_dim**-0.5``), which is
+    exact because ``relu(c * x) == c * relu(x)`` for ``c > 0``.
+    """
+    for h in range(n_heads):
+        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
+        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
+        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
+        scores = tl.maximum(tl.sum(k_tile * q_vec[None, :], axis=1), 0.0)
+        agg += tl.where(s_mask, scores * gate, 0.0)
+    return agg
+
+
+@triton.jit
 def _fused_score_kernel(
     Q_ptr,             # [B, n_heads, head_dim] BF16
     K_ptr,             # [B, max_seqlen, head_dim] BF16
@@ -259,12 +290,10 @@ def _fused_score_kernel(
     q_base = pid_b * n_heads * head_dim
     gates_base = pid_b * n_heads
 
-    for h in range(n_heads):
-        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
-        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
-        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
-        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
-        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+    agg = _relu_gated_head_sum(
+        agg, k_tile, Q_ptr, q_base, GATES_ptr, gates_base, d_offs, s_mask,
+        n_heads=n_heads, head_dim=head_dim,
+    )
 
     agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
     tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
@@ -328,12 +357,10 @@ def _fused_paged_score_kernel(
     q_base = pid_b * n_heads * head_dim
     gates_base = pid_b * n_heads
 
-    for h in range(n_heads):
-        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
-        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
-        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
-        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
-        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+    agg = _relu_gated_head_sum(
+        agg, k_tile, Q_ptr, q_base, GATES_ptr, gates_base, d_offs, s_mask,
+        n_heads=n_heads, head_dim=head_dim,
+    )
 
     agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
     tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
@@ -426,12 +453,10 @@ def _fused_paged_score_with_slots_kernel(
     q_base = pid_b * n_heads * head_dim
     gates_base = pid_b * n_heads
 
-    for h in range(n_heads):
-        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
-        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
-        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
-        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
-        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+    agg = _relu_gated_head_sum(
+        agg, k_tile, Q_ptr, q_base, GATES_ptr, gates_base, d_offs, s_mask,
+        n_heads=n_heads, head_dim=head_dim,
+    )
 
     agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
     tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
@@ -1097,12 +1122,13 @@ def reference_score_and_select(
     # Head gates
     head_gates = compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim)
 
-    # Q×K scoring — chunked per-head to avoid OOM at large seqlens
+    # ReLU-gated Q×K scoring (sum_h g_h * relu(q_h . k_t)) — chunked per-head
+    # to avoid OOM at large seqlens
     aggregated = torch.zeros(B, max_seqlen, dtype=torch.float32, device=q.device)
     q_f = q.float()
     for h in range(n_heads):
         s = torch.bmm(q_f[:, h:h+1, :], cached_k.float().transpose(1, 2))
-        aggregated += s.squeeze(1) * head_gates[:, h:h+1]
+        aggregated += torch.relu(s.squeeze(1)) * head_gates[:, h:h+1]
     pos_idx = torch.arange(max_seqlen, device=q.device).unsqueeze(0)
     mask = pos_idx >= cache_seqlens.unsqueeze(1)
     aggregated.masked_fill_(mask, float("-inf"))

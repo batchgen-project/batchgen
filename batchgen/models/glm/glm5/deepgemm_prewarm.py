@@ -350,8 +350,6 @@ CALL_SITES: Dict[Tuple[str, str, str], Tuple[int, Any]] = {
     # Indexer and MLP modules.
     (_GLM5 + "model.py", "Glm5Indexer.compute_indexer_kv", "w8a16_gemm"):
         (1, ("indexer_wk",)),
-    (_GLM5 + "model.py", "Glm5Indexer.score_and_select", "w8a16_gemm"):
-        (1, "unreachable: reference scorer, no GLM-5 caller"),
     (_GLM5 + "model.py", "Glm5Indexer.score_and_select_relu_gated",
      "w8a16_gemm"): (1, "unreachable: reference scorer, no GLM-5 caller"),
     (_GLM5 + "model.py", "Glm5Expert.deepgemm_forward", "w8a16_gemm"):
