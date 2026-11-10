@@ -56,9 +56,15 @@ import torch
 
 channel = sys.argv[1]
 cuda = f"{channel[2:-1]}.{channel[-1]}"
+# Pinned Torch per CUDA channel. Keep in sync with
+# batchgen/runtime_preflight.py::_TORCH_PINS.
+pins = {"cu128": "2.9.0", "cu132": "2.15.0"}
+pin = pins.get(channel)
 print(f"[build-source-runtime] python={sys.executable} torch={torch.__version__} cuda={torch.version.cuda}")
-if not torch.__version__.startswith("2.9.0") or torch.version.cuda != cuda:
-    sys.exit(f"expected torch 2.9.0 with CUDA {cuda} ({channel})")
+if pin is None:
+    sys.exit(f"unsupported TORCH_CUDA_CHANNEL {channel}; expected one of {sorted(pins)}")
+if not torch.__version__.startswith(pin) or torch.version.cuda != cuda:
+    sys.exit(f"expected torch {pin} with CUDA {cuda} ({channel})")
 PY
 
 # Optional compile cache: identical sources in another worktree hit the cache

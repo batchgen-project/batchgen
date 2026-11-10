@@ -25,7 +25,8 @@
 #include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
-#include "Weights_Storage/Weights_Storage.h" 
+#include "Parameter_Server/posix_shm.h"
+#include "Weights_Storage/Weights_Storage.h"
 #include "Weights_Storage/distributed_weight_daemon.h"
 #include "allocator.h"
 #include "data_structures.h"
@@ -1201,6 +1202,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("host_empty_cache", &at::cuda::CachingHostAllocator_emptyCache,
           "Empty the cache of caching host allocator");
+    m.def("plan_host_registration_segments",
+          &plan_host_registration_segments, py::arg("tensor_extents"),
+          py::arg("total_bytes"), py::arg("max_segment_bytes"),
+          py::arg("page_bytes"),
+          "cudaHostRegister segments [begin, end) that never cut a tensor.");
+    m.attr("MAX_HOST_REGISTRATION_BYTES") = kMaxHostRegistrationBytes;
     // Add version info
     m.attr("__version__") = "0.1.0";
 }

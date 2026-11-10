@@ -5,6 +5,14 @@ from .builder import CUDAOpBuilder
 BATCHGEN_CORE_ROOT = "core/"
 
 
+def _torch_cxx_std() -> str:
+    """C++ standard required by the active Torch (>=2.15 headers need C++20)."""
+    import torch
+
+    major, minor = (int(part) for part in torch.__version__.split("+")[0].split(".")[:2])
+    return "-std=c++20" if (major, minor) >= (2, 15) else "-std=c++17"
+
+
 def _libucx_paths():
     """Locate the pip-installed ``libucx-cu12`` wheel's headers/libs.
 
@@ -78,7 +86,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
         
         args = [
             "-O2",
-            "-std=c++17",  # Must be C++17 for PyTorch
+            _torch_cxx_std(),  # C++ standard the active Torch headers require
             "-fPIC",
             "-Wall",
             "-fipa-pta",
@@ -99,7 +107,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
         args += [
             "-O3",
             "--use_fast_math",
-            "-std=c++17",  # Match C++ standard
+            _torch_cxx_std(),  # Match C++ standard
         ]
         return args
 

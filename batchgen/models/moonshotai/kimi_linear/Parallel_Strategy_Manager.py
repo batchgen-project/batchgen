@@ -1460,9 +1460,10 @@ class KimiLinearParallelStrategyManager:
         if self._resident_ep_built:
             self._assert_resident_ep_attached()
             return
-        assert self._comm is not None, (
+        assert self.world_size == 1 or self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
-            "it via configure_decoding(comm=...) or set_comm)"
+            "it via configure_decoding(comm=...) or set_comm); world_size 1 "
+            "runs without collectives and needs none"
         )
         cfg = self.loaded_model_config
         device = self.engine_config.Basic_Config.device_torch
