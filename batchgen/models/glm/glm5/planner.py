@@ -68,6 +68,8 @@ class GLM5Planner(BasePlanner):
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "shared_expert"
             ] = 2
+            # Replica transport keeps two attention frames in flight.
+            self.config.GPU_Buffer_Config.num_prefill_module_buffer["attn"] = 2
             # Device memory the prefill prefix pool leaves for the forward.
             # Measured on a pooled 64k-token-prefix wave (8xH200, 2026-11-03):
             # between the budget measurement and the chunk forward the prefill
