@@ -195,3 +195,13 @@ cascading failures are marked as secondary. Read the ROOT CAUSE line first —
 the fix is host memory pressure (usually `--host-kv-cache-size` too large for
 the node, see the `[MEM-PLAN host]` line at launch), not the collective that
 happened to report last.
+
+## 12. GPT-OSS preflight fails with `tokenizer encoding 'o200k_base' is not staged`
+
+The GPT-OSS tokenizer reads tiktoken's `o200k_base` ranks from the copy the installer
+stages in the Python environment (`<prefix>/share/batchgen/tokenizer-assets/`) and never
+downloads them at run time. The environment was installed without that step, or the file
+was altered. Run `python -m batchgen.config.tokenizer_assets stage` with internet access,
+or on an offline node stage a copy obtained elsewhere with
+`python -m batchgen.config.tokenizer_assets stage --from /path/to/o200k_base.tiktoken`;
+the command refuses a file whose SHA-256 differs from the pinned digest.

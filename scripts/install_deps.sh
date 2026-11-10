@@ -609,6 +609,21 @@ PY
     fi
 }
 
+stage_tokenizer_assets() {
+    # Tokenizer encoding files (GPT-OSS's o200k_base) are install assets: the
+    # runtime reads the staged, SHA-256-verified copy and never downloads
+    # them. Offline nodes stage a copy obtained elsewhere with
+    #   python -m batchgen.config.tokenizer_assets stage --from <file>
+    print_step "Staging tokenizer encoding assets..."
+    if in_neutral_dir python -m batchgen.config.tokenizer_assets stage; then
+        print_success "Tokenizer encoding assets staged and verified"
+    else
+        print_error "Could not stage the tokenizer encoding assets; on an offline node run:"
+        print_error "  python -m batchgen.config.tokenizer_assets stage --from <o200k_base.tiktoken>"
+        return 1
+    fi
+}
+
 cleanup() {
     if [[ "$KEEP_BUILD_DIR" != "1" ]]; then
         print_step "Cleaning up build directory..."
@@ -884,6 +899,7 @@ main() {
         fi
         install_batchgen_kernels
         install_batchgen
+        stage_tokenizer_assets
     else
         if [[ $INSTALL_FLASH_ATTN -eq 1 ]]; then
             install_flash_attention
@@ -897,6 +913,7 @@ main() {
         if [[ $INSTALL_BATCHGEN -eq 1 ]]; then
             install_batchgen_kernels
             install_batchgen
+            stage_tokenizer_assets
         fi
     fi
 

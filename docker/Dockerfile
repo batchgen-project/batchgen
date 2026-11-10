@@ -100,6 +100,10 @@ RUN cd /root/moegen/batchgen_kernels \
 RUN uv pip install -r requirements.txt && uv pip install . -v \
     && uv cache clean
 
+# Stage the hash-verified tokenizer encodings (GPT-OSS o200k_base); the
+# runtime reads them from the environment and never downloads them.
+RUN cd / && python -m batchgen.config.tokenizer_assets stage
+
 ENV NCCL_BUFFSIZE=16777216
  
 CMD ["sleep", "infinity"]

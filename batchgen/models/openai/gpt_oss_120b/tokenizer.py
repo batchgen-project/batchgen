@@ -42,6 +42,7 @@ import tiktoken
 import torch
 
 from batchgen.config.base_tokenizer import BaseTokenizer
+from batchgen.config.tokenizer_assets import O200K_BASE, load_tiktoken_ranks
 from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -79,18 +80,20 @@ def _get_tiktoken_tokenizer() -> tiktoken.Encoding:
     """Create GPT-OSS tiktoken tokenizer.
 
     This follows the OpenAI reference implementation from
-    gpt-oss/gpt_oss/tokenizer.py.
+    gpt-oss/gpt_oss/tokenizer.py, except that the o200k_base ranks come from
+    the installer-staged, hash-verified file (``batchgen.config.tokenizer_assets``)
+    instead of ``tiktoken.get_encoding``, which downloads them on first use.
+    A missing file raises ``TokenizerAssetError`` naming the staging command.
 
     Returns:
         tiktoken.Encoding configured for GPT-OSS
     """
-    o200k_base = tiktoken.get_encoding("o200k_base")
     tokenizer = tiktoken.Encoding(
         name="o200k_harmony",
-        pat_str=o200k_base._pat_str,
-        mergeable_ranks=o200k_base._mergeable_ranks,
+        pat_str=O200K_BASE.pat_str,
+        mergeable_ranks=load_tiktoken_ranks(O200K_BASE),
         special_tokens={
-            **o200k_base._special_tokens,
+            **O200K_BASE.special_tokens,
             **GPT_OSS_SPECIAL_TOKENS,
             # Reserved tokens from 200013 to 201087
             **{f"<|reserved_{i}|>": i for i in range(200013, 201088)},
