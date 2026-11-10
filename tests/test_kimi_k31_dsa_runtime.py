@@ -112,9 +112,12 @@ def test_the_third_party_callables_the_dsa_paths_call_are_declared():
     assert _imports(fa3) == [("flash_attn_interface", ["flash_attn_with_kvcache"])]
     assert sparse_dispatch.SITE_SYMBOLS["fa3"] == {
         "flash_attn_interface": ("flash_attn_with_kvcache",)}
+    # The Blackwell decode launch is the one the dense seam shares.
     decode = _function(seam_tree, "_trtllm_sparse_decode")
+    assert "trtllm_gen_mla.trtllm_gen_mla_decode" in ast.unparse(decode)
+    shared = _function(_tree(SEAM.parent / "trtllm_gen_mla.py"), "trtllm_gen_mla_decode")
     prefill_seam = _function(seam_tree, "_flashmla_sparse_prefill")
-    assert _imports(decode) == [
+    assert _imports(shared) == [
         ("flashinfer.mla", ["trtllm_batch_decode_with_kv_cache_mla"])]
     assert _imports(prefill_seam) == [("flash_mla", ["flash_mla_sparse_fwd"])]
     assert sparse_dispatch.SITE_SYMBOLS["blackwell"] == {
