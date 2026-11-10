@@ -51,6 +51,15 @@ MODEL_BYTE_SIZES = {
     # Kimi K2.5: ~580GB INT4 experts + ~20GB BF16 (attn/shared/embed) ≈ 600GB + buffer
     "moonshotai/Kimi-K2.5": 650 * 1024**3,
     "moonshotai/Kimi-K2.6": 650 * 1024**3,
+    # Kimi-Linear-48B-A3B: ~96 GiB BF16 total; 110 GiB with buffer, the
+    # constant its parameter server reserves (_KIMI_LINEAR_48B_BYTE_SIZE).
+    "moonshotai/Kimi-Linear-48B-A3B-Instruct": 110 * 1024**3,
+    # Kimi-K3: the released checkpoint's metadata.total_size
+    # (1,560,860,324,864 B) plus one 4 KiB alignment unit per shard (96), the
+    # reservation k3_shm_byte_size computes from that index. Kimi-K3.1-Pro is
+    # the same rule on its own index (1,561,217,377,280 B, 96 shards).
+    "moonshotai/Kimi-K3": 1_560_860_324_864 + 96 * 4096,
+    "moonshotai/Kimi-K3.1-Pro": 1_561_217_377_280 + 96 * 4096,
     # MiniMax-M2.5: ~225GB FP8 experts + ~8GB BF16 (attn/embed/router) ≈ 233GB
     "MiniMaxAI/MiniMax-M2.5": 250 * 1024**3,
     # GLM-5-FP8: 675GB FP8 experts + 17.3GB attn+DSA + 4.5GB embed/dense ≈ 700GB + buffer
@@ -61,12 +70,10 @@ MODEL_BYTE_SIZES = {
     "zai-org/GLM-5.1-FP8": 760 * 1024**3,
     "zai-org/GLM-5.1": 1400 * 1024**3,
     # GLM-5.2 / GLM-5.2-FP8: same architecture family + sizes as GLM-5.1.
-    # Exact entries are required: the partial match below would otherwise hit
-    # the BF16 "zai-org/GLM-5" 1400 GB entry first and over-reserve hugepages.
     "zai-org/GLM-5.2-FP8": 760 * 1024**3,
     "zai-org/GLM-5.2": 1400 * 1024**3,
     # GLM-5.3 FP8 has the same released tensor total and host-weight envelope
-    # as GLM-5.2 FP8; keep exact entries ahead of the broad GLM-5 partial match.
+    # as GLM-5.2 FP8.
     "zai-org/GLM-5.3-FP8": 760 * 1024**3,
     "zai-org/GLM-5.3": 1400 * 1024**3,
 }
@@ -80,18 +87,21 @@ def _model_byte_size_index():
 
 _MODEL_BYTE_SIZE_INDEX = _model_byte_size_index()
 
-# Default byte_size when model not in lookup (700GB for backwards compatibility)
-DEFAULT_MODEL_BYTE_SIZE = 700 * 1024**3
+
+class UnknownModelByteSizeError(ValueError):
+    """``--model`` names no model with a host weight envelope."""
 
 
 def get_model_byte_size(model_name: str) -> int:
-    """Get model byte_size from lookup table.
+    """Host weight envelope of ``model_name``, in bytes.
 
     Args:
         model_name: HuggingFace model name (e.g., "openai/gpt-oss-120b")
 
-    Returns:
-        Byte size for the model. Returns DEFAULT_MODEL_BYTE_SIZE if not found.
+    Raises:
+        UnknownModelByteSizeError: ``model_name`` names no entry of
+            ``MODEL_BYTE_SIZES``. A neighbouring entry or a default would
+            size the hugepage pool and the weight region for another model.
     """
     # Exact match first, then the registered id the value names (a local
     # directory named after it, or a Base/Instruct/dated variant of it).
@@ -103,16 +113,13 @@ def get_model_byte_size(model_name: str) -> int:
     if named is not None:
         return named
 
-    # Try case-insensitive partial match
-    model_lower = model_name.lower()
-    for key, value in MODEL_BYTE_SIZES.items():
-        if key.lower() in model_lower or model_lower in key.lower():
-            return value
-
-    logger.warning(
-        f"Model '{model_name}' not in byte_size lookup, using default {DEFAULT_MODEL_BYTE_SIZE / (1024**3):.0f} GB"
+    raise UnknownModelByteSizeError(
+        f"Model {model_name!r} has no host weight envelope. Add an exact entry "
+        "keyed by its released Hugging Face id to "
+        "batchgen.server.process_utils.MODEL_BYTE_SIZES; a local directory "
+        "named after that id and its Base/Instruct/dated variants then "
+        "resolve to it."
     )
-    return DEFAULT_MODEL_BYTE_SIZE
 
 
 def get_hugepage_size() -> int:

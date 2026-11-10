@@ -205,11 +205,8 @@ def tokenizer_modules() -> Dict[str, str]:
 
 
 def model_byte_sizes() -> Dict[str, int]:
-    """Hugepage-sizing rows of ``process_utils.MODEL_BYTE_SIZES``.
-
-    Ascending by release: the lookup's partial match takes the first key a
-    name contains (or is contained in), so the order is part of its result.
-    """
+    """Hugepage-sizing rows of ``process_utils.MODEL_BYTE_SIZES``, ascending
+    by release."""
     sizes: Dict[str, int] = {}
     for release in _ascending():
         sizes[f"zai-org/GLM-{release.version}-FP8"] = release.geometry.fp8_weight_bytes
