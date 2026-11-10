@@ -84,6 +84,12 @@ While the pool is restarting or down, `/health` answers `503` and
 `POST /v1/batches` answers `503` with `Retry-After`. The earlier `/v1/reload`
 endpoint no longer exists.
 
+With the distributed weight store, the node's weight daemon is part of the
+pool's liveness: the worker monitor reads its state every second, so a daemon
+whose transport failed (cold restart required) or whose worker cohort failed
+takes the pool to `workers_down` at once, even while idle, and `/health`
+names the daemon's failure.
+
 ### Coordinated worker-pool restart
 
 A worker cohort is one `torch.distributed` world spanning every node, so

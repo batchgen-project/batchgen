@@ -2012,7 +2012,14 @@ class WorkerManager:
             else:
                 if self._monitor_stop_event.is_set():
                     return
-                exit_reason = self._collect_worker_exit_reason()
+                # A dead worker process names the root cause best; otherwise
+                # the node's distributed-weight daemon is part of the pool's
+                # liveness too: once latched it fails every fetch, so the pool
+                # must leave serving now, not at the next streamed prefill.
+                exit_reason = (
+                    self._collect_worker_exit_reason()
+                    or self._distributed_weight_daemon_failure()
+                )
                 if exit_reason:
                     if self._stopping:
                         return
@@ -2319,6 +2326,32 @@ class WorkerManager:
         if self.distributed_weight_daemon is None:
             return 0
         return int(self.distributed_weight_daemon.cohort_epoch())
+
+    def _distributed_weight_daemon_failure(self) -> Optional[str]:
+        """Why this node's daemon cannot serve the current cohort, or None.
+
+        A transport failure is a permanent latch (cold restart required); a
+        cohort fault is cleared by the swap of a worker restart. Either one
+        makes every remote-module fetch of the serving cohort fail.
+        """
+        daemon = self.distributed_weight_daemon
+        if daemon is None:
+            return None
+        try:
+            health = json.loads(daemon.health())
+        except Exception as exc:  # noqa: BLE001 - an unreadable daemon is a failure
+            return f"Distributed weight daemon health query failed: {exc!r}"
+        if health["transport_failed"]:
+            return (
+                "Distributed weight daemon transport failed (cold restart "
+                f"required): {health['failure']}"
+            )
+        if health["cohort_faulted"]:
+            return (
+                "Distributed weight daemon failed worker cohort "
+                f"{health['cohort_epoch']}: {health['cohort_fault']}"
+            )
+        return None
 
     def _begin_distributed_weight_swap(self) -> None:
         if self.distributed_weight_daemon is None:
