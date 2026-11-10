@@ -371,7 +371,8 @@ class KimiLinearPlanner(BasePlanner):
     def __init__(self, is_k3: bool = False, stream_all_modules: bool = None,
                  attention_group_size: int = 1,
                  gpu_total_memory_bytes: int | None = None,
-                 enable_deepep: bool = False):
+                 enable_deepep: bool = False,
+                 decode_graph_capturable: bool = True):
         """``is_k3`` selects the K3 (2.8T, 93L/896E) branch of the plan.
 
         Passed by ``KimiLinearInitializer`` from its own ``is_k3`` (which is
@@ -396,6 +397,11 @@ class KimiLinearPlanner(BasePlanner):
         self.attention_group_size = int(attention_group_size)
         # Kimi-K3 decode MoE exchange (server --enable-deepep): False=NCCL, True=DeepEP
         self.enable_deepep = bool(enable_deepep)
+        # Whether every MLA decode kernel the model runs on this device can be
+        # captured: paged_decode.graph_capturable, and for K3.1 also
+        # sparse_dispatch.graph_capturable (the initializer passes the live
+        # value, Hopper-era callers keep True).
+        self.decode_graph_capturable = bool(decode_graph_capturable)
         self.gpu_total_memory_bytes = (
             None
             if gpu_total_memory_bytes is None
@@ -651,10 +657,13 @@ class KimiLinearPlanner(BasePlanner):
         # sharded H20 plan): the unsharded four-slot plan keeps its validated
         # eager path, but a 128-row H20 decode would be launch-latency-bound
         # eager exactly like the H200 measurement above.
+        # The captured path also needs a graph-capturable dense MLA decode
+        # kernel (paged_decode.graph_capturable: Hopper today).
         if (
             self.attention_group_size == 8
             and self.gpu_total_memory_bytes is not None
             and int(self.gpu_total_memory_bytes) >= _K3_H20_MIN_MEMORY_BYTES
+            and self.decode_graph_capturable
         ):
             self.config.Basic_Config.decode_graph_mode = "graph"
 

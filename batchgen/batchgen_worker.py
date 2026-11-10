@@ -10079,19 +10079,11 @@ class BatchGenWorker:
 			(1, 64, 1, 576), dtype=torch.bfloat16, device=device
 		)
 		block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-		tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-			cache_seqlens, 12, 1
-		)
-		flash_mla.flash_mla_with_kvcache(
-			query,
-			blocked_k,
-			block_table,
-			cache_seqlens,
-			512,
-			tile_scheduler_metadata,
-			num_splits,
-			causal=True,
-		)
+		# Warm the same capability-selected kernel the decode forward uses
+		# (flash_mla on Hopper, flashinfer trtllm-gen on Blackwell).
+		from batchgen.attention.mla.paged_decode import mla_paged_decode
+
+		mla_paged_decode(query, blocked_k, block_table, cache_seqlens, 512, 576 ** -0.5)
 		torch.cuda.synchronize(device)
 
 	def _group_token_totals(self):
