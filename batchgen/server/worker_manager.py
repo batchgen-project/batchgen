@@ -1817,6 +1817,7 @@ class WorkerManager:
             ep_offloading_ratio=self.args.ep_offloading_ratio,
             pre_dequantize_weights=self.args.pre_dequantize_weights,
             enable_deepep=getattr(self.args, "enable_deepep", False),
+            prefill_moe_mode=getattr(self.args, "prefill_moe_mode", None),
             enable_cuda_graph=self.args.enable_cuda_graph,
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
