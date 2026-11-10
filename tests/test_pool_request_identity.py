@@ -18,6 +18,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 SERVER = Path(__file__).resolve().parents[1] / "batchgen" / "server"
@@ -109,7 +110,8 @@ async def _submit(scheduler, batch_id, custom_ids):
     assert ok, error
     await scheduler._process_batch_pool_mode(
         batch_id, SimpleNamespace(batchgen_debug=None, max_context_length=None),
-        requests, [f"prompt {c}" for c in custom_ids], [8] * len(custom_ids), None)
+        requests, [np.arange(3, dtype=np.int32) for _ in custom_ids],
+        [8] * len(custom_ids), None)
 
 
 def test_parse_rejects_duplicate_custom_id_within_a_batch():

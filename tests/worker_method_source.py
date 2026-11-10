@@ -81,3 +81,32 @@ def load_worker_methods(
             f"{WORKER_CLASS} has no method(s) {sorted(missing)} in {WORKER_SOURCE}"
         )
     return loaded
+
+
+def load_worker_functions(
+    names: Iterable[str],
+    namespace: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compile the named module-level functions of the worker source.
+
+    The module-level counterpart of :func:`load_worker_methods`, with the same
+    ``namespace`` contract.
+    """
+    wanted = set(names)
+    tree = ast.parse(WORKER_SOURCE.read_text(), filename=str(WORKER_SOURCE))
+    loaded: Dict[str, Any] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in wanted:
+            continue
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        scope: Dict[str, Any] = dict(namespace)
+        exec(compile(module, str(WORKER_SOURCE), "exec"), scope)  # noqa: S102
+        loaded[node.name] = scope[node.name]
+
+    missing = wanted - set(loaded)
+    if missing:
+        raise AssertionError(
+            f"{WORKER_SOURCE} has no module-level function(s) {sorted(missing)}"
+        )
+    return loaded

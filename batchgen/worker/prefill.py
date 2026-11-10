@@ -77,6 +77,36 @@ def compute_prefill_host_reservation(
 	return pages, pages * page_size
 
 
+def host_owned_pages_after_sharing(
+    *,
+    chain_pages: int,
+    shared_pages: int,
+    sequence_id: int,
+    where: str,
+) -> int:
+	"""Return the pages left in a sequence's own Host chain after sharing.
+
+	Invariant HOST_OWNED_PAGE: a sequence holding Host KV with decode budget
+	left owns at least one page of its own chain. Admission reserves at least
+	``ceil((prompt + 1) / page)`` pages (``compute_prefill_host_reservation``
+	with ``max_tokens >= 1``), while prefix attach and prefix commit share at
+	most ``floor(prompt / page)`` full prompt pages, so the page holding the
+	first decode position always stays owned. The host-KV growth planner
+	relies on it: evicting every candidate then clears every grower's debt.
+	``chain_pages`` is the owned count before this move; ``shared_pages`` is
+	what leaves the chain for shared prefix residency.
+	"""
+	owned = int(chain_pages) - int(shared_pages)
+	if owned < 1:
+		raise RuntimeError(
+			f"[SCHED_INVARIANT] HOST_OWNED_PAGE broken at {where}: sequence "
+			f"{sequence_id} would own {owned} Host pages "
+			f"(chain_pages={chain_pages}, shared_pages={shared_pages}); a "
+			"decode-capable sequence must own >= 1 page of its Host chain"
+		)
+	return owned
+
+
 @dataclass(frozen=True)
 class PrefillCandidate:
     """A sequence eligible for prefill admission (EVICTED or QUEUEING).

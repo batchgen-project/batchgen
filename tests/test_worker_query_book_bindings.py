@@ -16,7 +16,6 @@ def _make_sequence(uuid: str, global_idx: int, token_offset: int) -> SequenceEnt
         global_idx=global_idx,
         prompt_length=4,
         max_decode_length=8,
-        text=f"text-{uuid}",
     )
     seq.input_ids = torch.tensor(
         [[token_offset + 1, token_offset + 2, token_offset + 3, token_offset + 4]],
@@ -35,7 +34,6 @@ def test_release_local_query_slot_clears_query_book_for_freed_local_slot():
         free_local_indices=set(),
         query_book={
             4: QueryBookEntry(
-                text=seq.text,
                 encoded={"input_ids": seq.input_ids},
                 decoded_tokens=seq.decoded_tokens,
                 kv_token_budget=seq.kv_token_budget,
@@ -71,7 +69,6 @@ def test_bind_local_sequence_to_query_book_refreshes_reused_slot():
         next_local_idx=5,
         query_book={
             4: QueryBookEntry(
-                text="stale",
                 encoded={"input_ids": stale_input_ids},
                 decoded_tokens=stale_decoded_tokens,
                 kv_token_budget=99,
@@ -94,7 +91,6 @@ def test_bind_local_sequence_to_query_book_refreshes_reused_slot():
     assert state.uuid_to_local_map == {seq.uuid: 4}
     assert state.local_to_uuid_map == {4: seq.uuid}
     assert state.free_local_indices == set()
-    assert state.query_book[4].text == seq.text
     assert state.query_book[4].kv_token_budget == seq.kv_token_budget
     assert state.query_book[4].encoded["input_ids"].data_ptr() == seq.input_ids.data_ptr()
     assert state.query_book[4].decoded_tokens.data_ptr() == seq.decoded_tokens.data_ptr()
