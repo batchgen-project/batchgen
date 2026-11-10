@@ -21,6 +21,7 @@ boundary where a CPU test cannot follow.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,8 +46,8 @@ from batchgen.prefix_reuse.wave_plan import (  # noqa: E402
     MaterializedPrefix,
     PlanChunk,
     PlanItem,
+    DECLINED_DOES_NOT_FIT,
     PlanSegment,
-    PoolMaterializationDoesNotFit,
     WavePrefixPlan,
     group_materialized_prefixes,
     plan_wave_prefix_sharing,
@@ -419,20 +420,26 @@ def test_a_pool_that_cannot_read_its_own_chunk_is_refused():
         )
 
 
-def test_a_frontier_too_large_for_the_pool_falls_back_by_name():
+def test_a_frontier_too_large_for_the_pool_is_declined_by_name():
     prompts = [_hit_prompt(1, 8, 5)]
-    with pytest.raises(PoolMaterializationDoesNotFit, match="do not schedule"):
-        _plan(prompts, hits=[MaterializedPrefix(index=0, tokens=8 * B)], pool_pages=4)
+    plan = _plan(
+        prompts, hits=[MaterializedPrefix(index=0, tokens=8 * B)], pool_pages=4
+    )
+    assert plan.declined_materialized == ((0, DECLINED_DOES_NOT_FIT),)
 
 
-def test_the_same_wave_plans_without_materialization_after_the_refusal():
+def test_the_declined_hit_plans_as_a_recompute_in_the_same_call():
     """The fallback: the sequence still completes, as a full recompute."""
 
     prompts = [_hit_prompt(1, 8, 5)]
-    with pytest.raises(PoolMaterializationDoesNotFit):
-        _plan(prompts, hits=[MaterializedPrefix(index=0, tokens=8 * B)], pool_pages=4)
-    plan = _plan(prompts, hits=(), pool_pages=4)
+    plan = _plan(
+        prompts, hits=[MaterializedPrefix(index=0, tokens=8 * B)], pool_pages=4
+    )
     validate_wave_prefix_plan(plan, prompts)
+    assert plan == replace(
+        _plan(prompts, hits=(), pool_pages=4),
+        declined_materialized=((0, DECLINED_DOES_NOT_FIT),),
+    )
     assert plan.materialized_segments == ()
     assert plan.computed_tokens == len(prompts[0])
     tail = plan.chunks[0].items[0]

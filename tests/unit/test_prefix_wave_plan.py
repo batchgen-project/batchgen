@@ -344,3 +344,163 @@ def test_budget_composes_with_a_tight_pool():
 def test_negative_budget_is_refused():
     with pytest.raises(ValueError, match="max_computed_segments"):
         budget_plan(TREE, -1)
+
+
+# ---------------------------------------------------------------------------
+# Materialized hits are a per-row plan decision (arbitration, partial fit)
+# ---------------------------------------------------------------------------
+
+MaterializedPrefix = _MODULE.MaterializedPrefix
+DECLINED_POOL_CHAIN_LONGER = _MODULE.DECLINED_POOL_CHAIN_LONGER
+DECLINED_DOES_NOT_FIT = _MODULE.DECLINED_DOES_NOT_FIT
+pool_chain_coverage = _MODULE.pool_chain_coverage
+
+SYSTEM = blk(99)  # one shared "system page", the in-wave pool's usual match
+
+
+def hit_plan(prompts, hits, pool_pages=1000, chunk_tokens=1000):
+    result = plan_wave_prefix_sharing(
+        prompts, block_tokens=B, pool_pages=pool_pages,
+        chunk_tokens=chunk_tokens, same_chunk_ancestors=True,
+        materialized=hits,
+    )
+    validate_wave_prefix_plan(result, prompts)
+    return result
+
+
+def chain_end(result, index):
+    """Where row ``index``'s compute starts: the end of its deepest segment."""
+    return max(
+        (seg.token_end for seg in result.segments if index in seg.members),
+        default=0,
+    )
+
+
+def materialized_rows(result):
+    return sorted(
+        index
+        for seg in result.segments if seg.materialized
+        for index in seg.members
+    )
+
+
+def test_a_pool_tree_member_with_a_frontier_hit_plans_the_materialized_segment():
+    """The original failure's shape: the pool matches only the system page.
+
+    Row 0 shares one block with every other row (it is a member of the
+    in-wave tree) and continues a four-block frontier. Its frontier saves
+    more, so the plan loads [0, B) and starts its compute at B -- not at the
+    one-block pool chain.
+    """
+
+    frontier = SYSTEM + blk(1) + blk(2) + blk(3)
+    prompts = [
+        frontier + blk(80) + [9],
+        SYSTEM + blk(4) + [9],
+        SYSTEM + blk(5) + [9],
+        SYSTEM + blk(6) + [9],
+    ]
+    boundary = len(frontier)
+    assert pool_chain_coverage(prompts, [0], block_tokens=B) == {0: B}
+    result = hit_plan(prompts, [MaterializedPrefix(index=0, tokens=boundary)])
+    assert result.declined_materialized == ()
+    assert materialized_rows(result) == [0]
+    assert chain_end(result, 0) == boundary
+    # The rest of the wave still pools the system page among themselves.
+    assert [seg.members for seg in result.segments if not seg.materialized] == [
+        (1, 2, 3)
+    ]
+
+
+def test_a_frontier_shorter_than_its_pool_chain_is_declined_and_pooled():
+    shared = SYSTEM + blk(1) + blk(2)
+    prompts = [shared + blk(80) + [9], shared + blk(81) + [9], blk(7) + [9]]
+    assert pool_chain_coverage(prompts, [0], block_tokens=B) == {0: 3 * B}
+    result = hit_plan(prompts, [MaterializedPrefix(index=0, tokens=B)])
+    assert result.declined_materialized == ((0, DECLINED_POOL_CHAIN_LONGER),)
+    assert materialized_rows(result) == []
+    assert chain_end(result, 0) == 3 * B  # the pool's longer chain wins
+
+
+def test_a_tie_between_frontier_and_pool_chain_keeps_the_frontier():
+    shared = SYSTEM + blk(1)
+    prompts = [shared + blk(80) + [9], shared + blk(81) + [9]]
+    result = hit_plan(prompts, [MaterializedPrefix(index=0, tokens=2 * B)])
+    assert result.declined_materialized == ()
+    assert materialized_rows(result) == [0]
+
+
+def test_partial_fit_keeps_the_largest_saving_subset_and_declines_the_rest():
+    big = blk(1) + blk(2) + blk(3) + blk(4) + blk(5) + blk(6) + blk(7) + blk(8)
+    mid = blk(11) + blk(12) + blk(13)
+    small = blk(21) + blk(22)
+    prompts = [small + [9], big + [9], mid + [9], blk(30) + [9]]
+    hits = [
+        MaterializedPrefix(index=0, tokens=len(small)),
+        MaterializedPrefix(index=1, tokens=len(big)),
+        MaterializedPrefix(index=2, tokens=len(mid)),
+    ]
+    # Four pool pages: the eight-page frontier can never be resident, the
+    # three- and two-page ones can.
+    result = hit_plan(prompts, hits, pool_pages=4)
+    assert result.declined_materialized == ((1, DECLINED_DOES_NOT_FIT),)
+    assert materialized_rows(result) == [0, 2]
+    assert chain_end(result, 1) == 0  # the dropped row recomputes
+    assert result.materialized_tokens == len(small) + len(mid)
+
+
+def test_the_kept_set_does_not_depend_on_the_order_the_hits_arrive_in():
+    prompts = [blk(21) + blk(22) + [9], blk(1) + blk(2) + blk(3) + [9], blk(30) + [9]]
+    hits = [
+        MaterializedPrefix(index=0, tokens=2 * B),
+        MaterializedPrefix(index=1, tokens=3 * B),
+    ]
+    forward = hit_plan(prompts, hits, pool_pages=3)
+    backward = hit_plan(prompts, list(reversed(hits)), pool_pages=3)
+    assert forward == backward
+
+
+def _ladder_wave():
+    """Eight continuations + two exact resubmissions, all on one system page.
+
+    Each continuation is the system page, a three-block frontier of its own
+    and a two-block-and-one-token suffix; a resubmission IS its frontier, so
+    it can never restore (its last token must be recomputed for a logit) and
+    is never handed to the planner as a hit.
+    """
+    continuations = [
+        SYSTEM + blk(10 * i + 1) + blk(10 * i + 2) + blk(10 * i + 3)
+        + blk(10 * i + 4) + blk(10 * i + 5) + [9]
+        for i in range(8)
+    ]
+    resubmissions = [SYSTEM + blk(500 + 3 * i) + blk(501 + 3 * i) + blk(502 + 3 * i)
+                     for i in range(2)]
+    return continuations + resubmissions, 4 * B
+
+
+def test_the_saved_token_ladder_is_monotone_in_the_hit_fraction():
+    prompts, boundary = _ladder_wave()
+    saved = []
+    for hits in (0, 2, 4, 6, 8):  # hp0, hp25, hp50, hp75, hp100 (minus full hits)
+        result = hit_plan(
+            prompts,
+            [MaterializedPrefix(index=i, tokens=boundary) for i in range(hits)],
+        )
+        assert result.declined_materialized == ()
+        assert materialized_rows(result) == list(range(hits))
+        saved.append(result.saved_tokens)
+    # Loaded frontiers save every token they cover; the remaining rows pool
+    # the system page among themselves.
+    assert saved == [
+        16 * hits + (len(prompts) - hits - 1) * B for hits in (0, 2, 4, 6, 8)
+    ]
+    assert saved == sorted(set(saved)), saved  # strictly increasing
+    # The pre-fix ladder was flat: with no hit planned, every rung saves only
+    # the shared system page.
+    assert hit_plan(prompts, []).saved_tokens == saved[0]
+
+
+def test_a_full_hit_is_never_a_plannable_frontier():
+    prompts, boundary = _ladder_wave()
+    with pytest.raises(ValueError, match="must stay"):
+        hit_plan(prompts, [MaterializedPrefix(index=8, tokens=boundary)])

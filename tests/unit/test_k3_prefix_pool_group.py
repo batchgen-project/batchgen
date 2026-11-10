@@ -334,6 +334,9 @@ def _plan_worker(
             "_trajectory_commit_requested",
             "_owns_host_kv",
             "_debug_flag_enabled",
+            # The plan-time restore decision every return path settles; with
+            # no attachment it has nothing to decline.
+            "_settle_trajectory_restore_plan",
         ],
         {
             "torch": _fake_torch(free_pages * K3_PAGE_BYTES),

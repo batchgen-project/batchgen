@@ -77,6 +77,12 @@ METHODS = (
     "_prefill_pool_group",
     "_prefill_pool_free_state_slots",
     "_replace_prefix_lookup_hits",
+    "_settle_trajectory_restore_plan",
+    "_restore_trajectory_frontiers",
+    "_restore_mirrored_trajectory_shards",
+    "_get_trajectory_restorer",
+    "_trajectory_restore_payload",
+    "_trajectory_group_geometry",
     "_decode_attn_tp_size",
     "_prefill_pool_page_bytes",
     "_pool_pad_poison_enabled",
@@ -99,11 +105,41 @@ class _Record:
 class _Attachment:
     """What ``TrajectoryRestorer.lookup`` handed the worker for a hit."""
 
-    def __init__(self, *, boundary=BOUNDARY, group_id=0, pages=None):
+    def __init__(
+        self, *, boundary=BOUNDARY, group_id=0, pages=None, sequence_id=GLOBAL_IDS[0]
+    ):
         self.boundary_tokens = boundary
+        self.lcp_tokens = boundary
         self.owning_group_id = group_id
         self.record = _Record(pages)
         self.session_key = "s1"
+        self.sequence_id = sequence_id
+        self.storage_handle = 5
+        self.consumed = False
+
+
+class _RecordingRestorer:
+    """The restorer surface the plan and the restore seam call.
+
+    Consuming an attachment twice is the leak/double-release the plan-time
+    decline must never commit, so it fails the test here.
+    """
+
+    def __init__(self):
+        self.declines = []
+        self.restores = []
+
+    def _consume(self, attachment):
+        assert not attachment.consumed, "an attachment was consumed twice"
+        attachment.consumed = True
+
+    def decline(self, attachment, *, reason, detail=""):
+        self._consume(attachment)
+        self.declines.append((attachment.sequence_id, reason, detail))
+
+    def restore(self, attachment, *, serving_group_id, compute_cached_tokens):
+        self._consume(attachment)
+        self.restores.append((attachment.sequence_id, compute_cached_tokens))
 
 
 class _Index:
@@ -178,6 +214,7 @@ def _worker(
     seqs=None,
     owns_host_kv=True,
     token_cap=64,
+    restorer=None,
 ):
     methods = _worker_methods(
         METHODS,
@@ -220,6 +257,19 @@ def _worker(
         _any_sequence_batchgen_debug=True,
         _trajectory_attachments=dict(attachments or {}),
         _trajectory_session_groups=index,
+        _trajectory_restorer=_RecordingRestorer() if restorer is None else restorer,
+        # The leader's handle->arena table, read by the mirrored payload.
+        _trajectory_frontier_committer=SimpleNamespace(
+            arena_for=lambda handle: SimpleNamespace(
+                shard_count=attn_tp_size,
+                pseudo_sid=-3,
+                pages_per_group=1,
+                capacity_bytes=64,
+                page_ids_by_group={0: (41,)},
+            ),
+        ),
+        _trajectory_mirrored_restores={},
+        _local_to_uuid_map=dict(enumerate(UUIDS)),
     )
     # ``_owns_host_kv`` is the group-leader predicate; a follower answers no.
     worker._owns_host_kv = lambda seq: bool(owns_host_kv)
@@ -261,7 +311,7 @@ def test_the_flag_being_off_derives_no_hit_and_votes_yes(monkeypatch):
         index=index,
         states=_hit_states(),
     )
-    hits, confirmed, pages = worker._materialized_prefix_hits(
+    hits, confirmed, pages, _ = worker._materialized_prefix_hits(
         [worker.global_batch.get_sequence(uuid) for uuid in UUIDS],
         page_tokens=PAGE_TOKENS,
         group="group",
@@ -292,7 +342,7 @@ def test_at_g_gt_1_the_mirrored_index_decides_and_the_leader_confirms(monkeypatc
         index=index,
         states=_hit_states(),
     )
-    hits, confirmed, pages = worker._materialized_prefix_hits(
+    hits, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert [(hit.index, hit.tokens) for hit in hits] == [(0, BOUNDARY)]
@@ -310,7 +360,7 @@ def test_a_follower_derives_the_same_hit_set_with_no_record_of_its_own(monkeypat
         states={},
         owns_host_kv=False,
     )
-    hits, confirmed, pages = worker._materialized_prefix_hits(
+    hits, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert [(hit.index, hit.tokens) for hit in hits] == [(0, BOUNDARY)]
@@ -328,7 +378,7 @@ def test_at_g_1_the_ranks_own_attachment_is_the_hit_set(monkeypatch):
         index=index,
         states=_hit_states(),
     )
-    hits, confirmed, pages = worker._materialized_prefix_hits(
+    hits, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group=None
     )
     assert [(hit.index, hit.tokens) for hit in hits] == [(0, BOUNDARY)]
@@ -348,7 +398,7 @@ def test_a_mirrored_hit_the_leader_cannot_confirm_votes_no(monkeypatch):
         index=_Index([(BOUNDARY, _entry())]),
         states=_hit_states(),
     )
-    hits, confirmed, pages = worker._materialized_prefix_hits(
+    hits, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert len(hits) == 1  # the SET stays the group's; only the vote differs
@@ -363,7 +413,7 @@ def test_an_advanced_frontier_votes_no(monkeypatch):
         index=_Index([(BOUNDARY, _entry())]),
         states=_hit_states(),
     )
-    _, confirmed, pages = worker._materialized_prefix_hits(
+    _, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert confirmed is False and pages == {}
@@ -376,7 +426,7 @@ def test_a_record_naming_no_resident_page_votes_no(monkeypatch):
         index=_Index([(BOUNDARY, _entry())]),
         states=_hit_states(),
     )
-    _, confirmed, _ = worker._materialized_prefix_hits(
+    _, confirmed, _, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert confirmed is False
@@ -393,7 +443,7 @@ def test_an_attachment_short_of_the_frontier_votes_no(monkeypatch):
         index=_Index([(BOUNDARY, _entry())]),
         states=states,
     )
-    _, confirmed, pages = worker._materialized_prefix_hits(
+    _, confirmed, pages, _ = worker._materialized_prefix_hits(
         [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
     )
     assert confirmed is False and pages == {}
@@ -414,6 +464,13 @@ def test_the_vote_rides_the_budget_reduce_and_the_group_min_decides(monkeypatch)
     assert wave is not None
     assert wave.materialized == frozenset(), "the peer's no takes it back"
     assert wave.plan.materialized_tokens == 0
+    # And this rank's live attachment is declined by name at plan time.
+    assert worker._trajectory_restorer.declines == [(
+        GLOBAL_IDS[0], "not_planned",
+        "at plan time: the serve group could not confirm the mirrored "
+        "frontier set",
+    )]
+    assert worker._trajectory_attachments == {}
 
 
 def test_the_leaders_no_reaches_the_reduce(monkeypatch):
@@ -443,11 +500,12 @@ def test_a_boundary_off_the_page_grid_is_skipped_by_name(monkeypatch, caplog):
         states=_hit_states(),
     )
     with caplog.at_level("INFO"):
-        hits, confirmed, _ = worker._materialized_prefix_hits(
+        hits, confirmed, _, drops = worker._materialized_prefix_hits(
             [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
         )
     assert hits == [] and confirmed is True
     assert "boundary_off_the_page_grid" in caplog.text
+    assert drops[0] == "the pool cannot materialize it (boundary_off_the_page_grid)"
 
 
 def test_a_frontier_with_no_private_token_left_is_skipped_by_name(monkeypatch, caplog):
@@ -462,11 +520,12 @@ def test_a_frontier_with_no_private_token_left_is_skipped_by_name(monkeypatch, c
         states=_hit_states(),
     )
     with caplog.at_level("INFO"):
-        hits, confirmed, _ = worker._materialized_prefix_hits(
+        hits, confirmed, _, drops = worker._materialized_prefix_hits(
             [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
         )
     assert hits == [] and confirmed is True
     assert "no_private_token_left" in caplog.text
+    assert drops[0] == "the pool cannot materialize it (no_private_token_left)"
 
 
 def test_a_hit_serving_off_its_owning_group_is_skipped_by_name(monkeypatch, caplog):
@@ -479,11 +538,14 @@ def test_a_hit_serving_off_its_owning_group_is_skipped_by_name(monkeypatch, capl
         states=_hit_states(),
     )
     with caplog.at_level("INFO"):
-        hits, confirmed, _ = worker._materialized_prefix_hits(
+        hits, confirmed, _, drops = worker._materialized_prefix_hits(
             [seqs[uuid] for uuid in UUIDS], page_tokens=PAGE_TOKENS, group="group"
         )
     assert hits == [] and confirmed is True
     assert "serving_group_is_not_the_owning_group" in caplog.text
+    assert drops[0] == (
+        "the pool cannot materialize it (serving_group_is_not_the_owning_group)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -549,6 +611,12 @@ def test_the_hits_prefix_state_starts_at_the_frontier_boundary(monkeypatch):
     assert state.attached_tokens == BOUNDARY
     assert states[GLOBAL_IDS[0]].compute_cached_tokens == BOUNDARY
     assert wave.chain_tokens(0) == BOUNDARY
+    # The plan's restore decision: this row, at exactly its boundary.
+    assert state.trajectory_restore_boundary == BOUNDARY
+    assert worker._prefix_sequence_states[GLOBAL_IDS[1]].trajectory_restore_boundary == 0
+    # A planned attachment is NOT declined; it stays for the restore seam.
+    assert worker._trajectory_restorer.declines == []
+    assert set(worker._trajectory_attachments) == {GLOBAL_IDS[0]}
 
 
 def test_the_attachment_holding_the_frontier_resident_is_kept_for_the_wave(monkeypatch):
@@ -611,9 +679,15 @@ def test_a_dropped_hit_releases_its_attachment_exactly_once(monkeypatch):
     assert worker.prefix_cache_coordinator.released == [77]
     state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.commit_attachment_handles == (), "released, not also retained"
-    # And the sequence recomputes from token 0, which is what makes the KDA
-    # restore decline on its own suffix-offset identity.
+    # The sequence recomputes from token 0 and carries no restore: its
+    # trajectory attachment was declined when the wave was planned, so it
+    # never reaches the restore seam.
     assert state.compute_cached_tokens == 0
+    assert state.trajectory_restore_boundary == 0
+    assert [reason for _, reason, _ in worker._trajectory_restorer.declines] == [
+        "not_planned"
+    ]
+    assert worker._trajectory_attachments == {}
 
 
 def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplog):
@@ -656,8 +730,162 @@ def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplo
         wave = worker._plan_prefill_pool_wave(
             UUIDS, dict(worker._prefix_sequence_states)
         )
-    assert "WITHOUT its 1 materialized prefix" in caplog.text
+    assert "declined by the planner" in caplog.text
+    assert "pool_materialization_does_not_fit" in caplog.text
+    # The row's restore is declined by name at plan time, once.
+    assert worker._trajectory_restorer.declines == [(
+        GLOBAL_IDS[0], "not_planned",
+        "at plan time: the wave planner declined it "
+        "(pool_materialization_does_not_fit)",
+    )]
+    assert worker._trajectory_attachments == {}
     if wave is not None:
         assert wave.materialized == frozenset()
         # The sequence still completes: it is computed in full.
         assert wave.chain_tokens(0) == 0
+
+
+# --------------------------------------------------------------------------- #
+#  6. The plan IS the restore decision
+# --------------------------------------------------------------------------- #
+#
+# A row whose frontier the plan materializes carries
+# ``trajectory_restore_boundary`` and starts its compute there; every other
+# live attachment is declined at PLAN time with ``not_planned`` and the drop
+# reason, exactly once, and never reaches the restore seam. Before this, a
+# dropped row kept its attachment, started at its pool chain (e.g. 64) and
+# the restore declined it with ``suffix_offset_mismatch`` against its
+# boundary (e.g. 5120).
+
+# One block more than FRONTIER, shared with the hit row, for arbitration.
+LONGER_SHARE = FRONTIER + [5, 5, 5, 5] + [6]
+
+
+def _drop_case(name, monkeypatch):
+    """A worker whose next plan drops the hit row's restore on path ``name``."""
+
+    slots = 2 if name == "state_slots_short" else 32
+    _stub_heavy_modules(monkeypatch, free_state_slots=slots)
+    kwargs = dict(
+        fake_dist=FakeDist(peer_budget=[40, slots, 1]),
+        attachments={GLOBAL_IDS[0]: _Attachment()},
+        index=_Index([(BOUNDARY, _entry())]),
+        states=_hit_states(),
+    )
+    if name == "group_veto":
+        kwargs["fake_dist"] = FakeDist(peer_budget=[40, 32, 0])
+    elif name == "pool_smaller_than_scratch":
+        kwargs.update(free_pages=2, fake_dist=FakeDist(peer_budget=[2, 32, 1]))
+    elif name == "no_private_token_left":
+        kwargs["seqs"] = _seqs(prompts=[FRONTIER, PLAIN_PROMPT, PLAIN_PROMPT_2])
+    elif name == "index_does_not_place_it":
+        kwargs["index"] = _Index([])
+    elif name == "pool_chain_longer_than_frontier":
+        # G == 1, so the hit set is the rank's own attachments; the hit row's
+        # frontier is two blocks but it shares three with another prompt.
+        kwargs.update(
+            attn_tp_size=1,
+            attachments={GLOBAL_IDS[0]: _Attachment(boundary=2 * PAGE_TOKENS)},
+            seqs=_seqs(prompts=[HIT_PROMPT, LONGER_SHARE, PLAIN_PROMPT_2]),
+            index=None,
+        )
+    worker, _ = _worker(**kwargs)
+    if name == "budget_unmeasured":
+        worker._prefill_pool_page_budget = None
+    elif name == "same_chunk_gate":
+        worker.parallel_manager.supports_group_pool_prefill = lambda: False
+    return worker
+
+
+DROP_CASES = {
+    "group_veto": "the serve group could not confirm the mirrored frontier set",
+    "budget_unmeasured": "the prefill-phase pool budget is not yet measured",
+    "pool_smaller_than_scratch": "the wave is not pooled: pool 2 pages <= scratch",
+    "state_slots_short": "the wave is not pooled:",
+    "no_private_token_left": "the pool cannot materialize it (no_private_token_left)",
+    "index_does_not_place_it": "the mirrored session index does not place this session",
+    "same_chunk_gate": "this model's pool does not read a segment resident in its own chunk",
+    "pool_chain_longer_than_frontier": (
+        "the wave planner declined it (in_wave_pool_chain_longer_than_frontier)"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DROP_CASES))
+def test_every_drop_path_ends_in_one_named_plan_time_decline(monkeypatch, name):
+    worker = _drop_case(name, monkeypatch)
+    attachment = worker._trajectory_attachments[GLOBAL_IDS[0]]
+    worker._plan_prefill_pool_wave(UUIDS, dict(worker._prefix_sequence_states))
+
+    restorer = worker._trajectory_restorer
+    assert len(restorer.declines) == 1, restorer.declines
+    sequence_id, reason, detail = restorer.declines[0]
+    assert (sequence_id, reason) == (GLOBAL_IDS[0], "not_planned")
+    assert detail.startswith("at plan time: " + DROP_CASES[name]), detail
+    # Released exactly once (the recording restorer refuses a second
+    # consumption) and gone from the live map ...
+    assert attachment.consumed is True
+    assert worker._trajectory_attachments == {}
+    # ... so the restore seam has nothing to apply for the row.
+    worker._restore_trajectory_frontiers([0, 1, 2])
+    assert restorer.restores == []
+
+
+def test_the_planned_row_is_restored_at_exactly_its_boundary(monkeypatch):
+    worker, _, wave, _ = _materialized_wave(monkeypatch)
+    assert wave is not None and wave.materialized == frozenset({0})
+    worker._restore_trajectory_frontiers([0, 1, 2])
+    restorer = worker._trajectory_restorer
+    assert restorer.restores == [(GLOBAL_IDS[0], BOUNDARY)]
+    assert restorer.declines == []
+    assert worker._trajectory_attachments == {}
+
+
+def test_an_unplanned_attachment_at_the_restore_seam_is_a_broken_invariant(monkeypatch):
+    """Not restored and not tolerated: declined once, then raised."""
+
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker, _ = _worker(
+        attachments={GLOBAL_IDS[0]: _Attachment()},
+        states=_hit_states(),  # a lookup state, never planned
+    )
+    attachment = worker._trajectory_attachments[GLOBAL_IDS[0]]
+    with pytest.raises(RuntimeError, match="never planned"):
+        worker._restore_trajectory_frontiers([0])
+    restorer = worker._trajectory_restorer
+    assert restorer.restores == []
+    assert [reason for _, reason, _ in restorer.declines] == ["not_planned"]
+    assert attachment.consumed is True
+
+
+def test_the_mirrored_payload_carries_planned_rows_only(monkeypatch):
+    worker, _, wave, _ = _materialized_wave(monkeypatch)
+    assert wave is not None
+    # A second live attachment the plan never took (a row outside this
+    # wave's materialization, e.g. one left from an earlier pass).
+    worker._trajectory_attachments[GLOBAL_IDS[1]] = _Attachment(
+        sequence_id=GLOBAL_IDS[1]
+    )
+    payload = worker._trajectory_restore_payload()
+    assert sorted(payload) == [GLOBAL_IDS[0]]
+    entry = payload[GLOBAL_IDS[0]]
+    assert entry["boundary_tokens"] == BOUNDARY
+    assert entry["lcp_tokens"] == BOUNDARY  # for the follower's identity check
+
+
+def test_the_plan_keeps_the_hit_whose_frontier_covers_its_pool_chain(monkeypatch):
+    """Arbitration's other side: a frontier at least as long as the chain wins."""
+
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker, _ = _worker(
+        attn_tp_size=1,
+        attachments={GLOBAL_IDS[0]: _Attachment()},  # three-block frontier
+        seqs=_seqs(prompts=[HIT_PROMPT, LONGER_SHARE, PLAIN_PROMPT_2]),
+        states=_hit_states(),
+    )
+    wave = _plan(worker)
+    assert wave is not None and wave.materialized == frozenset({0})
+    assert wave.chain_tokens(0) == BOUNDARY
+    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    assert state.trajectory_restore_boundary == BOUNDARY
+    assert worker._trajectory_restorer.declines == []

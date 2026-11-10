@@ -2501,6 +2501,9 @@ class BatchGenWorker:
 						)
 						for group_id in host_views
 					},
+					# The plan's restore decision travels with the start it
+					# set, so a follower's state carries the leader's.
+					int(state.trajectory_restore_boundary),
 				)
 			payload = {
 				"global_ids": global_ids,
@@ -2589,7 +2592,7 @@ class BatchGenWorker:
 			from batchgen.prefix_reuse.wave_runtime import install_mirrored_segments
 
 			install_mirrored_segments(wave, segments, host_views)
-		for global_id, (attached, cached, shared) in entry["prefix"].items():
+		for global_id, (attached, cached, shared, restore) in entry["prefix"].items():
 			state = PrefixCacheSequenceState(
 				lookup_result=None,
 				attached_tokens=attached,
@@ -2598,6 +2601,7 @@ class BatchGenWorker:
 					int(group_id): tuple(pages)
 					for group_id, pages in shared.items()
 				},
+				trajectory_restore_boundary=int(restore),
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
@@ -7372,9 +7376,10 @@ class BatchGenWorker:
 		# byte-identical to a pre-Slice-2 one.
 		#
 		# Slice 3 moved this IN FRONT of the pool plan: a hit whose prefix the
-		# wave materializes is a plan input, and the reference this lookup
-		# takes is what keeps the frontier's pages resident from the plan that
-		# names them to the load that reads them.
+		# wave materializes is a plan input. The reference this lookup takes
+		# keeps the frontier's snapshot and registry entry from the plan to the
+		# restore; the MLA pages the load reads are kept resident by the row's
+		# prefix-cache attachment above, which the plan retains for the wave.
 		if owned and self._trajectory_commit_requested(
 			[self.global_batch.get_sequence(uuid) for uuid in served]
 		):
@@ -7403,6 +7408,16 @@ class BatchGenWorker:
 					self._replace_prefix_lookup_hits(
 						seqs, prefix_states, [0] * len(seqs)
 					)
+		else:
+			# No pool, no plan: nothing materializes a frontier, so no row of
+			# this wave restores. Declined here, at plan time, like every
+			# other attachment the plan does not take.
+			self._settle_trajectory_restore_plan(
+				[self.global_batch.get_sequence(uuid) for uuid in served],
+				{},
+				"the prefill prefix pool is off, so no plan materializes a "
+				"frontier",
+			)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -13061,7 +13076,7 @@ class BatchGenWorker:
 				)
 
 	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
-		"""``(hits, confirmed, pages)`` for this wave's trajectory re-entries.
+		"""``(hits, confirmed, pages, drops)`` for this wave's trajectory re-entries.
 
 		M3 Slice 3, the plan input. EVERY rank of a serve group must derive
 		the SAME hit set BEFORE planning, or two ranks pack different chunks
@@ -13083,15 +13098,26 @@ class BatchGenWorker:
 		``pages`` maps a hit's wave index to the frontier's resident Host
 		pages per KV group -- known only to the leader, which mirrors them to
 		the group inside this same pass.
+
+		``drops`` maps the wave index of every row this pass found a reason
+		NOT to plan to that reason, so the plan can decline the row's restore
+		by name. Only a rank holding the row's live attachment acts on it.
+
+		The ``attached_tokens < boundary`` veto stays: the frontier record's
+		reference pins only its snapshot and registry entry, while the MLA
+		pages ``[0, boundary)`` the load reads are kept resident by the row's
+		own prefix-cache attachment alone (an eviction under a referenced
+		record releases the pages first and only then refuses the record).
 		"""
 		from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
 
 		if not self._trajectory_commit_requested(seqs):
-			return [], True, {}
+			return [], True, {}, {}
 		digest = self.prefix_cache_runtime_config.namespace_digest
 		index = self._trajectory_session_groups
 		hits: List[MaterializedPrefix] = []
 		pages: Dict[int, Dict[int, List[int]]] = {}
+		drops: Dict[int, str] = {}
 		confirmed = True
 		unknown = 0
 		for position, seq in enumerate(seqs):
@@ -13115,6 +13141,9 @@ class BatchGenWorker:
 				)
 				if entry is None:
 					unknown += 1
+					drops[position] = (
+						"the mirrored session index does not place this session"
+					)
 					continue
 				boundary = int(entry.boundary_tokens)
 				entry_group = int(entry.owning_group_id)
@@ -13129,6 +13158,7 @@ class BatchGenWorker:
 					"prefilled in full",
 					self.rank, int(seq.global_idx), boundary, reason,
 				)
+				drops[position] = f"the pool cannot materialize it ({reason})"
 				continue
 			hits.append(MaterializedPrefix(index=position, tokens=boundary))
 			if attachment is None:
@@ -13151,6 +13181,11 @@ class BatchGenWorker:
 					self.rank, int(seq.global_idx),
 					int(attachment.boundary_tokens), boundary,
 				)
+				drops[position] = (
+					f"the live frontier is at boundary "
+					f"{int(attachment.boundary_tokens)} but the mirrored index "
+					f"says {boundary}"
+				)
 				confirmed = False
 				continue
 			state = self._prefix_sequence_states.get(int(seq.global_idx))
@@ -13167,6 +13202,11 @@ class BatchGenWorker:
 					"index advertised; the group recomputes",
 					self.rank, int(seq.global_idx), attached, boundary,
 				)
+				drops[position] = (
+					f"its prefix-cache attachment covers {attached} token(s), "
+					f"short of the {boundary}-token frontier it must keep "
+					"resident"
+				)
 				confirmed = False
 				continue
 			record_pages = {
@@ -13180,6 +13220,7 @@ class BatchGenWorker:
 					"names no resident Host page; the group recomputes",
 					self.rank, int(seq.global_idx),
 				)
+				drops[position] = "its frontier record names no resident Host page"
 				confirmed = False
 				continue
 			pages[position] = record_pages
@@ -13196,7 +13237,7 @@ class BatchGenWorker:
 				"this rank's live attachments" if group is None
 				else "the mirrored session index",
 			)
-		return hits, confirmed, pages
+		return hits, confirmed, pages, drops
 
 	def _unmaterializable_frontier(
 		self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
@@ -13237,17 +13278,23 @@ class BatchGenWorker:
 		and must come out with the same plan: the page and state-slot budgets
 		are reduced to the group MIN and the plan digest is compared inside the
 		group, so every early return and every chunk is group-identical.
+
+		The plan is also the trajectory RESTORE decision: a row whose frontier
+		it materializes carries ``trajectory_restore_boundary`` and starts its
+		compute exactly there; every other live trajectory attachment of the
+		wave is declined here, at plan time, with the reason it was dropped
+		(``_settle_trajectory_restore_plan``) -- on every return path.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
-			PoolMaterializationDoesNotFit,
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
 		)
 		from batchgen.prefix_reuse.wave_runtime import PoolWave
 
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		total_pages = self._prefill_pool_page_budget
 		if total_pages is None:
 			# Budget seeding is part of configure_prefill, which every rank of
@@ -13260,9 +13307,11 @@ class BatchGenWorker:
 				"prefill-phase pool budget not yet measured",
 				self.rank,
 			)
+			self._settle_trajectory_restore_plan(
+				seqs, {}, "the prefill-phase pool budget is not yet measured"
+			)
 			return None
 		group = self._prefill_pool_group()
-		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		prompts = [
 			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
 			for seq in seqs
@@ -13276,7 +13325,7 @@ class BatchGenWorker:
 		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
 		# replicated data so every rank of the group has the same set, plus
 		# this rank's vote on whether that set is still live.
-		hits, hits_confirmed, hit_pages = self._materialized_prefix_hits(
+		hits, hits_confirmed, hit_pages, drops = self._materialized_prefix_hits(
 			seqs, page_tokens=page_tokens, group=group
 		)
 		if group is not None:
@@ -13302,6 +13351,11 @@ class BatchGenWorker:
 				"wave recomputes them",
 				self.rank, len(hits),
 			)
+			for hit in hits:
+				drops.setdefault(
+					int(hit.index),
+					"the serve group could not confirm the mirrored frontier set",
+				)
 			hits = []
 		if self._prefill_pool_psm_layout() is not None:
 			# The pool holds EVERY token of a chunk, tails as well as segments,
@@ -13324,6 +13378,11 @@ class BatchGenWorker:
 			logging.info(
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
 				self.rank, total_pages, scratch,
+			)
+			self._settle_trajectory_restore_plan(
+				seqs, drops,
+				f"the wave is not pooled: pool {total_pages} pages <= scratch "
+				f"{scratch}",
 			)
 			return None
 		# A model that declares group-safe pool prefill (K3) writes a chunk's KV
@@ -13353,6 +13412,12 @@ class BatchGenWorker:
 				"chunk",
 				self.rank, len(hits),
 			)
+			for hit in hits:
+				drops.setdefault(
+					int(hit.index),
+					"this model's pool does not read a segment resident in its "
+					"own chunk",
+				)
 			hits = []
 		# Every computed segment holds a recurrent-state slot for the wave on
 		# top of the wave's own sequences, so the planner pools only as many
@@ -13360,19 +13425,25 @@ class BatchGenWorker:
 		# instead of declining the whole wave when the full tree does not fit.
 		if state_slots >= 0:
 			plan_kwargs["max_computed_segments"] = max(0, state_slots - len(prompts))
-		try:
-			plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
-		except PoolMaterializationDoesNotFit as exc:
-			# Deterministic in the group's own inputs (the same prompts, the
-			# same hit set, the same group-MIN budget), so every rank of the
-			# group falls back on the same wave.
+		# The planner decides per row which hits it materializes (arbitration
+		# against the in-wave pool, then partial fit) and names every one it
+		# declines. Deterministic in the group's own inputs (the same prompts,
+		# the same hit set, the same group-MIN budget), so every rank of the
+		# group keeps and declines the same rows.
+		plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
+		if plan.declined_materialized:
 			logging.warning(
-				"[PREFIX_POOL] Rank %s plans this wave WITHOUT its %d "
-				"materialized prefix(es) and recomputes them: %s",
-				self.rank, len(hits), exc,
+				"[PREFIX_POOL] Rank %s plans %d of %d materialized prefix(es); "
+				"declined by the planner: %s",
+				self.rank, len(hits) - len(plan.declined_materialized),
+				len(hits),
+				", ".join(
+					f"sequence {int(seqs[index].global_idx)} ({reason})"
+					for index, reason in plan.declined_materialized
+				),
 			)
-			hits = []
-			plan = plan_wave_prefix_sharing(prompts, materialized=(), **plan_kwargs)
+			for index, reason in plan.declined_materialized:
+				drops.setdefault(int(index), f"the wave planner declined it ({reason})")
 		if level_wise:
 			# Rows grouped by level, so a recurrent layer runs one packed call
 			# per level, each after the level that left its parents' state.
@@ -13393,6 +13464,11 @@ class BatchGenWorker:
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
 				"shared, %d state slots needed, %d free",
 				self.rank, len(plan.segments), state_slots_needed, state_slots,
+			)
+			self._settle_trajectory_restore_plan(
+				seqs, drops,
+				f"the wave is not pooled: {len(plan.segments)} segment(s), "
+				f"{state_slots_needed} state slot(s) needed, {state_slots} free",
 			)
 			return None
 		wave = PoolWave(
@@ -13415,14 +13491,21 @@ class BatchGenWorker:
 				# inside this same pass, before the forward reads them.
 				continue
 			wave.bind_materialized_host_pages(segment_id, source)
+		# A materialized member's chain IS its frontier, so its compute start
+		# is the snapshot boundary: that row, and only that row, restores.
+		restore_boundaries = {
+			index: wave.chain_tokens(index)
+			for segment_id in wave.materialized
+			for index in plan.segments[segment_id].members
+		}
 		self._replace_prefix_lookup_hits(
 			seqs, prefix_states,
 			[wave.chain_tokens(index) for index in range(len(seqs))],
-			retain=frozenset(
-				index
-				for segment_id in wave.materialized
-				for index in plan.segments[segment_id].members
-			),
+			retain=frozenset(restore_boundaries),
+			restore_boundaries=restore_boundaries,
+		)
+		self._settle_trajectory_restore_plan(
+			seqs, drops, "the wave plan does not materialize its frontier"
 		)
 		logging.info(
 			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
@@ -13699,7 +13782,8 @@ class BatchGenWorker:
 		return layout
 
 	def _replace_prefix_lookup_hits(
-		self, seqs, prefix_states, chain_tokens, retain=frozenset()
+		self, seqs, prefix_states, chain_tokens, retain=frozenset(),
+		restore_boundaries=None,
 	) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
 
@@ -13715,23 +13799,83 @@ class BatchGenWorker:
 		because the wave publishes it afresh). The handle moves into the
 		sequence's retained-handle tuple, so the one release lane every
 		sequence leaves through frees it exactly once.
+
+		``restore_boundaries`` maps the wave indices whose trajectory frontier
+		the plan materialized to that boundary: the row's restore decision,
+		carried on its state as ``trajectory_restore_boundary``. Every other
+		row gets 0, i.e. no restore.
 		"""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
+		restores = restore_boundaries or {}
 		for index, (seq, end) in enumerate(zip(seqs, chain_tokens)):
 			old = prefix_states.get(seq.global_idx)
 			handle = 0 if old is None else int(old.attachment_handle)
 			if handle and index not in retain:
 				self.prefix_cache_coordinator.release_attachment(handle)
 				handle = 0
+			restore = int(restores.get(index, 0))
+			if restore and restore != int(end):
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {int(seq.global_idx)} is "
+					f"planned to restore at token {restore} but its compute "
+					f"starts at {int(end)}"
+				)
 			state = PrefixCacheSequenceState(
 				lookup_result=None,
 				attached_tokens=end,
 				compute_cached_tokens=end,
 				commit_attachment_handles=(handle,) if handle else (),
+				trajectory_restore_boundary=restore,
 			)
 			prefix_states[seq.global_idx] = state
 			self._prefix_sequence_states[seq.global_idx] = state
+
+	def _settle_trajectory_restore_plan(self, seqs, drops, default_reason) -> None:
+		"""Decline, at plan time, every live attachment the plan does not restore.
+
+		Runs once at the end of every wave plan, on every return path, over
+		the wave's sequences in wave order. An attachment whose row carries a
+		``trajectory_restore_boundary`` is the plan's to restore and stays; any
+		other is consumed HERE with ``not_planned`` and the reason the plan
+		dropped it (``drops``: wave index -> reason; ``default_reason``
+		otherwise), so it never reaches the restore seam and its reference is
+		released exactly once. Only the rank holding attachments (the
+		host-KV leader) has anything to do; a follower's map is empty.
+		"""
+		if not self._trajectory_attachments:
+			return
+		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+
+		restorer = self._trajectory_restorer
+		for index, seq in enumerate(seqs):
+			if seq is None:
+				continue
+			global_id = int(seq.global_idx)
+			attachment = self._trajectory_attachments.get(global_id)
+			if attachment is None:
+				continue
+			state = self._prefix_sequence_states.get(global_id)
+			planned = 0 if state is None else int(state.trajectory_restore_boundary)
+			if planned:
+				if planned != int(attachment.boundary_tokens):
+					raise RuntimeError(
+						f"Rank {self.rank}: sequence {global_id} is planned to "
+						f"restore at token {planned} but its live frontier is "
+						f"at {int(attachment.boundary_tokens)}"
+					)
+				continue
+			if restorer is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {global_id} holds a live "
+					"trajectory attachment but this rank has no restorer"
+				)
+			del self._trajectory_attachments[global_id]
+			restorer.decline(
+				attachment,
+				reason=DECLINE_NOT_PLANNED,
+				detail=f"at plan time: {drops.get(index, default_reason)}",
+			)
 
 	def _prefill_pool_segment_host_pages(self) -> int:
 		"""Host pages this wave allocates for its segments.
@@ -14986,6 +15130,13 @@ class BatchGenWorker:
 		A follower keeps no registry, so it restores on the LEADER's decision:
 		one decision for the whole group means hit/miss and boundary cannot
 		differ across ranks that must run prefill in lockstep.
+
+		Only rows the wave PLANNED to restore are mirrored (their state
+		carries the attachment's boundary as ``trajectory_restore_boundary``);
+		every other attachment was declined when the wave was planned, and a
+		row with no planned restore has no restore for a follower to apply.
+		The leader's lookup agreement rides along for the follower's
+		token-identity check.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
 		if shard_count <= 1 or not is_leader or not self._trajectory_attachments:
@@ -14994,13 +15145,18 @@ class BatchGenWorker:
 		if committer is None:
 			return {}
 		payload = {}
-		for global_id, attachment in self._trajectory_attachments.items():
+		for global_id, attachment in sorted(self._trajectory_attachments.items()):
+			state = self._prefix_sequence_states.get(int(global_id))
+			planned = 0 if state is None else int(state.trajectory_restore_boundary)
+			if planned != int(attachment.boundary_tokens):
+				continue
 			arena = committer.arena_for(attachment.storage_handle)
 			if arena is None:
 				continue
 			payload[int(global_id)] = {
 				"session_key": str(attachment.session_key),
 				"boundary_tokens": int(attachment.boundary_tokens),
+				"lcp_tokens": int(attachment.lcp_tokens),
 				"owning_group_id": int(attachment.owning_group_id),
 				"shard_count": int(arena.shard_count),
 				"pseudo_sid": int(arena.pseudo_sid),
@@ -15234,6 +15390,12 @@ class BatchGenWorker:
 
 		Empty whenever the flag is off -- nothing is attached, so this is a
 		dict lookup and a return.
+
+		Executes the wave plan's decision, it does not take one: every
+		attachment still live here belongs to a row the plan materialized
+		(``trajectory_restore_boundary``), because the plan declined all the
+		others. One that is not is a broken invariant and is raised, after
+		its reference is consumed.
 		"""
 		if self._trajectory_mirrored_restores:
 			self._restore_mirrored_trajectory_shards(local_indices)
@@ -15242,6 +15404,8 @@ class BatchGenWorker:
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
 			return
+		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+
 		for local_idx in local_indices:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			seq = (
@@ -15257,16 +15421,23 @@ class BatchGenWorker:
 			if attachment is None:
 				continue
 			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			if state is None or not int(state.trajectory_restore_boundary):
+				restorer.decline(
+					attachment,
+					reason=DECLINE_NOT_PLANNED,
+					detail="reached the restore seam with no planned restore",
+				)
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {int(seq.global_idx)} reached "
+					"the trajectory restore with a live attachment its wave "
+					"plan never planned; the plan must decline it"
+				)
 			restorer.restore(
 				attachment,
 				serving_group_id=int(seq.decode_dp_group or 0),
-				# The position the suffix prefill will start at. Absent state
-				# means the whole prompt is recomputed, which the restorer
-				# refuses by name rather than restoring a state the forward
-				# would double-count.
-				compute_cached_tokens=(
-					int(state.compute_cached_tokens) if state is not None else 0
-				),
+				# The position the suffix prefill will start at, which the plan
+				# set to the snapshot boundary.
+				compute_cached_tokens=int(state.compute_cached_tokens),
 			)
 
 	def _restore_mirrored_trajectory_shards(self, local_indices) -> None:
@@ -15315,6 +15486,7 @@ class BatchGenWorker:
 				layout=committer.layout,
 				session_key=str(entry["session_key"]),
 				boundary_tokens=int(entry["boundary_tokens"]),
+				lcp_tokens=int(entry["lcp_tokens"]),
 				owning_group_id=int(entry["owning_group_id"]),
 				serving_group_id=int(seq.decode_dp_group or 0),
 				compute_cached_tokens=(
