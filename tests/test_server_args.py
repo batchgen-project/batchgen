@@ -85,18 +85,90 @@ def test_distributed_weights_accept_two_and_four_node_topologies(tmp_path):
 
 def test_distributed_weights_reject_other_node_counts(tmp_path):
     for nnodes in (1, 3, 8):
-        with pytest.raises(ValueError, match="--nnodes 2 --world-size 16"):
+        with pytest.raises(ValueError, match="require --nnodes 2 or 4"):
             validate_server_args(
                 _args(tmp_path, nnodes=nnodes, world_size=nnodes * 8)
             )
 
 
-def test_distributed_weights_require_eight_ranks_per_node(tmp_path):
-    for nnodes, world_size in ((2, 32), (4, 16), (2, 8), (4, 8)):
-        with pytest.raises(ValueError, match="--nnodes 2 --world-size 16"):
+def _published(tmp_path, *extra, nnodes=2):
+    from tests.test_kimi_k3_distributed_store_preflight import TOPOLOGY
+    from tests.test_kimi_k3_store_builder import Env
+    from batchgen.models.moonshotai.kimi_linear import store_builder as sb
+
+    env = Env(tmp_path / "k3")
+    output = tmp_path / f"store-{'-'.join(extra) or 'default'}"
+    argv = env.argv(output, 0)
+    argv[argv.index("--num-nodes") + 1] = str(nnodes)
+    argv[argv.index("--node-ips") + 1] = ",".join(
+        f"10.0.0.{index + 1}" for index in range(nnodes)
+    )
+    sb.build(argv + list(extra), expected_topology=TOPOLOGY)
+    return env, output / "node0.json"
+
+
+def test_distributed_weights_require_the_store_workers_per_node(tmp_path):
+    env, config = _published(tmp_path)
+    for world_size in (8, 32):
+        with pytest.raises(ValueError, match="8 workers per host require --world-size 16"):
             validate_server_args(
-                _args(tmp_path, nnodes=nnodes, world_size=world_size)
+                _args(
+                    tmp_path, nnodes=2, world_size=world_size,
+                    distributed_weight_config=config,
+                    converted_ckpt_dir=env.ckpt, cache_dir=env.model_dir,
+                )
             )
+
+
+def test_a_four_worker_local_store_runs_two_trays_as_world8(tmp_path):
+    env, config = _published(
+        tmp_path, "--transport", "local", "--workers-per-node", "4",
+    )
+    common = dict(
+        nnodes=2, distributed_weight_config=config,
+        converted_ckpt_dir=env.ckpt, cache_dir=env.model_dir,
+    )
+    validate_server_args(_args(tmp_path, world_size=8, **common))
+    with pytest.raises(ValueError, match="4 workers per host require --world-size 8"):
+        validate_server_args(_args(tmp_path, world_size=16, **common))
+
+
+def test_resident_ep_prefill_with_the_prefix_cache_is_refused_at_startup(
+    tmp_path, monkeypatch,
+):
+    import batchgen.prefix_reuse.config as prefix_config
+
+    monkeypatch.setattr(
+        prefix_config, "require_prefix_cache_model_support", lambda model: None
+    )
+    with pytest.raises(ValueError, match="prefill prefix pool runs per DP rank"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=8,
+                enable_prefix_cache=True,
+                prefill_moe_mode="resident_ep",
+            )
+        )
+
+
+def test_prefill_moe_mode_flag_parses_to_server_args():
+    parser = server_args_module._build_parser()
+    parsed = parser.parse_args(
+        ["--model", "m", "--host-kv-cache-size", "1",
+         "--prefill-moe-mode", "resident_ep"]
+    )
+    assert parsed.prefill_moe_mode == "resident_ep"
+    assert parser.parse_args(
+        ["--model", "m", "--host-kv-cache-size", "1"]
+    ).prefill_moe_mode is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--model", "m", "--host-kv-cache-size", "1",
+             "--prefill-moe-mode", "streamed"]
+        )
 
 
 def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):

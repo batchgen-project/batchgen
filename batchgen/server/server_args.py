@@ -207,6 +207,10 @@ class ServerArgs:
     # EP models). Default off = NCCL all_gather + reduce_scatter; on requires the
     # DeepEP build and fails fast at startup if it is unavailable (no silent NCCL fallback).
     enable_deepep: bool = False
+    # Server-level prefill MoE mode for models that declare prefill MoE
+    # modes. None = the model's default, which is streaming; every prefill
+    # wave of the server runs the one mode chosen here.
+    prefill_moe_mode: Optional[str] = None
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
@@ -393,6 +397,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "build; fails fast at startup if it is unavailable (no silent NCCL "
             "fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 "
             "and the K3 DeepEP build."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-moe-mode",
+        choices=("streamed_sp8", "resident_ep"),
+        default=None,
+        help=(
+            "Prefill MoE mode for every prefill wave of this server, on models "
+            "that declare prefill MoE modes. Default: the model's "
+            "streaming mode (streamed_sp8: each rank streams the routed "
+            "experts it owns over the model's stream span). resident_ep keeps "
+            "every rank's EP shard resident from startup and runs every wave, "
+            "the first included, against it. A model without prefill MoE "
+            "modes refuses the option at startup."
         ),
     )
     parser.add_argument(
@@ -887,6 +905,18 @@ def validate_server_args(args: ServerArgs) -> None:
         )
 
         require_prefix_cache_model_support(args.model)
+        if args.prefill_moe_mode == "resident_ep":
+            # The in-wave prefix pool plans its chunk forwards per DP rank,
+            # while every resident-EP prefill pass joins EP-world collectives
+            # whose per-pass row counts the pool's chunk loop does not
+            # synchronize; the worker would refuse the first pooled wave.
+            raise ValueError(
+                "--prefill-moe-mode resident_ep cannot run with "
+                "--enable-prefix-cache: the prefill prefix pool runs per DP "
+                "rank, but every resident-EP prefill pass joins EP-world "
+                "collectives. Use the default streamed prefill with the "
+                "prefix cache, or drop --enable-prefix-cache."
+            )
     require_cuda_graph_flag_supported(
         args.model, enable_cuda_graph=args.enable_cuda_graph
     )
@@ -1089,6 +1119,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
+        prefill_moe_mode=parsed.prefill_moe_mode,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
