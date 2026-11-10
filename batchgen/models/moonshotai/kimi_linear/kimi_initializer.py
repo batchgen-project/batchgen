@@ -169,7 +169,9 @@ class KimiLinearInitializer:
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
-        self.engine_config = self.planner.generate_config(self.engine_config)
+        self.engine_config = self.planner.generate_config(
+            self.engine_config, self.model_config.model_type
+        )
         self.engine_config.Basic_Config.distributed_weight_sharded = (
             self.distributed_weight_sharded
         )

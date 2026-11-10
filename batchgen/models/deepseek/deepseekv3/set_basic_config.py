@@ -19,7 +19,6 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 		engine_config.Basic_Config.kv_dtype = "bfloat16"
 	else:
 		logging.info(f"kv_dtype is set to {input_arguments.kv_dtype}")
-		logging.info(f"attn_mode is set to {input_arguments.get('attn_mode')}")
 		if input_arguments.kv_dtype.lower() in ['bfloat16', 'bf16']:
 			engine_config.Basic_Config.kv_dtype = "bfloat16"
 		elif input_arguments.kv_dtype.lower() in ['fp8', 'float8', 'float8_e4m3fn']:
@@ -58,14 +57,6 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 	else:
 		engine_config.Basic_Config.device = input_arguments.device
 		engine_config.Basic_Config.device_torch = torch.device(f"cuda:{input_arguments.device}")
-
-	# """ Attn Mode """
-	# if not input_arguments.get('attn_mode', None):
-	# 	# raise ValueError("Attn mode must be specified")
-	# else:
-	# 	if input_arguments.attn_mode not in [1, 2, 3]:
-	# 		raise ValueError("Currently attn_mode must be 1, 2, or 3")
-	# 	engine_config.Basic_Config.attn_mode = input_arguments.attn_mode
 
 	""" Module Types """
 	engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
