@@ -4,10 +4,57 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, Sequence
 
 import torch
+
+# FlashAttention paged KV takes pages that are a multiple of this many tokens.
+_FA_PAGE_ALIGN_TOKENS = 256
+
+
+def temporary_kv_page_tokens(profile_page_tokens: int) -> int:
+    """Page size of the temporary GPU KV: the profile's, FA-aligned."""
+
+    tokens = max(_FA_PAGE_ALIGN_TOKENS, int(profile_page_tokens))
+    return math.ceil(tokens / _FA_PAGE_ALIGN_TOKENS) * _FA_PAGE_ALIGN_TOKENS
+
+
+def temporary_kv_pages(full_length: int, page_tokens: int) -> int:
+    """Temporary GPU KV pages one sequence holds for its full prompt length."""
+
+    return math.ceil(max(1, int(full_length)) / int(page_tokens))
+
+
+def gpu_kv_page_bytes(config: object) -> int:
+    """Device bytes of one page across all layers, as ``initialize`` allocates."""
+
+    element = torch.empty((), dtype=config.kv_dtype).element_size()
+    row = int(config.num_k_heads) * int(config.k_head_dim)
+    if config.has_v_cache:
+        row += int(config.num_v_heads) * int(config.v_head_dim)
+    return int(config.num_layers) * int(config.page_size_tokens) * row * element
+
+
+def temporary_gpu_kv_config(
+    profile_config: object, full_lengths: Sequence[int]
+) -> object:
+    """Size the temporary GPU KV of one prefix-hit micro-batch.
+
+    Every member, hit or miss, holds its full prompt length: the prefix the
+    load fills plus the suffix prefill appends. The micro-batch planner caps
+    the same page count against the prefill-phase budget, so the two must be
+    computed here and nowhere else.
+    """
+
+    page_tokens = temporary_kv_page_tokens(profile_config.page_size_tokens)
+    return replace(
+        profile_config,
+        num_pages=sum(
+            temporary_kv_pages(length, page_tokens) for length in full_lengths
+        ),
+        page_size_tokens=page_tokens,
+    )
 
 
 class _AsyncTask(Protocol):

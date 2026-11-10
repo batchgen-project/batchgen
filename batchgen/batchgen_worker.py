@@ -1421,6 +1421,9 @@ class BatchGenWorker:
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
 		self._prefill_pool_page_budget = None
+		# Device bytes a prefill forward may hold as prefix KV beside the
+		# planner's forward workspace, measured at the same point.
+		self._prefill_prefix_kv_budget_bytes = None
 		# (allocated, reserved, device use outside the allocator) once the pool is up
 		self._prefill_pool_base = (0, 0, 0)
 		# Pseudo Host ids must not collide with entries a previous worker of
@@ -8492,9 +8495,20 @@ class BatchGenWorker:
 		return limits
 
 	def _plan_prefill_micro_batches(
-		self, seq_lengths: List[int]
+		self,
+		seq_lengths: List[int],
+		full_seq_lengths: List[int],
+		compute_cached_tokens: List[int],
 	) -> Tuple[List[Tuple[int, int]], int, bool]:
-		"""Build the one authoritative prepacked-forward plan for local rows."""
+		"""Build the one authoritative prepacked-forward plan for local rows.
+
+		``seq_lengths`` are the computed (suffix) lengths the forward packs;
+		``full_seq_lengths`` the prompt lengths. A micro-batch holding a
+		prefix hit materializes temporary GPU KV for every member's full
+		length, so its pages are capped by the prefill-phase prefix KV budget
+		(``_measure_prefill_prefix_kv_budget``) and the micro-batch splits
+		until the transient fits.
+		"""
 		token_cap = (
 			self.engine_config.Module_Batching_Config
 			.prefill_micro_batch_token_cap
@@ -8506,13 +8520,53 @@ class BatchGenWorker:
 			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
 			and self.parallel_manager.prefill_uses_streamed_sp8()
 		)
+		prefix_hits = [int(tokens) > 0 for tokens in compute_cached_tokens]
+		kv_pages = [0] * len(prefix_hits)
+		kv_page_cap = 0
+		if any(prefix_hits):
+			from batchgen.prefix_reuse.materialization import (
+				gpu_kv_page_bytes,
+				temporary_kv_pages,
+			)
+
+			budget = self._prefill_prefix_kv_budget_bytes
+			if budget is None:
+				raise RuntimeError(
+					"prefix-hit prefill has no prefill-phase prefix KV budget: "
+					"the model planner sets no prefill_prefix_pool_workspace_bytes"
+					", so the temporary full-length KV cannot be bounded"
+				)
+			if self._decode_attn_tp_size() != 1:
+				raise RuntimeError(
+					"prefix-hit prefill splits micro-batches by a rank-local "
+					"budget, which a serve group of attn_tp_size>1 cannot share"
+				)
+			page_config = self._prefix_materialization_kv_config([1])
+			kv_pages = [
+				temporary_kv_pages(length, page_config.page_size_tokens)
+				for length in full_seq_lengths
+			]
+			kv_page_cap = budget // gpu_kv_page_bytes(page_config)
 		micro_batches, l2_cap = build_prefill_micro_batches(
 			seq_lengths,
 			token_cap,
 			l2_balance=use_l2,
 			single_sequence_only=single_sequence_only,
+			prefix_hits=prefix_hits,
+			kv_pages=kv_pages,
+			kv_page_cap=kv_page_cap,
 		)
 		return micro_batches, l2_cap, single_sequence_only
+
+	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
+		"""The temporary GPU KV config of one prefix-hit micro-batch."""
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		from batchgen.prefix_reuse.materialization import temporary_gpu_kv_config
+
+		return temporary_gpu_kv_config(
+			build_gpu_kv_config(self.huggingface_ckpt_name, full_seq_lengths),
+			full_seq_lengths,
+		)
 
 	def _prefill_model_pass_count(self, batch: List[int]) -> int:
 		"""Return the number of complete model forwards local prefill will run."""
@@ -8531,13 +8585,27 @@ class BatchGenWorker:
 			)
 			return math.ceil(len(batch) / micro_batch_size)
 
-		seq_lengths = [
-			self.global_batch.get_sequence(
-				self._local_to_uuid_map[local_idx]
-			).prompt_length
-			for local_idx in batch
-		]
-		micro_batches, _, _ = self._plan_prefill_micro_batches(seq_lengths)
+		# The same inputs prefill_prepacked plans with: computed (suffix)
+		# lengths, prompt lengths and the attached prefix of each row.
+		full_seq_lengths = []
+		compute_cached_tokens = []
+		for local_idx in batch:
+			seq = self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+			prefix_state = self._prefix_sequence_states.get(seq.global_idx)
+			full_seq_lengths.append(seq.prompt_length)
+			compute_cached_tokens.append(
+				prefix_state.compute_cached_tokens
+				if prefix_state is not None
+				else 0
+			)
+		micro_batches, _, _ = self._plan_prefill_micro_batches(
+			[
+				full - cached
+				for full, cached in zip(full_seq_lengths, compute_cached_tokens)
+			],
+			full_seq_lengths,
+			compute_cached_tokens,
+		)
 		return len(micro_batches)
 
 	def _streamed_sp8_prefill_pass_alignment(
@@ -11259,8 +11327,8 @@ class BatchGenWorker:
 				if torch.cuda.is_available():
 					torch.cuda.synchronize(self.torch_device)
 			self.set_phase("prefill")
-			if self._prefill_prefix_pool_enabled():
-				self._measure_prefill_pool_budget()
+			if self.enable_prefix_cache:
+				self._measure_prefill_prefix_kv_budget()
 			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
 		else:
 			# phase_enter readies the instance for the first wave of a phase;
@@ -13413,19 +13481,37 @@ class BatchGenWorker:
 			+ len(indexer_layers) * page_tokens * indexer_dim
 		) * element
 
-	def _measure_prefill_pool_budget(self) -> None:
-		"""Measure the prefill-phase pool page budget. Runs after every
-		configure_prefill while the pool gate is enabled; the device layout at
-		that point is a deployment constant, so the measurement is stable."""
+	def _measure_prefill_prefix_kv_budget(self) -> None:
+		"""Measure the prefill-phase prefix KV budget. Runs after every
+		configure_prefill while prefix caching is on; the device layout at
+		that point is a deployment constant, so the measurement is stable.
+
+		The planner's ``prefill_prefix_pool_workspace_bytes`` is the forward
+		workspace of one prefill micro-batch; the free memory beside it is the
+		prefix KV a prefill forward may hold, either the in-wave pool's pages
+		or the temporary full-length KV of a cross-wave prefix hit. A model
+		whose planner sets no workspace has no such budget (None)."""
 		from batchgen.prefix_reuse.pool import pool_pages_from_budget
 
+		pool_enabled = self._prefill_prefix_pool_enabled()
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 		free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
 		batching = self.engine_config.Module_Batching_Config
+		workspace = int(batching.prefill_prefix_pool_workspace_bytes)
+		kv_budget = max(0, free_bytes - workspace) if workspace > 0 else None
+		if kv_budget != self._prefill_prefix_kv_budget_bytes:
+			logging.info(
+				"[PREFIX_KV] Rank %s prefill-phase prefix KV budget: %s B "
+				"(%d B free, %d B workspace, was %s)",
+				self.rank, kv_budget, free_bytes, workspace,
+				self._prefill_prefix_kv_budget_bytes,
+			)
+		self._prefill_prefix_kv_budget_bytes = kv_budget
+		if not pool_enabled:
+			return
 		budget = pool_pages_from_budget(
-			free_bytes, int(batching.prefill_prefix_pool_workspace_bytes),
-			self._prefill_pool_page_bytes(),
+			free_bytes, workspace, self._prefill_pool_page_bytes(),
 		)
 		previous = self._prefill_pool_page_budget
 		self._prefill_pool_page_budget = budget
@@ -15918,7 +16004,9 @@ class BatchGenWorker:
 		# prepack pass preserves the state contract; it is not a token-axis
 		# split pretending to be a resumable model forward.
 		micro_batches, l2_cap, _use_single_sequence_mb = (
-			self._plan_prefill_micro_batches(seq_lengths_list)
+			self._plan_prefill_micro_batches(
+				seq_lengths_list, full_seq_lengths, compute_cached_tokens
+			)
 		)
 		total_tokens_all = sum(seq_lengths_list)
 		if (
@@ -16069,9 +16157,6 @@ class BatchGenWorker:
 						raise RuntimeError(
 							"prefix-hit microbatch is missing lookup results"
 						)
-					from batchgen.kv_cache.host_kv_mananger_config import (
-						build_gpu_kv_config,
-					)
 					from batchgen.prefix_reuse.materialization import (
 						materialize_gpt_oss_prefixes,
 					)
@@ -16080,19 +16165,10 @@ class BatchGenWorker:
 						self.prefix_cache_runtime_config.group_specs[0]
 						.raw_page_tokens
 					)
-					gpu_config = build_gpu_kv_config(
-						self.huggingface_ckpt_name,
-						batch_full_seq_lengths,
-					)
-					fa_page_tokens = max(256, int(gpu_config.page_size_tokens))
-					fa_page_tokens = math.ceil(fa_page_tokens / 256) * 256
-					gpu_config = replace(
-						gpu_config,
-						num_pages=sum(
-							math.ceil(max(1, int(tokens)) / fa_page_tokens)
-							for tokens in batch_full_seq_lengths
-						),
-						page_size_tokens=fa_page_tokens,
+					# Sized by the same function the micro-batch planner
+					# capped against the prefill-phase prefix KV budget.
+					gpu_config = self._prefix_materialization_kv_config(
+						batch_full_seq_lengths
 					)
 					temporary_manager = GPUPagedKVCacheManager(
 						config=gpu_config,

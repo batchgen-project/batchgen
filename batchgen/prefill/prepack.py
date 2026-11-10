@@ -18,7 +18,7 @@ Example:
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
@@ -216,6 +216,14 @@ def prepack_sequences(
     )
 
 
+class PrefixMaterializationExceedsBudget(RuntimeError):
+    """One prefix-hit sequence's full-length temporary KV exceeds the budget.
+
+    A micro-batch with a prefix hit materializes temporary GPU KV for the full
+    length of every member, so no split can make such a sequence fit.
+    """
+
+
 def build_prefill_micro_batches(
     seq_lengths: List[int],
     token_cap: int,
@@ -223,8 +231,17 @@ def build_prefill_micro_batches(
     l2_balance: bool = True,
     l2_slack: float = 1.2,
     single_sequence_only: bool = False,
+    prefix_hits: Optional[Sequence[bool]] = None,
+    kv_pages: Optional[Sequence[int]] = None,
+    kv_page_cap: int = 0,
 ) -> Tuple[List[Tuple[int, int]], int]:
     """Plan contiguous sequence-index micro-batches for prefill.
+
+    ``prefix_hits[i]`` says whether sequence ``i`` attaches a cached prefix
+    and ``kv_pages[i]`` how many temporary GPU KV pages its full length takes.
+    A micro-batch holding any hit materializes those pages for EVERY member,
+    so such a micro-batch is also capped at ``kv_page_cap`` pages; one without
+    a hit holds none. Omitted, no sequence has a hit.
 
     Returns:
         A pair ``(micro_batches, l2_cap)`` where each micro-batch is a
@@ -232,11 +249,32 @@ def build_prefill_micro_batches(
         order. When ``single_sequence_only`` is set, each sequence gets its own
         micro-batch and ``l2_cap`` is reported as 0 because no balancing is
         applied.
+
+    Raises:
+        PrefixMaterializationExceedsBudget: a hit sequence alone needs more
+            than ``kv_page_cap`` pages.
     """
     if token_cap <= 0:
         raise ValueError(f"token_cap must be positive, got {token_cap}")
 
     num_sequences = len(seq_lengths)
+    if (prefix_hits is None) != (kv_pages is None):
+        raise ValueError("prefix_hits and kv_pages must be given together")
+    hits = [False] * num_sequences if prefix_hits is None else list(prefix_hits)
+    pages = [0] * num_sequences if kv_pages is None else [int(p) for p in kv_pages]
+    if len(hits) != num_sequences or len(pages) != num_sequences:
+        raise ValueError(
+            "prefix_hits and kv_pages must have one entry per sequence"
+        )
+    for seq_idx, (hit, seq_pages) in enumerate(zip(hits, pages)):
+        if hit and seq_pages > kv_page_cap:
+            raise PrefixMaterializationExceedsBudget(
+                f"prefix-hit sequence {seq_idx} needs {seq_pages} temporary "
+                f"GPU KV pages for its full length, above the prefill budget "
+                f"of {kv_page_cap} pages; lower the prompt length or free "
+                "device memory for the prefill phase"
+            )
+
     if num_sequences == 0:
         return [], 0
 
@@ -256,19 +294,28 @@ def build_prefill_micro_batches(
     current_batch_start = 0
     current_batch_tokens = 0
     current_batch_l2 = 0
+    current_batch_pages = 0
+    current_batch_hit = False
 
     for seq_idx, seq_len in enumerate(seq_lengths):
         seq_l2 = seq_len * seq_len
         over_tokens = current_batch_tokens + seq_len > token_cap
         over_l2 = (l2_cap > 0) and (current_batch_l2 + seq_l2 > l2_cap)
-        if (over_tokens or over_l2) and current_batch_tokens > 0:
+        over_kv = (current_batch_hit or hits[seq_idx]) and (
+            current_batch_pages + pages[seq_idx] > kv_page_cap
+        )
+        if (over_tokens or over_l2 or over_kv) and current_batch_tokens > 0:
             micro_batches.append((current_batch_start, seq_idx))
             current_batch_start = seq_idx
             current_batch_tokens = 0
             current_batch_l2 = 0
+            current_batch_pages = 0
+            current_batch_hit = False
 
         current_batch_tokens += seq_len
         current_batch_l2 += seq_l2
+        current_batch_pages += pages[seq_idx]
+        current_batch_hit = current_batch_hit or hits[seq_idx]
 
     if current_batch_start < num_sequences:
         micro_batches.append((current_batch_start, num_sequences))
