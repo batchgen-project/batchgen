@@ -7,20 +7,53 @@ This mirrors setup.py ext_modules. When adding a new CUDAExtension in
 setup.py, add a corresponding entry here for JIT dev mode support.
 """
 
+import torch
+
+
+def _device_gencode():
+    """Return the exact gencode pair for the active CUDA capability."""
+    if not torch.cuda.is_available():
+        # CPU-only declaration tests still need to inspect the registry. The
+        # runtime path always has a CUDA device before JIT compilation.
+        return ["-gencode", "arch=compute_90a,code=sm_90a"]
+    capability = tuple(torch.cuda.get_device_capability())
+    targets = {
+        (9, 0): "compute_90a,code=sm_90a",
+        (10, 0): "compute_100,code=sm_100",
+        (10, 3): "compute_103,code=sm_103",
+    }
+    try:
+        target = targets[capability]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability {capability}; "
+            "expected 9.0, 10.0, or 10.3"
+        ) from exc
+    return ["-gencode", f"arch={target}"]
+
+
+_ARCH_GENCODE = _device_gencode()
+
 # Common flag sets (mirror setup.py). SM90a code is always selected with the
-# explicit two-item ``-gencode arch=compute_90a,code=sm_90a``: the ``-arch=``
-# shorthand lets torch append its own arch flags and emits a plain compute_90
-# image that ptxas rejects for wgmma.*.
-_SM90A_GENCODE = ["-gencode", "arch=compute_90a,code=sm_90a"]
+# explicit two-item gencode pair: the ``-arch=`` shorthand lets torch append
+# its own arch flags and emits a plain compute image that ptxas rejects for
+# wgmma.*.
+_SM90A_GENCODE = _ARCH_GENCODE
+
+
+# C++ standard: Torch >= 2.15 headers require C++20; older lanes keep C++17.
+_CXX_STD = "-std=c++17"
+if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 15):
+    _CXX_STD = "-std=c++20"
 
 _SM90A_FLAGS = [
-    "-std=c++17", *_SM90A_GENCODE, "-O3",
+    _CXX_STD, *_SM90A_GENCODE, "-O3",
     "--ptxas-options=-v", "-lineinfo", "--threads", "4",
 ]
 
 # Hadamard extensions: the flags the kernels were validated with.
 _HADAMARD_NVCC_FLAGS = [
-    "-O3", "-std=c++17", "--use_fast_math",
+    "-O3", _CXX_STD, "--use_fast_math",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -35,7 +68,7 @@ _SM80_GENCODE = [
     "-gencode", "arch=compute_90,code=sm_90",
 ]
 
-_SM80_FLAGS = ["-std=c++17", "-O3", "--threads", "4"] + _SM80_GENCODE
+_SM80_FLAGS = [_CXX_STD, "-O3", "--threads", "4"] + _SM80_GENCODE
 
 
 def get_registry():
@@ -66,7 +99,7 @@ def get_registry():
         "batchgen_kernels.moe._C_marlin_grouped_gemm": {
             "sources": ["src/moe/marlin_grouped_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "--use_fast_math", "-lineinfo",
                 "-DUSE_BF16_COMPUTE",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -76,7 +109,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_gemm": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "-lineinfo", "--expt-relaxed-constexpr",
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
                 "-DNDEBUG", "-Xptxas=-v",
@@ -87,14 +120,14 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_ops": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "-lineinfo", "--threads", "4",
             ],
         },
         "batchgen_kernels.moe._C_marlin_transform": {
             "sources": ["src/moe/marlin_transform_kernel.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "--use_fast_math", "--threads", "4",
             ],
         },
@@ -111,18 +144,28 @@ def get_registry():
                 "src/moe/routing/router_epilogue.cu",
                 "src/moe/routing/gate_sigmoid_topk.cu",
                 "src/moe/routing/glm5_router_gemm.cu",
+            ],
+            "nvcc_flags": [
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
+                "--threads", "4",
+            ],
+        },
+        "batchgen_kernels.moe._C_routing_wgmma": {
+            "sources": [
+                "src/moe/routing/fused_gate_extension.cc",
                 "src/moe/routing/fused_gate.cu",
             ],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
         "batchgen_kernels.moe._C_dispatch_scatter_3d": {
             "sources": ["src/moe/dispatch_scatter_3d.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
+                "-O3", _CXX_STD,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -131,7 +174,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_wgmma_grouped_gemm": {
             "sources": ["src/moe/fp8_wgmma_grouped_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "--ptxas-options=-v", "-lineinfo",
                 "-DNUM_STAGES=4",
                 "--threads", "4",
@@ -140,7 +183,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_wgmma_quant_ops": {
             "sources": ["src/moe/fp8_wgmma_quant_ops.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "--ptxas-options=-v", "-lineinfo",
                 "--threads", "4",
             ],
@@ -156,7 +199,7 @@ def get_registry():
                 "src/attention/csrc/qkv_split.cu",
             ],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                "-O3", _CXX_STD, "--expt-relaxed-constexpr",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ] + _SM80_GENCODE,
@@ -167,7 +210,7 @@ def get_registry():
         "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant": {
             "sources": ["src/attention/csrc/add_rmsnorm_fp8_quant.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                "-O3", _CXX_STD, "--expt-relaxed-constexpr",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ] + _SM80_GENCODE,
@@ -175,7 +218,7 @@ def get_registry():
         "batchgen_kernels.conv1d._C_causal_conv1d": {
             "sources": ["src/conv1d/causal_conv1d.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                "-O3", _CXX_STD, "--expt-relaxed-constexpr",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ] + _SM80_GENCODE,
@@ -197,7 +240,7 @@ def get_registry():
         "batchgen_kernels.common._C_rmsnorm": {
             "sources": ["src/common/rmsnorm.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
+                "-O3", "--use_fast_math", _CXX_STD,
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -208,7 +251,7 @@ def get_registry():
         "batchgen_kernels.common._C_cuda_rmsnorm": {
             "sources": ["src/common/cuda_rmsnorm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
+                "-O3", _CXX_STD,
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -221,7 +264,7 @@ def get_registry():
         "batchgen_kernels.common._C_spin_delay": {
             "sources": ["src/common/spin_delay.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
+                "-O3", _CXX_STD,
                 "--threads", "4",
             ] + _SM80_GENCODE,
         },
@@ -234,7 +277,7 @@ def get_registry():
                 "src/moe/mgn/rmsnorm.cu",
             ],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
+                "-O3", _CXX_STD,
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -248,24 +291,24 @@ def get_registry():
         "batchgen_kernels.attention._C_fused_kv_norm_rope": {
             "sources": ["src/attention/fused_kv_norm_rope_cache.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
         "batchgen_kernels.attention._C_fused_q_absorb": {
             "sources": ["src/attention/fused_q_absorb.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
         "batchgen_kernels.attention._C_fused_q_split": {
             "sources": ["src/attention/fused_q_split.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
                 "--threads", "4",
             ],
         },
@@ -273,8 +316,8 @@ def get_registry():
         "batchgen_kernels.attention._C_fused_indexer_k_write_fp8": {
             "sources": ["src/attention/fused_indexer_k_write_fp8.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", _CXX_STD,
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -282,8 +325,8 @@ def get_registry():
         "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8": {
             "sources": ["src/attention/fused_indexer_k_norm_rope_write_fp8.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", _CXX_STD,
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -291,8 +334,8 @@ def get_registry():
         "batchgen_kernels.attention._C_kda_fused_decode": {
             "sources": ["src/attention/kda_fused_decode.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
-                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-O3", "--use_fast_math", _CXX_STD,
+                *_SM90A_GENCODE,
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
             ],
@@ -301,7 +344,7 @@ def get_registry():
         "batchgen_kernels.attention._C_indexer_kv_proj_wgmma": {
             "sources": ["src/attention/indexer_kv_proj_wgmma.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", *_SM90A_GENCODE,
+                "-O3", _CXX_STD, *_SM90A_GENCODE,
                 "--ptxas-options=-v", "-lineinfo",
                 "-DNUM_STAGES=4",
                 "--threads", "4",
@@ -313,7 +356,7 @@ def get_registry():
         "batchgen_kernels.attention._C_dsa_fast_topk": {
             "sources": ["src/attention/dsa_fast_topk.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
+                "-O3", "--use_fast_math", _CXX_STD,
                 "--threads", "4",
             ] + _SM80_GENCODE,
         },
@@ -323,7 +366,7 @@ def get_registry():
                 "src/attention/hadamard/fast_hadamard_transform_cuda.cu",
             ],
             "nvcc_flags": _HADAMARD_NVCC_FLAGS + _SM80_GENCODE,
-            "cxx_flags": ["-O3", "-std=c++17"],
+            "cxx_flags": ["-O3", _CXX_STD],
             "include_dirs": ["src/attention/hadamard"],
         },
         "batchgen_kernels.attention._C_fused_rope_hadamard": {
@@ -332,7 +375,7 @@ def get_registry():
                 "src/attention/hadamard/fused_rope_hadamard.cu",
             ],
             "nvcc_flags": _HADAMARD_NVCC_FLAGS + _SM80_GENCODE,
-            "cxx_flags": ["-O3", "-std=c++17"],
+            "cxx_flags": ["-O3", _CXX_STD],
             "include_dirs": ["src/attention/hadamard"],
         },
 
@@ -341,7 +384,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fused_moe_token_permutation": {
             "sources": ["src/moe/fused_moe_token_permutation.cu"],
             "nvcc_flags": [
-                "-O3", "--use_fast_math", "-std=c++17",
+                "-O3", "--use_fast_math", _CXX_STD,
                 "--threads", "4",
             ] + _SM80_GENCODE,
         },

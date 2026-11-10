@@ -15,7 +15,7 @@ Environment variables:
                       With `build_ext --parallel N`, N extensions build at once, each
                       with up to MAX_JOBS ninja jobs; lower MAX_JOBS accordingly.
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
-    BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
+    BUILD_ARCH      — "sm90a" (default), "sm100", "sm103a", or "all". Controls which arch kernels to build
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
@@ -88,24 +88,33 @@ _cache_tool = _setup_ccache()
 
 
 # ── Architecture build gating ──
-# BUILD_ARCH: "sm90a" (default), "sm100", "all"
+# BUILD_ARCH: "sm90a" (default), "sm100", "sm103a", "all"
 
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
+_build_sm103a = _build_arch == "sm103a"
 
 # ── Architecture flag sets ──
 
 # Explicit -gencode (not bare -arch=sm_90a): bare -arch makes torch cpp_extension
 # append its own arch flags (GPU-detection/TORCH_CUDA_ARCH_LIST based), which crashes
 # on no-GPU hosts and adds a plain compute_90 pass that ptxas rejects for wgmma.*.
-_sm90a_flags = ["-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "--ptxas-options=-v",
+# C++ standard: Torch >= 2.15 headers require C++20; older lanes keep C++17.
+import torch as _torch_for_std
+_CXX_STD = "-std=c++17"
+if tuple(int(x) for x in _torch_for_std.__version__.split("+")[0].split(".")[:2]) >= (2, 15):
+    _CXX_STD = "-std=c++20"
+
+_sm90a_flags = [_CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "--ptxas-options=-v",
                 "-lineinfo", "--threads", _nvcc_threads]
 
 if _build_arch == "sm90a":
     _sm80_gencode = ["-gencode", "arch=compute_90a,code=sm_90a"]
 elif _build_arch == "sm100":
     _sm80_gencode = ["-gencode", "arch=compute_100,code=sm_100"]
+elif _build_arch == "sm103a":
+    _sm80_gencode = ["-gencode", "arch=compute_103,code=sm_103"]
 elif _build_arch == "all":
     _sm80_gencode = [
         "-gencode", "arch=compute_80,code=sm_80",
@@ -119,10 +128,12 @@ elif _build_arch == "all":
             _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
 else:
     raise RuntimeError(
-        f"Unsupported BUILD_ARCH={_build_arch!r}; expected sm90a, sm100, or all"
+        f"Unsupported BUILD_ARCH={_build_arch!r}; expected sm90a, sm100, sm103a, or all"
     )
 
-_sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
+
+
+_sm80_flags = [_CXX_STD, "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
 # ── Build extension list ──
 
@@ -164,7 +175,7 @@ _sm90a_extensions = [
         sources=["src/moe/marlin_grouped_gemm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
+            "nvcc": ["-O3", _CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a",
                      "--use_fast_math", "-lineinfo",
                      "-DUSE_BF16_COMPUTE",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -179,7 +190,7 @@ _sm90a_extensions = [
                      _this_dir],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
+            "nvcc": ["-O3", _CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a",
                      "-lineinfo", "--expt-relaxed-constexpr",
                      "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
                      "-DNDEBUG",
@@ -193,7 +204,7 @@ _sm90a_extensions = [
         sources=["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
+            "nvcc": ["-O3", _CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a",
                      "-lineinfo",
                      "--threads", _nvcc_threads],
         },
@@ -204,7 +215,7 @@ _sm90a_extensions = [
         sources=["src/moe/marlin_transform_kernel.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
+            "nvcc": ["-O3", _CXX_STD, "-gencode", "arch=compute_90a,code=sm_90a",
                      "--use_fast_math",
                      "--threads", _nvcc_threads],
         },
@@ -215,7 +226,9 @@ _sm90a_extensions = [
         sources=["src/attention/qkv_wgmma.cu"],
         extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
     ),
-    # Routing kernels (fused_gate uses WGMMA)
+    # Generic routing kernels; the WGMMA fused gate lives in its own
+    # companion extension below so this module links on every supported
+    # architecture.
     CUDAExtension(
         name="batchgen_kernels.moe._C_routing",
         sources=[
@@ -226,11 +239,24 @@ _sm90a_extensions = [
             "src/moe/routing/router_epilogue.cu",
             "src/moe/routing/gate_sigmoid_topk.cu",
             "src/moe/routing/glm5_router_gemm.cu",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "--threads", _nvcc_threads],
+        },
+    ),
+    # SM90a-only fused routing gate companion (WGMMA).
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_routing_wgmma",
+        sources=[
+            "src/moe/routing/fused_gate_extension.cc",
             "src/moe/routing/fused_gate.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--threads", _nvcc_threads],
         },
@@ -241,7 +267,7 @@ _sm90a_extensions = [
         sources=["src/moe/dispatch_scatter_3d.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
@@ -253,7 +279,7 @@ _sm90a_extensions = [
         sources=["src/moe/fp8_wgmma_grouped_gemm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--ptxas-options=-v", "-lineinfo",
                      "-DNUM_STAGES=4",
@@ -267,7 +293,7 @@ _sm90a_extensions = [
         sources=["src/moe/fp8_wgmma_quant_ops.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--ptxas-options=-v", "-lineinfo",
                      "--threads", _nvcc_threads],
@@ -281,7 +307,7 @@ _sm90a_extensions = [
         sources=["src/attention/fused_kv_norm_rope_cache.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--threads", _nvcc_threads],
         },
@@ -292,7 +318,7 @@ _sm90a_extensions = [
         sources=["src/attention/fused_q_absorb.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--threads", _nvcc_threads],
         },
@@ -303,7 +329,7 @@ _sm90a_extensions = [
         sources=["src/attention/fused_q_split.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--threads", _nvcc_threads],
         },
@@ -317,7 +343,7 @@ _sm90a_extensions = [
         sources=["src/attention/fused_indexer_k_write_fp8.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads],
@@ -330,7 +356,7 @@ _sm90a_extensions = [
         sources=["src/attention/fused_indexer_k_norm_rope_write_fp8.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads],
@@ -343,7 +369,7 @@ _sm90a_extensions = [
         sources=["src/attention/kda_fused_decode.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads],
@@ -356,7 +382,7 @@ _sm90a_extensions = [
         sources=["src/attention/indexer_kv_proj_wgmma.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--ptxas-options=-v", "-lineinfo",
                      "-DNUM_STAGES=4",
@@ -374,7 +400,7 @@ _sm80_extensions = [
         sources=["src/conv1d/causal_conv1d.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+            "nvcc": ["-O3", _CXX_STD, "--expt-relaxed-constexpr",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
@@ -390,7 +416,7 @@ _sm80_extensions = [
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+            "nvcc": ["-O3", _CXX_STD, "--expt-relaxed-constexpr",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
@@ -404,7 +430,7 @@ _sm80_extensions = [
         sources=["src/attention/csrc/add_rmsnorm_fp8_quant.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+            "nvcc": ["-O3", _CXX_STD, "--expt-relaxed-constexpr",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
@@ -435,7 +461,7 @@ _sm80_extensions = [
         sources=["src/common/rmsnorm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "-U__CUDA_NO_HALF_OPERATORS__",
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -449,7 +475,7 @@ _sm80_extensions = [
         sources=["src/common/cuda_rmsnorm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-U__CUDA_NO_HALF_OPERATORS__",
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -465,7 +491,7 @@ _sm80_extensions = [
         sources=["src/common/spin_delay.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
@@ -483,7 +509,7 @@ _sm80_extensions = [
                      os.path.join(_this_dir, "3rd/cutlass/include")],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
+            "nvcc": ["-O3", _CXX_STD,
                      "-U__CUDA_NO_HALF_OPERATORS__",
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -498,7 +524,7 @@ _sm80_extensions = [
         sources=["src/moe/fused_moe_token_permutation.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
@@ -511,7 +537,7 @@ _sm80_extensions = [
         sources=["src/attention/dsa_fast_topk.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+            "nvcc": ["-O3", "--use_fast_math", _CXX_STD,
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
@@ -524,8 +550,8 @@ _sm80_extensions = [
         ],
         include_dirs=[os.path.join(_this_dir, "src/attention/hadamard")],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
-            "nvcc": ["-O3", "-std=c++17", "--use_fast_math",
+            "cxx": ["-O3", _CXX_STD],
+            "nvcc": ["-O3", _CXX_STD, "--use_fast_math",
                      "-U__CUDA_NO_HALF_OPERATORS__",
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -545,8 +571,8 @@ _sm80_extensions = [
         ],
         include_dirs=[os.path.join(_this_dir, "src/attention/hadamard")],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
-            "nvcc": ["-O3", "-std=c++17", "--use_fast_math",
+            "cxx": ["-O3", _CXX_STD],
+            "nvcc": ["-O3", _CXX_STD, "--use_fast_math",
                      "-U__CUDA_NO_HALF_OPERATORS__",
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -558,10 +584,59 @@ _sm80_extensions = [
     ),
 ]
 
+# The generic CUDA extensions that historically lived in the SM90a list are
+# also valid for Blackwell. Clone their declarations so the sm103a lane can
+# retarget only their gencode without changing the Hopper build.
+_SM103A_GENERIC_NAMES = frozenset({
+    "batchgen_kernels.moe._C_marlin_grouped_gemm",
+    "batchgen_kernels.moe._C_routing",
+    "batchgen_kernels.moe._C_dispatch_scatter_3d",
+    "batchgen_kernels.attention._C_fused_kv_norm_rope",
+    "batchgen_kernels.attention._C_fused_q_absorb",
+    "batchgen_kernels.attention._C_fused_q_split",
+    "batchgen_kernels.attention._C_fused_indexer_k_write_fp8",
+    "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+    "batchgen_kernels.attention._C_kda_fused_decode",
+})
+
+
+def _clone_for_sm103a(extension):
+    clone = copy.copy(extension)
+    clone.sources = list(extension.sources)
+    clone.extra_compile_args = {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in extension.extra_compile_args.items()
+    }
+    nvcc = clone.extra_compile_args["nvcc"]
+    retargeted = []
+    index = 0
+    while index < len(nvcc):
+        flag = nvcc[index]
+        if (flag == "-gencode" and index + 1 < len(nvcc)
+                and nvcc[index + 1] == "arch=compute_90a,code=sm_90a"):
+            retargeted.extend(["-gencode", "arch=compute_103,code=sm_103"])
+            index += 2
+            continue
+        retargeted.append(flag)
+        index += 1
+    if extension.name == "batchgen_kernels.moe._C_marlin_grouped_gemm":
+        retargeted.append("-DBATCHGEN_DISABLE_MARLIN_V3")
+    clone.extra_compile_args["nvcc"] = retargeted
+    return clone
+
+
+_sm103a_extensions = [
+    _clone_for_sm103a(extension)
+    for extension in _sm90a_extensions
+    if extension.name in _SM103A_GENERIC_NAMES
+]
+
 # Assemble final extension list based on build flags
 _ext_modules = []
 if _build_sm90a:
     _ext_modules.extend(_sm90a_extensions)
+elif _build_sm103a:
+    _ext_modules.extend(_sm103a_extensions)
 else:
     print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
 _ext_modules.extend(_sm80_extensions)
