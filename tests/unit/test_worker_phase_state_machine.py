@@ -783,15 +783,35 @@ def _k3_module_constant(name):
     return ast.literal_eval(node.value)
 
 
+class _DeadModels:
+    """Freed models tracked by weak identity.
+
+    Membership compares objects (``ref() is model``), never ``id()``: a
+    collected fake's address can be reused by the next ``_FakeModel``
+    allocation, and an id-keyed set then flags a live model as dead
+    (seen ~1/5 runs). Weak references also leave the freed models
+    collectable, which ``_assert_freed`` requires.
+    """
+
+    def __init__(self):
+        self._refs = []
+
+    def add(self, model):
+        self._refs.append(weakref.ref(model))
+
+    def __contains__(self, model):
+        return any(ref() is model for ref in self._refs)
+
+
 def _k3_worker():
     manager = _k3_manager_class()([])
     worker, events = _server_worker(manager=manager)
-    dead = set()
+    dead = _DeadModels()
 
     def deep_free():
         events.append("deep_free")
         if worker.model is not None:
-            dead.add(id(worker.model))
+            dead.add(worker.model)
             worker.model = None
 
     worker.deep_free_model_memory = deep_free
@@ -816,7 +836,7 @@ def _k3_start(worker):
 def _assert_no_state_outlives_its_model(worker):
     manager = worker.parallel_manager
     assert manager.model is not None
-    assert id(manager.model) not in worker.dead_models
+    assert manager.model not in worker.dead_models
     assert worker.model is manager.model
     for instance in (manager.prefill_instance, manager.decode_instance):
         if instance is not None:
