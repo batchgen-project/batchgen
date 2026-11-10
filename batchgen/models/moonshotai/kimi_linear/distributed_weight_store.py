@@ -8,17 +8,25 @@ from pathlib import Path
 from typing import Any, List
 
 
-#: How a worker obtains this layer's 112-expert ingress shard.
+#: How a worker obtains this layer's routed-expert ingress shard.
 #:
 #: ``host_rdma`` (default, backward compatible) — every worker pulls its own
-#: shard from its node's compact host store.
-#: ``hierarchical_gdr`` — only eight source ranks pull from the host store and
-#: replicate their shard to the remaining nodes over dedicated cross-node
-#: NCCL groups.
-WEIGHT_TRANSPORTS = ("host_rdma", "hierarchical_gdr")
+#: shard through the node daemon, which fetches experts another node owns
+#: over RDMA.
+#: ``hierarchical_gdr`` — only one source rank per stream-span slot pulls from
+#: the host store and replicates its shard to the other spans over dedicated
+#: cross-node NCCL groups.
+#: ``local`` — no daemon: the stream span covers the EP world, so every
+#: worker reads only experts it owns as an EP rank, all in its own host's
+#: store (GB300 trays).
+WEIGHT_TRANSPORTS = ("host_rdma", "hierarchical_gdr", "local")
 
-#: Supported node counts. Each node runs eight TP8 workers, so these are the
-#: world16 (2 nodes) and world32 (4 nodes) topologies.
+#: Transports that run the node daemon. The daemon serves exactly
+#: ``DAEMON_WORKERS`` workers over eight rails.
+DAEMON_TRANSPORTS = ("host_rdma", "hierarchical_gdr")
+DAEMON_WORKERS = 8
+
+#: Supported node counts (world = nodes x workers per node).
 DISTRIBUTED_NODE_COUNTS = (2, 4)
 
 #: Eight UCX rails used by the original H20 deployment. Configs may override
@@ -125,11 +133,7 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     if config["worker_sharded"] is not True:
         raise ValueError(
             "K3 distributed host weights require worker_sharded=true; "
-            "each TP8 worker must acquire only its 112-expert ingress shard"
-        )
-    if int(config["workers"]) != 8:
-        raise ValueError(
-            "K3 distributed host weights require workers=8 per node"
+            "each worker must acquire only its own expert ingress shard"
         )
     # Optional; an existing config without the key keeps the validated
     # host-RDMA transport. Normalized into the returned dict so every caller
@@ -141,19 +145,44 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
             f"got {config.get('transport')!r}"
         )
     config["transport"] = transport
-    rail_devices = config.get("rail_devices", list(DEFAULT_RAIL_DEVICES))
+    workers = config["workers"]
     if (
-        not isinstance(rail_devices, list)
-        or len(rail_devices) != len(DEFAULT_RAIL_DEVICES)
-        or any(
-            not isinstance(device, str) or not device
-            for device in rail_devices
-        )
+        not isinstance(workers, int)
+        or isinstance(workers, bool)
+        or workers <= 0
     ):
         raise ValueError(
-            "distributed weight rail_devices must contain exactly eight "
-            "non-empty strings"
+            "distributed weight workers (GPUs per host) must be a positive "
+            f"integer; got {workers!r}"
         )
+    if transport in DAEMON_TRANSPORTS and workers != DAEMON_WORKERS:
+        raise ValueError(
+            f"distributed weight transport {transport!r} runs the node "
+            f"daemon, which serves exactly {DAEMON_WORKERS} workers per node; "
+            f"got workers={workers} (use transport 'local' when every "
+            "worker reads only its own host's experts)"
+        )
+    if transport in DAEMON_TRANSPORTS:
+        rail_devices = config.get("rail_devices", list(DEFAULT_RAIL_DEVICES))
+        if (
+            not isinstance(rail_devices, list)
+            or len(rail_devices) != len(DEFAULT_RAIL_DEVICES)
+            or any(
+                not isinstance(device, str) or not device
+                for device in rail_devices
+            )
+        ):
+            raise ValueError(
+                "distributed weight rail_devices must contain exactly eight "
+                "non-empty strings"
+            )
+    else:
+        rail_devices = config.get("rail_devices", [])
+        if rail_devices:
+            raise ValueError(
+                "distributed weight transport 'local' runs no daemon and "
+                "takes no rail_devices"
+            )
     config["rail_devices"] = rail_devices
     # Optional; a config without `store_residency` keeps the legacy direct
     # mapping of `store_path`. Both keys are normalized into the returned

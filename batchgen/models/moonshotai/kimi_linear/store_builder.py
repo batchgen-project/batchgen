@@ -128,6 +128,8 @@ from typing import (
 )
 
 from .distributed_weight_store import (
+    DAEMON_TRANSPORTS,
+    DAEMON_WORKERS,
     DEFAULT_STORE_STAGING_DIR,
     DISTRIBUTED_NODE_COUNTS,
     STORE_RESIDENCIES,
@@ -155,8 +157,14 @@ logger = logging.getLogger(__name__)
 K3_LAYERS = 92
 K3_EXPERTS = 896
 
-#: Eight TP8 workers per node (``distributed_weight_daemon.cpp:53``); the
-#: loader rejects anything else (``distributed_weight_store.py:72-75``).
+#: ``--store-residency`` value that stages nothing: the config carries no
+#: residency and the server maps ``store_path`` directly.
+STORE_RESIDENCY_UNSTAGED = "unstaged"
+
+#: Default GPUs (workers) per node: eight on the 8-GPU hosts, the only count
+#: the daemon transports serve (``distributed_weight_daemon.cpp``). A
+#: ``local``-transport store may name another count (four on a GB300 tray)
+#: with ``--workers-per-node``; the store layout does not depend on it.
 K3_WORKERS_PER_NODE = 8
 
 #: The one module key that is not a routed expert and not a mapped ring module.
@@ -969,7 +977,8 @@ def node_config(
     base_port: int,
     transport: str,
     rail_devices: Sequence[str],
-    store_residency: str = STORE_RESIDENCIES[0],
+    store_residency: Optional[str] = STORE_RESIDENCIES[0],
+    workers: int = K3_WORKERS_PER_NODE,
     store_staging_dir: str = DEFAULT_STORE_STAGING_DIR,
 ) -> Dict[str, object]:
     """The per-node config JSON. Keys are the loader's required set plus the
@@ -982,7 +991,7 @@ def node_config(
         "node_rank": plan.node_rank,
         "num_nodes": plan.num_nodes,
         "node_ips": list(node_ips),
-        "workers": K3_WORKERS_PER_NODE,
+        "workers": int(workers),
         "worker_sharded": True,
         "store_path": str(store_path),
         "metadata_path": str(metadata_path),
@@ -996,7 +1005,9 @@ def node_config(
         "transport": transport,
         "rail_devices": list(rail_devices),
         "store_residency": store_residency,
-        "store_staging_dir": store_staging_dir,
+        "store_staging_dir": (
+            store_staging_dir if store_residency is not None else None
+        ),
     }
 
 
@@ -1964,12 +1975,17 @@ def _builder_argv(
         ("summary_path", "--summary-path"),
         ("base_port", "--base-port"),
         ("transport", "--transport"),
+        ("workers", "--workers-per-node"),
         ("store_residency", "--store-residency"),
         ("store_staging_dir", "--store-staging-dir"),
     ):
         if key in config:
-            argv += [flag, str(config[key])]
-    if isinstance(config.get("rail_devices"), list):
+            value = config[key]
+            if key == "store_residency" and value is None:
+                argv += [flag, STORE_RESIDENCY_UNSTAGED]
+            elif value is not None:
+                argv += [flag, str(value)]
+    if isinstance(config.get("rail_devices"), list) and config["rail_devices"]:
         argv += ["--rail-devices", ",".join(map(str, config["rail_devices"]))]
     return argv
 
@@ -2594,18 +2610,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--transport", choices=WEIGHT_TRANSPORTS, default=WEIGHT_TRANSPORTS[0]
     )
     parser.add_argument(
-        "--rail-devices", type=_parse_csv, default=list(H200_RAIL_DEVICES)
+        "--rail-devices",
+        type=_parse_csv,
+        default=None,
+        help=(
+            "Eight UCX rail devices for the daemon transports (default: the "
+            "H200 numbering); transport 'local' runs no daemon and takes none."
+        ),
+    )
+    parser.add_argument(
+        "--workers-per-node",
+        type=int,
+        default=K3_WORKERS_PER_NODE,
+        help=(
+            "GPUs per node. The daemon transports serve exactly "
+            f"{K3_WORKERS_PER_NODE}; transport 'local' accepts any count that "
+            "divides the routed experts across the nodes (4 on a GB300 tray)."
+        ),
     )
     parser.add_argument(
         "--store-residency",
-        choices=STORE_RESIDENCIES,
+        choices=STORE_RESIDENCIES + (STORE_RESIDENCY_UNSTAGED,),
         default=STORE_RESIDENCIES[0],
         help=(
             "Lifetime of the server's staged tmpfs copy of store.bin: 'run' "
             "removes it when the server stops; 'resident' keeps it so the "
             "next start maps it without copying this output again. The "
             "output written here is the source either way and is never "
-            "deleted by the server."
+            "deleted by the server. 'unstaged' writes no residency: the "
+            "server maps this output directly (page-cache backed), for hosts "
+            "whose tmpfs cannot hold a second copy of the store."
         ),
     )
     parser.add_argument(
@@ -2687,11 +2721,28 @@ def build(
             f"--node-ips lists {len(args.node_ips)} addresses for "
             f"--num-nodes {args.num_nodes}"
         )
-    if len(args.rail_devices) != len(H200_RAIL_DEVICES):
-        raise K3StoreBuilderError(
-            f"--rail-devices needs exactly {len(H200_RAIL_DEVICES)} entries; "
-            f"got {len(args.rail_devices)}"
-        )
+    if args.transport in DAEMON_TRANSPORTS:
+        if args.rail_devices is None:
+            args.rail_devices = list(H200_RAIL_DEVICES)
+        if len(args.rail_devices) != len(H200_RAIL_DEVICES):
+            raise K3StoreBuilderError(
+                f"--rail-devices needs exactly {len(H200_RAIL_DEVICES)} entries; "
+                f"got {len(args.rail_devices)}"
+            )
+        if args.workers_per_node != DAEMON_WORKERS:
+            raise K3StoreBuilderError(
+                f"--transport {args.transport} runs the node daemon, which "
+                f"serves exactly {DAEMON_WORKERS} workers per node; got "
+                f"--workers-per-node {args.workers_per_node}"
+            )
+    else:
+        if args.rail_devices:
+            raise K3StoreBuilderError(
+                "--transport local runs no daemon and takes no --rail-devices"
+            )
+        args.rail_devices = []
+        if args.workers_per_node <= 0:
+            raise K3StoreBuilderError("--workers-per-node must be positive")
     if args.read_buffer_bytes <= 0:
         raise K3StoreBuilderError("--read-buffer-bytes must be positive")
     if args.hash_workers is not None and args.hash_workers <= 0:
@@ -2739,7 +2790,12 @@ def build(
         base_port=args.base_port,
         transport=args.transport,
         rail_devices=args.rail_devices,
-        store_residency=args.store_residency,
+        workers=args.workers_per_node,
+        store_residency=(
+            None
+            if args.store_residency == STORE_RESIDENCY_UNSTAGED
+            else args.store_residency
+        ),
         store_staging_dir=args.store_staging_dir,
     )
     metadata = metadata_bytes(plan)

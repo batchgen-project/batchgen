@@ -2387,6 +2387,16 @@ class WorkerManager:
                 f"--node-rank: {config['node_rank']} != {self.args.node_rank}"
             )
         self.distributed_weight_config = config
+        if config["transport"] == "local":
+            # Every worker reads only its own host's experts: no daemon, no
+            # cohort (workers name cohort 0 and connect to nothing).
+            logger.info(
+                "Distributed weight store for node %d uses transport=local "
+                "(no daemon): store=%s",
+                self.args.node_rank,
+                config["store_path"],
+            )
+            return
         self.distributed_weight_daemon = bg_lib.DistributedWeightDaemon(
             str(config_path)
         )

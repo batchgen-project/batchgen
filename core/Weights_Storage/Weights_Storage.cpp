@@ -47,8 +47,6 @@ using batchgen::distributed_weights::Request;
 using batchgen::distributed_weights::Response;
 
 constexpr int kKimiK3Experts = 896;
-constexpr int kKimiK3Workers = 8;
-constexpr int kKimiK3ExpertsPerWorker = kKimiK3Experts / kKimiK3Workers;
 
 // Trailing expert index of "routed_expert_<layer>_<expert>", or -1 when the
 // key is not a routed expert at all. Never throws: the fail-closed pin guard
@@ -287,11 +285,6 @@ Weights_Storage::~Weights_Storage() {
 
 void Weights_Storage::InitDistributed(const std::string& config_path,
                                       uint64_t cohort_epoch) {
-    if (cohort_epoch == 0) {
-        throw std::runtime_error(
-            "distributed weights require the worker cohort epoch the "
-            "daemon admits; got 0");
-    }
     CUDA_CHECK(cudaSetDevice(this->device_id_));
     std::ifstream config_handle(config_path);
     if (!config_handle) {
@@ -302,11 +295,21 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     config_handle >> config;
 
     this->local_node_rank_ = config.at("node_rank").get<int>();
-    // Runtime topology: eight TP8 workers per node, so two nodes are world16
-    // and four nodes are world32. Owners in the metadata are validated against
-    // this count below, before any of them can reach prefill.
+    // Runtime topology: ``workers`` GPUs per host (eight on the 8-GPU hosts,
+    // four on a GB300 tray) on ``num_nodes`` hosts; global EP rank =
+    // node_rank * workers + device. Owners in the metadata are validated
+    // against this below, before any of them can reach prefill.
     const int num_nodes =
         static_cast<int>(config.at("node_ips").size());
+    const int workers = config.at("workers").get<int>();
+    if (workers <= 0 || kKimiK3Experts % workers != 0 ||
+        kKimiK3Experts % (workers * num_nodes) != 0) {
+        throw std::runtime_error(
+            "distributed weights need workers per host dividing the " +
+            std::to_string(kKimiK3Experts) + " experts across " +
+            std::to_string(num_nodes) + " nodes; got workers=" +
+            std::to_string(workers));
+    }
     if (num_nodes != 2 && num_nodes != 4) {
         throw std::runtime_error(
             "distributed weights require exactly 2 or 4 node_ips, got " +
@@ -331,12 +334,21 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     const std::string transport =
         config.value("transport", "host_rdma");
     if (transport != "host_rdma" &&
-        transport != "hierarchical_gdr") {
+        transport != "hierarchical_gdr" && transport != "local") {
         throw std::runtime_error(
-            "distributed weight transport must be host_rdma or "
-            "hierarchical_gdr");
+            "distributed weight transport must be host_rdma, "
+            "hierarchical_gdr or local");
     }
     this->hierarchical_gdr_ = transport == "hierarchical_gdr";
+    // local: every module a worker reads is in its own host's store (the
+    // stream span covers the EP world), so there is no daemon and no remote
+    // module; a request for one is refused by name.
+    this->local_only_ = transport == "local";
+    if (!this->local_only_ && cohort_epoch == 0) {
+        throw std::runtime_error(
+            "distributed weights require the worker cohort epoch the "
+            "daemon admits; got 0");
+    }
     if (!config.contains("worker_sharded") ||
         !config.at("worker_sharded").is_boolean() ||
         !config.at("worker_sharded").get<bool>()) {
@@ -372,17 +384,20 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     // The full mapping stays in every worker because get_tensor hands pageable
     // views of the local modules to Torch. Only the DMA pinning below is
     // narrowed, and only for hierarchical_gdr.
-    if (this->device_id_ < 0 || this->device_id_ >= kKimiK3Workers) {
+    if (this->device_id_ < 0 || this->device_id_ >= workers) {
         throw std::runtime_error(
-            "distributed weights require a TP slot in [0, " +
-            std::to_string(kKimiK3Workers) + "), got " +
+            "distributed weights require a local device in [0, " +
+            std::to_string(workers) + "), got " +
             std::to_string(this->device_id_));
     }
+    // hierarchical_gdr streams one copy of the experts per host: local slot
+    // d owns [d * E / workers, (d + 1) * E / workers) and is sourced on node
+    // (d * num_nodes) / workers.
+    const int experts_per_slot = kKimiK3Experts / workers;
     const int pin_source_node =
-        (this->device_id_ * num_nodes) / kKimiK3Workers;
-    this->pin_expert_begin_ = this->device_id_ * kKimiK3ExpertsPerWorker;
-    this->pin_expert_end_ =
-        this->pin_expert_begin_ + kKimiK3ExpertsPerWorker;
+        (this->device_id_ * num_nodes) / workers;
+    this->pin_expert_begin_ = this->device_id_ * experts_per_slot;
+    this->pin_expert_end_ = this->pin_expert_begin_ + experts_per_slot;
     this->pin_source_ = this->hierarchical_gdr_ &&
                         this->local_node_rank_ == pin_source_node;
     // MEASURED (r27, world16): the resident shard build after the first
@@ -391,9 +406,9 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     // 63-146 s on every other rank (pageable copies of unregistered store
     // pages) -- 146 s inside the client wall.
     const int experts_per_ep_rank =
-        kKimiK3Experts / (kKimiK3Workers * num_nodes);
+        kKimiK3Experts / (workers * num_nodes);
     this->resident_expert_begin_ =
-        (this->local_node_rank_ * kKimiK3Workers + this->device_id_) *
+        (this->local_node_rank_ * workers + this->device_id_) *
         experts_per_ep_rank;
     this->resident_expert_end_ =
         this->resident_expert_begin_ + experts_per_ep_rank;
@@ -460,8 +475,10 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
             const bool streams_it =
                 this->pin_source_ && expert >= this->pin_expert_begin_ &&
                 expert < this->pin_expert_end_;
+            // local pins the worker's own EP experts: the resident shard and,
+            // with the stream span equal to the EP world, the streamed shard.
             const bool resident_here =
-                this->hierarchical_gdr_ &&
+                (this->hierarchical_gdr_ || this->local_only_) &&
                 owner == this->local_node_rank_ &&
                 expert >= this->resident_expert_begin_ &&
                 expert < this->resident_expert_end_;
@@ -492,9 +509,10 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         }
     }
     // host_rdma serves arbitrary modules to arbitrary peers, so it keeps the
-    // whole compact store pinned. hierarchical_gdr registers the coalesced
-    // slot ranges only, which is what turns a >20 min startup into seconds.
-    if (this->hierarchical_gdr_) {
+    // whole compact store pinned. hierarchical_gdr and local register the
+    // coalesced slot ranges only, which is what turns a >20 min startup into
+    // seconds.
+    if (this->hierarchical_gdr_ || this->local_only_) {
         // The staged store sits on a tmpfs whose huge= option, with the
         // MADV_HUGEPAGE above, decides whether THP backs this mapping.
         const auto pin_alignment = static_cast<int64_t>(
@@ -540,6 +558,22 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         }
     }
 
+    if (this->local_only_) {
+        this->distributed_ = true;
+        this->byte_size_ = this->compact_bytes_;
+        this->logger->info(
+            "Distributed compact weights ready: node_rank={}, store={:.3f} "
+            "GiB, local_tensors={}, remote_tensors={}, transport=local, "
+            "workers={}, resident_experts=[{}, {}), pinned_ranges={}, "
+            "pinned_compact={:.3f} GiB",
+            this->local_node_rank_,
+            this->compact_bytes_ / (1024.0 * 1024.0 * 1024.0),
+            local_tensors, remote_tensors, workers,
+            this->resident_expert_begin_, this->resident_expert_end_,
+            pin_intervals.size(),
+            pinned_compact_bytes / (1024.0 * 1024.0 * 1024.0));
+        return;
+    }
     this->daemon_socket_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (this->daemon_socket_ < 0) {
         throw std::runtime_error(
@@ -891,6 +925,13 @@ Weights_Storage::get_module_weights_storage(
             throw std::runtime_error(
                 "hierarchical_gdr rank requested non-local host module: " +
                 module_key);
+        }
+        if (this->local_only_) {
+            throw std::runtime_error(
+                "local distributed-weight transport has no remote modules, "
+                "but this worker requested " + module_key +
+                ", which another host's store holds; the stream span must "
+                "cover the EP world for transport=local");
         }
         const std::optional<active_lease> lease =
             this->acquire_remote_module(module_key, stop_requested);

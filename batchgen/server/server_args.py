@@ -126,13 +126,9 @@ def _validate_distributed_weight_source(args: "ServerArgs") -> None:
         raise WeightSourceError(
             "--distributed-weight-config currently supports Kimi-K3 only"
         )
-    if (
-        args.nnodes not in _K3_DISTRIBUTED_NODE_COUNTS
-        or args.world_size != args.nnodes * 8
-    ):
+    if args.nnodes not in _K3_DISTRIBUTED_NODE_COUNTS:
         raise WeightSourceError(
-            "Kimi-K3 distributed host weights require "
-            "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
+            "Kimi-K3 distributed host weights require --nnodes 2 or 4"
         )
     from batchgen.models.moonshotai.kimi_linear.store_builder import (
         K3StoreManifestError,
@@ -151,6 +147,15 @@ def _validate_distributed_weight_source(args: "ServerArgs") -> None:
         spot_check_store_path=complete_staged_store(args.distributed_weight_config),
     )
     config = verified["config"]
+    # Every host runs the store's ``workers`` GPUs (8 on the 8-GPU hosts, 4
+    # on a GB300 tray), so the world is nodes x workers.
+    workers = int(config["workers"])
+    if args.world_size != args.nnodes * workers:
+        raise WeightSourceError(
+            f"distributed host weights with {workers} workers per "
+            f"host require --world-size {args.nnodes * workers} for "
+            f"--nnodes {args.nnodes}; got --world-size {args.world_size}"
+        )
     if (config["node_rank"], config["num_nodes"]) != (args.node_rank, args.nnodes):
         raise K3StoreManifestError(
             f"{args.distributed_weight_config} is node {config['node_rank']} "

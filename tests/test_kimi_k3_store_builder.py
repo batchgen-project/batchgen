@@ -1559,3 +1559,64 @@ def test_run_read_of_a_truncated_store_names_the_row(tmp_path):
             sb._read_span_digests(descriptor, [(1, 0, 40), (2, 40, 40)], 16)
     finally:
         os.close(descriptor)
+
+
+def test_a_local_transport_store_names_its_workers_and_runs_unstaged(env):
+    output = env.tmp / "node0"
+    env.build(
+        output,
+        0,
+        extra=[
+            "--transport", "local",
+            "--workers-per-node", "4",
+            "--store-residency", sb.STORE_RESIDENCY_UNSTAGED,
+        ],
+    )
+    config = load_distributed_weight_config(output / "node0.json")
+    assert config["transport"] == "local"
+    assert config["workers"] == 4
+    assert config["rail_devices"] == []
+    # Unstaged: the server maps store.bin directly, nothing is copied.
+    assert config["store_residency"] is None
+    assert config["store_staging_dir"] is None
+    manifest = json.loads((output / sb.MANIFEST_FILE_NAME).read_text())
+    for token in (
+        "--transport local",
+        "--workers-per-node 4",
+        f"--store-residency {sb.STORE_RESIDENCY_UNSTAGED}",
+    ):
+        assert token in manifest["build_command"]
+    assert "--rail-devices" not in manifest["build_command"]
+
+
+def test_the_store_layout_does_not_depend_on_workers_per_node(env):
+    eight = env.build(env.tmp / "w8", 0)
+    four = env.build(
+        env.tmp / "w4", 0,
+        extra=["--transport", "local", "--workers-per-node", "4"],
+    )
+    assert eight.store_bytes == four.store_bytes
+    assert (env.tmp / "w8" / "store.bin").read_bytes() == (
+        env.tmp / "w4" / "store.bin"
+    ).read_bytes()
+    assert (env.tmp / "w8" / "metadata.tsv").read_bytes() == (
+        env.tmp / "w4" / "metadata.tsv"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("transport", ["host_rdma", "hierarchical_gdr"])
+def test_daemon_transports_refuse_another_worker_count(env, transport):
+    with pytest.raises(sb.K3StoreBuilderError, match="exactly 8 workers"):
+        env.build(
+            env.tmp / "bad", 0,
+            extra=["--transport", transport, "--workers-per-node", "4"],
+        )
+
+
+def test_local_transport_refuses_rail_devices(env):
+    rails = ",".join(f"mlx5_{index}:1" for index in range(8))
+    with pytest.raises(sb.K3StoreBuilderError, match="no --rail-devices"):
+        env.build(
+            env.tmp / "bad", 0,
+            extra=["--transport", "local", "--rail-devices", rails],
+        )

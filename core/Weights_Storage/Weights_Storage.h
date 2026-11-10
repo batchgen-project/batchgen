@@ -137,15 +137,17 @@ class Weights_Storage {
 
     bool distributed_ = false;
     bool hierarchical_gdr_ = false;
+    // transport=local: no daemon, every module read is in this host's store.
+    bool local_only_ = false;
     int local_node_rank_ = -1;
     // hierarchical_gdr pins only the routed experts this worker streams:
-    // TP slot device_id_ owns experts [pin_expert_begin_, pin_expert_end_),
+    // local slot device_id_ owns experts [pin_expert_begin_, pin_expert_end_),
     // and only the node that sources that slot registers them.
     bool pin_source_ = false;
     int pin_expert_begin_ = -1;
     int pin_expert_end_ = -1;
     // The resident-EP decode shard of this worker (EP rank
-    // local_node_rank_ * 8 + device_id_) is always local to this node's
+    // local_node_rank_ * workers + device_id_) is always local to this node's
     // store; pin it too, so the one-time shard materialization after the
     // first streamed prefill is a pinned H2D copy on every rank (not just
     // the one whose slot range happens to cover it).

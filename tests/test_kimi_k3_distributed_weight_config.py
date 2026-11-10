@@ -188,7 +188,7 @@ def test_weight_transport_rejects_values_outside_the_two_allowed(tmp_path):
         read_distributed_weight_config,
     )
 
-    assert WEIGHT_TRANSPORTS == ("host_rdma", "hierarchical_gdr")
+    assert WEIGHT_TRANSPORTS == ("host_rdma", "hierarchical_gdr", "local")
     for value in ("gdr", "nvlink", "HOST_RDMA", "", None, 1):
         path = _write_store_config(tmp_path / str(value), transport=value)
         with pytest.raises(ValueError, match="transport must be one of"):
@@ -347,3 +347,60 @@ def test_bootstrap_timeout_default_agrees_between_daemon_and_python():
         / "distributed_weight_store.py"
     ).read_text()
     assert '"bootstrap_timeout_s", 180' not in store
+
+
+def test_local_transport_accepts_four_workers_per_host_without_rails(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    config = read_distributed_weight_config(
+        _write_store_config(
+            tmp_path, node_ips=["n0", "n1"], workers=4, transport="local"
+        )
+    )
+    assert config["workers"] == 4
+    assert config["transport"] == "local"
+    assert config["rail_devices"] == []
+
+
+@pytest.mark.parametrize("transport", ["host_rdma", "hierarchical_gdr"])
+def test_daemon_transports_serve_exactly_eight_workers(tmp_path, transport):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    path = _write_store_config(
+        tmp_path, node_ips=["n0", "n1"], workers=4, transport=transport
+    )
+    with pytest.raises(ValueError, match="serves exactly 8 workers"):
+        read_distributed_weight_config(path)
+
+
+def test_local_transport_takes_no_rail_devices(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    path = _write_store_config(
+        tmp_path,
+        node_ips=["n0", "n1"],
+        workers=4,
+        transport="local",
+        rail_devices=[f"mlx5_{index}:1" for index in range(8)],
+    )
+    with pytest.raises(ValueError, match="takes no rail_devices"):
+        read_distributed_weight_config(path)
+
+
+@pytest.mark.parametrize("workers", [0, -4, "4", True, 4.0])
+def test_workers_must_be_a_positive_integer(tmp_path, workers):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    path = _write_store_config(
+        tmp_path, node_ips=["n0", "n1"], workers=workers, transport="local"
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        read_distributed_weight_config(path)

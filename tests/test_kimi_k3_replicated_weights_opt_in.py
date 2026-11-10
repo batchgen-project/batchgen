@@ -100,7 +100,7 @@ def test_a_config_file_that_is_not_a_published_store_is_refused(tmp_path):
 
 def test_distributed_store_constraints_still_apply(tmp_path):
     """The default-path rule must not shadow the existing topology rules."""
-    with pytest.raises(ValueError, match="--nnodes 2 --world-size 16"):
+    with pytest.raises(ValueError, match="require --nnodes 2 or 4"):
         validate_server_args(
             _args(tmp_path, with_config=True, nnodes=3, world_size=24)
         )
