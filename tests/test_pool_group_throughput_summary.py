@@ -15,6 +15,9 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
+import torch
+
 from batchgen.sequence import SequenceBatch, SequenceEntry
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
@@ -36,10 +39,10 @@ class _Worker:
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
 
-    def _tokenize_admitted_sequences(self, uuids):
-        for u in uuids:
+    def _bind_admitted_prompts(self, uuids, prompt_ids):
+        for u, token_ids in zip(uuids, prompt_ids):
             seq = self.global_batch.get_sequence(u)
-            seq.prompt_length = len(seq.text)
+            seq.prompt_length = int(token_ids.numel())
 
     def _update_config_after_tokenization(self):
         pass
@@ -57,22 +60,24 @@ class _Worker:
 namespace = {
     "SequenceEntry": SequenceEntry,
     "logging": logging,
-    # Trims allocator arenas after tokenization; irrelevant to the totals.
-    "_release_tokenizer_arenas": lambda **_: None,
+    "np": np,
+    "torch": torch,
     "time": time,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
     body=[copy.deepcopy(_method("_admit_sequences_from_message")),
+          copy.deepcopy(_method("_admitted_prompt_ids")),
           copy.deepcopy(_method("_group_token_totals"))],
     type_ignores=[])), str(WORKER), "exec"), namespace)
 _Worker._admit_sequences_from_message = namespace["_admit_sequences_from_message"]
 _Worker._group_token_totals = namespace["_group_token_totals"]
 
 
-def _admit(worker, batch_id, prompts):
+def _admit(worker, batch_id, prompt_lengths):
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": f"{batch_id}-{i}", "text": text, "batch_id": batch_id}
-        for i, text in enumerate(prompts)]})
+        {"request_id": f"{batch_id}-{i}",
+         "input_ids": np.zeros(length, dtype=np.int32), "batch_id": batch_id}
+        for i, length in enumerate(prompt_lengths)]})
 
 
 def _decode(worker, decoded):
@@ -83,15 +88,15 @@ def _decode(worker, decoded):
 
 def test_totals_cover_only_the_current_batch_group():
     worker = _Worker()
-    _admit(worker, "b1", ["x" * 100, "x" * 200, "x" * 300])
+    _admit(worker, "b1", [100, 200, 300])
     _decode(worker, decoded=50)
     assert worker._group_token_totals() == (3, 600, 150)
 
     # Idle admission starts a new group; b1 stays in global_batch.
     worker._group_uuids = set()
-    _admit(worker, "b2", ["x" * 10, "x" * 20])
+    _admit(worker, "b2", [10, 20])
     # A mid-flight admission joins the running group.
-    _admit(worker, "b3", ["x" * 40])
+    _admit(worker, "b3", [40])
     _decode(worker, decoded=7)
     assert len(worker.global_batch) == 6
     assert worker._group_token_totals() == (3, 70, 21)
@@ -99,7 +104,7 @@ def test_totals_cover_only_the_current_batch_group():
 
 def test_rejected_sequences_are_not_counted():
     worker = _Worker()
-    _admit(worker, "b1", ["x" * 10, "x" * 20])
+    _admit(worker, "b1", [10, 20])
     worker.global_batch.remove_sequence("b1-1")
     assert worker._group_token_totals() == (1, 10, 0)
 

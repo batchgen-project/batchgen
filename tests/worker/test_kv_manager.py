@@ -495,7 +495,6 @@ def _make_token_budget_req(*, query_book=None) -> TokenBudgetRequest:
 
 def _make_entry(*, kv_token_budget=None) -> QueryBookEntry:
     return QueryBookEntry(
-        text="dummy",
         encoded={"input_ids": [1, 2, 3]},
         decoded_tokens=None,
         kv_token_budget=kv_token_budget,
@@ -534,7 +533,7 @@ def test_token_budget_raises_keyerror_for_missing_entry():
 
 def test_token_budget_raises_keyerror_for_entry_without_encoded():
     """encoded=None ⇒ entry not ready ⇒ KeyError (legacy parity)."""
-    entry = QueryBookEntry(text="x", encoded=None, kv_token_budget=None)
+    entry = QueryBookEntry(encoded=None, kv_token_budget=None)
     req = _make_token_budget_req(query_book={5: entry})
     with pytest.raises(KeyError, match="Missing query entry for sequence 5"):
         KVCacheManager.get_sequence_token_budget(req, 5)

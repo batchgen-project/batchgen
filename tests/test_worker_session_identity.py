@@ -16,11 +16,13 @@ import queue
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from batchgen.query_book import release_local_query_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_functions, load_worker_methods
 
 # What the other rank contributes to the next all_gather_object.
 _PEER = {"payload": {}}
@@ -39,10 +41,16 @@ _METHODS = load_worker_methods(
         "logging": logging,
         "time": time,
         "release_local_query_slot": release_local_query_slot,
-        "_release_tokenizer_arenas": lambda **_: None,
+        "_admitted_prompt_ids": load_worker_functions(
+            ["_admitted_prompt_ids"], {"np": np, "torch": torch},
+        )["_admitted_prompt_ids"],
         "dist": SimpleNamespace(all_gather_object=_all_gather_object),
     },
 )
+
+
+def _ids(length):
+    return np.zeros(length, dtype=np.int32)
 
 
 class _Worker:
@@ -70,10 +78,10 @@ class _Worker:
         self._prefix_sequence_states = {}
         self._response_queue = queue.Queue() if rank == 0 else None
 
-    def _tokenize_admitted_sequences(self, uuids):
-        for uuid in uuids:
+    def _bind_admitted_prompts(self, uuids, prompt_ids):
+        for uuid, token_ids in zip(uuids, prompt_ids):
             seq = self.global_batch.get_sequence(uuid)
-            seq.prompt_length = len(seq.text)
+            seq.prompt_length = int(token_ids.numel())
             seq.original_prompt_length = seq.prompt_length
             seq.assigned_rank = self.owner_rank
 
@@ -101,7 +109,7 @@ class _Worker:
 
 _TURN_ENTRY = {
     "request_id": "turn_abc",
-    "text": "x" * 40,
+    "input_ids": _ids(40),
     "batch_id": "turn_abc",
     "max_tokens": 16,
     "traj_id": "traj-1",
@@ -122,7 +130,7 @@ def test_admit_stores_the_identity_next_to_batch_id(caplog):
     with caplog.at_level(logging.INFO):
         worker._admit_sequences_from_message({"entries": [
             _TURN_ENTRY,
-            {"request_id": "r@batch_1", "text": "batch prompt", "batch_id": "batch_1"},
+            {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1"},
         ]})
     turn = worker.global_batch.get_sequence("turn_abc")
     assert (turn.batch_id, turn.traj_id, turn.session_id, turn.parent_session_id) == (
@@ -196,7 +204,7 @@ def test_completion_reports_cached_computed_and_stamps(caplog):
 def test_batch_completion_without_prefix_cache_reports_zero_cached():
     worker = _Worker(rank=0)
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": "r@batch_1", "text": "y" * 12, "batch_id": "batch_1"},
+        {"request_id": "r@batch_1", "input_ids": _ids(12), "batch_id": "batch_1"},
     ]})
     _complete(worker, "r@batch_1")
     worker._report_completion("r@batch_1", gathered_text="answer")
