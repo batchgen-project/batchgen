@@ -109,11 +109,6 @@ class BatchGen {
         // std::string module_key);
     py::dict get_tensor(std::string module_key);
     void start_h2d_worker();
-    void set_global_routed_experts_data_ptr(
-        const py::dict& experts_IPC_handles,
-        const py::dict& expert_location_map
-    );
-    void cuda_enable_peer_access(int rank, int world_size);
     void save_compressed_kv();
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&

@@ -69,10 +69,6 @@ class HtoD_Engine {
                             int64_t micro_batch_idx, int64_t layer_idx,
                             int64_t byte_size);
     void clear_kv_copy_queue();
-    void set_global_routed_experts_data_ptr(
-        const py::dict& experts_IPC_handles,
-        const py::dict& expert_location_map);
-    void cuda_enable_peer_access(int rank, int world_size);
     // Installs the tasks in the weight buffer and the producer queues and
     // restarts pass numbering. Throws while the producer runs, a pass is open
     // or a slot is held.
@@ -137,9 +133,6 @@ class HtoD_Engine {
     std::mutex mutex_;
     std::condition_variable cv_;
     py::module p2p_tensor_copy_module;
-    std::unordered_map<std::string, std::unordered_map<std::string, void*>>
-                       global_device_experts_ptrs_;
-    std::unordered_map<std::string, int64_t> expert_location_map_;
 
     /* Need to query kv storage and weights storage. */
     GPU_Weight_Buffer& gpu_weight_buffer_;

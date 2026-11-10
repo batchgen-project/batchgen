@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -83,6 +84,76 @@ torch::Dtype get_tensor_dtype(
     return basic_config.weight_dtype_torch;
 }
 }  // namespace
+
+// Appends `count` slots of `module_type`, all carved from ONE zeroed
+// allocation. A slot holds the type's tensors (module_shapes, ordered by
+// name) as views at 256-byte-aligned offsets of a fixed per-slot stride, so
+// every rank lays a type's ring out identically. A grow adds a new
+// allocation and never moves an existing slot: a pointer captured by a CUDA
+// graph stays valid, and an allocation is freed when its last view drops.
+// The caller serialises access (holds mutex_, or runs before the producer).
+void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
+                                          int64_t count) {
+    auto& buffers = this->buffers_[module_type];
+    if (count <= 0) {
+        return;
+    }
+    const auto& config = this->engine_config_.gpu_buffer_config;
+    auto shapes = config.module_shapes.find(module_type);
+    if (shapes == config.module_shapes.end() || shapes->second.empty()) {
+        // A type without module_shapes has slots but no tensors, as before.
+        buffers.resize(buffers.size() + static_cast<size_t>(count));
+        return;
+    }
+    struct Field {
+        std::string name;
+        std::vector<int64_t> shape;
+        torch::Dtype dtype;
+        int64_t offset;
+        int64_t nbytes;
+    };
+    constexpr int64_t kAlign = 256;
+    std::vector<std::string> names;
+    names.reserve(shapes->second.size());
+    for (const auto& entry : shapes->second) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    std::vector<Field> fields;
+    fields.reserve(names.size());
+    int64_t stride = 0;
+    for (const auto& name : names) {
+        const auto& shape = shapes->second.at(name);
+        const torch::Dtype dtype = get_tensor_dtype(
+            config, this->engine_config_.basic_config, module_type, name);
+        int64_t numel = 1;
+        for (const int64_t dim : shape) {
+            numel *= dim;
+        }
+        const int64_t nbytes =
+            numel * static_cast<int64_t>(c10::elementSize(dtype));
+        fields.push_back(Field{name, shape, dtype, stride, nbytes});
+        stride += (nbytes + kAlign - 1) / kAlign * kAlign;
+    }
+    const auto options =
+        torch::TensorOptions()
+            .dtype(torch::kUInt8)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device)
+            .requires_grad(false);
+    const torch::Tensor storage = torch::zeros({count * stride}, options);
+    buffers.reserve(buffers.size() + static_cast<size_t>(count));
+    for (int64_t index = 0; index < count; ++index) {
+        module_weight_tensor_map slot;
+        for (const Field& field : fields) {
+            slot[field.name] = storage
+                                   .narrow(0, index * stride + field.offset,
+                                           field.nbytes)
+                                   .view(field.dtype)
+                                   .view(field.shape);
+        }
+        buffers.push_back(std::move(slot));
+    }
+}
 
 GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
                                      ModelConfig& model_config)
@@ -206,71 +277,29 @@ pybind11::dict GPU_Weight_Buffer::get_weight_stream_profile() {
 }
 
 void GPU_Weight_Buffer::Init() {
-    auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
         this->engine_config_.gpu_buffer_config
             .num_prefill_module_buffer;  // TODO: {"attn": 1, "routed_expert":
                                          // 160, "shared_expert": 1}
     for (auto& [module_type, num_buffer] : num_buffers) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
         this->buffers_[module_type].clear();
-        this->buffers_[module_type].resize(num_buffer);
-        {
-            std::lock_guard<std::mutex> lock(this->mutex_);
-            this->slots_.reset_type(module_type, num_buffer);
-        }
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
-                this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                module_type,
-                buffer_name);
-            auto options =
-                torch::TensorOptions()
-                    .dtype(tensor_dtype)
-                    .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                    .requires_grad(false)
-                    .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
-                 buffer_idx++) {
-                this->buffers_[module_type][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
-        }
+        this->slots_.reset_type(module_type, num_buffer);
+        this->append_ring_slots_(module_type, num_buffer);
     }
 };
 
 void GPU_Weight_Buffer::resize_buffer() {
-    auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
         this->engine_config_.gpu_buffer_config
             .num_decoding_module_buffer;  // {"attn": 1, "routed_expert": 160,
                                           // "shared_expert": 1}
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        int64_t to_add_buffer = num_buffers["routed_expert"] -
-                                this->buffers_["routed_expert"].size();
-        for (int64_t i = 0; i < to_add_buffer; i++) {
-            module_weight_tensor_map new_buffer;
-            for (auto& [buffer_name, buffer_shape] :
-                 buffer_shapes["routed_expert"]) {
-                // Get per-tensor dtype using the helper function
-                torch::Dtype tensor_dtype = get_tensor_dtype(
-                    this->engine_config_.gpu_buffer_config,
-                    this->engine_config_.basic_config,
-                    "routed_expert",
-                    buffer_name);
-                auto options =
-                    torch::TensorOptions()
-                        .dtype(tensor_dtype)
-                        .device(torch::kCUDA,
-                                this->engine_config_.basic_config.device)
-                        .requires_grad(false)
-                        .memory_format(torch::MemoryFormat::Contiguous);
-                new_buffer[buffer_name] = torch::zeros(buffer_shape, options);
-            }
-            this->buffers_["routed_expert"].push_back(new_buffer);
-        }
+        const int64_t to_add_buffer =
+            num_buffers["routed_expert"] -
+            static_cast<int64_t>(this->buffers_["routed_expert"].size());
+        this->append_ring_slots_("routed_expert", to_add_buffer);
         this->slots_.grow_type(
             "routed_expert",
             static_cast<int64_t>(this->buffers_["routed_expert"].size()));
@@ -557,8 +586,7 @@ GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
 
 
 // void GPU_Weight_Buffer::reset_prefill_buffer() {
-//     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
-//     auto& num_buffers =
+// //     auto& num_buffers =
 //         this->engine_config_.gpu_buffer_config
 //             .num_prefill_module_buffer;  // {"attn": 1, "routed_expert": 160,
 //                                          // "shared_expert": 1}
@@ -615,8 +643,7 @@ GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
 // }
 
 // void GPU_Weight_Buffer::reset_prefill_buffer() {
-//     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
-//     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer;
+// //     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer;
     
 //     auto options = torch::TensorOptions()
 //         .dtype(this->engine_config_.basic_config.weight_dtype_torch)
@@ -726,7 +753,6 @@ GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
 // }
 
 void GPU_Weight_Buffer::reset_prefill_buffer() {
-    auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer;
 
     {
@@ -754,27 +780,8 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
             }
         }
 
-        // Reset the buffer size as the prefill buffer size
-        this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
-
-        // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
-                this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
-        }
+        // Rebuild the ring at the prefill size.
+        this->append_ring_slots_("routed_expert", num_buffers["routed_expert"]);
 
         // Every slot FREE (for ALL module types, not just routed_expert)
         for (auto& [module_type, num_buffer] : num_buffers) {
@@ -791,8 +798,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
 
 
 // void GPU_Weight_Buffer::reset_decoding_buffer() {
-//     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
-//     auto& num_buffers =
+// //     auto& num_buffers =
 //         this->engine_config_.gpu_buffer_config
 //             .num_decoding_module_buffer;  // {"attn": 1, "routed_expert": 160,
 //                                           // "shared_expert": 1}
@@ -850,8 +856,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
 // }
 
 // void GPU_Weight_Buffer::reset_decoding_buffer() {
-//     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
-//     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer;
+// //     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer;
     
 //     auto options = torch::TensorOptions()
 //         .dtype(this->engine_config_.basic_config.weight_dtype_torch)
@@ -973,7 +978,6 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
 
 
 void GPU_Weight_Buffer::reset_decoding_buffer() {
-    auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer;
 
     {
@@ -1000,27 +1004,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
             }
         }
 
-        // Reset the buffer size
-        this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
-
-        // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
-                this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
-        }
+        // Rebuild the ring at the decoding size.
+        this->append_ring_slots_("routed_expert", num_buffers["routed_expert"]);
 
         // Every slot FREE
         for (auto& [module_type, num_buffer] : num_buffers) {

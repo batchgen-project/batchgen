@@ -143,6 +143,8 @@ class GPU_Weight_Buffer {
         std::vector<std::pair<std::string, int64_t>> slots;
     };
 
+    // Appends count slots of module_type carved from one allocation.
+    void append_ring_slots_(const std::string& module_type, int64_t count);
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
     // Waits for every pending release and returns its slots to FREE.
