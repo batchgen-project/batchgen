@@ -686,9 +686,13 @@ def test_streamed_sp8_layer_uses_planned_collective_stripe_threshold():
         )
     )
 
-    assert "collective_stripe_threshold_rows=int(getattr(" in source
-    assert "'k3_prefill_collective_stripe_threshold_rows'" in source
-    assert "32768" in source
+    assert (
+        "collective_stripe_threshold_rows=planned_rows["
+        "'k3_prefill_collective_stripe_threshold_rows']"
+    ) in source
+    # planner-owned: no engine-side default for a missing value
+    assert "32768" not in source
+    assert "requires a planned positive" in source
 
 
 def test_streamed_sp8_layer_uses_planned_grouped_chunk_rows():
@@ -708,9 +712,10 @@ def test_streamed_sp8_layer_uses_planned_grouped_chunk_rows():
         )
     )
 
-    assert "chunk_rows=int(getattr(" in source
-    assert "'k3_prefill_grouped_chunk_rows'" in source
-    assert "2048" in source
+    assert "chunk_rows=planned_rows['k3_prefill_grouped_chunk_rows']" in source
+    # planner-owned: no engine-side default for a missing value
+    assert "2048" not in source
+    assert "requires a planned positive" in source
 
 
 def _psm_path():
