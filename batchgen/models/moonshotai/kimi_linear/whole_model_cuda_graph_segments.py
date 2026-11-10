@@ -42,6 +42,7 @@ from .row_gather_triton import (
     row_gather_triton_available as _row_gather_available,
 )
 
+from batchgen.attention.mla.paged_decode import DecodeSchedule, decode_schedule
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from .moe_tp_reshard import balanced_row_split
 
@@ -139,13 +140,11 @@ class KimiLinearWholeModelSegment:
         self.index_key_buffer: Optional[torch.Tensor] = None
         self.index_scale_buffer: Optional[torch.Tensor] = None
         self.primary_kv_offload_buffers = None
-        # FlashMLA's scheduler metadata depends on the decode batch's
-        # cache_seqlens but not on the layer.  Keep the capture-time pair per
-        # graph bucket; its one metadata-generation kernel is consumed by
-        # every NoPE-MLA layer.
-        self._flashmla_metadata: Dict[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        # The dense MLA decode schedule (paged_decode.decode_schedule)
+        # depends on the decode batch's cache_seqlens but not on the layer.
+        # Keep the capture-time schedule per graph bucket; it is recorded once
+        # and consumed by every NoPE-MLA layer.
+        self._mla_schedules: Dict[int, DecodeSchedule] = {}
         # Decode has one token per sequence, so KDA's packed cumulative
         # lengths are always [0, 1, ..., bucket].  Keep one static vector per
         # graph bucket instead of recording an identical torch.arange call in
@@ -266,7 +265,7 @@ class KimiLinearWholeModelSegment:
             release = getattr(segment, "release_static_buffers", None)
             if release is not None:
                 release(bucket_size)
-        self._flashmla_metadata.pop(int(bucket_size), None)
+        self._mla_schedules.pop(int(bucket_size), None)
         self._kda_cu_seqlens.pop(int(bucket_size), None)
         self._bucket_maps.pop(int(bucket_size), None)
 
@@ -298,9 +297,7 @@ class KimiLinearWholeModelSegment:
             hidden_states.dtype
         )
 
-        flashmla_metadata, flashmla_num_splits = (
-            self._get_flashmla_metadata(bucket)
-        )
+        mla_schedule = self._get_mla_schedule(bucket)
         kda_cu_seqlens = self._get_kda_cu_seqlens(bucket)
         # The balanced-split row maps depend only on ``selector`` (fixed for
         # the step), so look them up once instead of once per MoE layer:
@@ -328,8 +325,7 @@ class KimiLinearWholeModelSegment:
         for layer_idx, layer_segment in enumerate(self.layer_segments):
             outputs = layer_segment.forward(
                 hidden_states,
-                flashmla_metadata=flashmla_metadata,
-                flashmla_num_splits=flashmla_num_splits,
+                mla_schedule=mla_schedule,
                 kda_cu_seqlens=kda_cu_seqlens,
             )
             k_tensor = outputs.get("k_tensor")
@@ -397,27 +393,22 @@ class KimiLinearWholeModelSegment:
         )
         return {"hidden_states": hidden_states}
 
-    def _get_flashmla_metadata(
-        self, bucket: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the one FlashMLA schedule pair for this graph bucket.
+    def _get_mla_schedule(self, bucket: int) -> DecodeSchedule:
+        """Return the one dense MLA decode schedule for this graph bucket.
 
         K3 has 24 NoPE-MLA layers, but all of them use the same local head
-        count and the same per-step cache lengths.  The old inline path called
-        ``get_mla_metadata`` once in every layer, recording 24 identical
-        metadata kernels and allocations in the whole-model graph.  Generate
-        it once here so replay still adapts to refreshed cache lengths while
-        removing those duplicate scheduler launches.
+        count and the same per-step cache lengths.  Recording the schedule
+        once here (flash_mla's scheduler metadata on Hopper; nothing on
+        Blackwell, whose kernel schedules on device) keeps replay adaptive to
+        refreshed cache lengths without 24 duplicate scheduler launches.
         """
-        metadata = self._flashmla_metadata.get(int(bucket))
+        schedule = self._mla_schedules.get(int(bucket))
         # The graph manager runs eager warmups before capture.  Reuse the
-        # warmup pair there, but force one fresh call while capturing so the
-        # metadata kernel itself is recorded in the graph rather than leaving
-        # the replay with warmup-time lengths.
-        if metadata is not None and not torch.cuda.is_current_stream_capturing():
-            return metadata
-
-        from flash_mla import get_mla_metadata
+        # warmup schedule there, but force one fresh call while capturing so
+        # its kernels are recorded in the graph rather than leaving the
+        # replay with warmup-time lengths.
+        if schedule is not None and not torch.cuda.is_current_stream_capturing():
+            return schedule
 
         mla_segments = [
             segment
@@ -433,13 +424,11 @@ class KimiLinearWholeModelSegment:
             for segment in mla_segments
         ):
             raise RuntimeError(
-                "K3 whole graph requires one local FlashMLA head geometry"
+                "K3 whole graph requires one local MLA decode head geometry"
             )
-        metadata = get_mla_metadata(
-            self.statics[bucket].cache_seqlens, num_heads, 1
-        )
-        self._flashmla_metadata[int(bucket)] = metadata
-        return metadata
+        schedule = decode_schedule(self.statics[bucket].cache_seqlens, num_heads)
+        self._mla_schedules[int(bucket)] = schedule
+        return schedule
 
     def _get_kda_cu_seqlens(self, bucket: int) -> torch.Tensor:
         """Return the fixed packed-length vector for a decode graph bucket."""
