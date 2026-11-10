@@ -95,6 +95,11 @@ class ExitMode(enum.Enum):
     decode rebuild (batchgen_worker.py:11291-11292, :11633) and the GPU KV
     destroy (batchgen_worker.py:11295-11305). Used on a key mismatch,
     cohort end, memory pressure and shutdown.
+
+    The worker keeps the key every held instance was entered with: a held
+    instance is resumed only under that exact key, and a RETIRE retires
+    every held instance (each under its own key) before the deep free, so
+    no instance outlives the model it references.
     """
 
     SUSPEND = "suspend"

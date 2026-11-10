@@ -2726,17 +2726,24 @@ class KimiLinearParallelStrategyManager:
     def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
         """Leave ``key.phase`` in ``mode`` while retaining reusable state.
 
-        RETIRE mechanics remain worker-owned. On decode SUSPEND, only routed
-        experts are released; KDA state pools are manager-owned and survive so
-        the next activation keeps recurrent and convolution state intact.
+        One model serves both phases, so RETIRE of either phase retires that
+        model: what the configure steps attached to it (the streamed-SP8
+        buffer and its pending prefetch, the resident EP shard and the decode
+        graph that bakes its addresses) is released while the model is still
+        reachable, and both instance tuples go with it, so no kept instance
+        outlives the model the worker's ``deep_free_model_memory`` then frees.
+        On decode SUSPEND, only routed experts are released; KDA state pools
+        are manager-owned and survive so the next activation keeps recurrent
+        and convolution state intact.
         """
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
         if mode is ExitMode.RETIRE:
-            if key.phase == "prefill":
-                self.prefill_instance = None
-            else:
-                self.decode_instance = None
+            self._release_streamed_sp8_prefill()
+            self._release_resident_ep_decode()
+            self.prefill_instance = None
+            self.decode_instance = None
+            self._active_phase = None
             self.model = None
             self.weight_copy_task = {}
             return
