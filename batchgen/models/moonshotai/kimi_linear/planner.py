@@ -21,6 +21,7 @@ from batchgen.models.moonshotai.kimi_linear.machine_profile import (
     KL48_PREFIX_POOL_WORKSPACE_BYTES,
     K3EngineProfile,
     k3_engine_profile,
+    solve_kda_user_slots,
 )
 from batchgen.planner.base_planner import BasePlanner
 
@@ -336,6 +337,47 @@ class KimiLinearPlanner(BasePlanner):
         if self.stream_all_modules:
             self._configure_streamed_rings()
 
+    def _kda_sequence_slots(self, profile: K3EngineProfile) -> int:
+        """Per-node user sequence slots of this plan.
+
+        A "kv-solve" row is solved HERE, at configure time, against the
+        launch's served full length (``padding_length + max_decoding_length``)
+        -- the profile's static ``kda_user_slots`` on such a row is only the
+        4,096-token reference solve and is never planned directly. The solve
+        is floored to an attention-TP-size multiple so every rank of the
+        group plans the same row count. Measured/inherited rows keep their
+        static value: their basis is an observed run, not the budget.
+        """
+        if profile.kda_slots_basis != "kv-solve":
+            return profile.kda_user_slots
+        basic = self.config.Basic_Config
+        prompt_tokens = basic.get_max_prompt_length()
+        decode_tokens = basic.max_decoding_length
+        if not prompt_tokens or not decode_tokens:
+            raise ValueError(
+                "K3 kv-solve slot derivation needs the served context: "
+                "Basic_Config.max_prompt_length (padding_length) and "
+                f"max_decoding_length must be set, got {prompt_tokens!r} "
+                f"and {decode_tokens!r}"
+            )
+        solved = solve_kda_user_slots(
+            profile.decode_budget,
+            extra_physical_slots=(
+                1 + self.config.GPU_Buffer_Config.kda_prefix_segment_slots
+            ),
+            full_length_tokens=prompt_tokens + decode_tokens,
+        )
+        group = self.attention_group_size
+        sequence_slots = int(solved // group) * group
+        if sequence_slots < group:
+            raise ValueError(
+                f"K3 decode budget of {profile.family.value} w{profile.world_size} "
+                f"funds {solved:.1f} sequence slots at full length "
+                f"{prompt_tokens + decode_tokens} tokens -- fewer than one "
+                f"TP{group} multiple; shorten the context or change topology"
+            )
+        return sequence_slots
+
     def _adjust_config_for_k3(self, profile: K3EngineProfile | None):
         """K3 (93 layers, 896 experts, MXFP4) overrides. Runs last.
 
@@ -354,7 +396,9 @@ class KimiLinearPlanner(BasePlanner):
         """
         # KDA conv/recurrent state pools. At K3 dimensions, an unsharded slot
         # is 428.6 MiB; TP8 KDA makes it 53.57 MiB/rank. The profile row sets
-        # the user-visible sequence capacity (the non-TP8 plan keeps four),
+        # the user-visible sequence capacity (kv-solve rows are re-solved at
+        # the served context in _kda_sequence_slots; the non-TP8 plan keeps
+        # four),
         # then one separate physical item is allocated for CUDA-graph
         # padding/warmup. The graph reserves that item before readiness, so
         # admission still sees exactly the user capacity instead of silently
@@ -362,7 +406,7 @@ class KimiLinearPlanner(BasePlanner):
         if profile is not None:
             shard_latent = profile.shard_latent_projections
             shard_vocab = profile.shard_vocab_parallel
-            sequence_slots = profile.kda_user_slots
+            sequence_slots = self._kda_sequence_slots(profile)
         else:
             shard_latent = False
             shard_vocab = False

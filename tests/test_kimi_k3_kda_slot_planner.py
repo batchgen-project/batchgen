@@ -49,11 +49,13 @@ def _plan(
     is_k3=True,
     capturable=True,
     facts=None,
+    max_prompt_length=8192,
+    max_decoding_length=128,
 ):
     config = EngineConfig()
     config.Basic_Config.kv_dtype = "bfloat16"
-    config.Basic_Config.set_max_prompt_length(8192)
-    config.Basic_Config.max_decoding_length = 128
+    config.Basic_Config.set_max_prompt_length(max_prompt_length)
+    config.Basic_Config.max_decoding_length = max_decoding_length
     config.Basic_Config.world_size = world_size
     planner = KimiLinearPlanner(
         is_k3=is_k3,
@@ -139,11 +141,15 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     )
 
 
-def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
-    config = _plan("b300", world_size=8)
+def test_b300_single_node_plan_solves_slots_at_the_served_context():
+    # The kv-solve row is solved at configure time against the launch's
+    # served full length; 2,048 + 2,048 = 4,096 reproduces the row's static
+    # 4,096-token reference solve (364.8 -> 360).
+    config = _plan(
+        "b300", world_size=8, max_prompt_length=2048, max_decoding_length=2048
+    )
 
-    # 360 user slots (kv-solve on the measured single-node decode memory) +
-    # 1 graph scratch + 16 prefix segments.
+    # 360 user slots + 1 graph scratch + 16 prefix segments.
     assert config.GPU_Buffer_Config.kda_state_slots == 360 + 1 + 16
     assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 360
     assert config.Basic_Config.decode_graph_buckets == [
@@ -155,6 +161,74 @@ def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
     assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 524_288
     assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 16_384
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
+
+
+@pytest.mark.parametrize(
+    ("max_prompt_length", "max_decoding_length", "slots"),
+    [
+        (1024, 1024, 544),  # the w1 workload (2,048-token full length)
+        (2048, 2048, 360),  # the 4,096-token reference solve
+        (512, 512, 728),    # 1,024-token full length
+    ],
+)
+def test_b300_kv_solve_follows_the_served_full_length(
+    max_prompt_length, max_decoding_length, slots
+):
+    config = _plan(
+        "b300",
+        world_size=8,
+        max_prompt_length=max_prompt_length,
+        max_decoding_length=max_decoding_length,
+    )
+    # One derivation path: the solved value replaces the static 360
+    # everywhere sequence_slots flows (state pool, decode cap, buckets).
+    assert config.GPU_Buffer_Config.kda_state_slots == slots + 1 + 16
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == slots
+    assert config.Basic_Config.decode_graph_buckets[-1] == slots
+
+
+def test_b300_kv_solve_floors_to_a_tp8_multiple():
+    # At 2,048-token full length the real solve is 547.9; the plan takes the
+    # largest TP8 multiple at or below it, never a rounded-up 548/552.
+    config = _plan(
+        "b300", world_size=8, max_prompt_length=1024, max_decoding_length=1024
+    )
+    slots = config.Module_Batching_Config.MoE_decoding_micro_batch_size
+    assert slots == 544
+    assert slots % 8 == 0
+
+    solved = _machine_profile_solve(full_length_tokens=2048)
+    assert slots <= solved < slots + 8
+
+
+def _machine_profile_solve(*, full_length_tokens):
+    from batchgen.hardware.machine_family import MachineFamily
+    from batchgen.models.moonshotai.kimi_linear.machine_profile import (
+        k3_engine_profile,
+        solve_kda_user_slots,
+    )
+
+    row = k3_engine_profile(MachineFamily.B300, 8)
+    return solve_kda_user_slots(
+        row.decode_budget,
+        extra_physical_slots=17,
+        full_length_tokens=full_length_tokens,
+    )
+
+
+def test_h200_measured_row_ignores_the_served_context():
+    # A measured-basis row keeps its observed slot count at any context.
+    for prompt, decode in ((1024, 1024), (512, 512), (8192, 128)):
+        config = _plan(
+            "h200",
+            world_size=16,
+            max_prompt_length=prompt,
+            max_decoding_length=decode,
+        )
+        assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
+        assert (
+            config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
+        )
 
 
 def test_blackwell_decode_runs_eager_when_kernel_not_capturable():

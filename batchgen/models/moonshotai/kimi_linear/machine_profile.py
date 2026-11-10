@@ -169,6 +169,7 @@ def solve_kda_user_slots(
     budget: K3DecodeBudget,
     *,
     extra_physical_slots: int,
+    full_length_tokens: int | None = None,
     geometry: K3Geometry = K3_GEOMETRY,
 ) -> float:
     """Sequences the decode budget sustains to full length.
@@ -178,9 +179,16 @@ def solve_kda_user_slots(
     length: ``S * (slot + kv(full_length)) = budget - base - graph reserve -
     extra physical slots``. Returns the real-valued solution; a row takes a
     TP-size multiple at or below it.
+
+    ``full_length_tokens`` is the served full length (prompt padding plus max
+    decode). The planner passes the launch's value at configure time; left
+    ``None``, the solve falls back to the budget's recorded reference length
+    (the rows' static 4,096-token reference solve).
     """
+    if full_length_tokens is None:
+        full_length_tokens = budget.full_length_tokens
     slot_gib = geometry.kda_slot_bytes / _GIB
-    kv_gib = geometry.kv_bytes_per_token * budget.full_length_tokens / _GIB
+    kv_gib = geometry.kv_bytes_per_token * full_length_tokens / _GIB
     free_gib = (
         budget.budget_gib
         - budget.non_slot_base_gib
@@ -201,7 +209,9 @@ class K3EngineProfile:
     #: Per-node decode admission cap (= user-visible KDA state slots).
     kda_user_slots: int
     #: How ``kda_user_slots`` was chosen: "kv-solve" (``solve_kda_user_slots``
-    #: on ``decode_budget``) or "measured: ..." / "inherited: ...".
+    #: on ``decode_budget``) or "measured: ..." / "inherited: ...". On a
+    #: kv-solve row the planner re-solves at configure time with the served
+    #: full length; the static value is the 4,096-token reference solve.
     kda_slots_basis: str
     prefill_micro_batch_token_cap: int
     resident_ep_prefill_token_cap: int
@@ -395,7 +405,11 @@ _H200_W16 = K3EngineProfile(
 # (0.89 GiB), 57.56 GiB remain for user slots and GPU KV. One sequence held
 # to 4,096 tokens costs 53.57 MiB of KDA state + 4,096 x 27,648 B of MLA KV
 # = 0.1578 GiB, so S = 57.56 / 0.1578 = 364.8; the largest TP-size multiple
-# below it is 360. A K3.1 run at frac 0.95 peaked at 254.65 GiB in use
+# below it is 360. That 360 is the 4,096-token REFERENCE solve only: on a
+# kv-solve row the planner re-solves at configure time with the launch's
+# served full length (padding_length + max_decoding_length), so a 2,048-token
+# serve plans 544 and a 1,024-token serve plans 728 from the same measured
+# budget. A K3.1 run at frac 0.95 peaked at 254.65 GiB in use
 # (2026-11-10), so the 0.95 budget leaves ~13 GiB of the device untouched.
 # Every prefill knob keeps the value this machine ran under the retired
 # memory tiers; streamed waves of 448K tokens prefilled without running out
@@ -432,7 +446,11 @@ _B300_W8 = K3EngineProfile(
             "passed the accuracy gate"
         ),
         "shard_vocab_parallel": "measured 2026-11-09/10: same runs, vocab-parallel on",
-        "kda_user_slots": "provisional kv-solve on measured memory (see the row comment)",
+        "kda_user_slots": (
+            "provisional kv-solve on measured memory at the 4,096-token "
+            "reference length (see the row comment); the planner re-solves "
+            "at the served context on this basis"
+        ),
         "prefill_micro_batch_token_cap": (
             _INHERITED_H200 + "; 448K-token streamed waves ran 2026-11-10"
         ),

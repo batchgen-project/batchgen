@@ -150,6 +150,45 @@ def test_b300_slot_solve_reproduces_the_stated_derivation():
     assert "provisional" in row.sources["kda_user_slots"]
 
 
+def test_b300_slot_solve_follows_the_served_full_length():
+    # The static 360 is the 4,096-token reference solve; the same measured
+    # budget funds more rows at the shorter served contexts.
+    row = k3_engine_profile(MachineFamily.B300, 8)
+    budget = row.decode_budget
+    cases = {4096: 364.8, 2048: 547.9, 1024: 731.5}
+    for full_length, expected in cases.items():
+        solved = solve_kda_user_slots(
+            budget, extra_physical_slots=17, full_length_tokens=full_length
+        )
+        assert solved == pytest.approx(expected, abs=0.1), full_length
+    # left out, the solve is the budget's recorded reference length
+    assert solve_kda_user_slots(
+        budget, extra_physical_slots=17
+    ) == solve_kda_user_slots(
+        budget, extra_physical_slots=17, full_length_tokens=4096
+    )
+
+
+def test_b300_2k_solve_is_gpu_kv_self_consistent():
+    # (544 + 17) slots leave 29.10 GiB of the decode budget for GPU KV =
+    # 17,657 pages (64 tokens x 27,648 B); 544 rows at the budget-capped 32
+    # pages each need 17,408.
+    row = k3_engine_profile(MachineFamily.B300, 8)
+    budget = row.decode_budget
+    slot_gib = K3_GEOMETRY.kda_slot_bytes / GIB
+    kv_gib = (
+        budget.budget_gib
+        - budget.non_slot_base_gib
+        - budget.graph_reserve_gib
+        - (544 + 17) * slot_gib
+    )
+    assert kv_gib == pytest.approx(29.10, abs=0.01)
+    page_gib = 64 * K3_GEOMETRY.kv_bytes_per_token / GIB
+    pages = int(kv_gib / page_gib)
+    assert pages == 17_657
+    assert 544 * 32 <= pages
+
+
 def test_profile_lookup_refuses_unknown_pairs_by_name():
     with pytest.raises(UnsupportedK3TopologyError, match="b200"):
         k3_engine_profile(MachineFamily.B200, 8)
