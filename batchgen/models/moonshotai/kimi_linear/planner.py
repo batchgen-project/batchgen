@@ -18,8 +18,8 @@ _GIB = 1024 ** 3
 _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
 _K3_H20_PREFILL_TOKEN_CAP = 16_384
 _K3_H200_PREFILL_TOKEN_CAP = 524_288
-# A batch that selects resident-EP prefill (batchgen_debug.k3_prefill_moe_mode)
-# runs through the resident EP shard (kept on the GPU) in chunks of this many
+# A server started with --prefill-moe-mode resident_ep runs every prefill wave
+# through the resident EP shard (kept on the GPU) in chunks of this many
 # tokens. The 84 GiB shard leaves ~25 GB for prefill scratch on H200; the
 # global FP32 MoE output alone is world_size x cap x hidden x 4 B = 7.5 GB at
 # 16K.
@@ -240,11 +240,12 @@ def k3_resident_prefill_token_cap(
 ) -> int:
     """Per-micro-batch token cap of a prefill wave that runs resident-EP.
 
-    Every wave prefills in the server's streamed mode; resident-EP runs only
-    when a batch selects it with ``batchgen_debug.k3_prefill_moe_mode``. Its
-    FP32 output buffer is preallocated per wave, so on H200-class TP8 such a
-    wave is split under this smaller cap. 0 plans no separate bound: the
-    wave then runs under ``prefill_micro_batch_token_cap``, as on H20."""
+    Every wave of a server prefills in the one mode chosen at start; this
+    cap applies to a server started with ``--prefill-moe-mode resident_ep``.
+    Its FP32 output buffer is preallocated per wave, so on H200-class TP8
+    every such wave is split under this smaller cap. 0 plans no separate
+    bound: the wave then runs under ``prefill_micro_batch_token_cap``, as on
+    H20."""
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")

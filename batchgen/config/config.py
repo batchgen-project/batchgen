@@ -99,8 +99,8 @@ class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
     # Token-based prefill config (for prepack mode, always recommended)
     prefill_micro_batch_token_cap: int = 131_072  # Max tokens per prefill micro-batch (= max_position_embeddings)
-    # Per-micro-batch token cap of a prefill wave a batch runs resident-EP
-    # through its batch-level mode override; 0 = no separate bound. Set by the
+    # Per-micro-batch token cap of every prefill wave of a server started
+    # with --prefill-moe-mode resident_ep; 0 = no separate bound. Set by the
     # model planner; read only by prefill_token_cap_for_mode.
     resident_ep_prefill_token_cap: int = 0
     k3_resident_prefill_chunk_rows: int = 0  # 0 = the 256-row large-pass clamp

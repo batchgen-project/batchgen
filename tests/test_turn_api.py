@@ -822,3 +822,47 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
     assert (out["state"], out["turns"]) == ("open", 0)
     assert out["at_limit"].status_code == 200, out["at_limit"].text
     assert len(admitted) == 1
+
+
+RETIRED_MODE_DEBUG = {"k3_prefill_moe_mode": "resident_ep"}
+
+
+def test_e2e_a_turn_with_the_retired_mode_key_is_refused(tmp_path):
+    # The prefill MoE mode is a server constant (--prefill-moe-mode); the
+    # per-batch key that switched it is refused before the session or a
+    # worker sees the turn.
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        refused = await client.post(
+            "/v1/turns", json=_turn_body("s1", batchgen_debug=RETIRED_MODE_DEBUG))
+        session = app.state.session_registry.get("s1")
+        return refused, (session.state.value, session.turns), list(worker.admitted)
+
+    refused, session, admitted = asyncio.run(_serve(tmp_path, scenario))
+    assert refused.status_code == 400
+    detail = refused.json()["detail"]
+    assert detail["code"] == "retired_batchgen_debug_key"
+    assert "--prefill-moe-mode" in detail["message"]
+    assert session == ("open", 0)
+    assert admitted == []
+
+
+def test_a_stored_batch_with_the_retired_mode_key_fails_before_any_worker(tmp_path):
+    # POST /v1/batches refuses the key; a batch stored before that (the
+    # store survives restarts) fails when the scheduler picks it up.
+    worker = _ns_worker()
+    scheduler = _scheduler(tmp_path, worker)
+    batch = SimpleNamespace(
+        status=bs.BatchStatus.VALIDATING, input_file_id="file-1",
+        batchgen_debug=RETIRED_MODE_DEBUG,
+    )
+    scheduler.storage.load_batch = lambda batch_id: batch
+    scheduler.storage.load_metadata = lambda file_id: pytest.fail(
+        "a refused batch reached its input file")
+
+    asyncio.run(scheduler._process_batch("batch_old"))
+
+    (batch_id, status, kwargs), = scheduler.storage.statuses
+    assert (batch_id, status) == ("batch_old", bs.BatchStatus.FAILED)
+    assert "--prefill-moe-mode" in kwargs["error"]
+    assert scheduler.intake_pool_size() == 0

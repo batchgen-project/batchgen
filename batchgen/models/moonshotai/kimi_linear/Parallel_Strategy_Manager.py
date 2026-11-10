@@ -1188,13 +1188,11 @@ class KimiLinearParallelStrategyManager:
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
-            # The largest micro-batch any wave of this server can run: its
-            # server mode or a batch-level mode override.
-            max_prefill_tokens=max(
-                prefill_token_cap_for_mode(
-                    self.engine_config.Module_Batching_Config, mode
-                )
-                for mode in PREFILL_MOE_MODES
+            # The micro-batch cap of every wave of this server: its prefill
+            # MoE mode is fixed at construction.
+            max_prefill_tokens=prefill_token_cap_for_mode(
+                self.engine_config.Module_Batching_Config,
+                self._prefill_moe_mode,
             ),
             part_index=part_index,
             part_count=part_count,
