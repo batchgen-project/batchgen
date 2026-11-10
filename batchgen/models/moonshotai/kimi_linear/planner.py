@@ -468,7 +468,7 @@ class KimiLinearPlanner(BasePlanner):
             if self.is_k3 and self.attention_group_size > 1
             else 262_144
         )
-        self.config.Module_Batching_Config.k3_resident_prefill_token_cap = (
+        self.config.Module_Batching_Config.resident_ep_prefill_token_cap = (
             k3_resident_prefill_token_cap(
                 gpu_total_memory_bytes=self.gpu_total_memory_bytes,
                 attention_group_size=self.attention_group_size,
@@ -478,7 +478,7 @@ class KimiLinearPlanner(BasePlanner):
         )
         self.config.Module_Batching_Config.k3_resident_prefill_chunk_rows = (
             _K3_H200_RESIDENT_PREFILL_CHUNK_ROWS
-            if self.config.Module_Batching_Config.k3_resident_prefill_token_cap > 0
+            if self.config.Module_Batching_Config.resident_ep_prefill_token_cap > 0
             else 0
         )
         self.config.Module_Batching_Config.k3_prefill_collective_stripe_threshold_rows = (

@@ -31,8 +31,20 @@ def _class_method_source(path, class_name, method_name):
     return textwrap.dedent("".join(lines[fn.lineno - 1 : fn.end_lineno]))
 
 
+def _psm_module_constant(name):
+    """A literal module-level constant of the K3 manager, read from its AST."""
+    tree = ast.parse(PSM.read_text())
+    node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(target, "id", None) == name for target in node.targets)
+    )
+    return ast.literal_eval(node.value)
+
+
 def _psm_stub(**attrs):
-    namespace = {}
+    namespace = {"PREFILL_MOE_MODES": _psm_module_constant("PREFILL_MOE_MODES")}
     for name in (
         "set_prefill_moe_mode",
         "default_prefill_moe_mode",
@@ -157,4 +169,4 @@ def test_phase_instance_reuse_no_longer_declines_on_the_resident_cap():
     source = _class_method_source(
         PSM, "KimiLinearParallelStrategyManager", "_instances_are_reused"
     )
-    assert "k3_resident_prefill_token_cap" not in source
+    assert "resident_ep_prefill_token_cap" not in source

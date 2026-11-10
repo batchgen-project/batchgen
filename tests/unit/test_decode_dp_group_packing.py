@@ -72,9 +72,8 @@ _METHODS = (
     # The A/B arm the packer call sites resolve per batch; these fakes carry no
     # batchgen_debug, so it is always the default (profile) arm.
     "_prefix_rank_cost_profile_disabled",
-    # The wave's prefill token cap, chosen by its prefill MoE mode.
-    "_planned_prefill_token_cap",
-    "_prefill_moe_mode_for_debug",
+    # Placement scores with the server mode's prefill token cap.
+    "_placement_prefill_token_cap",
     "_prefill_token_cap_for_mode",
     "_server_prefill_moe_mode",
 )
@@ -130,7 +129,7 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
         engine_config=SimpleNamespace(
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=CHUNK)),
         # Startup resolved the server prefill mode: every wave is streamed.
-        _resolved_server_prefill_moe_mode="streamed",
+        _server_prefill_moe_mode_resolved=("streamed",),
         _active_batchgen_debug_for_sequences=lambda batch_sequences: (
             {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
         ),
