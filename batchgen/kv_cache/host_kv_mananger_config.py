@@ -488,7 +488,7 @@ def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 		raise ValueError(
 			f"Unsupported model '{model_name}' for host KV cache: it names no "
 			"registered model id (a local path must be a directory named after "
-			"the released id, e.g. .../GLM-5.3-FP8)"
+			"the released id, e.g. .../<org>/<released-name>)"
 		)
 	return _PROFILE_REGISTRY[canonical]
 
