@@ -102,6 +102,15 @@ class ExitMode(enum.Enum):
     and the prefill H2D ring is
     released before decode builds (batchgen_worker.py:11603-11608).
 
+    A hold (a kept instance) may stay across the prefill-decode switch
+    only while the model it references is live: holding never pins a model
+    past its retirement. ``deep_free_model_memory`` is that retirement and
+    refuses to run under any hold, and a manager must not build a new
+    model skeleton while it still holds an instance of the previous one --
+    a hold that coexisted with the next ``_load_model_skeleton`` kept the
+    prior instances' device memory mapped under the new build and OOMed
+    the K3.1 4-node H20 startup. Release (RETIRE) every hold first.
+
     RETIRE: full deep free; nothing of the instance survives. This is
     today's rebuild path: ``deep_free_model_memory()`` before a prefill or
     decode rebuild (batchgen_worker.py:11291-11292, :11633) and the GPU KV
