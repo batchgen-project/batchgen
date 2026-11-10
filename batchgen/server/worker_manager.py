@@ -48,6 +48,7 @@ from batchgen.server.server_args import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.worker.startup_phases import (
+    PHASE_HOST_KV_ALLOCATION,
     PHASE_STORE_STAGING,
     StartupPhaseRecord,
     StartupPhaseWatchdog,
@@ -502,6 +503,13 @@ class WorkerManager:
             labels,
             self._fail_startup_phase_breach,
             scale=self.args.startup_phase_timeout_scale,
+            # Multi-node: a cross-node rendezvous is charged from when every
+            # node reached it, and the nodes still missing are named.
+            cluster=(
+                self._restart_coordinator
+                if self._restart_coordinator.enabled
+                else None
+            ),
         )
         self._startup_phase_watchdog = watchdog
         watchdog.start()
@@ -516,6 +524,7 @@ class WorkerManager:
         if watchdog is None:
             return
         watchdog.stop()
+        self._restart_coordinator.end_startup_progress()
 
     def _fail_startup_phase_breach(self, reason: str) -> None:
         """End a start-up that has stopped inside one phase.
@@ -644,13 +653,14 @@ class WorkerManager:
             kv_start = _time.monotonic()
             try:
                 _diag(">>> allocate_host_kv_cache")
-                result = self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size,
-                    self.args.model,
-                    primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
-                    aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
-                    enable_thp=self.args.fast_init,
-                )
+                with self._server_startup_phase(PHASE_HOST_KV_ALLOCATION):
+                    result = self.allocate_host_kv_cache(
+                        self.args.host_kv_cache_size,
+                        self.args.model,
+                        primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
+                        aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+                        enable_thp=self.args.fast_init,
+                    )
                 _diag("<<< allocate_host_kv_cache")
                 if isinstance(result, tuple):
                     self.host_kv_manager, self.host_kv_aux_manager = result
