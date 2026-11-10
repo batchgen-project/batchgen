@@ -8,7 +8,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
@@ -40,6 +40,7 @@ def _worker_methods(*names):
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List,
+        "Optional": Optional,
         "hashlib": hashlib,
         "logging": logging,
         "torch": torch,
@@ -174,6 +175,8 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
             group_specs=[SimpleNamespace(raw_page_tokens=2)]),
         engine_config=SimpleNamespace(
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=64)),
+        # Startup resolved the server prefill mode: every wave is streamed.
+        _server_prefill_moe_mode_resolved=("streamed",),
         _active_batchgen_debug_for_sequences=lambda batch_sequences: {
             "prefix_rank_assignment_mode": "packing_v2"
         },
@@ -199,6 +202,13 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         ],
         worker_state,
     )
+    # Placement scores with the server mode's prefill token cap.
+    for name in ('_placement_prefill_token_cap', '_prefill_token_cap_for_mode', '_server_prefill_moe_mode'):
+        setattr(
+            worker_state,
+            name,
+            types.MethodType(_worker_methods(name)[name], worker_state),
+        )
     # Prompts live in the trajectory book after admission; these stubs keep
     # the tokens on input_ids and serve them through the book contract.
     worker_state._trajectory_tokens = (

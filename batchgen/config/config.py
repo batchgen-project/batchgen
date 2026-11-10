@@ -122,10 +122,10 @@ class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
     # Token-based prefill config (for prepack mode, always recommended)
     prefill_micro_batch_token_cap: int = 131_072  # Max tokens per prefill micro-batch (= max_position_embeddings)
-    # Kimi-K3: token cap for admission waves prefilled through the resident
-    # EP experts after the first decode phase (0 = always release the shard
-    # and prefill streamed). Set by the planner; see resident_ep_prefill_available.
-    k3_resident_prefill_token_cap: int = 0
+    # Per-micro-batch token cap of a prefill wave a batch runs resident-EP
+    # through its batch-level mode override; 0 = no separate bound. Set by the
+    # model planner; read only by prefill_token_cap_for_mode.
+    resident_ep_prefill_token_cap: int = 0
     k3_resident_prefill_chunk_rows: int = 0  # 0 = the 256-row large-pass clamp
     # Kimi-K3: TP-shard routed_expert_down/up_proj across the attention TP
     # group (DECODE_CONCURRENCY_PLAN.md). Set by the planner.
@@ -159,6 +159,23 @@ class ModuleBatchingConfig:
             f"  MoE_decoding_micro_batch_size: {self.MoE_decoding_micro_batch_size}\n"
             f"  expert_decoding_batch_size_upper_bound: {self.expert_decoding_batch_size_upper_bound}"
         )
+
+
+def prefill_token_cap_for_mode(batching, mode: Optional[str]) -> int:
+    """Per-micro-batch prefill token cap of a wave in prefill MoE ``mode``.
+
+    The one reader of the two planner caps. ``prefill_micro_batch_token_cap``
+    bounds every streamed wave (and every wave of a model without prefill MoE
+    modes, ``mode=None``). A resident-EP wave preallocates its FP32 MoE output
+    from its cap, so it runs under the planner's resident cap when one is set
+    (0 plans no separate bound). Nothing writes either field after the
+    planner.
+    """
+    if mode == "resident_ep":
+        resident_cap = int(batching.resident_ep_prefill_token_cap)
+        if resident_cap > 0:
+            return resident_cap
+    return int(batching.prefill_micro_batch_token_cap)
 
 
 # GPU buffer configuration section

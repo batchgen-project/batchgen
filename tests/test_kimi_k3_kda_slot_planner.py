@@ -247,7 +247,7 @@ def test_h20_plan_funds_128_slots_latent_only_with_graphs():
     # decode at this width is launch-latency-bound)
     assert config.Basic_Config.decode_graph_mode == "graph"
     # H20 keeps the release-and-stream admission cycle (resident handoff off)
-    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 0
+    assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 0
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 0
     # latent shards; vocab-parallel stays behind the H200 gate until
     # batchgen-k3-vocab-parallel-h20-corruption is fixed
@@ -291,7 +291,7 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     # resident EP shard in SGLang-sized chunks instead of dropping and
     # rebuilding the 84 GiB shard per wave
     assert (
-        config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
+        config.Module_Batching_Config.resident_ep_prefill_token_cap == 16_384
     )
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
 

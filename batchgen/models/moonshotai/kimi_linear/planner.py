@@ -18,15 +18,15 @@ _GIB = 1024 ** 3
 _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
 _K3_H20_PREFILL_TOKEN_CAP = 16_384
 _K3_H200_PREFILL_TOKEN_CAP = 524_288
-# Admission waves after the first decode phase prefill through the resident
-# EP shard (kept on the GPU) in chunks of this many tokens — SGLang's
-# max-prefill-tokens for the matched baseline. The 84 GiB shard leaves
-# ~25 GB for prefill scratch on H200; the global FP32 MoE output alone is
-# world_size x cap x hidden x 4 B = 7.5 GB at 16K.
+# A batch that selects resident-EP prefill (batchgen_debug.k3_prefill_moe_mode)
+# runs through the resident EP shard (kept on the GPU) in chunks of this many
+# tokens. The 84 GiB shard leaves ~25 GB for prefill scratch on H200; the
+# global FP32 MoE output alone is world_size x cap x hidden x 4 B = 7.5 GB at
+# 16K.
 _K3_H200_RESIDENT_PREFILL_TOKEN_CAP = 16_384
 # Resident-prefill expert chunk for passes above 16K global rows. 2048 rows
 # is ~3-4 GiB of dispatched/intermediate/expert_out + FP32 combine scratch
-# against the ~18 GB free at an H200 handoff prefill; the 256-row default
+# against the ~18 GB free at an H200 resident-EP prefill; the 256-row default
 # was a tight-HBM rule and costs 8x the grouped-Marlin launches.
 _K3_H200_RESIDENT_PREFILL_CHUNK_ROWS = 2048
 _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
@@ -238,9 +238,13 @@ def k3_kda_state_slots(
 def k3_resident_prefill_token_cap(
     *, gpu_total_memory_bytes: int | None, attention_group_size: int
 ) -> int:
-    """Token cap for resident-EP prefill of admission waves after the first
-    decode phase; 0 disables the resident handoff (H20 keeps the validated
-    release-and-stream cycle, its shard is small and its HBM is not)."""
+    """Per-micro-batch token cap of a prefill wave that runs resident-EP.
+
+    Every wave prefills in the server's streamed mode; resident-EP runs only
+    when a batch selects it with ``batchgen_debug.k3_prefill_moe_mode``. Its
+    FP32 output buffer is preallocated per wave, so on H200-class TP8 such a
+    wave is split under this smaller cap. 0 plans no separate bound: the
+    wave then runs under ``prefill_micro_batch_token_cap``, as on H20."""
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")
@@ -470,7 +474,7 @@ class KimiLinearPlanner(BasePlanner):
             if self.is_k3 and self.attention_group_size > 1
             else 262_144
         )
-        self.config.Module_Batching_Config.k3_resident_prefill_token_cap = (
+        self.config.Module_Batching_Config.resident_ep_prefill_token_cap = (
             k3_resident_prefill_token_cap(
                 gpu_total_memory_bytes=self.gpu_total_memory_bytes,
                 attention_group_size=self.attention_group_size,
@@ -480,7 +484,7 @@ class KimiLinearPlanner(BasePlanner):
         )
         self.config.Module_Batching_Config.k3_resident_prefill_chunk_rows = (
             _K3_H200_RESIDENT_PREFILL_CHUNK_ROWS
-            if self.config.Module_Batching_Config.k3_resident_prefill_token_cap > 0
+            if self.config.Module_Batching_Config.resident_ep_prefill_token_cap > 0
             else 0
         )
         self.config.Module_Batching_Config.k3_prefill_collective_stripe_threshold_rows = (

@@ -343,6 +343,8 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
     # watchdog); neither is part of the order these tests pin.
     worker._max_decode_rank_bsz = lambda: 128
     worker._startup_phase = lambda name: contextlib.nullcontext()
+    # The worker's once-per-process read of the manager's server mode.
+    worker._server_prefill_moe_mode = manager.default_prefill_moe_mode
     return worker
 
 
@@ -670,11 +672,11 @@ def test_kimi_k3_startup_follows_the_topology_default_prefill_mode():
     _bind_startup(worker)()
 
     assert ("set_prefill_moe_mode", "streamed") in trace
-    # The mode comes from the manager, never from a literal in the worker.
+    # The mode is the server mode every wave uses, never a literal here.
     source = _body_source(
         _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
     )
-    assert "default_prefill_moe_mode()" in source
+    assert "self._server_prefill_moe_mode()" in source
     for literal in ("'streamed_sp8'", "'resident_ep'", "'streamed'"):
         assert literal not in source
 
