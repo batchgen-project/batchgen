@@ -84,7 +84,12 @@ class RuntimeContract:
     """Native/runtime capabilities required by one exact model type."""
 
     modules: tuple[str, ...] = ()
+    # Required on every device.
     extensions: tuple[str, ...] = ()
+    # sm_90a-only builds the generation path loads on a Hopper (sm_90) device;
+    # other architectures do not build them and the model takes its
+    # non-WGMMA kernels there.
+    hopper_extensions: tuple[str, ...] = ()
     require_deepgemm: bool = False
 
 
@@ -125,30 +130,69 @@ _DSA_MOE_WGMMA_EXTENSIONS = (
     "batchgen_kernels.moe._C_dispatch_scatter_3d",
 )
 
+# Every extension a contract lists is one its model package can load
+# (tests/test_runtime_preflight_extension_coverage.py derives the set from the
+# source and fails when a contract misses one), so a partial kernel build is
+# refused here rather than minutes into decode.
+_K = "batchgen_kernels."
+
+
+def _ext(*names: str) -> tuple[str, ...]:
+    return tuple(_K + name for name in names)
+
+
+_GLM5_HOPPER_EXTENSIONS = _ext(
+    "moe._C_fp8_blockwise_gemm",
+    "moe._C_fp8_blockwise_ops",
+    "moe._C_routing",
+    "attention._C_fused_indexer_k_write_fp8",
+    "attention._C_fused_q_split",
+    "attention._C_qkv_wgmma",
+)
+
+# Kimi-Linear and Kimi-K3 (one model package; Kimi-K3.1 adds the DSA indexer).
+_KIMI_LINEAR_EXTENSIONS = _COMMON_EXTENSIONS + _ext("conv1d._C_causal_conv1d")
+_KIMI_LINEAR_HOPPER_EXTENSIONS = _ext(
+    "attention._C_fused_q_split",
+    "attention._C_kda_fused_decode",
+    "moe._C_dispatch_scatter_3d",
+    "moe._C_marlin_grouped_gemm",
+    "moe._C_routing",
+)
+
 # These are exact model-type contracts, not family-wide fallback rules.  A new
 # model type must be added here before it can enter the production server path.
 _CONTRACTS: dict[str, RuntimeContract] = {
     "gpt_oss": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _ext("moe._C_mxfp4_dequant_cute"),
+        hopper_extensions=_ext(
+            "moe._C_expert_mxfp4_wgmma",
+            "moe._C_grouped_mxfp4_wgmma",
+            "moe._C_routing",
+            "attention._C_qkv_wgmma",
+        ),
         require_deepgemm=True,
     ),
     "glm_moe_dsa": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
+        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_2": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
+        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
+        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "deepseek_v2": RuntimeContract(
@@ -157,7 +201,10 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "deepseek_v3": RuntimeContract(
         modules=("flash_attn", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _ext(
+            "common._C_mgn_ops", "moe._C_fused_moe_token_permutation"
+        ),
+        hopper_extensions=_ext("attention._C_fused_q_split"),
     ),
     "deepseek_v4": RuntimeContract(
         modules=("flash_attn", "libucx"),
@@ -169,26 +216,50 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "minimax_m25": RuntimeContract(
         modules=("flash_attn_interface", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _ext("common._C_mgn_ops"),
+        hopper_extensions=_ext(
+            "moe._C_dispatch_scatter_3d",
+            "moe._C_fp8_blockwise_gemm",
+            "moe._C_fp8_blockwise_ops",
+            "moe._C_routing",
+            "attention._C_fused_q_split",
+            "attention._C_qkv_wgmma",
+        ),
     ),
     "kimi_linear": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_KIMI_LINEAR_EXTENSIONS,
+        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
     ),
     "kimi_k3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_KIMI_LINEAR_EXTENSIONS,
+        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
     ),
     # The dense contract plus the page-split DSA indexer: DeepGEMM scores the
     # index keys (paged on decode, causal on prefill).
     "kimi_k31": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS + _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS,
+        extensions=_KIMI_LINEAR_EXTENSIONS + _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS,
+        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "kimi_k25": RuntimeContract(
         modules=("flash_attn", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _ext(
+            "common._C_cuda_rmsnorm",
+            "common._C_mgn_ops",
+            "moe._C_fused_moe_token_permutation",
+        ),
+        hopper_extensions=_ext(
+            "moe._C_dispatch_scatter_3d",
+            "moe._C_fused_int4_wgmma_grouped",
+            "moe._C_marlin_grouped_gemm",
+            "moe._C_marlin_transform",
+            "moe._C_routing",
+            "moe._C_single_expert_int4_wgmma",
+            "attention._C_fused_q_split",
+        ),
     ),
 }
 
@@ -465,7 +536,11 @@ def run_runtime_preflight(server_args: object) -> str:
         if module_name == "libucx":
             _check_ucx(module)
 
-    for extension_name in contract.extensions:
+    hopper = (
+        torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+    )
+    extensions = contract.extensions + (contract.hopper_extensions if hopper else ())
+    for extension_name in extensions:
         _import_required(extension_name, origin=_ORIGIN_BATCHGEN)
 
     if decode_backend == "wgmma":
