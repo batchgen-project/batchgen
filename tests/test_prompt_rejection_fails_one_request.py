@@ -1,11 +1,10 @@
 """A request whose prompt cannot be constructed fails alone.
 
-The chat template (or request validation) can refuse one conversation: the
-Kimi-K3 tokenizer refuses a conversation it cannot render faithfully through
-the string prompt seam. That ValueError used to propagate out of
-_convert_requests_to_worker_inputs and fail the WHOLE batch, so one such
-request among 48 returned zero completions. Now the request gets the Batch
-API error item and the rest of the batch reaches the worker.
+The chat template (or request validation) can refuse one conversation, e.g.
+an unknown role or a malformed tool call. That ValueError used to propagate
+out of _convert_requests_to_worker_inputs and fail the WHOLE batch, so one
+such request among 48 returned zero completions. Now the request gets the
+Batch API error item and the rest of the batch reaches the worker.
 """
 import asyncio
 import json
@@ -16,15 +15,19 @@ from tests.test_batch_in_progress_failure import bs
 MODEL = "moonshotai/Kimi-K3"
 
 
+def _encode(text):
+    return [ord(ch) for ch in text]
+
+
 class _Tokenizer:
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kw):
+        assert tokenize is True
         content = messages[-1]["content"]
         if "unfaithful" in content:
             raise ValueError(
-                "Kimi-K3: this conversation cannot be rendered faithfully "
-                "through BatchGen's string prompt seam"
+                "Kimi-K3: this conversation cannot be rendered faithfully"
             )
-        return f"<rendered>{content}"
+        return _encode(f"<rendered>{content}")
 
 
 def _chat_line(custom_id, content):
@@ -71,7 +74,7 @@ def _scheduler(tmp_path, lines):
     )
     finalized = []
 
-    async def record_finalize(batch_id, requests, prompts):
+    async def record_finalize(batch_id, requests):
         finalized.append(batch_id)
 
     scheduler._wait_and_finalize_batch = record_finalize
@@ -95,8 +98,9 @@ def test_an_unrenderable_conversation_fails_only_its_own_request(tmp_path):
     asyncio.run(scheduler._process_batch("batch-1"))
 
     assert [status for status, _ in updates] == [bs.BatchStatus.IN_PROGRESS]
-    queued = [entry.raw_request["text"] for entry in scheduler._intake_pool._normal]
-    assert queued == ["<rendered>hello", "<rendered>world"]
+    queued = [entry.raw_request["input_ids"].tolist()
+              for entry in scheduler._intake_pool._normal]
+    assert queued == [_encode("<rendered>hello"), _encode("<rendered>world")]
 
     (item,) = _items(tmp_path, "batch-1")
     assert item["custom_id"] == "bad"

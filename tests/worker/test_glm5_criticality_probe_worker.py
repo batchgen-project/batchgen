@@ -352,8 +352,12 @@ def test_capture_path_admits_only_the_armed_recapture():
 
 
 def test_release_drops_the_installed_probe():
-    for name in ("_release_glm5_whole_model_graph_state", "deep_free_model_memory"):
+    # The probe's spin nodes live in the decode graphs, so it goes with them.
+    for name in ("_release_glm5_whole_model_graph_state", "_release_decode_graph_state"):
         assert "self._criticality_probe = None" in ast.unparse(_method_ast(name)), name
+    assert "self._release_decode_graph_state()" in ast.unparse(
+        _method_ast("deep_free_model_memory")
+    )
 
 
 def test_decode_loop_updates_the_table_before_each_glm5_replay_and_tags_the_pair():

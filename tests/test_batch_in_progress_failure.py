@@ -70,6 +70,13 @@ def _line(custom_id, max_tokens=None):
     })
 
 
+class _Tokenizer:
+    """Encodes completion prompt text one id per character."""
+
+    def __call__(self, texts, **kwargs):
+        return {"input_ids": [[ord(ch) for ch in text] for text in texts]}
+
+
 def _scheduler(tmp_path, lines, max_decoding_length=None):
     input_id = "file-input"
     (tmp_path / input_id).write_bytes("\n".join(lines).encode())
@@ -80,6 +87,7 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
     scheduler._scheduling_pool = bs.SchedulingPool(capacity=4)
     scheduler._intake_pool = bs.IntakePool(max_capacity=16)
     scheduler._pool_request_meta = {}
+    scheduler._get_tokenizer = lambda model: _Tokenizer()
     scheduler.storage = SimpleNamespace(
         files_dir=tmp_path,
         load_batch=lambda batch_id: SimpleNamespace(
@@ -139,7 +147,7 @@ def test_any_exception_after_in_progress_ends_in_failed(tmp_path, stage):
     with the exception recorded, instead of only being logged by _run."""
     scheduler, updates = _scheduler(tmp_path, [_line("req-1", 16)])
 
-    def broken_render(requests, batch=None):
+    def broken_render(requests, built, batch=None):
         raise ValueError("request 'req-1': the chat template rejected it")
 
     async def broken_submit(*args, **kwargs):
@@ -173,7 +181,7 @@ def test_an_exception_after_pool_registration_releases_the_batch_state(tmp_path)
         scheduler._intake_pool.submit_batch(batch_id, [bs.IntakeEntry(
             request_id=f"req-1@{batch_id}",
             batch_id=batch_id,
-            raw_request={"text": prompts[0], "max_tokens": 16},
+            raw_request={"input_ids": prompts[0], "max_tokens": 16},
             priority=bs.Priority.NORMAL,
         )])
         scheduler._pool_request_meta[batch_id] = {f"req-1@{batch_id}": {}}

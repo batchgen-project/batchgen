@@ -161,9 +161,10 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
             self.kwargs = None
 
         def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
+            assert tokenize is True
             self.messages = messages
             self.kwargs = kwargs
-            return "formatted-prompt"
+            return [7, 8, 9]
 
     tokenizer = _FakeTokenizer()
     scheduler = BatchScheduler.__new__(BatchScheduler)
@@ -180,15 +181,17 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
         tools=[{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}],
     )
 
+    requests = [SimpleNamespace(body=request)]
     prompts, max_tokens, sampling_params, rejections = (
         scheduler._convert_requests_to_worker_inputs(
-            [SimpleNamespace(body=request)],
+            requests,
+            [scheduler._build_prompt(requests[0], tokenizer)],
             None,
         )
     )
     assert rejections == {}
 
-    assert prompts == ["formatted-prompt"]
+    assert [p.tolist() for p in prompts] == [[7, 8, 9]]
     assert max_tokens == [None]
     assert sampling_params == [{"temperature": None, "top_p": 1.0, "top_k": None}]
     assert tokenizer.kwargs["thinking"] is False

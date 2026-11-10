@@ -1,6 +1,5 @@
 import concurrent.futures
 import copy
-import ctypes
 import functools
 import hashlib
 import heapq
@@ -49,12 +48,6 @@ from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
-_TOKENIZER_TRIM_TOKENS_PER_RANK = 1 << 20
-# Admissions assigning this many prompt characters to any rank tokenize one
-# rank at a time, so tokenizer host-memory peaks do not land simultaneously.
-# 4M chars/rank sits below the roughly 4.8M chars/rank measured in both the
-# 32x256K and 8x1M repro; it is not a universal character/token conversion.
-_TOKENIZER_SERIALIZE_CHARS_PER_RANK = 4_000_000
 
 # --- Bounded decode-step token wait (see _wait_decode_tokens) --------------
 # A rank whose peer died mid-decode blocks in the per-step token-event sync far
@@ -162,30 +155,28 @@ def _repetition_check_enabled(seq) -> bool:
 	return not seq.ignore_eos
 
 
-def _malloc_trim() -> None:
-	"""Return this process's freed heap arenas to the OS (glibc, best effort).
+def _admitted_prompt_ids(entry: dict) -> torch.Tensor:
+	"""The prompt token ids one admission entry carries, as a CPU int32 tensor.
 
-	Platforms without glibc's malloc_trim silently no-op.
+	The server builds every prompt's ids (``batch_scheduler.prompt_ids_array``)
+	and sends them as a 1-D int32 numpy array; the returned tensor shares its
+	memory. Anything else is a producer defect and raises.
 	"""
-	try:
-		malloc_trim = ctypes.CDLL(None).malloc_trim
-		malloc_trim.argtypes = [ctypes.c_size_t]
-		malloc_trim.restype = ctypes.c_int
-		malloc_trim(0)
-	except (AttributeError, OSError, TypeError):
-		pass
-
-def _release_tokenizer_arenas(total_prompt_tokens: int, world_size: int) -> None:
-	"""Return the tokenizer's freed heap arenas to the OS (glibc, best effort).
-
-	A measured 1,048,576-token per-rank workload left about 480 MiB of
-	freed-but-resident RssAnon after one admission and 694 MiB after a second;
-	malloc_trim(0) returned about 619 MiB. Skip smaller admissions because
-	malloc_trim walks every process arena.
-	"""
-	if total_prompt_tokens < world_size * _TOKENIZER_TRIM_TOKENS_PER_RANK:
-		return
-	_malloc_trim()
+	token_ids = entry.get("input_ids")
+	if not (
+		isinstance(token_ids, np.ndarray)
+		and token_ids.ndim == 1
+		and token_ids.dtype == np.int32
+	):
+		raise TypeError(
+			f"admission entry {entry.get('request_id')!r}: input_ids must be a "
+			f"1-D int32 numpy array, got {type(token_ids).__name__}"
+			+ (
+				f" of shape {token_ids.shape} and dtype {token_ids.dtype}"
+				if isinstance(token_ids, np.ndarray) else ""
+			)
+		)
+	return torch.from_numpy(token_ids)
 
 from tqdm import trange
 import gc
@@ -253,6 +244,7 @@ from batchgen.worker.prefill import (
 	compute_prefill_host_reservation,
 	describe_prefill_blockers,
 	host_kv_eviction_enabled,
+	host_owned_pages_after_sharing,
 	prefill_host_reserve_page_deficit,
 	prefill_reclaim_target_pages,
 )
@@ -721,8 +713,8 @@ def allocate_node_shared_int64(
 ) -> Tuple[torch.Tensor, NodeSharedMemfd]:
 	"""Map ONE int64 ``[rows, width]`` CPU tensor per node into every worker.
 
-	The tokenized batch is identical on every rank (``_tokenize_admitted_sequences``
-	all-gathers the results to all of them), so each worker used to hold its own
+	The prompt ids are identical on every rank (every rank receives them in the
+	admission message, ``_bind_admitted_prompts``), so each worker used to hold its own
 	private copy of the same input-ids table — ``world_size`` duplicates of the
 	same bytes, which is what OOM-killed the node.
 
@@ -831,7 +823,7 @@ def allocate_node_shared_tensor(
 class QueryBookBufferPool:
 	"""Pre-allocated contiguous buffers for query book tensors.
 
-	Eliminates per-sequence tensor allocation in Phase 3 of _tokenize_admitted_sequences().
+	Eliminates per-sequence tensor allocation in _bind_admitted_prompts().
 	With 16 ranks each creating 12K tensors, allocator contention causes ~19 min init.
 	This replaces 24K allocations per rank with 2 large allocations + views.
 
@@ -1583,10 +1575,15 @@ class BatchGenWorker:
 		# Compatibility key for the currently entered manager phase.
 		self._phase = None
 		self._live_phase_key = None
-		# Whole-model decode graph capture episodes completed by this process.
-		# On the reuse lifecycle it must stay at 1: the switch invariants and
-		# the capture-once guard in _setup_cuda_graphs read it.
+		# Whole-model decode graph capture episodes of the current decode
+		# instance; reset when that instance's graph state is released
+		# (_release_decode_graph_state). On the reuse lifecycle it stays at 1:
+		# the switch invariants and the capture-once guard in
+		# _setup_cuda_graphs read it.
 		self._decode_graph_captures = 0
+		# Prefill MoE mode of the most recent prefill entry; see
+		# _desired_phase_key("decode").
+		self._prefill_moe_mode_in_effect = None
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -1685,7 +1682,11 @@ class BatchGenWorker:
 			max_input_length: Maximum input length hint. If None, will be determined dynamically
 			                  during tokenization as the longest prompt in the batch.
 			                  For first initialization, a default of 8192 is used if None.
-			max_decoding_length: Maximum number of tokens to decode.
+			max_decoding_length: Decode-budget hint for init-time sizing. In
+			                     pool mode it is the budget of the first batch the
+			                     server saw, so nothing may cap a sequence with it:
+			                     each admission entry carries that sequence's own
+			                     budget (``kv_token_budget``).
 			num_queries: Number of queries in the global batch.
 			max_context_length: Maximum total context length (prompt + decode). None = use model max.
 		"""
@@ -1699,12 +1700,6 @@ class BatchGenWorker:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
 		self.max_context_length = max_context_length
-
-		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
-		if self.adaptive_chunk_sizer is not None and max_decoding_length > 0:
-			capped_max = min(self.adaptive_chunk_sizer.max_chunk, max_decoding_length)
-			capped_max = math.ceil(capped_max / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
-			self.adaptive_chunk_sizer.max_chunk = capped_max
 
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		
@@ -2101,16 +2096,31 @@ class BatchGenWorker:
 		"""Admit new sequences from an admission message into the live global_batch.
 
 		Adds sequences to an already-running generate() loop without resetting
-		state: create entries, tokenize, assign ranks, build the query book.
+		state: create entries, bind their prompt ids, assign ranks, build the
+		query book.
 
 		Args:
 			msg: Dict with keys:
-				- "entries": List of dicts, each with "request_id", "text", "max_tokens",
+				- "entries": List of dicts, each with "request_id", "input_ids"
+				  (the prompt token ids, a 1-D int32 numpy array), "max_tokens",
 				  "batch_id", "priority", and optionally "sampling_params"
 		"""
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# Each entry's own budget is the only decode cap. The worker-wide
+		# max_decoding_length is the first pool batch's budget, so defaulting
+		# to it would silently truncate a later request. Checked before any
+		# entry is created so a malformed message admits nothing.
+		missing_budget = [
+			entry.get("request_id") for entry in entries
+			if entry.get("max_tokens") is None
+		]
+		if missing_budget:
+			raise ValueError(
+				f"admission entries {missing_budget!r} carry no max_tokens; every "
+				"admitted sequence must carry its own decode budget"
+			)
 		# New live work: the next drain is a new edge for the prefix_drain row.
 		self._prefix_drain_metric_emitted = False
 
@@ -2123,15 +2133,16 @@ class BatchGenWorker:
 		# Step 1: Create SequenceEntry objects
 		admitted_at = time.time()
 		new_uuids = []
+		prompt_ids = []
 		for i, entry in enumerate(entries):
 			global_idx = start_idx + i
-			max_dec = entry.get("max_tokens", self.max_decoding_length)
+			max_dec = int(entry["max_tokens"])
+			prompt_ids.append(_admitted_prompt_ids(entry))
 			seq = SequenceEntry(
 				uuid=entry["request_id"],
 				global_idx=global_idx,
-				prompt_length=0,  # Set during tokenization
+				prompt_length=0,  # Set when the prompt is bound
 				max_decode_length=max_dec,
-				text=entry.get("text", ""),
 			)
 			seq.batch_id = entry.get("batch_id")
 			seq.batchgen_debug = entry.get("batchgen_debug")
@@ -2150,20 +2161,8 @@ class BatchGenWorker:
 			new_uuids.append(seq.uuid)
 		self._group_uuids.update(new_uuids)
 
-		# Step 2: Tokenize new sequences (all ranks, parallel)
-		self._tokenize_admitted_sequences(new_uuids)
-
-		# The tokenizer's temporary payloads are dead only once that call has
-		# returned, so trim here — before any later admission work grows RSS
-		# again on top of arenas this admission already freed.
-		_release_tokenizer_arenas(
-			total_prompt_tokens=sum(
-				seq.prompt_length
-				for uuid in new_uuids
-				if (seq := self.global_batch.get_sequence(uuid)) is not None
-			),
-			world_size=self.world_size,
-		)
+		# Step 2: Bind the prompt ids (identical on every rank) into the book
+		self._bind_admitted_prompts(new_uuids, prompt_ids)
 
 		# Step 2.5: Update max_input_length from admitted sequences
 		# This is critical — engine config uses max_input_length for attention mask shape
@@ -2200,149 +2199,48 @@ class BatchGenWorker:
 				f"global_batch now has {len(self.global_batch)} sequences"
 			)
 
-	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
-		"""Tokenize newly admitted sequences and bind trajectory reservations.
+	def _bind_admitted_prompts(
+		self, uuids: List[str], prompt_ids: List[torch.Tensor]
+	) -> None:
+		"""Bind newly admitted prompts into trajectory reservations.
 
-		Tokenizes in parallel across ranks, then writes each prompt into the
-		fixed unified token pool. Only the new sequences are processed; the pool
-		reservation is never resized or copied during a later admission.
-
-		Optimization: uses padding=False to avoid creating a large padded 2D
-		tensor on CPU. The tokenizer returns List[List[int]] directly, which
-		is lighter than a [N, max_len] padded tensor + attention_mask.
-
-		Before the object collective, compact each prompt's ``List[int]`` into
-		a contiguous CPU int64 tensor. This bounds the gathered token payload by
-		the token count instead of replicating boxed Python integers on every rank.
-
-		Very large admissions tokenize one rank at a time and broadcast instead,
-		so only one rank per node holds a tokenizer host-memory peak at a time.
+		``prompt_ids[i]`` is the prompt of ``uuids[i]`` exactly as the server
+		built it: every rank receives the same ids in the admission message, so
+		every rank runs this deterministically without a collective. Prompts
+		that do not fit the model context are rejected; the rest are written
+		into the fixed unified token pool. Only the new sequences are
+		processed; the pool reservation is never resized or copied during a
+		later admission.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
-		all_texts = [seq.text for seq in sequences]
-		num_new = len(all_texts)
+		lengths = [int(token_ids.numel()) for token_ids in prompt_ids]
 
-		def tokenize_indices(indices):
-			"""Tokenize all_texts[indices] into compact CPU int64 payload items."""
-			if not indices:
-				return []
-			texts = [all_texts[i] for i in indices]
-			# padding=False + return_tensors=None: returns List[List[int]]
-			# directly — no padded 2D tensor, no attention_mask overhead.
-			# Must pass return_tensors=None explicitly because model-specific
-			# tokenizers (e.g., Kimi K2.5) default to "pt" which crashes on
-			# ragged lists.
-			batch_tokenized = self.tokenizer(
-				texts,
-				return_tensors=None,
-				truncation=False,
-				padding=False,
-				return_attention_mask=False,
-			)
-			# Compact to contiguous CPU int64 tensors and drop each raw Python
-			# list as soon as it is copied, so the boxed-int representation is
-			# never alive alongside the gathered payload. `list(...)` takes our
-			# own pointer array so clearing entries cannot mutate a tokenizer
-			# container that only exposes an immutable sequence.
-			raw_input_ids = list(batch_tokenized["input_ids"])
-			del batch_tokenized
-			tokenized = []
-			for i in range(len(texts)):
-				token_ids = raw_input_ids[i]
-				raw_input_ids[i] = None
-				tokenized.append({
-					"idx": indices[i],
-					"input_ids": torch.tensor(
-						token_ids, dtype=torch.int64, device="cpu"
-					),
-					"length": len(token_ids),
-				})
-				del token_ids
-			del raw_input_ids
-			return tokenized
-
-		# Phase 1: tokenize across ranks. all_texts is identical on every rank,
-		# so this gate picks the same path everywhere without an extra collective.
-		total_chars = sum(len(text) for text in all_texts)
-		max_rank_chars = max(
-			(
-				sum(len(all_texts[i]) for i in range(rank, num_new, self.world_size))
-				for rank in range(min(self.world_size, num_new))
-			),
-			default=0,
-		)
-		tokenized_by_idx = {}
-
-		if max_rank_chars >= _TOKENIZER_SERIALIZE_CHARS_PER_RANK:
-			if self.rank == 0:
-				logging.info(
-					f"[ADMIT] Serialized tokenization: {num_new} sequences, "
-					f"{total_chars} total prompt chars, max rank assignment "
-					f"{max_rank_chars} >= {_TOKENIZER_SERIALIZE_CHARS_PER_RANK}"
-				)
-			# Ranks at or above num_new own no strided index, so stop there.
-			for source in range(min(self.world_size, num_new)):
-				payload = [
-					tokenize_indices(list(range(source, num_new, self.world_size)))
-					if self.rank == source
-					else None
-				]
-				if self.rank == source:
-					# Hand the arenas this rank just freed back to the OS before
-					# releasing this turn's broadcast barrier. The compact tensor
-					# payload remains live and is not affected by malloc_trim.
-					_malloc_trim()
-				dist.broadcast_object_list(payload, src=source)
-				for item in payload[0]:
-					tokenized_by_idx[item["idx"]] = item
-				del payload
-		else:
-			my_tokenized = tokenize_indices(
-				list(range(self.rank, num_new, self.world_size))
-			)
-
-			# Phase 1.5: Gather across ranks
-			all_tokenized_lists = [None] * self.world_size
-			dist.all_gather_object(all_tokenized_lists, my_tokenized)
-
-			for rank_results in all_tokenized_lists:
-				if rank_results:
-					for item in rank_results:
-						tokenized_by_idx[item["idx"]] = item
-			del all_tokenized_lists
-
-		# Phase 2.5: Reject sequences exceeding context length
+		# Reject sequences exceeding context length
 		rejected_uuids = []
-		for i, seq in enumerate(sequences):
-			item = tokenized_by_idx.get(i)
-			if item is None:
-				rejected_uuids.append(seq.uuid)
+		for seq, length in zip(sequences, lengths):
+			if length < self.model_context_length:
 				continue
-			if item["length"] >= self.model_context_length:
-				rejected_uuids.append(seq.uuid)
-				if self.rank == 0:
-					logging.warning(
-						f"[ADMIT] Rejecting {seq.uuid}: prompt length {item['length']} >= "
-						f"model context {self.model_context_length}"
-					)
-
-		for uuid in rejected_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if self._response_queue is not None and self.rank == 0 and seq is not None:
+			rejected_uuids.append(seq.uuid)
+			if self.rank == 0:
+				logging.warning(
+					f"[ADMIT] Rejecting {seq.uuid}: prompt length {length} >= "
+					f"model context {self.model_context_length}"
+				)
+			if self._response_queue is not None and self.rank == 0:
 				self._response_queue.put({
 					"type": "completion",
-					"request_id": uuid,
+					"request_id": seq.uuid,
 					"batch_id": getattr(seq, 'batch_id', None),
 					"error": {
 						"code": "context_length_exceeded",
 						"message": (
-							f"Prompt length {getattr(seq, 'prompt_length', '?')} exceeds "
+							f"Prompt length {length} exceeds "
 							f"model context {self.model_context_length}"
 						),
 					},
 					"text": "",
 				})
-			self.global_batch.remove_sequence(uuid)
+			self.global_batch.remove_sequence(seq.uuid)
 
 		# Token lengths are now known. Ownership is assigned AFTER the
 		# trajectory-book write below: sharing-aware assignment reads prompts
@@ -2351,17 +2249,17 @@ class BatchGenWorker:
 		for i, seq in enumerate(sequences):
 			if seq.uuid in rejected_uuids:
 				continue
-			seq.prompt_length = tokenized_by_idx[i]["length"]
+			seq.prompt_length = lengths[i]
 			valid_uuids.append(seq.uuid)
 
-		# Phase 2.75/3: reserve the complete fixed model-context page chain and
+		# Reserve the complete fixed model-context page chain and
 		# copy the prompt into the same store that will receive decode tokens.
 		# Every rank executes this deterministically so local metadata and the
 		# node-shared storage have identical slot assignments.
 		if self._trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		valid = [
-			(seq, tokenized_by_idx[i])
+			(seq, prompt_ids[i])
 			for i, seq in enumerate(sequences)
 			if seq.uuid not in rejected_uuids
 		]
@@ -2369,9 +2267,9 @@ class BatchGenWorker:
 		reserved_tokens = [self.model_context_length] * len(valid)
 		reserved_slots = self._trajectory_book.bind_batch(sequence_ids, reserved_tokens)
 		try:
-			for (seq, item), slot in zip(valid, reserved_slots):
-				actual_prompt_len = int(item["length"])
-				self._trajectory_book.write_prompt(slot, item["input_ids"])
+			for (seq, token_ids), slot in zip(valid, reserved_slots):
+				actual_prompt_len = int(token_ids.numel())
+				self._trajectory_book.write_prompt(slot, token_ids)
 				seq._buffer_slot = slot
 				# Token storage is now accessed through QueryBook; these fields are
 				# intentionally empty so no stale dense view can escape the book.
@@ -5137,7 +5035,7 @@ class BatchGenWorker:
 	def _update_config_after_tokenization(self) -> None:
 		"""
 		Update engine config after tokenization determines the actual max_input_length.
-		This is called after _tokenize_admitted_sequences() has raised
+		This is called after _bind_admitted_prompts() has raised
 		self.max_input_length to the longest admitted prompt.
 		"""
 		if self.engine_config is None:
@@ -6485,7 +6383,6 @@ class BatchGenWorker:
 				self._migrated_sequences = set()
 			self._migrated_sequences.add(uuid)
 			self._pending_migrated_query_book[uuid] = {
-				'text': seq.text,
 				'trajectory': trajectory_recv,
 				'prompt_length': prompt_length,
 				'decoded_length': decoded_length,
@@ -7073,17 +6970,18 @@ class BatchGenWorker:
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
 
-		The chunk size is capped by max_decoding_length since allocating more
-		than the maximum possible decode tokens is wasteful. The result is
-		always rounded up to a page boundary (multiple of PAGE_SIZE=64).
+		The value is worker-wide; every consumer bounds it by the sequence's
+		own ``kv_token_budget`` (``compute_prefill_host_reservation`` for the
+		initial reservation, ``SequenceEntry.get_host_growth_pages`` for
+		growth), so a short sequence never reserves past its budget. Capping it
+		by the worker-wide ``max_decoding_length`` instead would size every
+		later pool-mode batch by the first batch's budget. The result is always
+		rounded up to a page boundary (multiple of PAGE_SIZE=64).
 		"""
 		if self.adaptive_chunk_sizer is not None:
 			chunk = self.adaptive_chunk_sizer.get_chunk_size()
 		else:
 			chunk = self.host_kv_chunk_size
-		# Cap by max_decoding_length — no point reserving more than max decode
-		if self.max_decoding_length > 0:
-			chunk = min(chunk, self.max_decoding_length)
 		# A boundary is the only place where host pages may be allocated.  Keep
 		# one complete decision interval of runway so the next boundary is
 		# reached while the metadata invariant still holds.  This removes the
@@ -7160,16 +7058,16 @@ class BatchGenWorker:
 				if state is not None and state.attached_tokens:
 					# Attached prefix pages already sit in the Host pool; the
 					# owner allocates only the private remainder. Metadata
-					# still commits the TOTAL capacity below.
-					attached_pages = state.attached_tokens // seq.PAGE_SIZE
-					if attached_pages > pages:
-						raise RuntimeError(
-							"prefix attachment exceeds Host KV reservation: "
-							f"sequence={seq.global_idx}, "
-							f"attached_pages={attached_pages}, "
-							f"reserved_pages={pages}"
-						)
-					private_tokens = (pages - attached_pages) * seq.PAGE_SIZE
+					# still commits the TOTAL capacity below. Raising here
+					# (before the capacity collective) rejects the wave on
+					# every rank.
+					private_pages = host_owned_pages_after_sharing(
+						chain_pages=pages,
+						shared_pages=state.attached_tokens // seq.PAGE_SIZE,
+						sequence_id=seq.global_idx,
+						where="prefill reservation plan",
+					)
+					private_tokens = private_pages * seq.PAGE_SIZE
 				owner_requests.append((uuid, private_tokens))
 		return reservations, owner_requests
 
@@ -7701,15 +7599,20 @@ class BatchGenWorker:
 			# Attached prefix pages never enter the sequence's own chain, so
 			# releasing the row returns only the private remainder. Non-owner
 			# ranks sync this through the boundary metadata exchange.
-			owned = pages
 			state = (
 				self._prefix_sequence_states.get(seq.global_idx)
 				if self.enable_prefix_cache
 				else None
 			)
-			if state is not None and state.attached_tokens:
-				owned = pages - state.attached_tokens // seq.PAGE_SIZE
-			seq.host_owned_pages = owned
+			attached_pages = (
+				state.attached_tokens // seq.PAGE_SIZE if state is not None else 0
+			)
+			seq.host_owned_pages = host_owned_pages_after_sharing(
+				chain_pages=pages,
+				shared_pages=attached_pages,
+				sequence_id=seq.global_idx,
+				where="prefill reservation commit",
+			)
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
 		# allocator consumed, so the next round may credit again.
@@ -10014,13 +9917,19 @@ class BatchGenWorker:
 		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
 		# the runtime decode path applies to its own estimate, so the padded MoE
 		# buffers are already sized for the largest batch that can be admitted.
+		# This decode entry precedes any prefill entry, so the worker's record
+		# of the prefill mode these instances are built for must be primed
+		# here: the decode phase key carries it, and a None here against the
+		# startup mode below would turn the resumable decode exit into RETIRE,
+		# which leaves the resident shard mapped and OOMs the prefill build.
+		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
+		self._prefill_moe_mode_in_effect = startup_prefill_mode
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 
 		# Then hand the built model to the prefill mode this weight topology
 		# will actually use, so the first admission inherits this phase directly
 		# instead of rebuilding the streamed-SP8 buffers itself.
-		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
 		with self._startup_phase("prefill-configure"):
 			self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
 			prefill_key = PhaseKey("prefill", startup_prefill_mode, ())
@@ -11116,9 +11025,14 @@ class BatchGenWorker:
 	def _desired_phase_key(self, phase: str) -> PhaseKey:
 		"""Resolve the compatibility key for the next phase entry."""
 		if phase == "decode":
+			# The decode key carries the prefill MoE mode of the instance it
+			# follows. The worker records that mode on every prefill entry
+			# (_transition_phase), so the decode key and the live prefill key
+			# compare the same value; a manager attribute committed only on a
+			# rebuild would read None after a resumed or builder-made entry.
 			return PhaseKey(
 				"decode",
-				getattr(self.parallel_manager, "_prefill_moe_mode", None),
+				self._prefill_moe_mode_in_effect,
 				getattr(self, "_phase_profile_overrides", ()),
 			)
 		if phase != "prefill":
@@ -11267,6 +11181,8 @@ class BatchGenWorker:
 			PhaseEnterContext(comm=comm, max_num_seq=max_num_seq),
 		)
 		self._live_phase_key = desired
+		if desired.phase == "prefill":
+			self._prefill_moe_mode_in_effect = desired.prefill_moe_mode
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:
@@ -11925,10 +11841,12 @@ class BatchGenWorker:
 		)
 		prefill_key = PhaseKey("prefill", prefill_mode, ())
 		self._phase_profile_overrides = ()
+		if hasattr(pm, "set_prefill_moe_mode"):
+			pm.set_prefill_moe_mode(prefill_mode)
 		self._transition_phase(prefill_key)
 		self.set_phase("prefill")
 		self._install_prefill_weight_copy_pipeline(False)
-		decode_key = PhaseKey("decode", prefill_mode, ())
+		decode_key = self._desired_phase_key("decode")
 		_, resumed = self._transition_phase(
 			decode_key,
 			comm=self.comm,
@@ -15652,7 +15570,12 @@ class BatchGenWorker:
 			)
 			# Retained pages left the sequence chain for prefix residency. Every
 			# group retains the same page count; host_owned_pages counts one.
-			seq.host_owned_pages -= len(retained.get(0, ()))
+			seq.host_owned_pages = host_owned_pages_after_sharing(
+				chain_pages=seq.host_owned_pages,
+				shared_pages=len(retained.get(0, ())),
+				sequence_id=seq.global_idx,
+				where="prefix commit retain",
+			)
 			if trajectory_frontier:
 				# M3 Slice 1b, inside this same transaction: the snapshot's
 				# Host pages come from the SAME allocator, so the deduction
@@ -22638,6 +22561,41 @@ class BatchGenWorker:
 				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
 					self.model.model.layers[layer_idx].mlp.cleanup()
 
+	def _release_decode_graph_state(self) -> None:
+		"""Drop the decode instance's captured graphs and their bookkeeping."""
+		self._cuda_graph_manager = None
+		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_layer_cuda_graph_manager = None
+		self._glm5_layer_graph_failed_buckets = set()
+		self._glm5_layer_graph_capture_attempted_for_batch = False
+		self._glm5_layer_graph_signature = None
+		self._glm5_layer_graph_max_seqlen = None
+		self._glm5_dsa_graph_capture_attempted_for_batch = False
+		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
+		self._whole_model_segment = None
+		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
+		self._whole_model_bucketing = None
+		self._glm5_whole_model_capture_input_ids = None
+		self._glm5_moe_graph_failed_buckets = set()
+		self._whole_model_graph = False
+		self._glm5_whole_model_graph = False
+		self._glm5_whole_model_graph_failed_buckets = set()
+		self._glm5_whole_model_graph_capture_attempted_for_batch = False
+		self._glm5_whole_model_graph_state_change_after_capture_logged = False
+		self._glm5_whole_model_graph_signature = None
+		self._glm5_whole_model_graph_unavailable_reason = None
+		# The probe's spin nodes live in the graphs dropped above.
+		self._criticality_probe = None
+		# Adapter holds Python refs to model/segment/KV manager via _ctx;
+		# without release_context() the captured segment's static KV buffers
+		# survive empty_cache() and prefill OOMs on the next batch.
+		if getattr(self, '_cuda_graph_adapter', None) is not None:
+			self._cuda_graph_adapter.release_context()
+		# A later decode instance is a new owner and captures its own graphs.
+		self._decode_graph_captures = 0
+
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.
 
@@ -22680,31 +22638,13 @@ class BatchGenWorker:
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
-		self._cuda_graph_manager = None
-		self._glm5_moe_cuda_graph_manager = None
-		self._glm5_layer_cuda_graph_manager = None
-		self._glm5_layer_graph_failed_buckets = set()
-		self._glm5_layer_graph_capture_attempted_for_batch = False
-		self._glm5_layer_graph_signature = None
-		self._glm5_layer_graph_max_seqlen = None
-		self._glm5_dsa_graph_capture_attempted_for_batch = False
-		self._glm5_moe_graph_capture_attempted_for_batch = False
-		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
-		self._whole_model_segment = None
-		self._glm5_whole_model_all_short = False
-		self._glm5_whole_model_index_topk = 0
-		self._whole_model_bucketing = None
-		self._glm5_whole_model_capture_input_ids = None
-		self._glm5_moe_graph_failed_buckets = set()
-		self._whole_model_graph = False
-		self._glm5_whole_model_graph = False
-		self._glm5_whole_model_graph_failed_buckets = set()
-		self._glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._glm5_whole_model_graph_signature = None
-		self._glm5_whole_model_graph_unavailable_reason = None
-		# The probe's spin nodes live in the graphs dropped above.
-		self._criticality_probe = None
+		# Decode graph state belongs to the decode instance that captured it.
+		# A held decode instance replays those graphs on its next activation
+		# (capture-once), so freeing the live prefill model must not drop
+		# them; they go when the decode instance itself is retired, whose
+		# phase_exit clears the manager's hold before this runs.
+		if not self.parallel_manager.holds_instance("decode"):
+			self._release_decode_graph_state()
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)
@@ -22732,12 +22672,6 @@ class BatchGenWorker:
 				if hasattr(pm, attr):
 					delattr(pm, attr)
 		_df_t3 = time.perf_counter()
-
-		# Adapter holds Python refs to model/segment/KV manager via _ctx;
-		# without release_context() the captured segment's static KV buffers
-		# survive empty_cache() and prefill OOMs on the next batch.
-		if getattr(self, '_cuda_graph_adapter', None) is not None:
-			self._cuda_graph_adapter.release_context()
 
 		# Release memory
 		if torch.cuda.is_available():
