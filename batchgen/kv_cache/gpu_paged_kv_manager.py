@@ -1119,7 +1119,15 @@ class GPUPagedKVCacheManager:
 	def allocate_pages_for_sequences(
 		self, sequence_ids: Sequence[int], num_tokens: Sequence[int]
 	) -> Dict[int, List[int]]:
-		"""Allocates enough pages to hold `num_tokens` for each sequence."""
+		"""Allocates enough pages to hold `num_tokens` for each sequence.
+
+		All or nothing. The rows are validated one at a time while earlier
+		rows already hold pages, so a row that fails (no positive page count,
+		not enough free pages) first returns every row this call allocated,
+		last row first. That restores the free stack in its original order,
+		which a peer pool that mirrors this one relies on (see
+		``DualKVCacheCoordinator._rollback_allocations``).
+		"""
 
 		self._ensure_initialized()
 		if len(sequence_ids) != len(num_tokens):
@@ -1131,38 +1139,63 @@ class GPUPagedKVCacheManager:
 
 		required_pages = self._geometry.required_pages(num_tokens).tolist()
 		allocations: Dict[int, List[int]] = {}
-		any_changes = False
+		# (seq_id, page count before this call or None if created, new pages)
+		undo: List[Tuple[int, Optional[int], torch.Tensor]] = []
 
-		for seq_id, required in zip(sequence_ids, required_pages):
-			required_int = int(required)
-			if required_int <= 0:
-				raise ValueError(
-					f"allocate_pages_for_sequences: required pages must be positive for seq {seq_id}, got {required_int}"
-				)
+		try:
+			for seq_id, required in zip(sequence_ids, required_pages):
+				required_int = int(required)
+				if required_int <= 0:
+					raise ValueError(
+						f"allocate_pages_for_sequences: required pages must be positive for seq {seq_id}, got {required_int}"
+					)
 
-			state = self._sequences.get(seq_id)
-			current = state.pages.numel() if state else 0
-			missing = max(0, required_int - current)
-			if missing == 0:
-				allocations[seq_id] = []
-				continue
+				state = self._sequences.get(seq_id)
+				current = state.pages.numel() if state else 0
+				missing = max(0, required_int - current)
+				if missing == 0:
+					allocations[seq_id] = []
+					continue
 
-			if missing > self._free_pages.size:
-				raise RuntimeError(
-					f"Insufficient free pages for seq {seq_id}: need {missing}, free {self._free_pages.size}"
-				)
+				if missing > self._free_pages.size:
+					raise RuntimeError(
+						f"Insufficient free pages for seq {seq_id}: need {missing}, free {self._free_pages.size}"
+					)
 
-			new_pages = self._free_pages.pop(missing)
-			self._retain_gpu_pages(new_pages)
-			if state is None:
-				self._sequences[seq_id] = _SequenceState(pages=new_pages)
-			else:
-				state.append_pages(new_pages)
-			allocations[seq_id] = new_pages.tolist()
-			any_changes = True
-		if any_changes:
+				new_pages = self._free_pages.pop(missing)
+				self._retain_gpu_pages(new_pages)
+				if state is None:
+					self._sequences[seq_id] = _SequenceState(pages=new_pages)
+				else:
+					state.append_pages(new_pages)
+				undo.append((seq_id, int(current) if state else None, new_pages))
+				allocations[seq_id] = new_pages.tolist()
+		except BaseException:
+			self._undo_row_allocations(undo)
+			raise
+		if undo:
 			self._clear_active_page_pointer_tables()
 		return allocations
+
+	def _undo_row_allocations(
+		self, undo: Sequence[Tuple[int, Optional[int], torch.Tensor]]
+	) -> None:
+		"""Return the pages one call allocated, last row first.
+
+		Each row's pages were popped as one slice and ``_release_gpu_pages``
+		pushes them back as the same slice, so releasing the rows in reverse
+		order leaves the free stack exactly as the call found it. The pages
+		were free before the call, so their only reference is this call's
+		and the release reclaims them all.
+		"""
+
+		for seq_id, previous_count, new_pages in reversed(undo):
+			if previous_count is None:
+				del self._sequences[seq_id]
+			else:
+				state = self._sequences[seq_id]
+				state.pages = state.pages[:previous_count].clone()
+			self._release_gpu_pages(new_pages)
 
 	def count_new_shared_pages(
 		self,

@@ -547,12 +547,20 @@ class DualKVCacheCoordinator:
 		resident sequence, so only the last reference may reclaim it -- and a
 		page pushed back while its refcount still stands would be handed out
 		twice.
+
+		Rows are released in REVERSE allocation order. The allocator pops
+		each row as one slice off the top of the free stack and a release
+		pushes a slice back in the same order, so undoing the rows last-first
+		restores the free stack exactly. Releasing them first-first would
+		leave this pool's free stack in a different order from its peer's,
+		which never popped, and the next mirrored allocation would hand the
+		two pools different page ids.
 		"""
 
 		if not allocations:
 			return
 		touched = False
-		for seq_id, pages in allocations.items():
+		for seq_id, pages in reversed(list(allocations.items())):
 			if not pages:
 				continue
 			state = manager._sequences.get(seq_id)
