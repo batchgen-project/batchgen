@@ -82,7 +82,7 @@ class AttnWrapperBase(BaseModuleWrapper):
                            per token next to the quantized keys and requires
                            it; a bf16 AoS region rejects it.
       KV / misc:
-        attn_mode, scale, past_key_states, past_value_states,
+        scale, past_key_states, past_value_states,
         kv_quantization_factor, batchgen_debug,
         async_kv_load_active / async_kv_load_task.
 
@@ -97,7 +97,6 @@ class AttnWrapperBase(BaseModuleWrapper):
     """
 
     # Class-level state (shared across all instances)
-    attn_mode: ClassVar[int] = 0
     cur_batch: ClassVar[Optional[List[int]]] = None
     attention_mask: ClassVar[Optional[torch.Tensor]] = None
     position_ids: ClassVar[Optional[torch.Tensor]] = None

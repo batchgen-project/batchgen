@@ -56,7 +56,9 @@ class MiniMaxM25Initializer:
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
         self.planner = MiniMaxM25Planner()
-        self.engine_config = self.planner.generate_config(self.engine_config)
+        self.engine_config = self.planner.generate_config(
+            self.engine_config, self.model_config.model_type
+        )
 
         # Post-planner fixups (depend on values set by planner)
         self._post_planner_config()
@@ -127,9 +129,6 @@ class MiniMaxM25Initializer:
             ec.Module_Batching_Config.attn_decoding_micro_batch_size
             * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
         )
-
-        # attn_mode: always 3 for MiniMax-M2.5 (uses decoding_continuous path)
-        ec.Basic_Config.attn_mode = 3
 
         # For attn_mode=3 (EP decode), zero out module buffers (all weights persistent on GPU)
         if ec.Basic_Config.attn_mode == 3 and not ec.EP_Config.enable_offloading:

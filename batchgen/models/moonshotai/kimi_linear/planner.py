@@ -426,9 +426,6 @@ class KimiLinearPlanner(BasePlanner):
 
     def _adjust_config_for_model(self):
         """Kimi-Linear specific config adjustments."""
-        # Modern paged-KV decode path (decoding_continuous), same as K2.5.
-        self.config.Basic_Config.attn_mode = 3
-
         # In-wave prefill prefix pool reserve; 0 leaves the pool off. At G > 1
         # the 48B runs the same resident head-parallel KDA and NoPE-MLA seams
         # as K3 with identical per-head widths (192 K, 128 V, 576 latent), so
@@ -499,9 +496,8 @@ class KimiLinearPlanner(BasePlanner):
         # (core/utils.cpp) both match on "bfloat16", never "bf16".
         self.config.Basic_Config.kv_dtype = "bfloat16"
 
-        # F6: _compute_batch_configs() ran before this method with the base
-        # default attn_mode=1 (our attn_mode=3 above lands after buffer
-        # sizing), so its expert-residency math is wrong for this model.
+        # F6: _compute_batch_configs() ran before this method with generic
+        # expert-residency math; this model needs its own buffer sizing.
         # Override all three results here — this method runs last, so the
         # values stick:
         # (a) Decode expert staging buffers: normalize to the prefill ring (8).

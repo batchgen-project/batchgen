@@ -178,12 +178,15 @@ PINS = {
         "BasePlanner": {
             "kind": "class",
             "bases": ["ABC"],
-            "fields": ["MAGIC_NUM", "DEFAULT_MEM_FRAC", "NUM_EXPERTS"],
+            # S4a: FORCED_DECODE_MODE is the registration-seam declaration a
+            # model family uses to pin its only decode path; generate_config
+            # takes the parsed model_type so normalization can log it.
+            "fields": ["MAGIC_NUM", "DEFAULT_MEM_FRAC", "NUM_EXPERTS", "FORCED_DECODE_MODE"],
             "members": {},
             "public_methods": ["generate_config", "get_module_shapes"],
             "methods": {
                 "generate_config": {
-                    "params": ["self", "config"],
+                    "params": ["self", "config", "model_type"],
                     "returns": "EngineConfig",
                 },
                 "get_module_shapes": {

@@ -13,7 +13,6 @@ python <dir-to-r1_mmlu_pro_test.py> \
 	--host_kv_cache_size 256 \
     --max_input_length 2048 \
     --max_decoding_length 8192 \
-    --ATTN_MODE 3 \
     --cache_dir <dir to model checkpoint> \
     --server_host "localhost" \
     --server_port 10900 \

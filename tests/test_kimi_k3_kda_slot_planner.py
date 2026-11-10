@@ -229,7 +229,7 @@ def _plan_k3(gpu_memory_bytes):
         attention_group_size=8,
         gpu_total_memory_bytes=gpu_memory_bytes,
     )
-    return planner.generate_config(config)
+    return planner.generate_config(config, "kimi_k3")
 
 
 def test_h20_plan_funds_128_slots_latent_only_with_graphs():

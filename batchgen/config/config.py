@@ -36,7 +36,9 @@ class BasicConfig:
     activation_dtype_torch: Optional[Any] = None
     device: Optional[str] = None
     device_torch: Optional[Any] = None
-    attn_mode: int = 1
+    # 3 = decoupled GPU decode (decoding_continuous), the deployed path.
+    # 0/1/2 are selectable only explicitly and currently non-executable.
+    attn_mode: int = 3
     module_types: Optional[List[str]] = None
     num_threads: Optional[int] = 0
     max_prompt_length: Optional[int] = None
