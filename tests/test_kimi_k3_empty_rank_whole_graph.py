@@ -54,3 +54,20 @@ def test_refresh_statics_handles_zero_rows_without_wrapper_batch_tensors():
     zero = src[src.index("if bsz == 0:"):src.index("cache_seqlens = AttnWrapperBase")]
     assert "statics.refresh(0, empty, empty, statics.page_table[:0])" in zero
     assert "return" in zero
+
+
+def test_prewarm_captures_the_moe_bucket_only_when_every_ep_rank_has_rows():
+    """The prewarm MoE capture warms up global EP collectives.
+
+    A rank whose DP rank holds no decode rows returns before any capture
+    (``bsz == 0``), so a populated rank that captured the MoE bucket anyway
+    waited forever in those collectives (GB300 two-tray G=4, one-request
+    wave). The decision must be the synchronized all-ranks-nonempty one that
+    ``_begin_step`` uses.
+    """
+    src = _method("prewarm_decode_graphs")
+    assert "if bsz == 0:" in src
+    tail = src[src.index("if bucket not in self._captured:"):]
+    gate = tail[: tail.index("self._capture_moe_bucket(moe_bucket)")]
+    assert "self._moe_all_ranks_nonempty()" in gate
+    assert "self._ensure_moe_built()" in gate

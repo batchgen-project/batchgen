@@ -1341,7 +1341,15 @@ class KimiLinearDecodeGraph:
         if bucket not in self._captured:
             self._capture_bucket(bucket)
 
-        moe_ready = self._ensure_moe_built()
+        # The MoE capture warms up global EP collectives, so it runs only when
+        # every EP rank has decode rows -- the same synchronized decision the
+        # step-time capture in ``_begin_step`` takes. A rank whose DP rank has
+        # no rows returns above (``bsz == 0``) and never joins those
+        # collectives; capturing here regardless deadlocked the populated
+        # ranks of a decode wave that left one DP rank empty.
+        moe_ready = (
+            self._ensure_moe_built() and self._moe_all_ranks_nonempty()
+        )
         moe_bucket = (
             self._moe_group_bucket_for_step() if moe_ready else None
         )
