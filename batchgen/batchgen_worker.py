@@ -1583,10 +1583,15 @@ class BatchGenWorker:
 		# Compatibility key for the currently entered manager phase.
 		self._phase = None
 		self._live_phase_key = None
-		# Whole-model decode graph capture episodes completed by this process.
-		# On the reuse lifecycle it must stay at 1: the switch invariants and
-		# the capture-once guard in _setup_cuda_graphs read it.
+		# Whole-model decode graph capture episodes of the current decode
+		# instance; reset when that instance's graph state is released
+		# (_release_decode_graph_state). On the reuse lifecycle it stays at 1:
+		# the switch invariants and the capture-once guard in
+		# _setup_cuda_graphs read it.
 		self._decode_graph_captures = 0
+		# Prefill MoE mode of the most recent prefill entry; see
+		# _desired_phase_key("decode").
+		self._prefill_moe_mode_in_effect = None
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -11128,9 +11133,14 @@ class BatchGenWorker:
 	def _desired_phase_key(self, phase: str) -> PhaseKey:
 		"""Resolve the compatibility key for the next phase entry."""
 		if phase == "decode":
+			# The decode key carries the prefill MoE mode of the instance it
+			# follows. The worker records that mode on every prefill entry
+			# (_transition_phase), so the decode key and the live prefill key
+			# compare the same value; a manager attribute committed only on a
+			# rebuild would read None after a resumed or builder-made entry.
 			return PhaseKey(
 				"decode",
-				getattr(self.parallel_manager, "_prefill_moe_mode", None),
+				self._prefill_moe_mode_in_effect,
 				getattr(self, "_phase_profile_overrides", ()),
 			)
 		if phase != "prefill":
@@ -11279,6 +11289,8 @@ class BatchGenWorker:
 			PhaseEnterContext(comm=comm, max_num_seq=max_num_seq),
 		)
 		self._live_phase_key = desired
+		if desired.phase == "prefill":
+			self._prefill_moe_mode_in_effect = desired.prefill_moe_mode
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:
@@ -11937,10 +11949,12 @@ class BatchGenWorker:
 		)
 		prefill_key = PhaseKey("prefill", prefill_mode, ())
 		self._phase_profile_overrides = ()
+		if hasattr(pm, "set_prefill_moe_mode"):
+			pm.set_prefill_moe_mode(prefill_mode)
 		self._transition_phase(prefill_key)
 		self.set_phase("prefill")
 		self._install_prefill_weight_copy_pipeline(False)
-		decode_key = PhaseKey("decode", prefill_mode, ())
+		decode_key = self._desired_phase_key("decode")
 		_, resumed = self._transition_phase(
 			decode_key,
 			comm=self.comm,
@@ -22650,6 +22664,41 @@ class BatchGenWorker:
 				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
 					self.model.model.layers[layer_idx].mlp.cleanup()
 
+	def _release_decode_graph_state(self) -> None:
+		"""Drop the decode instance's captured graphs and their bookkeeping."""
+		self._cuda_graph_manager = None
+		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_layer_cuda_graph_manager = None
+		self._glm5_layer_graph_failed_buckets = set()
+		self._glm5_layer_graph_capture_attempted_for_batch = False
+		self._glm5_layer_graph_signature = None
+		self._glm5_layer_graph_max_seqlen = None
+		self._glm5_dsa_graph_capture_attempted_for_batch = False
+		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
+		self._whole_model_segment = None
+		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
+		self._whole_model_bucketing = None
+		self._glm5_whole_model_capture_input_ids = None
+		self._glm5_moe_graph_failed_buckets = set()
+		self._whole_model_graph = False
+		self._glm5_whole_model_graph = False
+		self._glm5_whole_model_graph_failed_buckets = set()
+		self._glm5_whole_model_graph_capture_attempted_for_batch = False
+		self._glm5_whole_model_graph_state_change_after_capture_logged = False
+		self._glm5_whole_model_graph_signature = None
+		self._glm5_whole_model_graph_unavailable_reason = None
+		# The probe's spin nodes live in the graphs dropped above.
+		self._criticality_probe = None
+		# Adapter holds Python refs to model/segment/KV manager via _ctx;
+		# without release_context() the captured segment's static KV buffers
+		# survive empty_cache() and prefill OOMs on the next batch.
+		if getattr(self, '_cuda_graph_adapter', None) is not None:
+			self._cuda_graph_adapter.release_context()
+		# A later decode instance is a new owner and captures its own graphs.
+		self._decode_graph_captures = 0
+
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.
 
@@ -22692,31 +22741,13 @@ class BatchGenWorker:
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
-		self._cuda_graph_manager = None
-		self._glm5_moe_cuda_graph_manager = None
-		self._glm5_layer_cuda_graph_manager = None
-		self._glm5_layer_graph_failed_buckets = set()
-		self._glm5_layer_graph_capture_attempted_for_batch = False
-		self._glm5_layer_graph_signature = None
-		self._glm5_layer_graph_max_seqlen = None
-		self._glm5_dsa_graph_capture_attempted_for_batch = False
-		self._glm5_moe_graph_capture_attempted_for_batch = False
-		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
-		self._whole_model_segment = None
-		self._glm5_whole_model_all_short = False
-		self._glm5_whole_model_index_topk = 0
-		self._whole_model_bucketing = None
-		self._glm5_whole_model_capture_input_ids = None
-		self._glm5_moe_graph_failed_buckets = set()
-		self._whole_model_graph = False
-		self._glm5_whole_model_graph = False
-		self._glm5_whole_model_graph_failed_buckets = set()
-		self._glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._glm5_whole_model_graph_signature = None
-		self._glm5_whole_model_graph_unavailable_reason = None
-		# The probe's spin nodes live in the graphs dropped above.
-		self._criticality_probe = None
+		# Decode graph state belongs to the decode instance that captured it.
+		# A held decode instance replays those graphs on its next activation
+		# (capture-once), so freeing the live prefill model must not drop
+		# them; they go when the decode instance itself is retired, whose
+		# phase_exit clears the manager's hold before this runs.
+		if not self.parallel_manager.holds_instance("decode"):
+			self._release_decode_graph_state()
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)
@@ -22744,12 +22775,6 @@ class BatchGenWorker:
 				if hasattr(pm, attr):
 					delattr(pm, attr)
 		_df_t3 = time.perf_counter()
-
-		# Adapter holds Python refs to model/segment/KV manager via _ctx;
-		# without release_context() the captured segment's static KV buffers
-		# survive empty_cache() and prefill OOMs on the next batch.
-		if getattr(self, '_cuda_graph_adapter', None) is not None:
-			self._cuda_graph_adapter.release_context()
 
 		# Release memory
 		if torch.cuda.is_available():
