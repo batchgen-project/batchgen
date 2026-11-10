@@ -244,6 +244,7 @@ from batchgen.worker.prefill import (
 	compute_prefill_host_reservation,
 	describe_prefill_blockers,
 	host_kv_eviction_enabled,
+	host_owned_pages_after_sharing,
 	prefill_host_reserve_page_deficit,
 	prefill_reclaim_target_pages,
 )
@@ -7069,16 +7070,16 @@ class BatchGenWorker:
 				if state is not None and state.attached_tokens:
 					# Attached prefix pages already sit in the Host pool; the
 					# owner allocates only the private remainder. Metadata
-					# still commits the TOTAL capacity below.
-					attached_pages = state.attached_tokens // seq.PAGE_SIZE
-					if attached_pages > pages:
-						raise RuntimeError(
-							"prefix attachment exceeds Host KV reservation: "
-							f"sequence={seq.global_idx}, "
-							f"attached_pages={attached_pages}, "
-							f"reserved_pages={pages}"
-						)
-					private_tokens = (pages - attached_pages) * seq.PAGE_SIZE
+					# still commits the TOTAL capacity below. Raising here
+					# (before the capacity collective) rejects the wave on
+					# every rank.
+					private_pages = host_owned_pages_after_sharing(
+						chain_pages=pages,
+						shared_pages=state.attached_tokens // seq.PAGE_SIZE,
+						sequence_id=seq.global_idx,
+						where="prefill reservation plan",
+					)
+					private_tokens = private_pages * seq.PAGE_SIZE
 				owner_requests.append((uuid, private_tokens))
 		return reservations, owner_requests
 
@@ -7610,15 +7611,20 @@ class BatchGenWorker:
 			# Attached prefix pages never enter the sequence's own chain, so
 			# releasing the row returns only the private remainder. Non-owner
 			# ranks sync this through the boundary metadata exchange.
-			owned = pages
 			state = (
 				self._prefix_sequence_states.get(seq.global_idx)
 				if self.enable_prefix_cache
 				else None
 			)
-			if state is not None and state.attached_tokens:
-				owned = pages - state.attached_tokens // seq.PAGE_SIZE
-			seq.host_owned_pages = owned
+			attached_pages = (
+				state.attached_tokens // seq.PAGE_SIZE if state is not None else 0
+			)
+			seq.host_owned_pages = host_owned_pages_after_sharing(
+				chain_pages=pages,
+				shared_pages=attached_pages,
+				sequence_id=seq.global_idx,
+				where="prefill reservation commit",
+			)
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
 		# allocator consumed, so the next round may credit again.
@@ -15576,7 +15582,12 @@ class BatchGenWorker:
 			)
 			# Retained pages left the sequence chain for prefix residency. Every
 			# group retains the same page count; host_owned_pages counts one.
-			seq.host_owned_pages -= len(retained.get(0, ()))
+			seq.host_owned_pages = host_owned_pages_after_sharing(
+				chain_pages=seq.host_owned_pages,
+				shared_pages=len(retained.get(0, ())),
+				sequence_id=seq.global_idx,
+				where="prefix commit retain",
+			)
 			if trajectory_frontier:
 				# M3 Slice 1b, inside this same transaction: the snapshot's
 				# Host pages come from the SAME allocator, so the deduction

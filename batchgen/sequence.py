@@ -352,6 +352,17 @@ class SequenceEntry:
         if self.status in host_required_statuses:
             require(self.assigned_rank is not None, f"{self.status.name} requires assigned_rank")
             require(self.host_pages_allocated > 0, f"{self.status.name} requires host_pages_allocated > 0")
+            # HOST_OWNED_PAGE: admission keeps the page holding the first
+            # decode position in the sequence's own chain (shared prefix pages
+            # cover only full prompt pages), and the host-KV growth planner
+            # depends on it. Zero stays legal outside these statuses:
+            # QUEUEING and IN_PREFILL carry no checked Host reservation yet,
+            # COMPLETED and EVICTED have released theirs.
+            require(
+                self.host_owned_pages >= 1,
+                f"{self.status.name} requires host_owned_pages >= 1 "
+                f"(HOST_OWNED_PAGE invariant), got {self.host_owned_pages}",
+            )
             if not terminal_capacity_gap:
                 require(
                     self.host_token_capacity >= self.current_context_length,
