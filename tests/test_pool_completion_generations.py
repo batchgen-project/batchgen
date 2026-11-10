@@ -108,6 +108,12 @@ class _SchedulingPoolStub:
         self.completed.append((request_id, batch_id))
         return False
 
+    def get_batch_tracker(self, batch_id: str):
+        return self._batch_trackers.get(batch_id)
+
+    def remove_batch_tracker(self, batch_id: str):
+        return self._batch_trackers.pop(batch_id, None)
+
     def num_active_slots(self) -> int:
         return 0
 
@@ -174,8 +180,15 @@ def _scheduler(tmp_path: Path):
     scheduler.worker = _WorkerStub()
     scheduler.storage = _StorageStub()
     scheduler._scheduling_pool = _SchedulingPoolStub()
+    # Every completion routes to a batch the pool tracks; a test replaces this
+    # tracker to model a failing or failed batch.
+    scheduler._scheduling_pool._batch_trackers["batch-1"] = SimpleNamespace(
+        is_complete=False, is_failed=False, error=None,
+    )
     scheduler._intake_pool = SimpleNamespace(
-        size=lambda: 0, remove_batch_entries=lambda batch_id: 0,
+        size=lambda: 0,
+        remove_batch_entries=lambda batch_id: 0,
+        remove_batch_info=lambda batch_id: None,
     )
     scheduler._stale_intake_batches = set()
     scheduler._turn_waiters = {}
@@ -292,16 +305,20 @@ def test_listener_survives_pool_shutdown_and_routes_the_next_generation(tmp_path
         assert not listener.done()
 
         # The next generation reuses the SAME listener task.
-        tracker.is_failed = True
         fresh_queue: Any = queue.Queue()
         scheduler.worker.response_queue = fresh_queue
         await asyncio.to_thread(scheduler.worker_generation_ready)
         assert scheduler._completion_listener_task is listener
         assert not listener.done()
 
-        fresh_queue.put(_completion("req-1", "batch-1"))
+        # The failed batch was discarded, so the probe is a batch admitted to
+        # the new generation.
+        scheduler._scheduling_pool._batch_trackers["batch-2"] = SimpleNamespace(
+            is_complete=False, is_failed=False, error=None,
+        )
+        fresh_queue.put(_completion("req-1", "batch-2"))
         assert await _await_true(lambda: scheduler._scheduling_pool.completed)
-        assert scheduler._scheduling_pool.completed == [("req-1", "batch-1")]
+        assert scheduler._scheduling_pool.completed == [("req-1", "batch-2")]
         # Still exactly one persisted failure for that batch, one report.
         assert [entry[0] for entry in scheduler.storage.statuses] == ["batch-1"]
         assert scheduler.worker.fatals == [("worker fatal", True)]
@@ -893,3 +910,101 @@ def test_drain_discards_entries_of_an_inactive_batch_without_a_slot(
         asyncio.run(scenario())
     discards = [r for r in caplog.records if "Discarding" in r.getMessage()]
     assert len(discards) == 3
+
+
+def _recording_intake(scheduler) -> Dict[str, List[str]]:
+    calls: Dict[str, List[str]] = {"entries": [], "info": []}
+    scheduler._intake_pool = SimpleNamespace(
+        size=lambda: 0,
+        remove_batch_entries=lambda batch_id: calls["entries"].append(batch_id) or 0,
+        remove_batch_info=lambda batch_id: calls["info"].append(batch_id),
+    )
+    return calls
+
+
+def test_a_timed_out_batch_releases_its_state_and_drops_late_completions(
+    tmp_path, caplog
+):
+    """A failed batch leaves no tracker, intake info or request metadata
+    behind, and a completion the worker returns afterwards frees its slot
+    but never reaches the FAILED batch's output or completion count."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        intake_calls = _recording_intake(scheduler)
+        scheduler._batch_timeout = 0
+
+        await scheduler._wait_and_finalize_batch("batch-1", [], [])
+
+        [(batch_id, status, kwargs)] = scheduler.storage.statuses
+        assert (batch_id, status) == ("batch-1", "failed")
+        assert kwargs["error"].startswith("timeout")
+        assert "batch-1" not in scheduler._scheduling_pool._batch_trackers
+        assert "batch-1" not in scheduler._pool_request_meta
+        assert intake_calls == {"entries": ["batch-1"], "info": ["batch-1"]}
+
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        scheduler.worker.response_queue.put(_completion("req-1", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.freed)
+        await asyncio.sleep(0.1)
+        assert scheduler._scheduling_pool.freed == ["req-1"]
+        assert scheduler._scheduling_pool.completed == []
+        assert not (tmp_path / "batch-1.jsonl").exists()
+
+        await _shutdown(scheduler)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    drops = [r for r in caplog.records if "Dropping late completion" in r.getMessage()]
+    assert len(drops) == 1
+
+
+def test_a_worker_fatal_discards_batch_state_once(tmp_path):
+    """The worker-fatal path uses the same discard: the tracker and metadata
+    go with the FAILED status, and the batch's wait task ends without
+    persisting a second, different status over it."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        intake_calls = _recording_intake(scheduler)
+        scheduler._batch_timeout = 60
+        waiter = asyncio.create_task(
+            scheduler._wait_and_finalize_batch("batch-1", [], [])
+        )
+        await asyncio.sleep(0)
+
+        assert scheduler._fail_all_active_batches("worker died") == 1
+        await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert scheduler.storage.statuses == [
+            ("batch-1", "failed", {"error": "worker_fatal: worker died"}),
+        ]
+        assert "batch-1" not in scheduler._scheduling_pool._batch_trackers
+        assert "batch-1" not in scheduler._pool_request_meta
+        assert intake_calls == {"entries": ["batch-1"], "info": ["batch-1"]}
+        assert scheduler._scheduling_pool.cleared == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_completion_for_a_failed_tracker_is_dropped(tmp_path):
+    """Between a batch failing and its state being discarded, the tracker is
+    still present but failed; a completion in that window is dropped too."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = SimpleNamespace(
+            is_complete=False, is_failed=True, error="worker died",
+        )
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        scheduler.worker.response_queue.put(_completion("req-1", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.freed)
+        await asyncio.sleep(0.1)
+        assert scheduler._scheduling_pool.completed == []
+        assert not (tmp_path / "batch-1.jsonl").exists()
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())

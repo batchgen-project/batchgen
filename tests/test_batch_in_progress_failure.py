@@ -76,6 +76,10 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
     updates = []
     scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
     scheduler.server_args = SimpleNamespace(model=MODEL)
+    # The pool state BatchScheduler.__init__ creates; a failure releases it.
+    scheduler._scheduling_pool = bs.SchedulingPool(capacity=4)
+    scheduler._intake_pool = bs.IntakePool(max_capacity=16)
+    scheduler._pool_request_meta = {}
     scheduler.storage = SimpleNamespace(
         files_dir=tmp_path,
         load_batch=lambda batch_id: SimpleNamespace(
@@ -154,3 +158,34 @@ def test_any_exception_after_in_progress_ends_in_failed(tmp_path, stage):
         bs.BatchStatus.IN_PROGRESS, bs.BatchStatus.FAILED,
     ]
     assert updates[-1][1] == f"Batch processing failed: {expected}"
+
+
+def test_an_exception_after_pool_registration_releases_the_batch_state(tmp_path):
+    """A batch that fails after the pool registered it must not leave its
+    tracker, queued entries or request metadata behind for the drain and the
+    listener to act on."""
+    scheduler, updates = _scheduler(tmp_path, [_line("req-1", 16)])
+
+    async def register_then_fail(batch_id, batch, requests, prompts,
+                                 per_request_max_tokens, sampling_params):
+        scheduler._scheduling_pool.register_batch(batch_id, total_requests=1)
+        scheduler._intake_pool.submit_batch(batch_id, [bs.IntakeEntry(
+            request_id=f"req-1@{batch_id}",
+            batch_id=batch_id,
+            raw_request={"text": prompts[0], "max_tokens": 16},
+            priority=bs.Priority.NORMAL,
+        )])
+        scheduler._pool_request_meta[batch_id] = {f"req-1@{batch_id}": {}}
+        raise OSError("incremental output directory is not writable")
+
+    scheduler._process_batch_pool_mode = register_then_fail
+    asyncio.run(scheduler._process_batch("batch-1"))
+
+    assert [status for status, _ in updates] == [
+        bs.BatchStatus.IN_PROGRESS, bs.BatchStatus.FAILED,
+    ]
+    assert "OSError: incremental output directory is not writable" in updates[-1][1]
+    assert scheduler._scheduling_pool.get_batch_tracker("batch-1") is None
+    assert scheduler._intake_pool.size() == 0
+    assert scheduler._intake_pool.get_batch_info("batch-1") is None
+    assert scheduler._pool_request_meta == {}
