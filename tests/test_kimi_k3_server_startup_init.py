@@ -505,9 +505,25 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
     path, function_name
 ):
     decode = _function(path, function_name)
+    # Both K3 dense decodes (eager and graph) reach the kernel only through
+    # the capability-selected seam, never a kernel package directly.
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "batchgen.attention.mla.paged_decode"
+        and [alias.name for alias in node.names] == ["mla_paged_decode"]
+        for node in ast.walk(decode)
+    )
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and (node.module or "").split(".")[0] in ("flash_mla", "flashinfer")
+        for node in ast.walk(decode)
+    )
+    seam = ast.parse(
+        (ROOT / "batchgen" / "attention" / "mla" / "paged_decode.py").read_text()
+    )
     imported = {
         alias.name
-        for node in ast.walk(decode)
+        for node in ast.walk(seam)
         if isinstance(node, ast.ImportFrom) and node.module == "flash_mla"
         for alias in node.names
     }
@@ -522,8 +538,9 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
         for node in ast.walk(decode)
     )
 
-    # Whatever the real K3 consumers import is what startup must prove exists;
+    # Whatever the seam imports for Hopper is what startup must prove exists;
     # otherwise the readiness check can drift away from the failing path.
+    # (The Blackwell launch is proven by the warmup, which runs the seam.)
     source = _body_source(
         _function(WORKER, "_preload_kimi_k3_runtime_extensions", "BatchGenWorker")
     )
@@ -548,7 +565,9 @@ def test_kimi_k3_graph_mla_preserves_the_tp_output_reduce():
     )
 
 
-def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
+def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs(
+    monkeypatch,
+):
     trace = []
 
     class FakeTorch:
@@ -581,15 +600,14 @@ def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
             trace.append(value)
             return value
 
-    class FakeFlashMLA:
-        @staticmethod
-        def get_mla_metadata(cache_seqlens, num_q_tokens, num_kv_heads):
-            trace.append(("metadata", cache_seqlens, num_q_tokens, num_kv_heads))
-            return "metadata", "splits"
+    from batchgen.attention.mla import paged_decode
 
-        @staticmethod
-        def flash_mla_with_kvcache(*args, **kwargs):
-            trace.append(("decode", args, kwargs))
+    # The warmup runs the capability-selected seam the decode forward uses
+    # (flash_mla on Hopper, flashinfer trtllm-gen on Blackwell).
+    def seam(*args, **kwargs):
+        trace.append(("decode", args, kwargs))
+
+    monkeypatch.setattr(paged_decode, "mla_paged_decode", seam)
 
     warmup = _isolated_method(
         WORKER,
@@ -597,16 +615,16 @@ def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
         "_warmup_kimi_k3_flash_mla",
         {"torch": FakeTorch},
     ).__get__(SimpleNamespace(rank=11))
-    warmup(FakeFlashMLA)
+    warmup(object())
 
     assert trace[0] == "current_device"
-    assert ("zeros", (1, 1, 12, 576), "bfloat16", "cuda:3") in trace
-    assert ("zeros", (1, 64, 1, 576), "bfloat16", "cuda:3") in trace
-    metadata = next(item for item in trace if item[0] == "metadata")
-    assert metadata[2:] == (12, 1)
+    query = ("zeros", (1, 1, 12, 576), "bfloat16", "cuda:3")
+    blocked_k = ("zeros", (1, 64, 1, 576), "bfloat16", "cuda:3")
+    block_table = ("zeros", (1, 1), "int32", "cuda:3")
+    cache_seqlens = ("ones", (1,), "int32", "cuda:3")
     decode = next(item for item in trace if item[0] == "decode")
-    assert decode[1][4] == 512
-    assert decode[2] == {"causal": True}
+    assert decode[1] == (query, blocked_k, block_table, cache_seqlens, 512, 576 ** -0.5)
+    assert decode[2] == {}
     assert trace[-1] == ("synchronize", "cuda:3")
 
 

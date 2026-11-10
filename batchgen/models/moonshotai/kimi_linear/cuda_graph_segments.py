@@ -36,8 +36,11 @@ structurally free win (folding the collective-free dense layer) is taken.
 WHAT IS AND IS NOT IN THE GRAPH
 -------------------------------
 In:   layer norms, all projections, 3x causal_conv1d_update + fla
-      fused_recurrent_kda_fwd (KDA), paged-KV token write + FlashMLA (MLA),
-      the attention TP all-reduce, o_proj, residual adds, dense MLP of layer 0.
+      fused_recurrent_kda_fwd (KDA), paged-KV token write + dense MLA decode
+      (MLA), the attention TP all-reduce, o_proj, residual adds, dense MLP of
+      layer 0. The dense MLA decode is the capability-selected seam
+      (``batchgen.attention.mla.paged_decode``): flash_mla on Hopper,
+      flashinfer trtllm-gen on Blackwell; both capture.
 K3 resident-MXFP4 MoE layers additionally use a companion graph segment; it
       owns their EP/TP collectives, grouped Marlin path, and shared expert.
 Out:  embedding, final norm, lm_head, KV offload callback (fired post-replay
@@ -52,7 +55,9 @@ STATIC BUFFERS
 * cache_seqlens / token_indices / slot_indices / num_valid_tokens / page_table
   — one shared `_BucketStatics` set per bucket (kimi_k25 adapter refresh
   pattern: the batch's rows of the KV manager's graph-stable page table are
-  copied into a fixed [bucket, max_pages] buffer each step).
+  copied into a fixed [bucket, width] buffer each step; ``width`` is the
+  decode seam's ``block_table_width`` of the manager's max_pages, so the
+  kernel reads the static table in place).
 * KDA slot indices — NOT reallocated here: `KDAStateGPUManager` already owns a
   persistent int32 buffer at a fixed address (M5.1), so the segments bind a
   bucket-sized view of it and `prepare_decode_step` refreshes it in place, once
@@ -69,8 +74,9 @@ Bucket padding rows must not corrupt live state:
     `ssm_state_indices` is an out-of-bounds write BEFORE the fla pool base.
     Several padded rows share the scratch slot; that race is benign precisely
     because the slot is scratch. Warmup uses the scratch slot for every row.
-  * FlashMLA reads pad rows with cache_seqlens=1 and page_table=0 (a valid
-    page); the outputs are discarded by the bucket->bsz slice.
+  * The dense MLA decode reads pad rows with cache_seqlens=1 and
+    page_table=0 (a valid page); the outputs are discarded by the
+    bucket->bsz slice.
 
 Attention buckets remain rank-local. The K3 MoE graph uses a separate
 TP-group-sized bucket: the worker's globally synchronized
@@ -103,6 +109,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from batchgen.attention.mla.paged_decode import block_table_width
 from batchgen.cuda_graph.graph_manager import (
     BatchSizeBucketing,
     CUDAGraphManager,
@@ -174,9 +181,7 @@ def _mla_decode_graph_safe(
     cache_seqlens,
     num_valid_tokens,
     page_size_tokens,
-    flashmla_metadata=None,
-    flashmla_num_splits=None,
-    kda_cu_seqlens=None,
+    mla_schedule=None,
 ):
     """Graph-safe inline of `serving_modules.mla_decoding_nope_with_pagekv`.
 
@@ -186,8 +191,8 @@ def _mla_decode_graph_safe(
          `gpu_paged_kv_manager.update_layer_decode_new_token` (which re-reads
          the manager's active table / slot tensor — both may be reallocated
          between steps, so their addresses cannot be baked into a graph);
-      2. FlashMLA reads the same STATIC page table instead of the manager's
-         active block table;
+      2. the dense MLA decode reads the same STATIC page table instead of
+         the manager's active block table;
       3. bucket padding rows are dropped by `num_valid_tokens` on the write.
 
     Args:
@@ -200,25 +205,16 @@ def _mla_decode_graph_safe(
         cache_seqlens: (bucket,) int32 context length including the new token.
         num_valid_tokens: (1,) int32 unpadded row count.
         page_size_tokens: tokens per KV page.
+        mla_schedule: the step's ``paged_decode.DecodeSchedule`` shared by
+            every MLA layer (whole-model graph), or None for a standalone
+            per-layer capture, which then records its own.
 
     Returns:
         (attn_output (bucket, 1, hidden), k_tensor (bucket, 1, 1, kv_dim)).
     """
-    # K3's graph path uses the same pure-BF16 FlashMLA entry points as the
-    # eager path.  Import them directly so graph capture does not pull in the
-    # unused legacy FP8/FA3 backend and its DeepGEMM dependency.
-    if torch.cuda.get_device_capability()[0] != 9:
-        # The graph path bakes flash_mla's precomputed scheduler metadata into
-        # the capture. The Blackwell decode kernel (flashinfer trtllm-gen)
-        # needs a per-bucket plan made outside capture instead; until that
-        # graph-safe variant exists, Blackwell decode must run eager.
-        raise NotImplementedError(
-            "graph-captured Kimi MLA decode is Hopper-only; run decode_graph_mode "
-            "'eager' on Blackwell (sub-project batchgen-k3-b300-single-node)"
-        )
-    from flash_mla import flash_mla_with_kvcache
-
-    from batchgen.attention.mla.paged_decode import flashmla_dense_kwargs as dense_decode_kwargs
+    # The same pure-BF16 seam as the eager path; it never pulls in the legacy
+    # FP8/FA3 backend and its DeepGEMM dependency.
+    from batchgen.attention.mla.paged_decode import mla_paged_decode
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
     bsz = hidden_states.shape[0]
@@ -285,29 +281,17 @@ def _mla_decode_graph_safe(
     query_states[:, :, :, attn.kv_lora_rank :] = q_pe
     query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
-    if flashmla_metadata is None or flashmla_num_splits is None:
-        # The standalone per-layer graph path has no enclosing model graph,
-        # so it owns its metadata generation.  The K3 whole-model graph passes
-        # one pair shared by all NoPE-MLA layers instead.
-        from flash_mla import get_mla_metadata
-
-        tile_scheduler_metadata, num_splits = get_mla_metadata(
-            cache_seqlens, attn.num_heads, 1, **dense_decode_kwargs()
-        )
-    else:
-        tile_scheduler_metadata = flashmla_metadata
-        num_splits = flashmla_num_splits
-    attn_out, _ = flash_mla_with_kvcache(
+    # The standalone per-layer graph path has no enclosing model graph, so
+    # the seam records its schedule here (mla_schedule=None). The K3
+    # whole-model graph passes one schedule shared by all NoPE-MLA layers.
+    attn_out = mla_paged_decode(
         query_states,
         blocked_k,
         page_table,
         cache_seqlens,
         attn.kv_lora_rank,
-        tile_scheduler_metadata,
-        num_splits,
         attn.scaling,
-        True,
-        **dense_decode_kwargs(),
+        schedule=mla_schedule,
     )
 
     attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
@@ -331,6 +315,10 @@ class _BucketStatics:
     def __init__(self, bucket: int, max_pages: int, device, kda_slots, *,
                  block_residual_columns: int = 0, hidden_size: int = 0,
                  dtype=None, max_aux_pages: int = 0):
+        """``max_pages`` is the static table's column count: the decode
+        seam's ``block_table_width`` of the manager's graph table, which may
+        exceed the manager's own width (the extra columns stay page 0 and no
+        length reaches them)."""
         self.bucket = bucket
         self.cache_seqlens = torch.ones(
             bucket, dtype=torch.int32, device=device
@@ -401,7 +389,9 @@ class _BucketStatics:
                 self.aux_page_table[bsz:].zero_()
         self.cache_seqlens[:bsz].copy_(cache_seqlens, non_blocking=True)
         self.token_indices[:bsz].copy_(token_indices, non_blocking=True)
-        self.page_table[:bsz].copy_(page_rows, non_blocking=True)
+        self.page_table[:bsz, : page_rows.shape[1]].copy_(
+            page_rows, non_blocking=True
+        )
         if self.aux_page_table is not None and bsz > 0:
             self.aux_page_table[:bsz].copy_(aux_page_rows, non_blocking=True)
 
@@ -508,27 +498,15 @@ class KimiLinearSpanSegment:
         self,
         hidden_states: torch.Tensor,
         *,
-        flashmla_metadata=None,
-        flashmla_num_splits=None,
+        mla_schedule=None,
         kda_cu_seqlens=None,
     ) -> Dict[str, torch.Tensor]:
         attention = self._graph_attention
-        if (
-            flashmla_metadata is not None
-            or flashmla_num_splits is not None
-            or kda_cu_seqlens is not None
-        ):
-            if flashmla_metadata is None or flashmla_num_splits is None:
-                raise ValueError(
-                    "FlashMLA metadata and num_splits must be supplied together"
-                )
+        if mla_schedule is not None or kda_cu_seqlens is not None:
 
             def attention(normed):
                 return self._graph_attention(
-                    normed,
-                    flashmla_metadata,
-                    flashmla_num_splits,
-                    kda_cu_seqlens,
+                    normed, mla_schedule, kda_cu_seqlens,
                 )
 
         if self.use_block_residual:
@@ -554,8 +532,7 @@ class KimiLinearSpanSegment:
     def _graph_attention(
         self,
         normed,
-        flashmla_metadata=None,
-        flashmla_num_splits=None,
+        mla_schedule=None,
         kda_cu_seqlens=None,
     ):
         """``(attn_out, kv_outputs)``: the attention output and the cache rows
@@ -571,10 +548,11 @@ class KimiLinearSpanSegment:
             )
             return attn_out, {}
         if self.is_dsa:
-            # FlashMLA's schedule is unused here: the sparse attention runs on
-            # FA3 over the selected tokens. Both page tables come from the
-            # graph's static buffer, so only the cache tensors are read; an
-            # empty rank captures before it ever builds an active table.
+            # The dense decode schedule is unused here: the sparse attention
+            # runs through the sparse seam over the selected tokens. Both page
+            # tables come from the graph's static buffer, so only the cache
+            # tensors are read; an empty rank captures before it ever builds
+            # an active table.
             blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
                 self.layer_idx
             )
@@ -615,8 +593,7 @@ class KimiLinearSpanSegment:
                 cache_seqlens=buf.cache_seqlens,
                 num_valid_tokens=buf.num_valid_tokens,
                 page_size_tokens=self.page_size_tokens,
-                flashmla_metadata=flashmla_metadata,
-                flashmla_num_splits=flashmla_num_splits,
+                mla_schedule=mla_schedule,
             )
         return attn_out, {"k_tensor": k_tensor}
 
@@ -735,6 +712,7 @@ class KimiLinearDecodeGraph:
         self._scratch_slot: Optional[int] = None
         self._kv_signature = None
         self._max_pages = 0
+        self._static_pages = 0
         self._page_size_tokens = 0
         # Kimi-K3.1 DSA: the auxiliary (index-key) cache geometry. Zero when
         # the model has no indexer layer, which keeps every K3 path unchanged.
@@ -1744,6 +1722,10 @@ class KimiLinearDecodeGraph:
         table = kv_manager.get_cuda_graph_page_table_storage()
         self._max_pages = int(table.shape[1])
         self._page_size_tokens = int(kv_manager.config.page_size_tokens)
+        # The statics hold the width the dense decode reads in place.
+        self._static_pages = block_table_width(
+            self._max_pages, self._page_size_tokens
+        )
         if self._has_dsa:
             aux_manager = self._require_aux_manager()
             aux_table = aux_manager.get_cuda_graph_page_table_storage()
@@ -1770,11 +1752,12 @@ class KimiLinearDecodeGraph:
             logger.info(
                 "[KIMI_DECODE_GRAPH] rank=%s built %d spans "
                 "(%d KDA, %d MLA, %d whole-layer dense), kda_scratch_slot=%d, "
-                "page_size=%d max_pages=%d",
+                "page_size=%d max_pages=%d static_pages=%d",
                 self.rank, len(self.segments), n_kda,
                 len(self.segments) - n_kda,
                 sum(1 for s in self.segments.values() if s.fold_ffn),
                 self._scratch_slot, self._page_size_tokens, self._max_pages,
+                self._static_pages,
             )
         return True
 
@@ -1786,7 +1769,7 @@ class KimiLinearDecodeGraph:
             )
             statics = _BucketStatics(
                 bucket,
-                self._max_pages,
+                self._static_pages,
                 self.device,
                 slots,
                 block_residual_columns=self._block_residual_columns,
