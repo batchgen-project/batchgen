@@ -428,6 +428,77 @@ def test_a_plain_rollback_also_gives_the_refcount_back():
     assert coordinator.primary._gpu_page_refcounts == {}
 
 
+def _pool_state(manager):
+    free = manager._free_pages
+    return (
+        free._buffer[: free.size].tolist(),
+        {seq_id: _pages(manager, seq_id) for seq_id in manager._sequences},
+        dict(manager._gpu_page_refcounts),
+    )
+
+
+# Three rows of 2, 3 and 4 pages. A pool of SMALL_POOL_PAGES fits the first
+# rows of either call and fails a later one: allocate fails at row 2 (5 pages
+# taken, 1 free); grow, behind three resident one-page rows, fails at row 1.
+ROWS = [7, 8, 9]
+ROW_PAGES = [2, 3, 4]
+SMALL_POOL_PAGES = 6
+
+
+def _allocate_rows(coordinator):
+    coordinator.allocate_pages_for_sequences(
+        ROWS, [pages * PAGE_TOKENS for pages in ROW_PAGES]
+    )
+
+
+def _grow_rows(coordinator):
+    coordinator.grow_pages_for_sequences(ROWS, ROW_PAGES)
+
+
+@pytest.mark.parametrize("failing_pool", ["primary", "auxiliary"])
+@pytest.mark.parametrize(
+    "operation, resident_rows",
+    [(_allocate_rows, False), (_grow_rows, True)],
+    ids=["allocate", "grow"],
+)
+def test_a_failed_multi_row_call_leaves_both_pools_as_they_were(
+    operation, resident_rows, failing_pool
+):
+    """A mirrored call that fails at row k > 0 of one pool changes neither.
+
+    The coordinator's capacity preflight is bypassed so the pool's own
+    per-row check is what fails, after earlier rows of the same call already
+    took pages. The pool that raised must have returned those rows itself,
+    and the coordinator must have undone the pool that succeeded, both last
+    row first, so the next mirrored allocation hands both pools the same ids.
+    """
+
+    coordinator = KV.DualKVCacheCoordinator(
+        _manager(SMALL_POOL_PAGES if failing_pool == "primary" else POOL_PAGES),
+        _manager(SMALL_POOL_PAGES if failing_pool == "auxiliary" else POOL_PAGES),
+    )
+    if resident_rows:
+        coordinator.allocate_pages_for_sequences(ROWS, [PAGE_TOKENS] * len(ROWS))
+    before = {
+        name: _pool_state(manager)
+        for name, manager in (
+            ("primary", coordinator.primary),
+            ("auxiliary", coordinator.auxiliary),
+        )
+    }
+    coordinator._preflight_allocate = lambda *args, **kwargs: None
+    coordinator._preflight_grow = lambda *args, **kwargs: None
+
+    with pytest.raises(RuntimeError, match="(?i)insufficient free pages for seq"):
+        operation(coordinator)
+
+    assert _pool_state(coordinator.primary) == before["primary"]
+    assert _pool_state(coordinator.auxiliary) == before["auxiliary"]
+
+    coordinator.allocate_pages_for_sequences([20], [PAGE_TOKENS])
+    assert _pages(coordinator.primary, 20) == _pages(coordinator.auxiliary, 20)
+
+
 def test_the_two_pools_must_agree_on_the_shared_page_demand():
     coordinator = _coordinator()
     # The indexer rows claim one more shared page than the primary rows: the
