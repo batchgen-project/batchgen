@@ -74,7 +74,6 @@ def test_pool_completion_separates_k3_reasoning(tmp_path):
                 "custom_id": "request-1",
                 "url": "/v1/chat/completions",
                 "model": "moonshotai/Kimi-K3",
-                "prompt_text": "question",
             }
         }
     }

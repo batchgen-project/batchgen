@@ -69,7 +69,7 @@ class SequenceEntry:
         'uuid', 'global_idx', 'prompt_length', 'max_decode_length',
         'status', 'decoded_length', 'current_context_length',
         'input_ids', 'decoded_tokens',
-        'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
+        'kv_token_budget', 'assigned_rank', 'eos_reached',
         # Prefix-grouped admission order (packing_v2); unset means global_idx.
         'prefill_order',
         # Decode-side DP-group (M2b): 0..num_dp-1, the group of G ranks that
@@ -145,7 +145,6 @@ class SequenceEntry:
         global_idx: int,
         prompt_length: int,
         max_decode_length: int,
-        text: Optional[str] = None,
     ):
         self.uuid = uuid
         self.global_idx = global_idx
@@ -160,7 +159,6 @@ class SequenceEntry:
         self.assigned_rank: Optional[int] = None
         self.decode_dp_group: Optional[int] = None
         self.evicted_from_dp_group: Optional[int] = None
-        self.text = text
         self.eos_reached: bool = False
         
         # Two-page buffer: tracks current GPU page allocation

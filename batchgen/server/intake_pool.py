@@ -33,7 +33,7 @@ class IntakeEntry:
     """A single raw request waiting to enter the SchedulingPool."""
     request_id: str
     batch_id: str
-    raw_request: Dict[str, Any]   # Unparsed JSONL body (messages, max_tokens, etc.)
+    raw_request: Dict[str, Any]   # Worker inputs: input_ids (int32 prompt token ids), max_tokens, etc.
     priority: Priority
     created_at: float = field(default_factory=time.time)
 

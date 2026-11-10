@@ -1087,7 +1087,6 @@ class QueryBook:
 
 @dataclass
 class QueryBookEntry:
-    text: Optional[str] = None
     encoded: Optional[Dict[str, torch.Tensor]] = None
     decoded_tokens: Optional[torch.Tensor] = None
     kv_token_budget: Optional[int] = None
@@ -1095,7 +1094,6 @@ class QueryBookEntry:
 
 def make_query_book_entry(sequence) -> QueryBookEntry:
     return QueryBookEntry(
-        text=sequence.text,
         encoded={"input_ids": sequence.input_ids},
         decoded_tokens=sequence.decoded_tokens,
         kv_token_budget=sequence.kv_token_budget,

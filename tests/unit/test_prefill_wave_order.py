@@ -188,7 +188,7 @@ def test_sequence_entry_carries_the_stamped_order():
     from batchgen.sequence import SequenceEntry
 
     seq = SequenceEntry(uuid="s", global_idx=0, prompt_length=3,
-                        max_decode_length=1, text="s")
+                        max_decode_length=1)
     assert getattr(seq, "prefill_order", None) is None
     seq.prefill_order = 7
     assert seq.prefill_order == 7

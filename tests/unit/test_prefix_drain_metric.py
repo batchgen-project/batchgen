@@ -15,6 +15,9 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
+import torch
+
 from batchgen.query_book import release_local_query_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 
@@ -33,7 +36,8 @@ _NAMESPACE = {
     "SequenceEntry": SequenceEntry,
     "logging": logging,
     "release_local_query_slot": release_local_query_slot,
-    "_release_tokenizer_arenas": lambda **_: None,
+    "np": np,
+    "torch": torch,
     "time": time,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
@@ -43,6 +47,7 @@ exec(compile(ast.fix_missing_locations(ast.Module(
             "_maybe_emit_prefix_drain_metric",
             "_trajectory_restore_fields",
             "_admit_sequences_from_message",
+            "_admitted_prompt_ids",
         )
     ],
     type_ignores=[],
@@ -53,7 +58,6 @@ class _Worker:
     rank = 1
     world_size = 1
     max_input_length = 1 << 20
-    max_decoding_length = 64
     _trajectory_book = None
     _response_queue = None
 
@@ -89,9 +93,9 @@ class _Worker:
     def _prefix_host_resource_fields(self):
         return {"active_attachments": self.active_attachments, "resident_nodes": 3}
 
-    # Admission collaborators: tokenization and query-book binding are out of
+    # Admission collaborators: prompt binding and query-book binding are out of
     # scope; the drain edge only needs the sequences to enter global_batch.
-    def _tokenize_admitted_sequences(self, uuids):
+    def _bind_admitted_prompts(self, uuids, prompt_ids):
         for uuid in uuids:
             self.global_batch.get_sequence(uuid).prompt_length = 4
 
@@ -104,7 +108,8 @@ class _Worker:
 
 def _admit(worker, *request_ids):
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": rid, "text": "prompt", "batch_id": "b"}
+        {"request_id": rid, "input_ids": np.zeros(4, dtype=np.int32), "batch_id": "b",
+         "max_tokens": 64}
         for rid in request_ids
     ]})
 
