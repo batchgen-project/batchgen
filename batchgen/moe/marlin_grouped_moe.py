@@ -267,16 +267,20 @@ def marlin_grouped_stage1_unified(
 # forward path at all — the flag name below is forward-declared, not live.
 # ============================================================================
 
-_MXFP4_KERNEL_ENTRIES = (
-    "grouped_marlin_gemm_m16_mxfp4",
-    "grouped_marlin_gemm_m16_s1_mxfp4_situ",
-    "grouped_marlin_gemm_m16_mxfp4_v2",
-    "grouped_marlin_gemm_m16_s1_mxfp4_situ_v2",
-    "grouped_marlin_gemm_m16_mxfp4_v3",
-    "grouped_marlin_gemm_m16_s1_mxfp4_situ_v3",
-    "marlin_mxfp4_v3_expert_order",
-    "marlin_mxfp4_v3_launch_config",
-)
+# Entries per kernel version. Versions 1 and 2 are mma.sync kernels built for
+# every lane; version 3 is sm_90a wgmma and is compiled out of other lanes
+# (-DBATCHGEN_DISABLE_MARLIN_V3), so each wrapper requires only its own
+# version's entries.
+_MXFP4_KERNEL_ENTRIES_BY_VERSION = {
+    1: ("grouped_marlin_gemm_m16_mxfp4",
+        "grouped_marlin_gemm_m16_s1_mxfp4_situ"),
+    2: ("grouped_marlin_gemm_m16_mxfp4_v2",
+        "grouped_marlin_gemm_m16_s1_mxfp4_situ_v2"),
+    3: ("grouped_marlin_gemm_m16_mxfp4_v3",
+        "grouped_marlin_gemm_m16_s1_mxfp4_situ_v3",
+        "marlin_mxfp4_v3_expert_order",
+        "marlin_mxfp4_v3_launch_config"),
+}
 
 _warned_mxfp4 = False
 _warned_mxfp4_v2 = False
@@ -293,14 +297,26 @@ MXFP4_V2_MAX_SCALE_BYTE = 128
 MXFP4_V3_VARIANTS = {0: (2, 64), 1: (2, 48), 2: (4, 32)}
 
 
-def is_marlin_mxfp4_available() -> bool:
+def is_marlin_mxfp4_available(version: int = 1) -> bool:
     return _module is not None and all(
-        hasattr(_module, k) for k in _MXFP4_KERNEL_ENTRIES)
+        hasattr(_module, k) for k in _MXFP4_KERNEL_ENTRIES_BY_VERSION[version])
 
 
-def _require_mxfp4_kernels():
-    """L1: the marlin MXFP4 entries must exist — K3 refuses to run otherwise."""
-    missing = [k for k in _MXFP4_KERNEL_ENTRIES if not hasattr(_module, k)]
+def _require_mxfp4_kernels(version: int):
+    """L1: the entries of MXFP4 kernel `version` must exist — K3 refuses to
+    run otherwise."""
+    if version not in _MXFP4_KERNEL_ENTRIES_BY_VERSION:
+        raise ValueError(
+            f"mxfp4 kernel version must be one of "
+            f"{sorted(_MXFP4_KERNEL_ENTRIES_BY_VERSION)}, got {version}")
+    missing = [k for k in _MXFP4_KERNEL_ENTRIES_BY_VERSION[version]
+               if not hasattr(_module, k)]
+    if missing and version == 3:
+        raise RuntimeError(
+            f"Marlin MXFP4 kernel v3 entries missing from "
+            f"batchgen_kernels.moe._C_marlin_grouped_gemm: {missing}. v3 is "
+            f"sm_90a wgmma and is compiled only into the sm90a build lane; "
+            f"use kernel version 1 on other architectures.")
     if missing:
         # Name the .so actually loaded. A stale copy installed in
         # site-packages shadows the repo's in-tree build whenever the repo
@@ -429,7 +445,7 @@ def marlin_grouped_stage1_fused_mxfp4_situ(
     caller must NOT filter empty experts (graph-static pointer arrays).
     """
     global _warned_mxfp4
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(1)
     _check_activation("dispatched_x_3d", dispatched_x_3d, K)
     _check_activation("intermediate_3d", intermediate_3d, N)
     E = int(num_experts)
@@ -473,7 +489,7 @@ def marlin_grouped_m16_mxfp4(
     max_m_tiles: int,
 ) -> None:
     """K3 M16 MXFP4 grouped GEMM (S3 down projection / standalone)."""
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(1)
     _check_activation("A", A, prob_k)
     E = int(num_experts)
     _check_counts("expert_counts", expert_counts, E)
@@ -558,7 +574,7 @@ def marlin_grouped_stage1_fused_mxfp4_situ_v2(
     is <= 128 (check_mxfp4_scales_v2_compatible, at weight-build time).
     """
     global _warned_mxfp4_v2
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(2)
     _check_activation("dispatched_x_3d", dispatched_x_3d, K)
     _check_activation("intermediate_3d", intermediate_3d, N)
     E = int(num_experts)
@@ -609,7 +625,7 @@ def marlin_grouped_m16_mxfp4_v2(
     contract and checks as marlin_grouped_m16_mxfp4, plus `variant`.
     max_m_tiles is accepted for interchangeability but does not limit rows.
     Scale bytes must be <= 128 (check_mxfp4_scales_v2_compatible)."""
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(2)
     _check_activation("A", A, prob_k)
     E = int(num_experts)
     _check_counts("expert_counts", expert_counts, E)
@@ -668,7 +684,7 @@ def compute_mxfp4_v3_expert_order(
     Pass a preallocated int32 `out` of the same length when capturing a CUDA
     graph; the kernel is capturable together with the v3 launches.
     """
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(3)
     E = expert_counts.numel()
     _check_counts("expert_counts", expert_counts, E)
     if out is None:
@@ -710,7 +726,7 @@ def marlin_grouped_stage1_fused_mxfp4_situ_v3(
     is <= 128 (check_mxfp4_scales_v2_compatible, at weight-build time).
     """
     global _warned_mxfp4_v3
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(3)
     _check_activation("dispatched_x_3d", dispatched_x_3d, K)
     _check_activation("intermediate_3d", intermediate_3d, N)
     E = int(num_experts)
@@ -764,7 +780,7 @@ def marlin_grouped_m16_mxfp4_v3(
     plus `variant` and an optional `expert_order` (requires num_matrices ==
     num_experts). Rows per expert are bounded by max_m_tiles as in v1. Scale
     bytes must be <= 128 (check_mxfp4_scales_v2_compatible)."""
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(3)
     _check_activation("A", A, prob_k)
     E = int(num_experts)
     _check_counts("expert_counts", expert_counts, E)
@@ -829,7 +845,7 @@ def single_expert_marlin_mxfp4_decode(
         N: moe_intermediate_size (K3: 3072); K: hidden_size (K3: 3584).
     Returns: [t, K] BF16.
     """
-    _require_mxfp4_kernels()
+    _require_mxfp4_kernels(1)
     _check_activation("x", x, K, require_contiguous=False)  # .contiguous() below
     _check_m16_shapes(N, K)   # S1: prob_n=N, prob_k=K
     _check_m16_shapes(K, N)   # S3: prob_n=K, prob_k=N

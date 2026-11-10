@@ -674,12 +674,15 @@ class CUDAOpBuilder(OpBuilder):
         args = []
         self.enable_bf16 = True
         for cc in ccs:
-            num = cc[0] + cc[2]
+            # "major.minor" with an optional +PTX suffix; majors can be two
+            # digits (10.0, 10.3), so never index into the string.
+            major, minor = cc.removesuffix("+PTX").split(".")
+            num = f"{int(major)}{int(minor)}"
             args.append(f"-gencode=arch=compute_{num},code=sm_{num}")
             if cc.endswith("+PTX"):
                 args.append(f"-gencode=arch=compute_{num},code=compute_{num}")
 
-            if int(cc[0]) <= 7:
+            if int(major) <= 7:
                 self.enable_bf16 = False
 
         return args

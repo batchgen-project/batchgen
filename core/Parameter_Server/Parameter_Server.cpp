@@ -299,7 +299,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         if (!size_aligned) alignment_info += "total_size NOT aligned, ";
         if (dest_aligned && size_aligned) alignment_info += "both aligned, ";
         this->logger->debug("");
-        this->logger->info(alignment_info + "using direct I/O for {} bytes", 
+        // Literal format string: C++20 fmt checks the format at compile time,
+        // so the runtime-assembled prefix is passed as an argument instead.
+        this->logger->info("{}using direct I/O for {} bytes", alignment_info,
                         dest_aligned ? metadata.total_byte_size : 0);
 
         if (!dest_aligned) {
@@ -487,7 +489,7 @@ void Parameter_Server::Init(
     int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(this->log_level_,
                                                weight_shm_name, byte_size, true,
-                                               this->enable_hugetlbfs, false,
+                                               this->enable_hugetlbfs,
                                                this->enable_thp_, -1, -1,
                                                &memfd_fd_out,
                                                &mapped_size);
@@ -662,8 +664,9 @@ Parameter_Server::Parameter_Server(const std::string& log_level,
 
 Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->log_level_, this->weight_ptr_,
-                                  this->mapped_size_);
+        // The server never registers the weights with CUDA; workers do.
+        unmap_shared_memory(this->log_level_, this->weight_ptr_,
+                            this->mapped_size_);
     }
     // Closing the memfds drops the last reference the kernel needs: no name
     // survives this process in any mode, hugetlbfs included, so nothing is left
