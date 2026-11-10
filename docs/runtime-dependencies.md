@@ -96,7 +96,11 @@ preflight before importing the HTTP server. It checks:
   indexer extensions (`_C_fast_hadamard_transform`, `_C_fused_rope_hadamard`,
   `_C_dsa_fast_topk`, `_C_indexer_kv_proj_wgmma`) and the FP8 WGMMA MoE
   extensions (`_C_fp8_wgmma_grouped_gemm`, `_C_fp8_wgmma_quant_ops`,
-  `_C_dispatch_scatter_3d`);
+  `_C_dispatch_scatter_3d`); every model's contract lists each AOT extension
+  its model code can load (MoE GEMMs such as `_C_fp8_blockwise_gemm` and
+  `_C_expert_mxfp4_wgmma` included), so a partial kernel build is refused at
+  startup. Extensions built only for `sm_90a` are required on a Hopper
+  (`sm_90`) GPU; on other GPUs the model uses its non-WGMMA kernels;
 - a native (AOT) `batchgen.core_engine` module, not older than `core/` when
   running from a worktree;
 - the provenance rule above.
