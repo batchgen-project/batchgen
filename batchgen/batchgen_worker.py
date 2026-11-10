@@ -794,7 +794,7 @@ def allocate_node_shared_tensor(
 	legacy int64 input table helper and is used by the unified trajectory book.
 	"""
 	import mmap
-	if dtype not in (torch.int32, torch.int64):
+	if dtype not in (torch.uint8, torch.int32, torch.int64):
 		raise ValueError(f"unsupported shared tensor dtype: {dtype}")
 	if rows <= 0 or width <= 0:
 		raise ValueError(f"shared tensor shape must be positive, got ({rows}, {width})")
