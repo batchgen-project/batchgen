@@ -237,9 +237,19 @@ Get current status of a batch job. Use this endpoint to poll for completion.
 
 ### POST /v1/batches/{batch_id}/cancel
 
-Cancel a batch in `validating` or `in_progress` state (other states return an error). The batch is marked `cancelled` immediately; `cancelling_at` and `cancelled_at` are set to the same timestamp. A cancelled batch that has not started yet is skipped by the scheduler; sequences already executing are not interrupted.
+Cancel a batch in `validating` or `in_progress` state (other states return
+an error). A batch with no request on a worker is `cancelled` at once, with
+`cancelling_at` and `cancelled_at` set to the same timestamp. Otherwise the
+batch becomes `cancelling`: its queued requests are removed, the worker stops
+its admitted requests at the next scheduling boundary (a request not yet
+prefilled is dropped at once; a decoding one stops producing tokens and
+releases its KV cache at the next decode boundary), and the batch becomes
+`cancelled` once every request has left the worker. A running GPU kernel is
+not preempted. Results that arrive after the cancel are discarded; lines
+already written to the incremental output file stay there. A cancelled batch
+never becomes `completed` or `failed` afterwards.
 
-**Response:** `BatchObject` with `status: "cancelled"`
+**Response:** `BatchObject` with `status: "cancelling"` or `"cancelled"`
 
 ---
 
@@ -248,6 +258,7 @@ Cancel a batch in `validating` or `in_progress` state (other states return an er
 ```
 validating → in_progress → completed
                          → failed
+                         → cancelling → cancelled
                          → cancelled
 ```
 
@@ -257,8 +268,8 @@ validating → in_progress → completed
 | `in_progress` | Sequences are being processed |
 | `completed` | All sequences finished. `output_file_id` is set. |
 | `failed` | Processing failed. `error` field has details. |
-| `cancelling` | Reserved. Defined in the API schema but currently never emitted — cancel sets `cancelled` directly. |
-| `cancelled` | Batch was cancelled. `cancelled_at` is set. |
+| `cancelling` | Cancel accepted; admitted requests are being stopped on the worker. `cancelling_at` is set. |
+| `cancelled` | Batch was cancelled and no request of it remains on a worker. `cancelled_at` is set. |
 
 **Timestamps:** `started_at`, `completed_at`, `cancelled_at`, `cancelling_at` are set as the batch transitions through states.
 
@@ -318,8 +329,8 @@ them has a turn running. **Response:** `{"object": "session.close", "reason": �
 Optional body `{"reason": "tool_crash"}`. Marks the session `aborted` and
 cancels its in-flight turn, whose caller gets `409 turn_aborted`. A turn still
 queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`); a
-turn already running on a worker runs to completion there and its result is
-discarded (`cancelled_turn: "detached"`) — the same limit as batch cancel.
+turn already running on a worker is stopped there at its next scheduling
+boundary and its result is discarded (`cancelled_turn: "detached"`).
 
 A turn is finished once the server routes its worker completion, even before
 its HTTP response is written. An abort that arrives in that window gets

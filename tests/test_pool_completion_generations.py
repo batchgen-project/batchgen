@@ -183,7 +183,7 @@ def _scheduler(tmp_path: Path):
     # Every completion routes to a batch the pool tracks; a test replaces this
     # tracker to model a failing or failed batch.
     scheduler._scheduling_pool._batch_trackers["batch-1"] = SimpleNamespace(
-        is_complete=False, is_failed=False, error=None,
+        is_complete=False, is_failed=False, error=None, cancelled=False,
     )
     scheduler._intake_pool = SimpleNamespace(
         size=lambda: 0,
@@ -285,7 +285,7 @@ def test_listener_survives_pool_shutdown_and_routes_the_next_generation(tmp_path
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()
@@ -314,7 +314,7 @@ def test_listener_survives_pool_shutdown_and_routes_the_next_generation(tmp_path
         # The failed batch was discarded, so the probe is a batch admitted to
         # the new generation.
         scheduler._scheduling_pool._batch_trackers["batch-2"] = SimpleNamespace(
-            is_complete=False, is_failed=False, error=None,
+            is_complete=False, is_failed=False, error=None, cancelled=False,
         )
         fresh_queue.put(_completion("req-1", "batch-2"))
         assert await _await_true(lambda: scheduler._scheduling_pool.completed)
@@ -398,7 +398,7 @@ def test_stale_pool_shutdown_does_not_fail_or_report_the_live_generation(tmp_pat
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()
@@ -428,7 +428,7 @@ def test_pump_read_failure_persists_active_batches_as_failed(tmp_path):
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler.worker.response_queue = _BrokenQueue()
         scheduler._ensure_completion_listener()
@@ -455,7 +455,7 @@ def test_retired_pump_read_failure_is_benign(tmp_path):
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
 
         retired = threading.Event()
@@ -656,7 +656,7 @@ def test_a_per_request_error_does_not_end_completion_delivery(tmp_path):
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         response_queue = scheduler.worker.response_queue
         response_queue.put(_error_completion("req-1", "batch-1"))
@@ -717,7 +717,7 @@ def test_an_item_of_unknown_shape_fails_active_batches_loudly(tmp_path, item):
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()
@@ -749,7 +749,7 @@ def test_retiring_the_pump_retires_its_generation(tmp_path):
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
-        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()
@@ -822,8 +822,8 @@ def test_failing_a_batch_purges_its_queued_intake_entries(tmp_path):
         scheduler._intake_pool = intake
         intake.submit_batch("batch-1", _intake_entries(intake_mod, "batch-1", 3))
         intake.submit_batch("batch-2", _intake_entries(intake_mod, "batch-2", 2))
-        failing = SimpleNamespace(is_complete=False, is_failed=False, error=None)
-        finished = SimpleNamespace(is_complete=True, is_failed=False, error=None)
+        failing = SimpleNamespace(is_complete=False, is_failed=False, error=None, cancelled=False)
+        finished = SimpleNamespace(is_complete=True, is_failed=False, error=None, cancelled=False)
         scheduler._scheduling_pool._batch_trackers.update(
             {"batch-1": failing, "batch-2": finished}
         )
@@ -881,9 +881,9 @@ def test_drain_discards_entries_of_an_inactive_batch_without_a_slot(
         scheduler._pool_initialized = True
         scheduler.worker.request_queue = _RecordingRequestQueue()
         pool._batch_trackers.update({
-            "live": SimpleNamespace(is_complete=False, is_failed=False),
-            "failed": SimpleNamespace(is_complete=False, is_failed=True),
-            "complete": SimpleNamespace(is_complete=True, is_failed=False),
+            "live": SimpleNamespace(is_complete=False, is_failed=False, cancelled=False),
+            "failed": SimpleNamespace(is_complete=False, is_failed=True, cancelled=False),
+            "complete": SimpleNamespace(is_complete=True, is_failed=False, cancelled=False),
         })
         intake.submit_batch("failed", _intake_entries(intake_mod, "failed", 2))
         intake.submit_batch("live", _intake_entries(intake_mod, "live", 1))
@@ -995,7 +995,7 @@ def test_a_completion_for_a_failed_tracker_is_dropped(tmp_path):
     async def scenario():
         scheduler = _scheduler(tmp_path)
         scheduler._scheduling_pool._batch_trackers["batch-1"] = SimpleNamespace(
-            is_complete=False, is_failed=True, error="worker died",
+            is_complete=False, is_failed=True, error="worker died", cancelled=False,
         )
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()

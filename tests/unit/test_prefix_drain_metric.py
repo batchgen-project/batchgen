@@ -223,14 +223,19 @@ def test_every_completion_site_releases_before_reporting():
         and node.name != "_report_completion"
         and _calls(node, "_report_completion")
     }
-    assert set(callers) == {
-        "_finish_prefill_completed_sequences",
-        "generate",
-        "_page_boundary_fast",
-        "_decoding_legacy_modes",
+    # A cancelled sequence that was never prefilled holds no Host pages; its
+    # site releases through the prefix-attachment seam that the Host release
+    # ends in.
+    release_call = {
+        "_finish_prefill_completed_sequences": "_release_host_kv_pages_for_batch",
+        "generate": "_release_host_kv_pages_for_batch",
+        "_page_boundary_fast": "_release_host_kv_pages_for_batch",
+        "_decoding_legacy_modes": "_release_host_kv_pages_for_batch",
+        "_cancel_batch_sequences": "_release_prefix_cache_attachments",
     }
+    assert set(callers) == set(release_call)
     for name, node in callers.items():
-        releases = _calls(node, "_release_host_kv_pages_for_batch")
+        releases = _calls(node, release_call[name])
         previous_report = 0
         for report in _calls(node, "_report_completion"):
             assert any(previous_report < line < report for line in releases), (

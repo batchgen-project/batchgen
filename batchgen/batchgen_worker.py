@@ -56,6 +56,9 @@ _TOKENIZER_TRIM_TOKENS_PER_RANK = 1 << 20
 # 32x256K and 8x1M repro; it is not a universal character/token conversion.
 _TOKENIZER_SERIALIZE_CHARS_PER_RANK = 4_000_000
 
+# Pool-control messages the admission poll broadcasts to every rank.
+_POOL_CONTROL_TYPES = frozenset({"admit", "cancel"})
+
 # --- Bounded decode-step token wait (see _wait_decode_tokens) --------------
 # A rank whose peer died mid-decode blocks in the per-step token-event sync far
 # below Python, where no flag check can retire it, and aborting the dead
@@ -2051,6 +2054,8 @@ class BatchGenWorker:
 		Only rank 0 polls the queue; result is broadcast to all ranks.
 		New sequences are tokenized, assigned ranks, and added to global_batch as QUEUEING.
 
+		A ``cancel`` message is applied on every rank the same way.
+
 		Returns:
 			True if new sequences were admitted.
 		"""
@@ -2064,7 +2069,7 @@ class BatchGenWorker:
 				msg = self._admission_queue.get_nowait()
 				if msg is None:
 					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") == "admit":
+				elif isinstance(msg, dict) and msg.get("type") in _POOL_CONTROL_TYPES:
 					msg_data = msg
 					has_new = True
 				elif isinstance(msg, dict) and "prompts" in msg:
@@ -2093,9 +2098,84 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			self._admit_sequences_from_message(msg_data)
+			return self._handle_pool_control_message(msg_data)
 
-		return has_new
+		return False
+
+	def _handle_pool_control_message(self, msg: dict) -> bool:
+		"""Apply one broadcast pool-control message; True if it admitted work.
+
+		Every rank calls this with the identical message at the same poll
+		point, so admission and cancellation mutate the same batch-global
+		state everywhere.
+		"""
+		msg_type = msg.get("type")
+		if msg_type == "admit":
+			self._admit_sequences_from_message(msg)
+			return True
+		if msg_type == "cancel":
+			self._cancel_batch_sequences(msg.get("batch_id"))
+			return False
+		raise ValueError(f"unknown pool-control message type {msg_type!r}")
+
+	def _cancel_batch_sequences(self, batch_id: str) -> List[str]:
+		"""End every live sequence of a cancelled batch; return their uuids.
+
+		Applied on every rank with the identical broadcast message at an
+		admission poll point, outside prefill. Each sequence ends through the
+		path that already releases what it holds, not a second release routine:
+
+		* Never prefilled (QUEUEING, or EVICTED awaiting recompute): it holds no
+		  KV, only its token-storage reservation and local query slot, and no
+		  prefill or decode state refers to it. It is completed here; the
+		  prefix-attachment seam and ``_report_completion`` free the rest.
+		* Holding KV (PREFILLED, IN_DECODE, ON_HOLD): it is marked cancelled.
+		  The completion predicate then reports it done, so a decode row stops
+		  producing tokens and the next decode boundary completes it through
+		  the boundary release (GPU KV, host KV, KDA state, prefix pages, token
+		  storage).
+
+		Each reports ``finish_reason "cancelled"``; the server discards it.
+		"""
+		if not isinstance(batch_id, str) or not batch_id:
+			raise ValueError(f"pool cancel message needs a batch_id, got {batch_id!r}")
+		live = sorted(
+			(
+				seq for seq in self.global_batch
+				if seq.batch_id == batch_id
+				and seq.status != SequenceStatus.COMPLETED
+			),
+			key=lambda seq: seq.global_idx,
+		)
+		if any(seq.status == SequenceStatus.IN_PREFILL for seq in live):
+			raise RuntimeError(
+				f"Rank {self.rank}: cancel of batch {batch_id} reached the worker "
+				"with sequences IN_PREFILL; cancellation is applied only at "
+				"admission poll points"
+			)
+		for seq in live:
+			seq.cancelled = True
+		unprefilled = [
+			seq.uuid for seq in live
+			if seq.status in (SequenceStatus.QUEUEING, SequenceStatus.EVICTED)
+		]
+		for uuid in unprefilled:
+			self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
+		# They hold no Host pages, but go through the same prefix-attachment
+		# seam as every completion so nothing can outlive them.
+		self._release_prefix_cache_attachments([
+			self.global_batch.get_sequence(uuid).global_idx
+			for uuid in unprefilled if uuid in self._uuid_to_local_map
+		])
+		for uuid in unprefilled:
+			self._report_completion(uuid, gathered_text="")
+		if self.rank == 0:
+			logging.info(
+				"[POOL] Cancelled batch %s: %d sequences ended before prefill, "
+				"%d end at the next decode boundary",
+				batch_id, len(unprefilled), len(live) - len(unprefilled),
+			)
+		return [seq.uuid for seq in live]
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -10233,20 +10313,23 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
-						elif isinstance(msg, dict) and msg.get("type") == "admit":
-							# Broadcast that we got new work
+						elif isinstance(msg, dict) and msg.get("type") in _POOL_CONTROL_TYPES:
+							# Broadcast that we got a pool-control message
 							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							self._group_uuids = set()
-							self._admit_sequences_from_message(msg)
-							# Reset per-batch-group timing so each admission cycle
-							# emits its own "Pool batch group completed" summary.
-							prefill_time = 0.0
-							decoding_time = 0.0
-							generation_start_time = time.perf_counter()
-							self._timing_logged = False
+							if msg.get("type") == "admit":
+								self._group_uuids = set()
+								self._admit_sequences_from_message(msg)
+								# Reset per-batch-group timing so each admission cycle
+								# emits its own "Pool batch group completed" summary.
+								prefill_time = 0.0
+								decoding_time = 0.0
+								generation_start_time = time.perf_counter()
+								self._timing_logged = False
+							else:
+								self._handle_pool_control_message(msg)
 							# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
@@ -10271,13 +10354,16 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._group_uuids = set()
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						if container[0].get("type") == "admit":
+							self._group_uuids = set()
+							self._admit_sequences_from_message(container[0])
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
+						else:
+							self._handle_pool_control_message(container[0])
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless

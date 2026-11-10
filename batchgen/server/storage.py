@@ -21,6 +21,31 @@ from batchgen.server.io_struct import (
 logger = logging.getLogger(__name__)
 
 
+# The batch lifecycle. A terminal status is final: once a batch is completed,
+# failed or cancelled, no later writer may replace that outcome, so a cancel
+# can never be overwritten by a completion that was already in flight.
+_BATCH_TRANSITIONS: Dict[BatchStatus, frozenset] = {
+    BatchStatus.VALIDATING: frozenset({
+        BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS,
+        BatchStatus.FAILED, BatchStatus.CANCELLED,
+    }),
+    BatchStatus.IN_PROGRESS: frozenset({
+        BatchStatus.IN_PROGRESS, BatchStatus.COMPLETED, BatchStatus.FAILED,
+        BatchStatus.CANCELLING, BatchStatus.CANCELLED,
+    }),
+    BatchStatus.CANCELLING: frozenset({
+        BatchStatus.CANCELLING, BatchStatus.CANCELLED, BatchStatus.FAILED,
+    }),
+    BatchStatus.COMPLETED: frozenset(),
+    BatchStatus.FAILED: frozenset(),
+    BatchStatus.CANCELLED: frozenset(),
+}
+
+
+class BatchStatusTransitionError(RuntimeError):
+    """A status write that the batch lifecycle does not allow."""
+
+
 class StorageManager:
     """Manage on-disk state for uploaded files and batches."""
 
@@ -154,6 +179,12 @@ class StorageManager:
         batch = self.load_batch(batch_id)
         if not batch:
             return None
+        current = BatchStatus(batch.status)
+        if status not in _BATCH_TRANSITIONS[current]:
+            raise BatchStatusTransitionError(
+                f"batch {batch_id}: status {current.value} cannot change to "
+                f"{status.value}"
+            )
         data = batch.dict()
         data.update({"status": status.value, **updates})
         updated = BatchObject(**data)

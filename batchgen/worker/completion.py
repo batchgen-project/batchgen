@@ -64,8 +64,11 @@ class CompletionHandler:
         2. ``current_context_length >= model_context_length`` (context limit), OR
         3. ``eos_reached`` (real EOS; a per-request ``ignore_eos`` keeps this
            unset at the source), OR
-        4. Repetition pattern was detected on this sequence.
+        4. Repetition pattern was detected on this sequence, OR
+        5. Its batch was cancelled (``BatchGenWorker._cancel_batch_sequences``).
         """
+        if seq.cancelled:
+            return True
         if seq.decoded_length >= seq.max_decode_length:
             return True
         if seq.current_context_length >= ctx.model_context_length:
@@ -89,6 +92,9 @@ class CompletionHandler:
         the chosen reason; dumps the lifespan log on any non-stop finish
         or any context-mismatch observation.
         """
+        if seq.cancelled:
+            seq.log_event(SeqEvent.COMPLETED, ctx.rank, "finish_reason=cancelled")
+            return "cancelled"
         # Repetition detected — dump lifespan for root cause analysis
         if seq._rep_detected:
             seq.log_event(SeqEvent.COMPLETED, ctx.rank, "finish_reason=repetition")
