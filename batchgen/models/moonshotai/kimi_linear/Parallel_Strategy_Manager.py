@@ -437,17 +437,26 @@ class KimiLinearParallelStrategyManager:
         self._comm = comm
 
     def set_prefill_moe_mode(self, mode):
-        """Select the K3 prefill MoE control for the next active batch.
+        """Install the server prefill MoE mode on the built model's manager.
 
-        ``streamed`` is the legacy replicated pure-DP path. ``resident_ep`` is
-        the R5 control. ``streamed_sp8`` keeps TP8 attention but scatters token
-        rows locally across the eight GPUs, runs one grouped all-expert MoE per
-        layer, and gathers rows only inside the node.
+        The worker calls it once, at startup, with the mode
+        ``default_prefill_moe_mode`` returned; every prefill wave of the
+        server runs that mode. ``streamed`` is the legacy replicated pure-DP
+        path. ``resident_ep`` is the R5 control. ``streamed_sp8`` keeps TP8
+        attention but scatters token rows locally across the eight GPUs, runs
+        one grouped all-expert MoE per layer, and gathers rows only inside
+        the node.
         """
+        self._prefill_moe_mode = self._validated_prefill_moe_mode(
+            mode, resident_shard_built=self._resident_ep_built
+        )
+
+    def _validated_prefill_moe_mode(self, mode, *, resident_shard_built):
+        """Normalize ``mode`` and refuse one this topology cannot run."""
         value = str(mode or "streamed").strip().lower()
         if value not in PREFILL_MOE_MODES:
             raise ValueError(
-                "k3_prefill_moe_mode must be 'streamed', 'resident_ep' or "
+                "prefill MoE mode must be 'streamed', 'resident_ep' or "
                 "'streamed_sp8', "
                 f"got {mode!r}"
             )
@@ -459,42 +468,73 @@ class KimiLinearParallelStrategyManager:
             # The streamed path would hand each rank's latent column slice to
             # full-width experts (activation contract violation 93 layers in).
             raise ValueError(
-                "k3_prefill_moe_mode='streamed' needs unsharded LatentMoE "
+                "prefill MoE mode 'streamed' needs unsharded LatentMoE "
                 "projections; with TP-sharded projections use 'streamed_sp8' "
                 "or 'resident_ep'"
             )
         if (
             getattr(self, "_distributed_weight_sharded", False)
             and value != "streamed_sp8"
-            and not (value == "resident_ep" and self._resident_ep_built)
+            and not (value == "resident_ep" and resident_shard_built)
         ):
             # resident_ep is legal once the shard exists: it was built from
             # this node's ingress store and the resident layer never requests
             # an expert by name, so no cross-shard fetch can happen.
             raise ValueError(
-                "distributed K3 host weights require k3_prefill_moe_mode="
+                "distributed K3 host weights require prefill MoE mode "
                 "'streamed_sp8' (the legacy replicated path would request "
                 "experts outside this worker's ingress shard); 'resident_ep' "
                 "is accepted only after the resident EP shard has been built"
             )
-        self._prefill_moe_mode = value
+        return value
 
     def default_prefill_moe_mode(self):
-        """Return the server prefill MoE mode for this weight topology.
+        """Return the server prefill MoE mode, fixed for the server's lifetime.
 
-        The worker reads it once and uses it for every prefill wave; only a
-        batch-level ``batchgen_debug.k3_prefill_moe_mode`` overrides it, for
-        that batch alone. ``streamed`` feeds each rank's full-width latent
-        into full-width experts, so it is only valid while the LatentMoE
+        The worker reads it once and every prefill wave runs it; no batch
+        changes it. Without ``--prefill-moe-mode`` it follows the weight
+        topology: ``streamed`` feeds each rank's full-width latent into
+        full-width experts, so it is only valid while the LatentMoE
         projections are unsharded. Once they are TP-sharded (planner
         ``k3_shard_latent_projections``, TP8 K3, single node or not) each rank
         holds a column slice and prefill must go through ``streamed_sp8``,
         which rebuilds the full projections per phase. Distributed host
         weights force ``streamed_sp8`` for the same reason plus ingress.
+
+        ``--prefill-moe-mode`` (``Basic_Config.prefill_moe_mode``) replaces
+        that default and is validated here, at construction, so a mode the
+        topology cannot run is refused before any model is built. The
+        resident EP shard a distributed ``resident_ep`` server needs is built
+        by the startup decode configure before the worker installs the mode,
+        and ``set_prefill_moe_mode`` re-checks it then.
         """
-        if self._distributed_weight_sharded or self._latent_tp_planned:
-            return "streamed_sp8"
-        return "streamed"
+        requested = getattr(
+            self.engine_config.Basic_Config, "prefill_moe_mode", None
+        )
+        if requested is None:
+            if self._distributed_weight_sharded or self._latent_tp_planned:
+                return "streamed_sp8"
+            return "streamed"
+        mode = self._validated_prefill_moe_mode(
+            requested, resident_shard_built=True
+        )
+        if mode == "resident_ep" and (
+            self._stream_all_modules or self._attn_tp_size <= 1
+        ):
+            raise ValueError(
+                "--prefill-moe-mode resident_ep needs K3's resident TP "
+                "attention layout (attention_group_size > 1, "
+                "stream_all_modules off)"
+            )
+        if mode == "streamed_sp8" and (
+            self._stream_all_modules or self._attn_tp_size != 8
+        ):
+            raise ValueError(
+                "--prefill-moe-mode streamed_sp8 needs K3's resident TP8 "
+                "attention layout (attention_group_size == 8, "
+                "stream_all_modules off)"
+            )
+        return mode
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"

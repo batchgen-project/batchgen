@@ -99,6 +99,38 @@ def test_distributed_weights_require_eight_ranks_per_node(tmp_path):
             )
 
 
+def test_resident_ep_prefill_with_the_prefix_cache_is_refused_at_startup(
+    tmp_path, monkeypatch,
+):
+    import batchgen.prefix_reuse.config as prefix_config
+
+    monkeypatch.setattr(
+        prefix_config, "require_prefix_cache_model_support", lambda model: None
+    )
+    with pytest.raises(ValueError, match="prefill prefix pool runs per DP rank"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=8,
+                enable_prefix_cache=True,
+                prefill_moe_mode="resident_ep",
+            )
+        )
+
+
+def test_prefill_moe_mode_flag_parses_to_server_args():
+    parser = server_args_module._build_parser()
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    for mode in ("streamed", "streamed_sp8", "resident_ep"):
+        parsed = parser.parse_args(base + ["--prefill-moe-mode", mode])
+        assert parsed.prefill_moe_mode == mode
+    assert parser.parse_args(base).prefill_moe_mode is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--prefill-moe-mode", "resident"])
+
+
 def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):
     # Off the distributed store any positive world_size stands. Kimi-K3
     # multi-node now defaults to that store, so the replicated path this case
