@@ -22,6 +22,7 @@ from batchgen.server.io_struct import (
     FileStatus,
     ToolCall,
     ToolCallFunction,
+    retired_batchgen_debug_error,
 )
 from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.scheduling_pool import SchedulingPool
@@ -30,6 +31,15 @@ from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _tokenizer_registry():
+    """The tokenizer registry, imported on first use: it loads model
+    tokenizer assets, which the scheduler process only needs once a batch
+    actually renders or encodes."""
+    from batchgen.config import tokenizer_registry
+
+    return tokenizer_registry
 
 
 def completion_prompt_to_text(prompt: str | List[str]) -> str:
@@ -51,7 +61,7 @@ def tokenizer_family_mismatch(
     type the registry resolves, so aliases of the served model still pass.
     A request name that resolves to no family is left to the tokenizer load.
     """
-    from batchgen.config.tokenizer_registry import resolve_tokenizer_type
+    resolve_tokenizer_type = _tokenizer_registry().resolve_tokenizer_type
 
     served_family = resolve_tokenizer_type(served_model)
     if served_family is None:
@@ -552,6 +562,17 @@ class BatchScheduler:
             )
             return
 
+        # POST /v1/batches refuses these keys; a batch stored before the
+        # refusal existed (the store survives restarts) fails here, before
+        # any of its requests reaches a worker.
+        retired_debug = retired_batchgen_debug_error(batch.batchgen_debug)
+        if retired_debug is not None:
+            logger.error("Batch %s: %s", batch_id, retired_debug)
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=retired_debug
+            )
+            return
+
         input_meta = self.storage.load_metadata(batch.input_file_id)
         if not input_meta:
             logger.error(
@@ -902,11 +923,9 @@ class BatchScheduler:
         if self._tokenizer_model == model and self._tokenizer is not None:
             return self._tokenizer
 
-        from batchgen.config.tokenizer_registry import load_tokenizer
-
         try:
             # Model name used for pattern matching; tokenizer loads from package dir
-            tokenizer = load_tokenizer(model)
+            tokenizer = _tokenizer_registry().load_tokenizer(model)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load tokenizer for {model}: {exc}"

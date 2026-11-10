@@ -178,8 +178,8 @@ class KimiLinearInitializer:
         self.engine_config.Basic_Config.distributed_weight_transport = (
             self.distributed_weight_transport
         )
-        # Server-level prefill MoE mode (--prefill-moe-mode); the PSM returns
-        # it as its default and validates it against the topology.
+        # Server-level prefill MoE mode (--prefill-moe-mode); the manager
+        # returns it as its default and validates it against the topology.
         self.engine_config.Basic_Config.prefill_moe_mode = getattr(
             input_arguments, "prefill_moe_mode", None
         )

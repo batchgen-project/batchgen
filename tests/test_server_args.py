@@ -156,19 +156,13 @@ def test_resident_ep_prefill_with_the_prefix_cache_is_refused_at_startup(
 
 def test_prefill_moe_mode_flag_parses_to_server_args():
     parser = server_args_module._build_parser()
-    parsed = parser.parse_args(
-        ["--model", "m", "--host-kv-cache-size", "1",
-         "--prefill-moe-mode", "resident_ep"]
-    )
-    assert parsed.prefill_moe_mode == "resident_ep"
-    assert parser.parse_args(
-        ["--model", "m", "--host-kv-cache-size", "1"]
-    ).prefill_moe_mode is None
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    for mode in ("streamed", "streamed_sp8", "resident_ep"):
+        parsed = parser.parse_args(base + ["--prefill-moe-mode", mode])
+        assert parsed.prefill_moe_mode == mode
+    assert parser.parse_args(base).prefill_moe_mode is None
     with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["--model", "m", "--host-kv-cache-size", "1",
-             "--prefill-moe-mode", "streamed"]
-        )
+        parser.parse_args(base + ["--prefill-moe-mode", "resident"])
 
 
 def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):

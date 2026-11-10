@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, root_validator, validator
 
+from batchgen.config.model_name_utils import RETIRED_BATCHGEN_DEBUG_KEYS
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
@@ -207,6 +209,18 @@ class BatchStatus(str, Enum):
     FAILED = "failed"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
+
+
+def retired_batchgen_debug_error(debug: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The refusal message for a ``batchgen_debug`` carrying a retired key."""
+    retired = sorted(set(debug or {}) & RETIRED_BATCHGEN_DEBUG_KEYS.keys())
+    if not retired:
+        return None
+    return "; ".join(
+        f"batchgen_debug.{key} is no longer accepted: "
+        f"{RETIRED_BATCHGEN_DEBUG_KEYS[key]}"
+        for key in retired
+    )
 
 
 class CreateBatchRequest(BaseModel):

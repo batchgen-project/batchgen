@@ -401,16 +401,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prefill-moe-mode",
-        choices=("streamed_sp8", "resident_ep"),
+        choices=("streamed", "streamed_sp8", "resident_ep"),
         default=None,
         help=(
             "Prefill MoE mode for every prefill wave of this server, on models "
-            "that declare prefill MoE modes. Default: the model's "
-            "streaming mode (streamed_sp8: each rank streams the routed "
-            "experts it owns over the model's stream span). resident_ep keeps "
-            "every rank's EP shard resident from startup and runs every wave, "
-            "the first included, against it. A model without prefill MoE "
-            "modes refuses the option at startup."
+            "that declare prefill MoE modes; no batch can change it. Default: "
+            "the model's streaming mode for its weight topology. streamed: "
+            "every rank streams all routed experts (only with unsharded "
+            "latent MoE projections and node-local weights). streamed_sp8: "
+            "each rank streams the routed experts it owns over the model's "
+            "stream span. resident_ep keeps every rank's EP shard resident "
+            "from startup and runs every wave, the first included, against "
+            "it. The model refuses a mode its topology cannot run at startup, "
+            "and a model without prefill MoE modes refuses the option."
         ),
     )
     parser.add_argument(

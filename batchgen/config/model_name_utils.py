@@ -38,6 +38,21 @@ PRE_READINESS_STARTUP_MODEL_IDS = frozenset({
 })
 
 
+# batchgen_debug keys the server no longer accepts, each with the reason a
+# request that carries it is refused. The key names are model-specific, so
+# the table lives in the model half of the config split; admission
+# (``batchgen.server.io_struct.retired_batchgen_debug_error``) refuses them
+# (HTTP 400 on /v1/batches and /v1/turns, a failed batch for one already
+# stored), so they never reach a worker, where nothing reads them any more.
+RETIRED_BATCHGEN_DEBUG_KEYS: dict[str, str] = {
+    "k3_prefill_moe_mode": (
+        "the prefill MoE mode is fixed for the server's lifetime and no batch "
+        "can change it; start a server with --prefill-moe-mode "
+        "{streamed,streamed_sp8,resident_ep} to run another mode"
+    ),
+}
+
+
 def runs_startup_before_readiness(model_name: str | None) -> bool:
     """Whether this exact served model id takes the pre-readiness startup."""
     return model_name in PRE_READINESS_STARTUP_MODEL_IDS

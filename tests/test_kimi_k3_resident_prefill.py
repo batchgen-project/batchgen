@@ -1,6 +1,7 @@
 import ast
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,7 @@ def _psm_stub(**attrs):
     namespace = {"PREFILL_MOE_MODES": _psm_module_constant("PREFILL_MOE_MODES")}
     for name in (
         "set_prefill_moe_mode",
+        "_validated_prefill_moe_mode",
         "default_prefill_moe_mode",
         "release_decode_graph",
         "prefill_uses_resident_ep",
@@ -61,6 +63,7 @@ def _psm_stub(**attrs):
 
     for name in (
         "set_prefill_moe_mode",
+        "_validated_prefill_moe_mode",
         "default_prefill_moe_mode",
         "release_decode_graph",
         "prefill_uses_resident_ep",
@@ -76,9 +79,9 @@ def _psm_stub(**attrs):
     obj._latent_tp_planned = False
     obj._decode_graph = None
     obj._stream_span = 8
-    obj.engine_config = type("_Config", (), {})()
-    obj.engine_config.Basic_Config = type("_Basic", (), {})()
-    obj.engine_config.Basic_Config.prefill_moe_mode = None
+    obj.engine_config = SimpleNamespace(
+        Basic_Config=SimpleNamespace(prefill_moe_mode=None)
+    )
     for key, value in attrs.items():
         setattr(obj, key, value)
     return obj
@@ -141,6 +144,49 @@ def test_distributed_weights_default_to_streamed_sp8():
     for latent in (False, True):
         psm = _psm_stub(_latent_tp_planned=latent)
         assert psm.default_prefill_moe_mode() == "streamed_sp8"
+
+
+def _requested(mode, **attrs):
+    psm = _psm_stub(**attrs)
+    psm.engine_config.Basic_Config.prefill_moe_mode = mode
+    return psm
+
+
+def test_server_option_replaces_the_topology_default():
+    # Distributed weights: a host stores its own ranks' EP experts, so the
+    # resident shard is always local and resident_ep is accepted both at
+    # construction and at install (the startup decode configure builds the
+    # shard before the first resident wave runs).
+    psm = _requested("resident_ep")
+    assert psm.default_prefill_moe_mode() == "resident_ep"
+    psm.set_prefill_moe_mode(psm.default_prefill_moe_mode())
+    assert psm.prefill_uses_resident_ep()
+
+    assert _requested("streamed_sp8").default_prefill_moe_mode() == "streamed_sp8"
+    unsharded = _requested(
+        "streamed", _distributed_weight_sharded=False, _latent_tp_planned=False
+    )
+    assert unsharded.default_prefill_moe_mode() == "streamed"
+
+
+@pytest.mark.parametrize(
+    "mode, attrs, match",
+    [
+        ("streamed", {"_latent_tp_planned": True,
+                      "_distributed_weight_sharded": False}, "unsharded LatentMoE"),
+        ("streamed", {}, "distributed K3 host weights"),
+        ("resident_ep", {"_attn_tp_size": 1}, "resident TP attention layout"),
+        ("resident_ep", {"_stream_all_modules": True}, "resident TP attention"),
+        ("streamed_sp8", {"_stream_span": 0}, "k3_prefill_stream_span"),
+        ("resident_ep", {"_is_k3": False}, "only for Kimi-K3"),
+        ("resident", {}, "must be 'streamed'"),
+    ],
+)
+def test_server_option_the_topology_cannot_run_is_refused_at_construction(
+    mode, attrs, match
+):
+    with pytest.raises(ValueError, match=match):
+        _requested(mode, **attrs).default_prefill_moe_mode()
 
 
 def _latent_plan_stub(*, is_k3, want, group_size):

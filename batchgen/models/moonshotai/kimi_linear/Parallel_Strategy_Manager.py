@@ -475,17 +475,26 @@ class KimiLinearParallelStrategyManager:
         self._comm = comm
 
     def set_prefill_moe_mode(self, mode):
-        """Select the K3 prefill MoE control for the next active batch.
+        """Install the server prefill MoE mode on the built model's manager.
 
-        ``streamed`` is the legacy replicated pure-DP path. ``resident_ep`` is
-        the R5 control. ``streamed_sp8`` keeps TP8 attention but scatters token
-        rows locally across the eight GPUs, runs one grouped all-expert MoE per
-        layer, and gathers rows only inside the node.
+        The worker calls it once, at startup, with the mode
+        ``default_prefill_moe_mode`` returned; every prefill wave of the
+        server runs that mode. ``streamed`` is the legacy replicated pure-DP
+        path. ``resident_ep`` is the R5 control. ``streamed_sp8`` keeps TP8
+        attention but scatters token rows locally across the eight GPUs, runs
+        one grouped all-expert MoE per layer, and gathers rows only inside
+        the node.
         """
+        self._prefill_moe_mode = self._validated_prefill_moe_mode(
+            mode, resident_shard_built=self._resident_ep_built
+        )
+
+    def _validated_prefill_moe_mode(self, mode, *, resident_shard_built):
+        """Normalize ``mode`` and refuse one this topology cannot run."""
         value = str(mode or "streamed").strip().lower()
         if value not in PREFILL_MOE_MODES:
             raise ValueError(
-                "k3_prefill_moe_mode must be 'streamed', 'resident_ep' or "
+                "prefill MoE mode must be 'streamed', 'resident_ep' or "
                 "'streamed_sp8', "
                 f"got {mode!r}"
             )
@@ -497,7 +506,7 @@ class KimiLinearParallelStrategyManager:
             # The streamed path would hand each rank's latent column slice to
             # full-width experts (activation contract violation 93 layers in).
             raise ValueError(
-                "k3_prefill_moe_mode='streamed' needs unsharded LatentMoE "
+                "prefill MoE mode 'streamed' needs unsharded LatentMoE "
                 "projections; with TP-sharded projections use 'streamed_sp8' "
                 "or 'resident_ep'"
             )
@@ -515,46 +524,47 @@ class KimiLinearParallelStrategyManager:
                 "k3_prefill_moe_mode='streamed_sp8' needs a planned "
                 "k3_prefill_stream_span (a K3 DP-attention profile row)"
             )
-        self._prefill_moe_mode = value
+        return value
 
     def default_prefill_moe_mode(self):
-        """Return the server prefill MoE mode for this weight topology.
+        """Return the server prefill MoE mode, fixed for the server's lifetime.
 
-        The worker reads it once and uses it for every prefill wave; only a
-        batch-level ``batchgen_debug.k3_prefill_moe_mode`` overrides it, for
-        that batch alone. ``streamed`` feeds each rank's full-width latent
-        into full-width experts, so it is only valid while the LatentMoE
+        The worker reads it once and every prefill wave runs it; no batch
+        changes it. Without ``--prefill-moe-mode`` it follows the weight
+        topology: ``streamed`` feeds each rank's full-width latent into
+        full-width experts, so it is only valid while the LatentMoE
         projections are unsharded. Once they are TP-sharded (planner
         ``k3_shard_latent_projections``, TP8 K3, single node or not) each rank
         holds a column slice and prefill must go through ``streamed_sp8``,
         which rebuilds the full projections per phase. Distributed host
         weights force ``streamed_sp8`` for the same reason plus ingress.
 
-        The server option ``--prefill-moe-mode`` (``Basic_Config.
-        prefill_moe_mode``) replaces that default for every wave; it is
-        validated here, at construction, so a mode the topology cannot run
-        is refused before any model is built.
+        ``--prefill-moe-mode`` (``Basic_Config.prefill_moe_mode``) replaces
+        that default and is validated here, at construction, so a mode the
+        topology cannot run is refused before any model is built. The
+        resident EP shard a distributed ``resident_ep`` server needs is
+        built by the startup decode configure before the worker installs
+        the mode.
         """
         requested = getattr(
             self.engine_config.Basic_Config, "prefill_moe_mode", None
         )
-        if requested is not None:
-            previous = getattr(self, "_prefill_moe_mode", None)
-            self.set_prefill_moe_mode(requested)
-            mode = self._prefill_moe_mode
-            self._prefill_moe_mode = previous
-            if mode == "resident_ep" and (
-                self._stream_all_modules or self._attn_tp_size <= 1
-            ):
-                raise ValueError(
-                    "--prefill-moe-mode resident_ep needs K3's resident TP "
-                    "attention layout (attention_group_size > 1, "
-                    "stream_all_modules off)"
-                )
-            return mode
-        if self._distributed_weight_sharded or self._latent_tp_planned:
-            return "streamed_sp8"
-        return "streamed"
+        if requested is None:
+            if self._distributed_weight_sharded or self._latent_tp_planned:
+                return "streamed_sp8"
+            return "streamed"
+        mode = self._validated_prefill_moe_mode(
+            requested, resident_shard_built=True
+        )
+        if mode == "resident_ep" and (
+            self._stream_all_modules or self._attn_tp_size <= 1
+        ):
+            raise ValueError(
+                "--prefill-moe-mode resident_ep needs K3's resident TP "
+                "attention layout (attention_group_size > 1, "
+                "stream_all_modules off)"
+            )
+        return mode
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"
@@ -1244,13 +1254,11 @@ class KimiLinearParallelStrategyManager:
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
-            # The largest micro-batch any wave of this server can run: its
-            # server mode or a batch-level mode override.
-            max_prefill_tokens=max(
-                prefill_token_cap_for_mode(
-                    self.engine_config.Module_Batching_Config, mode
-                )
-                for mode in PREFILL_MOE_MODES
+            # The micro-batch cap of every wave of this server: its prefill
+            # MoE mode is fixed at construction.
+            max_prefill_tokens=prefill_token_cap_for_mode(
+                self.engine_config.Module_Batching_Config,
+                self._prefill_moe_mode,
             ),
             part_index=part_index,
             part_count=part_count,
@@ -2813,17 +2821,24 @@ class KimiLinearParallelStrategyManager:
     def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
         """Leave ``key.phase`` in ``mode`` while retaining reusable state.
 
-        RETIRE mechanics remain worker-owned. On decode SUSPEND, only routed
-        experts are released; KDA state pools are manager-owned and survive so
-        the next activation keeps recurrent and convolution state intact.
+        One model serves both phases, so RETIRE of either phase retires that
+        model: what the configure steps attached to it (the streamed-SP8
+        buffer and its pending prefetch, the resident EP shard and the decode
+        graph that bakes its addresses) is released while the model is still
+        reachable, and both instance tuples go with it, so no kept instance
+        outlives the model the worker's ``deep_free_model_memory`` then frees.
+        On decode SUSPEND, only routed experts are released; KDA state pools
+        are manager-owned and survive so the next activation keeps recurrent
+        and convolution state intact.
         """
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
         if mode is ExitMode.RETIRE:
-            if key.phase == "prefill":
-                self.prefill_instance = None
-            else:
-                self.decode_instance = None
+            self._release_streamed_sp8_prefill()
+            self._release_resident_ep_decode()
+            self.prefill_instance = None
+            self.decode_instance = None
+            self._active_phase = None
             self.model = None
             self.weight_copy_task = {}
             return

@@ -203,7 +203,7 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         worker_state,
     )
     # Placement scores with the server mode's prefill token cap.
-    for name in ('_placement_prefill_token_cap', '_prefill_token_cap_for_mode', '_server_prefill_moe_mode'):
+    for name in ('_server_prefill_token_cap', '_server_prefill_moe_mode'):
         setattr(
             worker_state,
             name,
