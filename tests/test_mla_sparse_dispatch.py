@@ -23,6 +23,7 @@ H, LORA, ROPE, PAGE = 12, 512, 64, 64
 def _reset(monkeypatch):
     monkeypatch.setattr(sd, "_BACKEND", None)
     monkeypatch.setattr(sd, "_FI_WORKSPACES", {})
+    monkeypatch.setattr(sd, "_ANNOUNCED", set())
 
 
 def _capability(monkeypatch, capability):
@@ -221,3 +222,20 @@ def test_the_dsa_modules_have_no_capability_branch():
         source = (kimi / name).read_text()
         assert "get_device_capability" not in source, name
         assert "from batchgen.attention.mla.sparse_dispatch import" in source, name
+
+
+def test_each_phase_is_announced_once(monkeypatch, caplog):
+    _capability(monkeypatch, (9, 0))
+    monkeypatch.setattr(sd, "_fa3_with_kvcache", lambda: _fa3_recorder([]))
+    monkeypatch.setattr(sd, "_fa3_num_splits", lambda: 1)
+    q_pe, q_latent, blocked_k, rows, lengths = _inputs()
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            sd.sparse_mla_decode(q_pe, q_latent, blocked_k, rows, lengths, 0.07)
+            sd.sparse_mla_prefill(q_pe, q_latent, blocked_k.view(-1, LORA + ROPE), rows,
+                                  lengths, 0.07)
+    lines = [r.getMessage() for r in caplog.records if "[sparse-mla]" in r.getMessage()]
+    assert lines == [
+        "[sparse-mla] first sparse decode on backend fa3: rows=3 heads=12 topk=256",
+        "[sparse-mla] first sparse prefill on backend fa3: rows=3 heads=12 topk=256",
+    ]

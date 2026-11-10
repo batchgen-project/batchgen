@@ -33,11 +33,15 @@ Anything else fails loud.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 
 _BACKEND: Optional[str] = None
+#: Phases already announced in this process (one INFO line each, so a log
+#: shows which sparse kernel served a run without per-call logging).
+_ANNOUNCED: set = set()
 _FI_WORKSPACES: dict = {}
 #: trtllm-gen MLA scratch per device; zero-initialized once (semaphore state).
 _FI_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -89,7 +93,8 @@ def graph_capturable() -> bool:
     FA3 captures. The flashinfer trtllm-gen sparse call is one functional
     launch over a process-lifetime workspace with device-side lengths and a
     static ``max_seq_len`` (the top-k width): no per-call plan and no host
-    synchronization. The Kimi decode span on Blackwell nevertheless runs eager
+    synchronization; a captured replay on sm_103 matched the eager call
+    bitwise on new inputs at K3.1 shapes. The Kimi decode span on Blackwell nevertheless runs eager
     while the dense seam (``paged_decode.graph_capturable``) is not
     capturable; the planner requires both.
     """
@@ -225,6 +230,16 @@ def _flashmla_sparse_prefill(q_pe, q_latent, kv_rows, token_rows, lengths, softm
 # --------------------------------------------------------------------------- #
 
 
+def _announce(phase: str, q_latent: torch.Tensor, token_rows: torch.Tensor) -> None:
+    if phase in _ANNOUNCED:
+        return
+    _ANNOUNCED.add(phase)
+    logging.info(
+        "[sparse-mla] first sparse %s on backend %s: rows=%d heads=%d topk=%d",
+        phase, _backend(), q_latent.shape[0], q_latent.shape[2], token_rows.shape[1],
+    )
+
+
 def sparse_mla_decode(
     q_pe: torch.Tensor,
     q_latent: torch.Tensor,
@@ -234,6 +249,7 @@ def sparse_mla_decode(
     softmax_scale: float,
 ) -> torch.Tensor:
     """Decode: one query token per row over the paged latent cache."""
+    _announce("decode", q_latent, token_rows)
     if _backend() == "fa3":
         flat_kv = blocked_k.view(-1, 1, 1, blocked_k.shape[-1])
         return _fa3_sparse(q_pe, q_latent, flat_kv, token_rows, lengths, softmax_scale)
@@ -249,6 +265,7 @@ def sparse_mla_prefill(
     softmax_scale: float,
 ) -> torch.Tensor:
     """Prefill: every query token its own row over flat latent rows."""
+    _announce("prefill", q_latent, token_rows)
     if _backend() == "fa3":
         flat_kv = kv_rows.view(-1, 1, 1, kv_rows.shape[-1])
         return _fa3_sparse(q_pe, q_latent, flat_kv, token_rows, lengths, softmax_scale)
