@@ -1138,7 +1138,10 @@ def decode_geometry(gpu_manager, shapes: Glm5PrewarmShapes,
         primary_page_size=int(primary.config.page_size_tokens),
         aux_page_size=int(aux.config.page_size_tokens),
         aux_page_split=aux_page_split,
-        max_position_embeddings=shapes.max_position_embeddings,
+        max_position_embeddings=(
+            getattr(primary.config, "max_model_len", None)
+            or shapes.max_position_embeddings
+        ),
         max_decode_rows=_page_table_slots(primary, "primary"),
         span_cap_tokens=span_cap,
     )

@@ -339,7 +339,7 @@ def test_the_provisional_measurement_still_bounds_itself_with_the_fraction():
     # Before the capture the graph footprint is unallocated, so (1 - frac) is
     # the only thing covering it; that is the one load-bearing use of frac.
     body = ast.unparse(_method("_init_gpu_kv_with_actual_size"))
-    assert "total_mem_gb * self.gpu_memory_frac - used_mem_gb" in body
+    assert "KVCacheManager.provisional_pool_gb(total_mem_gb, used_mem_gb, self.gpu_memory_frac)" in body
 
 
 def _cached_path_worker(cached_gb):

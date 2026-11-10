@@ -226,9 +226,10 @@ def register_turn_routes(app: FastAPI) -> None:
                 status_code=422, detail=json.loads(exc.json())
             ) from exc
         try:
-            _check_turn_limits(
-                body, request.app.state.model_object.max_context_length
-            )
+            length = request.app.state.scheduler.max_model_len
+            if length is None:
+                raise TurnError(503, "workers_not_ready", "deployment capacity is not ready")
+            _check_turn_limits(body, length)
         except TurnError as exc:
             raise _http_error(exc) from exc
 

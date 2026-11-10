@@ -82,6 +82,7 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
     (tmp_path / input_id).write_bytes("\n".join(lines).encode())
     updates = []
     scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler.max_model_len = 4096
     scheduler.server_args = SimpleNamespace(model=MODEL)
     # The pool state BatchScheduler.__init__ creates; a failure releases it.
     scheduler._scheduling_pool = bs.SchedulingPool(capacity=4)
@@ -105,22 +106,22 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
     return scheduler, updates
 
 
-def test_missing_max_tokens_without_a_batch_default_fails_the_batch(tmp_path):
+def test_missing_max_tokens_defaults_to_remaining_deployment_context(tmp_path):
     scheduler, updates = _scheduler(
         tmp_path, [_line("has-limit", 16), _line("no-limit-a"), _line("no-limit-b")]
     )
+    submitted = {}
 
-    async def must_not_submit(*args, **kwargs):
-        raise AssertionError("a batch with unbounded requests reached the pool")
+    async def record_submit(batch_id, batch, requests, prompts,
+                            per_request_max_tokens, sampling_params, **kwargs):
+        submitted["max_tokens"] = per_request_max_tokens
+        submitted["lengths"] = [len(prompt) for prompt in prompts]
 
-    scheduler._process_batch_pool_mode = must_not_submit
+    scheduler._process_batch_pool_mode = record_submit
     asyncio.run(scheduler._process_batch("batch-1"))
-
-    statuses = [status for status, _ in updates]
-    assert statuses == [bs.BatchStatus.IN_PROGRESS, bs.BatchStatus.FAILED]
-    error = updates[-1][1]
-    assert "2/3 requests have no max_completion_tokens or max_tokens" in error
-    assert "['no-limit-a', 'no-limit-b']" in error
+    assert [status for status, _ in updates] == [bs.BatchStatus.IN_PROGRESS]
+    assert submitted["max_tokens"] == [
+        16, 4096 - submitted["lengths"][1], 4096 - submitted["lengths"][2]]
 
 
 def test_a_batch_default_covers_requests_without_max_tokens(tmp_path):

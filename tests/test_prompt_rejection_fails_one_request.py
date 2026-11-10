@@ -48,6 +48,7 @@ def _scheduler(tmp_path, lines):
     (tmp_path / input_id).write_bytes("\n".join(lines).encode())
     updates = []
     scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler.max_model_len = 4096
     scheduler.server_args = SimpleNamespace(
         model=MODEL, incremental_output_dir=str(tmp_path / "incr"),
     )
