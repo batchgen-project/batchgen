@@ -139,8 +139,10 @@ class KimiLinearParallelStrategyManager:
             raise ValueError("distributed host weights require K3")
         # Weight transport (initializer-set from the distributed store config,
         # no env var). "host_rdma" is the validated default in which every rank
-        # pulls its own 112-expert shard; "hierarchical_gdr" pulls on eight
-        # source ranks and replicates GPU-to-GPU across nodes.
+        # pulls its own expert shard through the node daemon;
+        # "hierarchical_gdr" pulls on one source rank per span slot and
+        # replicates GPU-to-GPU across spans; "local" runs no daemon, so every
+        # expert a rank reads must be one it owns as an EP rank.
         self._distributed_weight_transport = str(
             getattr(
                 engine_config.Basic_Config,
@@ -151,10 +153,11 @@ class KimiLinearParallelStrategyManager:
         if self._distributed_weight_transport not in (
             "host_rdma",
             "hierarchical_gdr",
+            "local",
         ):
             raise ValueError(
-                "distributed_weight_transport must be 'host_rdma' or "
-                f"'hierarchical_gdr', got "
+                "distributed_weight_transport must be 'host_rdma', "
+                f"'hierarchical_gdr' or 'local', got "
                 f"{self._distributed_weight_transport!r}"
             )
         self._hierarchical_gdr = (
@@ -264,6 +267,19 @@ class KimiLinearParallelStrategyManager:
                 f"distributed_weight_sharded={self._distributed_weight_sharded}, "
                 f"world_size={world_size}, "
                 f"k3_prefill_stream_span={self._stream_span}"
+            )
+        if (
+            self._distributed_weight_sharded
+            and self._distributed_weight_transport == "local"
+            and self._stream_span not in (0, world_size)
+        ):
+            # A span narrower than the world streams experts another host
+            # owns, which only a daemon transport can fetch.
+            raise ValueError(
+                "distributed_weight_transport 'local' needs the streamed "
+                "prefill span to cover the EP world (each rank streams only "
+                f"the experts it owns); got k3_prefill_stream_span="
+                f"{self._stream_span} at world_size={world_size}"
             )
         if self._hierarchical_gdr:
             self._require_hierarchical_gdr_runtime()

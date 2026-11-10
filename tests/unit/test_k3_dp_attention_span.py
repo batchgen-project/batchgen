@@ -315,3 +315,21 @@ def test_a_pass_whose_rows_grow_between_layers_is_refused(
     assert buffer.span_rows_per_rank(1, 4) == 1
     with pytest.raises(RuntimeError, match="row count changed"):
         buffer.span_rows_per_rank(2, 40)
+
+
+def test_local_transport_streams_over_the_whole_ep_world():
+    psm = _psm(
+        world=8, group=4, span=8,
+        distributed_weight_sharded=True, distributed_weight_transport="local",
+    )
+    assert psm.prefill_uses_streamed_sp8()
+    assert psm._stream_span == psm.world_size
+
+
+def test_local_transport_refuses_a_span_narrower_than_the_world():
+    with pytest.raises(ValueError, match="cover the EP world"):
+        _psm(
+            world=16, group=8, span=8,
+            distributed_weight_sharded=True,
+            distributed_weight_transport="local",
+        )
