@@ -50,6 +50,7 @@
 #include <filesystem>
 
 #include <cuda_runtime_api.h>
+#include "../host_page_geometry.h"
 #include "../utils.h"
 #include "posix_shm.h"
 #include "spdlog/spdlog.h"
@@ -106,25 +107,6 @@ static int create_anonymous_memfd(const char* name) {
 static int create_huge_anonymous_memfd(const char* name) {
     return static_cast<int>(
         syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_HUGETLB));
-}
-
-// MFD_HUGETLB without a size flag uses the host's default huge page size, so
-// the region must be rounded and mapped to exactly that size.
-static size_t default_huge_page_size(
-    const std::shared_ptr<spdlog::logger>& logger) {
-    std::ifstream meminfo("/proc/meminfo");
-    std::string line;
-    while (std::getline(meminfo, line)) {
-        if (line.find("Hugepagesize:") == 0) {
-            std::istringstream iss(line);
-            std::string key, value;
-            iss >> key >> value;
-            return static_cast<size_t>(std::stol(value)) * 1024;
-        }
-    }
-    logger->warn(
-        "Hugepagesize missing from /proc/meminfo; assuming 2MB huge pages");
-    return 2 * 1024 * 1024;
 }
 
 // --fast-init requests transparent huge pages explicitly. Without it the
@@ -308,8 +290,8 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
     }
     if (out_mapped_size) *out_mapped_size = 0;
 
-    const size_t page_size = sysconf(_SC_PAGESIZE);
-    const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
+    const auto& geometry = batchgen::HostPageGeometry::Host();
+    const size_t page_size = geometry.base_page_bytes;
 
     logger->info("Allocating shared memory: name={}, size={}MB, mode={}",
                  shm_name, size / (1024 * 1024),
@@ -324,7 +306,9 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
     // name, because neither has a name, so it always takes the attach path in
     // STAGE 2 and discovers the page size from the fd itself.
     if (enable_hugetlbfs && create) {
-        const size_t hugetlb_page_size = default_huge_page_size(logger);
+        // MFD_HUGETLB without a size flag takes the host's default huge page
+        // size, so the region is rounded and mapped to exactly that size.
+        const size_t hugetlb_page_size = geometry.HugetlbPageBytes();
         const int64_t hugetlb_size =
             ((size + hugetlb_page_size - 1) / hugetlb_page_size) *
             hugetlb_page_size;
@@ -376,9 +360,6 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
              logger->info("Falling back to a base page memfd allocation...");
         }
 
-        size_t alignment = std::max(huge_page_size, page_size);
-        int64_t aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-
         if (create) {
             int fd = create_anonymous_memfd("batchgen_weights");
             if (fd < 0) {
@@ -388,6 +369,19 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                     "memfd_create for weights failed: " +
                     std::string(strerror(errno)));
             }
+            // The size and the address are aligned to the page that backs
+            // the memfd: the THP size when the shmem policy (with
+            // MADV_HUGEPAGE under --fast-init) lets THP back it, else the
+            // base page.
+            size_t backing_bytes = 0;
+            try {
+                backing_bytes = batchgen::MappingBackingBytes(fd, enable_thp);
+            } catch (...) {
+                close(fd);
+                throw;
+            }
+            const int64_t aligned_size =
+                ((size + backing_bytes - 1) / backing_bytes) * backing_bytes;
             if (ftruncate64(fd, aligned_size) != 0) {
                 int err = errno;
                 close(fd);
@@ -399,7 +393,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                     std::string(strerror(err)));
             }
             ptr = mmap_aligned(aligned_size, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, fd, 0, alignment);
+                               MAP_SHARED, fd, 0, backing_bytes);
             if (ptr == MAP_FAILED) {
                 int err = errno;
                 close(fd);
@@ -416,6 +410,9 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
             if (enable_thp) {
                 // Pre-fault THP pages before weight loading to avoid
                 // non-deterministic compaction stalls during direct I/O.
+                // One touch per backing page: the THP size when THP backs
+                // the memfd, else every base page (a THP-sized stride over
+                // base pages would leave most of them unfaulted).
                 if (const char* skip_touch =
                         std::getenv("BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH");
                     skip_touch != nullptr && std::strcmp(skip_touch, "1") == 0) {
@@ -425,7 +422,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                 } else {
                     auto touch_start = std::chrono::high_resolution_clock::now();
                     bool ok = touch_pages(logger, ptr, allocated_size,
-                                          huge_page_size,
+                                          backing_bytes,
                                           /*multi_threaded=*/true);
                     auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - touch_start).count();
@@ -441,9 +438,12 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                 logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
             *out_memfd_fd = fd;
-            logger->info("Weights allocated via memfd_create ({:.1f} GB, {} pages)",
-                         allocated_size / (1024.0 * 1024.0 * 1024.0),
-                         enable_thp ? "transparent huge" : "base");
+            logger->info(
+                "Weights allocated via memfd_create ({:.1f} GB, {} KiB "
+                "backing pages, base page {} KiB, THP hint {})",
+                allocated_size / (1024.0 * 1024.0 * 1024.0),
+                backing_bytes / 1024, page_size / 1024,
+                enable_thp ? "on" : "off");
         } else {
             // Worker: open the creator's memfd via /proc/<pid>/fd/<N>.
             if (memfd_creator_pid <= 0 || memfd_fd_arg < 0) {
@@ -467,26 +467,31 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                     strerror(errno));
             }
             struct stat sb{};
-            if (fstat(fd, &sb) == -1 || sb.st_size < aligned_size) {
+            if (fstat(fd, &sb) == -1 || sb.st_size < size) {
                 logger->error(
                     "weights memfd too small or fstat failed (expected>={}, "
                     "found={})",
-                    aligned_size, static_cast<int64_t>(sb.st_size));
+                    size, static_cast<int64_t>(sb.st_size));
                 close(fd);
                 throw std::runtime_error(
                     "weights memfd too small or fstat failed");
             }
-            // A huge page memfd only accepts a mapping aligned to its own page
-            // size, which the base page alignment above does not guarantee.
+            // The creator sized the memfd to its backing page; the mapping
+            // address is aligned to the same page here. A huge page memfd
+            // reports its own page size and accepts nothing less.
             struct statfs sfs;
             const bool fd_is_hugetlb =
                 fstatfs(fd, &sfs) == 0 &&
                 static_cast<unsigned long>(sfs.f_type) == HUGETLBFS_MAGIC;
-            if (fd_is_hugetlb) {
-                alignment = std::max(default_huge_page_size(logger), page_size);
+            size_t backing_bytes = 0;
+            try {
+                backing_bytes = batchgen::MappingBackingBytes(fd, enable_thp);
+            } catch (...) {
+                close(fd);
+                throw;
             }
             ptr = mmap_aligned(sb.st_size, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, fd, 0, alignment);
+                               MAP_SHARED, fd, 0, backing_bytes);
             if (ptr == MAP_FAILED) {
                 int err = errno;
                 close(fd);

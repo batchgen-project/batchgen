@@ -4585,24 +4585,31 @@ def test_distributed_pin_intervals_are_aligned_coalesced_and_clamped():
         "}  // namespace",
     )
 
-    assert "constexpr int64_t kPinAlignment = 2 * 1024 * 1024;" in source
+    # The alignment is the page backing the store mapping, never a constant.
+    assert "kPinAlignment" not in source
+    assert "int64_t alignment) {" in merge
     # Start rounds down, end rounds up.
-    assert "(interval.first / kPinAlignment) * kPinAlignment" in merge
+    assert "(interval.first / alignment) * alignment" in merge
     assert (
-        "((interval.second + kPinAlignment - 1) / kPinAlignment) *"
+        "((interval.second + alignment - 1) / alignment) *"
         in merge
     )
     # Clamped to the store, so the unaligned tail cannot run past the mapping.
     assert "std::max<int64_t>(begin, 0)" in merge
     assert "std::min<int64_t>(end, limit)" in merge
     # Sorted, then touching or overlapping ranges are merged (``<=``, not
-    # ``<``): 2 MiB rounding makes adjacent experts share a boundary page.
+    # ``<``): backing-page rounding makes adjacent experts share a boundary
+    # page.
     assert "std::sort(aligned.begin(), aligned.end());" in merge
     assert "range.first <= merged.back().second" in merge
     assert "std::max(merged.back().second, range.second)" in merge
 
     init = _init_distributed_section(source)
     assert "merge_pin_intervals(std::move(pin_intervals)" in init
+    assert (
+        "batchgen::MappingBackingBytes(this->compact_fd_,\n"
+        "                                          /*madvised=*/true)" in init
+    )
 
 
 def test_distributed_unregisters_exactly_the_ranges_it_registered():

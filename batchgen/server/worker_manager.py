@@ -28,8 +28,8 @@ from batchgen.memfd import create_memfd
 from batchgen.eventlog import process as eventlog_process
 from batchgen.server.process_utils import (
     cleanup_shm_files,
-    get_hugepage_size,
     get_model_byte_size,
+    reserve_hugepages,
 )
 from batchgen.server.runtime_locks import (
     RuntimeLocks,
@@ -1653,37 +1653,10 @@ class WorkerManager:
         except (subprocess.CalledProcessError, PermissionError) as e:
             logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
 
-    def _config_hugepages(self, byte_size: int = None) -> None:
-        """Reserve the host huge page pool the weights memfd draws from.
-
-        MFD_HUGETLB needs no hugetlbfs mount, only the reservation, so this
-        configures the pool size and nothing else.
-
-        Args:
-            byte_size: Model size in bytes. If None, uses default 700GB.
-        """
-        hugepage_size = get_hugepage_size()
-
-        if byte_size is not None:
-            # Model byte_size already includes buffer
-            num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
-        else:
-            # Fallback to old default (for backwards compatibility)
-            num_hugepages = 350000
-
-        logger.info(
-            f"Configuring hugepages: {num_hugepages} pages "
-            f"({num_hugepages * hugepage_size / (1024**3):.1f} GB, "
-            f"{hugepage_size / (1024**2):.0f} MB pages)"
-        )
-
-        cmd = ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except Exception as exc:
-            logger.warning(
-                "Hugepages configuration failed (%s): %s", cmd, exc
-            )
+    def _config_hugepages(self, byte_size: int) -> None:
+        """Reserve the host huge page pool the weights memfd draws from and
+        fail with HugePagesReservationError on a shortfall."""
+        reserve_hugepages(byte_size)
 
     def _load_model_resources(self) -> None:
         import sys as _diag_sys, time as _diag_time

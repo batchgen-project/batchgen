@@ -110,8 +110,13 @@ def test_backend_follows_system_page_size_unless_thp_is_requested():
         == 2
     )
 
-    # The 2 MiB prefault stays behind the THP opt-in.
+    # The backing-page prefault stays behind the THP opt-in, and its stride
+    # is the page that backs the region, never a constant.
     assert source.count("TouchPagesMultiThreaded(") == 2
+    assert (
+        "TouchPagesMultiThreaded(mapped, total_bytes, backing_page_bytes);"
+        in source
+    )
     call = source.index("TouchPagesMultiThreaded(mapped")
     guard = source.rindex("if (config.enable_thp)", 0, call)
     assert 0 < call - guard < 120

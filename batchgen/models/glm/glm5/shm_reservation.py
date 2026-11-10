@@ -9,7 +9,9 @@ Mirrors the layout that ``Parameter_Server::_load_cus_format_file_to_host_mem``
 (core/Parameter_Server/Parameter_Server.cpp) writes: every directory entry whose
 name contains ``.json`` is a shard metadata file, each shard occupies
 ``total_byte_size`` bytes, and the running offset is rounded up to 4 KiB after
-each shard. Validating here keeps a malformed checkpoint from being discovered
+each shard. The total is rounded to the page that backs the weights region,
+which the caller derives from the host (``batchgen.host_page_geometry``).
+Validating here keeps a malformed checkpoint from being discovered
 only after the C++ side has already allocated hundreds of GiB of SHM.
 
 Stdlib only — this module must stay importable without torch.
@@ -18,8 +20,9 @@ Stdlib only — this module must stay importable without torch.
 import json
 import os
 
+# Parameter_Server's per-shard file offset alignment (kWeightFileAlignment,
+# the O_DIRECT block granule), not a memory page size.
 _SHARD_ALIGNMENT = 4096
-_TOTAL_ALIGNMENT = 2 * 1024 * 1024
 
 
 def _round_up(value, alignment):
@@ -102,12 +105,22 @@ def _shard_byte_size(metadata_path):
     return _round_up(total_byte_size, _SHARD_ALIGNMENT)
 
 
-def converted_checkpoint_byte_size(converted_ckpt_dir):
-    """Return the SHM bytes the C++ parameter server needs for this checkpoint.
+def converted_checkpoint_byte_size(converted_ckpt_dir, *, total_alignment):
+    """Return the SHM bytes the C++ parameter server needs for this checkpoint,
+    rounded up to ``total_alignment`` (the weights region's backing page).
 
     Raises ValueError naming the offending path if the directory is unreadable,
     holds no shard metadata, or any shard is inconsistent with its .bin file.
     """
+    if (
+        isinstance(total_alignment, bool)
+        or not isinstance(total_alignment, int)
+        or total_alignment <= 0
+        or total_alignment & (total_alignment - 1)
+    ):
+        raise ValueError(
+            f"total_alignment must be a positive power of two, got {total_alignment!r}"
+        )
     try:
         entries = sorted(os.listdir(converted_ckpt_dir))
     except OSError as exc:
@@ -128,4 +141,4 @@ def converted_checkpoint_byte_size(converted_ckpt_dir):
             f"No checkpoint metadata (.json) found in {converted_ckpt_dir}"
         )
 
-    return _round_up(total_byte_size, _TOTAL_ALIGNMENT)
+    return _round_up(total_byte_size, total_alignment)

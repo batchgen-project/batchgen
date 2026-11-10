@@ -419,12 +419,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fast-init",
         action="store_true",
         help="Back the shared weights and host KV cache with transparent huge "
-             "pages (THP) for faster memory registration. The regions are "
-             "unnamed memfds in every mode; this flag only adds THP. "
-             "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
-             "(2) root access (for pre-allocation memory compaction). "
-             "Automatically runs drop_caches + compact_memory before allocation "
-             "to defragment physical memory for stable 2MB THP pages.",
+             "pages (THP) for faster memory registration, and pre-fault them "
+             "one THP page at a time. The regions are unnamed memfds in every "
+             "mode; this flag only adds THP. The THP size is the host's "
+             "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size (2 MiB on "
+             "x86_64 with 4 KiB pages, 512 MiB on arm64 with 64 KiB pages). "
+             "Requires: (1) /sys/kernel/mm/transparent_hugepage/shmem_enabled "
+             "set to always or within_size, (2) root access (for "
+             "pre-allocation memory compaction). Automatically runs "
+             "drop_caches + compact_memory before allocation so the kernel "
+             "can assemble THP pages from contiguous physical memory.",
     )
     parser.add_argument(
         "--dist-init-addr",

@@ -40,6 +40,7 @@ _diag("tqdm done")
 from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
 from .shm_reservation import converted_checkpoint_byte_size
+from batchgen.host_page_geometry import host_page_geometry
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
 from batchgen.eventlog.process import native_log_level
 _diag("model_registry done")
@@ -96,7 +97,12 @@ class GLM5_Parameter_Server:
 
         # Size the reservation from the converted metadata instead of a fixed
         # per-dtype constant.
-        byte_size = converted_checkpoint_byte_size(self.converted_ckpt_dir)
+        byte_size = converted_checkpoint_byte_size(
+            self.converted_ckpt_dir,
+            total_alignment=host_page_geometry().weights_region_backing_bytes(
+                enable_hugetlbfs=self.enable_hugetlbfs, enable_thp=self.enable_thp
+            ),
+        )
 
         import uuid
         self.shm_name = "/shm_" + str(uuid.uuid4())

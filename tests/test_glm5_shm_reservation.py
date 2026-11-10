@@ -3,6 +3,7 @@
 Imports only the helper module (stdlib-backed) — no torch, no core_engine.
 """
 
+import functools
 import importlib.util
 import json
 import os
@@ -18,7 +19,12 @@ _SPEC = importlib.util.spec_from_file_location("glm5_shm_reservation", _MODULE_P
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
-converted_checkpoint_byte_size = _MODULE.converted_checkpoint_byte_size
+_X86_THP_BYTES = 2 * 1024 * 1024
+# The x86 weights region (4 KiB base pages, 2 MiB THP/hugetlb pages): the
+# rounding the module hard-coded before it took the alignment from the host.
+converted_checkpoint_byte_size = functools.partial(
+    _MODULE.converted_checkpoint_byte_size, total_alignment=_X86_THP_BYTES
+)
 
 
 def _write_shard(directory, stem, tensor_byte_sizes, metadata_overrides=None,
@@ -219,3 +225,32 @@ def test_directory_named_like_metadata_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="stale.json"):
         converted_checkpoint_byte_size(directory)
+
+
+def test_total_follows_the_backing_page_of_a_64k_page_arm64_host(tmp_path):
+    directory = str(tmp_path)
+    _write_shard(directory, "shard_0", [3 * 1024 * 1024])
+    _write_shard(directory, "shard_1", [4096])
+    payload = 3 * 1024 * 1024 + 4096
+
+    # Base 64 KiB pages (THP off): rounded to 64 KiB, not to 2 MiB.
+    assert _MODULE.converted_checkpoint_byte_size(
+        directory, total_alignment=64 * 1024
+    ) == payload - payload % (64 * 1024) + 64 * 1024
+    # 512 MiB THP or hugetlb pages.
+    assert _MODULE.converted_checkpoint_byte_size(
+        directory, total_alignment=512 * 1024 * 1024
+    ) == 512 * 1024 * 1024
+
+
+@pytest.mark.parametrize("alignment", [0, -4096, 3 * 1024 * 1024, True, 4096.0])
+def test_alignment_must_be_a_positive_power_of_two(tmp_path, alignment):
+    _write_shard(str(tmp_path), "shard_0", [4096])
+    with pytest.raises(ValueError, match="total_alignment"):
+        _MODULE.converted_checkpoint_byte_size(str(tmp_path), total_alignment=alignment)
+
+
+def test_alignment_is_required(tmp_path):
+    _write_shard(str(tmp_path), "shard_0", [4096])
+    with pytest.raises(TypeError):
+        _MODULE.converted_checkpoint_byte_size(str(tmp_path))

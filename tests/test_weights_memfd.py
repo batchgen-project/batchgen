@@ -136,13 +136,13 @@ def test_weights_follow_system_page_size_unless_thp_is_requested():
     )
     assert "enable_thp && !fd_is_hugetlb);" in source
 
-    # The 2 MiB prefault stays behind the THP opt-in; without it the mapping
-    # keeps the base-page-stride touch.
+    # The backing-page prefault stays behind the THP opt-in; without it the
+    # mapping keeps the base-page-stride touch.
     assert source.count("if (enable_thp) {") == 1
     thp_block = source.split("if (enable_thp) {", 1)[1]
     thp_block = thp_block.split("} else if (!touch_pages", 1)[0]
     assert "touch_pages(logger, ptr, allocated_size," in thp_block
-    assert "huge_page_size," in thp_block
+    assert "backing_bytes," in thp_block
     assert (
         "} else if (!touch_pages(logger, ptr, size, page_size, true)) {"
         in source
@@ -192,8 +192,10 @@ def test_hugetlbfs_weights_are_an_unnamed_huge_page_memfd():
     assert "syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_HUGETLB)" in source
     assert 'create_huge_anonymous_memfd("batchgen_weights")' in source
     # The huge page size is the host's default, so the region is rounded and
-    # mapped to exactly that, not to a hardcoded 2 MB.
-    assert "default_huge_page_size(logger)" in source
+    # mapped to exactly that, not to a hardcoded 2 MB, and a kernel without
+    # hugetlb raises instead of assuming one.
+    assert "geometry.HugetlbPageBytes()" in source
+    assert "2 * 1024 * 1024" not in source
     assert "ftruncate64(fd, hugetlb_size)" in source
     # Only the creator allocates; an attacher cannot name a memfd, so it takes
     # the same /proc path in both modes.
@@ -206,8 +208,11 @@ def test_hugetlbfs_weights_are_an_unnamed_huge_page_memfd():
 
 def test_hugepage_setup_reserves_the_pool_without_mounting_hugetlbfs():
     source = WORKER_MANAGER.read_text()
-    config = source.split("def _config_hugepages(", 1)[1]
-    config = config.split("\n    def ", 1)[0]
+    assert "reserve_hugepages(byte_size)" in source.split(
+        "def _config_hugepages(", 1
+    )[1].split("\n    def ", 1)[0]
+    config = PROCESS_UTILS.read_text().split("def reserve_hugepages(", 1)[1]
+    config = config.split("\ndef ", 1)[0]
 
     # memfd needs the reservation, which stays host/operator configuration.
     assert '["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]' in config

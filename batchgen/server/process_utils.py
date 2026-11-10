@@ -7,12 +7,15 @@ import logging
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Callable, Optional
 
 import psutil
+
+from batchgen.host_page_geometry import host_page_geometry, read_hugepages_total
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +31,6 @@ BATCHGEN_SHM_PREFIXES = (
 # The model weight and tensor-metadata regions are anonymous memfds in every
 # mode, hugetlbfs included, so this run creates no named model region for a
 # supervisor to attribute and records no model SHM provenance.
-
-# Default hugepage size (2MB) used as fallback if detection fails
-DEFAULT_HUGEPAGE_SIZE = 2 * 1024 * 1024
 
 # Model byte_size lookup table
 # These values are from each model's parameter_server.py
@@ -116,29 +116,56 @@ def get_model_byte_size(model_name: str) -> int:
 
 
 def get_hugepage_size() -> int:
-    """Get system hugepage size in bytes from /proc/meminfo.
+    """The host's default huge page size in bytes (``Hugepagesize`` in
+    /proc/meminfo): 2 MiB on x86_64, 512 MiB on a 64 KiB-page arm64 kernel.
 
-    Hugepage sizes vary by architecture:
-    - x86_64: 2 MB (default) or 1 GB
-    - ARM64: 2 MB (default) or 1 GB
-    - ARM64 (64K pages): 512 MB
-
-    Returns:
-        Hugepage size in bytes. Defaults to 2MB if detection fails.
+    Raises HostPageGeometryError when the kernel provides no hugetlb pages;
+    there is no assumed size.
     """
-    try:
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                if line.startswith("Hugepagesize:"):
-                    # Format: "Hugepagesize:     2048 kB"
-                    parts = line.split()
-                    size_kb = int(parts[1])
-                    return size_kb * 1024  # Convert KB to bytes
-    except (IOError, ValueError, IndexError) as e:
-        logger.debug(f"Failed to read hugepage size from /proc/meminfo: {e}")
+    return host_page_geometry().require_hugetlb_page_bytes()
 
-    # Default to 2MB if detection fails
-    return DEFAULT_HUGEPAGE_SIZE
+
+class HugePagesReservationError(RuntimeError):
+    """The host huge page pool is smaller than the weights region needs."""
+
+
+def reserve_hugepages(byte_size: int, *, run=subprocess.run) -> int:
+    """Size the default huge page pool for ``byte_size`` bytes of weights.
+
+    MFD_HUGETLB needs no hugetlbfs mount, only the reservation, so this sets
+    ``vm.nr_hugepages`` and nothing else. The pool size is read back from
+    ``HugePages_Total`` because the kernel grants what it can (fragmented or
+    unprivileged hosts get fewer pages, a container may refuse the write);
+    a shortfall raises HugePagesReservationError instead of letting the
+    weights memfd fall back to base pages. Returns the pages required.
+    """
+    if byte_size is None or byte_size <= 0:
+        raise ValueError(f"reserve_hugepages needs a positive byte_size, got {byte_size!r}")
+    hugepage_size = get_hugepage_size()
+    num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+    logger.info(
+        "Configuring hugepages: %d pages (%.1f GB, %d MiB pages)",
+        num_hugepages,
+        num_hugepages * hugepage_size / (1024**3),
+        hugepage_size // (1024**2),
+    )
+    cmd = ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]
+    try:
+        run(cmd, check=True, capture_output=True, text=True)
+    except Exception as exc:
+        # The pool may already be reserved by the operator; the read-back
+        # below decides.
+        logger.warning("Hugepages configuration failed (%s): %s", cmd, exc)
+    total = read_hugepages_total()
+    if total < num_hugepages:
+        raise HugePagesReservationError(
+            f"HugePagesReservationError: the weights need {num_hugepages} huge pages of "
+            f"{hugepage_size // (1024**2)} MiB ({num_hugepages * hugepage_size / (1024**3):.1f} GiB), "
+            f"but HugePages_Total is {total} after `{' '.join(cmd)}`; reserve the pool "
+            f"(as root, on a host with enough contiguous memory) or run without "
+            f"--enable-hugetlbfs"
+        )
+    return num_hugepages
 
 
 def calculate_hugepages(byte_size: int) -> int:

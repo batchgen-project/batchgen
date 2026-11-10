@@ -21,6 +21,7 @@
 #include "Weights_Storage.h"
 #include "distributed_weights_protocol.h"
 #include "../Parameter_Server/posix_shm.h"
+#include "../host_page_geometry.h"
 #include "spdlog/spdlog.h"
 #include <algorithm>
 #include <cerrno>
@@ -48,7 +49,6 @@ using batchgen::distributed_weights::Response;
 constexpr int kKimiK3Experts = 896;
 constexpr int kKimiK3Workers = 8;
 constexpr int kKimiK3ExpertsPerWorker = kKimiK3Experts / kKimiK3Workers;
-constexpr int64_t kPinAlignment = 2 * 1024 * 1024;
 
 // Trailing expert index of "routed_expert_<layer>_<expert>", or -1 when the
 // key is not a routed expert at all. Never throws: the fail-closed pin guard
@@ -71,18 +71,20 @@ int parse_routed_expert(const std::string& module_key) {
     return std::stoi(suffix);
 }
 
-// Page-align the selected tensor extents outward and coalesce them, so a
-// 112-expert slot is registered as a handful of large ranges instead of one
-// cudaHostRegister per tensor.
+// Align the selected tensor extents outward to the page that backs the store
+// mapping and coalesce them, so a 112-expert slot is registered as a handful
+// of large ranges instead of one cudaHostRegister per tensor, and no range
+// starts or ends inside a backing page.
 std::vector<std::pair<int64_t, int64_t>> merge_pin_intervals(
-    std::vector<std::pair<int64_t, int64_t>> intervals, int64_t limit) {
+    std::vector<std::pair<int64_t, int64_t>> intervals, int64_t limit,
+    int64_t alignment) {
     std::vector<std::pair<int64_t, int64_t>> aligned;
     aligned.reserve(intervals.size());
     for (const auto& interval : intervals) {
-        int64_t begin = (interval.first / kPinAlignment) * kPinAlignment;
+        int64_t begin = (interval.first / alignment) * alignment;
         int64_t end =
-            ((interval.second + kPinAlignment - 1) / kPinAlignment) *
-            kPinAlignment;
+            ((interval.second + alignment - 1) / alignment) *
+            alignment;
         begin = std::max<int64_t>(begin, 0);
         end = std::min<int64_t>(end, limit);
         if (end > begin) {
@@ -493,9 +495,14 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     // whole compact store pinned. hierarchical_gdr registers the coalesced
     // slot ranges only, which is what turns a >20 min startup into seconds.
     if (this->hierarchical_gdr_) {
+        // The staged store sits on a tmpfs whose huge= option, with the
+        // MADV_HUGEPAGE above, decides whether THP backs this mapping.
+        const auto pin_alignment = static_cast<int64_t>(
+            batchgen::MappingBackingBytes(this->compact_fd_,
+                                          /*madvised=*/true));
         pin_intervals =
             merge_pin_intervals(std::move(pin_intervals),
-                                this->compact_bytes_);
+                                this->compact_bytes_, pin_alignment);
     } else {
         pin_intervals = {{0, this->compact_bytes_}};
     }
@@ -742,7 +749,8 @@ void Weights_Storage::Init(
     try {
         segments = plan_host_registration_segments(
             std::move(extents), byte_size, kMaxHostRegistrationBytes,
-            static_cast<int64_t>(sysconf(_SC_PAGESIZE)));
+            static_cast<int64_t>(
+                batchgen::HostPageGeometry::Host().base_page_bytes));
     } catch (...) {
         unmap_shared_memory(this->log_level_, weight_ptr, mapped_size);
         throw;

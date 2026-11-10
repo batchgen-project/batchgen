@@ -29,6 +29,7 @@
 #include "Weights_Storage/Weights_Storage.h"
 #include "Weights_Storage/distributed_weight_daemon.h"
 #include "allocator.h"
+#include "host_page_geometry.h"
 #include "data_structures.h"
 #include <ATen/cuda/CachingHostAllocator.h>
 #include <cstdint>
@@ -1211,6 +1212,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("page_bytes"),
           "cudaHostRegister segments [begin, end) that never cut a tensor.");
     m.attr("MAX_HOST_REGISTRATION_BYTES") = kMaxHostRegistrationBytes;
+    // The C++ host page geometry, bound so tests can hold it to the same
+    // table as batchgen/host_page_geometry.py.
+    py::class_<batchgen::HostPageGeometry>(m, "HostPageGeometry")
+        .def_static("from_text", &batchgen::HostPageGeometry::FromText,
+                    py::arg("base_page_bytes"), py::arg("hpage_pmd_size_text"),
+                    py::arg("meminfo_text"), py::arg("shmem_enabled_text"))
+        .def_static("host", &batchgen::HostPageGeometry::Host,
+                    py::return_value_policy::reference)
+        .def_readonly("base_page_bytes",
+                      &batchgen::HostPageGeometry::base_page_bytes)
+        .def_readonly("thp_pmd_bytes",
+                      &batchgen::HostPageGeometry::thp_pmd_bytes)
+        .def_readonly("hugetlb_page_bytes",
+                      &batchgen::HostPageGeometry::hugetlb_page_bytes)
+        .def_readonly("shmem_thp_policy",
+                      &batchgen::HostPageGeometry::shmem_thp_policy)
+        .def("shmem_thp_active", &batchgen::HostPageGeometry::ShmemThpActive,
+             py::arg("madvised"), py::arg("mount_huge") = py::none())
+        .def("shmem_backing_bytes",
+             &batchgen::HostPageGeometry::ShmemBackingBytes,
+             py::arg("madvised"), py::arg("mount_huge") = py::none())
+        .def("hugetlb_page_bytes_required",
+             &batchgen::HostPageGeometry::HugetlbPageBytes);
+    m.def(
+        "mapping_backing_bytes",
+        [](int fd, bool madvised) {
+            return batchgen::MappingBackingBytes(fd, madvised);
+        },
+        py::arg("fd"), py::arg("madvised"),
+        "Page size backing a MAP_SHARED mapping of fd on this host.");
     // Add version info
     m.attr("__version__") = "0.1.0";
 }

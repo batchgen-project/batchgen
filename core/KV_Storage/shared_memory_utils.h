@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <system_error>
 
+#include "../host_page_geometry.h"
+
 namespace batchgen::kv {
 
 enum class SharedMemoryInitState : std::uint32_t {
@@ -31,12 +33,7 @@ inline std::size_t AlignUp(std::size_t value, std::size_t alignment) {
 }
 
 inline std::size_t SystemPageSize() {
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "sysconf(_SC_PAGESIZE) failed");
-    }
-    return static_cast<std::size_t>(page_size);
+    return HostPageGeometry::Host().base_page_bytes;
 }
 
 class ScopedPthreadMutexLock {

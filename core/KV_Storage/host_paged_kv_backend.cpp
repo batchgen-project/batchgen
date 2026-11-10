@@ -1,5 +1,6 @@
 #include "host_paged_kv_backend.h"
 
+#include "../host_page_geometry.h"
 #include "../utils.h"
 
 #include <fcntl.h>
@@ -35,14 +36,18 @@ namespace {
 // The magic doubles as the version of the region's metadata layout
 // (SharedHeader, the free stack, page owners/links, SequenceEntry). Neither
 // layout_fingerprint nor config_hash covers that layout, and a header that
-// grows shifts every array behind it while leaving the data offset (2 MiB
-// aligned) and every validated field where they were, so a creator and an
+// grows shifts every array behind it while leaving the data offset (aligned
+// to the backing page) and every validated field where they were, so a creator and an
 // attacher built from different layouts would pass validation and corrupt the
 // allocator. Change the magic whenever any of those layouts changes.
 //   "HOSTKVMG": the original layout.
 //   "HOSTKVM2": SharedHeader gained the three lifetime counters.
+//   "HOSTKVM3": the data offset is aligned to the page that backs the region
+//               (base page, or the THP size when THP backs it) instead of a
+//               fixed 2 MiB; SharedHeader records data_offset and
+//               backing_page_bytes and an attacher must match both.
 constexpr std::uint64_t kSharedMemoryMagic =
-    0x484f53544b564d32ULL;  // "HOSTKVM2"
+    0x484f53544b564d33ULL;  // "HOSTKVM3"
 constexpr std::int32_t kInvalidPageIndex = -1;
 constexpr std::int64_t kEmptySequenceId =
     std::numeric_limits<std::int64_t>::min();
@@ -70,16 +75,6 @@ std::size_t AlignUp(std::size_t value, std::size_t alignment) {
         return value;
     }
     return value + (alignment - remainder);
-}
-
-std::size_t GetSystemPageSize() {
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        const int err = errno;
-        throw std::system_error(err, std::generic_category(),
-                                "sysconf(_SC_PAGESIZE) failed");
-    }
-    return static_cast<std::size_t>(page_size);
 }
 
 class ScopedMutexLock {
@@ -142,6 +137,9 @@ struct SharedHeader {
     std::atomic<std::uint64_t> sequences_inserted{0};
     std::atomic<std::uint64_t> sequences_released{0};
     std::atomic<std::uint64_t> acquire_failures{0};
+    // Geometry the creator laid the region out with (HOSTKVM3).
+    std::uint64_t data_offset = 0;
+    std::uint64_t backing_page_bytes = 0;
     pthread_mutex_t allocation_mutex{};
     pthread_mutex_t sequence_mutex{};
 };
@@ -166,6 +164,8 @@ static_assert(offsetof(SharedHeader, free_stack_top) == 84);
 static_assert(offsetof(SharedHeader, active_sequences) == 88);
 static_assert(offsetof(SharedHeader, sequences_inserted) == 96);
 static_assert(offsetof(SharedHeader, sequences_released) == 104);
+static_assert(offsetof(SharedHeader, data_offset) == 120);
+static_assert(offsetof(SharedHeader, backing_page_bytes) == 128);
 static_assert(offsetof(SharedHeader, acquire_failures) == 112);
 
 std::size_t SafeHardwareConcurrency() {
@@ -260,6 +260,13 @@ struct HostPagedKVBackend::SharedState {
         sequence_capacity = config.sequence_table_capacity == 0
                                 ? config.num_pages
                                 : config.sequence_table_capacity;
+        // The region is a memfd on the kernel's internal shmem mount:
+        // shmem_enabled (with MADV_HUGEPAGE under enable_thp) decides
+        // whether THP backs it.
+        const auto& geometry = HostPageGeometry::Host();
+        base_page_bytes = geometry.base_page_bytes;
+        backing_page_bytes =
+            geometry.ShmemBackingBytes(config.enable_thp, std::nullopt);
         ComputeOffsets();
     }
 
@@ -312,6 +319,8 @@ struct HostPagedKVBackend::SharedState {
     std::size_t data_offset = 0;
     std::size_t total_bytes_unaligned = 0;
     std::size_t sequence_capacity = 0;
+    std::size_t base_page_bytes = 0;
+    std::size_t backing_page_bytes = 0;
 
    private:
     void ComputeOffsets();
@@ -349,13 +358,11 @@ void HostPagedKVBackend::SharedState::ComputeOffsets() {
     sequence_table_offset = offset;
     offset += sizeof(SequenceEntry) * sequence_capacity;
 
-    // Align data_offset to 2MB (huge page size) because cudaHostRegister may require
-    // huge-page aligned pointers when the underlying memory is backed by huge pages
-    // (e.g., via Transparent Huge Pages or hugetlbfs).
-    // Using simple page alignment (4KB) can cause "invalid argument" errors with cudaHostRegister
-    // on some systems when THP is active.
-    constexpr std::size_t kHugePageAlignment = 2 * 1024 * 1024;
-    offset = AlignUp(offset, kHugePageAlignment);
+    // The data region starts on a backing page boundary: cudaHostRegister of
+    // a THP-backed range that starts inside a huge page can fail with
+    // "invalid argument", and the data pages must not share a huge page with
+    // the metadata.
+    offset = AlignUp(offset, backing_page_bytes);
     data_offset = offset;
     offset += data_bytes;
 
@@ -393,6 +400,8 @@ void HostPagedKVBackend::SharedState::ConstructSharedState() {
     header->num_layers = config.num_layers;
     header->page_size_tokens = config.page_size_tokens;
     header->has_v_cache = has_v_cache ? 1 : 0;
+    header->data_offset = data_offset;
+    header->backing_page_bytes = backing_page_bytes;
     header->free_stack_top.store(static_cast<std::uint32_t>(config.num_pages),
                                  std::memory_order_relaxed);
     header->active_sequences.store(0, std::memory_order_relaxed);
@@ -504,6 +513,18 @@ void HostPagedKVBackend::SharedState::ValidateSharedState() const {
             << ")";
         throw std::runtime_error(oss.str());
     }
+    if (header->backing_page_bytes != backing_page_bytes ||
+        header->data_offset != data_offset) {
+        std::ostringstream oss;
+        oss << "Shared memory page geometry mismatch (expected backing page="
+            << backing_page_bytes << " data_offset=" << data_offset
+            << ", found backing page=" << header->backing_page_bytes
+            << " data_offset=" << header->data_offset
+            << "); the creator and this attacher disagree on whether THP "
+               "backs the region (enable_thp or "
+               "/sys/kernel/mm/transparent_hugepage/shmem_enabled changed)";
+        throw std::runtime_error(oss.str());
+    }
 }
 
 std::size_t HostPagedKVBackend::SharedState::HashSequenceId(
@@ -580,10 +601,8 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
 }
 
 void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
-    const std::size_t page_size = GetSystemPageSize();
-    total_bytes = AlignUp(total_bytes_unaligned, page_size);
-    constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
-    const std::size_t alignment = std::max(kHugePageSize, page_size);
+    total_bytes = AlignUp(total_bytes_unaligned, base_page_bytes);
+    const std::size_t alignment = backing_page_bytes;
 
     // The region is always an anonymous memfd: it carries no /dev/shm name, so
     // the kernel reclaims it as soon as the last process mapping it is gone,
@@ -615,8 +634,10 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
 
         AdviseTransparentHugePages(BackendLogger(config), mapped, total_bytes,
                                    config.enable_thp);
+        // One touch per backing page: the THP size when THP backs the
+        // region, else every base page.
         if (config.enable_thp) {
-            TouchPagesMultiThreaded(mapped, total_bytes, kHugePageSize);
+            TouchPagesMultiThreaded(mapped, total_bytes, backing_page_bytes);
         }
 
         shm_fd = fd;
