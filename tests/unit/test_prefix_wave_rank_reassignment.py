@@ -176,7 +176,7 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         engine_config=SimpleNamespace(
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=64)),
         # Startup resolved the server prefill mode: every wave is streamed.
-        _resolved_server_prefill_moe_mode="streamed",
+        _server_prefill_moe_mode_resolved=("streamed",),
         _active_batchgen_debug_for_sequences=lambda batch_sequences: {
             "prefix_rank_assignment_mode": "packing_v2"
         },
@@ -202,8 +202,8 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         ],
         worker_state,
     )
-    # The wave's prefill token cap, chosen by its prefill MoE mode.
-    for name in ('_planned_prefill_token_cap', '_prefill_moe_mode_for_debug', '_prefill_token_cap_for_mode', '_server_prefill_moe_mode'):
+    # Placement scores with the server mode's prefill token cap.
+    for name in ('_placement_prefill_token_cap', '_prefill_token_cap_for_mode', '_server_prefill_moe_mode'):
         setattr(
             worker_state,
             name,
