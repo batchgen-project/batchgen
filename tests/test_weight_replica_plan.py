@@ -48,6 +48,7 @@ int main() {
     CHECK(source_owner(group, WeightModuleKind::kRoutedExpert, 0, 0, 8) == 3);
     CHECK(source_owner(group, WeightModuleKind::kRoutedExpert, 0, 3, 8) == 5);
     CHECK(source_owner(group, WeightModuleKind::kRoutedExpert, 0, 7, 8) == 9);
+    CHECK(source_owner(group, "routed_expert", 0, 7, 8) == 9);
     CHECK(source_owner(group, "attn", 0, 0, 8) == 3);
     CHECK(source_owner(group, "shared_expert", 1, 0, 8) == 5);
     CHECK(source_owner(group, "attn", 4, 0, 8) == 3);
@@ -64,6 +65,9 @@ int main() {
     const auto rank0 = install_record_kinds({0, 1}, 0, owners, readers);
     CHECK(rank0.size() == 3);
     CHECK(rank0[0].kind == WeightRecordKind::HostShared);
+    CHECK(rank0[0].module == "attn0");
+    CHECK(rank0[0].owner == 0);
+    CHECK(rank0[0].readers == std::vector<int64_t>({0, 1}));
     CHECK(rank0[1].kind == WeightRecordKind::Replica);
     CHECK(rank0[2].kind == WeightRecordKind::HostPrivate);
     const auto rank1 = install_record_kinds({0, 1}, 1, owners, readers);
@@ -73,6 +77,8 @@ int main() {
     CHECK(flat_frame(2, 3, 4) == 7);
     const WeightFrameMap frames(4);
     CHECK(frames.at(2, 3).flat == 7);
+    CHECK(frames.at(2, 3).pass == 2);
+    CHECK(frames.at(2, 3).layer_position == 3);
     CHECK(ring_capacity_error("attn", 1, 1).find("attn") != std::string::npos);
     CHECK(ring_capacity_error("attn", 1, 1).find("1") != std::string::npos);
     CHECK(ring_capacity_error("attn", 2, 1).empty());
@@ -88,6 +94,14 @@ int main() {
     accounting.mark_landed(2);
     CHECK(accounting.may_post_barrier_a());
     CHECK(accounting.may_post_barrier_b());
+
+    WeightFrameAccounting skipped(rank0);
+    skipped.mark_landed(0);
+    skipped.mark_declined(1);
+    skipped.mark_skipped(2);
+    CHECK(skipped.may_post_barrier_b());
+    expect_throw(__LINE__, [&] { skipped.mark_landed(0); }, "already terminal");
+    expect_throw(__LINE__, [&] { skipped.mark_skipped(3); }, "outside the frame");
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

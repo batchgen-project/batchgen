@@ -8,8 +8,8 @@
 //   * batchgen/batchgen_worker.py
 //     (_install_prefill_weight_copy_pipeline, _prepare_phase_exit)
 // This header deliberately contains only CPU-testable ownership, frame,
-// record-kind, capacity and barrier-accounting logic. Engine wiring, the
-// control block, and torch CUDA IPC export/import are later GPU-node work.
+// record-kind, capacity and barrier-accounting logic. The shared control
+// block, engine adapters and torch CUDA IPC export/import live separately.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -37,26 +37,12 @@ enum class WeightRecordKind : uint8_t {
     Replica = 2,
 };
 
-using RecordKind = WeightRecordKind;
-
 enum class WeightFrameRecordState : uint8_t {
     kPending = 0,
     kLanded = 1,
     kDeclined = 2,
     kSkipped = 3,
 };
-
-inline const char* weight_record_kind_name(WeightRecordKind kind) {
-    switch (kind) {
-        case WeightRecordKind::HostShared:
-            return "HostShared";
-        case WeightRecordKind::HostPrivate:
-            return "HostPrivate";
-        case WeightRecordKind::Replica:
-            return "Replica";
-    }
-    return "Unknown";
-}
 
 inline void validate_replica_group(const std::vector<int64_t>& group) {
     if (group.empty()) {
@@ -105,23 +91,6 @@ inline int64_t source_owner(const std::vector<int64_t>& ordered_group,
                             ? WeightModuleKind::kRoutedExpert
                             : WeightModuleKind::kSingleModule,
                         layer, expert, experts);
-}
-
-inline int64_t source_owner(const std::vector<int64_t>& ordered_group,
-                            bool routed_expert, uint64_t layer,
-                            uint64_t expert, uint64_t experts) {
-    return source_owner(
-        ordered_group,
-        routed_expert ? WeightModuleKind::kRoutedExpert
-                      : WeightModuleKind::kSingleModule,
-        layer, expert, experts);
-}
-
-inline int64_t source_owner(const std::vector<int64_t>& ordered_group,
-                            const char* module_type, uint64_t layer,
-                            uint64_t expert, uint64_t experts) {
-    return source_owner(ordered_group, std::string_view(module_type), layer,
-                        expert, experts);
 }
 
 struct WeightRecord {
@@ -183,14 +152,6 @@ inline std::vector<WeightRecord> install_record_kinds(
     return records;
 }
 
-inline std::vector<WeightRecord> record_kinds(
-    const std::vector<int64_t>& ordered_group, int64_t rank,
-    const std::map<std::string, int64_t>& owner_by_module,
-    const std::map<std::string, std::vector<int64_t>>& static_reader_map) {
-    return install_record_kinds(ordered_group, rank, owner_by_module,
-                                static_reader_map);
-}
-
 struct WeightFrame {
     uint64_t pass = 0;
     uint64_t layer_position = 0;
@@ -220,8 +181,6 @@ class WeightFrameMap {
         }
     }
 
-    uint64_t layers_per_pass() const { return layers_per_pass_; }
-
     WeightFrame at(uint64_t pass, uint64_t layer_position) const {
         return WeightFrame{pass, layer_position,
                            flat_frame(pass, layer_position,
@@ -231,11 +190,6 @@ class WeightFrameMap {
    private:
     uint64_t layers_per_pass_ = 0;
 };
-
-inline WeightFrame frame_map(uint64_t pass, uint64_t layer_position,
-                             uint64_t layers_per_pass) {
-    return WeightFrameMap(layers_per_pass).at(pass, layer_position);
-}
 
 // Return an empty string when the ring can hold the two-frame rendezvous.
 inline std::string ring_capacity_error(std::string_view module_type,
@@ -263,8 +217,6 @@ inline void require_ring_capacity(std::string_view module_type,
 }
 
 struct WeightFrameAccounting {
-    WeightFrameAccounting() = default;
-
     explicit WeightFrameAccounting(const std::vector<WeightRecord>& records)
         : kinds(), states(records.size(), WeightFrameRecordState::kPending) {
         kinds.reserve(records.size());
@@ -273,25 +225,12 @@ struct WeightFrameAccounting {
         }
     }
 
-    size_t size() const { return states.size(); }
-
-    size_t add_record(WeightRecordKind kind) {
-        kinds.push_back(kind);
-        states.push_back(WeightFrameRecordState::kPending);
-        return states.size() - 1;
-    }
-
     void mark_landed(size_t index) { mark(index, WeightFrameRecordState::kLanded); }
     void mark_declined(size_t index) {
         mark(index, WeightFrameRecordState::kDeclined);
     }
     void mark_skipped(size_t index) {
         mark(index, WeightFrameRecordState::kSkipped);
-    }
-
-    WeightFrameRecordState state(size_t index) const {
-        check_index(index);
-        return states[index];
     }
 
     // Barrier A is local to this rank and needs every owned record landed.
@@ -313,13 +252,10 @@ struct WeightFrameAccounting {
             });
     }
 
-    bool barrier_a_ready() const { return may_post_barrier_a(); }
-    bool barrier_b_ready() const { return may_post_barrier_b(); }
-
+   private:
     std::vector<WeightRecordKind> kinds;
     std::vector<WeightFrameRecordState> states;
 
-   private:
     void check_index(size_t index) const {
         if (index >= states.size()) {
             throw std::out_of_range("Frame record index is outside the frame");
@@ -334,13 +270,4 @@ struct WeightFrameAccounting {
         states[index] = next;
     }
 };
-
-using FrameAccounting = WeightFrameAccounting;
-using FrameMap = WeightFrameMap;
-
-inline std::string check_ring_capacity(std::string_view module_type,
-                                       uint64_t ring_slots,
-                                       uint64_t frame_size) {
-    return ring_capacity_error(module_type, ring_slots, frame_size);
-}
 
