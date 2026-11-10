@@ -1598,9 +1598,6 @@ class BatchGenWorker:
 		# the switch invariants and the capture-once guard in
 		# _setup_cuda_graphs read it.
 		self._decode_graph_captures = 0
-		# Prefill MoE mode of the most recent prefill entry; see
-		# _desired_phase_key("decode").
-		self._prefill_moe_mode_in_effect = None
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -9995,13 +9992,11 @@ class BatchGenWorker:
 		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
 		# the runtime decode path applies to its own estimate, so the padded MoE
 		# buffers are already sized for the largest batch that can be admitted.
-		# This decode entry precedes any prefill entry, so the worker's record
-		# of the prefill mode these instances are built for must be primed
-		# here: the decode phase key carries it, and a None here against the
-		# startup mode below would turn the resumable decode exit into RETIRE,
-		# which leaves the resident shard mapped and OOMs the prefill build.
+		# This decode entry precedes any prefill entry, and that order needs
+		# no priming: the decode phase key derives its mode from the one
+		# server constant, so the later resumable decode exit compares equal
+		# whatever entry order the startup used.
 		startup_prefill_mode = self._server_prefill_moe_mode()
-		self._prefill_moe_mode_in_effect = startup_prefill_mode
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 
@@ -11415,8 +11410,6 @@ class BatchGenWorker:
 			PhaseEnterContext(comm=comm, max_num_seq=max_num_seq),
 		)
 		self._live_phase_key = desired
-		if desired.phase == "prefill":
-			self._prefill_moe_mode_in_effect = desired.prefill_moe_mode
 		if manager.holds_instance(desired.phase):
 			self._kept_phase_keys[desired.phase] = desired
 		else:
@@ -22869,13 +22862,21 @@ class BatchGenWorker:
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
-		# Decode graph state belongs to the decode instance that captured it.
-		# A held decode instance replays those graphs on its next activation
-		# (capture-once), so freeing the live prefill model must not drop
-		# them; they go when the decode instance itself is retired, whose
-		# phase_exit clears the manager's hold before this runs.
-		if not self.parallel_manager.holds_instance("decode"):
-			self._release_decode_graph_state()
+		# Deep free is the model's retirement, and no held instance may pin
+		# memory past it: a SUSPEND never reaches here, and the RETIRE path
+		# retires every kept instance first (_retire_kept_phase_instances).
+		# A decode hold still present would keep captured graphs and the
+		# resident shard mapped under the next model build and OOM it (the
+		# K3.1 4-node H20 startup failure), so it is refused by name, not
+		# silently preserved.
+		for held_phase in PHASES:
+			if self.parallel_manager.holds_instance(held_phase):
+				raise RuntimeError(
+					f"Rank {self.rank}: deep_free_model_memory with a held "
+					f"{held_phase} instance; a hold never outlives the model "
+					"it references — retire it before the deep free"
+				)
+		self._release_decode_graph_state()
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)

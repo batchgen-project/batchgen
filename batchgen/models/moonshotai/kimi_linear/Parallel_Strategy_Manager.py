@@ -1882,9 +1882,35 @@ class KimiLinearParallelStrategyManager:
     #  Model build                                                        #
     # ------------------------------------------------------------------ #
 
+    def _require_no_held_instances_for_build(self) -> None:
+        """A new model skeleton never coexists with a held phase instance.
+
+        A kept instance references the previous model and pins its device
+        memory (resident shard, captured decode graphs, streamed buffers);
+        building the next skeleton over that pin is what OOMed the K3.1
+        4-node H20 startup. The holder must be retired
+        (``phase_exit(..., RETIRE)``) before any rebuild.
+        """
+        held = [
+            phase
+            for phase, instance in (
+                ("prefill", self.prefill_instance),
+                ("decode", self.decode_instance),
+            )
+            if instance is not None
+        ]
+        if held:
+            raise RuntimeError(
+                f"Rank {self.rank}: _build_model while holding "
+                f"{' and '.join(held)} instance(s) of the previous model; "
+                "a hold never outlives the model it references — retire it "
+                "before building a new skeleton"
+            )
+
     def _build_model(self):
         from .model import KimiLinearForCausalLM
 
+        self._require_no_held_instances_for_build()
         start = time.perf_counter()
         cfg = self.loaded_model_config
         device = self.engine_config.Basic_Config.device_torch
