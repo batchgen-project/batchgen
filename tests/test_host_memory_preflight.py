@@ -229,8 +229,9 @@ def test_weights_come_from_the_distributed_store_config(monkeypatch, tmp_path):
         cache_dir=None,
         distributed_weight_config=store_config,
     )
+    # No residency, default transport: mapped in place, host_rdma pins all.
     weights, source = resolve_weights_bytes(args)
-    assert source == "distributed-store"
+    assert source == "distributed-store-mapped-host_rdma"
     assert weights == 780000000000
 
 
@@ -286,8 +287,10 @@ def _stub_sources(monkeypatch):
     )
     monkeypatch.setattr(
         preflight,
-        "resolve_weights_bytes",
-        lambda args: (INCIDENT_WEIGHTS, "host-weight-envelope"),
+        "resolve_host_weights",
+        lambda args: preflight.HostWeights(
+            INCIDENT_WEIGHTS, INCIDENT_WEIGHTS, "host-weight-envelope"
+        ),
     )
     # The GPU block is print-only and never decides anything here.
     monkeypatch.setattr(preflight, "_log_gpu_plan", lambda args: None)
@@ -344,3 +347,110 @@ def test_preflight_refuses_an_undefined_per_node_rank_count(monkeypatch):
         run_host_memory_preflight(
             _preflight_args(700, world_size=8, nnodes=3)
         )
+
+
+# GB300 two-tray K3.1 node store (2026-11-10, node0.json): replicated tensors
+# plus the 448 experts this node owns, 92 MoE layers x 448 x 17,547,264 B.
+GB300_STORE_BYTES = 837_989_344_256
+GB300_REPLICATED_BYTES = 114_761_311_232
+GB300_MEM_TOTAL = 1_002_291_648 * 1024
+
+
+def _store_config(tmp_path, **fields):
+    config = {
+        "node_rank": 0, "node_ips": ["a", "b"], "workers": 4,
+        "store_path": "/data/store.bin", "metadata_path": "m.tsv",
+        "daemon_socket": "s", "summary_path": "sum.json",
+        "store_bytes": GB300_STORE_BYTES,
+        "replicated_bytes": GB300_REPLICATED_BYTES,
+        "module_bytes": 17_547_264, "worker_sharded": True,
+    }
+    config.update(fields)
+    path = tmp_path / "node0.json"
+    path.write_text(__import__("json").dumps(config))
+    return SimpleNamespace(
+        model="moonshotai/Kimi-K3.1-Pro", cache_dir=None,
+        distributed_weight_config=path,
+    )
+
+
+def test_an_unstaged_local_store_commits_only_its_pinned_expert_region(tmp_path):
+    weights = preflight.resolve_host_weights(
+        _store_config(tmp_path, transport="local", store_residency=None)
+    )
+    expert_region = GB300_STORE_BYTES - GB300_REPLICATED_BYTES
+    assert expert_region == 92 * 448 * 17_547_264
+    assert weights.resident_bytes == expert_region
+    # mapped in place: nothing is copied through the page cache
+    assert weights.streamed_bytes == 0
+    plan = build_plan(
+        mem_total_bytes=GB300_MEM_TOTAL,
+        weights_bytes=weights.resident_bytes,
+        host_kv_bytes=64 * GIB,
+        local_world_size=4,
+        weights_source=weights.source,
+        streamed_bytes=weights.streamed_bytes,
+    )
+    assert plan.transient_bytes == 4 * 19 * GIB
+    assert plan.fits
+
+
+def test_a_staged_store_is_shmem_and_streams_through_the_page_cache(tmp_path):
+    weights = preflight.resolve_host_weights(
+        _store_config(
+            tmp_path, transport="local", store_residency="run",
+            store_staging_dir="/dev/shm/batchgen-weight-stores",
+        )
+    )
+    assert weights.resident_bytes == GB300_STORE_BYTES
+    assert weights.streamed_bytes == GB300_STORE_BYTES
+    plan = build_plan(
+        mem_total_bytes=GB300_MEM_TOTAL,
+        weights_bytes=weights.resident_bytes,
+        host_kv_bytes=64 * GIB,
+        local_world_size=4,
+        weights_source=weights.source,
+        streamed_bytes=weights.streamed_bytes,
+    )
+    # The same store copied into a tmpfs does not fit this node.
+    assert plan.transient_bytes == 4 * 19 * GIB + preflight._PAGE_CACHE_SLACK_CAP_BYTES
+    assert not plan.fits
+
+
+@pytest.mark.parametrize("transport, expect_whole", [
+    ("host_rdma", True), ("hierarchical_gdr", False), ("local", False),
+])
+def test_an_unstaged_store_commits_what_its_transport_pins(
+    tmp_path, transport, expect_whole,
+):
+    weights = preflight.resolve_host_weights(
+        _store_config(tmp_path, transport=transport)
+    )
+    assert weights.resident_bytes == (
+        GB300_STORE_BYTES if expect_whole
+        else GB300_STORE_BYTES - GB300_REPLICATED_BYTES
+    )
+    assert weights.streamed_bytes == 0
+
+
+def test_a_checkpoint_region_still_streams_every_byte(monkeypatch):
+    monkeypatch.setattr(
+        preflight, "_checkpoint_index_bytes", lambda cache_dir: 705 * GIB
+    )
+    weights = preflight.resolve_host_weights(SimpleNamespace(
+        model="zai-org/GLM-5.3-FP8", cache_dir="/ckpt",
+        distributed_weight_config=None,
+    ))
+    assert (weights.resident_bytes, weights.streamed_bytes) == (705 * GIB, 705 * GIB)
+    # The incident's two configurations keep their verdicts through the
+    # resolved path: 700 GiB host KV served, 796 GiB was OOM-killed.
+    for host_kv, fits in ((700, True), (796, False)):
+        plan = build_plan(
+            mem_total_bytes=INCIDENT_MEM_TOTAL,
+            weights_bytes=weights.resident_bytes,
+            host_kv_bytes=host_kv * GIB,
+            local_world_size=INCIDENT_RANKS,
+            weights_source=weights.source,
+            streamed_bytes=weights.streamed_bytes,
+        )
+        assert plan.fits is fits

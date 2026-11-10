@@ -53,15 +53,18 @@ _PER_RANK_TRANSIENT_BYTES = 19 * GIB
 # It is calibrated to that window, not measured on its own, and the meminfo
 # sampler the bug log mentions is what would sharpen it.
 #
-# The slack is capped by the weight bytes themselves: the page cache this term
-# mostly stands for is the checkpoint streaming through it, which can never
-# exceed the checkpoint's size, so a small model on a small-memory node is not
-# refused by a slack calibrated on a 700-GiB-class checkpoint.
+# The slack is capped by the bytes that stream through the page cache into a
+# separate resident region: the page cache this term mostly stands for is
+# that copy (the checkpoint filling the parameter-server region, or a store
+# source filling its tmpfs staging copy), which can never exceed the bytes
+# copied, so a small model on a small-memory node is not refused by a slack
+# calibrated on a 700-GiB-class checkpoint, and a store mapped in place, which
+# copies nothing, carries none.
 _PAGE_CACHE_SLACK_CAP_BYTES = 384 * GIB
 
 
-def _page_cache_slack_bytes(weights_bytes: int) -> int:
-    return min(_PAGE_CACHE_SLACK_CAP_BYTES, max(0, weights_bytes))
+def _page_cache_slack_bytes(streamed_bytes: int) -> int:
+    return min(_PAGE_CACHE_SLACK_CAP_BYTES, max(0, streamed_bytes))
 
 _PLAN_TAG = "[MEM-PLAN host]"
 _GPU_PLAN_TAG = "[MEM-PLAN gpu]"
@@ -179,12 +182,17 @@ def build_plan(
     host_kv_bytes: int,
     local_world_size: int,
     weights_source: str,
+    streamed_bytes: Optional[int] = None,
 ) -> HostMemoryPlan:
     """Assemble the plan. Pure arithmetic: every input is already resolved.
 
     ``host_kv_bytes`` is the whole host KV budget.  A DSA model's auxiliary
     pool is carved out of that same budget by ``DualHostKVCoordinator``, and
     so is the prefix-cache index, so neither is a separate term here.
+    ``weights_bytes`` is the host memory the weights hold that the kernel
+    cannot reclaim; ``streamed_bytes`` the bytes copied through the page cache
+    into that region at load (None: the weights themselves, as for a region
+    filled from a checkpoint).
     """
 
     if mem_total_bytes <= 0:
@@ -197,9 +205,11 @@ def build_plan(
             f"local world size reported as {local_world_size}; refusing to "
             "plan host memory for an empty cohort"
         )
+    if streamed_bytes is None:
+        streamed_bytes = weights_bytes
     transient_bytes = (
         _PER_RANK_TRANSIENT_BYTES * local_world_size
-        + _page_cache_slack_bytes(weights_bytes)
+        + _page_cache_slack_bytes(streamed_bytes)
     )
     return HostMemoryPlan(
         mem_total_bytes=mem_total_bytes,
@@ -263,15 +273,61 @@ def _checkpoint_index_bytes(cache_dir: Optional[Path]) -> Optional[int]:
         return None
 
 
-def resolve_weights_bytes(server_args: object) -> Tuple[int, str]:
-    """Host weight footprint this launch reserves, and where the number is from.
+@dataclass(frozen=True)
+class HostWeights:
+    """What the weights of one launch hold in this node's host memory.
+
+    ``resident_bytes``: host memory the kernel cannot reclaim (anonymous or
+    tmpfs shmem, or pinned file pages). ``streamed_bytes``: bytes copied
+    through the page cache into a separate resident region at load.
+    """
+
+    resident_bytes: int
+    streamed_bytes: int
+    source: str
+
+
+# Distributed-store transports that pin only the node's routed experts (each
+# worker its own EP range, and the hierarchical source its slot, both inside
+# the node's expert region); host_rdma pins the whole store.
+_EXPERT_REGION_PIN_TRANSPORTS = ("hierarchical_gdr", "local")
+
+
+def _distributed_store_weights(config_path) -> HostWeights:
+    """Host memory of a distributed node store, by residency and transport.
+
+    Staged (``store_residency`` set): the server copies ``store.bin`` into a
+    tmpfs, so the whole store is shmem and the copy streams the source through
+    the page cache. Unstaged (no residency): the store file is mapped in
+    place; nothing is copied, and the non-reclaimable part is what the workers
+    pin -- the whole store under host_rdma, the expert region
+    (``store_bytes - replicated_bytes``) under hierarchical_gdr and local. The
+    unpinned replicated prefix stays reclaimable page cache.
+    """
+
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    store_bytes = int(config["store_bytes"])
+    if config.get("store_residency") is not None:
+        return HostWeights(store_bytes, store_bytes, "distributed-store-staged")
+    transport = config.get("transport", "host_rdma")
+    if transport in _EXPERT_REGION_PIN_TRANSPORTS:
+        pinned = store_bytes - int(config["replicated_bytes"])
+    else:
+        pinned = store_bytes
+    return HostWeights(pinned, 0, f"distributed-store-mapped-{transport}")
+
+
+def resolve_host_weights(server_args: object) -> HostWeights:
+    """Host weight footprint this launch commits, and where the number is from.
 
     Never stats the weight files; every source is a number the loader already
     has, in the order of how exactly it describes what will be resident:
 
-    * ``--distributed-weight-config``: the node config's ``store_bytes``, the
-      exact size of this node's share of the compact store, already validated
-      by ``prepare_server_args``.
+    * ``--distributed-weight-config``: from the node config's ``store_bytes``
+      (this node's share of the compact store: the replicated tensors plus
+      the experts this node owns), its residency and its transport, already
+      validated by ``prepare_server_args`` (``_distributed_store_weights``).
     * the checkpoint's safetensors index: ``metadata.total_size``, the exact
       byte total the parameter server fills its region with.  This is the
       resident figure -- the region is an anonymous memfd created at the
@@ -283,15 +339,16 @@ def resolve_weights_bytes(server_args: object) -> Tuple[int, str]:
       ``_config_hugepages`` reserves against.  It is an upper bound (it
       carries the table's buffer), which is the safe direction to plan in
       when the exact total is not on this machine.
+
+    The last two fill their region from the checkpoint, so every byte also
+    streams through the page cache.
     """
 
     config_path = getattr(server_args, "distributed_weight_config", None)
     if config_path is not None:
-        # The node config is validated by ``prepare_server_args`` before this
-        # runs; ``store_bytes`` is read directly so this launch-layer module
-        # does not import the model package.
-        with open(config_path, "r", encoding="utf-8") as handle:
-            return int(json.load(handle)["store_bytes"]), "distributed-store"
+        # The node config is read directly so this launch-layer module does
+        # not import the model package.
+        return _distributed_store_weights(config_path)
 
     model = str(getattr(server_args, "model", ""))
     index_bytes = _checkpoint_index_bytes(
@@ -299,11 +356,19 @@ def resolve_weights_bytes(server_args: object) -> Tuple[int, str]:
         or (Path(model) if Path(model).is_dir() else None)
     )
     if index_bytes is not None:
-        return index_bytes, "checkpoint-index"
+        return HostWeights(index_bytes, index_bytes, "checkpoint-index")
 
     from batchgen.server.process_utils import get_model_byte_size
 
-    return int(get_model_byte_size(model)), "host-weight-envelope"
+    envelope = int(get_model_byte_size(model))
+    return HostWeights(envelope, envelope, "host-weight-envelope")
+
+
+def resolve_weights_bytes(server_args: object) -> Tuple[int, str]:
+    """The resident weight bytes and their source (``resolve_host_weights``)."""
+
+    weights = resolve_host_weights(server_args)
+    return weights.resident_bytes, weights.source
 
 
 def _log_gpu_plan(server_args: object) -> None:
@@ -362,13 +427,14 @@ def run_host_memory_preflight(server_args: object) -> HostMemoryPlan:
             "--host-kv-cache-size is unset at the host memory plan; it is "
             "required before any host KV pool is created"
         )
-    weights_bytes, weights_source = resolve_weights_bytes(server_args)
+    weights = resolve_host_weights(server_args)
     plan = build_plan(
         mem_total_bytes=read_mem_total_bytes(),
-        weights_bytes=weights_bytes,
+        weights_bytes=weights.resident_bytes,
         host_kv_bytes=int(host_kv_gib) * GIB,
         local_world_size=world_size // nnodes,
-        weights_source=weights_source,
+        weights_source=weights.source,
+        streamed_bytes=weights.streamed_bytes,
     )
     # One block, from the server process only: every worker would print the
     # same machine's plan, and this runs before the workers exist.
@@ -383,8 +449,10 @@ __all__ = [
     "GIB",
     "HostMemoryPlan",
     "HostMemoryPlanError",
+    "HostWeights",
     "build_plan",
     "read_mem_total_bytes",
+    "resolve_host_weights",
     "resolve_weights_bytes",
     "run_host_memory_preflight",
 ]
