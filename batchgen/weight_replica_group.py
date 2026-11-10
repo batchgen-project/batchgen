@@ -245,35 +245,36 @@ def derive_frame_plan(task: Mapping[str, Sequence[str]]) -> FramePlan | None:
             continue
         layers: list[int] = []
         counts: list[int] = []
-        experts_seen: list[int | None] = []
         for name in names:
             parsed = _parse_module_name(module_type, name)
             if parsed is None:
                 return None
             layer, expert = parsed
             if not layers or layer != layers[-1]:
+                if layers and layer < layers[-1]:
+                    return None  # layers out of order: not a frame schedule
                 layers.append(layer)
                 counts.append(0)
-            elif layers.count(layer) > 1:
-                return None  # a layer resumed after another layer: not frames
             counts[-1] += 1
-            experts_seen.append(expert)
-        if len(set(layers)) != len(layers):
-            return None
         if len(set(counts)) != 1:
             return None  # ragged frames
         frame_size[module_type] = counts[0]
         layer_sequences[module_type] = layers
-        for name in names:
-            layer, expert = _parse_module_name(module_type, name)  # type: ignore[misc]
-            position[name] = (layers.index(layer), expert)
     if not frame_size:
         return None
-    sequences = {tuple(seq) for seq in layer_sequences.values()}
-    if len(sequences) != 1:
-        return None  # types disagree on the layer sequence
+    # A type may cover only part of the pass (GLM's first dense layers have
+    # attention but no experts): the frame sequence is the ordered union, and
+    # a frame simply has no record of an absent type.
+    union = sorted({layer for seq in layer_sequences.values() for layer in seq})
+    union_index = {layer: pos for pos, layer in enumerate(union)}
+    for module_type, names in task.items():
+        if not names:
+            continue
+        for name in names:
+            layer, expert = _parse_module_name(module_type, name)  # type: ignore[misc]
+            position[name] = (union_index[layer], expert)
     return FramePlan(
-        layer_sequence=next(iter(sequences)),
+        layer_sequence=tuple(union),
         frame_size=dict(frame_size),
         position=position,
     )

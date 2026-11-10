@@ -424,8 +424,25 @@ void HtoD_Engine::install_replica_plan(
     runtime->records_per_frame = records_per_frame;
     runtime->owned_per_position = owned_per_position;
     runtime->block_backing = std::move(control_block);
+    runtime->total_per_position.assign(layers_per_pass, 0);
     for (const auto& module : modules) {
         runtime->modules[module.module] = module;
+        if (module.layer_position >= layers_per_pass) {
+            throw std::runtime_error(
+                "module " + module.module + " is outside the pass layout");
+        }
+        ++runtime->total_per_position[module.layer_position];
+    }
+    for (uint64_t pos = 0; pos < layers_per_pass; ++pos) {
+        if (runtime->total_per_position[pos] == 0 ||
+            runtime->total_per_position[pos] <
+                runtime->owned_per_position[pos]) {
+            throw std::runtime_error(
+                "layer position " + std::to_string(pos) +
+                " accounts " + std::to_string(runtime->total_per_position[pos]) +
+                " records against " +
+                std::to_string(runtime->owned_per_position[pos]) + " owned");
+        }
     }
     for (const auto& [module_type, segments] : peer_segments) {
         if (segments.size() != static_cast<size_t>(group_size)) {
@@ -507,7 +524,8 @@ void HtoD_Engine::replica_mark_owned_landed_(uint64_t flat_frame) {
 void HtoD_Engine::replica_mark_terminal_(uint64_t flat_frame) {
     ReplicaPlanRuntime& plan = *this->replica_plan_;
     const uint32_t terminal = ++plan.terminal[flat_frame];
-    if (terminal == plan.records_per_frame) {
+    if (terminal == plan.total_per_position[flat_frame %
+                                            plan.layers_per_pass]) {
         plan.block.advance(plan.member_index,
                            ReplicaControlBlock::Barrier::B, flat_frame);
         plan.terminal.erase(flat_frame);

@@ -226,6 +226,10 @@ class HtoD_Engine {
         uint64_t layers_per_pass = 0;
         uint32_t records_per_frame = 0;
         std::vector<uint32_t> owned_per_position;
+        // Installed records per layer position; a frame of a partly
+        // covered pass (GLM dense-prefix layers) has fewer than
+        // records_per_frame live records.
+        std::vector<uint32_t> total_per_position;
         std::unordered_map<std::string, ReplicaModuleInstall> modules;
         ReplicaControlBlock block;
         torch::Tensor block_backing;  // keep-alive of the shared mapping view

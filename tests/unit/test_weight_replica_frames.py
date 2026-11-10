@@ -37,9 +37,38 @@ def test_glm_shaped_task_derives_frames():
     assert plan.position["attn_3"] == (3, None)
 
 
-def test_mismatched_layer_sequence_yields_none():
+def test_partial_coverage_unions_the_layer_sequence():
+    # GLM's first dense layers carry attention but no experts: the pass is
+    # the ordered union and dense frames simply hold fewer records.
     task = _glm_task()
     task["attn"] = ["attn_0", "attn_1", "attn_2", "attn_9"]
+    plan = derive_frame_plan(task)
+    assert plan is not None
+    assert plan.layer_sequence == (0, 1, 2, 3, 9)
+    assert plan.position["attn_9"] == (4, None)
+    assert plan.position["routed_expert_3_0"] == (3, 0)
+
+
+def test_glm_dense_prefix_shape_derives_frames():
+    task = {
+        "attn": [f"attn_{l}" for l in range(4)],
+        "shared_expert": ["shared_expert_3"],
+        "routed_expert": [f"routed_expert_3_{e}" for e in range(8)],
+    }
+    plan = derive_frame_plan(task)
+    assert plan is not None
+    assert plan.layer_sequence == (0, 1, 2, 3)
+    assert plan.frame_size == {
+        "attn": 1,
+        "shared_expert": 1,
+        "routed_expert": 8,
+    }
+    assert plan.position["routed_expert_3_5"] == (3, 5)
+
+
+def test_out_of_order_layers_yield_none():
+    task = _glm_task()
+    task["attn"] = ["attn_1", "attn_0", "attn_2", "attn_3"]
     assert derive_frame_plan(task) is None
 
 
