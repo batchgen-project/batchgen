@@ -135,13 +135,8 @@ class KimiLinearParallelStrategyManager:
                 False,
             )
         )
-        if self._distributed_weight_sharded and (
-            not self._is_k3 or world_size not in (16, 32)
-        ):
-            raise ValueError(
-                "distributed host weights require K3 with world_size=16 "
-                "(2 nodes) or world_size=32 (4 nodes)"
-            )
+        if self._distributed_weight_sharded and not self._is_k3:
+            raise ValueError("distributed host weights require K3")
         # Weight transport (initializer-set from the distributed store config,
         # no env var). "host_rdma" is the validated default in which every rank
         # pulls its own 112-expert shard; "hierarchical_gdr" pulls on eight
@@ -225,23 +220,50 @@ class KimiLinearParallelStrategyManager:
         # ordered against attention's all-reduces when ranks reach the
         # prefetch point at slightly different times.
         self._weight_tp_group = None
-        # Hierarchical GDR adds a third communicator family: eight cross-node
-        # groups, one per local TP slot, each carrying that slot's 112-expert
-        # shard from its single source rank to the remaining nodes.
+        # Streamed prefill span S (planner ``k3_prefill_stream_span``): the S
+        # ranks of one span hold one copy of a layer's routed experts between
+        # them, each streaming ``experts / S`` (the experts it owns as a rank
+        # of the span), and gather the latent rows of their S / G DP ranks.
+        # S == G is the node-local TP8 layout of the 8-GPU hosts; S > G spans
+        # several DP ranks (GB300 trays, TP4 on one B300). 0: no streamed
+        # layout is planned (G == 1, or the 48B).
+        self._stream_span = int(getattr(
+            engine_config.Module_Batching_Config, "k3_prefill_stream_span", 0
+        ) or 0)
+        if self._stream_span:
+            if (
+                self._stream_span % G
+                or world_size % self._stream_span
+                or self.num_experts % self._stream_span
+            ):
+                raise ValueError(
+                    f"k3_prefill_stream_span {self._stream_span} must be a "
+                    f"multiple of attention_group_size {G}, divide "
+                    f"world_size {world_size} and divide the "
+                    f"{self.num_experts} routed experts"
+                )
+            self._stream_span_rank = global_rank % self._stream_span
+        else:
+            self._stream_span_rank = 0
+        self._stream_span_group = None  # torch NCCL group, built at configure
+        # Hierarchical GDR adds a third communicator family: one cross-span
+        # group per span slot, each carrying that slot's expert shard from its
+        # single source rank to the same slot of every other span.
         self._cross_weight_group = None
         self._cross_weight_root = None
         self._cross_weight_source = False
         if self._hierarchical_gdr and not (
             self._distributed_weight_sharded
-            and world_size in (16, 32)
-            and self._attn_tp_size == 8
+            and self._stream_span
+            and world_size > self._stream_span
         ):
             raise ValueError(
-                "hierarchical_gdr weight transport is defined only for the "
-                "distributed K3 TP8/world16 or TP8/world32 topology; got "
+                "hierarchical_gdr weight transport replicates one stream "
+                "span's experts to the other spans; it needs distributed host "
+                "weights and more than one span; got "
                 f"distributed_weight_sharded={self._distributed_weight_sharded}, "
                 f"world_size={world_size}, "
-                f"attention_group_size={self._attn_tp_size}"
+                f"k3_prefill_stream_span={self._stream_span}"
             )
         if self._hierarchical_gdr:
             self._require_hierarchical_gdr_runtime()
@@ -463,19 +485,19 @@ class KimiLinearParallelStrategyManager:
                 "projections; with TP-sharded projections use 'streamed_sp8' "
                 "or 'resident_ep'"
             )
-        if (
-            getattr(self, "_distributed_weight_sharded", False)
-            and value != "streamed_sp8"
-            and not (value == "resident_ep" and self._resident_ep_built)
-        ):
-            # resident_ep is legal once the shard exists: it was built from
-            # this node's ingress store and the resident layer never requests
-            # an expert by name, so no cross-shard fetch can happen.
+        if getattr(self, "_distributed_weight_sharded", False) and value == "streamed":
+            # A host stores its own ranks' EP experts, so the resident shard
+            # and the span-owned streamed shard are local; the legacy
+            # replicated path would request every expert by name.
             raise ValueError(
                 "distributed K3 host weights require k3_prefill_moe_mode="
-                "'streamed_sp8' (the legacy replicated path would request "
-                "experts outside this worker's ingress shard); 'resident_ep' "
-                "is accepted only after the resident EP shard has been built"
+                "'streamed_sp8' or 'resident_ep' (the legacy replicated path "
+                "would request experts outside this host's store)"
+            )
+        if value == "streamed_sp8" and not getattr(self, "_stream_span", 0):
+            raise ValueError(
+                "k3_prefill_moe_mode='streamed_sp8' needs a planned "
+                "k3_prefill_stream_span (a K3 DP-attention profile row)"
             )
         self._prefill_moe_mode = value
 
@@ -491,7 +513,29 @@ class KimiLinearParallelStrategyManager:
         holds a column slice and prefill must go through ``streamed_sp8``,
         which rebuilds the full projections per phase. Distributed host
         weights force ``streamed_sp8`` for the same reason plus ingress.
+
+        The server option ``--prefill-moe-mode`` (``Basic_Config.
+        prefill_moe_mode``) replaces that default for every wave; it is
+        validated here, at construction, so a mode the topology cannot run
+        is refused before any model is built.
         """
+        requested = getattr(
+            self.engine_config.Basic_Config, "prefill_moe_mode", None
+        )
+        if requested is not None:
+            previous = getattr(self, "_prefill_moe_mode", None)
+            self.set_prefill_moe_mode(requested)
+            mode = self._prefill_moe_mode
+            self._prefill_moe_mode = previous
+            if mode == "resident_ep" and (
+                self._stream_all_modules or self._attn_tp_size <= 1
+            ):
+                raise ValueError(
+                    "--prefill-moe-mode resident_ep needs K3's resident TP "
+                    "attention layout (attention_group_size > 1, "
+                    "stream_all_modules off)"
+                )
+            return mode
         if self._distributed_weight_sharded or self._latent_tp_planned:
             return "streamed_sp8"
         return "streamed"
@@ -633,11 +677,26 @@ class KimiLinearParallelStrategyManager:
         return selected
 
     def streamed_sp8_requires_global_pass_alignment(self):
-        """Whether every node must join each streamed prefill model pass."""
-        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
+        """Whether every rank must join each streamed prefill model pass.
+
+        True when a pass's MoE collectives reach beyond one DP rank: the span
+        gathers the latent rows of several DP ranks (S > G), or hierarchical
+        GDR broadcasts weights across spans.
+        """
+        return self.prefill_uses_streamed_sp8() and (
+            self._hierarchical_gdr or self._stream_span > self._attn_tp_size
+        )
 
     def run_streamed_sp8_transport_only_prefill(self, num_passes):
-        """Join hierarchical weight broadcasts for passes with no local rows."""
+        """Join the MoE collectives of passes this DP rank has no rows for.
+
+        Each MoE layer runs its streamed forward with zero local rows: it
+        loads the layer (ingress, and the hierarchical source broadcast),
+        joins the span's latent gather and FP32 reduce-scatter when another
+        DP rank of the span has rows, and opens the cross-span launch gate,
+        in the same per-layer order as a populated pass. Attention, the
+        shared expert and logits stay inside the DP rank and are skipped.
+        """
         num_passes = int(num_passes)
         if num_passes < 0:
             raise ValueError("streamed-SP8 transport-only pass count must be >= 0")
@@ -645,16 +704,37 @@ class KimiLinearParallelStrategyManager:
             return
         if not self.streamed_sp8_requires_global_pass_alignment():
             raise RuntimeError(
-                "streamed-SP8 transport-only prefill is only valid for "
-                "hierarchical GDR"
+                "streamed-SP8 transport-only prefill is only valid when a "
+                "pass's MoE collectives reach beyond the DP rank"
             )
-        if self._streamed_sp8_buffer is None:
+        if self._streamed_sp8_buffer is None or self.model is None:
             raise RuntimeError(
                 "streamed-SP8 transport-only prefill requires an initialized "
                 "layer buffer"
             )
+        hidden = int(self.loaded_model_config.hidden_size)
+        device = self.engine_config.Basic_Config.device_torch
+        empty = torch.empty((0, hidden), dtype=torch.bfloat16, device=device)
+        buffer = self._streamed_sp8_buffer
         for _ in range(num_passes):
-            self._streamed_sp8_buffer.participate_empty_prefill_pass()
+            if buffer.has_pending():
+                raise RuntimeError(
+                    "transport-only streamed-SP8 pass started with a pending layer"
+                )
+            for layer in self.model.model.layers:
+                moe = getattr(layer, "block_sparse_moe", None)
+                streamed = (
+                    getattr(moe, "_streamed_sp8_moe", None)
+                    if moe is not None else None
+                )
+                if streamed is None:
+                    continue
+                streamed.forward(empty, moe.gate, 0)
+                buffer.allow_cross_launch()
+            if buffer.has_pending():
+                raise RuntimeError(
+                    "transport-only streamed-SP8 pass left a pending layer"
+                )
 
     def run_resident_ep_collective_only_prefill(self):
         """Join one resident-EP prefill pass with zero local rows.
@@ -1083,10 +1163,10 @@ class KimiLinearParallelStrategyManager:
                 continue
             for e_idx in range(len(moe.experts)):
                 if self.prefill_uses_streamed_sp8():
-                    start = self._attn_tp_rank * (
-                        len(moe.experts) // self._attn_tp_size
+                    start = self._stream_span_rank * (
+                        len(moe.experts) // self._stream_span
                     )
-                    end = start + len(moe.experts) // self._attn_tp_size
+                    end = start + len(moe.experts) // self._stream_span
                     if not (start <= e_idx < end):
                         continue
                 task["routed_expert"].append(
@@ -1205,10 +1285,15 @@ class KimiLinearParallelStrategyManager:
                     "experts, EP32 collectives, compact routed scratch"
                 )
         elif self.prefill_uses_streamed_sp8():
-            if self._stream_all_modules or self._attn_tp_size != 8:
+            if (
+                self._stream_all_modules
+                or self._attn_tp_size <= 1
+                or not self._stream_span
+            ):
                 raise RuntimeError(
-                    "streamed-SP8 prefill requires K3's resident TP8 attention "
-                    "layout (attention_group_size=8, stream_all_modules=False)"
+                    "streamed-SP8 prefill requires K3's resident TP attention "
+                    "layout (attention_group_size>1, stream_all_modules=False) "
+                    "and a planned k3_prefill_stream_span"
                 )
             self._set_resident_ep_prefill_enabled(False)
             self._release_resident_ep_decode()
@@ -1217,10 +1302,12 @@ class KimiLinearParallelStrategyManager:
             if self.rank == 0:
                 logging.info(
                     "[K3_PREFILL_MOE] streamed_sp8 enabled: transport=%s, "
-                    "112 experts/shard, no TP8 weight all-gather, "
-                    "node-local latent gather/FP32 reduce-scatter, "
-                    "zero cross-node MoE activation collectives",
+                    "TP%d attention, stream span %d (%d experts/shard), "
+                    "latent gather/FP32 reduce-scatter over the span",
                     self._distributed_weight_transport,
+                    self._attn_tp_size,
+                    self._stream_span,
+                    self.num_experts // self._stream_span,
                 )
         else:
             self._release_streamed_sp8_prefill()
@@ -1552,8 +1639,9 @@ class KimiLinearParallelStrategyManager:
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
-            tp_group=self._weight_tp_group,
-            tp_rank=self._attn_tp_rank,
+            span_group=self._stream_span_group,
+            span_rank=self._stream_span_rank,
+            span_size=self._stream_span,
             tp_size=self._attn_tp_size,
             num_experts=cfg.n_routed_experts,
             intermediate_size=cfg.moe_intermediate_size,
@@ -2294,41 +2382,64 @@ class KimiLinearParallelStrategyManager:
             grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
             if g == self._attn_tp_group_id:
                 self._weight_tp_group = grp
+        self._build_stream_span_group()
         self._build_cross_weight_group()
         # Every family is up; later rebuilds reuse them (see the guard above),
         # and the signature records the topology they belong to.
         self._attn_tp_groups_built = True
         self._attn_tp_group_signature = signature
 
-    def _build_cross_weight_group(self):
-        """Build the eight cross-node weight groups (hierarchical GDR only).
+    def _build_stream_span_group(self):
+        """Build the streamed-prefill span groups.
 
-        COLLECTIVE, like the two node-local families above: every rank creates
-        all eight groups in the same order and keeps the one it belongs to.
-        They are created LAST so that the creation order of the attention and
+        COLLECTIVE. With S == G the span is the DP rank, so the node-local
+        weight group above serves it and no group is created: the creation
+        order of every existing topology is unchanged. With S > G every rank
+        creates the ``world / S`` span groups in the same order and keeps
+        its own.
+        """
+        S = self._stream_span
+        if not S:
+            return
+        if S == self._attn_tp_size:
+            self._stream_span_group = self._weight_tp_group
+            return
+        import torch.distributed as dist
+
+        for span in range(self.world_size // S):
+            grp = dist.new_group(ranks=list(range(span * S, (span + 1) * S)))
+            if span == self.global_rank // S:
+                self._stream_span_group = grp
+
+    def _build_cross_weight_group(self):
+        """Build the cross-span weight groups (hierarchical GDR only).
+
+        COLLECTIVE, like the families above: every rank creates all ``S``
+        groups in the same order and keeps the one it belongs to. They are
+        created LAST so that the creation order of the attention and
         node-local weight groups is unchanged for host_rdma.
 
-        Group ``g`` is ``[g + n*8 for n in range(num_nodes)]`` — local TP slot
-        ``g`` on each node, i.e. exactly the ranks that need experts
-        ``[112g, 112(g+1))``. Its source is local slot ``g`` on node
-        ``(g * num_nodes) // 8``, so the eight sources spread evenly over the
-        nodes (two per node on four nodes, four per node on two nodes) and
-        every node drives an egress stream instead of one node fanning out all
-        896 experts.
+        Group ``g`` is ``[g + n*S for n in range(num_spans)]`` — span slot
+        ``g`` of every span, i.e. exactly the ranks that stream experts
+        ``[g*E/S, (g+1)*E/S)``. Its source is slot ``g`` of span
+        ``(g * num_spans) // S``, so the sources spread evenly over the spans
+        (two per span on four spans, four per span on two spans with S = 8)
+        and every span drives an egress stream instead of one fanning out
+        every expert.
         """
         if not self._hierarchical_gdr:
             return
         import torch.distributed as dist
 
-        G = self._attn_tp_size
-        num_nodes = self.world_size // G
-        for g in range(G):
+        S = self._stream_span
+        num_spans = self.world_size // S
+        for g in range(S):
             grp = dist.new_group(
-                ranks=[g + node * G for node in range(num_nodes)]
+                ranks=[g + span * S for span in range(num_spans)]
             )
-            if g == self._attn_tp_rank:
+            if g == self._stream_span_rank:
                 self._cross_weight_group = grp
-                self._cross_weight_root = ((g * num_nodes) // G) * G + g
+                self._cross_weight_root = ((g * num_spans) // S) * S + g
         self._cross_weight_source = (
             self.global_rank == self._cross_weight_root
         )

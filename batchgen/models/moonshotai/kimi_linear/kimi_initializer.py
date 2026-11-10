@@ -104,29 +104,31 @@ class KimiLinearInitializer:
             input_arguments, "distributed_weight_config", None
         )
         self.distributed_weight_sharded = bool(self.distributed_weight_config)
-        if self.distributed_weight_sharded and (
-            not self.is_k3 or self.world_size not in (16, 32)
-        ):
+        if self.distributed_weight_sharded and not self.is_k3:
             raise ValueError(
-                "K3 distributed host weights require model_type='kimi_k3' "
-                "and world_size=16 (2 nodes) or world_size=32 (4 nodes)"
+                "distributed host weights require model_type='kimi_k3'"
             )
         # Weight transport is selected in the distributed store config, not by
         # an env var. Re-reading the (small) JSON here keeps the allowed-value
         # check in the one loader that already validates the store.
         self.distributed_weight_transport = "host_rdma"
+        # Local GPUs per host of the distributed store (its "workers").
+        self.distributed_weight_workers = None
         if self.distributed_weight_sharded:
             from .distributed_weight_store import load_distributed_weight_config
 
             distributed_config = load_distributed_weight_config(
                 self.distributed_weight_config
             )
-            if distributed_config["num_nodes"] * 8 != self.world_size:
+            workers = int(distributed_config["workers"])
+            if distributed_config["num_nodes"] * workers != self.world_size:
                 raise ValueError(
                     "distributed weight config topology does not match "
                     f"world_size={self.world_size}: "
-                    f"num_nodes={distributed_config['num_nodes']}"
+                    f"num_nodes={distributed_config['num_nodes']} x "
+                    f"workers={workers}"
                 )
+            self.distributed_weight_workers = workers
             self.distributed_weight_transport = distributed_config["transport"]
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
@@ -136,23 +138,23 @@ class KimiLinearInitializer:
         self.engine_config = EngineConfig()
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        # M2b: decode head-parallel TP degree G (attention_group_size). A
-        # distributed K3 store is only valid with TP8: each node's eight
-        # workers own disjoint 112-expert ingress shards and the node-local
-        # group reconstructs the current layer.
-        requested_G = int(
-            os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1")
-        )
+        # DP-attention rank size G (attention_group_size): attention, KDA and
+        # the shared expert run TP-G inside one DP rank; routed experts run EP
+        # over the world. A distributed K3 store places one DP rank per host
+        # at most, so G defaults to the store's workers per host and an
+        # explicit G must divide it (a DP rank never spans hosts).
+        requested = os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE")
         if self.distributed_weight_sharded:
-            if requested_G != 8 and self.global_rank == 0:
-                logging.warning(
-                    "[K3] distributed host weights require attention_group_size=8; "
-                    "overriding requested G=%d",
-                    requested_G,
+            workers = self.distributed_weight_workers
+            G = workers if requested is None else int(requested)
+            if G <= 1 or workers % G:
+                raise ValueError(
+                    "distributed K3 host weights need a DP-attention rank size "
+                    f"G > 1 that divides the store's {workers} workers per "
+                    f"host; got BATCHGEN_KIMI_ATTENTION_GROUP_SIZE={requested}"
                 )
-            G = 8
         else:
-            G = requested_G
+            G = int(requested or "1")
         from batchgen.attention.mla import paged_decode, sparse_dispatch
 
         # A captured decode span runs the dense MLA kernel on every layer and,
@@ -175,6 +177,11 @@ class KimiLinearInitializer:
         )
         self.engine_config.Basic_Config.distributed_weight_transport = (
             self.distributed_weight_transport
+        )
+        # Server-level prefill MoE mode (--prefill-moe-mode); the PSM returns
+        # it as its default and validates it against the topology.
+        self.engine_config.Basic_Config.prefill_moe_mode = getattr(
+            input_arguments, "prefill_moe_mode", None
         )
         if self.global_rank == 0:
             logging.info(

@@ -75,22 +75,33 @@ def _psm_stub(**attrs):
     obj._prefill_moe_mode = "streamed_sp8"
     obj._latent_tp_planned = False
     obj._decode_graph = None
+    obj._stream_span = 8
+    obj.engine_config = type("_Config", (), {})()
+    obj.engine_config.Basic_Config = type("_Basic", (), {})()
+    obj.engine_config.Basic_Config.prefill_moe_mode = None
     for key, value in attrs.items():
         setattr(obj, key, value)
     return obj
 
 
-def test_distributed_weights_accept_resident_ep_only_after_the_shard_exists():
+def test_distributed_weights_accept_resident_ep_and_refuse_streamed():
+    # A host stores its own ranks' EP experts, so a resident shard is always
+    # local: resident_ep is accepted before the shard exists (the server
+    # option builds it at startup). Only the legacy replicated path, which
+    # requests every expert by name, is refused.
     psm = _psm_stub()
-    with pytest.raises(ValueError):
-        psm.set_prefill_moe_mode("resident_ep")
-    psm.set_prefill_moe_mode("streamed_sp8")
-    assert psm._prefill_moe_mode == "streamed_sp8"
-    psm._resident_ep_built = True
     psm.set_prefill_moe_mode("resident_ep")
     assert psm.prefill_uses_resident_ep()
-    with pytest.raises(ValueError):
+    psm.set_prefill_moe_mode("streamed_sp8")
+    assert psm._prefill_moe_mode == "streamed_sp8"
+    with pytest.raises(ValueError, match="streamed_sp8' or 'resident_ep"):
         psm.set_prefill_moe_mode("streamed")
+
+
+def test_streamed_sp8_needs_a_planned_stream_span():
+    psm = _psm_stub(_distributed_weight_sharded=False, _stream_span=0)
+    with pytest.raises(ValueError, match="k3_prefill_stream_span"):
+        psm.set_prefill_moe_mode("streamed_sp8")
 
 
 def test_release_decode_graph_drops_the_captured_graphs():

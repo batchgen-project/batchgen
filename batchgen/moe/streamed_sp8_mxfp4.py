@@ -1,29 +1,31 @@
-"""Layer-wise streamed SP8 MoE for Kimi-K3 MXFP4 prefill.
+"""Layer-wise streamed expert-parallel MoE for Kimi-K3 MXFP4 prefill.
 
-TP8 attention replicates token rows inside one node, and the eight TP slots of
-a node hold DISJOINT 112-expert shards of the layer.  The MoE is therefore
-expert-parallel inside the node and communicates activations nowhere else:
+TP-G attention replicates a DP rank's token rows on its G ranks. A stream span
+of S ranks (S a multiple of G: one DP rank on the 8-GPU hosts, several on
+GB300 trays) holds DISJOINT ``E/S``-expert shards of the layer, so the MoE is
+expert-parallel over the span:
 
     local row slice -> router + down-proj on the padded slice
-    -> node-local all_gather(latent, topk idx, topk weight)
-    -> this rank's 112 experts over ALL node rows (non-owned -> -1)
-    -> FP32 combine -> node-local reduce_scatter(SUM) -> this rank's rows
+    -> span all_gather(latent, topk idx, topk weight)
+    -> this rank's E/S experts over ALL span rows (non-owned -> -1)
+    -> FP32 combine -> span reduce_scatter(SUM) -> this rank's rows
     -> norm + up-proj -> caller's all_gather_rows restores replicated hidden
 
-Because the eight shards partition the 896 experts, every routed assignment of
-the node is computed on exactly one rank, and the FP32 reduce-scatter sums the
-eight disjoint partial latents.  The gathered latent is 3584-d, half the 7168
-hidden, and the collectives never leave the node.
+Because the S shards partition the experts, every routed assignment of the
+span is computed on exactly one rank, and the FP32 reduce-scatter sums the S
+disjoint partial latents. The gathered latent is 3584-d, half the 7168
+hidden. With S == G == 8 (the historical "SP8" layout) the collectives never
+leave the node.
 
-Expert ingress is sharded the same way: local TP rank ``g`` copies only its
-contiguous 112-expert shard from host into ``local``, and phase two of the
-prefetch copies that same shard into the ``compute`` buffer the grouped kernels
-read.  Nothing all-gathers weights: a rank never holds an expert it does not
-own, so one layer costs ~1.5 GiB/rank instead of ~12 GiB.
+Expert ingress is sharded the same way: span slot ``g`` copies only its
+contiguous shard from host into ``local``, and phase two of the prefetch
+copies that same shard into the ``compute`` buffer the grouped kernels read.
+Nothing all-gathers weights: a rank never holds an expert it does not own.
 
 Under the ``hierarchical_gdr`` transport the shard is fetched from host on one
-source rank per local TP slot and replicated GPU-to-GPU to the other three
-nodes over a dedicated cross-node group before that local-to-compute copy.
+source rank per span slot and replicated GPU-to-GPU to the same slot of the
+other spans over a dedicated cross-span group before that local-to-compute
+copy.
 """
 
 from __future__ import annotations
@@ -68,7 +70,13 @@ def _profile_mark(marks):
 
 
 class StreamedSP8LayerBuffer:
-    """Two reusable 112-expert MXFP4 shard buffers per GPU.
+    """Two reusable MXFP4 expert-shard buffers per GPU.
+
+    The ``span_size`` ranks of one stream span hold one copy of each layer's
+    routed experts between them: span slot ``span_rank`` streams experts
+    ``[span_rank * E / S, (span_rank + 1) * E / S)``. ``tp_size`` is the
+    DP-attention rank size G that splits a DP rank's rows; the span is a
+    whole number of DP ranks (S == G is the node-local TP8 layout).
 
     The two buffers are roles, not a ping-pong pair: ``local`` is the ingress
     target that host copies and the cross-node broadcast write, ``compute``
@@ -87,8 +95,9 @@ class StreamedSP8LayerBuffer:
         *,
         core_engine,
         device,
-        tp_group,
-        tp_rank: int,
+        span_group,
+        span_rank: int,
+        span_size: int,
         tp_size: int,
         num_experts: int,
         intermediate_size: int,
@@ -99,16 +108,25 @@ class StreamedSP8LayerBuffer:
         cross_root=None,
         cross_source: bool = False,
     ):
-        if tp_size <= 1 or num_experts % tp_size:
+        if (
+            tp_size <= 1
+            or span_size % tp_size
+            or num_experts % span_size
+            or not 0 <= span_rank < span_size
+        ):
             raise ValueError(
-                f"streamed SP8 requires num_experts divisible by TP size; "
-                f"got experts={num_experts}, tp_size={tp_size}"
+                "streamed SP8 requires a span that is a multiple of the TP "
+                "size and divides the experts, and a rank inside it; got "
+                f"experts={num_experts}, span_size={span_size}, "
+                f"span_rank={span_rank}, tp_size={tp_size}"
             )
         self.core_engine = core_engine
         self.device = device
-        self.tp_group = tp_group
-        self.tp_rank = int(tp_rank)
+        self.span_group = span_group
+        self.span_rank = int(span_rank)
+        self.span_size = int(span_size)
         self.tp_size = int(tp_size)
+        self._span_rows_per_rank = None
         self.cross_group = cross_group
         self.cross_root = cross_root
         self.cross_source = bool(cross_source)
@@ -122,8 +140,8 @@ class StreamedSP8LayerBuffer:
         # the same bytes from the broadcast below.
         self._acquires_from_host = cross_group is None or self.cross_source
         self.num_experts = int(num_experts)
-        self.experts_per_rank = self.num_experts // self.tp_size
-        self.expert_start = self.tp_rank * self.experts_per_rank
+        self.experts_per_rank = self.num_experts // self.span_size
+        self.expert_start = self.span_rank * self.experts_per_rank
         self.intermediate_size = int(intermediate_size)
         self.latent_size = int(latent_size)
         self.acquire_batch_size = max(1, int(acquire_batch_size))
@@ -703,38 +721,35 @@ class StreamedSP8LayerBuffer:
         self._load_layer_bytes(layer_idx)
         return self._make_shard()
 
-    def participate_empty_prefill_pass(self):
-        """Join one hierarchical weight schedule without running model math.
+    def has_pending(self) -> bool:
+        """Whether a next-layer prefetch is in flight."""
+        return self._pending is not None
 
-        A physical TP8 node can own no rows for an otherwise valid admission.
-        Its ranks still belong to the cross-node weight-broadcast groups, so
-        they must join every layer's ingress in the same order as populated
-        nodes.  This transport-only drive deliberately skips attention, routed
-        and shared expert compute, scale expansion, and logits.
+    def span_rows_per_rank(self, layer_idx: int, num_rows: int) -> int:
+        """Padded per-rank row stride of this pass, identical over the span.
+
+        ``num_rows`` is this DP rank's row count, split over its ``tp_size``
+        ranks. With one DP rank per span (S == G) every rank already knows
+        the stride. With several, the DP ranks differ, so the first MoE layer
+        of each pass takes the span maximum once (one small all-reduce) and
+        the later layers of the pass reuse it: every layer of a pass carries
+        the same rows.
         """
-        if self.cross_group is None:
+        local = (int(num_rows) + self.tp_size - 1) // self.tp_size
+        if self.span_size == self.tp_size:
+            return local
+        first = self.layer_indices[0] if self.layer_indices else int(layer_idx)
+        if int(layer_idx) == first or self._span_rows_per_rank is None:
+            stride = torch.tensor([local], dtype=torch.int64, device=self.device)
+            dist.all_reduce(stride, op=dist.ReduceOp.MAX, group=self.span_group)
+            self._span_rows_per_rank = int(stride.item())
+        if self._span_rows_per_rank < local:
             raise RuntimeError(
-                "transport-only streamed-SP8 participation requires "
-                "hierarchical GDR"
+                f"streamed-SP8 layer {layer_idx}: span row stride "
+                f"{self._span_rows_per_rank} is below this rank's {local}; "
+                "the pass row count changed between MoE layers"
             )
-        if self._pending is not None:
-            raise RuntimeError(
-                "transport-only streamed-SP8 pass started with a pending layer"
-            )
-
-        for layer_idx in self.layer_indices:
-            self._load_layer_bytes(layer_idx)
-            self.begin_prefetch_next(layer_idx)
-            # No kernel reads ``self.compute`` on this node. Release assembly
-            # first, then the cross launch, matching the populated MoE branch's
-            # handshake order without issuing any node-local collectives.
-            self.allow_full_overwrite()
-            self.allow_cross_launch()
-
-        if self._pending is not None:
-            raise RuntimeError(
-                "transport-only streamed-SP8 pass left a pending layer"
-            )
+        return self._span_rows_per_rank
 
 
 class StreamedSP8MXFP4MoELayer:
@@ -1108,12 +1123,13 @@ class StreamedSP8MXFP4MoELayer:
             )
 
     def forward(self, x: torch.Tensor, gate, num_rows: int) -> torch.Tensor:
-        """Run this rank's expert shard over the whole node's rows.
+        """Run this rank's expert shard over the rows of the whole span.
 
-        ``x`` is this rank's contiguous slice of the node's replicated rows and
-        ``num_rows`` is the node's row count before that split -- the caller
-        knows it, and it is identical on all eight ranks, so it decides the
-        padded ``ntp`` stride without an extra collective.
+        ``x`` is this rank's contiguous slice of its DP rank's replicated rows
+        and ``num_rows`` is the DP rank's row count before that split. The
+        padded per-rank stride ``ntp`` must be identical over the span; with
+        one DP rank per span it follows from ``num_rows`` alone, otherwise
+        the buffer takes the span maximum once per pass.
         """
         T, H = x.shape
         cls = type(self)
@@ -1141,10 +1157,11 @@ class StreamedSP8MXFP4MoELayer:
         # the gate the serving branch opens once EVERY TP8 collective of this
         # layer has been issued, so every GPU still orders TP8 -> cross-node.
         buffer.begin_prefetch_next(self.layer_idx)
-        # ``num_rows`` is the node-wide count, so this branch is taken by all
-        # eight ranks together or by none.  Keying it on the per-rank ``T``
-        # instead would desynchronize the node-local collectives below.
-        if num_rows == 0:
+        # ``ntp`` is identical over the span, so this branch is taken by every
+        # rank of the span together or by none.  Keying it on the per-rank
+        # ``T`` instead would desynchronize the span collectives below.
+        ntp = buffer.span_rows_per_rank(self.layer_idx, num_rows)
+        if ntp == 0:
             # No reader of ``buffer.compute`` is enqueued at all, so the
             # assembly may proceed.  The cross-node gate is NOT opened here:
             # the serving branch opens it after the routed all-gather and the
@@ -1160,8 +1177,8 @@ class StreamedSP8MXFP4MoELayer:
         marks = [] if profile else None
         if profile:
             _profile_mark(marks)
-        tp_size = buffer.tp_size
-        tp_group = buffer.tp_group
+        span_size = buffer.span_size
+        span_group = buffer.span_group
         expert_start = buffer.expert_start
         num_local = buffer.experts_per_rank
         helper = ResidentEPMXFP4MoELayer(
@@ -1184,8 +1201,7 @@ class StreamedSP8MXFP4MoELayer:
         # compute chunk. Each stripe still gathers all TP slices, computes
         # every routed assignment exactly once, and reduce-scatters in FP32
         # before the single BF16 downcast. W1/W2 retain the original wide path.
-        ntp = (num_rows + tp_size - 1) // tp_size
-        num_node_rows = tp_size * ntp
+        num_node_rows = span_size * ntp
         stripe_threshold_rows = int(
             getattr(self, "collective_stripe_threshold_rows", 32768)
         )
@@ -1231,9 +1247,9 @@ class StreamedSP8MXFP4MoELayer:
         all_weight = topk_weight.new_empty((num_node_rows, top_k))
         if profile:
             _profile_mark(marks)
-        dist.all_gather_into_tensor(all_latent, x_latent, group=tp_group)
-        dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
-        dist.all_gather_into_tensor(all_weight, topk_weight, group=tp_group)
+        dist.all_gather_into_tensor(all_latent, x_latent, group=span_group)
+        dist.all_gather_into_tensor(all_idx, topk_idx, group=span_group)
+        dist.all_gather_into_tensor(all_weight, topk_weight, group=span_group)
         if profile:
             _profile_mark(marks)
             cls._prefill_profile_grouped_chunks += (
@@ -1337,7 +1353,7 @@ class StreamedSP8MXFP4MoELayer:
         if profile:
             _profile_mark(marks)
         dist.reduce_scatter_tensor(
-            local_latent, combined, op=dist.ReduceOp.SUM, group=tp_group
+            local_latent, combined, op=dist.ReduceOp.SUM, group=span_group
         )
         if profile:
             _profile_mark(marks)
@@ -1384,14 +1400,14 @@ class StreamedSP8MXFP4MoELayer:
         T, H = x.shape
         cls = type(self)
         buffer = self.buffer
-        tp_size = buffer.tp_size
-        tp_group = buffer.tp_group
+        span_size = buffer.span_size
+        span_group = buffer.span_group
         expert_start = buffer.expert_start
         num_local = buffer.experts_per_rank
         latent_size = shard.K_latent
         stripe_rows = min(
             int(getattr(self, "collective_chunk_rows", 256)),
-            max(1, self.chunk_rows // tp_size),
+            max(1, self.chunk_rows // span_size),
         )
 
         output = x.new_empty((T, H))
@@ -1437,7 +1453,7 @@ class StreamedSP8MXFP4MoELayer:
                 topk_weight[valid_count:].zero_()
             x_latent = self.down_proj(local_hidden).contiguous()
 
-            num_stripe_rows = tp_size * count
+            num_stripe_rows = span_size * count
             all_latent = x_latent.new_empty(
                 (num_stripe_rows, latent_size)
             )
@@ -1446,11 +1462,11 @@ class StreamedSP8MXFP4MoELayer:
                 (num_stripe_rows, top_k)
             )
             dist.all_gather_into_tensor(
-                all_latent, x_latent, group=tp_group
+                all_latent, x_latent, group=span_group
             )
-            dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
+            dist.all_gather_into_tensor(all_idx, topk_idx, group=span_group)
             dist.all_gather_into_tensor(
-                all_weight, topk_weight, group=tp_group
+                all_weight, topk_weight, group=span_group
             )
 
             owned = (all_idx >= expert_start) & (
@@ -1512,7 +1528,7 @@ class StreamedSP8MXFP4MoELayer:
                 local_latent,
                 combined,
                 op=dist.ReduceOp.SUM,
-                group=tp_group,
+                group=span_group,
             )
             if local_end == ntp:
                 # No later stripe reads the expert shard. Match the wide

@@ -155,6 +155,7 @@ def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed"
     manager._latent_tp_planned = False
+    manager._stream_span = 8
     manager.set_prefill_moe_mode = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode",
         {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
@@ -424,6 +425,9 @@ def _sp8_schedule_manager(*, hierarchical_gdr, cross_source=False):
     manager._stream_all_modules = False
     manager._attn_tp_size = 8
     manager._attn_tp_rank = 3
+    # One DP rank per span on the 8-GPU hosts (S == G == 8).
+    manager._stream_span = 8
+    manager._stream_span_rank = 3
     manager._hierarchical_gdr = hierarchical_gdr
     manager._cross_weight_source = cross_source
     manager.prefill_uses_streamed_sp8 = lambda: True
@@ -502,6 +506,8 @@ def test_hierarchical_gdr_builds_the_exact_cross_node_group_and_root_map():
         manager._hierarchical_gdr = hierarchical_gdr
         manager._attn_tp_size = 8
         manager._attn_tp_rank = global_rank % 8
+        manager._stream_span = 8
+        manager._stream_span_rank = global_rank % 8
         manager.world_size = 32
         manager.global_rank = global_rank
         manager._cross_weight_group = None
@@ -581,6 +587,8 @@ def test_hierarchical_gdr_cross_node_map_follows_the_node_count():
                 manager._hierarchical_gdr = True
                 manager._attn_tp_size = 8
                 manager._attn_tp_rank = global_rank % 8
+                manager._stream_span = 8
+                manager._stream_span_rank = global_rank % 8
                 manager.world_size = world_size
                 manager.global_rank = global_rank
                 manager._cross_weight_group = None
@@ -1577,45 +1585,31 @@ def _mock_sp8_buffer(
     return buffer
 
 
-def test_streamed_sp8_transport_only_pass_drives_bytes_without_model_math():
-    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    trace = []
-    buffer = SimpleNamespace(
-        cross_group="cross4",
-        _pending=None,
-        layer_indices=(1, 3, 7),
-        _load_layer_bytes=lambda layer: trace.append(("bytes", layer)),
-        begin_prefetch_next=lambda layer: trace.append(("begin", layer)),
-        allow_full_overwrite=lambda: trace.append(("overwrite",)),
-        allow_cross_launch=lambda: trace.append(("cross",)),
-        _make_shard=lambda: pytest.fail("transport-only path expanded a shard"),
+def test_streamed_sp8_transport_only_pass_drives_each_moe_layer_with_zero_rows():
+    """The empty pass is the MoE layer's own forward at zero rows.
+
+    With S == G under hierarchical GDR that forward loads the layer, starts
+    the next prefetch and grants the overwrite without any collective (the
+    span stride is zero); the PSM then opens the cross-node gate. With S > G
+    the same forward joins the span gather/reduce-scatter. The behaviour is
+    driven end to end in tests/unit/test_k3_dp_attention_span.py.
+    """
+    path = (
+        ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
     )
-    participate = _isolated_method(
-        path,
-        "StreamedSP8LayerBuffer",
-        "participate_empty_prefill_pass",
-    ).__get__(buffer)
-
-    participate()
-
-    assert trace == [
-        ("bytes", 1), ("begin", 1), ("overwrite",), ("cross",),
-        ("bytes", 3), ("begin", 3), ("overwrite",), ("cross",),
-        ("bytes", 7), ("begin", 7), ("overwrite",), ("cross",),
-    ]
-
-
-def test_streamed_sp8_transport_only_pass_rejects_host_rdma():
-    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    buffer = SimpleNamespace(cross_group=None, _pending=None, layer_indices=())
-    participate = _isolated_method(
-        path,
-        "StreamedSP8LayerBuffer",
-        "participate_empty_prefill_pass",
-    ).__get__(buffer)
-
-    with pytest.raises(RuntimeError, match="requires hierarchical GDR"):
-        participate()
+    source = ast.unparse(
+        _function(
+            path,
+            "KimiLinearParallelStrategyManager",
+            "run_streamed_sp8_transport_only_prefill",
+        )
+    )
+    assert "streamed.forward(empty, moe.gate, 0)" in source
+    assert "buffer.allow_cross_launch()" in source
+    assert source.index("streamed.forward(empty, moe.gate, 0)") < source.index(
+        "buffer.allow_cross_launch()"
+    )
 
 
 def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
@@ -1979,8 +1973,11 @@ def _mock_sp8_moe_layer(
         ),
         allow_full_overwrite=lambda: log("allow", None),
         cross_group=cross_group,
-        tp_group="tp8",
+        # One DP rank per span (S == G): the node-local layout these tests pin.
+        span_group="tp8",
+        span_size=tp_size,
         tp_size=tp_size,
+        span_rows_per_rank=lambda idx, n: (int(n) + tp_size - 1) // tp_size,
         expert_start=expert_start,
         experts_per_rank=num_local,
     )
@@ -2990,7 +2987,7 @@ def test_streamed_sp8_buffers_hold_only_this_rank_expert_shard():
     assert "self.num_experts" not in allocate
 
     init = ast.unparse(_function(path, "StreamedSP8LayerBuffer", "__init__"))
-    assert "self.expert_start = self.tp_rank * self.experts_per_rank" in init
+    assert "self.expert_start = self.span_rank * self.experts_per_rank" in init
     assert "torch.arange(self.experts_per_rank" in init
 
 
@@ -3455,7 +3452,7 @@ def test_streamed_sp8_node_empty_check_happens_after_the_load():
     )
     source = ast.unparse(function)
     assert source.index("shard = buffer.load") < source.index(
-        "if num_rows == 0"
+        "if ntp == 0"
     )
     # A per-rank ``T == 0`` early return would desynchronize the node-local
     # gathers and the reduce-scatter below it.
@@ -3638,8 +3635,10 @@ def test_kimi_initializer_cross_checks_store_nodes_against_world_size():
         / "kimi_initializer.py"
     ).read_text()
 
-    assert 'self.world_size not in (16, 32)' in source
-    assert 'distributed_config["num_nodes"] * 8 != self.world_size' in source
+    # nodes x the store's workers per host must be the world (8 x 2/4 on the
+    # 8-GPU hosts, 4 x 2 on GB300 trays).
+    assert 'workers = int(distributed_config["workers"])' in source
+    assert 'distributed_config["num_nodes"] * workers != self.world_size' in source
     assert "distributed weight config topology does not match" in source
 
 
@@ -4148,7 +4147,7 @@ def test_worker_initializes_streamed_sp8_install_state():
     assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
 
 
-def test_only_hierarchical_gdr_aligns_and_drives_empty_prefill_passes():
+def test_global_pass_alignment_follows_the_collective_reach():
     path = (
         ROOT
         / "batchgen"
@@ -4162,32 +4161,22 @@ def test_only_hierarchical_gdr_aligns_and_drives_empty_prefill_passes():
         "KimiLinearParallelStrategyManager",
         "streamed_sp8_requires_global_pass_alignment",
     )
-    drive = _isolated_method(
-        path,
-        "KimiLinearParallelStrategyManager",
-        "run_streamed_sp8_transport_only_prefill",
-    )
-    trace = []
     manager = SimpleNamespace(
         _hierarchical_gdr=True,
-        _streamed_sp8_buffer=SimpleNamespace(
-            participate_empty_prefill_pass=lambda: trace.append("pass")
-        ),
+        _stream_span=8,
+        _attn_tp_size=8,
         prefill_uses_streamed_sp8=lambda: True,
     )
-    manager.streamed_sp8_requires_global_pass_alignment = (
-        predicate.__get__(manager)
-    )
-
-    assert manager.streamed_sp8_requires_global_pass_alignment() is True
-    drive(manager, 2)
-    assert trace == ["pass", "pass"]
-
+    # hierarchical GDR broadcasts across spans
+    assert predicate(manager) is True
+    # host_rdma with one DP rank per span stays node-local
     manager._hierarchical_gdr = False
-    assert manager.streamed_sp8_requires_global_pass_alignment() is False
-    with pytest.raises(RuntimeError, match="only valid for hierarchical GDR"):
-        drive(manager, 1)
-    assert trace == ["pass", "pass"]
+    assert predicate(manager) is False
+    # a span of two TP4 DP ranks gathers rows across them
+    manager._attn_tp_size = 4
+    assert predicate(manager) is True
+    manager.prefill_uses_streamed_sp8 = lambda: False
+    assert predicate(manager) is False
 
 
 @pytest.mark.parametrize(
@@ -4532,11 +4521,11 @@ def test_hierarchical_gdr_pin_source_owns_the_slot_it_registers():
         )
 
     init = _init_distributed_section(_weights_storage_source())
+    # ``workers`` comes from the node config (8 on these hosts).
+    assert "(this->device_id_ * num_nodes) / workers" in init
+    assert "const int experts_per_slot = kKimiK3Experts / workers;" in init
     assert (
-        "(this->device_id_ * num_nodes) / kKimiK3Workers" in init
-    )
-    assert (
-        "this->pin_expert_begin_ = this->device_id_ * kKimiK3ExpertsPerWorker"
+        "this->pin_expert_begin_ = this->device_id_ * experts_per_slot"
         in init
     )
     assert "this->local_node_rank_ == pin_source_node" in init
@@ -4546,9 +4535,9 @@ def test_hierarchical_gdr_registers_only_the_slot_experts_of_the_source():
     source = _weights_storage_source()
     init = _init_distributed_section(source)
 
-    # 112 experts per TP slot, 896 across the node.
-    assert "constexpr int kKimiK3ExpertsPerWorker = kKimiK3Experts / kKimiK3Workers;" in source
-    assert "constexpr int kKimiK3Workers = 8;" in source
+    # E / workers experts per local slot (112 with eight workers).
+    assert "constexpr int kKimiK3Experts = 896;" in source
+    assert 'const int workers = config.at("workers").get<int>();' in init
 
     # Only a source collects intervals, and only for its own slot.
     assert (
@@ -4559,7 +4548,7 @@ def test_hierarchical_gdr_registers_only_the_slot_experts_of_the_source():
 
     # host_rdma keeps the whole compact store pinned; a non-source
     # hierarchical worker collects nothing and therefore pins nothing.
-    assert "if (this->hierarchical_gdr_) {" in init
+    assert "if (this->hierarchical_gdr_ || this->local_only_) {" in init
     assert "pin_intervals = {{0, this->compact_bytes_}};" in init
 
     # The full mapping and every local module survive the narrowing, because
