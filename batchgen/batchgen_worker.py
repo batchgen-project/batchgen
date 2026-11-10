@@ -950,6 +950,7 @@ class InputArguments:
 	pre_dequantize_weights: bool = False
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
+	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
 
 	def __post_init__(self):
 		if self.max_prompt_length is None and self.padding_length is not None:
@@ -1064,6 +1065,7 @@ class BatchGenWorkerArgs:
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
+	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -4830,6 +4832,7 @@ class BatchGenWorker:
 			"pre_dequantize_weights": self.args.pre_dequantize_weights,
 			"distributed_weight_config": self.args.distributed_weight_config,
 			"enable_deepep": getattr(self.args, "enable_deepep", False),
+			"prefill_moe_mode": getattr(self.args, "prefill_moe_mode", None),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -11184,7 +11187,23 @@ class BatchGenWorker:
 					"default_prefill_moe_mode / set_prefill_moe_mode; the "
 					"prefill MoE mode capability needs both"
 				)
+			requested = getattr(
+				getattr(self, "args", None), "prefill_moe_mode", None
+			)
+			if requested is not None and not declares[0]:
+				raise ValueError(
+					f"--prefill-moe-mode {requested} is set but "
+					f"{type(manager).__name__} has no prefill MoE modes"
+				)
+			# The manager reads the server option from its engine config
+			# and returns it as its default when one was given.
 			mode = manager.default_prefill_moe_mode() if declares[0] else None
+			if requested is not None and mode != requested:
+				raise RuntimeError(
+					f"{type(manager).__name__} resolved prefill MoE mode "
+					f"{mode!r}, but the server was started with "
+					f"--prefill-moe-mode {requested}"
+				)
 			resolved = (mode,)
 			self._server_prefill_moe_mode_resolved = resolved
 			logging.info(

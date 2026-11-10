@@ -46,6 +46,15 @@ def _isolated_method(path, class_name, function_name, globals_=None):
     return getattr(namespace["Isolated"], function_name)
 
 
+def _bind_prefill_mode_validator(manager, path):
+    """Bind the K3 manager's mode validator, which set/default delegate to."""
+    manager._resident_ep_built = getattr(manager, "_resident_ep_built", False)
+    manager._validated_prefill_moe_mode = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "_validated_prefill_moe_mode",
+        {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
+    ).__get__(manager)
+
+
 def _prefill_moe_modes(path):
     """``PREFILL_MOE_MODES`` as the K3 manager module declares it."""
     tree = ast.parse(path.read_text())
@@ -155,6 +164,7 @@ def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed"
     manager._latent_tp_planned = False
+    _bind_prefill_mode_validator(manager, path)
     manager.set_prefill_moe_mode = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode",
         {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
@@ -191,6 +201,10 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed_sp8"
     manager._latent_tp_planned = False
+    manager.engine_config = SimpleNamespace(
+        Basic_Config=SimpleNamespace(prefill_moe_mode=None)
+    )
+    _bind_prefill_mode_validator(manager, path)
     default_mode = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
@@ -385,6 +399,7 @@ def test_resident_prefill_is_refused_for_non_k3():
     manager._is_k3 = False
     manager._prefill_moe_mode = "streamed"
     manager._latent_tp_planned = False
+    _bind_prefill_mode_validator(manager, path)
     manager.set_prefill_moe_mode = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode",
         {"PREFILL_MOE_MODES": _prefill_moe_modes(path)},
