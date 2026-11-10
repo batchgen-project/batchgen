@@ -618,6 +618,113 @@ def test_listener_survives_an_item_that_fails_to_route(tmp_path, caplog):
     assert failures[0].exc_info is not None
 
 
+def _error_completion(request_id: str, batch_id: str) -> Dict[str, Any]:
+    """The shape the worker sends when it rejects one request at admission."""
+    return {
+        "type": "completion",
+        "request_id": request_id,
+        "batch_id": batch_id,
+        "error": {
+            "code": "context_length_exceeded",
+            "message": "Prompt length 9000 exceeds model context 8192",
+        },
+        "text": "",
+    }
+
+
+def test_a_per_request_error_does_not_end_completion_delivery(tmp_path):
+    """One rejected request is that request's result, not the generation's
+    end: the pump keeps reading, the next request's completion is delivered,
+    and the pump stops only at pool_shutdown."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
+        response_queue = scheduler.worker.response_queue
+        response_queue.put(_error_completion("req-1", "batch-1"))
+        response_queue.put(_completion("req-2", "batch-1"))
+        response_queue.put({"type": "pool_shutdown"})
+        # Anything after the terminal item is never read by this pump.
+        response_queue.put(_completion("req-3", "batch-1"))
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        pump = scheduler._pump_thread
+
+        assert await _await_true(
+            lambda: len(scheduler._scheduling_pool.completed) == 2
+        )
+        assert scheduler._scheduling_pool.completed == [
+            ("req-1", "batch-1"), ("req-2", "batch-1"),
+        ]
+        assert scheduler._scheduling_pool.freed == ["req-1", "req-2"]
+        lines = [
+            json.loads(line)
+            for line in (tmp_path / "batch-1.jsonl").read_text().splitlines()
+        ]
+        assert [line["custom_id"] for line in lines] == ["req-1", "req-2"]
+        assert lines[0]["response"] is None
+        assert lines[0]["error"]["code"] == "context_length_exceeded"
+        assert lines[1]["error"] is None
+        assert lines[1]["response"]["status_code"] == 200
+
+        # The pump ended at pool_shutdown, not at the error completion.
+        assert await _await_true(lambda: not pump.is_alive())
+        assert response_queue.qsize() == 1
+        # A clean shutdown fails nothing and reports no fatal.
+        assert scheduler.storage.statuses == []
+        assert scheduler.worker.fatals == []
+        assert tracker.error is None
+        assert not scheduler._completion_listener_task.done()
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        "not a dict",
+        {"error": {"code": "worker_error", "message": "no type"}},
+        {"type": "mystery"},
+        {"type": "completion", "batch_id": "batch-1", "text": "x"},
+    ],
+    ids=["non-dict", "typeless-error", "unknown-type", "completion-without-request-id"],
+)
+def test_an_item_of_unknown_shape_fails_active_batches_loudly(tmp_path, item):
+    """An item outside the protocol cannot be accounted to any request: the
+    active batches are persisted as failed and the generation is reported
+    down, instead of the item being logged and the batches left in_progress.
+    The pump and the listener keep running."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        pump = scheduler._pump_thread
+
+        scheduler.worker.response_queue.put(item)
+        assert await _await_true(lambda: scheduler.worker.fatals)
+        assert [entry[0] for entry in scheduler.storage.statuses] == ["batch-1"]
+        _, status, kwargs = scheduler.storage.statuses[0]
+        assert status == "failed"
+        assert "unknown shape" in kwargs["error"]
+        assert tracker.error is not None
+        reason, persisted = scheduler.worker.fatals[0]
+        assert "unknown shape" in reason
+        assert persisted is True
+        assert scheduler._scheduling_pool.completed == []
+        assert pump.is_alive()
+        assert not scheduler._completion_listener_task.done()
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
 def test_retiring_the_pump_retires_its_generation(tmp_path):
     """Between the retire and the next generation's pump, an item of the
     retired cohort -- already queued, or forwarded by its pump afterwards --
