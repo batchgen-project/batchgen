@@ -73,8 +73,7 @@ _METHODS = (
     # batchgen_debug, so it is always the default (profile) arm.
     "_prefix_rank_cost_profile_disabled",
     # Placement scores with the server mode's prefill token cap.
-    "_placement_prefill_token_cap",
-    "_prefill_token_cap_for_mode",
+    "_server_prefill_token_cap",
     "_server_prefill_moe_mode",
 )
 

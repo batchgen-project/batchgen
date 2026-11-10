@@ -33,6 +33,7 @@ from batchgen.server.io_struct import (
     CloseSessionRequest,
     SessionIdentity,
     TurnRequest,
+    retired_batchgen_debug_error,
 )
 
 
@@ -107,6 +108,9 @@ def _check_turn_limits(body: TurnRequest, max_context_length: int) -> None:
                 f"batchgen_debug is {debug_bytes} bytes as JSON; the limit is "
                 f"{MAX_TURN_DEBUG_BYTES}",
             )
+        retired_debug = retired_batchgen_debug_error(body.batchgen_debug)
+        if retired_debug is not None:
+            raise TurnError(400, "retired_batchgen_debug_key", retired_debug)
 
 
 def _http_error(exc: TurnError) -> HTTPException:
