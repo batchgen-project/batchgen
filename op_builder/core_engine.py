@@ -54,6 +54,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
             f"{BATCHGEN_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
             f"{BATCHGEN_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
+            f"{BATCHGEN_CORE_ROOT}/GPU_Weight_Buffer/replica_control_block.cpp",
             f"{BATCHGEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_manager.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
