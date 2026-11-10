@@ -671,6 +671,71 @@ def test_the_protocol_runs_over_a_real_control_store():
         node0.close()
 
 
+def test_a_peer_fails_within_the_join_grace_when_node0_never_listens():
+    """Node 0 down or never launched: the peer's start-up fails naming node
+    0's address within one connect attempt of the join grace, instead of
+    blocking in one store connect for twice its full timeout."""
+    pytest.importorskip("torch")
+    port = _free_port()
+    node1 = RestartCoordinator(
+        2, 1, "127.0.0.1", port,
+        connect_attempt_s=0.5, join_grace_s=1.0, error_backoff_s=0.01,
+    )
+    started = time.monotonic()
+    with pytest.raises(
+        coordinator_module.ControlStoreUnreachableError,
+        match=rf"node 0's restart control store at 127\.0\.0\.1:{port}",
+    ):
+        node1.start()
+    # One attempt can take about twice its timeout plus a backoff.
+    assert time.monotonic() - started < 6.0
+    node1.close()
+
+
+def test_a_peer_keeps_connecting_until_node0_opens_its_store():
+    """A node 0 that starts late within the grace is joined, not refused,
+    and the connected store gets the operation timeout."""
+    clock = [0.0]
+    store = FakeStore()
+    calls = []
+
+    def factory(host, port, nnodes, node_rank, connect_timeout_s, **kw):
+        calls.append((connect_timeout_s, kw))
+        clock[0] += connect_timeout_s
+        if len(calls) < 3:
+            raise RuntimeError("connection refused")
+        return store
+
+    node1 = RestartCoordinator(
+        2, 1, "127.0.0.1", 0,
+        store_factory=factory, connect_attempt_s=10.0, op_timeout_s=600.0,
+        join_grace_s=600.0, error_backoff_s=0.0, clock=lambda: clock[0],
+    )
+    node1.start()
+    assert node1._store is store
+    assert calls == [(10.0, {"op_timeout_s": 600.0})] * 3
+    node1.close()
+
+
+def test_the_peer_connect_budget_is_the_join_grace():
+    clock = [0.0]
+
+    def refuse(host, port, nnodes, node_rank, connect_timeout_s, **_kw):
+        clock[0] += connect_timeout_s
+        raise RuntimeError("connection refused")
+
+    node1 = RestartCoordinator(
+        2, 1, "10.0.0.1", 9356,
+        store_factory=refuse, connect_attempt_s=10.0, join_grace_s=600.0,
+        error_backoff_s=0.0, clock=lambda: clock[0],
+    )
+    with pytest.raises(
+        coordinator_module.ControlStoreUnreachableError, match="in 600s"
+    ):
+        node1.start()
+    assert clock[0] == 600.0
+
+
 # ------------------------------------------- the manager running the phases
 
 

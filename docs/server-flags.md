@@ -106,8 +106,10 @@ any node takes every node to `workers_down`, and `/health` on each node names
 the node that failed; one restart sent to node 0 then brings every node back.
 With fail-fast on (the multi-node default) every node instead exits; see below.
 Each node other than node 0
-waits a bounded time at startup for node 0's control store, so start node 0
-first or together with the others. The control store
+connects to node 0's control store at startup in 10 s attempts for at most
+600 s (the same grace node 0 gives a peer to join), then fails its start-up
+with `node 0's restart control store at <host:port> accepted no connection`,
+so start node 0 first or together with the others. The control store
 lives as long as node 0's server: if node 0 is relaunched, relaunch every node
 (a fresh node 0 cannot form a cohort with the old peers' workers anyway).
 
