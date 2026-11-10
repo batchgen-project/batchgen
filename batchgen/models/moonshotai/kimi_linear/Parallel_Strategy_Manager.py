@@ -91,6 +91,9 @@ def _replace_param(root_module, dotted_name, tensor):
 # (planner.py kda_state_slots); this is that "+ 1".
 _KDA_GRAPH_SCRATCH_SLOTS = 1
 
+# Every prefill MoE mode set_prefill_moe_mode accepts.
+PREFILL_MOE_MODES = ("streamed", "resident_ep", "streamed_sp8")
+
 
 class KimiLinearParallelStrategyManager:
     """Parallel Strategy Manager for Kimi-Linear (KDA + NoPE-MLA hybrid)."""
@@ -442,7 +445,7 @@ class KimiLinearParallelStrategyManager:
         layer, and gathers rows only inside the node.
         """
         value = str(mode or "streamed").strip().lower()
-        if value not in {"streamed", "resident_ep", "streamed_sp8"}:
+        if value not in PREFILL_MOE_MODES:
             raise ValueError(
                 "k3_prefill_moe_mode must be 'streamed', 'resident_ep' or "
                 "'streamed_sp8', "
@@ -1113,6 +1116,8 @@ class KimiLinearParallelStrategyManager:
         """
         if not torch.cuda.is_available():
             return
+        from batchgen.config.config import prefill_token_cap_for_mode
+
         from .triton_prewarm import prewarm_k3_triton_kernels
 
         basic = self.engine_config.Basic_Config
@@ -1143,9 +1148,14 @@ class KimiLinearParallelStrategyManager:
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
-            max_prefill_tokens=int(getattr(
-                self.engine_config.Module_Batching_Config,
-                "prefill_micro_batch_token_cap", 0) or 0),
+            # The largest micro-batch any wave of this server can run: its
+            # server mode or a batch-level mode override.
+            max_prefill_tokens=max(
+                prefill_token_cap_for_mode(
+                    self.engine_config.Module_Batching_Config, mode
+                )
+                for mode in PREFILL_MOE_MODES
+            ),
             part_index=part_index,
             part_count=part_count,
             barrier=barrier,

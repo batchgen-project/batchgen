@@ -98,8 +98,6 @@ class GLM5ParallelStrategyManager:
         self.reuse_phase_instances = False
         self.prefill_instance = None
         self.decode_instance = None
-        self._prefill_moe_mode = None
-        self._pending_prefill_moe_mode = None
         self._expert_arena = None
         self._expert_copy_pairs = []
         # Device copies of the skeleton's FP8 dequant scales. The scales never
@@ -144,11 +142,6 @@ class GLM5ParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
-        pending_prefill_moe_mode = getattr(
-            self, "_pending_prefill_moe_mode", None
-        )
-        if pending_prefill_moe_mode is not None:
-            self._prefill_moe_mode = pending_prefill_moe_mode
         self.loaded_model_config.phase = "prefill"
         Glm5MoE.reset_prefill_grouped_state()
 
@@ -512,10 +505,6 @@ class GLM5ParallelStrategyManager:
         check_late_compiles(self.global_rank, where,
                             strict=strict_requested(_batch_debug()))
 
-    def set_prefill_moe_mode(self, mode):
-        """Record the worker-selected prefill MoE mode for reuse checks."""
-        self._pending_prefill_moe_mode = mode
-
     def _prepare_prefill_activation(self, instance=None):
         Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "prefill"
@@ -576,8 +565,7 @@ class GLM5ParallelStrategyManager:
         """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
 
         Resumes the instance this process keeps for the phase, otherwise
-        builds it. A prefill build uses the mode recorded by
-        set_prefill_moe_mode.
+        builds it. GLM-5 has no prefill MoE modes, so its keys carry None.
         """
         if key.phase == "prefill":
             if self.prefill_instance is not None:

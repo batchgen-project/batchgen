@@ -80,7 +80,7 @@ def test_h20_plan_funds_128_slots_latent_only_with_graphs():
     # decode at this width is launch-latency-bound)
     assert config.Basic_Config.decode_graph_mode == "graph"
     # H20 keeps the release-and-stream admission cycle (resident handoff off)
-    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 0
+    assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 0
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 0
     assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 16_384
     assert (
@@ -130,7 +130,7 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
         == 32_768
     )
     assert (
-        config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
+        config.Module_Batching_Config.resident_ep_prefill_token_cap == 16_384
     )
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
     assert (
@@ -153,7 +153,7 @@ def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
     assert config.Module_Batching_Config.k3_shard_vocab_parallel is True
     # prefill keeps the values the machine ran under the retired tiers
     assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 524_288
-    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
+    assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 16_384
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
 
 
@@ -207,7 +207,7 @@ def test_non_tp8_k3_plan_is_machine_independent(family):
     assert config.Module_Batching_Config.k3_shard_vocab_parallel is False
     assert config.Basic_Config.decode_graph_mode == "eager"
     assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 262_144
-    assert config.Module_Batching_Config.k3_resident_prefill_token_cap == 0
+    assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 0
 
 
 def test_head_parallel_non_tp8_k3_keeps_the_single_prompt_cap():
