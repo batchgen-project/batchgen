@@ -141,7 +141,8 @@ def _ext(*names: str) -> tuple[str, ...]:
     return tuple(_K + name for name in names)
 
 
-_GLM5_HOPPER_EXTENSIONS = _ext(
+# GLM-5.x on Hopper: FP8 blockwise MoE GEMMs and the FP8 DSA index-key write.
+_DSA_FP8_HOPPER_EXTENSIONS = _ext(
     "moe._C_fp8_blockwise_gemm",
     "moe._C_fp8_blockwise_ops",
     "moe._C_routing",
@@ -150,9 +151,10 @@ _GLM5_HOPPER_EXTENSIONS = _ext(
     "attention._C_qkv_wgmma",
 )
 
-# Kimi-Linear and Kimi-K3 (one model package; Kimi-K3.1 adds the DSA indexer).
-_KIMI_LINEAR_EXTENSIONS = _COMMON_EXTENSIONS + _ext("conv1d._C_causal_conv1d")
-_KIMI_LINEAR_HOPPER_EXTENSIONS = _ext(
+# KDA models: Kimi-Linear and Kimi-K3 (one model package; Kimi-K3.1 adds the
+# DSA indexer).
+_KDA_EXTENSIONS = _COMMON_EXTENSIONS + _ext("conv1d._C_causal_conv1d")
+_KDA_HOPPER_EXTENSIONS = _ext(
     "attention._C_fused_q_split",
     "attention._C_kda_fused_decode",
     "moe._C_dispatch_scatter_3d",
@@ -178,21 +180,21 @@ _CONTRACTS: dict[str, RuntimeContract] = {
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
-        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
+        hopper_extensions=_DSA_FP8_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_2": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
-        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
+        hopper_extensions=_DSA_FP8_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS
                     + _DSA_MOE_WGMMA_EXTENSIONS),
-        hopper_extensions=_GLM5_HOPPER_EXTENSIONS,
+        hopper_extensions=_DSA_FP8_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "deepseek_v2": RuntimeContract(
@@ -228,20 +230,20 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "kimi_linear": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_KIMI_LINEAR_EXTENSIONS,
-        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
+        extensions=_KDA_EXTENSIONS,
+        hopper_extensions=_KDA_HOPPER_EXTENSIONS,
     ),
     "kimi_k3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_KIMI_LINEAR_EXTENSIONS,
-        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
+        extensions=_KDA_EXTENSIONS,
+        hopper_extensions=_KDA_HOPPER_EXTENSIONS,
     ),
     # The dense contract plus the page-split DSA indexer: DeepGEMM scores the
     # index keys (paged on decode, causal on prefill).
     "kimi_k31": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_KIMI_LINEAR_EXTENSIONS + _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS,
-        hopper_extensions=_KIMI_LINEAR_HOPPER_EXTENSIONS,
+        extensions=_KDA_EXTENSIONS + _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS,
+        hopper_extensions=_KDA_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     ),
     "kimi_k25": RuntimeContract(
