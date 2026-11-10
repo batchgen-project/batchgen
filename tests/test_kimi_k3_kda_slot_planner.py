@@ -139,12 +139,19 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     )
 
 
-def test_b300_single_node_plan_carries_the_inherited_values():
+def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
     config = _plan("b300", world_size=8)
-    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
-    assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
+
+    # 360 user slots (kv-solve on the measured single-node decode memory) +
+    # 1 graph scratch + 16 prefix segments.
+    assert config.GPU_Buffer_Config.kda_state_slots == 360 + 1 + 16
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 360
+    assert config.Basic_Config.decode_graph_buckets == [
+        1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 160, 192, 256, 320, 360,
+    ]
     assert config.Module_Batching_Config.k3_shard_latent_projections is True
     assert config.Module_Batching_Config.k3_shard_vocab_parallel is True
+    # prefill keeps the values the machine ran under the retired tiers
     assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 524_288
     assert config.Module_Batching_Config.resident_ep_prefill_token_cap == 16_384
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
