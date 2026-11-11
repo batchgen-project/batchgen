@@ -2649,14 +2649,10 @@ class BatchGenWorker:
 		than one group instead pack by predicted prefill seconds, so a prefix
 		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
 
-		M3 Slice 3a adds ONE input in front of the balancer: a sequence that
-		continues a committed trajectory is PINNED to the group whose registry
-		holds that session. Without the pin the balancer places consecutive
-		batches independently, so a continuation lands on whichever group the
-		load says -- and a frontier registry is group-local, so landing on the
-		other group is a guaranteed miss. A pinned sequence is charged to its
-		pinned group's prior load, so the balancer places everything else
-		around it instead of ignoring it.
+		A committed trajectory contributes resident leading tokens on its owning
+		group to that same objective, even without ``packing_v2``. The packer
+		may place a continuation elsewhere when recomputing the prefix lowers
+		the busiest group's cost. Evicted re-entries remain hard-pinned.
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2668,7 +2664,7 @@ class BatchGenWorker:
 		num_dp = num_decode_dp_groups(self.world_size, G)
 		# Free and byte-identical whenever no session map exists, which is
 		# every run that never turned the trajectory flag on.
-		pins = self._pin_trajectory_session_groups(uuids, num_groups=num_dp)
+		residency = self._trajectory_session_residency(uuids, num_groups=num_dp)
 		prior = [0.0] * num_dp
 		to_assign = set(uuids)
 		for seq in self.global_batch:
@@ -2684,24 +2680,20 @@ class BatchGenWorker:
 			# already lives on that group's ranks, so re-grouping would strand it.
 			if seq is None or seq.decode_dp_group is not None:
 				continue
-			pinned_group = pins.get(uuid)
-			if pinned_group is not None:
-				# The session's own group, stamped here; the idempotent skip
-				# above then keeps it through every later assignment.
-				seq.decode_dp_group = int(pinned_group)
-				L = getattr(seq, "prompt_length", 0) or 0
-				prior[int(pinned_group)] += float(L) * float(L)
-				continue
 			lengths.append(getattr(seq, "prompt_length", 0) or 0)
 			seqs.append(seq)
 		if not seqs:
 			return
 		if (
 			num_dp > 1
-			and self._prefill_prefix_pool_enabled()
-			and self._prefix_rank_packing_mode(seqs)
+			and (
+				residency
+				or (self._prefill_prefix_pool_enabled() and self._prefix_rank_packing_mode(seqs))
+			)
 		):
-			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp)
+			if residency:
+				seqs.sort(key=lambda seq: seq.uuid)
+			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp, residency)
 		else:
 			# An evicted re-entry returns to the group it decoded on: its
 			# decoded suffix lives only in that group's node's trajectory book.
@@ -2721,8 +2713,19 @@ class BatchGenWorker:
 			# Grouped again: the eviction record has served its purpose, and
 			# a later eviction records the then-current group afresh.
 			seq.evicted_from_dp_group = None
+		for uuid in sorted(residency):
+			owner, boundary = residency[uuid]
+			seq = self.global_batch.get_sequence(uuid)
+			honored = seq.decode_dp_group == owner
+			self._trajectory_session_groups.record_pin(placed_on_owner=honored)
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s sequence %s owner_group=%s "
+				"placed_group=%s boundary=%s honored_on_owner=%s placed_offgroup=%s",
+				self.rank, seq.uuid, owner, seq.decode_dp_group, boundary,
+				honored, not honored,
+			)
 
-	def _pack_decode_dp_groups_for_sharing(self, seqs, num_dp: int) -> List[int]:
+	def _pack_decode_dp_groups_for_sharing(self, seqs, num_dp: int, residency=None) -> List[int]:
 		"""Place ungrouped sequences on serve groups by predicted prefill seconds.
 
 		A group prefills its members through its own in-wave prefix pool, so a
@@ -2803,6 +2806,11 @@ class BatchGenWorker:
 			chunk_tokens=chunk_tokens,
 			profile=profile,
 			fixed=fixed,
+			resident=[
+				{residency[seq.uuid][0]: residency[seq.uuid][1]}
+				if seq.uuid in residency else {}
+				for seq in queued
+			] if residency else (),
 		))
 		return [next(packed) if group is None else group for group in groups]
 
@@ -15338,14 +15346,12 @@ class BatchGenWorker:
 				len(index),
 			)
 
-	def _pin_trajectory_session_groups(self, uuids, *, num_groups: int) -> dict:
-		"""``{uuid: owning group}`` for the flag-on continuations in ``uuids``.
+	def _trajectory_session_residency(self, uuids, *, num_groups: int) -> dict:
+		"""``{uuid: (owning group, boundary tokens)}`` for continuations.
 
-		The pin input of ``_assign_decode_dp_groups``. Only sequences that do
-		NOT already carry a group are consulted: a grouped sequence keeps its
-		group (that idempotence is what keeps an evicted re-entry on the ranks
-		holding its head-sharded KDA state), so re-pinning it would be either
-		a no-op or a contradiction.
+		The cost-credit input of ``_assign_decode_dp_groups``; no group is
+		stamped here. Already grouped sequences keep their group. Evicted
+		re-entries use their saved group and never read node-local tokens here.
 
 		Resolution is the map's, which probes the SAME
 		``frontier_index_key`` derivation the registry index is built from, so
@@ -15360,19 +15366,21 @@ class BatchGenWorker:
 		runtime = self.prefix_cache_runtime_config
 		if runtime is None or self._trajectory_book is None:
 			return {}
-		sequences = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		sequences = [self.global_batch.get_sequence(uuid) for uuid in sorted(uuids)]
 		if not self._trajectory_commit_requested(
 			[seq for seq in sequences if seq is not None]
 		):
 			return {}
 		namespace_digest = runtime.namespace_digest
-		pins = {}
+		residency = {}
 		for seq in sequences:
 			if seq is None or seq.decode_dp_group is not None:
 				continue
+			if seq.evicted_from_dp_group is not None:
+				continue
 			if not self._trajectory_book.has_sequence(seq.uuid):
 				# No trajectory reservation: the prompt is not readable yet, so
-				# this sequence is not a continuation this pin can place.
+				# this sequence cannot supply a residency credit yet.
 				continue
 			entry = index.resolve(
 				namespace_digest=namespace_digest,
@@ -15388,18 +15396,8 @@ class BatchGenWorker:
 					f"by serve group {entry.owning_group_id}, which does not "
 					f"exist in a {int(num_groups)}-group world"
 				)
-			pins[seq.uuid] = int(entry.owning_group_id)
-			index.record_pin()
-			logging.info(
-				"[TRAJECTORY_FRONTIER] Rank %s pinned sequence %s to serve "
-				"group %s: it continues session %s committed at boundary %s",
-				self.rank,
-				int(seq.global_idx),
-				int(entry.owning_group_id),
-				entry.session_key,
-				int(entry.boundary_tokens),
-			)
-		return pins
+			residency[seq.uuid] = (int(entry.owning_group_id), int(entry.boundary_tokens))
+		return residency
 
 	@staticmethod
 	def _trajectory_arena_from_payload(entry: dict):
@@ -15636,13 +15634,11 @@ class BatchGenWorker:
 		restorer = self._trajectory_restorer
 		if restorer is not None:
 			fields.update(restorer.counters())
-		# M3 Slice 3a: how many sequences the session map placed. Reported
-		# wherever the map exists, including on a rank that holds no restorer,
-		# because a pin is an admission-side decision; absent on a run that
-		# never turned the flag on.
+		# Placement telemetry is replicated even on ranks without a restorer.
 		index = self._trajectory_session_groups
 		if index is not None:
-			fields["trajectory_group_pins"] = int(index.pins)
+			fields["trajectory_group_honored_on_owner"] = int(index.honored_on_owner)
+			fields["trajectory_group_placed_offgroup"] = int(index.placed_offgroup)
 		return fields
 
 	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
