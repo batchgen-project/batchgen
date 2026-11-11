@@ -729,7 +729,7 @@ class TrajectoryRestorer:
             attachment.session_key,
             reason,
             attachment.boundary_tokens,
-            detail,
+            ("planned_offgroup=true " if reason == DECLINE_GROUP_MISMATCH else "") + detail,
         )
         self.release(attachment)
 
@@ -1130,7 +1130,7 @@ class TrajectoryRestorer:
             session_key,
             reason,
             int(boundary_tokens),
-            detail,
+            ("planned_offgroup=true " if reason == DECLINE_GROUP_MISMATCH else "") + detail,
         )
 
 
