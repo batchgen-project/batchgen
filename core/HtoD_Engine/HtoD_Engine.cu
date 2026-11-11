@@ -205,7 +205,8 @@ void HtoD_Engine::complete_landing_(PendingLanding& landing) {
             // peer passing barrier B of the frame, so peers read it for as
             // long as they need it.
             this->gpu_weight_buffer_.release_unconsumed(
-                landing.module_name, static_cast<int64_t>(landing.flat));
+                landing.module_name, landing.pass,
+                static_cast<int64_t>(landing.flat));
         }
     }
     if (landing.has_role) {

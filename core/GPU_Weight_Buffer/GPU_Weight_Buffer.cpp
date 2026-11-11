@@ -464,9 +464,9 @@ void GPU_Weight_Buffer::decline_produce_only(const std::string& module_type,
 }
 
 void GPU_Weight_Buffer::release_unconsumed(const std::string& module_name,
-                                           int64_t frame) {
+                                           int64_t pass, int64_t frame) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    const auto ref = this->slots_.release_unconsumed(module_name, frame);
+    const auto ref = this->slots_.release_unconsumed(module_name, pass, frame);
     // No consumer event: the entry is immediately reclaimable once every
     // peer has passed barrier B of the record's frame.
     this->pending_releases_.push_back(PendingRelease{

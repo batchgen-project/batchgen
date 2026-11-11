@@ -706,9 +706,17 @@ class WeightSlotTable {
     // lease (a HostShared module this rank owns but does not consume). The
     // slot stays out of FREE until every peer has passed barrier B(frame);
     // frame is the flat frame index the record belongs to.
-    SlotRef release_unconsumed(const std::string& module_name, int64_t frame) {
-        const int64_t pass = this->require_current_pass(
-            "release unconsumed " + module_name);
+    SlotRef release_unconsumed(const std::string& module_name, int64_t pass,
+                               int64_t frame) {
+        // The record's own pass, not the current one: with a carried pass
+        // the producer lands records of the NEXT pass while the oldest is
+        // still open, and both can be produce-only padding passes.
+        if (!this->is_open(pass)) {
+            throw std::runtime_error(
+                "Cannot release unconsumed " + module_name + ": pass " +
+                std::to_string(pass) + " is not open (" +
+                this->describe_open() + ")");
+        }
         auto resident = this->index_.find(Key{module_name, pass});
         if (resident == this->index_.end()) {
             throw std::runtime_error(

@@ -97,7 +97,8 @@ class GPU_Weight_Buffer {
                               const std::string& module_name);
     // PRESENT -> PENDING_RELEASE for an owned record with no consumer; the
     // reclaim stays gated on every peer passing barrier B of frame.
-    void release_unconsumed(const std::string& module_name, int64_t frame);
+    void release_unconsumed(const std::string& module_name, int64_t pass,
+                            int64_t frame);
     SkipCounts cancel_pass(int64_t pass);
     // Waits until the producer is past the end of pass, none of its slots is
     // FILLING and every pending asynchronous release has completed.
