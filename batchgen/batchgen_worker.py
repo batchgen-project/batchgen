@@ -2,7 +2,6 @@ import concurrent.futures
 import copy
 import functools
 import hashlib
-import heapq
 import json
 import psutil
 import logging
@@ -868,43 +867,15 @@ class QueryBookBufferPool:
 		self.num_sequences = num_sequences
 		self.input_ids_width = input_ids_width
 		self.max_decoding_length = max_decoding_length
-		# Min-heap: input_ids is node-shared, so every rank must hand the same
-		# slot to the same sequence. Taking the lowest free slot depends only on
-		# which slots are free, not on the order completions freed them (a set's
-		# pop() order does, and that order differs across ranks).
-		self._free_slots: list = []
-		self._next_slot: int = 0
 
 	def adopt(self, old: "QueryBookBufferPool") -> None:
-		"""Carry contents and slot bookkeeping over from a superseded pool."""
+		"""Carry contents over from a superseded pool."""
 		rows = min(self.num_sequences, old.num_sequences)
 		cols = min(self.input_ids_width, old.input_ids_width)
 		if self.input_ids_buffer is not None and old.input_ids_buffer is not None:
 			self.input_ids_buffer[:rows, :cols] = old.input_ids_buffer[:rows, :cols]
 		dec = min(self.max_decoding_length, old.max_decoding_length)
 		self.decoded_tokens_buffer[:rows, :dec] = old.decoded_tokens_buffer[:rows, :dec]
-		self._free_slots = list(old._free_slots)
-		self._next_slot = old._next_slot
-
-	def allocate_slot(self) -> int:
-		if self._free_slots:
-			slot = heapq.heappop(self._free_slots)
-			# Clear stale data from previous occupant to prevent EOS/token contamination
-			self.decoded_tokens_buffer[slot, :] = self.pad_token_id
-			if self.input_ids_buffer is not None:
-				self.input_ids_buffer[slot, :] = 0
-			return slot
-		slot = self._next_slot
-		if slot >= self.num_sequences:
-			raise QueryBookPoolCapacityError(
-				f"QueryBookBufferPool exhausted: {self.num_sequences} slots used "
-				"(legacy buffer-pool mode is unavailable)"
-			)
-		self._next_slot += 1
-		return slot
-
-	def free_slot(self, slot: int):
-		heapq.heappush(self._free_slots, slot)
 
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
 		if self.input_ids_buffer is None:
