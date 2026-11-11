@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -687,18 +688,38 @@ class RestartCoordinator:
     # ---------------------- Heartbeat ----------------------
     def _beat(self) -> None:
         """Advance this node's heartbeat by one tick."""
+        t0 = time.monotonic()
         try:
             self._require_store().add(_alive_key(self._node_rank), 1)
         except Exception as exc:
             self._record_control_error(exc)
             return
         self._last_store_ok = self._clock()
+        # [HB-DIAG] temporary diagnosis instrumentation (branch-only, never
+        # merged): a slow add() is a store/transport stall; a LATE line from
+        # the loop below with a fast add() is writer-thread scheduling (GIL).
+        dt = time.monotonic() - t0
+        if dt > 1.0:
+            logger.warning("[HB] slow beat node=%d add_s=%.2f", self._node_rank, dt)
 
     def _beat_until_closed(self) -> None:
         # A thread of its own: the follower runs a coordinated restart, and a
         # peer's failure handover, inline for minutes, and a node that is busy
         # recovering must not look dead to its peers meanwhile.
+        logger.info(
+            "[HB] writer start node=%d pid=%d interval=%.1fs",
+            self._node_rank, os.getpid(), self._heartbeat_s,
+        )
+        prev = time.monotonic()
         while not self._follower_stop.is_set():
+            now = time.monotonic()
+            gap = now - prev
+            if gap > self._heartbeat_s * 2:
+                logger.warning(
+                    "[HB] late wakeup node=%d gap_s=%.2f (scheduling/GIL)",
+                    self._node_rank, gap,
+                )
+            prev = now
             self._beat()
             self._follower_stop.wait(self._heartbeat_s)
 
