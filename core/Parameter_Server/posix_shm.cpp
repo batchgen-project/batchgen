@@ -146,6 +146,93 @@ static void advise_transparent_huge_pages(
 }
 
 // Helper function for page touching with signal handling
+
+// The creator's touch threads used to first-touch the shared weight memfd
+// on whichever NUMA node the scheduler placed them, so each server
+// lifetime drew a random page placement and the prefill H2D rate swung
+// with the draw. Interleaving the mapping before the touch makes every
+// lifetime's placement deterministic. Raw syscalls: the runtime images
+// ship libnuma.so.1 without the dev headers (numa_compat.h).
+static bool read_online_nodes(unsigned long* mask_out, int* max_node_out) {
+    std::ifstream online("/sys/devices/system/node/online");
+    std::string text;
+    if (!online || !std::getline(online, text)) {
+        return false;
+    }
+    unsigned long mask = 0;
+    int max_node = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t next = text.find(',', pos);
+        std::string part = text.substr(
+            pos, next == std::string::npos ? std::string::npos : next - pos);
+        size_t dash = part.find('-');
+        int lo = std::stoi(part.substr(0, dash));
+        int hi = dash == std::string::npos ? lo
+                                           : std::stoi(part.substr(dash + 1));
+        for (int node = lo; node <= hi && node < 64; ++node) {
+            mask |= 1UL << node;
+            max_node = std::max(max_node, node);
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    *mask_out = mask;
+    *max_node_out = max_node;
+    return mask != 0;
+}
+
+static void interleave_weight_mapping(
+    const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
+    unsigned long mask = 0;
+    int max_node = 0;
+    if (!read_online_nodes(&mask, &max_node) || max_node == 0) {
+        logger->info("Weights NUMA interleave skipped: single node");
+        return;
+    }
+    const long rc = syscall(SYS_mbind, ptr, static_cast<unsigned long>(len),
+                            MPOL_INTERLEAVE, &mask,
+                            static_cast<unsigned long>(max_node + 2), 0UL);
+    if (rc != 0) {
+        logger->warn("Weights NUMA interleave mbind failed: {}",
+                     strerror(errno));
+        return;
+    }
+    logger->info("Weights NUMA policy: MPOL_INTERLEAVE nodes mask {:#x}",
+                 mask);
+}
+
+static void log_weight_numa_composition(
+    const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
+    // Sample one page per GiB; per-leg evidence of the placement draw.
+    const int64_t step = 1LL << 30;
+    const int count = static_cast<int>(
+        std::min<int64_t>(1024, (len + step - 1) / step));
+    if (count <= 0) return;
+    std::vector<void*> pages(count);
+    std::vector<int> status(count, -1);
+    for (int index = 0; index < count; ++index) {
+        pages[index] = static_cast<char*>(ptr) +
+                       std::min<int64_t>(int64_t(index) * step, len - 1);
+    }
+    const long rc = syscall(SYS_move_pages, 0, static_cast<unsigned long>(count),
+                            pages.data(), nullptr, status.data(), 0);
+    if (rc != 0) {
+        logger->warn("Weights NUMA composition sample failed: {}",
+                     strerror(errno));
+        return;
+    }
+    std::unordered_map<int, int> per_node;
+    for (int node : status) ++per_node[node];
+    std::string summary;
+    for (const auto& [node, pages_on_node] : per_node) {
+        summary += "node" + std::to_string(node) + "=" +
+                   std::to_string(pages_on_node * 100 / count) + "% ";
+    }
+    logger->info("Weights NUMA composition ({} x 1GiB samples): {}", count,
+                 summary);
+}
+
 bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
                  int64_t size, long page_size, bool multi_threaded) {
     // Set up signal handlers
@@ -352,7 +439,9 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                 logger->warn("hugepage memfd mmap failed: {}", strerror(errno));
                 ptr = nullptr;
                 close(fd);
-            } else if (!touch_pages(logger, ptr, size, hugetlb_page_size, true)) {
+            } else if (interleave_weight_mapping(logger, ptr, hugetlb_size),
+                       !touch_pages(logger, ptr, size, hugetlb_page_size,
+                                    true)) {
                 logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
                 munmap(ptr, hugetlb_size);
                 ptr = nullptr;
@@ -360,6 +449,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
             } else {
                 allocated_size = hugetlb_size;
                 using_huge_pages = true;
+                log_weight_numa_composition(logger, ptr, allocated_size);
                 *out_memfd_fd = fd;
                 logger->info(
                     "Weights allocated via memfd_create(MFD_HUGETLB) "
@@ -414,6 +504,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                     std::string(strerror(err)));
             }
             allocated_size = aligned_size;
+            interleave_weight_mapping(logger, ptr, allocated_size);
             advise_transparent_huge_pages(logger, ptr, allocated_size,
                                           enable_thp);
             if (enable_thp) {
@@ -443,6 +534,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
             } else if (!touch_pages(logger, ptr, size, page_size, true)) {
                 logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
+            log_weight_numa_composition(logger, ptr, allocated_size);
             *out_memfd_fd = fd;
             logger->info("Weights allocated via memfd_create ({:.1f} GB, {} pages)",
                          allocated_size / (1024.0 * 1024.0 * 1024.0),
