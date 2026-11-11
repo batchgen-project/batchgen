@@ -532,6 +532,9 @@ void HtoD_Engine::install_replica_plan(
     runtime->total_per_type_pos.assign(
         runtime->type_index.size(),
         std::vector<uint32_t>(layers_per_pass, 0));
+    runtime->a_cursor.assign(runtime->type_index.size(), 0);
+    runtime->b_cursor.assign(runtime->type_index.size(), 0);
+    runtime->cursor_init.assign(runtime->type_index.size(), false);
     for (const auto& module : modules) {
         if (module.layer_position >= layers_per_pass) {
             throw std::runtime_error(
@@ -647,31 +650,73 @@ void HtoD_Engine::uninstall_replica_plan() {
     this->logger_->info("Replica plan uninstalled");
 }
 
+void HtoD_Engine::replica_note_issue_(size_t type, uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    if (!plan.cursor_init[type]) {
+        // The producer meets a type's records in frame order, so the first
+        // record carries the type's lowest frame of this install.
+        plan.a_cursor[type] = flat_frame;
+        plan.b_cursor[type] = flat_frame;
+        plan.cursor_init[type] = true;
+    }
+}
+
+void HtoD_Engine::replica_advance_a_(size_t type) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    while (true) {
+        const uint64_t frame = plan.a_cursor[type];
+        const uint32_t owned =
+            plan.owned_per_type_pos[type][frame % plan.layers_per_pass];
+        if (owned == 0) {
+            // This member owns nothing of the frame: no consumer waits on
+            // its word there, the cursor steps across without posting.
+            ++plan.a_cursor[type];
+            continue;
+        }
+        auto landed = plan.owned_landed.find({type, frame});
+        if (landed == plan.owned_landed.end() || landed->second < owned) {
+            return;  // the prefix ends at the first incomplete owned frame
+        }
+        plan.block.advance(plan.member_index, type,
+                           ReplicaControlBlock::Barrier::A, frame);
+        plan.owned_landed.erase(landed);
+        ++plan.a_cursor[type];
+    }
+}
+
+void HtoD_Engine::replica_advance_b_(size_t type) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    while (true) {
+        const uint64_t frame = plan.b_cursor[type];
+        const uint32_t total =
+            plan.total_per_type_pos[type][frame % plan.layers_per_pass];
+        if (total == 0) {
+            ++plan.b_cursor[type];
+            continue;
+        }
+        auto terminal = plan.terminal.find({type, frame});
+        if (terminal == plan.terminal.end() || terminal->second < total) {
+            return;
+        }
+        plan.block.advance(plan.member_index, type,
+                           ReplicaControlBlock::Barrier::B, frame);
+        plan.terminal.erase(terminal);
+        plan.wait_since.erase({type, frame});
+        ++plan.b_cursor[type];
+    }
+}
+
 void HtoD_Engine::replica_mark_owned_landed_(size_t type,
                                              uint64_t flat_frame) {
     ReplicaPlanRuntime& plan = *this->replica_plan_;
-    const auto key = std::make_pair(type, flat_frame);
-    const uint32_t landed = ++plan.owned_landed[key];
-    const uint32_t owned =
-        plan.owned_per_type_pos[type][flat_frame % plan.layers_per_pass];
-    if (landed == owned) {
-        plan.block.advance(plan.member_index, type,
-                           ReplicaControlBlock::Barrier::A, flat_frame);
-        plan.owned_landed.erase(key);
-    }
+    ++plan.owned_landed[{type, flat_frame}];
+    this->replica_advance_a_(type);
 }
 
 void HtoD_Engine::replica_mark_terminal_(size_t type, uint64_t flat_frame) {
     ReplicaPlanRuntime& plan = *this->replica_plan_;
-    const auto key = std::make_pair(type, flat_frame);
-    const uint32_t terminal = ++plan.terminal[key];
-    if (terminal ==
-        plan.total_per_type_pos[type][flat_frame % plan.layers_per_pass]) {
-        plan.block.advance(plan.member_index, type,
-                           ReplicaControlBlock::Barrier::B, flat_frame);
-        plan.terminal.erase(key);
-        plan.wait_since.erase(key);
-    }
+    ++plan.terminal[{type, flat_frame}];
+    this->replica_advance_b_(type);
 }
 
 void HtoD_Engine::HtoD_Worker() {
@@ -857,6 +902,7 @@ void HtoD_Engine::HtoD_Worker() {
                 flat = flat_frame(static_cast<uint64_t>(next.pass),
                                   role->layer_position,
                                   this->replica_plan_->layers_per_pass);
+                this->replica_note_issue_(role->type_index, flat);
             }
             if (role != nullptr &&
                 role->kind ==
@@ -864,18 +910,6 @@ void HtoD_Engine::HtoD_Worker() {
                 next.kind == WeightProduction::kCopy) {
                 ReplicaPlanRuntime& plan = *this->replica_plan_;
                 const size_t type = role->type_index;
-                // A frame this member owns nothing of (for this type) still
-                // posts A once.
-                const uint32_t owned =
-                    plan.owned_per_type_pos[type]
-                                           [flat % plan.layers_per_pass];
-                const uint64_t own_a = plan.block.passed(
-                    plan.member_index, type, ReplicaControlBlock::Barrier::A);
-                if (owned == 0 && (own_a == ReplicaControlBlock::kNone ||
-                                   own_a < flat)) {
-                    plan.block.advance(plan.member_index, type,
-                                       ReplicaControlBlock::Barrier::A, flat);
-                }
                 const uint64_t owner_a = plan.block.passed(
                     static_cast<size_t>(role->owner_member), type,
                     ReplicaControlBlock::Barrier::A);

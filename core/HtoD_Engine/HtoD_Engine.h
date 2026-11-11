@@ -282,11 +282,21 @@ class HtoD_Engine {
         // imported peer segment mappings (unmapped at uninstall)
         std::vector<std::shared_ptr<batchgen_vmm::VmmPeerImport>> keepalive;
         std::vector<cudaStream_t> pull_streams;  // one per member
-        // frame bookkeeping per (type, flat frame), producer thread only
+        // Frame bookkeeping per (type, flat frame), producer thread only.
+        // Barrier words post for the CONTIGUOUS prefix of complete frames
+        // per type (cursors below), never in completion order: deferred
+        // landings and immediate skip marks finish out of order, and a word
+        // that jumps past an incomplete frame tells every peer that frame
+        // landed (early reclaim race) before throwing on the late post.
         std::map<std::pair<size_t, uint64_t>, uint32_t> owned_landed;
         std::map<std::pair<size_t, uint64_t>, uint32_t> terminal;
         std::map<std::pair<size_t, uint64_t>,
                  std::chrono::steady_clock::time_point> wait_since;
+        // Next frame each barrier may post, per type; initialized from the
+        // first record of the type the producer meets (its lowest frame).
+        std::vector<uint64_t> a_cursor;
+        std::vector<uint64_t> b_cursor;
+        std::vector<bool> cursor_init;
         ReplicaPlanRuntime(ReplicaControlBlock attached)
             : block(attached) {}
     };
@@ -294,4 +304,7 @@ class HtoD_Engine {
     // Producer-side frame hooks; no-ops without an installed plan.
     void replica_mark_terminal_(size_t type, uint64_t flat_frame);
     void replica_mark_owned_landed_(size_t type, uint64_t flat_frame);
+    void replica_note_issue_(size_t type, uint64_t flat_frame);
+    void replica_advance_a_(size_t type);
+    void replica_advance_b_(size_t type);
 };
