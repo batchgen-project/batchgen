@@ -620,3 +620,15 @@ def test_deleted_symbols_are_gone_from_python_callers():
 def test_dead_python_modules_are_deleted():
     for relative in DEAD_MODULES:
         assert not (PACKAGE / relative).exists(), relative
+
+
+def test_inflight_landing_bound_counts_host_leases_only():
+    """The make_space bound exists to cap leased host staging; counting
+    replica pulls (which hold no lease) against it serialized the per-owner
+    pull streams into a per-layer supply tail (R16 nsys capture)."""
+    text = (ROOT / "core/HtoD_Engine/HtoD_Engine.cu").read_text()
+    assert "pending_host_landings_ >= kMaxInFlightLandings" in text
+    assert "pending_landings_.size() >= kMaxInFlightLandings" not in text
+    # Counter stays consistent on every dequeue path.
+    assert text.count("--this->pending_host_landings_;") == 2
+    assert text.count("++this->pending_host_landings_;") == 1

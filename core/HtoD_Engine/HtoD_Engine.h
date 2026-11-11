@@ -250,11 +250,14 @@ class HtoD_Engine {
         uint32_t role_record_index = 0;
         uint64_t flat = 0;
     };
-    // Bounds host staging the way the per-tensor sync used to: at most this
-    // many modules' host leases are held by in-flight copies. 64 modules is
-    // ~1.5 GB of leased host staging and two routed frames' worth of issue
-    // depth; at 8 the producer sat issue-to-completion locked at the
-    // ~0.5 ms/record event cadence (R10 drain accounting).
+    // Bounds HOST STAGING only: at most this many modules' host leases are
+    // held by in-flight copies (~1.5 GB leased staging at 64; at 8 the
+    // producer sat issue-to-completion locked at the ~0.5 ms/record event
+    // cadence, R10 drain accounting). Replica pulls hold no host lease and
+    // are bounded by ring-slot claims, so they do not count: bounding them
+    // here limited issue depth to two 32-record owner blocks and serialized
+    // the per-owner pull streams into a per-layer supply tail the compute
+    // could not hide (R16 nsys capture).
     static constexpr size_t kMaxInFlightLandings = 64;
     // Producer-loop section accounting (producer thread writes without a
     // lock; weight_stream_status reads approximately - diagnostics only).
@@ -273,6 +276,7 @@ class HtoD_Engine {
     uint64_t producer_records_ = 0;
     uint64_t producer_ring_full_ = 0;  // acquireEmptyBuffer returned none
     std::deque<PendingLanding> pending_landings_;
+    size_t pending_host_landings_ = 0;  // host_lease entries; producer thread
     void complete_landing_(PendingLanding& landing);
     // Complete finished landings (front first; completion keeps issue
     // order). With make_space, block on the oldest when the queue is full.

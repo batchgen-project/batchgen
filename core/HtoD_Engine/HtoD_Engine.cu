@@ -213,16 +213,22 @@ bool HtoD_Engine::drain_landings_(bool make_space) {
         PendingLanding& front = this->pending_landings_.front();
         const cudaError_t status = cudaEventQuery(front.event);
         if (status == cudaErrorNotReady) {
+            // Only held host leases bound issue depth; replica pulls are
+            // bounded by their ring-slot claims (kMaxInFlightLandings note).
             if (!(make_space &&
-                  this->pending_landings_.size() >= kMaxInFlightLandings)) {
+                  this->pending_host_landings_ >= kMaxInFlightLandings)) {
                 break;
             }
-            // Full queue: complete_landing_ blocks on the oldest event.
+            // Staging bound reached: complete_landing_ blocks on the oldest
+            // event (FIFO drain frees a host lease within a bounded prefix).
         } else {
             CUDA_CHECK(status);
         }
         PendingLanding landing = std::move(front);
         this->pending_landings_.pop_front();
+        if (landing.host_lease) {
+            --this->pending_host_landings_;
+        }
         this->complete_landing_(landing);
         any = true;
     }
@@ -233,6 +239,9 @@ void HtoD_Engine::flush_landings_(bool swallow_errors) {
     while (!this->pending_landings_.empty()) {
         PendingLanding landing = std::move(this->pending_landings_.front());
         this->pending_landings_.pop_front();
+        if (landing.host_lease) {
+            --this->pending_host_landings_;
+        }
         if (!swallow_errors) {
             this->complete_landing_(landing);
             continue;
@@ -1262,6 +1271,7 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 ++this->producer_records_;
                 lease_held = false;
+                ++this->pending_host_landings_;
                 this->pending_landings_.push_back(std::move(landing));
                 {
                     std::lock_guard<std::mutex> lock(
