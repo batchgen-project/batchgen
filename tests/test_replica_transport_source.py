@@ -34,25 +34,34 @@ def test_replica_pull_is_one_device_copy_on_the_owner_stream():
     pull = body.index("plan.pull_streams[role->owner_member]")
     copy = body.index("cudaMemcpyDeviceToDevice", pull - 2000)
     assert abs(copy - pull) < 2500
-    # paced like the host path: the producer synchronizes its own copy
-    assert body.index("cudaStreamSynchronize(stream)", pull) - pull < 800
-    # and never acquires host storage or a daemon lease on this path
+    # L-E2: no blocking sync per record; the landing waits on the copy's
+    # event so the stream stays bandwidth-bound (the per-record sync made
+    # the wall track module count; ABBA 2026-11-11).
     replica_block = body[body.index("Pull the owner's landed slot"):
                          body.index("set_producer_state_(ProducerState::kAcquiring")]
+    assert "cudaStreamSynchronize" not in replica_block
+    assert "cudaEventRecord(landing.event, stream)" in replica_block
+    # and never acquires host storage or a daemon lease on this path
     assert "get_module_weights_storage" not in replica_block
     assert "release_module" not in replica_block
 
 
 def test_host_shared_landing_publishes_arms_gate_and_posts_frames():
-    body = _producer(ENGINE.read_text())
-    landing = body.index("weights_copy_complete(\n                        module_type, module_name, buffer_idx);")
-    tail = body[landing:landing + 2600]
-    assert "arm_peer_release_gate" in tail
-    assert "publish_slot" in tail
-    assert "replica_mark_owned_landed_" in tail
-    assert "replica_mark_terminal_" in tail
+    source = ENGINE.read_text()
+    # L-E2: the landing actions run in complete_landing_ once the module's
+    # copy event is done; publish/marks never precede the copied bytes.
+    body = source[source.index("void HtoD_Engine::complete_landing_"):
+                  source.index("bool HtoD_Engine::drain_landings_")]
+    sync = body.index("cudaEventSynchronize(landing.event)")
+    complete = body.index("weights_copy_complete(")
+    assert sync < complete
+    assert "arm_peer_release_gate" in body
+    assert "publish_slot" in body
+    assert "replica_mark_owned_landed_" in body
+    assert "replica_mark_terminal_" in body
+    assert complete < body.index("publish_slot")
     # produce-only (HostShared skip or release-on-landing) fails loud
-    assert "produce-only" in body
+    assert "produce-only" in body or "produce-only" in _producer(source)
 
 
 def test_failed_producer_raises_its_abort_word():

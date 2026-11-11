@@ -227,6 +227,39 @@ class HtoD_Engine {
     void HtoD_Worker();
     void blocking_copy_(void* dst, void* src, int64_t size);
 
+    /* L-E2: event-deferred landings. The producer issues every weight tensor
+       copy asynchronously and runs a module's landing actions (host lease
+       release, slot completion, replica publish and barrier marks) when its
+       stream event completes. One blocking sync per tensor made the wave
+       wall track MODULE COUNT instead of bytes (ABBA 2026-11-11: an 8x byte
+       reduction moved the wall 0%); with deferral the stream is
+       bandwidth-bound and landings stay correct because nothing is published
+       or marked PRESENT before the copy's event. Producer thread only. */
+    struct PendingLanding {
+        cudaEvent_t event = nullptr;
+        cudaEvent_t profile_start = nullptr;  // only when profiling
+        std::string module_type;
+        std::string module_name;
+        int64_t buffer_idx = -1;
+        uint64_t bytes = 0;
+        bool host_lease = false;    // release_module at completion
+        bool replica_pull = false;  // counters; no publish
+        bool has_role = false;
+        uint8_t role_kind = 1;
+        uint32_t role_type_index = 0;
+        uint32_t role_record_index = 0;
+        uint64_t flat = 0;
+    };
+    // Bounds host staging the same way the per-tensor sync used to: at most
+    // this many modules' host leases are held by in-flight copies.
+    static constexpr size_t kMaxInFlightLandings = 8;
+    std::deque<PendingLanding> pending_landings_;
+    void complete_landing_(PendingLanding& landing);
+    // Complete finished landings (front first; completion keeps issue
+    // order). With make_space, block on the oldest when the queue is full.
+    bool drain_landings_(bool make_space);
+    void flush_landings_(bool swallow_errors);
+
     /* Replica transport runtime. Written only while the producer is stopped;
        read by the producer thread. */
     struct ReplicaPlanRuntime {

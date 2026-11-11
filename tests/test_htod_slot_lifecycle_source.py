@@ -10,6 +10,7 @@ outside the locks the request path takes.
 
 import re
 from pathlib import Path
+import pathlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -273,19 +274,25 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
 
 
 def test_lease_is_released_before_the_copy_lands():
+    # L-E2: the lease travels with the deferred landing (bounded in-flight
+    # queue) and complete_landing_ releases it before the slot turns PRESENT,
+    # so no FILLING slot of a pass implies no daemon lease of it.
+    source = pathlib.Path("core/HtoD_Engine/HtoD_Engine.cu").read_text()
     weights = _weight_section()
-    # Anchor on the HOST copy state, after the host fetch; the replica
-    # branch earlier in the loop lands without any lease to release.
     copying = weights.index(
         "ProducerState::kCopying",
         weights.index("get_module_weights_storage("),
     )
-    release = weights.index("this->weights_storage_.release_module(module_name);", copying)
-    complete = weights.index("this->gpu_weight_buffer_.weights_copy_complete(", copying)
-    # No FILLING slot of a pass implies no daemon lease of it.
+    handoff = weights.index("landing.host_lease = true;", copying)
+    # the producer's local flag clears once the landing owns the lease
+    assert weights.index("lease_held = false;", handoff) > handoff
+    landing = source[source.index("void HtoD_Engine::complete_landing_"):
+                     source.index("bool HtoD_Engine::drain_landings_")]
+    release = landing.index("release_module(landing.module_name);")
+    complete = landing.index("weights_copy_complete(")
     assert release < complete
-    assert "const bool present =" in weights[complete - 80:complete]
-    assert "this->released_on_landing_modules_" in weights[complete:]
+    assert "const bool present =" in landing[complete - 80:complete]
+    assert "this->released_on_landing_modules_" in landing[complete:]
     buffer = BUFFER.read_text()
     landed = _section(
         buffer,
