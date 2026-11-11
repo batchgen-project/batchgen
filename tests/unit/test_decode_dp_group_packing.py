@@ -63,9 +63,9 @@ def _worker_methods(*names):
 
 _METHODS = (
     "_assign_decode_dp_groups",
-    # The M3 pin input the balancer consults first; these fakes carry no
+    # The residency input the balancer consults first; these fakes carry no
     # session map, so it returns nothing and assignment is unchanged.
-    "_pin_trajectory_session_groups",
+    "_trajectory_session_residency",
     "_pack_decode_dp_groups_for_sharing",
     "_prefix_rank_packing_mode",
     "_cached_prefix_rank_cost_profile",
@@ -128,7 +128,7 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
         ),
         _decode_attn_tp_size=lambda: G,
-        # No trajectory session map: the pin is inert for these batches.
+        # No trajectory session map: residency is empty for these batches.
         _trajectory_session_groups=None,
         _prefill_prefix_pool_enabled=lambda: pool,
         _trajectory_tokens=lambda seq, length=None, **_: torch.tensor(
@@ -181,16 +181,18 @@ def _assigned(seqs):
 #  The pure wrapper                                                           #
 # --------------------------------------------------------------------------- #
 
-def test_group_packer_is_the_wave_packer_over_groups():
+@pytest.mark.parametrize("with_residency", [False, True])
+def test_group_packer_is_the_wave_packer_over_groups(with_residency):
     prompts = _family(1, 5, 8, 1) + _family(2, 4, 6, 2) + [_singleton(3, 2)]
     fixed = ((1, 40.0),)
+    resident = [{0: 8 * B}] * 5 + [{}] * 5 if with_residency else ()
     expected = pack_wave_ranks(
         prompts, world_size=3, block_tokens=B, chunk_tokens=CHUNK,
-        profile=None, fixed=fixed,
+        profile=None, fixed=fixed, resident=resident,
     ).ranks
     got = pack_groups_for_sharing(
         prompts, num_groups=3, block_tokens=B, chunk_tokens=CHUNK,
-        profile=None, fixed=fixed,
+        profile=None, fixed=fixed, resident=resident,
     )
     assert got == expected
     with pytest.raises(ValueError):

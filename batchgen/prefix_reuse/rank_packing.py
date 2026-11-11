@@ -35,8 +35,8 @@ at most ``_MAX_LEVELS + 4`` rounds.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Callable, Mapping, Optional, Sequence
 
 from batchgen.prefix_reuse.executor_cost import ExecutorCostProfile
 from batchgen.prefix_reuse.wave_plan import _Tree, _build_tree
@@ -240,6 +240,8 @@ class _UnitSegs:
     ``counts`` and ``ends`` say how many members pass through resp. end at
     each. ``tail_tokens`` and ``tail_pairs`` are every member's work past its
     last tree segment, which is private to that member and so simply adds up.
+    ``resident`` maps segments to ranks where every member through the segment
+    has enough leading tokens resident to cover it in full.
     """
 
     segs: tuple[int, ...]
@@ -248,6 +250,7 @@ class _UnitSegs:
     members: int
     tail_tokens: int
     tail_pairs: int
+    resident: Mapping[int, frozenset[int]] = field(default_factory=dict)
 
 
 def _unit_segs(
@@ -255,15 +258,26 @@ def _unit_segs(
     members: Sequence[int],
     prompt_lengths: Sequence[int],
     block_tokens: int,
+    resident: Sequence[Mapping[int, int]] = (),
 ) -> _UnitSegs:
     counts: dict[int, int] = {}
     ends: dict[int, int] = {}
     tail_tokens = 0
     tail_pairs = 0
+    credits: dict[int, dict[int, int]] = {}
     for index in members:
         path = tree.paths[index]
         for seg in path:
             counts[seg] = counts.get(seg, 0) + 1
+            if resident:
+                credit = resident[index]
+                if seg not in credits:
+                    credits[seg] = {g: credit[g] for g in sorted(credit)}
+                else:
+                    credits[seg] = {
+                        g: min(boundary, credit.get(g, 0))
+                        for g, boundary in credits[seg].items()
+                    }
         if path:
             ends[path[-1]] = ends.get(path[-1], 0) + 1
         start = tree.end_block[path[-1]] * block_tokens if path else 0
@@ -277,6 +291,13 @@ def _unit_segs(
         len(members),
         tail_tokens,
         tail_pairs,
+        {
+            seg: frozenset(
+                g for g, boundary in credit.items()
+                if tree.end_block[seg] * block_tokens <= boundary
+            )
+            for seg, credit in credits.items()
+        },
     )
 
 
@@ -309,10 +330,15 @@ class _RankState:
     ``depth`` is the one bound left: the deepest pooled segment's tree depth,
     which over-counts by every pooled run this rank happens to merge. It only
     raises the chunk floor in ``_score``.
+
+    Resident segments subtract their tokens and pairs once from the union.
+    A segment stays credited only while every member through it is covered.
     """
 
-    def __init__(self, info: _SegInfo) -> None:
+    def __init__(self, info: _SegInfo, rank: int = 0) -> None:
         self._info = info
+        self._rank = rank
+        self._resident: set[int] = set()
         self._count: dict[int, int] = {}  # this rank's members through a seg
         self._kids: dict[int, int] = {}  # its children this rank holds
         self._ends: dict[int, int] = {}  # members whose path ends at it
@@ -332,12 +358,20 @@ class _RankState:
         depth = self._depth
         fresh: dict[int, int] = {}  # per segment, children new to this rank
         for seg in unit.segs:
+            covered = self._rank in unit.resident.get(seg, ())
             if seg not in self._count:
-                computed += info.tokens[seg]
-                pairs += info.pairs[seg]
+                if not covered:
+                    computed += info.tokens[seg]
+                    pairs += info.pairs[seg]
                 up = info.parent[seg]
                 if up is not None:  # a path keeps ancestors, so up is in segs
                     fresh[up] = fresh.get(up, 0) + 1
+            elif seg in self._resident and not covered:
+                # The union's credit is the minimum over all its members.
+                # A new member without coverage makes this segment payable
+                # once, even if earlier units restored it on this rank.
+                computed += info.tokens[seg]
+                pairs += info.pairs[seg]
         pooled = self._pooled
         merged = self._merged
         for position, seg in enumerate(unit.segs):
@@ -375,9 +409,13 @@ class _RankState:
         self._members += unit.members
         for position, seg in enumerate(unit.segs):
             if seg not in self._count:
+                if self._rank in unit.resident.get(seg, ()):
+                    self._resident.add(seg)
                 up = self._info.parent[seg]
                 if up is not None:
                     self._kids[up] = self._kids.get(up, 0) + 1
+            elif self._rank not in unit.resident.get(seg, ()):
+                self._resident.discard(seg)
             self._count[seg] = self._count.get(seg, 0) + unit.counts[position]
             if unit.ends[position]:
                 self._ends[seg] = self._ends.get(seg, 0) + unit.ends[position]
@@ -434,7 +472,7 @@ def _place(
     """
 
     order = sorted(range(len(units)), key=lambda u: (-units[u][2], units[u][0][0]))
-    state = [_RankState(info) for _ in range(world_size)]
+    state = [_RankState(info, rank) for rank in range(world_size)]
     where = [0] * len(units)
     for u in order:
         segs = units[u][1]
@@ -463,6 +501,7 @@ def pack_wave_ranks(
     chunk_tokens: int,
     profile: Optional[ExecutorCostProfile],
     fixed: Sequence[tuple[int, float]] = (),
+    resident: Sequence[Mapping[int, int]] = (),
 ) -> RankPacking:
     """Balance one wave's predicted per-rank prefill executor time.
 
@@ -471,9 +510,14 @@ def pack_wave_ranks(
     added to that rank's starting score, so a busy rank simply receives fewer
     prompts.
 
-    ``lower`` bounds the busiest rank from below: a rank cannot be cheaper than
-    an even share of the unsplit wave, nor than the single costliest prompt.
-    It seeds the score targets and stops the schedule once a round reaches it.
+    ``resident[i]`` maps ranks to leading tokens already materialized for
+    prompt i. A tree segment wholly covered for every member using it on a
+    rank costs zero tokens and pairs there; all other segments cost once.
+    Rows, chunk floors and private tails retain the existing cost model.
+
+    Without residency, ``lower`` bounds the busiest rank by an even share of
+    the unsplit wave and the single costliest prompt. It seeds score targets;
+    residency keeps those targets but uses fixed load as the stopping bound.
 
     Features assume every shared segment is pooled, as an unlimited prefix pool
     would allow. A rank whose pool is too small for that raises its own
@@ -482,6 +526,8 @@ def pack_wave_ranks(
 
     if world_size <= 0 or block_tokens <= 0 or chunk_tokens <= 0:
         raise ValueError("world_size, block_tokens and chunk_tokens must be positive")
+    if resident and len(resident) != len(prompts):
+        raise ValueError("resident must have one mapping per prompt")
     base = [0.0] * world_size
     for rank, load in fixed:
         base[rank] += float(load)
@@ -508,7 +554,7 @@ def pack_wave_ranks(
             feats = unit_features(tree, members, lengths, block_tokens)
             made = (
                 members,
-                _unit_segs(tree, members, lengths, block_tokens),
+                _unit_segs(tree, members, lengths, block_tokens, resident),
                 _feature_score(profile, feats, chunk_tokens),
             )
             units_seen[key] = made
@@ -560,6 +606,10 @@ def pack_wave_ranks(
     root = list(range(len(prompts)))
     whole = unit(root)
     lower = max(whole[2] / world_size, max(unit([i])[2] for i in root))
+    # Uncredited scores still seed the same refinement targets. With residency
+    # they are no longer a lower bound: credits can differ across ranks. Only
+    # the fixed load is a safe stopping bound for every such placement.
+    stopping_lower = max(base) if resident else lower
 
     rounds: list[tuple[Optional[int], float]] = [
         (level, math.inf) for level in range(_MAX_LEVELS)
@@ -589,7 +639,7 @@ def pack_wave_ranks(
                 for i in members:
                     ranks[i] = where[position]
             best = (span, index, tuple(ranks), predicted)
-        if span <= lower * (1.0 + 1e-9):
+        if span <= stopping_lower * (1.0 + 1e-9):
             break  # a rank at the lower bound cannot be improved on
 
     assert best is not None
@@ -604,6 +654,7 @@ def pack_groups_for_sharing(
     chunk_tokens: int,
     profile: Optional[ExecutorCostProfile],
     fixed: Sequence[tuple[int, float]] = (),
+    resident: Sequence[Mapping[int, int]] = (),
 ) -> tuple[int, ...]:
     """Assign prompts to serve groups so prefix families share one group's pool.
 
@@ -625,4 +676,5 @@ def pack_groups_for_sharing(
         chunk_tokens=chunk_tokens,
         profile=profile,
         fixed=fixed,
+        resident=resident,
     ).ranks

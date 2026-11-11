@@ -1101,7 +1101,7 @@ def test_a_suffix_that_does_not_start_at_the_frontier_is_refused():
     )
 
 
-def test_a_serving_group_other_than_the_owning_group_is_refused():
+def test_a_serving_group_other_than_the_owning_group_is_refused(caplog):
     harness = _Harness()
     _commit_seeded_frontier(harness, sequence_id=7)
     restorer = harness.restorer()
@@ -1118,6 +1118,7 @@ def test_a_serving_group_other_than_the_owning_group_is_refused():
     assert (
         restorer.counters()[f"trajectory_decline_{DECLINE_GROUP_MISMATCH}"] == 1
     )
+    assert "planned_offgroup=true" in caplog.text
 
 
 def test_a_shard_count_that_is_not_this_group_is_refused_by_name(caplog):
@@ -1603,7 +1604,7 @@ def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
     assert restorer.live_attachments == 0
 
 
-def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path():
+def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog):
     harness = _GroupHarness(shard_count=4)
     harness.seed()
     arena, installed = harness.commit_pass()
@@ -1639,6 +1640,8 @@ def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path():
     )
     counters = restorer.counters()
     assert counters[f"trajectory_decline_{DECLINE_GROUP_MISMATCH}"] == 1
+    planned = [r.message for r in caplog.records if "reason=group_mismatch" in r.message]
+    assert len(planned) == 1 and "planned_offgroup=true" in planned[0]
     assert counters[f"trajectory_decline_{DECLINE_SUFFIX_OFFSET}"] == 1
     assert counters["trajectory_restores"] == 0
     assert restorer.live_attachments == 0
