@@ -248,11 +248,14 @@ def _seq(gid: int, budget: int, status=SequenceStatus.IN_DECODE):
     return types.SimpleNamespace(global_idx=gid, kv_token_budget=budget, status=status)
 
 
-def _stub_worker(global_batch, *, max_input=0, max_decoding=0):
+def _stub_worker(global_batch, *, max_input=0, max_decoding=0, deployment_len=0):
+    # max_input/max_decoding stand for the worker-wide Init values, i.e. the
+    # first pool batch's; the deployment length is the bound admission clamps to.
     return types.SimpleNamespace(
         global_batch=global_batch,
         max_input_length=max_input,
         max_decoding_length=max_decoding,
+        _deployment_context_bound_tokens=lambda: deployment_len,
     )
 
 
@@ -287,19 +290,33 @@ def test_required_tokens_falls_back_to_active_ids_when_all_completed(required_to
     assert required_tokens(worker, [3, 4, 99], page_size=64) == 2112
 
 
-def test_required_tokens_empty_batch_uses_max_seqlen_fallback(required_tokens, monkeypatch):
+@pytest.mark.parametrize("first_batch", [(100, 200), (60000, 60000)])
+def test_required_tokens_empty_batch_covers_the_deployment_bound(
+    required_tokens, monkeypatch, first_batch
+):
+    # No live row: the graph must cover any row admission can still produce,
+    # whatever the first pool batch's input/decode lengths were.
     monkeypatch.setattr(_StubAttnWrapperBase, "max_seqlen", 1500)
-    worker = _stub_worker([], max_input=100, max_decoding=200)
-    assert required_tokens(worker, [7, 8], page_size=64) == 1536
+    max_input, max_decoding = first_batch
+    worker = _stub_worker(
+        [], max_input=max_input, max_decoding=max_decoding, deployment_len=8000
+    )
+    assert required_tokens(worker, [7, 8], page_size=64) == 8000
 
 
-def test_required_tokens_no_batch_uses_input_plus_decoding_fallback(required_tokens):
+def test_required_tokens_no_batch_uses_the_deployment_bound(required_tokens):
+    worker = _stub_worker(None, max_input=1000, max_decoding=1100, deployment_len=4097)
+    assert required_tokens(worker, [], page_size=64) == 4160
+
+
+def test_required_tokens_without_deployment_bound_raises(required_tokens):
     worker = _stub_worker(None, max_input=1000, max_decoding=1100)
-    assert required_tokens(worker, [], page_size=64) == 2112
+    with pytest.raises(RuntimeError, match="deployment max_model_len"):
+        required_tokens(worker, [], page_size=64)
 
 
 def test_required_tokens_floor_is_one_page(required_tokens):
-    worker = _stub_worker(None)
+    worker = _stub_worker(None, deployment_len=1)
     assert required_tokens(worker, [], page_size=64) == 64
 
 

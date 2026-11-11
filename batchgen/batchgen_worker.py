@@ -18667,7 +18667,10 @@ class BatchGenWorker:
 
 		Budget-based: ``kv_token_budget`` bounds every row's final length for
 		the whole graph lifetime, so a graph specialized on this value can never
-		be outgrown mid-lifetime.
+		be outgrown mid-lifetime. With no live row to read a budget from, the
+		graph must cover any row admission can still produce, which is the
+		deployment bound. The worker-wide ``max_input_length +
+		max_decoding_length`` describes only the first pool batch.
 		"""
 		budgets = [
 			int(seq.kv_token_budget)
@@ -18687,12 +18690,12 @@ class BatchGenWorker:
 		if budgets:
 			required = max(budgets)
 		else:
-			required = max(
-				1,
-				int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
-				int(getattr(self, "max_input_length", 0) or 0)
-				+ int(getattr(self, "max_decoding_length", 0) or 0),
-			)
+			required = self._deployment_context_bound_tokens()
+			if required <= 0:
+				raise RuntimeError(
+					"GLM-5 DSA graph span with no live row requires the deployment "
+					"max_model_len, which is unset before core init"
+				)
 		return math.ceil(required / int(page_size)) * int(page_size)
 
 	def _debug_flag_enabled(self, value) -> bool:
@@ -22419,6 +22422,23 @@ class BatchGenWorker:
 		return active_uuids, completed_uuids
 
 
+	def _legacy_decode_step_bound(self, decode_uuids: List[str]) -> int:
+		"""Exclusive step bound of a legacy decode call, from the decode set's budgets.
+
+		Every row enters the call with its prefill token decoded, so no row
+		needs more than ``max_decode_length - 1`` further steps and the largest
+		budget in the set bounds the call. ``decode_uuids`` is the rank-synced
+		decode set and admission sets ``max_decode_length`` identically on every
+		rank, so every rank runs the same number of steps. The worker-wide
+		``max_decoding_length`` must not be used: in pool mode it is the first
+		batch's budget, so it would end every call at that budget and, at 1,
+		run no step at all for any later batch.
+		"""
+		return max(
+			(self.global_batch.get_sequence(uuid).max_decode_length for uuid in decode_uuids),
+			default=0,
+		)
+
 	def _decoding_legacy_modes(
 		self,
 		new_tokens: torch.Tensor,
@@ -22428,8 +22448,8 @@ class BatchGenWorker:
 	) -> None:
 		"""Legacy decoding for modes 0, 1, 2 with continuous batching support."""
 		new_token_idx = start_token_idx
-		
-		while new_token_idx < self.max_decoding_length and (decode_uuids or batch):
+
+		while new_token_idx < self._legacy_decode_step_bound(decode_uuids) and (decode_uuids or batch):
 			if self.rank == 0:
 				logging.info(f"Decoding new token idx: {new_token_idx}")
 			
