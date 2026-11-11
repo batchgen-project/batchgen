@@ -7,7 +7,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
               "Replica control words must be lock-free across processes");
 
 namespace {
-constexpr uint64_t kReady = 0x4c455245504c4943ULL;
+constexpr uint64_t kReady = 0x4c455245504c4944ULL;  // bumped for per-type words
 
 void check_mapping(void* mapping, size_t bytes, size_t required,
                    size_t alignment) {
@@ -20,17 +20,20 @@ void check_mapping(void* mapping, size_t bytes, size_t required,
 }  // namespace
 
 size_t ReplicaControlBlock::bytes_required(size_t members,
-                                          size_t records_per_frame) {
-    if (members == 0) {
-        throw std::invalid_argument("Replica control block needs a member");
+                                          size_t records_per_frame,
+                                          size_t num_types) {
+    if (members == 0 || num_types == 0) {
+        throw std::invalid_argument(
+            "Replica control block needs a member and a module type");
     }
     constexpr size_t max = std::numeric_limits<size_t>::max();
-    if (records_per_frame > (max - sizeof(Member)) /
-                                (2 * sizeof(std::atomic<uint64_t>))) {
-        throw std::overflow_error("Replica owned-slot table size overflow");
+    const size_t words = 2 * num_types + 2 * records_per_frame;
+    if (records_per_frame > max / 4 || num_types > max / 4 ||
+        words > (max - sizeof(Member)) / sizeof(std::atomic<uint64_t>)) {
+        throw std::overflow_error("Replica control block word count overflow");
     }
-    const size_t per_member = sizeof(Member) +
-        2 * records_per_frame * sizeof(std::atomic<uint64_t>);
+    const size_t per_member =
+        sizeof(Member) + words * sizeof(std::atomic<uint64_t>);
     if (members > (max - sizeof(Header)) / per_member) {
         throw std::overflow_error("Replica control block size overflow");
     }
@@ -38,19 +41,25 @@ size_t ReplicaControlBlock::bytes_required(size_t members,
 }
 
 ReplicaControlBlock ReplicaControlBlock::initialize(
-    void* mapping, size_t bytes, size_t members, size_t records_per_frame) {
-    check_mapping(mapping, bytes, bytes_required(members, records_per_frame),
+    void* mapping, size_t bytes, size_t members, size_t records_per_frame,
+    size_t num_types) {
+    check_mapping(mapping, bytes,
+                  bytes_required(members, records_per_frame, num_types),
                   alignof(Header));
     auto* header = new (mapping) Header;
     header->members = members;
     header->records_per_frame = records_per_frame;
+    header->num_types = num_types;
     auto* member_base = reinterpret_cast<Member*>(header + 1);
     for (size_t index = 0; index < members; ++index) {
         new (member_base + index) Member;
     }
-    auto* slots = reinterpret_cast<std::atomic<uint64_t>*>(member_base + members);
-    for (size_t index = 0; index < members * 2 * records_per_frame; ++index) {
-        new (slots + index) std::atomic<uint64_t>(kNone);
+    auto* words = reinterpret_cast<std::atomic<uint64_t>*>(
+        member_base + members);
+    const size_t total =
+        members * (2 * num_types + 2 * records_per_frame);
+    for (size_t index = 0; index < total; ++index) {
+        new (words + index) std::atomic<uint64_t>(kNone);
     }
     header->ready.store(kReady, std::memory_order_release);
     return ReplicaControlBlock(header);
@@ -63,7 +72,8 @@ ReplicaControlBlock ReplicaControlBlock::attach(void* mapping, size_t bytes) {
         throw std::invalid_argument("Replica control block is not initialized");
     }
     check_mapping(mapping, bytes,
-                  bytes_required(header->members, header->records_per_frame),
+                  bytes_required(header->members, header->records_per_frame,
+                                 header->num_types),
                   alignof(Header));
     return ReplicaControlBlock(header);
 }
@@ -74,11 +84,32 @@ size_t ReplicaControlBlock::records_per_frame() const {
     return header_->records_per_frame;
 }
 
+size_t ReplicaControlBlock::num_types() const { return header_->num_types; }
+
 ReplicaControlBlock::Member& ReplicaControlBlock::member_(size_t member) const {
     if (member >= members()) {
         throw std::out_of_range("Replica control block member is out of range");
     }
     return reinterpret_cast<Member*>(header_ + 1)[member];
+}
+
+std::atomic<uint64_t>* ReplicaControlBlock::words_base_() const {
+    return reinterpret_cast<std::atomic<uint64_t>*>(
+        reinterpret_cast<Member*>(header_ + 1) + members());
+}
+
+std::atomic<uint64_t>& ReplicaControlBlock::word_(size_t member, size_t type,
+                                                  Barrier barrier) const {
+    member_(member);
+    if (type >= num_types()) {
+        throw std::out_of_range("Replica barrier type is out of range");
+    }
+    // Per member: [A words per type][B words per type], then all members'
+    // barrier words precede the slot tables.
+    const size_t per_member = 2 * num_types();
+    const size_t offset = member * per_member +
+                          (barrier == Barrier::B ? num_types() : 0) + type;
+    return words_base_()[offset];
 }
 
 std::atomic<uint64_t>& ReplicaControlBlock::slot_(
@@ -87,8 +118,7 @@ std::atomic<uint64_t>& ReplicaControlBlock::slot_(
     if (frame == kNone || record >= records_per_frame()) {
         throw std::out_of_range("Replica frame or record is out of range");
     }
-    auto* slots = reinterpret_cast<std::atomic<uint64_t>*>(
-        reinterpret_cast<Member*>(header_ + 1) + members());
+    auto* slots = words_base_() + members() * 2 * num_types();
     return slots[(member * 2 + frame % 2) * records_per_frame() + record];
 }
 
@@ -102,12 +132,12 @@ uint64_t ReplicaControlBlock::owned_slot(size_t member, uint64_t frame,
     return slot_(member, frame, record).load(std::memory_order_acquire);
 }
 
-void ReplicaControlBlock::advance(size_t member, Barrier barrier, uint64_t frame) {
+void ReplicaControlBlock::advance(size_t member, size_t type, Barrier barrier,
+                                  uint64_t frame) {
     if (frame == kNone) {
         throw std::invalid_argument("Replica barrier frame uses the none sentinel");
     }
-    Member& words = member_(member);
-    auto& word = barrier == Barrier::A ? words.a : words.b;
+    auto& word = word_(member, type, barrier);
     const uint64_t previous = word.load(std::memory_order_acquire);
     if (previous != kNone && frame < previous) {
         throw std::logic_error("Replica barrier cannot move backwards");
@@ -116,18 +146,18 @@ void ReplicaControlBlock::advance(size_t member, Barrier barrier, uint64_t frame
     word.store(frame, std::memory_order_release);
 }
 
-uint64_t ReplicaControlBlock::passed(size_t member, Barrier barrier) const {
-    Member& words = member_(member);
-    return (barrier == Barrier::A ? words.a : words.b)
-        .load(std::memory_order_acquire);
+uint64_t ReplicaControlBlock::passed(size_t member, size_t type,
+                                     Barrier barrier) const {
+    return word_(member, type, barrier).load(std::memory_order_acquire);
 }
 
-size_t ReplicaControlBlock::first_waiting(Barrier barrier, uint64_t frame) const {
+size_t ReplicaControlBlock::first_waiting(size_t type, Barrier barrier,
+                                          uint64_t frame) const {
     if (frame == kNone) {
         throw std::invalid_argument("Replica barrier frame uses the none sentinel");
     }
     for (size_t member = 0; member < members(); ++member) {
-        const uint64_t value = passed(member, barrier);
+        const uint64_t value = passed(member, type, barrier);
         if (value == kNone || value < frame) {
             return member;
         }

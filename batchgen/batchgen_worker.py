@@ -11113,8 +11113,8 @@ class BatchGenWorker:
 			type_offsets[module_type] = offset
 			offset += plan.frame_size[module_type]
 		records_per_frame = offset
+		num_types = len(type_offsets)
 		modules = []
-		owned_per_position = [0] * layers_per_pass
 		for module_type in sorted(self.weight_copy_task):
 			names = self.weight_copy_task[module_type]
 			if not names:
@@ -11151,28 +11151,22 @@ class BatchGenWorker:
 						record_index,
 					)
 				)
-				if owners[name] == self.rank:
-					owned_per_position[layer_position] += 1
-		# owned_per_position counted every pass-wide module once per layer
-		# position already (each name is one record of its frame).
-		owned_per_position = [
-			count // 1 for count in owned_per_position
-		]
 		_mark("plan")
 		# The control block: one shared node mapping per geometry, reused
-		# across installs of the same shape.
-		key = (len(group), records_per_frame)
+		# across installs of the same shape. Barrier words are per
+		# (member, type): frame completion is monotone only within a type.
+		key = (len(group), records_per_frame, num_types)
 		cached = self._replica_block_cache.get(key)
 		if cached is None:
 			nbytes = int(
 				core_engine.replica_control_block_bytes(
-					len(group), records_per_frame
+					len(group), records_per_frame, num_types
 				)
 			)
 			storage, memfd = allocate_node_shared_tensor(
 				label=(
 					f"{self._query_book_shm_prefix}replica_block_"
-					f"{len(group)}x{records_per_frame}"
+					f"{len(group)}x{records_per_frame}x{num_types}"
 				),
 				rows=nbytes,
 				width=1,
@@ -11186,7 +11180,7 @@ class BatchGenWorker:
 		block_tensor = cached[0]
 		if member_index == 0:
 			core_engine.replica_control_block_initialize(
-				block_tensor, len(group), records_per_frame
+				block_tensor, len(group), records_per_frame, num_types
 			)
 		dist.barrier()
 		_mark("block")
@@ -11277,7 +11271,6 @@ class BatchGenWorker:
 				len(group),
 				layers_per_pass,
 				records_per_frame,
-				owned_per_position,
 				modules,
 				block_tensor,
 				peer_fds,

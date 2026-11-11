@@ -617,18 +617,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // mapping (a node memfd tensor); rank 0 initializes the header once and
     // the engine attaches at plan install.
     m.def("replica_control_block_bytes",
-          [](int64_t members, int64_t records_per_frame) {
+          [](int64_t members, int64_t records_per_frame, int64_t num_types) {
               return static_cast<int64_t>(ReplicaControlBlock::bytes_required(
                   static_cast<size_t>(members),
-                  static_cast<size_t>(records_per_frame)));
+                  static_cast<size_t>(records_per_frame),
+                  static_cast<size_t>(num_types)));
           });
     m.def("replica_control_block_initialize",
           [](torch::Tensor mapping, int64_t members,
-             int64_t records_per_frame) {
+             int64_t records_per_frame, int64_t num_types) {
               ReplicaControlBlock::initialize(
                   mapping.data_ptr(), static_cast<size_t>(mapping.nbytes()),
                   static_cast<size_t>(members),
-                  static_cast<size_t>(records_per_frame));
+                  static_cast<size_t>(records_per_frame),
+                  static_cast<size_t>(num_types));
           });
     py::class_<BatchGen>(m, "batchgen")
         .def(py::init<py::object, py::object, Weights_Storage&>())

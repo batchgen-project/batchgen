@@ -743,8 +743,10 @@ class WeightSlotTable {
     // As above, with the peer barrier: returns false and leaves the slot
     // PENDING_RELEASE while all_peers_passed(frame) does not hold for a
     // gated slot.
-    bool reclaim(const std::string& module_type, int64_t index,
-                 const std::function<bool(int64_t)>& all_peers_passed) {
+    bool reclaim(
+        const std::string& module_type, int64_t index,
+        const std::function<bool(const std::string&, int64_t)>&
+            all_peers_passed) {
         return this->reclaim_impl(module_type, index, &all_peers_passed);
     }
 
@@ -1138,8 +1140,10 @@ class WeightSlotTable {
 
     // all_peers_passed == nullptr: the caller has no peer barrier, so a
     // gated slot is an error instead of a silent early reuse.
-    bool reclaim_impl(const std::string& module_type, int64_t index,
-                      const std::function<bool(int64_t)>* all_peers_passed) {
+    bool reclaim_impl(
+        const std::string& module_type, int64_t index,
+        const std::function<bool(const std::string&, int64_t)>*
+            all_peers_passed) {
         Slot& slot = this->slot_at(module_type, index);
         if (slot.state != WeightSlotState::kPendingRelease) {
             throw this->transition_error("reclaim", slot.name, slot.state,
@@ -1153,7 +1157,7 @@ class WeightSlotTable {
                     "]: all peers have not passed B(frame " +
                     std::to_string(slot.reclaim_frame) + ")");
             }
-            if (!(*all_peers_passed)(slot.reclaim_frame)) {
+            if (!(*all_peers_passed)(module_type, slot.reclaim_frame)) {
                 return false;
             }
         }

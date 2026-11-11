@@ -114,7 +114,6 @@ class BatchGen {
     void install_replica_plan(
         int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
         uint32_t records_per_frame,
-        const std::vector<uint32_t>& owned_per_position,
         const std::vector<std::tuple<std::string, std::string, int64_t,
                                      int64_t, int64_t, int64_t>>& modules,
         torch::Tensor control_block,

@@ -71,7 +71,7 @@ def test_reclaim_keeps_peer_gated_slots_pending():
     drain = source[source.index("void GPU_Weight_Buffer::drainPendingReleasesLocked()"):
                    source.index("void GPU_Weight_Buffer::bumpProgressLocked()")]
     # teardown forces reclaim after the group barrier
-    assert "[](int64_t) { return true; }" in drain
+    assert "[](const std::string&, int64_t) { return true; }" in drain
 
 
 def test_worker_installs_between_queue_set_and_producer_start():
@@ -117,6 +117,24 @@ def test_ring_segments_are_shared_by_vmm_fd_not_torch_ipc():
     imp = vmm[vmm.index("class VmmPeerImport"):]
     assert "CU_MEM_ACCESS_FLAGS_PROT_READ;" in imp
     assert "cuMemUnmap" in imp  # uninstall returns the mapping
+
+
+def test_barrier_words_are_per_member_and_type():
+    """The producer interleaves types whose rings run at different depths
+    (attn ring 2 trails the forward; routed prefetches frames), so frame
+    completion is monotone only within a type. A single per-member word
+    regressed on GLM dense frames: the owner landed routed frame 3 before
+    attn frame 2 and every attn_2 consumer read "owner passed barrier A
+    without publishing" while the owner threw "cannot move backwards"."""
+    block = (ROOT / "core/GPU_Weight_Buffer/replica_control_block.h").read_text()
+    assert "void advance(size_t member, size_t type, Barrier barrier" in block
+    assert "size_t num_types() const;" in block
+    engine = ENGINE.read_text()
+    assert "owned_per_type_pos[type]" in engine
+    assert "total_per_type_pos[type]" in engine
+    # the pull gate reads the owner's word for the record's own type
+    assert "role->owner_member), type,\n" in engine or \
+        "static_cast<size_t>(role->owner_member), type," in engine
 
 
 def test_worker_declines_rather_than_crashes_non_participants():

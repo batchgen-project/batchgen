@@ -141,7 +141,8 @@ class GPU_Weight_Buffer {
     // Node replica transport: the reclaim gate for HostShared slots. The
     // engine installs a predicate over the cohort control block's barrier
     // B; nullptr means no gate (every reclaim proceeds on its event alone).
-    void set_peer_release_gate(std::function<bool(int64_t)> gate);
+    void set_peer_release_gate(
+        std::function<bool(const std::string&, int64_t)> gate);
     void arm_peer_release_gate(const std::string& module_type, int64_t index,
                                int64_t frame);
 
@@ -203,7 +204,8 @@ class GPU_Weight_Buffer {
     std::optional<std::string> producer_failure_;  // under mutex_
     uint64_t progress_epoch_ = 0;                  // under mutex_
     std::deque<PendingRelease> pending_releases_;
-    std::function<bool(int64_t)> peer_release_gate_;  // under mutex_
+    // (module type, frame) -> every member passed B; under mutex_
+    std::function<bool(const std::string&, int64_t)> peer_release_gate_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

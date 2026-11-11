@@ -110,7 +110,7 @@ def test_pass_end_drains_and_reclaims_every_pending_release():
     ]
     # Unlike the reset drain, the slots return to FREE in the table.
     assert drain.index("cudaEventSynchronize(pending.event)") < drain.index(
-        "this->slots_.reclaim(module_type, buffer_idx,"
+        "this->slots_.reclaim("
     )
     wait = source[
         source.index("void GPU_Weight_Buffer::wait_pass_drained(int64_t pass)") :

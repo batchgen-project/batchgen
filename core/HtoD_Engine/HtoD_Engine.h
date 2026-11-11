@@ -107,6 +107,10 @@ class HtoD_Engine {
         int32_t owner_member = 0;  // index into the ordered group
         uint32_t layer_position = 0;
         uint32_t record_index = 0;  // within one frame, identical on every member
+        // Index into the install's sorted type order; barrier words are per
+        // (member, type) because frame completion is monotone only within a
+        // type (ring depths differ across types).
+        uint32_t type_index = 0;
     };
     // peer_fds: per type, one exported VMM fd per group member in group
     // order, -1 for this member (whose base comes from the local ring).
@@ -115,7 +119,6 @@ class HtoD_Engine {
     void install_replica_plan(
         int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
         uint32_t records_per_frame,
-        const std::vector<uint32_t>& owned_per_position,
         const std::vector<ReplicaModuleInstall>& modules,
         torch::Tensor control_block,
         const std::unordered_map<std::string,
@@ -231,11 +234,12 @@ class HtoD_Engine {
         int64_t group_size = 1;
         uint64_t layers_per_pass = 0;
         uint32_t records_per_frame = 0;
-        std::vector<uint32_t> owned_per_position;
-        // Installed records per layer position; a frame of a partly
-        // covered pass (GLM dense-prefix layers) has fewer than
-        // records_per_frame live records.
-        std::vector<uint32_t> total_per_position;
+        // Sorted module types of the installed plan; barrier words, owned
+        // and total record counts are per type (a frame of a partly covered
+        // pass — GLM dense-prefix layers — has no records of some types).
+        std::unordered_map<std::string, size_t> type_index;
+        std::vector<std::vector<uint32_t>> owned_per_type_pos;
+        std::vector<std::vector<uint32_t>> total_per_type_pos;
         std::unordered_map<std::string, ReplicaModuleInstall> modules;
         ReplicaControlBlock block;
         torch::Tensor block_backing;  // keep-alive of the shared mapping view
@@ -245,15 +249,16 @@ class HtoD_Engine {
         // imported peer segment mappings (unmapped at uninstall)
         std::vector<std::shared_ptr<batchgen_vmm::VmmPeerImport>> keepalive;
         std::vector<cudaStream_t> pull_streams;  // one per member
-        // frame bookkeeping, producer thread only
-        std::map<uint64_t, uint32_t> owned_landed;
-        std::map<uint64_t, uint32_t> terminal;
-        std::map<uint64_t, std::chrono::steady_clock::time_point> wait_since;
+        // frame bookkeeping per (type, flat frame), producer thread only
+        std::map<std::pair<size_t, uint64_t>, uint32_t> owned_landed;
+        std::map<std::pair<size_t, uint64_t>, uint32_t> terminal;
+        std::map<std::pair<size_t, uint64_t>,
+                 std::chrono::steady_clock::time_point> wait_since;
         ReplicaPlanRuntime(ReplicaControlBlock attached)
             : block(attached) {}
     };
     std::unique_ptr<ReplicaPlanRuntime> replica_plan_;
     // Producer-side frame hooks; no-ops without an installed plan.
-    void replica_mark_terminal_(uint64_t flat_frame);
-    void replica_mark_owned_landed_(uint64_t flat_frame);
+    void replica_mark_terminal_(size_t type, uint64_t flat_frame);
+    void replica_mark_owned_landed_(size_t type, uint64_t flat_frame);
 };

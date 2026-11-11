@@ -389,7 +389,6 @@ py::dict HtoD_Engine::weight_stream_status() {
 void HtoD_Engine::install_replica_plan(
     int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
     uint32_t records_per_frame,
-    const std::vector<uint32_t>& owned_per_position,
     const std::vector<ReplicaModuleInstall>& modules,
     torch::Tensor control_block,
     const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
@@ -404,17 +403,24 @@ void HtoD_Engine::install_replica_plan(
             "a single-member group installs no plan; the uninstalled engine "
             "is that group");
     }
-    if (owned_per_position.size() != layers_per_pass) {
-        throw std::runtime_error(
-            "owned_per_position must list every layer position");
-    }
     auto runtime = std::make_unique<ReplicaPlanRuntime>(
         ReplicaControlBlock::attach(control_block.data_ptr(),
                                     static_cast<size_t>(
                                         control_block.nbytes())));
+    // Types in sorted order, identical on every member (each installs the
+    // same task). Barrier words, owned and total counts are per type.
+    std::set<std::string> type_names;
+    for (const auto& module : modules) {
+        type_names.insert(module.module_type);
+    }
+    size_t next_type = 0;
+    for (const auto& name : type_names) {
+        runtime->type_index[name] = next_type++;
+    }
     if (runtime->block.members() != static_cast<size_t>(group_size) ||
         runtime->block.records_per_frame() !=
-            static_cast<size_t>(records_per_frame)) {
+            static_cast<size_t>(records_per_frame) ||
+        runtime->block.num_types() != runtime->type_index.size()) {
         throw std::runtime_error(
             "control block geometry does not match the installed plan");
     }
@@ -422,27 +428,29 @@ void HtoD_Engine::install_replica_plan(
     runtime->group_size = group_size;
     runtime->layers_per_pass = layers_per_pass;
     runtime->records_per_frame = records_per_frame;
-    runtime->owned_per_position = owned_per_position;
     runtime->block_backing = std::move(control_block);
-    runtime->total_per_position.assign(layers_per_pass, 0);
+    runtime->owned_per_type_pos.assign(
+        runtime->type_index.size(),
+        std::vector<uint32_t>(layers_per_pass, 0));
+    runtime->total_per_type_pos.assign(
+        runtime->type_index.size(),
+        std::vector<uint32_t>(layers_per_pass, 0));
     for (const auto& module : modules) {
-        runtime->modules[module.module] = module;
         if (module.layer_position >= layers_per_pass) {
             throw std::runtime_error(
                 "module " + module.module + " is outside the pass layout");
         }
-        ++runtime->total_per_position[module.layer_position];
-    }
-    for (uint64_t pos = 0; pos < layers_per_pass; ++pos) {
-        if (runtime->total_per_position[pos] == 0 ||
-            runtime->total_per_position[pos] <
-                runtime->owned_per_position[pos]) {
-            throw std::runtime_error(
-                "layer position " + std::to_string(pos) +
-                " accounts " + std::to_string(runtime->total_per_position[pos]) +
-                " records against " +
-                std::to_string(runtime->owned_per_position[pos]) + " owned");
+        ReplicaModuleInstall entry = module;
+        entry.type_index = static_cast<uint32_t>(
+            runtime->type_index.at(module.module_type));
+        ++runtime->total_per_type_pos[entry.type_index]
+                                     [module.layer_position];
+        if (entry.kind !=
+            static_cast<uint8_t>(WeightRecordKind::Replica)) {
+            ++runtime->owned_per_type_pos[entry.type_index]
+                                         [module.layer_position];
         }
+        runtime->modules[module.module] = entry;
     }
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     const int device = this->engine_config_.basic_config.device;
@@ -502,10 +510,16 @@ void HtoD_Engine::install_replica_plan(
                                              cudaStreamNonBlocking));
     }
     ReplicaControlBlock block = runtime->block;
-    const int64_t self = member_index;
     this->gpu_weight_buffer_.set_peer_release_gate(
-        [block, self](int64_t frame) mutable -> bool {
-            return block.first_waiting(ReplicaControlBlock::Barrier::B,
+        [block, types = runtime->type_index](
+            const std::string& module_type, int64_t frame) mutable -> bool {
+            auto found = types.find(module_type);
+            if (found == types.end()) {
+                // A slot of a type outside the plan is never peer-gated.
+                return true;
+            }
+            return block.first_waiting(found->second,
+                                       ReplicaControlBlock::Barrier::B,
                                        static_cast<uint64_t>(frame)) ==
                    block.members();
         });
@@ -536,27 +550,30 @@ void HtoD_Engine::uninstall_replica_plan() {
     this->logger_->info("Replica plan uninstalled");
 }
 
-void HtoD_Engine::replica_mark_owned_landed_(uint64_t flat_frame) {
+void HtoD_Engine::replica_mark_owned_landed_(size_t type,
+                                             uint64_t flat_frame) {
     ReplicaPlanRuntime& plan = *this->replica_plan_;
-    const uint32_t landed = ++plan.owned_landed[flat_frame];
-    const uint32_t owned = plan.owned_per_position[flat_frame %
-                                                   plan.layers_per_pass];
+    const auto key = std::make_pair(type, flat_frame);
+    const uint32_t landed = ++plan.owned_landed[key];
+    const uint32_t owned =
+        plan.owned_per_type_pos[type][flat_frame % plan.layers_per_pass];
     if (landed == owned) {
-        plan.block.advance(plan.member_index,
+        plan.block.advance(plan.member_index, type,
                            ReplicaControlBlock::Barrier::A, flat_frame);
-        plan.owned_landed.erase(flat_frame);
+        plan.owned_landed.erase(key);
     }
 }
 
-void HtoD_Engine::replica_mark_terminal_(uint64_t flat_frame) {
+void HtoD_Engine::replica_mark_terminal_(size_t type, uint64_t flat_frame) {
     ReplicaPlanRuntime& plan = *this->replica_plan_;
-    const uint32_t terminal = ++plan.terminal[flat_frame];
-    if (terminal == plan.total_per_position[flat_frame %
-                                            plan.layers_per_pass]) {
-        plan.block.advance(plan.member_index,
+    const auto key = std::make_pair(type, flat_frame);
+    const uint32_t terminal = ++plan.terminal[key];
+    if (terminal ==
+        plan.total_per_type_pos[type][flat_frame % plan.layers_per_pass]) {
+        plan.block.advance(plan.member_index, type,
                            ReplicaControlBlock::Barrier::B, flat_frame);
-        plan.terminal.erase(flat_frame);
-        plan.wait_since.erase(flat_frame);
+        plan.terminal.erase(key);
+        plan.wait_since.erase(key);
     }
 }
 
@@ -749,18 +766,21 @@ void HtoD_Engine::HtoD_Worker() {
                     static_cast<uint8_t>(WeightRecordKind::Replica) &&
                 next.kind == WeightProduction::kCopy) {
                 ReplicaPlanRuntime& plan = *this->replica_plan_;
-                // A frame this member owns nothing of still posts A once.
+                const size_t type = role->type_index;
+                // A frame this member owns nothing of (for this type) still
+                // posts A once.
                 const uint32_t owned =
-                    plan.owned_per_position[flat % plan.layers_per_pass];
+                    plan.owned_per_type_pos[type]
+                                           [flat % plan.layers_per_pass];
                 const uint64_t own_a = plan.block.passed(
-                    plan.member_index, ReplicaControlBlock::Barrier::A);
+                    plan.member_index, type, ReplicaControlBlock::Barrier::A);
                 if (owned == 0 && (own_a == ReplicaControlBlock::kNone ||
                                    own_a < flat)) {
-                    plan.block.advance(plan.member_index,
+                    plan.block.advance(plan.member_index, type,
                                        ReplicaControlBlock::Barrier::A, flat);
                 }
                 const uint64_t owner_a = plan.block.passed(
-                    static_cast<size_t>(role->owner_member),
+                    static_cast<size_t>(role->owner_member), type,
                     ReplicaControlBlock::Barrier::A);
                 const bool owner_ready =
                     owner_a != ReplicaControlBlock::kNone && owner_a >= flat;
@@ -777,7 +797,8 @@ void HtoD_Engine::HtoD_Worker() {
                 if (!owner_ready) {
                     auto waiting =
                         plan.wait_since.emplace(
-                                flat, std::chrono::steady_clock::now())
+                                std::make_pair(type, flat),
+                                std::chrono::steady_clock::now())
                             .first;
                     const auto waited =
                         std::chrono::steady_clock::now() - waiting->second;
@@ -800,7 +821,7 @@ void HtoD_Engine::HtoD_Worker() {
                     progressed = false;
                     continue;
                 }
-                plan.wait_since.erase(flat);
+                plan.wait_since.erase(std::make_pair(type, flat));
             }
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
@@ -849,7 +870,7 @@ void HtoD_Engine::HtoD_Worker() {
                                                              module_name);
                         this->count_module_(this->skipped_modules_,
                                             module_type);
-                        this->replica_mark_terminal_(flat);
+                        this->replica_mark_terminal_(role->type_index, flat);
                         this->set_producer_state_(ProducerState::kIdle, "");
                         continue;
                     }
@@ -889,7 +910,7 @@ void HtoD_Engine::HtoD_Worker() {
                         this->count_module_(
                             this->released_on_landing_modules_, module_type);
                     }
-                    this->replica_mark_terminal_(flat);
+                    this->replica_mark_terminal_(role->type_index, flat);
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
                 }
@@ -942,7 +963,7 @@ void HtoD_Engine::HtoD_Worker() {
                                                          module_name);
                     this->count_module_(this->skipped_modules_, module_type);
                     if (role != nullptr) {
-                        this->replica_mark_terminal_(flat);
+                        this->replica_mark_terminal_(role->type_index, flat);
                     }
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
@@ -1044,10 +1065,10 @@ void HtoD_Engine::HtoD_Worker() {
                                             role->record_index,
                                             static_cast<uint64_t>(
                                                 buffer_idx));
-                    this->replica_mark_owned_landed_(flat);
+                    this->replica_mark_owned_landed_(role->type_index, flat);
                 }
                 if (role != nullptr) {
-                    this->replica_mark_terminal_(flat);
+                    this->replica_mark_terminal_(role->type_index, flat);
                 }
                 this->set_producer_state_(ProducerState::kIdle, "");
             } catch (const std::exception& error) {

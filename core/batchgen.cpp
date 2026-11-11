@@ -454,7 +454,6 @@ void BatchGen::start_h2d_worker() {
 void BatchGen::install_replica_plan(
     int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
     uint32_t records_per_frame,
-    const std::vector<uint32_t>& owned_per_position,
     const std::vector<std::tuple<std::string, std::string, int64_t, int64_t,
                                  int64_t, int64_t>>& modules,
     torch::Tensor control_block,
@@ -476,7 +475,7 @@ void BatchGen::install_replica_plan(
     }
     this->h2d_engine_.install_replica_plan(
         member_index, group_size, layers_per_pass, records_per_frame,
-        owned_per_position, installs, std::move(control_block),
+        installs, std::move(control_block),
         peer_fds, peer_bytes, strides);
 }
 
