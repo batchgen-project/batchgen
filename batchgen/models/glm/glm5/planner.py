@@ -59,21 +59,19 @@ class GLM5Planner(BasePlanner):
         """GLM-5 specific config adjustments."""
         if self.is_fp8:
             # Pure-DP grouped prefill acquires every one of the 256 routed
-            # experts for a layer at once. At two layers the strict in-order
-            # producer plus the per-frame peer release gate self-synchronize
-            # the eight ranks into a sequential per-owner supply rotation
-            # (R18 nsys: pull streams never overlap, ring_full_spins
-            # dominate), so the supply tail lands in every layer boundary.
-            # Four layers give the producer claimable slots while an old
-            # frame is still peer-gated, decoupling the rotation.
+            # experts for a layer at once. Two layers let the core-engine H2D
+            # worker fill L+1 while L computes; the staggered per-member walk
+            # (weight_replica_group.stagger_task_for_member) is what spreads
+            # the replica pulls across the owners' egress — deeper rings
+            # alone moved the wall 0% (R19) and cost GPU memory.
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "routed_expert"
-            ] = 4 * self.NUM_EXPERTS
+            ] = 2 * self.NUM_EXPERTS
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "shared_expert"
-            ] = 4
-            # The replica transport keeps the same depth for attention.
-            self.config.GPU_Buffer_Config.num_prefill_module_buffer["attn"] = 4
+            ] = 2
+            # Replica transport keeps two attention frames in flight.
+            self.config.GPU_Buffer_Config.num_prefill_module_buffer["attn"] = 2
             # Device memory the prefill prefix pool leaves for the forward.
             # Measured on a pooled 64k-token-prefix wave (8xH200, 2026-11-03):
             # between the budget measurement and the chunk forward the prefill
