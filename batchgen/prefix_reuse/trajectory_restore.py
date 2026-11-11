@@ -22,7 +22,15 @@ commit transaction and where the snapshot bytes physically live
 
 Fail-safe by construction: every refusal releases the attachment and reports a
 named reason, and the sequence then proceeds as a full recompute. Nothing here
-blocks a wave, waits for a slot, or raises into the prefill path.
+blocks a wave or waits for a slot, and no capacity or I/O outcome raises into
+the prefill path.
+
+WHETHER a row restores is the wave planner's decision, not this module's: the
+planner materializes the frontier and raises the row's compute start to
+exactly the snapshot boundary, and every attachment it does not plan is
+declined at plan time (``not_planned``). The restore therefore only checks
+that hand-off -- token identity and start == boundary -- and treats a failure
+of either as a broken invariant, raised after the attachment is consumed.
 
 The H2D ordering contract
 -------------------------
@@ -100,6 +108,17 @@ class TrajectoryAttachmentInvalid(TrajectoryRestoreError):
     """An attachment was used in a state the mechanism does not allow."""
 
 
+class TrajectoryRestorePlanDrift(TrajectoryRestoreError):
+    """A planned restore reached the apply step at the wrong suffix start.
+
+    The wave planner is what makes a restore exact: it raises a row's compute
+    start to exactly the snapshot boundary, and only such a row is handed to
+    the restore. A start that differs therefore means the planner and the
+    restore disagree about the row, which no fallback can repair -- the row
+    has no state for the tokens it was told it does not have to compute.
+    """
+
+
 class _RestoreDeclined(Exception):
     """Internal: a named reason the restore core could not finish.
 
@@ -126,11 +145,17 @@ class _RestoreDeclined(Exception):
 # carries.
 DECLINE_HEAD_SHARDED_GROUP = "head_sharded_group"
 DECLINE_GROUP_MISMATCH = "group_mismatch"
+# Since the wave planner decides restores, this one is an INVARIANT: it names
+# planner/restore drift and the restore raises after counting it.
 DECLINE_SUFFIX_OFFSET = "suffix_offset_mismatch"
 DECLINE_ARENA_MISSING = "arena_missing"
 DECLINE_ARENA_READ_FAILED = "arena_read_failed"
 DECLINE_SLOTS_EXHAUSTED = "slots_exhausted"
 DECLINE_SLOT_WRITE_FAILED = "slot_write_failed"
+# The wave plan did not materialize this row's frontier, so its compute start
+# is not the snapshot boundary and there is no restore to apply. Declined at
+# PLAN time, with the planner's own drop reason as the detail.
+DECLINE_NOT_PLANNED = "not_planned"
 
 DECLINE_REASONS = (
     DECLINE_HEAD_SHARDED_GROUP,
@@ -140,6 +165,7 @@ DECLINE_REASONS = (
     DECLINE_ARENA_READ_FAILED,
     DECLINE_SLOTS_EXHAUSTED,
     DECLINE_SLOT_WRITE_FAILED,
+    DECLINE_NOT_PLANNED,
 )
 
 
@@ -719,24 +745,43 @@ class TrajectoryRestorer:
         """Write the pinned snapshot into a KDA slot, before suffix prefill.
 
         ``None`` means the sequence recomputes: every path through it has
-        already released the attachment and logged the reason. Nothing here
-        raises into the prefill path.
+        already released the attachment and logged the reason. A capacity or
+        I/O outcome never raises into the prefill path; a broken INVARIANT
+        does, after the attachment is consumed.
 
-        ``compute_cached_tokens`` is the position the suffix prefill will start
-        at, and the restored state is the state after exactly
-        ``boundary_tokens`` tokens, so the two must be EQUAL. This is an
-        identity, not a tolerance: a suffix that starts one token early would
-        re-apply that token on top of a state that already contains it, and a
-        suffix that starts late would skip one. The full-hit case
-        (``compute_cached_tokens == prompt_length - 1``, the last token
-        recomputed so there is a logit to sample) therefore declines here
-        rather than restoring a state the forward would double-count.
+        Only a row the wave planner materialized reaches this call, and the
+        planner set its compute start to exactly the boundary. Two checks
+        guard that hand-off:
+
+        * token identity -- the prompt's first ``boundary_tokens`` tokens are
+          the frontier's (``lcp_tokens >= boundary_tokens``, which the
+          registry lookup established). A divergence below the boundary is a
+          lookup MISS and never yields an attachment, so an attachment that
+          fails this is invalid and is refused by raising;
+        * the plan handshake -- ``compute_cached_tokens`` is the position the
+          suffix prefill will start at, and the restored state is the state
+          after exactly ``boundary_tokens`` tokens, so the two must be EQUAL.
+          That is an identity, not a tolerance: a suffix that starts one token
+          early would re-apply that token on top of a state that already
+          contains it, and one that starts late would skip one. Since the
+          planner makes it true, a mismatch is planner/restore drift: it is
+          counted under ``suffix_offset_mismatch`` and then raised.
         """
 
         if attachment.consumed:
             raise TrajectoryAttachmentInvalid(
                 f"trajectory attachment for session {attachment.session_key} "
                 "was already consumed; it cannot be restored"
+            )
+        if int(attachment.lcp_tokens) < attachment.boundary_tokens:
+            # Consumed first, so the refusal leaks no reference.
+            self.release(attachment)
+            raise TrajectoryAttachmentInvalid(
+                f"trajectory attachment for session {attachment.session_key} "
+                f"(sequence {attachment.sequence_id}) agrees with the frontier "
+                f"on {int(attachment.lcp_tokens)} token(s), fewer than its "
+                f"{attachment.boundary_tokens}-token boundary; a lookup never "
+                "hands out such an attachment"
             )
         record_shards = int(attachment.record.shard_count)
         if record_shards != self._attention_group_size:
@@ -766,16 +811,19 @@ class TrajectoryRestorer:
             )
             return None
         if int(compute_cached_tokens) != attachment.boundary_tokens:
-            self.decline(
-                attachment,
-                reason=DECLINE_SUFFIX_OFFSET,
-                detail=(
-                    f"suffix prefill starts at token "
-                    f"{int(compute_cached_tokens)} but the snapshot is the "
-                    f"state after {attachment.boundary_tokens} tokens"
-                ),
+            detail = (
+                f"suffix prefill starts at token {int(compute_cached_tokens)} "
+                "but the snapshot is the state after "
+                f"{attachment.boundary_tokens} tokens"
             )
-            return None
+            self.decline(
+                attachment, reason=DECLINE_SUFFIX_OFFSET, detail=detail
+            )
+            raise TrajectoryRestorePlanDrift(
+                f"sequence {attachment.sequence_id} (session "
+                f"{attachment.session_key}) reached the restore planned, but "
+                f"its {detail}; the wave plan and the restore disagree"
+            )
 
         arena = self._committer.arena_for(attachment.storage_handle)
         if arena is None:
@@ -934,6 +982,7 @@ class TrajectoryRestorer:
         layout,
         session_key: str,
         boundary_tokens: int,
+        lcp_tokens: int,
         owning_group_id: int,
         serving_group_id: int,
         compute_cached_tokens: int,
@@ -955,9 +1004,19 @@ class TrajectoryRestorer:
         to.
 
         ``None`` means this rank recomputes, with the reason named -- the same
-        reasons and the same counters as the attachment path.
+        reasons and the same counters as the attachment path, and the same two
+        invariants: ``lcp_tokens`` is the LEADER's lookup agreement and must
+        reach the boundary, and a suffix start other than the boundary is
+        planner/restore drift, counted and then raised.
         """
 
+        if int(lcp_tokens) < int(boundary_tokens):
+            raise TrajectoryAttachmentInvalid(
+                f"the mirrored restore of sequence {int(sequence_id)} (session "
+                f"{session_key}) agrees with the frontier on {int(lcp_tokens)} "
+                f"token(s), fewer than its {int(boundary_tokens)}-token "
+                "boundary; the leader's lookup never hits such a prompt"
+            )
         self._lookups += 1
         self._hits += 1
         shards = int(getattr(arena, "shard_count", 1))
@@ -986,18 +1045,23 @@ class TrajectoryRestorer:
             )
             return None
         if int(compute_cached_tokens) != int(boundary_tokens):
+            detail = (
+                f"suffix prefill starts at token {int(compute_cached_tokens)} "
+                f"but the snapshot is the state after {int(boundary_tokens)} "
+                "tokens"
+            )
             self._decline_mirrored(
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
                 reason=DECLINE_SUFFIX_OFFSET,
-                detail=(
-                    f"suffix prefill starts at token "
-                    f"{int(compute_cached_tokens)} but the snapshot is the "
-                    f"state after {int(boundary_tokens)} tokens"
-                ),
+                detail=detail,
             )
-            return None
+            raise TrajectoryRestorePlanDrift(
+                f"sequence {int(sequence_id)} (session {session_key}) reached "
+                f"the mirrored restore planned, but its {detail}; the wave "
+                "plan and the restore disagree"
+            )
         try:
             slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
                 arena=arena, layout=layout, sequence_id=int(sequence_id)
@@ -1077,6 +1141,7 @@ __all__ = [
     "DECLINE_ARENA_READ_FAILED",
     "DECLINE_GROUP_MISMATCH",
     "DECLINE_HEAD_SHARDED_GROUP",
+    "DECLINE_NOT_PLANNED",
     "DECLINE_REASONS",
     "DECLINE_SLOTS_EXHAUSTED",
     "DECLINE_SLOT_WRITE_FAILED",
@@ -1089,6 +1154,7 @@ __all__ = [
     "TrajectoryAttachmentInvalid",
     "TrajectoryRestoreError",
     "TrajectoryRestoreOutcome",
+    "TrajectoryRestorePlanDrift",
     "TrajectoryRestorer",
     "trajectory_reuse_enabled",
 ]
