@@ -24,6 +24,7 @@ from batchgen.server.io_struct import (
     FileObject,
     FilePurpose,
     FileStatus,
+    StartupTransientObject,
     ToolCall,
     ToolCallFunction,
 )
@@ -257,6 +258,8 @@ class BatchScheduler:
         self._scheduling_pool = SchedulingPool(capacity=0)
         self._trajectory_pool_info: Optional[Dict[str, Any]] = None
         self.max_model_len: Optional[int] = None
+        # Published with max_model_len by the same worker message; report-only.
+        self.startup_transient: Optional[List[StartupTransientObject]] = None
         self._deployment_ready = asyncio.Event()
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
@@ -371,6 +374,7 @@ class BatchScheduler:
 
     def _clear_deployment(self) -> None:
         self.max_model_len = None
+        self.startup_transient = None
         self._deployment_ready.clear()
 
     def resume(self) -> None:
@@ -1834,9 +1838,17 @@ class BatchScheduler:
                             logger.info("[POOL] Worker shutdown signal received")
                         continue
                     elif msg_type == "deployment_capacity":
+                        transients = result["startup_transient"]
+                        if not isinstance(transients, list) or not transients:
+                            raise ValueError("worker published invalid startup_transient")
+                        transients = [
+                            StartupTransientObject.model_validate(item)
+                            for item in transients
+                        ]
                         self.max_model_len = int(result["max_model_len"])
                         if self.max_model_len < 2:
                             raise ValueError("worker published invalid max_model_len")
+                        self.startup_transient = transients
                         self._deployment_ready.set()
                     elif msg_type == "trajectory_pool_capacity":
                         # ``total_capacity`` is immutable token-pool capacity and

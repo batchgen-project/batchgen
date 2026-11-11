@@ -22,6 +22,7 @@ from batchgen.config.max_model_len import (
     resolve_max_model_len,
     verify_max_model_len,
 )
+from batchgen.worker import startup_transient
 from batchgen.worker.kv_manager import KVCacheManager
 from tests.test_kv_fixed_address_page_table import MANAGER
 from tests.test_prompt_rejection_fails_one_request import (
@@ -279,6 +280,8 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
         _transition_phase=lambda key: events.append("prefill"),
         set_phase=lambda phase: None,
         _install_prefill_weight_copy_pipeline=lambda flag: None,
+        _probe_startup_transient=lambda **kwargs: events.append(
+            ("probe", kwargs["seam"], kwargs["capture"])),
     )
 
     def size_pool():
@@ -289,12 +292,15 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
 
     worker._init_gpu_kv_with_actual_size = size_pool
     worker._build_persistent_phase_instances = size_pool
-    prepare = load_worker_methods(["prepare_deployment"], {"logging": logging})["prepare_deployment"]
+    prepare = load_worker_methods(["prepare_deployment"], {
+        "logging": logging, "_startup_transient": startup_transient,
+    })["prepare_deployment"]
     prepare(worker)
     assert worker._gpu_kv_cached_pool_gb == 3
     assert worker._gpu_kv_sizing_provisional is False
     assert events == (["core", "comm", "verify"] if persistent else [
-        "core", "comm", "decode", "verify", "prefill"])
+        "core", "comm", "decode", "verify",
+        ("probe", startup_transient.SEAM_DEPLOYMENT_PREPARE, None), "prefill"])
 
 
 @pytest.mark.parametrize("capture", [False, True])
@@ -303,7 +309,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
 
     events = []
     build = load_worker_methods(["_build_persistent_phase_instances"], {
-        "PhaseKey": PhaseKey, "logging": logging,
+        "PhaseKey": PhaseKey, "logging": logging, "_startup_transient": startup_transient,
         "time": SimpleNamespace(perf_counter=lambda: 0),
     })["_build_persistent_phase_instances"]
     worker = SimpleNamespace(
@@ -320,8 +326,17 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
         _warmup_cuda_graphs=lambda: events.append("capture"),
     )
+
+    def probe(*, seam, capture):
+        assert seam == startup_transient.SEAM_PERSISTENT_BUILD
+        events.append("probe")
+        if capture is not None:
+            capture()
+
+    worker._probe_startup_transient = probe
     build(worker)
-    assert events == ["prefill", "decode", "verify_pool"] + (["capture"] if capture else []) + ["prefill"]
+    assert events == ["prefill", "decode", "verify_pool", "probe"] + (
+        ["capture"] if capture else []) + ["prefill"]
 
     def refuse():
         raise MaxModelLenCapacityError(129, capacity(available_pages=1))
@@ -354,6 +369,16 @@ def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget
     assert finalized == ["length-batch"]
 
 
+def published_transient():
+    """The struct the worker publishes when neither flavor is measurable."""
+    return [
+        startup_transient.StartupTransient.missing(
+            flavor, startup_transient.SEAM_DEPLOYMENT_PREPARE, 8, "CUDA is unavailable",
+        ).as_dict()
+        for flavor in startup_transient.FLAVORS
+    ]
+
+
 def _models_app(scheduler):
     """Compile the real endpoint functions, avoiding the CUDA server imports."""
     pytest.importorskip("fastapi")
@@ -383,7 +408,8 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
         scheduler = bs.BatchScheduler(SimpleNamespace(), worker, SimpleNamespace())
         await scheduler.start()
         try:
-            worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129})
+            worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
+                                        "startup_transient": published_transient()})
             await scheduler.wait_for_deployment()
             with TestClient(_models_app(scheduler)) as client:
                 for path in ("/v1/models", "/v1/models/test-model"):
@@ -393,9 +419,11 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
                     if "data" in obj:
                         obj = obj["data"][0]
                     assert obj["max_model_len"] == obj["max_context_length"] == 129
+                    assert obj["startup_transient"] == published_transient()
                 scheduler._clear_deployment()
                 assert client.get("/v1/models").status_code == 503
-                worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 65})
+                worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 65,
+                                        "startup_transient": published_transient()})
                 await scheduler.wait_for_deployment()
                 assert client.get("/v1/models/test-model").json()["max_model_len"] == 65
                 assert client.get("/v1/models/missing").status_code == 404
