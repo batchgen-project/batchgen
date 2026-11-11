@@ -11019,6 +11019,20 @@ class BatchGenWorker:
 		"""
 		if not getattr(self, "_replica_plan_installed", False):
 			return
+		# The phase's transport counters, before they are lost with the plan.
+		# Zero replica_pulled with a plan installed means the pull path never
+		# ran — that is a finding, never a pass.
+		status = self.core_engine.weight_stream_status()
+		by_type = {
+			module_type: {
+				"copied": entry.get("copied", 0),
+				"replica_pulled": entry.get("replica_pulled", 0),
+			}
+			for module_type, entry in status.get("by_type", {}).items()
+		}
+		logging.info(
+			"[REPLICA] uninstall rank=%d counters=%s", self.rank, by_type
+		)
 		dist.barrier()
 		self.core_engine.uninstall_replica_plan()
 		self._replica_plan_installed = False
