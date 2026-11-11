@@ -76,10 +76,17 @@ def test_reserve_time_reclaim_rechecks_capacity_exactly_once():
     retry = source[
         source.index("def _retry_prefill_host_capacity_after_reclaim") :
     ]
-    retry = retry[: retry.index("def _attach_prefix_cache_for_prefill")]
+    retry = retry[: retry.index("\n\tdef ", 1)]
     assert retry.count("self._collective_prefill_host_capacity_ok(") == 1
     assert "while " not in retry
     # The wave's attachments are already held here, so the reclaim cannot take
-    # a prefix this wave hit; that is what makes one attempt enough.
-    assert "reclaim_prefix_pages_for_host_admission(" in retry
+    # a prefix this wave hit; that is what makes one attempt enough. The
+    # reclaim is the collective helper shared with boundary growth.
+    assert retry.count("self._reclaim_host_prefix_pages_collective(") == 1
     assert 'reason="host_reserve"' in retry
+    helper = source[
+        source.index("def _reclaim_host_prefix_pages_collective") :
+    ]
+    helper = helper[: helper.index("\n\tdef ", 1)]
+    assert helper.count("reclaim_prefix_pages_for_host_admission(") == 1
+    assert "while " not in helper

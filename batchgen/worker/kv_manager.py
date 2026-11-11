@@ -192,11 +192,10 @@ class KVStatsBackend(Protocol):
 class PageTableCapacityRequest:
     """Frozen snapshot for the page-table capacity helpers.
 
-    Token / slot capacity are pure max-of-candidates computations; the
-    worker passes the union of relevant config sources through this
-    snapshot. Optional fields are ``None`` when the underlying worker
-    attribute is unset (legacy uses ``getattr(self, "...", 0)`` or
-    similar; we normalize to typed ``Optional`` here).
+    Token capacity is the resolved deployment bound, carried in the historical
+    ``model_max_position_embeddings`` field. Slot capacity still takes the
+    maximum of the relevant batch and graph settings. Optional fields are
+    ``None`` when the underlying worker attribute is unset.
     """
 
     sequence_tokens: Tuple[int, ...]
@@ -422,33 +421,15 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     @staticmethod
     def page_table_token_capacity(req: PageTableCapacityRequest) -> int:
-        """Maximum token capacity any CUDA-graph page table must cover.
+        """The deployment bound, independent of any batch's prompt/decode mix.
 
-        Takes the max of:
-          * a 16384 floor,
-          * any explicit ``sequence_tokens`` from the call site,
-          * ``max_input_length + max_decoding_length`` from the worker,
-          * engine-config-derived prompt/decode budgets,
-          * the model's ``max_position_embeddings``.
+        The snapshot's historical ``model_max_position_embeddings`` field
+        carries the resolved deployment length, including startup auto-fit.
         """
-        candidates: list = [16384]
-        candidates.extend(int(t) for t in req.sequence_tokens if int(t) > 0)
-        if req.max_input_length > 0:
-            candidates.append(
-                req.max_input_length + max(0, req.max_decoding_length)
-            )
-        emp = req.engine_max_prompt
-        emd = req.engine_max_decode
-        if emp is not None and emd is not None:
-            candidates.append(int(emp) + int(emd))
-        elif emp is not None:
-            candidates.append(int(emp))
-        elif emd is not None:
-            candidates.append(int(emd))
-        mmp = req.model_max_position_embeddings
-        if mmp is not None and int(mmp) > 0:
-            candidates.append(int(mmp))
-        return max(candidates)
+        length = req.model_max_position_embeddings
+        if length is None or length < 2:
+            raise ValueError("page-table sizing requires a positive deployment max_model_len")
+        return int(length)
 
     @staticmethod
     def page_table_slot_capacity(req: PageTableCapacityRequest) -> int:
@@ -496,6 +477,7 @@ class KVCacheManager:
         slot_capacity = max(1, KVCacheManager.page_table_slot_capacity(req))
         return replace(
             config,
+            max_model_len=token_capacity,
             cuda_graph_max_pages_per_sequence=page_capacity,
             cuda_graph_max_slots=slot_capacity,
         )
@@ -539,6 +521,11 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     # Measure-once-cache pool sizing (pure helpers; the worker applies them)
     # ------------------------------------------------------------------
+    @staticmethod
+    def provisional_pool_gb(total_gb: float, used_gb: float, gpu_memory_frac: float) -> float:
+        """Pool budget after decode residency, before graph/transient allocations."""
+        return total_gb * gpu_memory_frac - used_gb
+
     @staticmethod
     def compute_final_pool_gb(
         total_gb: float,
@@ -612,14 +599,10 @@ class KVCacheManager:
     ) -> None:
         """Fail loud when the cached pool no longer fits the free memory.
 
-        The cached size is exactly what the post-capture steady state left
-        below the explicit headroom, so after the previous pool's segments are
-        released the free memory is the pool plus that headroom. Not fitting
-        therefore means resident memory GREW since the measurement — a leak or
-        an unaccounted allocation, which must be named here rather than
-        surface as a bare ``torch.zeros`` CUDA OOM inside pool creation (and
-        must never be absorbed by silently shrinking the pool, which is the
-        round-dependent squeeze this sizing path exists to remove).
+        Startup fixes the pool budget. Later residency may consume reserved
+        slack, but cannot take capacity promised by that pool. Name a shortfall
+        here rather than surface a bare allocation error or silently shrink
+        the pool across decode rounds.
         """
         if cached_pool_gb <= free_gb:
             return

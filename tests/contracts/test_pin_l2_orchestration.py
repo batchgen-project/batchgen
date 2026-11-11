@@ -120,7 +120,7 @@ PINS = {
                 "free_pages",
                 "total_pages",
                 "completed_pages",
-                "safety_margin",
+                "reclaimable_pages",
                 "strategy",
                 "page_key",
             ],

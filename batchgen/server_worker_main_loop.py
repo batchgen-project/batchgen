@@ -858,6 +858,14 @@ def _server_worker_main_impl(
 	# Any failure propagates and the worker never signals ready.
 	if runs_startup_before_readiness(args.model_name):
 		worker.prepare_kimi_k3_startup()
+	worker.prepare_deployment()
+	# Every node's scheduler receives its local rank-zero worker's resolved
+	# length, including after restart. Publish before the readiness signal.
+	if args.local_rank == 0:
+		response_queue.put({
+			"type": "deployment_capacity",
+			"max_model_len": worker.model_context_length,
+		})
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.

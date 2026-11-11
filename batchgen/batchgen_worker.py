@@ -268,6 +268,9 @@ from batchgen.worker.shared_prefix_charge import (
 	SharedPrefixLedger,
 	plan_shared_runs,
 )
+from batchgen.config.max_model_len import (
+	SequenceLengthCapacity, resolve_max_model_len, verify_max_model_len,
+)
 from batchgen.worker.kv_manager import (
 	GPU_KV_POOL_HEADROOM_GB,
 	KVCacheManager,
@@ -1057,6 +1060,7 @@ class BatchGenWorkerArgs:
 	enable_decode_preemption: bool = True
 	# GPU memory fraction for KV cache calculation (default: 0.9)
 	gpu_memory_frac: float = 0.9
+	max_model_len: Optional[int] = None
 	# GPU page buffer settings for decode scheduling
 	initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
 	extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
@@ -2501,6 +2505,9 @@ class BatchGenWorker:
 						)
 						for group_id in host_views
 					},
+					# The plan's restore decision travels with the start it
+					# set, so a follower's state carries the leader's.
+					int(state.trajectory_restore_boundary),
 				)
 			payload = {
 				"global_ids": global_ids,
@@ -2589,7 +2596,7 @@ class BatchGenWorker:
 			from batchgen.prefix_reuse.wave_runtime import install_mirrored_segments
 
 			install_mirrored_segments(wave, segments, host_views)
-		for global_id, (attached, cached, shared) in entry["prefix"].items():
+		for global_id, (attached, cached, shared, restore) in entry["prefix"].items():
 			state = PrefixCacheSequenceState(
 				lookup_result=None,
 				attached_tokens=attached,
@@ -2598,6 +2605,7 @@ class BatchGenWorker:
 					int(group_id): tuple(pages)
 					for group_id, pages in shared.items()
 				},
+				trajectory_restore_boundary=int(restore),
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
@@ -4769,17 +4777,12 @@ class BatchGenWorker:
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
-		client_max = getattr(self, 'max_context_length', None)
-		# Model's native context window is the only hard cap.
-		# Batch-level max_context_length should NOT override per-request max_tokens.
-		# Per-request values are ground truth (docs/input-format.md).
-		self.model_context_length = model_max
+		self.model_context_length = resolve_max_model_len(
+			getattr(self.args, "max_model_len", None), model_max
+		)
 		if self.rank == 0:
-			logging.info(
-				f"Model context length set to {self.model_context_length} "
-				f"(model_config={model_max}, client_max_context_length={client_max})"
-			)
-		
+			logging.info("Deployment max_model_len requested: %s", self.model_context_length)
+
 		# Load tokenizer using BatchGen's tokenizer abstraction
 		# This removes the dependency on transformers.AutoTokenizer
 		# Pass model identifier for pattern matching; tokenizer loads from package dir
@@ -4843,6 +4846,7 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
+		self.engine_config.Basic_Config.max_model_len = self.model_context_length
 		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
 		# Pull the cuda-graph adapter from the initializer (None if the model
 		# does not implement one).
@@ -5018,6 +5022,7 @@ class BatchGenWorker:
 			"largest_free_extent_pages": signature[4],
 			"page_tokens": self._trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
+			"max_model_len": self.model_context_length,
 			"capacity_bytes": self._trajectory_book.memory_bytes,
 		})
 
@@ -5867,11 +5872,18 @@ class BatchGenWorker:
 		Host KV is shared by ranks on the same node, not globally. Rank 0 uses
 		these per-node stats to plan dynamic host growth against the same pool
 		that each owner rank will later allocate from.
+
+		Each record also carries the retained prefix pages the node can reclaim
+		right now (resident, no live attachment, no pending load): growth may
+		consume them exactly as prefill admission does, and the boundary's
+		growth phase releases them on demand before the fresh capacity
+		preflight. Zero when the prefix cache is off.
 		"""
 		gpus_per_node = self.local_world_size
 		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
 		report_free = 0
 		report_total = 0
+		report_reclaimable = -1
 		report_node = -1
 		if worker_view is not None and self.local_rank == 0:
 			try:
@@ -5879,6 +5891,14 @@ class BatchGenWorker:
 				report_node = self.rank // gpus_per_node
 				report_free = int(stats.num_free_pages)
 				report_total = int(stats.num_total_pages)
+				report_reclaimable = (
+					max(0, int(self.prefix_cache_coordinator.count_releasable_pages(0)))
+					if (
+						self.enable_prefix_cache
+						and self.prefix_cache_coordinator is not None
+					)
+					else 0
+				)
 			except Exception:
 				# Carry a rank-local stats failure through the collective so
 				# peers do not block while this rank raises before all-gather.
@@ -5886,9 +5906,10 @@ class BatchGenWorker:
 				report_node = -2
 				report_free = -1
 				report_total = -1
+				report_reclaimable = -1
 
 		stats_tensor = torch.tensor(
-			[report_node, report_free, report_total],
+			[report_node, report_free, report_total, report_reclaimable],
 			dtype=torch.int64,
 			device=self.torch_device,
 		)
@@ -5908,6 +5929,7 @@ class BatchGenWorker:
 					'node_id': node_id,
 					'num_free_pages': int(item[1].item()),
 					'num_total_pages': int(item[2].item()),
+					'num_reclaimable_pages': int(item[3].item()),
 				}
 
 		for node in range(num_nodes):
@@ -5915,6 +5937,7 @@ class BatchGenWorker:
 				'node_id': node,
 				'num_free_pages': 0,
 				'num_total_pages': 0,
+				'num_reclaimable_pages': 0,
 			}))
 
 		return per_node_stats
@@ -7201,27 +7224,25 @@ class BatchGenWorker:
 			for node, needed in node_needs.items()
 		}
 
-	def _retry_prefill_host_capacity_after_reclaim(
+	def _reclaim_host_prefix_pages_collective(
 		self,
-		owner_requests: List[Tuple[str, int]],
-		capacity_rows: Dict[int, Tuple[int, int]],
-	) -> bool:
-		"""Reclaim this node's host-page deficit once, then re-check capacity.
+		page_target: Callable[[], int],
+		*,
+		reason: str,
+	) -> int:
+		"""Reclaim retained prefix pages on each node leader; all ranks align.
 
-		Exactly one attempt: a wave sized against free + reclaimable pages can
-		be short only by what is retained, and this releases it. A second
-		shortfall is a real capacity change (a concurrent decode grew, a peer
-		node is the short one and has nothing cold left), which the caller
-		rejects exactly as before.
+		The node leader evaluates ``page_target()`` (the Host pages this node is
+		short) and releases up to that many cold retained prefix pages -- only
+		pages with no live attachment and no pending load, so nothing a running
+		row or an attached wave reads is touched. Every other rank of the node
+		then retires the trajectory frontiers standing on the released pages.
 
-		Safe by construction: the wave's prefix attachments are already held,
-		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
-		keeps it -- only cold retained pages go, which is precisely the supply
-		the admission budget counted.
-
-		Collective discipline (same as the admission reclaim): every rank
-		reaches every collective, a leader-side failure becomes a MAX-reduced
-		flag, and no rank raises before that flag is reduced.
+		Collective discipline: every rank reaches every collective, a
+		leader-side failure (including in ``page_target``) becomes a MAX-reduced
+		flag, and no rank raises before that flag is reduced. ``reason`` names
+		the caller in logs, the ``prefix_reclaim`` metric and errors. Returns
+		the largest page count any leader reclaimed.
 		"""
 		from batchgen.prefix_reuse.eviction import (
 			EvictedPageRecorder,
@@ -7234,36 +7255,34 @@ class BatchGenWorker:
 		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
 		if self.local_rank == 0:
 			try:
-				page_target = prefill_host_reserve_page_deficit(
-					capacity_rows, node_id
-				)
-				if page_target:
+				target = int(page_target())
+				if target:
 					released = reclaim_prefix_pages_for_host_admission(
 						core_engine_module=core_engine,
 						coordinator=self.prefix_cache_coordinator,
 						worker_views_by_group=self._host_views_by_group(),
 						group_id=0,
-						page_target=page_target,
+						page_target=target,
 						max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
 						frontier_hook=reclaimed_pages,
 					)
 					logging.info(
-						"[PREFIX_CACHE] reserve reclaimed %s Host pages on node %s "
+						"[PREFIX_CACHE] %s reclaimed %s Host pages on node %s "
 						"(free=%s, target=%s)",
-						released, node_id, self._get_host_kv_free_pages(),
-						page_target,
+						reason, released, node_id, self._get_host_kv_free_pages(),
+						target,
 					)
 					if self.prefix_cache_debug_stats:
 						self._emit_prefix_cache_metric(
 							"prefix_reclaim",
-							reason="host_reserve",
+							reason=reason,
 							node=int(node_id),
-							page_target=int(page_target),
+							page_target=int(target),
 							released_pages=int(released),
 							**self._prefix_host_resource_fields(),
 						)
 			except Exception:
-				logging.exception("[PREFIX_CACHE] reserve eviction failed")
+				logging.exception("[PREFIX_CACHE] %s eviction failed", reason)
 				failure = 1
 		reclaimed_page_count = reclaimed_pages.page_count
 		if self.world_size > 1:
@@ -7275,7 +7294,7 @@ class BatchGenWorker:
 			failure = int(failed[0].item())
 			reclaimed_page_count = int(failed[1].item())
 		if failure != 0:
-			raise RuntimeError("prefix cache reserve eviction failed on a worker")
+			raise RuntimeError(f"prefix cache {reason} eviction failed on a worker")
 		# The leader already retired its own frontiers inside the release. Any
 		# other rank of the node may own frontier records standing on the
 		# reclaimed pages (G=1, or several serve groups per node), so every rank
@@ -7300,8 +7319,8 @@ class BatchGenWorker:
 					)
 				except Exception:
 					logging.exception(
-						"[PREFIX_CACHE] frontier retirement after reserve reclaim "
-						"failed"
+						"[PREFIX_CACHE] frontier retirement after %s reclaim "
+						"failed", reason,
 					)
 					frontier_failure = 1
 			retired = torch.tensor(
@@ -7310,11 +7329,89 @@ class BatchGenWorker:
 			dist.all_reduce(retired, op=dist.ReduceOp.MAX)
 			if int(retired.item()) != 0:
 				raise RuntimeError(
-					"trajectory frontier retirement after reserve reclaim failed "
-					"on a worker"
+					f"trajectory frontier retirement after {reason} reclaim "
+					"failed on a worker"
 				)
+		return reclaimed_page_count
+
+	def _retry_prefill_host_capacity_after_reclaim(
+		self,
+		owner_requests: List[Tuple[str, int]],
+		capacity_rows: Dict[int, Tuple[int, int]],
+	) -> bool:
+		"""Reclaim this node's host-page deficit once, then re-check capacity.
+
+		Exactly one attempt: a wave sized against free + reclaimable pages can
+		be short only by what is retained, and this releases it. A second
+		shortfall is a real capacity change (a concurrent decode grew, a peer
+		node is the short one and has nothing cold left), which the caller
+		rejects exactly as before.
+
+		Safe by construction: the wave's prefix attachments are already held,
+		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
+		keeps it -- only cold retained pages go, which is precisely the supply
+		the admission budget counted.
+
+		Collective discipline is ``_reclaim_host_prefix_pages_collective``'s:
+		every rank reaches every collective, and the deficit is computed on the
+		leader inside its MAX-reduced failure flag.
+		"""
+		node_id = self.rank // self.local_world_size
+		self._reclaim_host_prefix_pages_collective(
+			lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
+			reason="host_reserve",
+		)
 		capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
 		return capacity_ok
+
+	def _reclaim_host_prefix_pages_for_growth(
+		self,
+		growth_entries: List[Tuple[str, int, object]],
+		worker_view: Optional[object],
+	) -> int:
+		"""Release the retained prefix pages this boundary's growth plan counted.
+
+		The rank-0 growth plan covers each node's growth debt with free pages,
+		completed/evicted releases and the node's reclaimable retained prefix
+		pages. After every rank has released (the caller's barrier), the node
+		leader reads the physical free count and reclaims exactly the part of
+		this node's growth the free pages do not cover:
+		``max(0, node_growth_pages - free_after_releases)``. A shortfall the
+		reclaim cannot close is left to the fresh collective preflight, which
+		fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
+		list, identical on every rank.
+		"""
+		node_id = self.rank // self.local_world_size
+		group_size = self._decode_attn_tp_size()
+
+		def node_growth_deficit() -> int:
+			from batchgen.decode_dp_group import host_kv_owner_rank
+
+			node_growth_pages = 0
+			for uuid, growth_pages, seq in growth_entries:
+				if seq is None:
+					raise RuntimeError(f"growth sequence {uuid} is not in global_batch")
+				if group_size > 1:
+					if seq.decode_dp_group is None:
+						raise RuntimeError(
+							f"growth sequence {uuid} has no decode_dp_group for "
+							f"attn_tp_size={group_size}"
+						)
+					owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
+				else:
+					owner = seq.assigned_rank
+				if int(owner) // self.local_world_size == node_id:
+					node_growth_pages += int(growth_pages)
+			if node_growth_pages == 0:
+				return 0
+			if worker_view is None:
+				raise RuntimeError("host-KV worker view is unavailable")
+			free_after_releases = int(worker_view.get_stats().num_free_pages)
+			return max(0, node_growth_pages - free_after_releases)
+
+		return self._reclaim_host_prefix_pages_collective(
+			node_growth_deficit, reason="host_growth",
+		)
 
 	def _attach_prefix_cache_for_prefill(self, prefill_uuids: List[str]) -> None:
 		"""Attach page-aligned cached prefixes for sequences this rank owns.
@@ -7380,9 +7477,10 @@ class BatchGenWorker:
 		# byte-identical to a pre-Slice-2 one.
 		#
 		# Slice 3 moved this IN FRONT of the pool plan: a hit whose prefix the
-		# wave materializes is a plan input, and the reference this lookup
-		# takes is what keeps the frontier's pages resident from the plan that
-		# names them to the load that reads them.
+		# wave materializes is a plan input. The reference this lookup takes
+		# keeps the frontier's snapshot and registry entry from the plan to the
+		# restore; the MLA pages the load reads are kept resident by the row's
+		# prefix-cache attachment above, which the plan retains for the wave.
 		if owned and self._trajectory_commit_requested(
 			[self.global_batch.get_sequence(uuid) for uuid in served]
 		):
@@ -7411,6 +7509,16 @@ class BatchGenWorker:
 					self._replace_prefix_lookup_hits(
 						seqs, prefix_states, [0] * len(seqs)
 					)
+		else:
+			# No pool, no plan: nothing materializes a frontier, so no row of
+			# this wave restores. Declined here, at plan time, like every
+			# other attachment the plan does not take.
+			self._settle_trajectory_restore_plan(
+				[self.global_batch.get_sequence(uuid) for uuid in served],
+				{},
+				"the prefill prefix pool is off, so no plan materializes a "
+				"frontier",
+			)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -9944,6 +10052,79 @@ class BatchGenWorker:
 			)
 		return _find_available_port(host, start_port, remaining)
 
+	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
+		"""Collect every region before allocating GPU pages or publishing L."""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			_resolve_profile, _resolve_indexer_profile, is_dsa_model,
+		)
+
+		profiles = [_resolve_profile(self.huggingface_ckpt_name)]
+		if is_dsa_model(self.huggingface_ckpt_name):
+			profiles.append(_resolve_indexer_profile(self.huggingface_ckpt_name))
+		page_bytes = [p.bytes_per_page() * p.num_layers for p in profiles]
+		# This is the same split used by _initialize_gpu_kv_manager_fixed_size:
+		# all regions have equal page counts, each page spans its physical layers.
+		gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
+		node = self.rank // self.local_world_size
+		capacities = []
+		host_views = self._host_views_by_group()
+		for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
+			capacities.append(SequenceLengthCapacity(
+				"GPU KV", str(region), node, self.rank,
+				profile.page_size, size, gpu_pages,
+			))
+			if self.local_rank == 0:
+				capacities.append(SequenceLengthCapacity(
+					"host KV", str(region), node, self.rank,
+					profile.page_size, size,
+					int(host_views[region].get_stats().num_total_pages),
+					copies=self._decode_attn_tp_size(),
+				))
+		if self.local_rank == 0:
+			book = self._trajectory_book
+			capacities.append(SequenceLengthCapacity(
+				"input IDs", "trajectory", node, self.rank,
+				book.page_tokens, book.page_tokens * QueryBook.TOKEN_BYTES, book.page_count,
+			))
+		all_capacities = [None] * self.world_size
+		dist.all_gather_object(all_capacities, capacities)
+		length = verify_max_model_len(
+			self.model_context_length,
+			[capacity for rank_capacities in all_capacities for capacity in rank_capacities],
+			auto_fit=(
+				getattr(self.args, "max_model_len", None) == -1
+				and not getattr(self, "_deployment_length_verified", False)
+			),
+		)
+		self.model_context_length = length
+		self.engine_config.Basic_Config.max_model_len = length
+		self._deployment_length_verified = True
+
+	def prepare_deployment(self) -> None:
+		"""Resolve and verify L against decode residency before worker readiness.
+
+		The measured provisional budget is retained for every model and mode;
+		it reserves the configured fraction's slack for later allocations. A
+		measured per-cap eager transient reservation is a separate requirement.
+		"""
+		with self._startup_phase("model-build"):
+			if not self._core_initialized:
+				self.Init(None, 1, 0)
+		with self._startup_phase("communicator-init"):
+			self._ensure_pynccl_communicator()
+		with self._startup_phase("decode-shard-build"):
+			if self._persistent_phase_enabled():
+				self._build_persistent_phase_instances()
+			else:
+				prefill_key = self._desired_phase_key("prefill")
+				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
+				self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+				self._init_gpu_kv_with_actual_size()
+				self._transition_phase(prefill_key)
+				self.set_phase("prefill")
+				self._install_prefill_weight_copy_pipeline(False)
+		logging.info("Deployment max_model_len verified: %s", self.model_context_length)
+
 	def prepare_kimi_k3_startup(self) -> None:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
 
@@ -12081,7 +12262,7 @@ class BatchGenWorker:
 			self._remap_reused_kv_pool()
 			return
 
-		# Measure-once-cache: once the post-capture steady state has been
+		# Measure-once-cache: once startup decode residency has been
 		# measured, every later pool (re)creation reuses the cached size —
 		# never a fresh measurement (contract invariant 1: the pool is
 		# identical across decode rounds of the same server).
@@ -12092,19 +12273,13 @@ class BatchGenWorker:
 			# GENERAL cache's all-free segments (prefill transients) too, so
 			# the full-size cudaMalloc below sees the maximum free memory. The
 			# collection first drops tensors still held only by cycles, so
-			# empty_cache can return their segments: with the pool margin now
-			# an explicit 2 GB rather than (1 - frac) of the device, retained
-			# segments are the difference between fitting and fail-loud.
+			# empty_cache can return their segments.
 			torch.cuda.synchronize(self.torch_device)
 			gc.collect()
 			torch.cuda.empty_cache()
-			# The cached size is the device total minus the measured steady
-			# residency minus the explicit headroom, so what is free here must
-			# be the pool plus that headroom. Anything less is residency that
-			# grew after the measurement: name it instead of letting the pool's
-			# torch.zeros raise a bare CUDA OOM, and never re-measure (a fresh
-			# measurement is exactly the round-dependent squeeze this path
-			# removes).
+			# Later residency may consume the fraction's reserved slack, but
+			# the verified pool itself must still fit. Name any shortfall
+			# instead of silently shrinking the deployment's capacity.
 			free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
 			KVCacheManager.check_cached_pool_fits(
 				self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
@@ -12112,8 +12287,7 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(
 					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
-					f"(measure-once-cache; {free_mem_gb:.2f} GB free, headroom "
-					f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB)"
+					f"(startup budget; {free_mem_gb:.2f} GB free)"
 				)
 			self._initialize_gpu_kv_manager_fixed_size()
 			if self.rank == 0:
@@ -12124,14 +12298,9 @@ class BatchGenWorker:
 				)
 			return
 
-		# First time: PROVISIONAL size from the post-weights measurement. The
-		# graph pools, their static buffers and the collective/JIT first-touch
-		# caches are not allocated yet, so (1 - gpu_memory_frac) of the device
-		# is the only thing covering them here — that is the one place the
-		# fraction is load-bearing. The final size is fixed by
-		# _finalize_gpu_kv_pool_after_capture once the graph warmup has
-		# materialized every persistent allocation, and from there the explicit
-		# GPU_KV_POOL_HEADROOM_GB replaces the fraction's slack.
+		# First startup decode entry: measure after weights are resident. The
+		# remaining fraction is reserved for graph and eager allocations; it
+		# is not counted as KV capacity. Every later entry uses the cache.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -12140,34 +12309,24 @@ class BatchGenWorker:
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_gb
 
-		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-		if new_gpu_kv_cache_size > 0:
-			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
-		else:
-			# Fail-loud (contract invariant 3): a non-positive remainder is a
-			# configuration error, never a silently accepted minimum.
-			raise RuntimeError(
-				f"[GPU-KV] Calculated pool size non-positive "
-				f"({new_gpu_kv_cache_size:.2f} GB): total {total_mem_gb:.2f} GB "
-				f"x frac {self.gpu_memory_frac} - used {used_mem_gb:.2f} GB. "
-				"Lower resident memory or raise gpu_memory_frac."
-			)
-		self._gpu_kv_sizing_provisional = True
-
-		if self.rank == 0:
-			logging.info(
-				f"[GPU-KV] Provisional size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
-			)
-
-		# Broadcast to ensure all ranks use same value
-		size_tensor = torch.tensor([self.gpu_kv_cache_size_gb], dtype=torch.float32, device=self.torch_device)
-		dist.broadcast(size_tensor, src=0)
+		local_pool_gb = KVCacheManager.provisional_pool_gb(
+			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		)
+		self._verify_deployment_max_model_len(local_pool_gb)
+		# Identical page counts are required by decode admission. The tightest
+		# rank supplies the common pool, rather than rank zero's residency.
+		size_tensor = torch.tensor([local_pool_gb], dtype=torch.float64, device=self.torch_device)
+		dist.all_reduce(size_tensor, op=dist.ReduceOp.MIN)
 		self.gpu_kv_cache_size_gb = float(size_tensor.item())
+		# Freeze the measured startup pool for every mode before capture. A
+		# lazy capture must not change it after L has been published. The
+		# fraction's slack covers graph/eager allocations until startup can
+		# measure those allocations at the per-rank cap.
+		self._gpu_kv_sizing_provisional = False
 
 		# Initialize GPU KV manager with actual size
 		self._initialize_gpu_kv_manager_fixed_size()
+		self._gpu_kv_cached_pool_gb = self.gpu_kv_cache_size_gb
 
 		if self.rank == 0:
 			stats = self.gpu_paged_kv_cache_manager.get_stats()
@@ -13069,7 +13228,7 @@ class BatchGenWorker:
 				)
 
 	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
-		"""``(hits, confirmed, pages)`` for this wave's trajectory re-entries.
+		"""``(hits, confirmed, pages, drops)`` for this wave's trajectory re-entries.
 
 		M3 Slice 3, the plan input. EVERY rank of a serve group must derive
 		the SAME hit set BEFORE planning, or two ranks pack different chunks
@@ -13091,15 +13250,26 @@ class BatchGenWorker:
 		``pages`` maps a hit's wave index to the frontier's resident Host
 		pages per KV group -- known only to the leader, which mirrors them to
 		the group inside this same pass.
+
+		``drops`` maps the wave index of every row this pass found a reason
+		NOT to plan to that reason, so the plan can decline the row's restore
+		by name. Only a rank holding the row's live attachment acts on it.
+
+		The ``attached_tokens < boundary`` veto stays: the frontier record's
+		reference pins only its snapshot and registry entry, while the MLA
+		pages ``[0, boundary)`` the load reads are kept resident by the row's
+		own prefix-cache attachment alone (an eviction under a referenced
+		record releases the pages first and only then refuses the record).
 		"""
 		from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
 
 		if not self._trajectory_commit_requested(seqs):
-			return [], True, {}
+			return [], True, {}, {}
 		digest = self.prefix_cache_runtime_config.namespace_digest
 		index = self._trajectory_session_groups
 		hits: List[MaterializedPrefix] = []
 		pages: Dict[int, Dict[int, List[int]]] = {}
+		drops: Dict[int, str] = {}
 		confirmed = True
 		unknown = 0
 		for position, seq in enumerate(seqs):
@@ -13123,6 +13293,9 @@ class BatchGenWorker:
 				)
 				if entry is None:
 					unknown += 1
+					drops[position] = (
+						"the mirrored session index does not place this session"
+					)
 					continue
 				boundary = int(entry.boundary_tokens)
 				entry_group = int(entry.owning_group_id)
@@ -13137,6 +13310,7 @@ class BatchGenWorker:
 					"prefilled in full",
 					self.rank, int(seq.global_idx), boundary, reason,
 				)
+				drops[position] = f"the pool cannot materialize it ({reason})"
 				continue
 			hits.append(MaterializedPrefix(index=position, tokens=boundary))
 			if attachment is None:
@@ -13159,6 +13333,11 @@ class BatchGenWorker:
 					self.rank, int(seq.global_idx),
 					int(attachment.boundary_tokens), boundary,
 				)
+				drops[position] = (
+					f"the live frontier is at boundary "
+					f"{int(attachment.boundary_tokens)} but the mirrored index "
+					f"says {boundary}"
+				)
 				confirmed = False
 				continue
 			state = self._prefix_sequence_states.get(int(seq.global_idx))
@@ -13175,6 +13354,11 @@ class BatchGenWorker:
 					"index advertised; the group recomputes",
 					self.rank, int(seq.global_idx), attached, boundary,
 				)
+				drops[position] = (
+					f"its prefix-cache attachment covers {attached} token(s), "
+					f"short of the {boundary}-token frontier it must keep "
+					"resident"
+				)
 				confirmed = False
 				continue
 			record_pages = {
@@ -13188,6 +13372,7 @@ class BatchGenWorker:
 					"names no resident Host page; the group recomputes",
 					self.rank, int(seq.global_idx),
 				)
+				drops[position] = "its frontier record names no resident Host page"
 				confirmed = False
 				continue
 			pages[position] = record_pages
@@ -13204,7 +13389,7 @@ class BatchGenWorker:
 				"this rank's live attachments" if group is None
 				else "the mirrored session index",
 			)
-		return hits, confirmed, pages
+		return hits, confirmed, pages, drops
 
 	def _unmaterializable_frontier(
 		self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
@@ -13245,17 +13430,23 @@ class BatchGenWorker:
 		and must come out with the same plan: the page and state-slot budgets
 		are reduced to the group MIN and the plan digest is compared inside the
 		group, so every early return and every chunk is group-identical.
+
+		The plan is also the trajectory RESTORE decision: a row whose frontier
+		it materializes carries ``trajectory_restore_boundary`` and starts its
+		compute exactly there; every other live trajectory attachment of the
+		wave is declined here, at plan time, with the reason it was dropped
+		(``_settle_trajectory_restore_plan``) -- on every return path.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
-			PoolMaterializationDoesNotFit,
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
 		)
 		from batchgen.prefix_reuse.wave_runtime import PoolWave
 
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		total_pages = self._prefill_pool_page_budget
 		if total_pages is None:
 			# Budget seeding is part of configure_prefill, which every rank of
@@ -13268,9 +13459,11 @@ class BatchGenWorker:
 				"prefill-phase pool budget not yet measured",
 				self.rank,
 			)
+			self._settle_trajectory_restore_plan(
+				seqs, {}, "the prefill-phase pool budget is not yet measured"
+			)
 			return None
 		group = self._prefill_pool_group()
-		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		prompts = [
 			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
 			for seq in seqs
@@ -13284,7 +13477,7 @@ class BatchGenWorker:
 		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
 		# replicated data so every rank of the group has the same set, plus
 		# this rank's vote on whether that set is still live.
-		hits, hits_confirmed, hit_pages = self._materialized_prefix_hits(
+		hits, hits_confirmed, hit_pages, drops = self._materialized_prefix_hits(
 			seqs, page_tokens=page_tokens, group=group
 		)
 		if group is not None:
@@ -13310,6 +13503,11 @@ class BatchGenWorker:
 				"wave recomputes them",
 				self.rank, len(hits),
 			)
+			for hit in hits:
+				drops.setdefault(
+					int(hit.index),
+					"the serve group could not confirm the mirrored frontier set",
+				)
 			hits = []
 		if self._prefill_pool_psm_layout() is not None:
 			# The pool holds EVERY token of a chunk, tails as well as segments,
@@ -13332,6 +13530,11 @@ class BatchGenWorker:
 			logging.info(
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
 				self.rank, total_pages, scratch,
+			)
+			self._settle_trajectory_restore_plan(
+				seqs, drops,
+				f"the wave is not pooled: pool {total_pages} pages <= scratch "
+				f"{scratch}",
 			)
 			return None
 		# A model that declares group-safe pool prefill (K3) writes a chunk's KV
@@ -13361,6 +13564,12 @@ class BatchGenWorker:
 				"chunk",
 				self.rank, len(hits),
 			)
+			for hit in hits:
+				drops.setdefault(
+					int(hit.index),
+					"this model's pool does not read a segment resident in its "
+					"own chunk",
+				)
 			hits = []
 		# Every computed segment holds a recurrent-state slot for the wave on
 		# top of the wave's own sequences, so the planner pools only as many
@@ -13368,19 +13577,25 @@ class BatchGenWorker:
 		# instead of declining the whole wave when the full tree does not fit.
 		if state_slots >= 0:
 			plan_kwargs["max_computed_segments"] = max(0, state_slots - len(prompts))
-		try:
-			plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
-		except PoolMaterializationDoesNotFit as exc:
-			# Deterministic in the group's own inputs (the same prompts, the
-			# same hit set, the same group-MIN budget), so every rank of the
-			# group falls back on the same wave.
+		# The planner decides per row which hits it materializes (arbitration
+		# against the in-wave pool, then partial fit) and names every one it
+		# declines. Deterministic in the group's own inputs (the same prompts,
+		# the same hit set, the same group-MIN budget), so every rank of the
+		# group keeps and declines the same rows.
+		plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
+		if plan.declined_materialized:
 			logging.warning(
-				"[PREFIX_POOL] Rank %s plans this wave WITHOUT its %d "
-				"materialized prefix(es) and recomputes them: %s",
-				self.rank, len(hits), exc,
+				"[PREFIX_POOL] Rank %s plans %d of %d materialized prefix(es); "
+				"declined by the planner: %s",
+				self.rank, len(hits) - len(plan.declined_materialized),
+				len(hits),
+				", ".join(
+					f"sequence {int(seqs[index].global_idx)} ({reason})"
+					for index, reason in plan.declined_materialized
+				),
 			)
-			hits = []
-			plan = plan_wave_prefix_sharing(prompts, materialized=(), **plan_kwargs)
+			for index, reason in plan.declined_materialized:
+				drops.setdefault(int(index), f"the wave planner declined it ({reason})")
 		if level_wise:
 			# Rows grouped by level, so a recurrent layer runs one packed call
 			# per level, each after the level that left its parents' state.
@@ -13401,6 +13616,11 @@ class BatchGenWorker:
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
 				"shared, %d state slots needed, %d free",
 				self.rank, len(plan.segments), state_slots_needed, state_slots,
+			)
+			self._settle_trajectory_restore_plan(
+				seqs, drops,
+				f"the wave is not pooled: {len(plan.segments)} segment(s), "
+				f"{state_slots_needed} state slot(s) needed, {state_slots} free",
 			)
 			return None
 		wave = PoolWave(
@@ -13423,14 +13643,21 @@ class BatchGenWorker:
 				# inside this same pass, before the forward reads them.
 				continue
 			wave.bind_materialized_host_pages(segment_id, source)
+		# A materialized member's chain IS its frontier, so its compute start
+		# is the snapshot boundary: that row, and only that row, restores.
+		restore_boundaries = {
+			index: wave.chain_tokens(index)
+			for segment_id in wave.materialized
+			for index in plan.segments[segment_id].members
+		}
 		self._replace_prefix_lookup_hits(
 			seqs, prefix_states,
 			[wave.chain_tokens(index) for index in range(len(seqs))],
-			retain=frozenset(
-				index
-				for segment_id in wave.materialized
-				for index in plan.segments[segment_id].members
-			),
+			retain=frozenset(restore_boundaries),
+			restore_boundaries=restore_boundaries,
+		)
+		self._settle_trajectory_restore_plan(
+			seqs, drops, "the wave plan does not materialize its frontier"
 		)
 		logging.info(
 			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
@@ -13707,7 +13934,8 @@ class BatchGenWorker:
 		return layout
 
 	def _replace_prefix_lookup_hits(
-		self, seqs, prefix_states, chain_tokens, retain=frozenset()
+		self, seqs, prefix_states, chain_tokens, retain=frozenset(),
+		restore_boundaries=None,
 	) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
 
@@ -13723,23 +13951,83 @@ class BatchGenWorker:
 		because the wave publishes it afresh). The handle moves into the
 		sequence's retained-handle tuple, so the one release lane every
 		sequence leaves through frees it exactly once.
+
+		``restore_boundaries`` maps the wave indices whose trajectory frontier
+		the plan materialized to that boundary: the row's restore decision,
+		carried on its state as ``trajectory_restore_boundary``. Every other
+		row gets 0, i.e. no restore.
 		"""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
+		restores = restore_boundaries or {}
 		for index, (seq, end) in enumerate(zip(seqs, chain_tokens)):
 			old = prefix_states.get(seq.global_idx)
 			handle = 0 if old is None else int(old.attachment_handle)
 			if handle and index not in retain:
 				self.prefix_cache_coordinator.release_attachment(handle)
 				handle = 0
+			restore = int(restores.get(index, 0))
+			if restore and restore != int(end):
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {int(seq.global_idx)} is "
+					f"planned to restore at token {restore} but its compute "
+					f"starts at {int(end)}"
+				)
 			state = PrefixCacheSequenceState(
 				lookup_result=None,
 				attached_tokens=end,
 				compute_cached_tokens=end,
 				commit_attachment_handles=(handle,) if handle else (),
+				trajectory_restore_boundary=restore,
 			)
 			prefix_states[seq.global_idx] = state
 			self._prefix_sequence_states[seq.global_idx] = state
+
+	def _settle_trajectory_restore_plan(self, seqs, drops, default_reason) -> None:
+		"""Decline, at plan time, every live attachment the plan does not restore.
+
+		Runs once at the end of every wave plan, on every return path, over
+		the wave's sequences in wave order. An attachment whose row carries a
+		``trajectory_restore_boundary`` is the plan's to restore and stays; any
+		other is consumed HERE with ``not_planned`` and the reason the plan
+		dropped it (``drops``: wave index -> reason; ``default_reason``
+		otherwise), so it never reaches the restore seam and its reference is
+		released exactly once. Only the rank holding attachments (the
+		host-KV leader) has anything to do; a follower's map is empty.
+		"""
+		if not self._trajectory_attachments:
+			return
+		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+
+		restorer = self._trajectory_restorer
+		for index, seq in enumerate(seqs):
+			if seq is None:
+				continue
+			global_id = int(seq.global_idx)
+			attachment = self._trajectory_attachments.get(global_id)
+			if attachment is None:
+				continue
+			state = self._prefix_sequence_states.get(global_id)
+			planned = 0 if state is None else int(state.trajectory_restore_boundary)
+			if planned:
+				if planned != int(attachment.boundary_tokens):
+					raise RuntimeError(
+						f"Rank {self.rank}: sequence {global_id} is planned to "
+						f"restore at token {planned} but its live frontier is "
+						f"at {int(attachment.boundary_tokens)}"
+					)
+				continue
+			if restorer is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {global_id} holds a live "
+					"trajectory attachment but this rank has no restorer"
+				)
+			del self._trajectory_attachments[global_id]
+			restorer.decline(
+				attachment,
+				reason=DECLINE_NOT_PLANNED,
+				detail=f"at plan time: {drops.get(index, default_reason)}",
+			)
 
 	def _prefill_pool_segment_host_pages(self) -> int:
 		"""Host pages this wave allocates for its segments.
@@ -14994,6 +15282,13 @@ class BatchGenWorker:
 		A follower keeps no registry, so it restores on the LEADER's decision:
 		one decision for the whole group means hit/miss and boundary cannot
 		differ across ranks that must run prefill in lockstep.
+
+		Only rows the wave PLANNED to restore are mirrored (their state
+		carries the attachment's boundary as ``trajectory_restore_boundary``);
+		every other attachment was declined when the wave was planned, and a
+		row with no planned restore has no restore for a follower to apply.
+		The leader's lookup agreement rides along for the follower's
+		token-identity check.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
 		if shard_count <= 1 or not is_leader or not self._trajectory_attachments:
@@ -15002,13 +15297,18 @@ class BatchGenWorker:
 		if committer is None:
 			return {}
 		payload = {}
-		for global_id, attachment in self._trajectory_attachments.items():
+		for global_id, attachment in sorted(self._trajectory_attachments.items()):
+			state = self._prefix_sequence_states.get(int(global_id))
+			planned = 0 if state is None else int(state.trajectory_restore_boundary)
+			if planned != int(attachment.boundary_tokens):
+				continue
 			arena = committer.arena_for(attachment.storage_handle)
 			if arena is None:
 				continue
 			payload[int(global_id)] = {
 				"session_key": str(attachment.session_key),
 				"boundary_tokens": int(attachment.boundary_tokens),
+				"lcp_tokens": int(attachment.lcp_tokens),
 				"owning_group_id": int(attachment.owning_group_id),
 				"shard_count": int(arena.shard_count),
 				"pseudo_sid": int(arena.pseudo_sid),
@@ -15232,6 +15532,12 @@ class BatchGenWorker:
 
 		Empty whenever the flag is off -- nothing is attached, so this is a
 		dict lookup and a return.
+
+		Executes the wave plan's decision, it does not take one: every
+		attachment still live here belongs to a row the plan materialized
+		(``trajectory_restore_boundary``), because the plan declined all the
+		others. One that is not is a broken invariant and is raised, after
+		its reference is consumed.
 		"""
 		if self._trajectory_mirrored_restores:
 			self._restore_mirrored_trajectory_shards(local_indices)
@@ -15240,6 +15546,8 @@ class BatchGenWorker:
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
 			return
+		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+
 		for local_idx in local_indices:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			seq = (
@@ -15255,16 +15563,23 @@ class BatchGenWorker:
 			if attachment is None:
 				continue
 			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			if state is None or not int(state.trajectory_restore_boundary):
+				restorer.decline(
+					attachment,
+					reason=DECLINE_NOT_PLANNED,
+					detail="reached the restore seam with no planned restore",
+				)
+				raise RuntimeError(
+					f"Rank {self.rank}: sequence {int(seq.global_idx)} reached "
+					"the trajectory restore with a live attachment its wave "
+					"plan never planned; the plan must decline it"
+				)
 			restorer.restore(
 				attachment,
 				serving_group_id=int(seq.decode_dp_group or 0),
-				# The position the suffix prefill will start at. Absent state
-				# means the whole prompt is recomputed, which the restorer
-				# refuses by name rather than restoring a state the forward
-				# would double-count.
-				compute_cached_tokens=(
-					int(state.compute_cached_tokens) if state is not None else 0
-				),
+				# The position the suffix prefill will start at, which the plan
+				# set to the snapshot boundary.
+				compute_cached_tokens=int(state.compute_cached_tokens),
 			)
 
 	def _restore_mirrored_trajectory_shards(self, local_indices) -> None:
@@ -15313,6 +15628,7 @@ class BatchGenWorker:
 				layout=committer.layout,
 				session_key=str(entry["session_key"]),
 				boundary_tokens=int(entry["boundary_tokens"]),
+				lcp_tokens=int(entry["lcp_tokens"]),
 				owning_group_id=int(entry["owning_group_id"]),
 				serving_group_id=int(seq.decode_dp_group or 0),
 				compute_cached_tokens=(
@@ -17388,6 +17704,16 @@ class BatchGenWorker:
 				# GPU/KDA state, but only the host-KV owner may mutate its page table.
 				if self._owns_host_kv(seq):
 					host_grow_requests.append((seq.global_idx, growth_pages))
+
+			# The growth plan counted each node's reclaimable retained prefix
+			# pages as supply; release the part free pages do not cover now,
+			# after every rank's releases and before the fresh preflight.
+			# Gated on the rank-uniform prefix-cache config so every rank
+			# reaches the reclaim's collectives.
+			if self.enable_prefix_cache:
+				self._reclaim_host_prefix_pages_for_growth(
+					growth_entries, worker_view
+				)
 
 			# The rank-0 planner's stats are an admission snapshot.  Recheck the
 			# node-shared allocator after all releases have completed and before any

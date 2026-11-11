@@ -16,10 +16,11 @@ from batchgen.worker.boundary import (
 )
 
 _GPN = 8
-_TOTAL_PAGES = 455  # safety margin = int(455 * 0.05) = 22
+_TOTAL_PAGES = 455
 
 
-def _state(*, completed, allocated, owned, growth_pages=0, decoded_length=10):
+def _state(*, completed, allocated, owned, growth_pages=0, decoded_length=10,
+           context_length=100):
     return {
         "completed": completed,
         "assigned_rank": 0,
@@ -31,7 +32,7 @@ def _state(*, completed, allocated, owned, growth_pages=0, decoded_length=10):
         "host_owned_pages": owned,
         "needs_host_growth": growth_pages > 0,
         "host_growth_pages": growth_pages,
-        "current_context_length": 100,
+        "current_context_length": context_length,
         "host_token_capacity": allocated * 64,
     }
 
@@ -51,7 +52,8 @@ def _plan(state, *, free_pages, enable_host_kv_eviction=False):
         },),
         seq_meta={
             uuid: BoundarySeqMeta(
-                global_idx=i, priority=0, current_context_length=100,
+                global_idx=i, priority=0,
+                current_context_length=state[uuid]["current_context_length"],
                 host_token_capacity=state[uuid]["host_token_capacity"],
                 host_pages_allocated=state[uuid]["host_pages_allocated"],
             )
@@ -76,7 +78,7 @@ def _completed_and_growers(owned):
 
 
 def test_prefix_rows_credit_only_owned_pages():
-    # 13 free + 4 * 29 owned = 129 < 6 * 32 growth + 22 safety = 214.
+    # 13 free + 4 * 29 owned = 129 < 6 * 32 growth = 192.
     # Crediting host_pages_allocated would see 13 + 4 * 61 = 257 (feasible).
     plan = _plan(_completed_and_growers(owned=29), free_pages=13)
     assert plan.growth_feasible is False
@@ -85,7 +87,7 @@ def test_prefix_rows_credit_only_owned_pages():
 
 
 def test_prefix_free_rows_plan_unchanged():
-    # owned == allocated: 13 + 4 * 61 = 257 >= 214.
+    # owned == allocated: 13 + 4 * 61 = 257 >= 192.
     plan = _plan(_completed_and_growers(owned=61), free_pages=13)
     assert plan.growth_feasible is True
     assert plan.scheduler_error is None
@@ -93,8 +95,10 @@ def test_prefix_free_rows_plan_unchanged():
 
 
 def test_eviction_credits_only_owned_pages():
-    # Need 2 * 32 + 22 = 86 free. Victims each own 29 of 61 allocated pages:
-    # 13 + 29k >= 86 needs k = 3 (allocated credit would stop at k = 2).
+    # Need 2 * 32 = 64 free. Victims each own 29 of 61 allocated pages:
+    # 13 + 29k >= 64 needs k = 2 (allocated credit would stop at k = 1).
+    # The growers' long contexts make them the costlier victims
+    # ((8 + 32) / 10000 < 29 / 100 deficit pages per recompute token).
     state = {
         f"victim{i}": _state(completed=False, allocated=61, owned=29, decoded_length=1)
         for i in range(4)
@@ -102,12 +106,12 @@ def test_eviction_credits_only_owned_pages():
     state.update({
         f"grow{i}": _state(
             completed=False, allocated=8, owned=8, growth_pages=32,
-            decoded_length=100,
+            decoded_length=100, context_length=10_000,
         )
         for i in range(2)
     })
     plan = _plan(state, free_pages=13, enable_host_kv_eviction=True)
-    assert plan.host_evicted_uuids == ["victim0", "victim1", "victim2"]
+    assert plan.host_evicted_uuids == ["victim0", "victim1"]
     assert plan.growth_feasible is True
     assert plan.scheduler_error is None
 

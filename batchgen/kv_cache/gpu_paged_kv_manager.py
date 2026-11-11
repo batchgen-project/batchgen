@@ -170,6 +170,7 @@ class GPUPagedKVConfig:
 	cuda_graph_max_pages_per_sequence: Optional[int] = None
 	cuda_graph_max_slots: Optional[int] = None
 	logical_to_physical_layer: Optional[Sequence[int]] = None
+	max_model_len: Optional[int] = None
 
 	@classmethod
 	def from_device_config(
@@ -2605,36 +2606,20 @@ class GPUPagedKVCacheManager:
 		return max(1, max(candidates))
 
 	def _resolve_page_table_max_pages_per_sequence(self) -> int:
-		env_value = _positive_or_none(
-			int(os.environ["BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE"])
-			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
-			else None
-		)
-		# Decoupled from pool size: see _resolve_page_table_max_slots.
-		if env_value is not None:
-			return max(1, env_value)
-		config_value = _positive_or_none(
-			getattr(self.config, "cuda_graph_max_pages_per_sequence", None)
-		)
-		if config_value is not None:
-			return max(1, config_value)
-
-		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
+		# Serving supplies this from the verified deployment L for every model
+		# and every KV region, including eager decode. A standalone manager's
+		# explicit config is its contract; batch hints never size a row.
+		if self.config.max_model_len is not None:
+			return _ceil_div(self.config.max_model_len, self.config.page_size_tokens)
 		if self._engine_config is not None:
-			basic = self._engine_config.Basic_Config
-			max_prompt = basic.get_max_prompt_length()
-			max_decode = basic.max_decoding_length
-			if max_prompt is not None and max_decode is not None:
-				token_capacity = max(token_capacity, int(max_prompt) + int(max_decode))
-			elif max_prompt is not None:
-				token_capacity = max(token_capacity, int(max_prompt))
-			elif max_decode is not None:
-				token_capacity = max(token_capacity, int(max_decode))
-			prepack_capacity = self._engine_config.Module_Batching_Config.prepack_row_capacity
-			if prepack_capacity is not None and prepack_capacity > 0:
-				token_capacity = max(token_capacity, int(prepack_capacity))
-		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
-		return max(1, page_capacity)
+			length = self._engine_config.Basic_Config.max_model_len
+			if length is None or length < 2:
+				raise ValueError("GPU page-table sizing requires deployment max_model_len")
+			return _ceil_div(int(length), self.config.page_size_tokens)
+		config_value = _positive_or_none(self.config.cuda_graph_max_pages_per_sequence)
+		if config_value is not None:
+			return config_value
+		return _ceil_div(DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens)
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":

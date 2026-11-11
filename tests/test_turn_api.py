@@ -114,6 +114,7 @@ class _FakeWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
+        self.response_queue.put({"type": "deployment_capacity", "max_model_len": CONTEXT})
         self.response_queue.put({
             "type": "trajectory_pool_capacity",
             "capacity_semantics_version": 1,
@@ -205,6 +206,8 @@ def _scheduler(tmp_path, worker):
         parse_tool_call=False,
     )
     scheduler = bs.BatchScheduler(_Storage(tmp_path), worker, args)
+    scheduler.max_model_len = CONTEXT
+    scheduler._deployment_ready.set()
     scheduler._get_tokenizer = lambda model: _Tokenizer()
     # The fake worker needs no init message (WorkerManager sends it for a
     # real generation before worker_generation_ready()).
@@ -510,7 +513,6 @@ def test_submit_rejections(tmp_path):
         scheduler = _scheduler(tmp_path, _ns_worker())
         cases = {
             "n": _turn_body("s1", n=2),
-            "max": {k: v for k, v in _turn_body("s1").items() if k != "max_tokens"},
             "model": _turn_body("s1", model="DeepSeek-V3"),
         }
         out = {}
@@ -528,7 +530,6 @@ def test_submit_rejections(tmp_path):
     scheduler, out = asyncio.run(run())
     assert out == {
         "n": (400, "unsupported_n"),
-        "max": (400, "max_tokens_required"),
         "model": (400, "model_mismatch"),
         "full": (429, "capacity_exceeded"),
     }
@@ -613,8 +614,7 @@ def test_e2e_rejections_and_gates(tmp_path):
     assert out["unknown"].status_code == 404
     assert out["unknown"].json()["detail"]["code"] == "session_not_found"
     assert out["no_session"].status_code == 422
-    assert out["no_max"].status_code == 400
-    assert out["no_max"].json()["detail"]["code"] == "max_tokens_required"
+    assert out["no_max"].status_code == 200
     assert out["too_long"].status_code == 400
     assert out["too_long"].json()["detail"] == {
         "code": "context_length_exceeded",

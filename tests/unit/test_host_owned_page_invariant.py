@@ -218,16 +218,15 @@ def test_planner_feasible_when_every_row_owns_a_page():
             free_pages=rng.randint(0, total),
             total_pages=total,
             completed_pages=sum(o for u, o in zip(uuids, owned) if u in completed),
-            safety_margin=rng.randint(0, 2 * total),
+            reclaimable_pages=rng.randint(0, total),
             page_key="host_owned_pages",
         )
         assert plan.growth_feasible_after_eviction, plan
 
 
 def test_boundary_never_infeasible_when_every_row_owns_a_page():
-    # An empty pool, a pool too small for any growth, and a safety margin
-    # larger than the pool all stay feasible: evicting the growers clears
-    # their debt, and with no debt the margin is not required.
+    # An empty pool and a pool too small for any growth both stay feasible:
+    # evicting the growers clears their debt.
     for free_pages, total_pages in [(0, 20), (0, 455), (13, 455), (2, 2)]:
         state = {f"grow{i}": _row(owned=1, growth=32) for i in range(6)}
         state.update({f"idle{i}": _row(owned=3, growth=0) for i in range(3)})
@@ -243,8 +242,8 @@ def test_boundary_never_infeasible_when_every_row_owns_a_page():
 
 
 def test_boundary_infeasible_only_with_zero_owned_grower():
-    # 0 free + 0 freed < 32 growth + int(455 * 0.05) = 22 safety: the grower
-    # owns no page, the planner skips it as a candidate, and its debt stays.
+    # 0 free + 0 freed < 32 growth: the grower owns no page, the planner
+    # skips it as a candidate, and its debt stays.
     state = {"grow": _row(owned=0, growth=32), "idle": _row(owned=1, growth=0)}
     plan = _decide(state, free_pages=0, total_pages=455, enable_host_kv_eviction=True)
     assert plan.scheduler_error is not None
@@ -255,7 +254,7 @@ def test_boundary_infeasible_only_with_zero_owned_grower():
 def test_boundary_infeasible_with_eviction_disabled():
     # The other exact condition: with eviction disabled no row is a
     # candidate, so pool sizing alone decides. Every row owns >= 1 page:
-    # 13 free + 4 * 29 completed = 129 < 6 * 32 growth + 22 safety = 214.
+    # 13 free + 4 * 29 completed = 129 < 6 * 32 growth = 192.
     # Production derives eviction from a positive host-KV chunk size, which
     # server argument validation requires, so this needs a direct request.
     state = {
@@ -267,7 +266,8 @@ def test_boundary_infeasible_with_eviction_disabled():
     assert "eviction_enabled=False" in plan.scheduler_error
     assert "candidates=0" in plan.scheduler_error
     assert "expected_free=129" in plan.scheduler_error
-    assert "required_free=214" in plan.scheduler_error
+    assert "required_free=192" in plan.scheduler_error
+    assert "safety=" not in plan.scheduler_error
 
 
 # --------------------------------------------------------------------------
@@ -318,7 +318,7 @@ def test_infeasible_plan_raises_named_invariant(monkeypatch):
             remaining_growth_pages=[32],
             remaining_growth_needed=32,
             expected_free_pages=5,
-            required_free_pages=32 + 22,
+            required_free_pages=32,
             growth_feasible_after_eviction=False,
         )
 
@@ -333,7 +333,7 @@ def test_infeasible_plan_raises_named_invariant(monkeypatch):
     assert "HOST_OWNED_PAGE" in error
     for field in (
         "eviction_enabled=True", "candidates=1", "free=5", "expected_free=5",
-        "growth_pages=32", "safety=22", "required_free=54",
+        "growth_pages=32", "reclaimable_pages=0", "required_free=32",
         "grow(gid=0,owned=2,growth=32)",
     ):
         assert field in error, field

@@ -159,4 +159,5 @@ class TestPydanticModels:
             "created": 12345,
             "owned_by": "batchgen",
             "max_context_length": 8192,
+            "max_model_len": None,
         }

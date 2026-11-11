@@ -67,6 +67,7 @@ class FakePrefixState:
     compute_cached_tokens: int
     planned_shared_page_ids: dict = dataclasses.field(default_factory=dict)
     commit_attachment_handles: tuple = ()
+    trajectory_restore_boundary: int = 0
 
     @property
     def attachment_handle(self):

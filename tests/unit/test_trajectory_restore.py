@@ -99,6 +99,7 @@ from batchgen.prefix_reuse.trajectory_restore import (  # noqa: E402
     DECLINE_ARENA_READ_FAILED,
     DECLINE_GROUP_MISMATCH,
     DECLINE_HEAD_SHARDED_GROUP,
+    DECLINE_NOT_PLANNED,
     DECLINE_REASONS,
     DECLINE_SLOTS_EXHAUSTED,
     DECLINE_SLOT_WRITE_FAILED,
@@ -108,6 +109,7 @@ from batchgen.prefix_reuse.trajectory_restore import (  # noqa: E402
     KDAStateSnapshotWriter,
     TrajectoryAttachmentInvalid,
     TrajectoryRestoreError,
+    TrajectoryRestorePlanDrift,
     TrajectoryRestorer,
     trajectory_reuse_enabled,
 )
@@ -1078,22 +1080,26 @@ def test_a_missing_arena_falls_back_by_name():
     )
 
 
-def test_a_suffix_that_does_not_start_at_the_frontier_is_refused():
-    """The offset identity: a full-prompt recompute must not be restored into."""
+def test_a_suffix_that_does_not_start_at_the_frontier_is_planner_drift():
+    """The offset identity, now an invariant the wave planner makes true.
+
+    Only a planned row reaches the restore, and the plan set its start to
+    the boundary; any other start is counted under its name and RAISED --
+    never restored into, and never silently recomputed either.
+    """
 
     harness = _Harness()
     _commit_seeded_frontier(harness, sequence_id=7)
     restorer = harness.restorer()
     for cached in (0, len(BASE_PROMPT) - 1, len(BASE_PROMPT) + 1):
         attachment = _hit(harness, restorer)
-        assert (
+        with pytest.raises(TrajectoryRestorePlanDrift, match="disagree"):
             restorer.restore(
                 attachment,
                 serving_group_id=0,
                 compute_cached_tokens=cached,
             )
-            is None
-        )
+        assert attachment.consumed is True
         assert restorer.live_attachments == 0
         assert harness.manager.has_sequence_state_item(9) is False
     assert (
@@ -1588,6 +1594,7 @@ def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
         layout=harness.layout,
         session_key=installed.session_key,
         boundary_tokens=len(BASE_PROMPT),
+        lcp_tokens=len(BASE_PROMPT),
         owning_group_id=0,
         serving_group_id=0,
         compute_cached_tokens=len(BASE_PROMPT),
@@ -1618,26 +1625,27 @@ def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog)
             layout=harness.layout,
             session_key=installed.session_key,
             boundary_tokens=len(BASE_PROMPT),
+            lcp_tokens=len(BASE_PROMPT),
             owning_group_id=0,
             serving_group_id=3,
             compute_cached_tokens=len(BASE_PROMPT),
         )
         is None
     )
-    # Suffix that does not start exactly at the boundary.
-    assert (
+    # Suffix that does not start exactly at the boundary: planner drift,
+    # counted under the same name and raised, as on the attachment path.
+    with pytest.raises(TrajectoryRestorePlanDrift, match="disagree"):
         restorer.restore_mirrored_shard(
             sequence_id=9,
             arena=arena,
             layout=harness.layout,
             session_key=installed.session_key,
             boundary_tokens=len(BASE_PROMPT),
+            lcp_tokens=len(BASE_PROMPT),
             owning_group_id=0,
             serving_group_id=0,
             compute_cached_tokens=len(BASE_PROMPT) - 1,
         )
-        is None
-    )
     counters = restorer.counters()
     assert counters[f"trajectory_decline_{DECLINE_GROUP_MISMATCH}"] == 1
     planned = [r.message for r in caplog.records if "reason=group_mismatch" in r.message]
@@ -1680,3 +1688,199 @@ def test_the_g_wide_arena_holds_every_shard_and_only_those_pages():
             view.page_bytes_of(page) for page in window[0]
         )
         assert blob.strip(b"\x00"), f"shard {shard_index} window is all zeros"
+
+
+# ---------------------------------------------------------------------------
+# The plan decides; the restore checks the hand-off
+# ---------------------------------------------------------------------------
+#
+# The worker's two restore seams, compiled out of ``batchgen_worker.py`` onto
+# a fake that holds only what they read, driving the REAL restorer over the
+# real committed frontier above. Scaled to this harness: a one-page pool
+# chain stands for the 64-token system page and the two-page frontier for the
+# 5120-token boundary of the original failure.
+
+
+def _worker_seam(harness, restorer, *, compute_cached, planned):
+    from types import SimpleNamespace
+
+    from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+
+    names = (
+        "_settle_trajectory_restore_plan",
+        "_restore_trajectory_frontiers",
+        "_get_trajectory_restorer",
+    )
+    worker_source = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "batchgen"
+        / "batchgen_worker.py"
+    )
+    nodes = [
+        node
+        for node in ast.walk(ast.parse(worker_source.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert sorted(node.name for node in nodes) == sorted(names)
+    namespace = {}
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), str(worker_source), "exec"),
+        namespace,
+    )
+    seq = SimpleNamespace(uuid="u9", global_idx=9, decode_dp_group=0)
+    worker = SimpleNamespace(
+        rank=0,
+        global_batch=SimpleNamespace(get_sequence={"u9": seq}.get),
+        _local_to_uuid_map={0: "u9"},
+        _trajectory_frontier_committer=harness.committer,
+        _trajectory_restorer=restorer,
+        _trajectory_mirrored_restores={},
+        _trajectory_attachments={9: _hit(harness, restorer)},
+        _prefix_sequence_states={
+            9: PrefixCacheSequenceState(
+                lookup_result=None,
+                attached_tokens=compute_cached,
+                compute_cached_tokens=compute_cached,
+                trajectory_restore_boundary=planned,
+            )
+        },
+    )
+    for name in names:
+        setattr(worker, name, types.MethodType(namespace[name], worker))
+    return worker, seq
+
+
+def test_restore_applies_when_the_plan_raised_the_start_to_the_boundary(caplog):
+    harness = _Harness()
+    _slot, expected, _ = _commit_seeded_frontier(harness, sequence_id=7)
+    restorer = harness.restorer()
+    boundary = len(BASE_PROMPT)
+    worker, seq = _worker_seam(
+        harness, restorer, compute_cached=boundary, planned=boundary
+    )
+    attachment = worker._trajectory_attachments[9]
+
+    # Plan time: the row is planned, so nothing is declined.
+    worker._settle_trajectory_restore_plan([seq], {}, "unused")
+    assert worker._trajectory_attachments == {9: attachment}
+    # Restore time: the plan's decision is applied at exactly the boundary.
+    with caplog.at_level("INFO"):
+        worker._restore_trajectory_frontiers([0])
+
+    counters = restorer.counters()
+    assert counters["trajectory_restores"] == 1
+    assert counters["trajectory_declines"] == 0
+    assert restorer.live_attachments == 0
+    slot = harness.manager.get_sequence_state_item(9)
+    assert _slot_chunks(harness.manager, slot) == expected
+    assert f"suffix prefill resumes at token {boundary}" in caplog.text
+
+
+def test_the_pre_fix_ladder_row_is_declined_at_plan_time_and_never_restored(caplog):
+    """Pool chain one page, boundary two: the case that used to reach restore.
+
+    It used to keep its attachment, start its prefill at the pool chain, and
+    have the RESTORE decline it on ``suffix_offset_mismatch``. The plan now
+    declines it by name when it drops the row, and the restore never sees it.
+    """
+
+    harness = _Harness()
+    _commit_seeded_frontier(harness, sequence_id=7)
+    restorer = harness.restorer()
+    worker, seq = _worker_seam(
+        harness, restorer, compute_cached=PAGE_TOKENS, planned=0
+    )
+    attachment = worker._trajectory_attachments[9]
+    record = attachment.record
+    restore_calls = []
+    real_restore = restorer.restore
+
+    def _counting_restore(*args, **kwargs):
+        restore_calls.append(args)
+        return real_restore(*args, **kwargs)
+
+    restorer.restore = _counting_restore
+
+    with caplog.at_level("WARNING"):
+        worker._settle_trajectory_restore_plan(
+            [seq], {0: "the serve group could not confirm the mirrored frontier set"},
+            "unused",
+        )
+    assert worker._trajectory_attachments == {}
+    assert attachment.consumed is True
+    assert restorer.live_attachments == 0
+    assert record.refcount == 1  # the frontier is evictable again
+    worker._restore_trajectory_frontiers([0])
+
+    assert restore_calls == []
+    counters = restorer.counters()
+    assert counters[f"trajectory_decline_{DECLINE_NOT_PLANNED}"] == 1
+    assert counters[f"trajectory_decline_{DECLINE_SUFFIX_OFFSET}"] == 0
+    assert counters["trajectory_restores"] == 0
+    assert harness.manager.has_sequence_state_item(9) is False
+    assert (
+        f"reason={DECLINE_NOT_PLANNED}" in caplog.text
+        and "at plan time: the serve group could not confirm" in caplog.text
+    )
+
+
+def test_a_prompt_diverging_below_the_boundary_never_becomes_an_attachment():
+    """Token identity's first half: the lookup, not the restore, decides it."""
+
+    harness = _Harness()
+    _commit_seeded_frontier(harness)
+    restorer = harness.restorer()
+    diverged = BASE_PROMPT[:-1] + (999, 201, 202)  # differs at token B-1
+    assert (
+        restorer.lookup(
+            namespace_digest=NAMESPACE, prompt_token_ids=diverged, sequence_id=9
+        )
+        is None
+    )
+    assert restorer.live_attachments == 0
+
+
+def test_an_attachment_short_of_its_boundary_is_refused_without_a_slot_write():
+    """Token identity's second half: an attachment no lookup could produce."""
+
+    harness = _Harness()
+    _commit_seeded_frontier(harness, sequence_id=7)
+    restorer = harness.restorer()
+    attachment = _hit(harness, restorer)
+    record = attachment.record
+    attachment._lcp_tokens = len(BASE_PROMPT) - 1  # fabricated
+    free_before = harness.manager.get_stats().num_free_state_items
+
+    with pytest.raises(TrajectoryAttachmentInvalid, match="fewer than its"):
+        restorer.restore(
+            attachment,
+            serving_group_id=0,
+            compute_cached_tokens=len(BASE_PROMPT),
+        )
+    assert attachment.consumed is True
+    assert restorer.live_attachments == 0
+    assert record.refcount == 1
+    assert harness.manager.has_sequence_state_item(9) is False
+    assert harness.manager.get_stats().num_free_state_items == free_before
+    assert restorer.counters()["trajectory_restores"] == 0
+
+
+def test_a_mirrored_restore_short_of_its_boundary_is_refused():
+    harness = _GroupHarness(shard_count=2)
+    harness.seed()
+    arena, installed = harness.commit_pass()
+    restorer = harness.restorer(1)
+    with pytest.raises(TrajectoryAttachmentInvalid, match="fewer than its"):
+        restorer.restore_mirrored_shard(
+            sequence_id=9,
+            arena=arena,
+            layout=harness.layout,
+            session_key=installed.session_key,
+            boundary_tokens=len(BASE_PROMPT),
+            lcp_tokens=len(BASE_PROMPT) - 1,
+            owning_group_id=0,
+            serving_group_id=0,
+            compute_cached_tokens=len(BASE_PROMPT),
+        )
+    assert restorer.counters()["trajectory_restores"] == 0
+    assert harness.managers[1].has_sequence_state_item(9) is False
