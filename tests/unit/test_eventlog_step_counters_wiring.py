@@ -14,17 +14,20 @@ from pathlib import Path
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
+ENGINE = Path(__file__).resolve().parents[2] / "batchgen" / "worker" / "decode_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
 COUNTERS = "_step_counters"
 
 
 def _decoding_continuous() -> ast.FunctionDef:
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
     worker = next(
-        node for node in TREE.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        node for node in ENGINE_TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
     )
     return next(
         node for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == "decoding_continuous"
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
     )
 
 
@@ -55,7 +58,7 @@ def _counter_calls(nodes) -> list[str]:
 
 def test_the_counters_import_is_module_level():
     imports = [
-        node for node in TREE.body
+        node for node in ENGINE_TREE.body
         if isinstance(node, ast.ImportFrom)
         and node.module == "batchgen.eventlog.counters"
     ]
@@ -82,7 +85,7 @@ def test_one_instance_per_worker_started_once_per_round_before_the_loop():
     assert _counter_calls(before) == ["_step_counters.begin_round(_hb_last_time)"]
     # Nowhere else in the worker constructs one.
     all_ctor = [
-        node for node in ast.walk(TREE)
+        node for node in ast.walk(ENGINE_TREE)
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "StepCounters"
     ]
     assert len(all_ctor) == 1

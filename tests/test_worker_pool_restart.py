@@ -2018,9 +2018,11 @@ def _cohort_flag_probe_child(flag, observed, child_pid, deadline_s):
 # --------------------------------------------------------------------------
 
 BATCHGEN_WORKER_PATH = ROOT / "batchgen/batchgen_worker.py"
+DECODE_ENGINE_PATH = ROOT / "batchgen/worker/decode_engine.py"
 DUAL_COORDINATOR_PATH = ROOT / "batchgen/kv_cache/dual_host_kv_coordinator.py"
 
 _worker_tree_cache: Dict[str, ast.Module] = {}
+_decode_engine_tree_cache: Dict[str, ast.Module] = {}
 
 
 def _worker_tree() -> ast.Module:
@@ -2037,7 +2039,21 @@ def _worker_class() -> ast.ClassDef:
     )
 
 
+def _decode_engine_run() -> ast.FunctionDef:
+    if "run" not in _decode_engine_tree_cache:
+        _decode_engine_tree_cache["run"] = ast.parse(DECODE_ENGINE_PATH.read_text())
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    tree = _decode_engine_tree_cache["run"]
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
+    )
+    return next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "run")
+
+
 def _worker_method(name: str) -> ast.FunctionDef:
+    if name == "decoding_continuous":
+        return _decode_engine_run()
     return next(
         node for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name == name
