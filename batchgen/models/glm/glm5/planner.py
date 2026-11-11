@@ -62,8 +62,8 @@ class GLM5Planner(BasePlanner):
             # experts for a layer at once. Two layers let the core-engine H2D
             # worker fill L+1 while L computes; the staggered per-member walk
             # (weight_replica_group.stagger_task_for_member) is what spreads
-            # the replica pulls across the owners' egress — deeper rings
-            # alone moved the wall 0% (R19) and cost GPU memory.
+            # the replica pulls across the owners' egress; deeper rings
+            # alone do not move the wall and only cost device memory.
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "routed_expert"
             ] = 2 * self.NUM_EXPERTS
