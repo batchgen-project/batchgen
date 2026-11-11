@@ -5321,15 +5321,8 @@ class BatchGenWorker:
 		"""
 		return int(getattr(self, "model_context_length", 0) or 0)
 
-	def _make_page_table_capacity_request(
-		self, sequence_tokens: Optional[Sequence[int]] = None,
-	) -> PageTableCapacityRequest:
-		st = tuple(int(t) for t in (sequence_tokens or ()))
-		max_input_length = int(getattr(self, "max_input_length", 0) or 0)
-		max_decoding_length = int(getattr(self, "max_decoding_length", 0) or 0)
+	def _make_page_table_capacity_request(self) -> PageTableCapacityRequest:
 		engine_config = getattr(self, "engine_config", None)
-		engine_max_prompt: Optional[int] = None
-		engine_max_decode: Optional[int] = None
 		engine_module_global_batch_size: Optional[int] = None
 		engine_module_attn_decoding_micro_batch_size: Optional[int] = None
 		engine_basic_num_queries: Optional[int] = None
@@ -5337,8 +5330,6 @@ class BatchGenWorker:
 		if engine_config is not None:
 			basic = engine_config.Basic_Config
 			module_batching = engine_config.Module_Batching_Config
-			engine_max_prompt = basic.get_max_prompt_length()
-			engine_max_decode = getattr(basic, "max_decoding_length", None)
 			engine_module_global_batch_size = module_batching.global_batch_size
 			engine_module_attn_decoding_micro_batch_size = module_batching.attn_decoding_micro_batch_size
 			engine_basic_num_queries = basic.num_queries
@@ -5361,11 +5352,6 @@ class BatchGenWorker:
 		args = getattr(self, "args", None)
 		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
 		return PageTableCapacityRequest(
-			sequence_tokens=st,
-			max_input_length=max_input_length,
-			max_decoding_length=max_decoding_length,
-			engine_max_prompt=engine_max_prompt,
-			engine_max_decode=engine_max_decode,
 			engine_module_global_batch_size=engine_module_global_batch_size,
 			engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
 			engine_basic_num_queries=engine_basic_num_queries,
@@ -5374,12 +5360,9 @@ class BatchGenWorker:
 			engine_basic_decode_graph_max_bucket=engine_basic_decode_graph_max_bucket,
 		)
 
-	def _cuda_graph_page_table_token_capacity(
-		self,
-		sequence_tokens: Optional[Sequence[int]] = None,
-	) -> int:
+	def _cuda_graph_page_table_token_capacity(self) -> int:
 		return KVCacheManager.page_table_token_capacity(
-			self._make_page_table_capacity_request(sequence_tokens)
+			self._make_page_table_capacity_request()
 		)
 
 	def _cuda_graph_page_table_slot_capacity(self) -> int:
@@ -5387,13 +5370,9 @@ class BatchGenWorker:
 			self._make_page_table_capacity_request()
 		)
 
-	def _with_cuda_graph_page_table_capacity(
-		self,
-		config,
-		sequence_tokens: Optional[Sequence[int]] = None,
-	):
+	def _with_cuda_graph_page_table_capacity(self, config):
 		return KVCacheManager.apply_page_table_capacity(
-			self._make_page_table_capacity_request(sequence_tokens), config
+			self._make_page_table_capacity_request(), config
 		)
 
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):

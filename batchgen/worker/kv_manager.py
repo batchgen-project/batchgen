@@ -193,16 +193,13 @@ class PageTableCapacityRequest:
     """Frozen snapshot for the page-table capacity helpers.
 
     Token capacity is the resolved deployment bound, carried in the historical
-    ``model_max_position_embeddings`` field. Slot capacity still takes the
-    maximum of the relevant batch and graph settings. Optional fields are
-    ``None`` when the underlying worker attribute is unset.
+    ``model_max_position_embeddings`` field. Slot capacity takes the maximum
+    of the relevant batch and graph settings. Optional fields are ``None``
+    when the underlying worker attribute is unset. The snapshot carries only
+    what the two capacity helpers read: per-batch lengths have no place here,
+    because the page table's shape is a deployment constant.
     """
 
-    sequence_tokens: Tuple[int, ...]
-    max_input_length: int
-    max_decoding_length: int
-    engine_max_prompt: Optional[int]
-    engine_max_decode: Optional[int]
     engine_module_global_batch_size: Optional[int]
     engine_module_attn_decoding_micro_batch_size: Optional[int]
     engine_basic_num_queries: Optional[int]

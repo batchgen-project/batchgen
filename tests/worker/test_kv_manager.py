@@ -260,11 +260,6 @@ def test_can_swap_backend():
 
 def _make_cap_req(
     *,
-    sequence_tokens=(),
-    max_input_length=0,
-    max_decoding_length=0,
-    engine_max_prompt=None,
-    engine_max_decode=None,
     engine_module_global_batch_size=None,
     engine_module_attn_decoding_micro_batch_size=None,
     engine_basic_num_queries=None,
@@ -273,11 +268,6 @@ def _make_cap_req(
     engine_basic_decode_graph_max_bucket=None,
 ) -> PageTableCapacityRequest:
     return PageTableCapacityRequest(
-        sequence_tokens=tuple(sequence_tokens),
-        max_input_length=max_input_length,
-        max_decoding_length=max_decoding_length,
-        engine_max_prompt=engine_max_prompt,
-        engine_max_decode=engine_max_decode,
         engine_module_global_batch_size=engine_module_global_batch_size,
         engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
         engine_basic_num_queries=engine_basic_num_queries,
@@ -293,13 +283,10 @@ def _make_cap_req(
 
 
 @pytest.mark.parametrize("length", [17, 4096, 65537])
-@pytest.mark.parametrize("prompt,decode", [(0, 0), (20000, 4096), (4, 100000)])
-def test_token_capacity_is_only_the_deployment_bound(length, prompt, decode):
-    req = _make_cap_req(
-        sequence_tokens=(8000, 32000), max_input_length=prompt,
-        max_decoding_length=decode, engine_max_prompt=prompt,
-        engine_max_decode=decode, model_max_position_embeddings=length,
-    )
+def test_token_capacity_is_only_the_deployment_bound(length):
+    # Structural since the per-batch length fields were deleted from the
+    # snapshot: the deployment bound is the only length the request carries.
+    req = _make_cap_req(model_max_position_embeddings=length)
     assert KVCacheManager.page_table_token_capacity(req) == length
 
 
@@ -379,8 +366,6 @@ class _FakeCudaGraphConfig:
 
 def test_apply_capacity_normal_case():
     req = _make_cap_req(
-        max_input_length=16000,
-        max_decoding_length=8000,
         model_max_position_embeddings=24000,
         args_cuda_graph_max_bucket_size=64,
     )
@@ -433,7 +418,7 @@ def test_apply_capacity_does_not_mutate_input():
 def test_capacity_request_is_frozen():
     req = _make_cap_req()
     with pytest.raises((AttributeError, Exception)):
-        req.max_input_length = 99  # type: ignore[misc]
+        req.model_max_position_embeddings = 99  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
