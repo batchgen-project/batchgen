@@ -336,6 +336,7 @@ from batchgen.continuous_batching import (
 	AdaptiveChunkSizer,
 	BoundaryDecisions,
 	FastBoundaryTimingStats,
+	host_kv_owner_reports,
 	validate_boundary_payload_alignment,
 )
 # sample_tokens: Token sampling with temperature/top_p support
@@ -6758,6 +6759,9 @@ class BatchGenWorker:
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_owned_pages': seq.host_owned_pages,
 					'host_token_capacity': seq.host_token_capacity,
+					# G>1: names the serve group, whose leader's Host counters
+					# are the canonical ones (host_kv_owner_reports).
+					'decode_dp_group': seq.decode_dp_group,
 					# QueryBook metadata is process-local even though its token
 					# pages are node-shared.  Publish the owner's lengths so
 					# non-owning ranks can repair their mirror before re-entry.
@@ -6782,6 +6786,16 @@ class BatchGenWorker:
 		all_states = [None] * self.world_size
 		dist.all_gather_object(all_states, local_state)
 		
+		# Host chain counters have ONE writer per sequence, its host-KV owner.
+		# At G>1 every rank of the serve group holds and reports the row, but
+		# only the leader deducts attached and retained prefix pages from
+		# host_owned_pages, so every other rank -- followers included -- takes
+		# the counters from the leader's report, never from whichever group
+		# rank merged last. At G==1 the single reporter is the owner.
+		host_kv_reports = host_kv_owner_reports(
+			all_states, group_size=self._decode_attn_tp_size()
+		)
+
 		# Step 3: Merge and update local SequenceEntry objects
 		for rank_state in all_states:
 			if rank_state:
@@ -6809,11 +6823,10 @@ class BatchGenWorker:
 							if 'original_max_decode_length' in state:
 								seq.original_max_decode_length = state['original_max_decode_length']
 							# Sync host KV fields for consistent migration planning
-							if 'host_pages_allocated' in state:
-								seq.host_pages_allocated = state['host_pages_allocated']
-							seq.host_owned_pages = state['host_owned_pages']
-							if 'host_token_capacity' in state:
-								seq.host_token_capacity = state['host_token_capacity']
+							host_state = host_kv_reports[uuid]
+							seq.host_pages_allocated = host_state['host_pages_allocated']
+							seq.host_owned_pages = host_state['host_owned_pages']
+							seq.host_token_capacity = host_state['host_token_capacity']
 							# Eviction-related fields
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
@@ -6838,6 +6851,24 @@ class BatchGenWorker:
 					seq = self.global_batch.get_sequence(uuid)
 					if seq is not None:
 						self._sync_trajectory_metadata(seq, state)
+
+		# A G>1 follower holds the row locally, so the merge above skipped it;
+		# it still never writes the Host chain, so it adopts the leader's
+		# counters here. This is what carries the leader's prefix attach and
+		# commit-retain deductions to the followers before the decode boundary
+		# requires the group to agree. A no-op on the owner and at G==1.
+		for uuid, host_state in host_kv_reports.items():
+			if uuid not in self._uuid_to_local_map:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or self._owns_host_kv(seq):
+				continue
+			seq.host_pages_allocated = host_state['host_pages_allocated']
+			seq.host_owned_pages = host_state['host_owned_pages']
+			seq.host_token_capacity = host_state['host_token_capacity']
+			seq.validate_metadata(
+				f"rank {self.rank} _sync_sequence_metadata/host_kv_owner"
+			)
 
 	# Thin delegations to `batchgen.worker.sync.SyncCoordinator`. The worker
 	# owns the canonical state; `_make_sync_context` snapshots it into a
@@ -7719,8 +7750,10 @@ class BatchGenWorker:
 			seq.host_pages_allocated = pages
 			seq.host_token_capacity = tokens
 			# Attached prefix pages never enter the sequence's own chain, so
-			# releasing the row returns only the private remainder. Non-owner
-			# ranks sync this through the boundary metadata exchange.
+			# releasing the row returns only the private remainder. Only the
+			# host-KV owner holds the prefix state here; every other rank (G>1
+			# followers included) takes the owner's value at the post-prefill
+			# _sync_sequence_metadata.
 			state = (
 				self._prefix_sequence_states.get(seq.global_idx)
 				if self.enable_prefix_cache
@@ -16010,6 +16043,8 @@ class BatchGenWorker:
 			)
 			# Retained pages left the sequence chain for prefix residency. Every
 			# group retains the same page count; host_owned_pages counts one.
+			# Leader-only at G>1: the followers adopt the result at the
+			# post-prefill _sync_sequence_metadata (host_kv_owner_reports).
 			seq.host_owned_pages = host_owned_pages_after_sharing(
 				chain_pages=seq.host_owned_pages,
 				shared_pages=len(retained.get(0, ())),

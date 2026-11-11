@@ -14,6 +14,8 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from batchgen.decode_dp_group import host_kv_owner_rank
+
 logger = logging.getLogger(__name__)
 
 # Debug flag for continuous batching logging
@@ -117,6 +119,62 @@ def _reported_by_exact_group(ranks: List[int], group: Any, group_size: int) -> b
     return set(ranks) == expected
 
 
+def host_kv_owner_reports(
+    all_states: List[Optional[Dict[str, Dict[str, Any]]]],
+    group_size: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Per sequence, the gathered metadata report made by its Host-KV owner.
+
+    ``all_states[r]`` is rank ``r``'s ``{uuid: state}`` report. A sequence's
+    Host chain counters (``host_pages_allocated``, ``host_owned_pages``,
+    ``host_token_capacity``) have exactly one writer, the rank that owns its
+    Host KV:
+
+    * G==1: the owner is the only rank reporting the row, so its report is
+      returned as is.
+    * G>1: all G ranks of serve group g report the row, but only the leader
+      ``g*G`` attaches cached prefix pages and retains committed ones out of
+      the chain, so only the leader's ``host_owned_pages`` carries those
+      deductions. The leader's report is returned; the followers and every
+      rank outside the group take the counters from it.
+
+    A row reported without a serve group (evicted or completed, whose counters
+    every rank already zeroed) has no Host chain owner; its last report is
+    returned. A grouped row whose leader did not report raises: its canonical
+    counters are then unknown and any merge would guess.
+    """
+    G = int(group_size)
+    reports: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[str, Any] = {}
+    leader_reported: Set[str] = set()
+    for rank_idx, rank_state in enumerate(all_states):
+        for uuid, state in (rank_state or {}).items():
+            group = state.get("decode_dp_group") if G > 1 else None
+            if group is None:
+                if uuid not in groups:
+                    reports[uuid] = state
+                continue
+            groups[uuid] = group
+            if rank_idx == host_kv_owner_rank(group, G):
+                reports[uuid] = state
+                leader_reported.add(uuid)
+    missing = {
+        uuid: group for uuid, group in groups.items()
+        if uuid not in leader_reported
+    }
+    if missing:
+        raise RuntimeError(
+            "[SCHED_INVARIANT] HOST_KV_OWNER report missing: the serve-group "
+            "leader did not report these grouped sequences, so their Host chain "
+            "counters have no canonical source: "
+            + ", ".join(
+                f"{uuid}(group={group}, leader_rank={host_kv_owner_rank(group, G)})"
+                for uuid, group in sorted(missing.items())[:8]
+            )
+        )
+    return reports
+
+
 def validate_boundary_payload_alignment(
     decode_uuids: List[str],
     all_payloads: List[Optional[Dict[str, Any]]],
@@ -133,7 +191,11 @@ def validate_boundary_payload_alignment(
       ranks of its ``decode_dp_group`` g, so it must be reported by EXACTLY the G
       contiguous ranks ``[g*G, (g+1)*G)`` (``set(ranks) == set(range(g*G,(g+1)*G))``)
       and ownership is GROUP MEMBERSHIP (``rank // G == g``), not
-      ``assigned_rank == rank``.
+      ``assigned_rank == rank``. The G reports must also agree on
+      ``host_owned_pages``: the leader alone moves it at prefix attach and
+      commit, the post-prefill metadata sync hands its value to the
+      followers, and every later move is applied on all ranks, so two values
+      for one sequence mean the planner reads whichever rank merged last.
 
     Violations mean scheduler state is already corrupt enough that silently
     completing or dropping rows would hide data loss and can lead to long-tail
@@ -145,6 +207,7 @@ def validate_boundary_payload_alignment(
     candidate_reports: Dict[str, List[int]] = {}
     active_group: Dict[str, Any] = {}       # uuid -> decode_dp_group (G>1)
     candidate_group: Dict[str, Any] = {}
+    active_owned: Dict[str, Dict[int, Any]] = {}  # uuid -> rank -> host_owned_pages (G>1)
     active_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_bad_status: List[Tuple[str, int, Any]] = []
@@ -167,6 +230,9 @@ def validate_boundary_payload_alignment(
                 group = state.get("decode_dp_group") if isinstance(state, dict) else None
                 if group is not None:
                     active_group[uuid] = group
+                active_owned.setdefault(uuid, {})[rank_idx] = (
+                    state.get("host_owned_pages") if isinstance(state, dict) else None
+                )
                 # Owner check is group membership: rank // G == decode_dp_group.
                 if not isinstance(group, int) or rank_idx // G != group:
                     active_wrong_owner.append((uuid, rank_idx, group))
@@ -239,6 +305,19 @@ def validate_boundary_payload_alignment(
             errors.append(
                 "load candidates not reported by exactly their decode group's G ranks: "
                 f"{_format_ranked_reports(bad_candidate_card)}"
+            )
+        owned_diverged = {
+            uuid: per_rank for uuid, per_rank in active_owned.items()
+            if len(set(per_rank.values())) > 1
+        }
+        if owned_diverged:
+            errors.append(
+                "HOST_OWNED_PAGES diverged across serve-group ranks: "
+                + ", ".join(
+                    f"{uuid}(group={active_group.get(uuid)}, "
+                    f"host_owned_pages_by_rank={dict(sorted(per_rank.items()))})"
+                    for uuid, per_rank in sorted(owned_diverged.items())[:8]
+                )
             )
     else:
         duplicate_active = {
