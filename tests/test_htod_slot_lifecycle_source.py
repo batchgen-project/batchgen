@@ -256,7 +256,7 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     head = weights[:fetch]
     assert "if (next.kind == WeightProduction::kCopy) {" in head
     assert head.index("if (next.kind == WeightProduction::kCopy) {") < head.index(
-        "acquireEmptyBuffer(module_type)"
+        "acquireEmptyBuffer("
     )
 
     buffer = BUFFER.read_text()
