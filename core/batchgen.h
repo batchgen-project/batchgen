@@ -119,8 +119,14 @@ class BatchGen {
                                      int64_t, int64_t, int64_t>>& modules,
         torch::Tensor control_block,
         const std::unordered_map<std::string,
-                                 std::vector<torch::Tensor>>& peer_segments,
+                                 std::vector<int64_t>>& peer_fds,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_bytes,
         const std::unordered_map<std::string, int64_t>& strides);
+    // (fd, mapped bytes) of the type's single prefill ring segment; the
+    // caller owns the fd and closes it once every peer has imported.
+    std::pair<int64_t, int64_t> ring_segment_export_fd(
+        const std::string& module_type);
     void uninstall_replica_plan();
     std::vector<torch::Tensor> ring_segments(const std::string& module_type);
     int64_t ring_stride(const std::string& module_type);

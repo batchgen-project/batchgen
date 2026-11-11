@@ -392,8 +392,8 @@ void HtoD_Engine::install_replica_plan(
     const std::vector<uint32_t>& owned_per_position,
     const std::vector<ReplicaModuleInstall>& modules,
     torch::Tensor control_block,
-    const std::unordered_map<std::string, std::vector<torch::Tensor>>&
-        peer_segments,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
     const std::unordered_map<std::string, int64_t>& strides) {
     if (this->HtoD_worker_.joinable()) {
         throw std::runtime_error(
@@ -444,28 +444,55 @@ void HtoD_Engine::install_replica_plan(
                 std::to_string(runtime->owned_per_position[pos]) + " owned");
         }
     }
-    for (const auto& [module_type, segments] : peer_segments) {
-        if (segments.size() != static_cast<size_t>(group_size)) {
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    const int device = this->engine_config_.basic_config.device;
+    for (const auto& [module_type, fds] : peer_fds) {
+        if (fds.size() != static_cast<size_t>(group_size)) {
             throw std::runtime_error(
-                "peer segments of " + module_type +
-                " must hold one tensor per member");
+                "peer fds of " + module_type +
+                " must hold one entry per member");
+        }
+        auto bytes_entry = peer_bytes.find(module_type);
+        if (bytes_entry == peer_bytes.end() ||
+            bytes_entry->second.size() != static_cast<size_t>(group_size)) {
+            throw std::runtime_error(
+                "peer byte sizes of " + module_type +
+                " must hold one entry per member");
         }
         auto stride = strides.find(module_type);
         if (stride == strides.end() || stride->second <= 0) {
             throw std::runtime_error("missing ring stride for " + module_type);
         }
+        const auto [own_base, own_bytes] =
+            this->gpu_weight_buffer_.ring_segment_base(module_type);
         auto& bases = runtime->segment_base[module_type];
-        for (const torch::Tensor& segment : segments) {
-            if (!segment.defined() || !segment.is_cuda()) {
-                throw std::runtime_error(
-                    "peer segment of " + module_type + " is not a CUDA tensor");
+        for (int64_t member = 0; member < group_size; ++member) {
+            if (member == member_index) {
+                if (fds[member] >= 0) {
+                    throw std::runtime_error(
+                        "this member's own fd slot of " + module_type +
+                        " must be -1");
+                }
+                bases.push_back(own_base);
+                continue;
             }
-            bases.push_back(segment.data_ptr());
-            runtime->keepalive.push_back(segment);
+            const int64_t mapped = bytes_entry->second[member];
+            if (fds[member] < 0 || mapped <= 0 || mapped < own_bytes) {
+                throw std::runtime_error(
+                    "peer segment of " + module_type + " from member " +
+                    std::to_string(member) + " has fd " +
+                    std::to_string(fds[member]) + " and " +
+                    std::to_string(mapped) + " bytes, need >= " +
+                    std::to_string(own_bytes));
+            }
+            auto import = std::make_shared<batchgen_vmm::VmmPeerImport>(
+                static_cast<int>(fds[member]), static_cast<size_t>(mapped),
+                device);
+            bases.push_back(import->data());
+            runtime->keepalive.push_back(std::move(import));
         }
         runtime->stride[module_type] = stride->second;
     }
-    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     runtime->pull_streams.resize(group_size, nullptr);
     for (int64_t member = 0; member < group_size; ++member) {
         if (member == member_index) {

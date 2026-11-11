@@ -656,6 +656,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clear_kv_storage", &BatchGen::clear_kv_storage)
         .def("clear_kv_copy_queue", &BatchGen::clear_kv_copy_queue)
         .def("install_replica_plan", &BatchGen::install_replica_plan)
+        .def("ring_segment_export_fd", &BatchGen::ring_segment_export_fd)
         .def("uninstall_replica_plan", &BatchGen::uninstall_replica_plan)
         .def("ring_segments", &BatchGen::ring_segments)
         .def("ring_stride", &BatchGen::ring_stride)

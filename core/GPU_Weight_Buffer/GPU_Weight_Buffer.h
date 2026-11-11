@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "../data_structures.h"
+#include "GPU_Weight_Buffer/vmm_ring_segment.h"
 #include "../utils.h"
 #include "weight_slot_table.h"
 
@@ -157,6 +158,13 @@ class GPU_Weight_Buffer {
     // The segment tensors backing a type's ring, in grow order, and the
     // shared per-slot stride. Every rank lays a type out identically, so a
     // peer addresses slot i of segment s as base + i * stride.
+    // Export the single ring segment of a type as (POSIX fd, mapped bytes).
+    // The caller owns the fd. Throws unless the type has exactly one segment.
+    std::pair<int, int64_t> ring_segment_export_fd(
+        const std::string& module_type) const;
+    // Base pointer and padded size of the single ring segment of a type.
+    std::pair<void*, int64_t> ring_segment_base(
+        const std::string& module_type) const;
     std::vector<torch::Tensor> ring_segments(
         const std::string& module_type) const;
     int64_t ring_stride(const std::string& module_type) const;
@@ -181,6 +189,11 @@ class GPU_Weight_Buffer {
 
     std::unordered_map<std::string, weight_buffers> buffers_;
     std::unordered_map<std::string, std::vector<torch::Tensor>> segments_;
+    // VMM backings of the segments, in the same order; exported to node
+    // peers by fd (slice 2c). Cleared wherever segments_ is cleared.
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<batchgen_vmm::VmmRingSegment>>>
+        segment_backings_;
     std::unordered_map<std::string, int64_t> segment_strides_;
     /* Thread safe buffers management */
     mutable std::mutex mutex_;

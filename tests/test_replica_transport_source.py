@@ -95,6 +95,30 @@ def test_worker_tears_down_with_a_group_barrier_before_uninstall():
     )
 
 
+def test_ring_segments_are_shared_by_vmm_fd_not_torch_ipc():
+    """Slice 2c: torch CUDA-IPC rebuild enabled whole-device peer access and
+    left foreign contexts (minutes and GiBs on a serving worker); segments
+    now travel as exported VMM fds over SCM_RIGHTS and import maps only the
+    segment range read-only."""
+    worker = WORKER.read_text()
+    install = worker[worker.index("def _install_replica_transport"):
+                     worker.index("def _install_prefill_weight_copy_pipeline")]
+    assert "reduce_tensor" not in install
+    assert "ring_segment_export_fd" in install
+    assert "send_fds" in install and "recv_fds" in install
+    # every fd is closed after the engine imported the mappings
+    assert install.index("install_replica_plan(") < install.index("os.close")
+    engine = ENGINE.read_text()
+    assert "VmmPeerImport" in engine
+    assert "cudaIpcOpenMemHandle" not in engine
+    vmm = (ROOT / "core/GPU_Weight_Buffer/vmm_ring_segment.h").read_text()
+    assert "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR" in vmm
+    # the importer grants only its own device read access to the one range
+    imp = vmm[vmm.index("class VmmPeerImport"):]
+    assert "CU_MEM_ACCESS_FLAGS_PROT_READ;" in imp
+    assert "cuMemUnmap" in imp  # uninstall returns the mapping
+
+
 def test_worker_declines_rather_than_crashes_non_participants():
     source = WORKER.read_text()
     body = source[source.index("def _install_replica_transport"):

@@ -140,10 +140,17 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
             .dtype(torch::kUInt8)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false);
-    const torch::Tensor storage = torch::zeros({count * stride}, options);
-    // The replica transport exports whole segments to the node's peers, so
-    // the segment tensor and the shared per-slot stride stay addressable.
+    // The segment is VMM-backed so the replica transport can export it to
+    // node peers as a POSIX fd mapping of exactly this range (slice 2c). The
+    // tensor view keeps the mapping alive; releasing the last view unmaps
+    // and returns the memory immediately, outside the torch pool.
+    const int device = this->engine_config_.basic_config.device;
+    auto backing =
+        std::make_shared<batchgen_vmm::VmmRingSegment>(device, count * stride);
+    const torch::Tensor storage = torch::from_blob(
+        backing->data(), {count * stride}, [backing](void*) {}, options);
     this->segments_[module_type].push_back(storage);
+    this->segment_backings_[module_type].push_back(backing);
     this->segment_strides_[module_type] = stride;
     buffers.reserve(buffers.size() + static_cast<size_t>(count));
     for (int64_t index = 0; index < count; ++index) {
@@ -327,6 +334,7 @@ void GPU_Weight_Buffer::Init() {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->buffers_[module_type].clear();
         this->segments_[module_type].clear();
+        this->segment_backings_[module_type].clear();
         this->slots_.reset_type(module_type, num_buffer);
         this->append_ring_slots_(module_type, num_buffer);
     }
@@ -616,6 +624,35 @@ std::vector<torch::Tensor> GPU_Weight_Buffer::ring_segments(
                                           : found->second;
 }
 
+std::pair<int, int64_t> GPU_Weight_Buffer::ring_segment_export_fd(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_backings_.find(module_type);
+    if (found == this->segment_backings_.end() || found->second.size() != 1) {
+        throw std::runtime_error(
+            "ring_segment_export_fd needs exactly one segment of " +
+            module_type + ", have " +
+            std::to_string(found == this->segment_backings_.end()
+                               ? 0
+                               : found->second.size()));
+    }
+    const auto& backing = found->second.front();
+    return {backing->export_fd(),
+            static_cast<int64_t>(backing->mapped_bytes())};
+}
+
+std::pair<void*, int64_t> GPU_Weight_Buffer::ring_segment_base(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_backings_.find(module_type);
+    if (found == this->segment_backings_.end() || found->second.size() != 1) {
+        throw std::runtime_error(
+            "ring_segment_base needs exactly one segment of " + module_type);
+    }
+    const auto& backing = found->second.front();
+    return {backing->data(), static_cast<int64_t>(backing->mapped_bytes())};
+}
+
 int64_t GPU_Weight_Buffer::ring_stride(const std::string& module_type) const {
     std::lock_guard<std::mutex> lock(this->mutex_);
     auto found = this->segment_strides_.find(module_type);
@@ -830,6 +867,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
             }
             this->buffers_["routed_expert"].clear();
             this->segments_["routed_expert"].clear();
+            this->segment_backings_["routed_expert"].clear();
 
             // Optional: Force memory cleanup for routed_expert tensors only
             if (torch::cuda::is_available()) {
@@ -1055,6 +1093,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
             }
             this->buffers_["routed_expert"].clear();
             this->segments_["routed_expert"].clear();
+            this->segment_backings_["routed_expert"].clear();
 
             // Optional: Force memory cleanup
             if (torch::cuda::is_available()) {

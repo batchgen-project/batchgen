@@ -108,6 +108,10 @@ class HtoD_Engine {
         uint32_t layer_position = 0;
         uint32_t record_index = 0;  // within one frame, identical on every member
     };
+    // peer_fds: per type, one exported VMM fd per group member in group
+    // order, -1 for this member (whose base comes from the local ring).
+    // peer_bytes: the exporter's padded mapping size for each fd. The caller
+    // keeps ownership of the fds and closes them after this returns.
     void install_replica_plan(
         int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
         uint32_t records_per_frame,
@@ -115,7 +119,9 @@ class HtoD_Engine {
         const std::vector<ReplicaModuleInstall>& modules,
         torch::Tensor control_block,
         const std::unordered_map<std::string,
-                                 std::vector<torch::Tensor>>& peer_segments,
+                                 std::vector<int64_t>>& peer_fds,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_bytes,
         const std::unordered_map<std::string, int64_t>& strides);
     // Syncs and destroys the pull streams, drops the imported segments and
     // the control-block view, clears the reclaim gate. The caller has run
@@ -236,7 +242,8 @@ class HtoD_Engine {
         // per type: per member, base pointer of their single ring segment
         std::unordered_map<std::string, std::vector<void*>> segment_base;
         std::unordered_map<std::string, int64_t> stride;
-        std::vector<torch::Tensor> keepalive;  // imported segment tensors
+        // imported peer segment mappings (unmapped at uninstall)
+        std::vector<std::shared_ptr<batchgen_vmm::VmmPeerImport>> keepalive;
         std::vector<cudaStream_t> pull_streams;  // one per member
         // frame bookkeeping, producer thread only
         std::map<uint64_t, uint32_t> owned_landed;

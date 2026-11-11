@@ -11190,53 +11190,106 @@ class BatchGenWorker:
 			)
 		dist.barrier()
 		_mark("block")
-		# Ring segments: every member exports each type's single segment.
-		from torch.multiprocessing.reductions import reduce_tensor
+		# Ring segments travel as exported VMM fds over a node-local unix
+		# socket (SCM_RIGHTS): the peer maps only the segment, so the import
+		# is milliseconds and leaves no foreign context or whole-device peer
+		# mapping behind (the torch CUDA-IPC path cost minutes and GiBs on a
+		# serving worker; slice 2c). The /proc/<pid>/fd reopen seam does not
+		# work for driver fds (VMM P1, finding C1), so the fds are sent.
+		import socket as _socket
 
-		local_segments = {}
-		handles = {}
+		types = sorted(plan.frame_size)
+		own_fds = {}
+		own_bytes = {}
 		strides = {}
-		for module_type in sorted(plan.frame_size):
-			segments = self.core_engine.ring_segments(module_type)
-			if len(segments) != 1:
-				raise RuntimeError(
-					f"Rank {self.rank}: {module_type} ring holds "
-					f"{len(segments)} segments; the replica transport "
-					"expects the single prefill segment"
-				)
-			local_segments[module_type] = segments[0]
-			handles[module_type] = reduce_tensor(segments[0])
+		for module_type in types:
+			fd, mapped = self.core_engine.ring_segment_export_fd(module_type)
+			own_fds[module_type] = int(fd)
+			own_bytes[module_type] = int(mapped)
 			strides[module_type] = int(
 				self.core_engine.ring_stride(module_type)
 			)
 		_mark("export")
-		gathered_handles = [None] * self.world_size
-		dist.all_gather_object(gathered_handles, handles)
-		_mark("handles")
-		peer_segments = {}
-		for module_type in sorted(plan.frame_size):
-			per_member = []
+		peer_fds = {t: [-1] * len(group) for t in types}
+		peer_bytes = {t: [0] * len(group) for t in types}
+		for module_type in types:
+			peer_bytes[module_type][member_index] = own_bytes[module_type]
+		listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+		sock_name = (
+			f"\0{self._query_book_shm_prefix}replica-fd-{self.rank}"
+		)
+		try:
+			listener.bind(sock_name)
+			listener.listen(len(group))
+			dist.barrier()
+			payload = repr(
+				(self.rank, types, [own_bytes[t] for t in types])
+			).encode()
+			senders = []
 			for member_rank in group:
 				if member_rank == self.rank:
-					per_member.append(local_segments[module_type])
-				else:
-					rebuild, args = gathered_handles[member_rank][
-						module_type
-					]
-					per_member.append(rebuild(*args))
-			peer_segments[module_type] = per_member
-		_mark("rebuild")
-		self.core_engine.install_replica_plan(
-			member_index,
-			len(group),
-			layers_per_pass,
-			records_per_frame,
-			owned_per_position,
-			modules,
-			block_tensor,
-			peer_segments,
-			strides,
-		)
+					continue
+				peer = _socket.socket(
+					_socket.AF_UNIX, _socket.SOCK_STREAM
+				)
+				peer.connect(
+					f"\0{self._query_book_shm_prefix}replica-fd-"
+					f"{member_rank}"
+				)
+				_socket.send_fds(
+					peer, [payload], [own_fds[t] for t in types]
+				)
+				senders.append(peer)
+			for _ in range(len(group) - 1):
+				conn, _addr = listener.accept()
+				with conn:
+					data, fds, _flags, _addr2 = _socket.recv_fds(
+						conn, 4096, len(types)
+					)
+					import ast as _ast
+
+					sender_rank, sender_types, sender_bytes = (
+						_ast.literal_eval(data.decode())
+					)
+					if sender_types != types or len(fds) != len(types):
+						raise RuntimeError(
+							f"Rank {self.rank}: replica fd exchange from "
+							f"rank {sender_rank} carried types "
+							f"{sender_types} ({len(fds)} fds), expected "
+							f"{types}"
+						)
+					sender_member = group.index(sender_rank)
+					for module_type, fd, nbytes in zip(
+						types, fds, sender_bytes
+					):
+						peer_fds[module_type][sender_member] = int(fd)
+						peer_bytes[module_type][sender_member] = int(nbytes)
+			# The senders may close only after every receiver imported.
+			dist.barrier()
+			for peer in senders:
+				peer.close()
+		finally:
+			listener.close()
+		_mark("handles")
+		try:
+			self.core_engine.install_replica_plan(
+				member_index,
+				len(group),
+				layers_per_pass,
+				records_per_frame,
+				owned_per_position,
+				modules,
+				block_tensor,
+				peer_fds,
+				peer_bytes,
+				strides,
+			)
+		finally:
+			for module_type in types:
+				os.close(own_fds[module_type])
+				for fd in peer_fds[module_type]:
+					if fd >= 0:
+						os.close(fd)
 		self._replica_plan_installed = True
 		_mark("engine")
 		logging.info(

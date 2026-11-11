@@ -458,8 +458,8 @@ void BatchGen::install_replica_plan(
     const std::vector<std::tuple<std::string, std::string, int64_t, int64_t,
                                  int64_t, int64_t>>& modules,
     torch::Tensor control_block,
-    const std::unordered_map<std::string, std::vector<torch::Tensor>>&
-        peer_segments,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
     const std::unordered_map<std::string, int64_t>& strides) {
     std::vector<HtoD_Engine::ReplicaModuleInstall> installs;
     installs.reserve(modules.size());
@@ -477,7 +477,14 @@ void BatchGen::install_replica_plan(
     this->h2d_engine_.install_replica_plan(
         member_index, group_size, layers_per_pass, records_per_frame,
         owned_per_position, installs, std::move(control_block),
-        peer_segments, strides);
+        peer_fds, peer_bytes, strides);
+}
+
+std::pair<int64_t, int64_t> BatchGen::ring_segment_export_fd(
+    const std::string& module_type) {
+    const auto [fd, bytes] =
+        this->gpu_weight_buffer_.ring_segment_export_fd(module_type);
+    return {static_cast<int64_t>(fd), bytes};
 }
 
 void BatchGen::uninstall_replica_plan() {
