@@ -11064,6 +11064,19 @@ class BatchGenWorker:
 		if plan is None:
 			_decline("installed task does not fit the layer grammar")
 			return
+		# Install-step timing: the install runs once per prefill phase and
+		# spans collectives, shared mappings and peer imports, so each rank
+		# logs where its install time and device memory went.
+		_steps: list = []
+		_last = time.perf_counter()
+
+		def _mark(step: str) -> None:
+			nonlocal _last
+			now = time.perf_counter()
+			free_gib = torch.cuda.mem_get_info(self.local_rank)[0] / (1 << 30)
+			_steps.append((step, now - _last, free_gib))
+			_last = now
+
 		with open("/proc/sys/kernel/random/boot_id") as handle:
 			boot_id = handle.read().strip()
 		record = RankRecord(
@@ -11082,6 +11095,7 @@ class BatchGenWorker:
 		)
 		gathered = [None] * self.world_size
 		dist.all_gather_object(gathered, record)
+		_mark("gather")
 		groups = compute_replica_groups({r.rank: r for r in gathered})
 		group = sorted(groups[self.rank])
 		if len(group) < 2:
@@ -11144,6 +11158,7 @@ class BatchGenWorker:
 		owned_per_position = [
 			count // 1 for count in owned_per_position
 		]
+		_mark("plan")
 		# The control block: one shared node mapping per geometry, reused
 		# across installs of the same shape.
 		key = (len(group), records_per_frame)
@@ -11174,6 +11189,7 @@ class BatchGenWorker:
 				block_tensor, len(group), records_per_frame
 			)
 		dist.barrier()
+		_mark("block")
 		# Ring segments: every member exports each type's single segment.
 		from torch.multiprocessing.reductions import reduce_tensor
 
@@ -11193,8 +11209,10 @@ class BatchGenWorker:
 			strides[module_type] = int(
 				self.core_engine.ring_stride(module_type)
 			)
+		_mark("export")
 		gathered_handles = [None] * self.world_size
 		dist.all_gather_object(gathered_handles, handles)
+		_mark("handles")
 		peer_segments = {}
 		for module_type in sorted(plan.frame_size):
 			per_member = []
@@ -11207,6 +11225,7 @@ class BatchGenWorker:
 					]
 					per_member.append(rebuild(*args))
 			peer_segments[module_type] = per_member
+		_mark("rebuild")
 		self.core_engine.install_replica_plan(
 			member_index,
 			len(group),
@@ -11219,6 +11238,14 @@ class BatchGenWorker:
 			strides,
 		)
 		self._replica_plan_installed = True
+		_mark("engine")
+		logging.info(
+			"[REPLICA] install steps rank=%d: %s",
+			self.rank,
+			" ".join(
+				f"{n}={d:.2f}s/free={f:.1f}G" for n, d, f in _steps
+			),
+		)
 		if self.rank == group[0]:
 			logging.info(
 				"[REPLICA] installed: group=%s member=%d records/frame=%d "
