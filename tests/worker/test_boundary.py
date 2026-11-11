@@ -138,8 +138,8 @@ def test_host_plan_follows_owning_rank_not_assigned_rank():
         )
     )
 
-    # Node 1 is the only planned node: 5 free + the victim's 40 released pages,
-    # against 17 growth + a 22-page safety margin. Node 0 is charged nothing.
+    # Node 1 is the only planned node: 5 free + the victim's 40 released pages
+    # cover the 17 pages of growth exactly. Node 0 is charged nothing.
     assert plan.host_planned_free_pages == {1: 45}
     assert plan.host_evicted_uuids == ["victim"]
     assert plan.host_growth_uuids == ["grow"]
@@ -586,3 +586,118 @@ def test_select_for_loading_checks_slots_before_pages_and_counts_admitted_only()
         per_group_seq_slots=[1, 0],
     )
     assert loads == ["a"]
+
+
+# --------------------------------------------------------------------------
+# No-thrash growth wiring: reclaimable supply, exact cover, cost-aware victims
+# --------------------------------------------------------------------------
+
+
+def _growth_req(state, *, free, total=10_000, reclaimable=None, seq_meta=None):
+    stats = {"node_id": 0, "num_total_pages": total, "num_free_pages": free}
+    if reclaimable is not None:
+        stats["num_reclaimable_pages"] = reclaimable
+    return _req(
+        decode_uuids=list(state), global_seq_state=state,
+        per_rank_free=[100] * 8, world_size=8, enable_host_kv_eviction=True,
+        per_node_host_stats=[stats], seq_meta=seq_meta,
+    )
+
+
+def test_one_page_growth_debt_with_one_free_page_evicts_nothing():
+    # The deleted margin required 1 + int(10000 * 0.05) = 501 free pages.
+    state = {"grow": _state(assigned_rank=0, needs_host_growth=True,
+                            host_growth_pages=1)}
+    state.update({f"b{i}": _state(assigned_rank=0, host_pages_allocated=8)
+                  for i in range(70)})
+    plan = BoundaryHandler.compute_decisions(_growth_req(state, free=1))
+    assert plan.host_evicted_uuids == []
+    assert plan.host_growth_uuids == ["grow"]
+    assert plan.growth_feasible is True
+    assert plan.scheduler_error is None
+
+
+def test_reclaimable_prefix_pages_are_growth_supply():
+    state = {"grow": _state(assigned_rank=0, needs_host_growth=True,
+                            host_growth_pages=40)}
+    state.update({f"b{i}": _state(assigned_rank=0, host_pages_allocated=8)
+                  for i in range(30)})
+    plan = BoundaryHandler.compute_decisions(
+        _growth_req(state, free=0, reclaimable=40)
+    )
+    assert plan.host_evicted_uuids == []
+    assert plan.host_growth_uuids == ["grow"]
+    assert plan.growth_feasible is True
+    # The planned free count is what the growth phase reaches after it
+    # reclaims the retained pages.
+    assert plan.host_planned_free_pages == {0: 40}
+    short = BoundaryHandler.compute_decisions(
+        _growth_req(state, free=0, reclaimable=39)
+    )
+    assert len(short.host_evicted_uuids) == 1
+
+
+def test_one_page_debt_on_full_pool_evicts_one_row_not_a_wave():
+    state = {"grow": _state(assigned_rank=0, needs_host_growth=True,
+                            host_growth_pages=1, host_pages_allocated=8)}
+    state.update({f"b{i:02d}": _state(assigned_rank=0, host_pages_allocated=8)
+                  for i in range(70)})
+    # Equal contexts: the grower closes 8 + 1 pages per token-cost unit and
+    # beats every bystander's 8, so it retires its own debt.
+    plan = BoundaryHandler.compute_decisions(_growth_req(state, free=0))
+    assert plan.host_evicted_uuids == ["grow"]
+    assert plan.host_growth_uuids == []
+    assert plan.scheduler_error is None
+
+
+def test_boundary_victims_are_cost_aware_on_seq_meta_context():
+    # Same owned pages, different recompute cost: the short-context row is
+    # the cheaper victim regardless of decoded_length or global order.
+    state = {
+        "grow": _state(assigned_rank=0, needs_host_growth=True,
+                       host_growth_pages=6, host_pages_allocated=1),
+        "long": _state(assigned_rank=0, host_pages_allocated=8, decoded_length=1),
+        "short": _state(assigned_rank=0, host_pages_allocated=8, decoded_length=900),
+    }
+    seq_meta = {
+        "grow": _meta(0, ctx=50_000),
+        "long": _meta(1, ctx=40_000),
+        "short": _meta(2, ctx=2_000),
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _growth_req(state, free=0, seq_meta=seq_meta)
+    )
+    assert plan.host_evicted_uuids == ["short"]
+    assert plan.host_growth_uuids == ["grow"]
+
+
+def test_boundary_candidate_without_seq_meta_fails_loud():
+    state = {
+        "grow": _state(assigned_rank=0, needs_host_growth=True,
+                       host_growth_pages=6),
+        "ghost": _state(assigned_rank=0, host_pages_allocated=8),
+    }
+    with pytest.raises(RuntimeError, match="ghost has no boundary seq_meta"):
+        BoundaryHandler.compute_decisions(
+            _growth_req(state, free=0, seq_meta={"grow": _meta(0)})
+        )
+
+
+def test_growth_phase_reclaims_before_the_fresh_preflight():
+    """Wiring guard: the worker's boundary is not unit-instantiable."""
+    source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
+    boundary_source = source[source.index("def _page_boundary_fast"):]
+    growth = boundary_source[
+        boundary_source.index("if decisions.growth_feasible and decisions.host_growth_uuids:\n\t\t\thost_grow_requests"):
+    ]
+    reclaim = growth.index(
+        "if self.enable_prefix_cache:\n\t\t\t\tself._reclaim_host_prefix_pages_for_growth("
+    )
+    preflight = growth.index("self._collective_host_kv_growth_capacity_ok(")
+    allocate = growth.index("worker_view.grow_pages_for_sequences(")
+    assert reclaim < preflight < allocate
+    # The planner's stats come from the gather that reports reclaimable pages.
+    gather = source[source.index("def _gather_host_kv_stats_by_node"):]
+    gather = gather[: gather.index("\n\tdef ", 1)]
+    assert "count_releasable_pages(0)" in gather
+    assert "'num_reclaimable_pages'" in gather
