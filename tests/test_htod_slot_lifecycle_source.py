@@ -625,7 +625,7 @@ def test_dead_python_modules_are_deleted():
 def test_inflight_landing_bound_counts_host_leases_only():
     """The make_space bound exists to cap leased host staging; counting
     replica pulls (which hold no lease) against it serialized the per-owner
-    pull streams into a per-layer supply tail (R16 nsys capture)."""
+    pull streams into a per-layer supply tail (seen in an nsys capture)."""
     text = (ROOT / "core/HtoD_Engine/HtoD_Engine.cu").read_text()
     assert "pending_host_landings_ >= kMaxInFlightLandings" in text
     assert "pending_landings_.size() >= kMaxInFlightLandings" not in text

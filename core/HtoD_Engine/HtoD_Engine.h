@@ -253,11 +253,11 @@ class HtoD_Engine {
     // Bounds HOST STAGING only: at most this many modules' host leases are
     // held by in-flight copies (~1.5 GB leased staging at 64; at 8 the
     // producer sat issue-to-completion locked at the ~0.5 ms/record event
-    // cadence, R10 drain accounting). Replica pulls hold no host lease and
+    // cadence per the drain accounting). Replica pulls hold no host lease and
     // are bounded by ring-slot claims, so they do not count: bounding them
     // here limited issue depth to two 32-record owner blocks and serialized
     // the per-owner pull streams into a per-layer supply tail the compute
-    // could not hide (R16 nsys capture).
+    // could not hide (seen in an nsys capture).
     static constexpr size_t kMaxInFlightLandings = 64;
     // Producer-loop section accounting (producer thread writes without a
     // lock; weight_stream_status reads approximately - diagnostics only).
