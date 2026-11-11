@@ -250,9 +250,12 @@ class HtoD_Engine {
         uint32_t role_record_index = 0;
         uint64_t flat = 0;
     };
-    // Bounds host staging the same way the per-tensor sync used to: at most
-    // this many modules' host leases are held by in-flight copies.
-    static constexpr size_t kMaxInFlightLandings = 8;
+    // Bounds host staging the way the per-tensor sync used to: at most this
+    // many modules' host leases are held by in-flight copies. 64 modules is
+    // ~1.5 GB of leased host staging and two routed frames' worth of issue
+    // depth; at 8 the producer sat issue-to-completion locked at the
+    // ~0.5 ms/record event cadence (R10 drain accounting).
+    static constexpr size_t kMaxInFlightLandings = 64;
     // Producer-loop section accounting (producer thread writes without a
     // lock; weight_stream_status reads approximately - diagnostics only).
     // Indices into producer_section_ns_.
