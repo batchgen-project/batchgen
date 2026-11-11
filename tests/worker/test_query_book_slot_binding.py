@@ -25,7 +25,6 @@ from batchgen.worker.sequence_table import SequenceTable
 def _sequence(uuid, token_offset=10):
     seq = SequenceEntry(
         uuid, global_idx=7, prompt_length=4, max_decode_length=8,
-        text=f"text-{uuid}",
     )
     seq.input_ids = torch.tensor(
         [[token_offset + 1, token_offset + 2]], dtype=torch.long
@@ -44,7 +43,6 @@ def test_bind_writes_the_table_and_the_query_book_entry():
 
     assert local_idx == 0
     assert dict(table.uuid_to_local) == {"a": 0}
-    assert query_book[0].text == seq.text
     assert query_book[0].kv_token_budget == seq.kv_token_budget
     assert query_book[0].encoded["input_ids"].data_ptr() == seq.input_ids.data_ptr()
 
@@ -67,7 +65,7 @@ def test_bind_refreshes_a_reused_slot():
     )
 
     assert local_idx == 0, "the freed slot is reused"
-    assert query_book[0].text == fresh.text
+    assert query_book[0].encoded["input_ids"].data_ptr() == fresh.input_ids.data_ptr()
     assert query_book[0].decoded_tokens.data_ptr() == fresh.decoded_tokens.data_ptr()
 
 
