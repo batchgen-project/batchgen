@@ -29,10 +29,15 @@ A prompt that continues a committed trajectory frontier carries a prefix whose
 KV is already on the Host. Its plan contribution is a MATERIALIZED segment:
 the same geometry as a pooled segment, so the prompt's tail reads it through
 the same page table, but no row computes it -- the executor LOADS it. Such a
-prompt takes no part in the in-wave prefix tree (the arbitration of design
-note section 7.2: pooled waves keep recomputing, materialization serves only
-trajectory re-entry), so its chain is exactly its materialized segment and its
-tail starts at the frontier boundary.
+prompt takes no part in the in-wave prefix tree, so its chain is exactly its
+materialized segment and its tail starts at the frontier boundary.
+
+Which hits are materialized is the planner's per-row decision, by saved
+tokens: a hit is kept iff its frontier is at least as long as its best in-wave
+pool chain, and only while the wave still schedules with it (largest frontier
+first). Every hit it does not keep is reported on the plan by name, so the
+caller declines that row's restore at plan time instead of discovering a
+mismatched compute start when it applies the snapshot.
 
 Accounting therefore splits three ways instead of two::
 
@@ -47,17 +52,22 @@ materialized segment computes for nobody, so it saves all of its members.
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 
-class PoolMaterializationDoesNotFit(RuntimeError):
-    """No threshold schedules this wave while its hits are materialized.
-
-    Named so the caller falls back deliberately -- drop the materialized
-    segments and plan the wave as a recompute -- instead of a silent reuse of
-    whichever plan happened to fit.
-    """
+# Why a materialized-prefix hit was NOT planned, per row. The planner never
+# drops a hit silently: every hit it does not keep is reported on the plan
+# (``WavePrefixPlan.declined_materialized``) with one of these names, so the
+# caller can decline that row's restore by name at plan time.
+#
+# The in-wave pool would save more on this row than its frontier does: its
+# deepest shareable chain with the wave's other prompts is LONGER than the
+# frontier boundary, so the row joins the prefix tree instead.
+DECLINED_POOL_CHAIN_LONGER = "in_wave_pool_chain_longer_than_frontier"
+# No threshold schedules the wave with this hit materialized beside the
+# higher-saving hits already kept (the pool cannot hold it).
+DECLINED_DOES_NOT_FIT = "pool_materialization_does_not_fit"
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,10 @@ class WavePrefixPlan:
     chunk_keys: Optional[int] = None
     # Tokens served by materialized segments: loaded once each, never computed.
     materialized_tokens: int = 0
+    # Every materialized-prefix hit the planner was handed and did NOT plan,
+    # as ``(wave index, reason)`` sorted by wave index. A kept hit is a member
+    # of a materialized segment; a hit is exactly one of the two.
+    declined_materialized: tuple[tuple[int, str], ...] = ()
 
     @property
     def saved_tokens(self) -> int:
@@ -607,6 +621,47 @@ def _cap_pooled_segments(
     return frozenset(chosen)
 
 
+def pool_chain_coverage(
+    prompts: Sequence[Sequence[int]],
+    candidates: Sequence[int],
+    *,
+    block_tokens: int,
+) -> dict[int, int]:
+    """Each candidate's best in-wave pool chain, in tokens.
+
+    The deepest prefix a candidate prompt shares, block for block, with any
+    NON-candidate prompt of the wave -- the longest chain the in-wave prefix
+    tree could give it at threshold 2. Both prompts' last tokens stay private,
+    so the chain stops at the shorter one's shareable blocks, exactly as
+    ``_build_tree`` cuts a prompt.
+
+    Candidates are measured against non-candidates only: whether two
+    candidates would pool with each other depends on whether either is
+    materialized, which is the very decision this measure feeds. Pure in the
+    wave's prompts, so every rank of a serve group computes the same figure.
+    """
+
+    block = int(block_tokens)
+    chosen = frozenset(int(index) for index in candidates)
+    others = [index for index in range(len(prompts)) if index not in chosen]
+    shareable = [(len(tokens) - 1) // block for tokens in prompts]
+    coverage: dict[int, int] = {}
+    for index in sorted(chosen):
+        prompt = prompts[index]
+        best = 0
+        for other in others:
+            peer = prompts[other]
+            limit = min(shareable[index], shareable[other])
+            blocks = 0
+            while blocks < limit and tuple(
+                prompt[blocks * block:(blocks + 1) * block]
+            ) == tuple(peer[blocks * block:(blocks + 1) * block]):
+                blocks += 1
+            best = max(best, blocks)
+        coverage[index] = best * block
+    return coverage
+
+
 def plan_wave_prefix_sharing(
     prompts: Sequence[Sequence[int]],
     *,
@@ -631,11 +686,20 @@ def plan_wave_prefix_sharing(
     the schedule fits ``pool_pages``; with nothing pooled every prompt is a
     single tail, which always fits.
 
-    ``materialized`` names the prompts whose prefix is LOADED. They are kept
-    out of the prefix tree and get one materialized segment per distinct
-    frontier. When no threshold schedules the wave with them,
-    ``PoolMaterializationDoesNotFit`` is raised: the caller then plans the
-    same wave without them, which is the recompute fallback.
+    ``materialized`` names the prompts whose prefix CAN be LOADED. Which of
+    them are is decided here, per row, by saved tokens:
+
+    * arbitration -- a hit whose frontier boundary is shorter than its best
+      in-wave pool chain (``pool_chain_coverage``) saves more as a member of
+      the prefix tree, so the pool wins and the hit is declined;
+    * partial fit -- when no threshold schedules the wave with every
+      remaining hit materialized, the hits are re-admitted greedily, largest
+      frontier first (ties by wave index), each kept only if the wave still
+      schedules with it; only the hits that do not fit are declined.
+
+    A kept hit is kept out of the prefix tree and gets one materialized
+    segment per distinct frontier; a declined hit is an ordinary prompt of
+    the tree. Every declined hit is named in ``declined_materialized``.
     """
 
     if block_tokens <= 0 or chunk_tokens <= 0 or pool_pages < 0:
@@ -644,6 +708,7 @@ def plan_wave_prefix_sharing(
         raise ValueError("max_computed_segments must be >= 0 or None")
     if any(len(tokens) == 0 for tokens in prompts):
         raise ValueError("every prompt must be non-empty")
+    # Validates every hit, including the ones arbitration goes on to decline.
     groups = group_materialized_prefixes(
         prompts, materialized, block_tokens=block_tokens
     )
@@ -658,38 +723,68 @@ def plan_wave_prefix_sharing(
             "segment resident in its own chunk (same_chunk_ancestors)"
         )
     lengths = [len(tokens) for tokens in prompts]
-    skip = frozenset(
-        index for _, members in groups for index in members
-    )
-    tree = _build_tree(prompts, block_tokens, skip)
-    # 2 means every shared segment; higher values only where counts exist.
-    for threshold in sorted({2} | {c for c in tree.count if c > 2}):
-        pooled = None
-        if max_computed_segments is not None:
-            eligible = sum(1 for c in tree.count if c >= threshold)
-            if eligible > max_computed_segments:
-                pooled = _cap_pooled_segments(
-                    tree, block_tokens, threshold, max_computed_segments
-                )
-        plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
-                         threshold, same_chunk_ancestors, chunk_keys, groups,
-                         pooled=pooled)
-        if plan is not None:
-            return plan
-    plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, None,
-                     same_chunk_ancestors, chunk_keys, groups)
-    if plan is None:
-        if not groups:
-            raise AssertionError(
-                "a wave with nothing pooled is one tail per prompt and always "
-                "schedules"
-            )
-        raise PoolMaterializationDoesNotFit(
-            f"{len(groups)} materialized segment(s) covering "
-            f"{sum(tokens for tokens, _ in groups)} token(s) do not schedule "
-            f"in {pool_pages} pool page(s)"
+
+    def schedule(hits: Sequence[MaterializedPrefix]) -> Optional[WavePrefixPlan]:
+        """The wave with exactly ``hits`` materialized, or None if it cannot."""
+
+        # Wave-index order numbers the materialized segments, so the plan's
+        # ids do not depend on the order the hits were admitted in.
+        hit_groups = group_materialized_prefixes(
+            prompts,
+            sorted(hits, key=lambda hit: int(hit.index)),
+            block_tokens=block_tokens,
         )
-    return plan
+        skip = frozenset(
+            index for _, members in hit_groups for index in members
+        )
+        tree = _build_tree(prompts, block_tokens, skip)
+        # 2 means every shared segment; higher values only where counts exist.
+        for threshold in sorted({2} | {c for c in tree.count if c > 2}):
+            pooled = None
+            if max_computed_segments is not None:
+                eligible = sum(1 for c in tree.count if c >= threshold)
+                if eligible > max_computed_segments:
+                    pooled = _cap_pooled_segments(
+                        tree, block_tokens, threshold, max_computed_segments
+                    )
+            plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
+                             threshold, same_chunk_ancestors, chunk_keys,
+                             hit_groups, pooled=pooled)
+            if plan is not None:
+                return plan
+        return _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
+                         None, same_chunk_ancestors, chunk_keys, hit_groups)
+
+    declined: list[tuple[int, str]] = []
+    coverage = pool_chain_coverage(
+        prompts, [int(hit.index) for hit in materialized],
+        block_tokens=block_tokens,
+    )
+    kept: list[MaterializedPrefix] = []
+    for hit in materialized:
+        if int(hit.tokens) >= coverage[int(hit.index)]:
+            kept.append(hit)
+        else:
+            declined.append((int(hit.index), DECLINED_POOL_CHAIN_LONGER))
+    plan = schedule(kept)
+    if plan is None:
+        admitted: list[MaterializedPrefix] = []
+        plan = schedule(admitted)
+        for hit in sorted(kept, key=lambda hit: (-int(hit.tokens), int(hit.index))):
+            trial = schedule(admitted + [hit])
+            if trial is None:
+                declined.append((int(hit.index), DECLINED_DOES_NOT_FIT))
+                continue
+            admitted.append(hit)
+            plan = trial
+    if plan is None:
+        raise AssertionError(
+            "a wave with nothing pooled is one tail per prompt and always "
+            "schedules"
+        )
+    if not declined:
+        return plan
+    return replace(plan, declined_materialized=tuple(sorted(declined)))
 
 
 def assign_ranks_for_sharing(
