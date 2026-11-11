@@ -36,6 +36,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
@@ -182,6 +184,34 @@ static bool read_online_nodes(unsigned long* mask_out, int* max_node_out) {
     return mask != 0;
 }
 
+static bool read_node_cpuset(int node, cpu_set_t* set_out) {
+    std::ifstream cpulist("/sys/devices/system/node/node" +
+                          std::to_string(node) + "/cpulist");
+    std::string text;
+    if (!cpulist || !std::getline(cpulist, text)) {
+        return false;
+    }
+    CPU_ZERO(set_out);
+    size_t pos = 0;
+    bool any = false;
+    while (pos < text.size()) {
+        size_t next = text.find(',', pos);
+        std::string part = text.substr(
+            pos, next == std::string::npos ? std::string::npos : next - pos);
+        size_t dash = part.find('-');
+        int lo = std::stoi(part.substr(0, dash));
+        int hi = dash == std::string::npos ? lo
+                                           : std::stoi(part.substr(dash + 1));
+        for (int cpu = lo; cpu <= hi && cpu < CPU_SETSIZE; ++cpu) {
+            CPU_SET(cpu, set_out);
+            any = true;
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return any;
+}
+
 static void interleave_weight_mapping(
     const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
     unsigned long mask = 0;
@@ -251,35 +281,69 @@ bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
         logger->info("Attempting multi-threaded memory initialization...");
         const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
         const int64_t chunk_size = size / num_threads;
-        
+
+        // Weight pages are shared by every GPU on both sockets, so their
+        // placement must not depend on where the scheduler happens to run
+        // the touch threads. Neither the per-VMA mbind nor a thread-level
+        // interleave policy is honored by this kernel's shmem huge-page
+        // allocations (both measured as single-node placements), so the
+        // split is built structurally instead: threads are pinned to a
+        // node's CPUs and fault alternating stripes, and local first-touch
+        // does the rest. A single-node host keeps the historic layout.
+        unsigned long node_mask = 0;
+        int max_node = 0;
+        int nodes = 1;
+        if (read_online_nodes(&node_mask, &max_node) && max_node > 0) {
+            nodes = 0;
+            for (int node = 0; node <= max_node; ++node) {
+                if (node_mask & (1UL << node)) ++nodes;
+            }
+        }
+        const int64_t stripe = 64LL << 20;
+
         std::vector<std::thread> threads;
         std::atomic<int> failed_threads(0);
-        
+
         for (int i = 0; i < num_threads; i++) {
             threads.emplace_back([=, &failed_threads]() {
-                int64_t start_offset = i * chunk_size;
-                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
-                // Weight pages are shared by every GPU on both sockets, so
-                // the faulting thread interleaves its allocations across
-                // the online nodes instead of landing them wherever the
-                // scheduler put it. Thread-level policy: the per-VMA mbind
-                // is not honored on this shmem path (measured 2026-11-11).
-                {
-                    unsigned long node_mask = 0;
-                    int max_node = 0;
-                    if (read_online_nodes(&node_mask, &max_node) &&
-                        max_node > 0) {
-                        syscall(SYS_set_mempolicy, MPOL_INTERLEAVE,
-                                &node_mask,
-                                static_cast<unsigned long>(max_node + 2));
+                const int node = nodes > 1 ? i % nodes : 0;
+                if (nodes > 1) {
+                    cpu_set_t cpus;
+                    if (read_node_cpuset(node, &cpus)) {
+                        pthread_setaffinity_np(pthread_self(), sizeof(cpus),
+                                               &cpus);
                     }
                 }
-                
                 g_in_page_touch = true;
                 if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
-                        p[offset] = 0;
+                    if (nodes > 1) {
+                        // Stripe s belongs to node s % nodes; the node's
+                        // threads split its stripes round-robin.
+                        const int per_node = num_threads / nodes > 0
+                                                 ? num_threads / nodes
+                                                 : 1;
+                        const int lane = (i / nodes) % per_node;
+                        for (int64_t s = 0; s * stripe < size; ++s) {
+                            if (s % nodes != node) continue;
+                            if ((s / nodes) % per_node != lane) continue;
+                            const int64_t start = s * stripe;
+                            const int64_t end =
+                                std::min<int64_t>(start + stripe, size);
+                            for (int64_t offset = start; offset < end;
+                                 offset += page_size) {
+                                p[offset] = 0;
+                            }
+                        }
+                    } else {
+                        const int64_t start_offset = i * chunk_size;
+                        const int64_t end_offset =
+                            (i == num_threads - 1) ? size
+                                                   : start_offset + chunk_size;
+                        for (int64_t offset = start_offset;
+                             offset < end_offset; offset += page_size) {
+                            p[offset] = 0;
+                        }
                     }
                 } else {
                     logger->warn("Thread {} caught signal during page touch", i);
@@ -288,11 +352,11 @@ bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
                 g_in_page_touch = false;
             });
         }
-        
+
         for (auto& t : threads) {
             t.join();
         }
-        
+
         success = (failed_threads == 0);
         if (!success) {
             logger->warn("{} threads failed during initialization", failed_threads.load());
