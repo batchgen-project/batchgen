@@ -480,6 +480,20 @@ py::dict HtoD_Engine::weight_stream_status() {
     }
     result["passes"] = passes;
     result["schedule_lost"] = snapshot.schedule_lost;
+    {
+        // Producer-thread counters, read without a lock: diagnostics only.
+        py::dict producer;
+        static const char* kSectionNames[kSecCount] = {
+            "next", "acquire", "fetch", "claim", "issue", "drain",
+            "pull_gate"};
+        for (size_t index = 0; index < kSecCount; ++index) {
+            producer[kSectionNames[index]] =
+                this->producer_section_ns_[index] / 1e9;
+        }
+        producer["records"] = this->producer_records_;
+        producer["ring_full_spins"] = this->producer_ring_full_;
+        result["producer_seconds"] = producer;
+    }
     return result;
 }
 
@@ -719,6 +733,22 @@ void HtoD_Engine::replica_mark_terminal_(size_t type, uint64_t flat_frame) {
     this->replica_advance_b_(type);
 }
 
+
+namespace {
+struct SectionTimer {
+    explicit SectionTimer(uint64_t& sink)
+        : sink_(sink), start_(std::chrono::steady_clock::now()) {}
+    ~SectionTimer() {
+        sink_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_)
+                .count());
+    }
+    uint64_t& sink_;
+    std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
+
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     while (!terminate_flag_) {
@@ -874,8 +904,10 @@ void HtoD_Engine::HtoD_Worker() {
             }
             // The type's cursor (pass, position) lives in the weight buffer,
             // next to the passes the consumer armed.
-            const auto next =
-                this->gpu_weight_buffer_.next_production(module_type);
+            const auto next = [&] {
+                SectionTimer timer(this->producer_section_ns_[kSecNext]);
+                return this->gpu_weight_buffer_.next_production(module_type);
+            }();
             if (next.kind == WeightProduction::kNone ||
                 next.kind == WeightProduction::kParked) {
                 // Nothing installed (e.g. persistent experts), or the type
@@ -910,6 +942,8 @@ void HtoD_Engine::HtoD_Worker() {
                 next.kind == WeightProduction::kCopy) {
                 ReplicaPlanRuntime& plan = *this->replica_plan_;
                 const size_t type = role->type_index;
+                SectionTimer pull_gate_timer(
+                    this->producer_section_ns_[kSecPullGate]);
                 const uint64_t owner_a = plan.block.passed(
                     static_cast<size_t>(role->owner_member), type,
                     ReplicaControlBlock::Barrier::A);
@@ -960,9 +994,14 @@ void HtoD_Engine::HtoD_Worker() {
                 buffer;
             int64_t buffer_idx = -1;
             if (next.kind == WeightProduction::kCopy) {
-                auto optional_buffer =
-                    this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
+                auto optional_buffer = [&] {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecAcquire]);
+                    return this->gpu_weight_buffer_.acquireEmptyBuffer(
+                        module_type);
+                }();
                 if (!optional_buffer.has_value()) {
+                    ++this->producer_ring_full_;
                     continue;
                 }
                 buffer = optional_buffer->first;
@@ -992,8 +1031,12 @@ void HtoD_Engine::HtoD_Worker() {
                     // Pull the owner's landed slot over NVLink. No host
                     // acquisition and no daemon lease on this path.
                     ReplicaPlanRuntime& plan = *this->replica_plan_;
-                    const auto claim = this->gpu_weight_buffer_.claim_for_copy(
-                        module_type, buffer_idx, module_name);
+                    const auto claim = [&] {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecClaim]);
+                        return this->gpu_weight_buffer_.claim_for_copy(
+                            module_type, buffer_idx, module_name);
+                    }();
                     queue.try_pop(module_name);
                     queue.push(module_name);
                     if (claim == WeightProduction::kSkip) {
@@ -1027,7 +1070,11 @@ void HtoD_Engine::HtoD_Worker() {
                                 buffer_idx * stride;
                     cudaStream_t stream =
                         plan.pull_streams[role->owner_member];
-                    this->drain_landings_(true);
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecDrain]);
+                        this->drain_landings_(true);
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(dst, src,
                                                static_cast<size_t>(stride),
                                                cudaMemcpyDeviceToDevice,
@@ -1043,18 +1090,29 @@ void HtoD_Engine::HtoD_Worker() {
                     landing.role_type_index = role->type_index;
                     landing.role_record_index = role->record_index;
                     landing.flat = flat;
-                    CUDA_CHECK(cudaEventCreate(&landing.event));
-                    CUDA_CHECK(cudaEventRecord(landing.event, stream));
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecIssue]);
+                        CUDA_CHECK(cudaEventCreate(&landing.event));
+                        CUDA_CHECK(cudaEventRecord(landing.event, stream));
+                    }
+                    ++this->producer_records_;
                     this->pending_landings_.push_back(std::move(landing));
-                    this->drain_landings_(false);
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecDrain]);
+                        this->drain_landings_(false);
+                    }
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
                 }
                 this->set_producer_state_(ProducerState::kAcquiring,
                                           module_name, next.pass);
-                auto fetched =
-                    this->weights_storage_.get_module_weights_storage(
+                auto fetched = [&] {
+                    SectionTimer timer(this->producer_section_ns_[kSecFetch]);
+                    return this->weights_storage_.get_module_weights_storage(
                         module_name, &this->terminate_flag_);
+                }();
                 if (!fetched.has_value()) {
                     // Stop requested before the daemon readied the module:
                     // nothing is leased, and the module stays at the head of
@@ -1068,8 +1126,12 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 lease_held = true;
                 const auto src = std::move(*fetched);
-                const auto claim = this->gpu_weight_buffer_.claim_for_copy(
-                    module_type, buffer_idx, module_name);
+                const auto claim = [&] {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecClaim]);
+                    return this->gpu_weight_buffer_.claim_for_copy(
+                        module_type, buffer_idx, module_name);
+                }();
                 // Only this thread pops: the head is still module_name. It
                 // goes back to the tail, so the next pass reads the list in
                 // the same order.
@@ -1106,7 +1168,11 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 this->set_producer_state_(ProducerState::kCopying, module_name,
                                           next.pass);
-                this->drain_landings_(true);
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecDrain]);
+                    this->drain_landings_(true);
+                }
                 PendingLanding landing;
                 landing.module_type = module_type;
                 landing.module_name = module_name;
@@ -1187,8 +1253,14 @@ void HtoD_Engine::HtoD_Worker() {
                 // The landing releases the host lease once the module's
                 // copies complete; the bounded in-flight queue caps how many
                 // leases copies can hold at once.
-                CUDA_CHECK(cudaEventCreate(&landing.event));
-                CUDA_CHECK(cudaEventRecord(landing.event, this->HtoD_stream));
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecIssue]);
+                    CUDA_CHECK(cudaEventCreate(&landing.event));
+                    CUDA_CHECK(cudaEventRecord(landing.event,
+                                               this->HtoD_stream));
+                }
+                ++this->producer_records_;
                 lease_held = false;
                 this->pending_landings_.push_back(std::move(landing));
                 {
@@ -1198,7 +1270,11 @@ void HtoD_Engine::HtoD_Worker() {
                         this->weight_profile_modules_[module_type] += 1;
                     }
                 }
-                this->drain_landings_(false);
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecDrain]);
+                    this->drain_landings_(false);
+                }
                 this->set_producer_state_(ProducerState::kIdle, "");
             } catch (const std::exception& error) {
                 // Never rethrow: an exception leaving this thread is

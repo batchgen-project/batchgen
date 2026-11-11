@@ -11031,7 +11031,10 @@ class BatchGenWorker:
 			for module_type, entry in status.get("by_type", {}).items()
 		}
 		logging.info(
-			"[REPLICA] uninstall rank=%d counters=%s", self.rank, by_type
+			"[REPLICA] uninstall rank=%d counters=%s producer_seconds=%s",
+			self.rank,
+			by_type,
+			status.get("producer_seconds"),
 		)
 		dist.barrier()
 		self.core_engine.uninstall_replica_plan()

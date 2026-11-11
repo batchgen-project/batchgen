@@ -253,6 +253,22 @@ class HtoD_Engine {
     // Bounds host staging the same way the per-tensor sync used to: at most
     // this many modules' host leases are held by in-flight copies.
     static constexpr size_t kMaxInFlightLandings = 8;
+    // Producer-loop section accounting (producer thread writes without a
+    // lock; weight_stream_status reads approximately - diagnostics only).
+    // Indices into producer_section_ns_.
+    enum ProducerSection : size_t {
+        kSecNext = 0,      // next_production cursor read
+        kSecAcquire,       // acquireEmptyBuffer (successful)
+        kSecFetch,         // host storage fetch
+        kSecClaim,         // claim_for_copy
+        kSecIssue,         // tensor copy issue + event ops
+        kSecDrain,         // drain_landings_ calls in the record path
+        kSecPullGate,      // replica barrier-A poll iterations
+        kSecCount
+    };
+    uint64_t producer_section_ns_[kSecCount] = {0};
+    uint64_t producer_records_ = 0;
+    uint64_t producer_ring_full_ = 0;  // acquireEmptyBuffer returned none
     std::deque<PendingLanding> pending_landings_;
     void complete_landing_(PendingLanding& landing);
     // Complete finished landings (front first; completion keeps issue
