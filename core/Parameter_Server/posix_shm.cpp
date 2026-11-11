@@ -234,8 +234,11 @@ static void interleave_weight_mapping(
 
 static void log_weight_numa_composition(
     const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
-    // Sample one page per GiB; per-leg evidence of the placement draw.
-    const int64_t step = 1LL << 30;
+    // Sample with a prime stride: a power-of-two stride aliases against
+    // the touch threads' power-of-two stripes and reads one node only
+    // (measured: numastat showed thetrue split while the aligned sample
+    // claimed 100% on one node). Per-leg evidence of the placement.
+    const int64_t step = 97LL << 20;
     const int count = static_cast<int>(
         std::min<int64_t>(1024, (len + step - 1) / step));
     if (count <= 0) return;
