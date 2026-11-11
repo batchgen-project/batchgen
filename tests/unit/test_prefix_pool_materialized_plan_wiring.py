@@ -889,3 +889,102 @@ def test_the_plan_keeps_the_hit_whose_frontier_covers_its_pool_chain(monkeypatch
     state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.trajectory_restore_boundary == BOUNDARY
     assert worker._trajectory_restorer.declines == []
+
+
+# --------------------------------------------------------------------------- #
+#  7. A planned row never reaches the forward without its restored state
+# --------------------------------------------------------------------------- #
+#
+# The plan built the wave around the row's start at the boundary, so the seam
+# fails loud whenever it cannot hand that row its state: a refusal inside the
+# restore propagates, and a planned row with nothing to restore it from (no
+# live attachment on the registry rank, no mirrored decision on a follower)
+# is raised by name before any forward is launched.
+
+
+def test_a_planned_rows_restore_failure_propagates_out_of_the_seam(monkeypatch):
+    from batchgen.prefix_reuse.trajectory_restore import (
+        DECLINE_SLOTS_EXHAUSTED,
+        TrajectoryPlannedRestoreFailed,
+    )
+
+    worker, _, wave, _ = _materialized_wave(monkeypatch)
+    assert wave is not None and wave.materialized == frozenset({0})
+    restorer = worker._trajectory_restorer
+
+    def _exhausted(attachment, *, serving_group_id, compute_cached_tokens):
+        restorer._consume(attachment)
+        raise TrajectoryPlannedRestoreFailed(
+            reason=DECLINE_SLOTS_EXHAUSTED,
+            detail="no free KDA state slot",
+            rank=0,
+            sequence_id=attachment.sequence_id,
+            session_key=attachment.session_key,
+            boundary_tokens=attachment.boundary_tokens,
+        )
+
+    restorer.restore = _exhausted
+    with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
+        worker._restore_trajectory_frontiers([0, 1, 2])
+    assert excinfo.value.reason == DECLINE_SLOTS_EXHAUSTED
+    assert excinfo.value.sequence_id == GLOBAL_IDS[0]
+    assert worker._trajectory_attachments == {}
+
+
+def test_a_planned_row_whose_attachment_is_gone_is_raised_by_name(monkeypatch):
+    from batchgen.prefix_reuse.trajectory_restore import (
+        FAIL_NO_RESTORE_SOURCE,
+        TrajectoryPlannedRestoreFailed,
+    )
+
+    worker, _, wave, _ = _materialized_wave(monkeypatch)
+    assert wave is not None and wave.materialized == frozenset({0})
+    worker._trajectory_attachments.pop(GLOBAL_IDS[0])
+    with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
+        worker._restore_trajectory_frontiers([0, 1, 2])
+    assert excinfo.value.reason == FAIL_NO_RESTORE_SOURCE
+    assert excinfo.value.sequence_id == GLOBAL_IDS[0]
+    assert excinfo.value.boundary_tokens == BOUNDARY
+    assert worker._trajectory_restorer.restores == []
+
+
+def test_a_follower_planned_row_without_a_mirrored_decision_is_raised(monkeypatch):
+    """The leader's payload skipping a planned row must not go unnoticed."""
+
+    from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+    from batchgen.prefix_reuse.trajectory_restore import (
+        FAIL_NO_RESTORE_SOURCE,
+        TrajectoryPlannedRestoreFailed,
+    )
+
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    # A follower: no attachment of its own, the leader's plan in its state.
+    worker, _ = _worker(
+        rank=1,
+        owns_host_kv=False,
+        states={
+            GLOBAL_IDS[0]: PrefixCacheSequenceState(
+                lookup_result=None,
+                attached_tokens=BOUNDARY,
+                compute_cached_tokens=BOUNDARY,
+                trajectory_restore_boundary=BOUNDARY,
+            ),
+        },
+    )
+    assert worker._trajectory_attachments == {}
+    assert worker._trajectory_mirrored_restores == {}
+    with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
+        worker._restore_trajectory_frontiers([0, 1, 2])
+    assert excinfo.value.reason == FAIL_NO_RESTORE_SOURCE
+    assert excinfo.value.rank == 1
+    assert excinfo.value.sequence_id == GLOBAL_IDS[0]
+
+
+def test_unplanned_rows_with_no_source_pass_the_seam(monkeypatch):
+    """The plan-time decline path: nothing planned, nothing to restore."""
+
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker, _ = _worker(states=_hit_states())
+    worker._restore_trajectory_frontiers([0, 1, 2])
+    assert worker._trajectory_restorer.restores == []
+    assert worker._trajectory_restorer.declines == []

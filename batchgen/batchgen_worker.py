@@ -15530,23 +15530,70 @@ class BatchGenWorker:
 		write is a ``copy_`` from pageable host memory on the current stream,
 		so the restored bytes are in the slot before the forward reads it.
 
-		Empty whenever the flag is off -- nothing is attached, so this is a
-		dict lookup and a return.
+		Empty whenever the flag is off -- nothing is attached and no row is
+		planned to restore, so this is one state lookup per row and a return.
 
 		Executes the wave plan's decision, it does not take one: every
 		attachment still live here belongs to a row the plan materialized
 		(``trajectory_restore_boundary``), because the plan declined all the
 		others. One that is not is a broken invariant and is raised, after
 		its reference is consumed.
+
+		The converse is raised too. A planned row's compute starts at the
+		boundary and the wave is already built around that start, so a
+		planned row must reach the forward with its restored state: one with
+		no source to restore from (no live attachment on the rank holding the
+		registry, no mirrored leader decision on a follower) fails here as
+		``TrajectoryPlannedRestoreFailed``, and every refusal inside the
+		restore of a planned row fails loud the same way.
 		"""
+		from batchgen.prefix_reuse.trajectory_restore import (
+			DECLINE_NOT_PLANNED,
+			FAIL_NO_RESTORE_SOURCE,
+			TrajectoryPlannedRestoreFailed,
+		)
+
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			global_id = int(seq.global_idx)
+			state = self._prefix_sequence_states.get(global_id)
+			planned = 0 if state is None else int(state.trajectory_restore_boundary)
+			if (
+				planned
+				and global_id not in self._trajectory_attachments
+				and global_id not in self._trajectory_mirrored_restores
+			):
+				raise TrajectoryPlannedRestoreFailed(
+					reason=FAIL_NO_RESTORE_SOURCE,
+					detail=(
+						"the wave plan restores this row but the restore seam "
+						"holds neither its live attachment nor a mirrored "
+						"leader decision for it"
+					),
+					rank=self.rank,
+					sequence_id=global_id,
+					session_key="unknown",
+					boundary_tokens=planned,
+				)
 		if self._trajectory_mirrored_restores:
 			self._restore_mirrored_trajectory_shards(local_indices)
 		if not self._trajectory_attachments:
 			return
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
-			return
-		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+			raise RuntimeError(
+				f"Rank {self.rank}: {len(self._trajectory_attachments)} live "
+				"trajectory attachment(s) reached the restore seam but this "
+				"rank has no restorer; their planned rows would run without "
+				"their restored state"
+			)
 
 		for local_idx in local_indices:
 			uuid = self._local_to_uuid_map.get(local_idx)
