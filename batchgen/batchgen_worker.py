@@ -9386,6 +9386,26 @@ class BatchGenWorker:
 				f"completed at prefill (decode budget satisfied by the first "
 				f"sampled token); they skip the decode phase"
 			)
+			if getattr(self, "_replica_plan_installed", False):
+				# Cumulative over the phase; per-wave deltas come from
+				# consecutive lines. The uninstall log never fires on
+				# prefill-only workloads, so this is the only readout.
+				status = self.core_engine.weight_stream_status()
+				logging.info(
+					"[REPLICA] wave status rank=%d producer_seconds=%s "
+					"counters=%s",
+					self.rank,
+					status.get("producer_seconds"),
+					{
+						module_type: {
+							"copied": entry.get("copied", 0),
+							"replica_pulled": entry.get("replica_pulled", 0),
+						}
+						for module_type, entry in status.get(
+							"by_type", {}
+						).items()
+					},
+				)
 
 		# Same order as the decode-phase completion handling in generate():
 		# gather text -> release KV -> scalar cleanup -> status -> report.
