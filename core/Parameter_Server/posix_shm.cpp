@@ -260,6 +260,21 @@ bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
                 int64_t start_offset = i * chunk_size;
                 int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
+                // Weight pages are shared by every GPU on both sockets, so
+                // the faulting thread interleaves its allocations across
+                // the online nodes instead of landing them wherever the
+                // scheduler put it. Thread-level policy: the per-VMA mbind
+                // is not honored on this shmem path (measured 2026-11-11).
+                {
+                    unsigned long node_mask = 0;
+                    int max_node = 0;
+                    if (read_online_nodes(&node_mask, &max_node) &&
+                        max_node > 0) {
+                        syscall(SYS_set_mempolicy, MPOL_INTERLEAVE,
+                                &node_mask,
+                                static_cast<unsigned long>(max_node + 2));
+                    }
+                }
                 
                 g_in_page_touch = true;
                 if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
