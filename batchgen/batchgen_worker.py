@@ -250,6 +250,7 @@ from batchgen.worker.prefill import (
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.startup_phases import NULL_STARTUP_PHASE_REPORTER
+from batchgen.worker import startup_transient as _startup_transient
 from batchgen.worker.boundary import (
 	BoundaryDecisionRequest,
 	BoundaryHandler,
@@ -1625,6 +1626,10 @@ class BatchGenWorker:
 		# cached; every later pool (re)creation reuses the cached value.
 		self._gpu_kv_cached_pool_gb: Optional[float] = None
 		self._gpu_kv_sizing_provisional: bool = False
+		# Deployment-wide startup decode transient, one dict per flavor, set
+		# by _probe_startup_transient before readiness and published with the
+		# deployment capacity. Report-only: nothing sizes from it.
+		self.startup_transient: Optional[List[dict]] = None
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -10087,8 +10092,10 @@ class BatchGenWorker:
 		"""Resolve and verify L against decode residency before worker readiness.
 
 		The measured provisional budget is retained for every model and mode;
-		it reserves the configured fraction's slack for later allocations. A
-		measured per-cap eager transient reservation is a separate requirement.
+		it reserves the configured fraction's slack for later allocations.
+		Both lifecycles probe the startup decode transient at the per-rank cap
+		right after the pool is sized (``_probe_startup_transient``); it is
+		published, not yet reserved.
 		"""
 		with self._startup_phase("model-build"):
 			if not self._core_initialized:
@@ -10103,6 +10110,11 @@ class BatchGenWorker:
 				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
 				self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
 				self._init_gpu_kv_with_actual_size()
+				# This lifecycle captures no decode graph at startup; any
+				# capture happens at the first decode configure.
+				self._probe_startup_transient(
+					seam=_startup_transient.SEAM_DEPLOYMENT_PREPARE, capture=None
+				)
 				self._transition_phase(prefill_key)
 				self.set_phase("prefill")
 				self._install_prefill_weight_copy_pipeline(False)
@@ -12095,11 +12107,19 @@ class BatchGenWorker:
 		self._decode_padding_bsz = self._max_decode_rank_bsz()
 		self._init_gpu_kv_with_actual_size()
 		capture = self._glm5_whole_model_graph_requested_for_current_batch()
-		if capture:
+
+		def capture_decode_graphs() -> None:
 			self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
 			self._current_decode_max_rank_batch_size = 1
 			self._bind_decode_attention_metadata_for_graph_config([])
 			self._warmup_cuda_graphs()
+
+		# The probe runs the capture exactly once whether or not it can
+		# measure it, so capture behavior is unchanged by the probe.
+		self._probe_startup_transient(
+			seam=_startup_transient.SEAM_PERSISTENT_BUILD,
+			capture=capture_decode_graphs if capture else None,
+		)
 		self._transition_phase(prefill_key)
 		self.set_phase("prefill")
 		self._install_prefill_weight_copy_pipeline(False)
@@ -12109,6 +12129,83 @@ class BatchGenWorker:
 			time.perf_counter() - start,
 			capture,
 		)
+
+	def _probe_startup_transient(
+		self, *, seam: str, capture: Optional[Callable[[], None]]
+	) -> None:
+		"""Measure the startup decode transient at the per-rank cap; publish it.
+
+		Runs at the startup decode configure on every rank: after
+		``configure_decoding`` at the cap and after the GPU KV pool is sized,
+		while decode is the live phase, before readiness. Collective when CUDA
+		and torch.distributed are up (one ``all_gather_object``).
+
+		Flavors:
+		- eager: the cap-sized synthetic decode step the parallel strategy
+		  manager provides as ``startup_decode_probe_step(padding_bsz)``. The
+		  eager decode step is otherwise inline in the decode loop and needs
+		  admitted rows, so a manager without the hook is reported, by name,
+		  as unavailable rather than approximated.
+		- capture: ``capture`` is the decode graph capture this lifecycle
+		  performs at startup (None when it captures none). It is invoked
+		  exactly once, measured or not.
+
+		Report-only: the result is logged and stored in
+		``self.startup_transient`` for the deployment-capacity publication;
+		nothing reads it for sizing.
+		"""
+		padding_bsz = getattr(self, "_decode_padding_bsz", None)
+		if getattr(self, "_phase", None) != "decode" or not padding_bsz:
+			raise RuntimeError(
+				f"Rank {self.rank}: startup transient probe requires the decode "
+				f"phase configured at its padding; phase={getattr(self, '_phase', None)!r} "
+				f"padding_bsz={padding_bsz!r}"
+			)
+		transient = _startup_transient
+		cuda = torch.cuda if torch.cuda.is_available() else None
+		pm = self.parallel_manager
+		step = getattr(pm, "startup_decode_probe_step", None)
+		if cuda is None:
+			eager = transient.StartupTransient.missing(
+				transient.FLAVOR_EAGER, seam, padding_bsz, "CUDA is unavailable"
+			)
+		elif step is None:
+			eager = transient.StartupTransient.missing(
+				transient.FLAVOR_EAGER, seam, padding_bsz,
+				f"{type(pm).__name__} provides no cap-sized synthetic decode step",
+			)
+		else:
+			eager = transient.measure_eager(
+				lambda: step(padding_bsz),
+				cuda=cuda, device=self.local_rank, seam=seam, padding_bsz=padding_bsz,
+			)
+		if capture is None:
+			captured = transient.StartupTransient.missing(
+				transient.FLAVOR_CAPTURE, seam, padding_bsz,
+				"this lifecycle captures no decode graph at startup",
+			)
+		elif cuda is None:
+			capture()
+			captured = transient.StartupTransient.missing(
+				transient.FLAVOR_CAPTURE, seam, padding_bsz, "CUDA is unavailable"
+			)
+		else:
+			captured = transient.measure_capture(
+				capture, cuda=cuda, device=self.local_rank, seam=seam,
+				padding_bsz=padding_bsz,
+			)
+		local = [eager, captured]
+		transient.log_ledger_line(f"rank={self.rank}", local)
+		if cuda is not None and dist.is_initialized():
+			gathered = [None] * self.world_size
+			dist.all_gather_object(gathered, local)
+			deployment = transient.reduce_across_ranks(gathered)
+		else:
+			deployment = local
+		if self.rank == 0:
+			transient.log_ledger_line("deployment", deployment)
+		self.startup_transient = [item.as_dict() for item in deployment]
+
 	def _mark_phase_end(self, phase: str) -> None:
 		# [phase, running since (None while idle), busy seconds so far]
 		self._phase_end = [phase, time.perf_counter(), 0.0]

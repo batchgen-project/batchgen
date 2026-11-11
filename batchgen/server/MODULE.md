@@ -47,3 +47,13 @@ a startup forward protocol at the per-rank cap for every model, including lazy
 graph capture and allocations outside the tensor allocator. Until then, the
 startup check proves the KV length contract against the measured pool budget;
 it is not a measurement of every later eager allocation.
+
+The same publication carries `startup_transient`: per flavor (`eager`,
+`capture`), the maximum over ranks of the device memory the startup decode
+configure costs above steady state, measured right after the pool is sized
+(`batchgen/worker/startup_transient.py`). The scheduler requires it with
+`max_model_len`, and `/v1/models` reports it. It is report-only: the pool
+budget does not deduct it. A flavor the deployment cannot measure is published
+with an `unavailable` reason instead of a value: eager needs a model-provided
+cap-sized synthetic decode step, and capture is measured only where the
+lifecycle captures at startup.

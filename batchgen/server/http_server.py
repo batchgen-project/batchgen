@@ -90,12 +90,15 @@ def coordinator_only_rejection(
 
 
 def published_model_object(request: Request) -> ModelObject:
-    """Model metadata with the current worker generation's verified limit."""
-    length = request.app.state.scheduler.max_model_len
+    """Model metadata with the current worker generation's verified limit
+    and its report-only startup decode transient."""
+    scheduler = request.app.state.scheduler
+    length = scheduler.max_model_len
     if length is None:
         raise HTTPException(status_code=503, detail="deployment capacity is not ready")
     return request.app.state.model_object.model_copy(update={
         "max_model_len": length, "max_context_length": length,
+        "startup_transient": scheduler.startup_transient,
     })
 
 

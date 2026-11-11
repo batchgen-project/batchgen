@@ -861,10 +861,13 @@ def _server_worker_main_impl(
 	worker.prepare_deployment()
 	# Every node's scheduler receives its local rank-zero worker's resolved
 	# length, including after restart. Publish before the readiness signal.
+	# The startup decode transient rides the same publication; it is already
+	# reduced over every rank, and is report-only.
 	if args.local_rank == 0:
 		response_queue.put({
 			"type": "deployment_capacity",
 			"max_model_len": worker.model_context_length,
+			"startup_transient": worker.startup_transient,
 		})
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister

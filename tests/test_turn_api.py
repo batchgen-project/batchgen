@@ -114,7 +114,14 @@ class _FakeWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
-        self.response_queue.put({"type": "deployment_capacity", "max_model_len": CONTEXT})
+        self.response_queue.put({
+            "type": "deployment_capacity",
+            "max_model_len": CONTEXT,
+            "startup_transient": [{
+                "flavor": "eager", "seam": "startup-deployment-prepare",
+                "padding_bsz": 1, "unavailable": "CUDA is unavailable",
+            }],
+        })
         self.response_queue.put({
             "type": "trajectory_pool_capacity",
             "capacity_semantics_version": 1,

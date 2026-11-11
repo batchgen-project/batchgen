@@ -440,6 +440,23 @@ def _normalize_result_value(value: Any) -> Any:
 # ======================== Model Metadata ========================
 
 
+class StartupTransientObject(BaseModel):
+    """One flavor of the startup decode transient, maximum over ranks.
+
+    Measured at the startup decode configure at the per-rank cap. Report-only:
+    the pool budget does not deduct it. GiB fields are null exactly when
+    ``unavailable`` names why the flavor was not measured.
+    """
+
+    flavor: Literal["eager", "capture"]
+    seam: str
+    padding_bsz: int
+    allocator_gib: Optional[float] = None
+    external_gib: Optional[float] = None
+    deterministic: Optional[bool] = None
+    unavailable: Optional[str] = None
+
+
 class ModelObject(BaseModel):
     """OpenAI-compatible model object with BatchGen extensions."""
 
@@ -452,6 +469,10 @@ class ModelObject(BaseModel):
     )
     max_model_len: Optional[int] = Field(
         default=None, description="Verified deployment prompt + completion limit"
+    )
+    startup_transient: Optional[List[StartupTransientObject]] = Field(
+        default=None,
+        description="Measured startup decode transient per flavor (report-only)",
     )
 
 
