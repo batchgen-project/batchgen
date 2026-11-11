@@ -159,3 +159,31 @@ def test_worker_declines_rather_than_crashes_non_participants():
     ):
         assert reason in body, reason
     assert "raise RuntimeError" not in body.split("ring capacity")[1][:400]
+
+
+def test_produce_only_pass_alignment_is_wired():
+    """Slice 2b: a rank short of the group's pass count pads with
+    produce-only passes — it publishes its owned records, declines its
+    pulls, and never strands peers on barrier A (the BCT deadlock)."""
+    table = (ROOT / "core/GPU_Weight_Buffer/weight_slot_table.h").read_text()
+    assert "void mark_produce_only(int64_t pass)" in table
+    assert "void decline_produce_only" in table
+    assert "produce_only_passes_.erase(pass)" in table
+    assert "produce_only_passes_.clear()" in table
+
+    buffer = (ROOT / "core/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp").read_text()
+    assert "begin_pass(bool produce_only)" in buffer
+    assert "release_unconsumed" in buffer
+    # Pass-end drain honors the peer gate instead of force-reclaiming slots
+    # a slower member may still be reading.
+    assert "drainPendingReleasesGatedLocked(lock)" in buffer
+
+    engine = (ROOT / "core/HtoD_Engine/HtoD_Engine.cu").read_text()
+    assert "pass_produce_only(next.pass)" in engine
+    assert "decline_produce_only" in engine
+    assert "release_unconsumed" in engine
+
+    worker = WORKER.read_text()
+    assert 'replica = getattr(self, "_replica_plan_installed", False)' in worker
+    assert "produce_only=replica_padding" in worker
+    assert "cannot" in worker and "_carried_produce_only" in worker

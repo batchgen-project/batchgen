@@ -199,6 +199,14 @@ void HtoD_Engine::complete_landing_(PendingLanding& landing) {
                                 static_cast<uint64_t>(landing.buffer_idx));
         this->replica_mark_owned_landed_(landing.role_type_index,
                                          landing.flat);
+        if (this->gpu_weight_buffer_.pass_produce_only(landing.pass)) {
+            // Produce-only pass: no consumer will lease this record. The
+            // slot leaves PRESENT now; its reclaim stays gated on every
+            // peer passing barrier B of the frame, so peers read it for as
+            // long as they need it.
+            this->gpu_weight_buffer_.release_unconsumed(
+                landing.module_name, static_cast<int64_t>(landing.flat));
+        }
     }
     if (landing.has_role) {
         this->replica_mark_terminal_(landing.role_type_index, landing.flat);
@@ -1036,6 +1044,23 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 if (role != nullptr &&
                     role->kind ==
+                        static_cast<uint8_t>(WeightRecordKind::Replica) &&
+                    this->gpu_weight_buffer_.pass_produce_only(next.pass)) {
+                    // Produce-only pass: this rank runs no forward, so it
+                    // never pulls. The record is counted at barrier B and
+                    // the reserved slot goes back untouched.
+                    this->gpu_weight_buffer_.abandon(module_type, buffer_idx);
+                    queue.try_pop(module_name);
+                    queue.push(module_name);
+                    this->gpu_weight_buffer_.decline_produce_only(
+                        module_type, module_name);
+                    this->count_module_(this->skipped_modules_, module_type);
+                    this->replica_mark_terminal_(role->type_index, flat);
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                    continue;
+                }
+                if (role != nullptr &&
+                    role->kind ==
                         static_cast<uint8_t>(WeightRecordKind::Replica)) {
                     // Pull the owner's landed slot over NVLink. No host
                     // acquisition and no daemon lease on this path.
@@ -1094,6 +1119,7 @@ void HtoD_Engine::HtoD_Worker() {
                     landing.buffer_idx = buffer_idx;
                     landing.bytes = static_cast<uint64_t>(stride);
                     landing.replica_pull = true;
+                    landing.pass = next.pass;
                     landing.has_role = true;
                     landing.role_kind = role->kind;
                     landing.role_type_index = role->type_index;
@@ -1187,6 +1213,7 @@ void HtoD_Engine::HtoD_Worker() {
                 landing.module_name = module_name;
                 landing.buffer_idx = buffer_idx;
                 landing.host_lease = true;
+                landing.pass = next.pass;
                 if (role != nullptr) {
                     landing.has_role = true;
                     landing.role_kind = role->kind;

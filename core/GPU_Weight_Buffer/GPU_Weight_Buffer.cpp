@@ -442,9 +442,36 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     return this->buffers_.at(slot.module_type).at(slot.index);
 }
 
-int64_t GPU_Weight_Buffer::begin_pass() {
+int64_t GPU_Weight_Buffer::begin_pass(bool produce_only) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->slots_.begin_pass();
+    const int64_t pass = this->slots_.begin_pass();
+    if (produce_only && pass != 0) {
+        this->slots_.mark_produce_only(pass);
+    }
+    return pass;
+}
+
+bool GPU_Weight_Buffer::pass_produce_only(int64_t pass) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->slots_.produce_only(pass);
+}
+
+void GPU_Weight_Buffer::decline_produce_only(const std::string& module_type,
+                                             const std::string& module_name) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.decline_produce_only(module_type, module_name);
+    this->bumpProgressLocked();
+}
+
+void GPU_Weight_Buffer::release_unconsumed(const std::string& module_name,
+                                           int64_t frame) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const auto ref = this->slots_.release_unconsumed(module_name, frame);
+    // No consumer event: the entry is immediately reclaimable once every
+    // peer has passed barrier B of the record's frame.
+    this->pending_releases_.push_back(PendingRelease{
+        nullptr, {{ref.module_type, ref.index}}});
+    this->cv_.notify_all();
 }
 
 GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::cancel_pass(int64_t pass) {
@@ -474,8 +501,61 @@ void GPU_Weight_Buffer::wait_pass_drained(int64_t pass) {
                    this->slots_.count_in_pass(pass,
                                               WeightSlotState::kFilling) == 0;
         });
-    // A forward boundary: waiting for the consumer's release events is fine.
-    this->drainPendingReleasesLocked();
+    // A forward boundary: waiting for the consumer's release events is
+    // fine, and a peer-gated release is reclaimed only once every member
+    // has passed barrier B of its frame -- reclaiming earlier would let the
+    // next pass overwrite a slot a slower peer is still reading.
+    this->drainPendingReleasesGatedLocked(lock);
+}
+
+void GPU_Weight_Buffer::drainPendingReleasesGatedLocked(
+    std::unique_lock<std::mutex>& lock) {
+    const auto deadline = std::chrono::steady_clock::now() + kStallTimeout;
+    for (;;) {
+        for (auto it = this->pending_releases_.begin();
+             it != this->pending_releases_.end();) {
+            if (it->event != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(it->event));
+                CUDA_CHECK(cudaEventDestroy(it->event));
+                it->event = nullptr;
+            }
+            static const std::function<bool(const std::string&, int64_t)>
+                kUngated = [](const std::string&, int64_t) { return true; };
+            std::vector<std::pair<std::string, int64_t>> still_gated;
+            for (const auto& [module_type, buffer_idx] : it->slots) {
+                if (!this->slots_.reclaim(module_type, buffer_idx,
+                                          this->peer_release_gate_
+                                              ? this->peer_release_gate_
+                                              : kUngated)) {
+                    still_gated.emplace_back(module_type, buffer_idx);
+                }
+            }
+            if (still_gated.empty()) {
+                it = this->pending_releases_.erase(it);
+            } else {
+                it->slots = std::move(still_gated);
+                ++it;
+            }
+        }
+        if (this->pending_releases_.empty()) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream held;
+            for (const auto& pending : this->pending_releases_) {
+                for (const auto& [module_type, buffer_idx] : pending.slots) {
+                    held << " " << module_type << "[" << buffer_idx << "]";
+                }
+            }
+            throw std::runtime_error(
+                "peer-gated weight releases did not clear within the stall "
+                "timeout; a group member is not passing barrier B. Gated:" +
+                held.str());
+        }
+        // Gate progress comes from peers writing the shared control block,
+        // which never notifies this condition variable: poll.
+        this->cv_.wait_for(lock, std::chrono::milliseconds(50));
+    }
 }
 
 WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(int64_t pass) {

@@ -111,7 +111,7 @@ def test_failure_is_visible_to_waiters_and_cleared_by_a_queue_install():
     get_weights = _section(
         buffer,
         "module_weight_tensor_map GPU_Weight_Buffer::get_weights(",
-        "int64_t GPU_Weight_Buffer::begin_pass()",
+        "int64_t GPU_Weight_Buffer::begin_pass(bool produce_only)",
     )
     assert "this->waitWithoutStallLocked(lock, module_name," in get_weights
     assert "this->slots_.lease(module_name)" in get_weights
@@ -499,7 +499,7 @@ def test_bindings_expose_passes_skip_and_status():
     binding = BINDING.read_text()
     assert '.def("skip_weight_modules", &BatchGen::skip_weight_modules,' in binding
     assert '.def("weight_stream_status", &BatchGen::weight_stream_status)' in binding
-    assert '.def("begin_weight_pass", &BatchGen::begin_weight_pass)' in binding
+    assert '.def("begin_weight_pass", &BatchGen::begin_weight_pass,' in binding
     assert '.def("end_weight_pass", &BatchGen::end_weight_pass,\n             py::arg("pass_id"))' in binding
     assert '.def("cancel_weight_pass", &BatchGen::cancel_weight_pass,\n             py::arg("pass_id"))' in binding
 

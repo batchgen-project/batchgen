@@ -116,6 +116,8 @@ def test_pass_end_drains_and_reclaims_every_pending_release():
         source.index("void GPU_Weight_Buffer::wait_pass_drained(int64_t pass)") :
         source.index("WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(")
     ]
+    # The pass-boundary drain honors the peer gate: a slower member may
+    # still be reading an owned slot, so reclaim waits for barrier B.
     assert wait.index("this->waitWithoutStallLocked(") < wait.index(
-        "this->drainPendingReleasesLocked();"
+        "this->drainPendingReleasesGatedLocked(lock);"
     )

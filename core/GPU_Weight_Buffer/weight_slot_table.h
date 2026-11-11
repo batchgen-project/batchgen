@@ -268,6 +268,42 @@ class WeightSlotTable {
         return pass;
     }
 
+    // Declare an open pass produce-only: this rank's consumer runs no
+    // forward for it. The producer still copies, lands and publishes every
+    // record this rank owns (peers in the pass read them) and declines the
+    // records it would have pulled, counting them at barrier B. Group pass
+    // alignment begins such a pass on every rank whose local pass count is
+    // short of the group maximum.
+    void mark_produce_only(int64_t pass) {
+        this->require_open(pass, "mark produce-only");
+        this->produce_only_passes_.insert(pass);
+    }
+
+    bool produce_only(int64_t pass) const {
+        return this->produce_only_passes_.count(pass) != 0;
+    }
+
+    // Advance the cursor past a replica record of a produce-only pass
+    // without a slot: the rank consumes nothing, so it never pulls, and the
+    // caller counts the record at barrier B.
+    void decline_produce_only(const std::string& module_type,
+                              const std::string& module_name) {
+        const Production next = this->next_production(module_type);
+        if (next.kind != WeightProduction::kCopy ||
+            next.module_name != module_name) {
+            throw std::runtime_error(
+                "Producer declined " + module_name + " for " + module_type +
+                ", but its cursor is at " + this->describe_cursors());
+        }
+        if (!this->produce_only(next.pass)) {
+            throw std::runtime_error(
+                "Producer declined " + module_name + " of pass " +
+                std::to_string(next.pass) + ", which is not produce-only");
+        }
+        this->pass_counts_[next.pass][module_type].skipped += 1;
+        this->advance(module_type);
+    }
+
     // Declare every module of an open pass that is not leased as skipped:
     // PRESENT frees, FILLING releases on landing, not yet produced becomes a
     // pending skip. A LEASED slot of the pass throws and changes nothing.
@@ -368,6 +404,7 @@ class WeightSlotTable {
                 violation + " Held: " + this->describe_held());
         }
         this->open_passes_.pop_front();
+        this->produce_only_passes_.erase(pass);
         summary.pass = pass;
         for (const auto& [module_type, module_names] : this->lists_) {
             if (!module_names.empty()) {
@@ -413,6 +450,7 @@ class WeightSlotTable {
         this->pending_skips_.clear();
         this->pass_counts_.clear();
         this->open_passes_.clear();
+        this->produce_only_passes_.clear();
         for (auto& [module_type, cursor] : this->cursors_) {
             cursor = Cursor{this->next_pass_, 0};
         }
@@ -1169,6 +1207,7 @@ class WeightSlotTable {
     std::map<Key, SlotRef> index_;
     // (pass, module name) whose copy in that pass the producer skips.
     std::set<std::pair<int64_t, std::string>> pending_skips_;
+    std::set<int64_t> produce_only_passes_;
     // installed module name -> its type and position in the type's list.
     std::unordered_map<std::string, Installed> installed_;
     std::unordered_map<std::string, std::vector<std::string>> lists_;

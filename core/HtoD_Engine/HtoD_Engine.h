@@ -244,6 +244,7 @@ class HtoD_Engine {
         uint64_t bytes = 0;
         bool host_lease = false;    // release_module at completion
         bool replica_pull = false;  // counters; no publish
+        int64_t pass = 0;           // produce-only release decision at landing
         bool has_role = false;
         uint8_t role_kind = 1;
         uint32_t role_type_index = 0;

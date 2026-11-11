@@ -145,7 +145,7 @@ class BatchGen {
      * forward. */
     // Arms the next pass and returns its id (0: nothing installed). Arming a
     // second pass while one is open is the explicit carry; a third throws.
-    int64_t begin_weight_pass();
+    int64_t begin_weight_pass(bool produce_only = false);
     // Waits until the producer is past the end of pass_id (the oldest open
     // pass) and its copies and releases completed, asserts that it holds no
     // slot, skip or daemon lease, and closes it. Returns {"pass", "copied",

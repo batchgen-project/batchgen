@@ -86,7 +86,18 @@ class GPU_Weight_Buffer {
     module_weight_tensor_map get_weights(const std::string& module_name);
 
     /* Passes */
-    int64_t begin_pass();
+    // produce_only: the pass is marked before the producer can observe it
+    // (same lock), so no record of it is ever pulled for a consumer that
+    // will not run.
+    int64_t begin_pass(bool produce_only = false);
+    bool pass_produce_only(int64_t pass);
+    // Replica record of a produce-only pass: cursor past it, no slot; the
+    // engine counts it at barrier B.
+    void decline_produce_only(const std::string& module_type,
+                              const std::string& module_name);
+    // PRESENT -> PENDING_RELEASE for an owned record with no consumer; the
+    // reclaim stays gated on every peer passing barrier B of frame.
+    void release_unconsumed(const std::string& module_name, int64_t frame);
     SkipCounts cancel_pass(int64_t pass);
     // Waits until the producer is past the end of pass, none of its slots is
     // FILLING and every pending asynchronous release has completed.
@@ -143,6 +154,9 @@ class GPU_Weight_Buffer {
     // B; nullptr means no gate (every reclaim proceeds on its event alone).
     void set_peer_release_gate(
         std::function<bool(const std::string&, int64_t)> gate);
+    // Reclaims every pending release at a pass boundary, honoring the peer
+    // gate (polls; throws after kStallTimeout).
+    void drainPendingReleasesGatedLocked(std::unique_lock<std::mutex>& lock);
     void arm_peer_release_gate(const std::string& module_type, int64_t index,
                                int64_t frame);
 

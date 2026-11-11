@@ -522,6 +522,7 @@ class _WeightPasses:
 		self._phase = None
 		self._current = None
 		self._carried = None
+		self._carried_produce_only = False
 		# Batch-level debug skew (batchgen_debug.weight_pass_end_delay): this
 		# rank sleeps before closing each prefill pass, so its siblings run
 		# ahead exactly where a per-rank stop used to strand the node daemon.
@@ -573,8 +574,15 @@ class _WeightPasses:
 		finally:
 			self._phase = None
 
-	def begin(self, carry=False):
-		"""Open the pass of the forward about to run."""
+	def begin(self, carry=False, produce_only=False):
+		"""Open the pass of the forward about to run.
+
+		produce_only: a group-alignment padding pass -- this rank runs no
+		forward; the producer publishes its owned records and declines its
+		pulls. The mark happens inside begin_weight_pass (same lock the
+		producer reads), so no record is pulled before the pass is marked.
+		A pass carried from a real forward must not become produce-only.
+		"""
 		if self._phase is None:
 			raise RuntimeError(
 				f"Rank {self._rank}: a weight pass was begun outside a scope"
@@ -585,11 +593,22 @@ class _WeightPasses:
 				"before the next forward began"
 			)
 		if self._carried is not None:
+			if produce_only != self._carried_produce_only:
+				raise RuntimeError(
+					f"Rank {self._rank}: pass {self._carried} was carried as "
+					f"produce_only={self._carried_produce_only} and cannot "
+					f"begin as produce_only={produce_only}"
+				)
 			self._current, self._carried = self._carried, None
 		else:
-			self._current = self._core_engine.begin_weight_pass()
+			self._current = self._core_engine.begin_weight_pass(
+				produce_only=produce_only
+			)
 		if carry and self._current != 0:
-			self._carried = self._core_engine.begin_weight_pass()
+			self._carried = self._core_engine.begin_weight_pass(
+				produce_only=produce_only
+			)
+			self._carried_produce_only = produce_only
 
 	def end(self):
 		"""Close the pass of the forward that just ran."""
@@ -8673,7 +8692,12 @@ class BatchGenWorker:
 			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
 			and self.parallel_manager.prefill_uses_resident_ep()
 		)
-		if not resident and (method is None or not method()):
+		replica = getattr(self, "_replica_plan_installed", False)
+		if (
+			not resident
+			and not replica
+			and (method is None or not method())
+		):
 			return 0, 0
 
 		local_passes = self._prefill_model_pass_count(local_prefill_indices)
@@ -10566,10 +10590,16 @@ class BatchGenWorker:
 							hasattr(self.parallel_manager, "prefill_uses_resident_ep")
 							and self.parallel_manager.prefill_uses_resident_ep()
 						)
+						replica_padding = (
+							not resident_padding
+							and getattr(self, "_replica_plan_installed", False)
+						)
 						logging.info(
 							f"Rank {self.rank}: joining {transport_only_passes} "
 							+ ("resident-EP prefill passes with no local rows"
 							   if resident_padding else
+							   "replica produce-only prefill passes with no local rows"
+							   if replica_padding else
 							   "streamed-SP8 prefill weight schedules with no local rows")
 						)
 						transport_start = time.perf_counter()
@@ -10579,18 +10609,23 @@ class BatchGenWorker:
 							for transport_pass in range(transport_only_passes):
 								self.feed_watchdog()
 								self._weight_passes.begin(
-									carry=transport_pass + 1 < transport_only_passes
+									carry=transport_pass + 1 < transport_only_passes,
+									produce_only=replica_padding,
 								)
-								with torch.inference_mode():
-									if resident_padding:
-										self._sync_prefill_moe_rank_counts(
-											0, reason="resident_padding_pass",
-										)
-										self.parallel_manager.run_resident_ep_collective_only_prefill()
-									else:
-										self.parallel_manager.run_streamed_sp8_transport_only_prefill(
-											1
-										)
+								if not replica_padding:
+									with torch.inference_mode():
+										if resident_padding:
+											self._sync_prefill_moe_rank_counts(
+												0, reason="resident_padding_pass",
+											)
+											self.parallel_manager.run_resident_ep_collective_only_prefill()
+										else:
+											self.parallel_manager.run_streamed_sp8_transport_only_prefill(
+												1
+											)
+								# A replica produce-only pass needs no forward:
+								# end() waits for the producer to publish this
+								# rank's owned records and decline its pulls.
 								self._weight_passes.end()
 						prefill_time += time.perf_counter() - transport_start
 					self._nsys_prefill_profile_end(_prefill_profile_active)

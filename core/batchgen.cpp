@@ -353,8 +353,8 @@ py::dict BatchGen::weight_stream_status() {
     return this->h2d_engine_.weight_stream_status();
 }
 
-int64_t BatchGen::begin_weight_pass() {
-    const int64_t pass = this->gpu_weight_buffer_.begin_pass();
+int64_t BatchGen::begin_weight_pass(bool produce_only) {
+    const int64_t pass = this->gpu_weight_buffer_.begin_pass(produce_only);
     if (pass != 0) {
         this->h2d_engine_.wake_producer();
     }

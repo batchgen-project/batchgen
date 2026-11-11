@@ -677,7 +677,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("skip_weight_modules", &BatchGen::skip_weight_modules,
              py::arg("module_names"))
         .def("weight_stream_status", &BatchGen::weight_stream_status)
-        .def("begin_weight_pass", &BatchGen::begin_weight_pass)
+        .def("begin_weight_pass", &BatchGen::begin_weight_pass,
+             py::arg("produce_only") = false)
         // end_weight_pass releases the interpreter lock itself while it
         // waits, and takes it back to build its result.
         .def("end_weight_pass", &BatchGen::end_weight_pass,
