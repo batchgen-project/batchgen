@@ -30,6 +30,7 @@ from batchgen.prefix_reuse.materialization import (
     temporary_kv_pages,
 )
 from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
+from tests.worker.worker_fakes import attach_prefix_state
 
 
 @dataclass(frozen=True)
@@ -275,11 +276,11 @@ def test_pass_count_plans_with_the_inputs_execution_plans_with():
     worker.enable_prepack = True
     worker._local_to_uuid_map = {i: f"u{i}" for i in range(6)}
     worker.global_batch = SimpleNamespace(get_sequence=seqs.__getitem__)
-    worker._prefix_sequence_states = {
+    attach_prefix_state(worker, prefix_sequence_states={
         100 + i: SimpleNamespace(compute_cached_tokens=cached[i])
         for i in range(6)
         if cached[i]
-    }
+    })
     count = _PLAN["_prefill_model_pass_count"](worker, list(range(6)))
     executed, _, _ = worker._plan_prefill_micro_batches(
         [f - c for f, c in zip(full, cached)], full, cached
