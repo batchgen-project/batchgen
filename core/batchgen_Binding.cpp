@@ -1184,7 +1184,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<const std::string&, bool, bool>(),
              py::arg("log_level"), py::arg("enable_hugetlbfs"),
              py::arg("enable_thp") = false)
-        .def("Init", &Parameter_Server::Init)
+        // Init reads every weight file (minutes, blocking I/O) and touches no
+        // Python state, so it must not hold the GIL: holding it starves the
+        // server's restart-coordinator heartbeat thread for the whole load
+        // and a 2-node startup kills itself at PEER_DEAD_S while both nodes
+        // load concurrently.
+        .def("Init", &Parameter_Server::Init,
+             py::call_guard<py::gil_scoped_release>())
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
         .def("byte_size", &Parameter_Server::byte_size)
