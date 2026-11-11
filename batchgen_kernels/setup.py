@@ -253,6 +253,7 @@ _sm90a_extensions = [
         sources=[
             "src/moe/routing/fused_gate_extension.cc",
             "src/moe/routing/fused_gate.cu",
+            "src/moe/routing/gate_topk_softmax.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3"],
