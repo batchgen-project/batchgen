@@ -11077,6 +11077,7 @@ class BatchGenWorker:
 			derive_frame_plan,
 			derive_owner_map,
 			install_record_kinds,
+			stagger_task_for_member,
 		)
 
 		def _decline(reason: str) -> None:
@@ -11124,8 +11125,18 @@ class BatchGenWorker:
 				if j != self.local_rank else True
 				for j in range(self.local_world_size)
 			],
+			# Canonical (order-insensitive) identity: members compare the
+			# SET of modules, because a prior install staggered this
+			# member's walk order and the stagger differs per member.
 			list_fingerprint=str(
-				self._weight_copy_task_fingerprint(self.weight_copy_task)
+				self._weight_copy_task_fingerprint(
+					{
+						module_type: sorted(names)
+						for module_type, names in (
+							self.weight_copy_task or {}
+						).items()
+					}
+				)
 			),
 			weight_source_kind="local",
 			rank=self.rank,
@@ -11141,6 +11152,16 @@ class BatchGenWorker:
 		owners = derive_owner_map(group, self.weight_copy_task, plan)
 		kinds = install_record_kinds(self.rank, group, owners)
 		member_index = group.index(self.rank)
+		# Stagger this member's within-layer walk (own block first, then
+		# the other owners round-robin) and rebuild the engine queue to
+		# match; the producer has not started. Record identity stays
+		# canonical by name, so barriers are unaffected.
+		staggered = stagger_task_for_member(
+			self.weight_copy_task, plan, owners, group, self.rank
+		)
+		if staggered != self.weight_copy_task:
+			self.weight_copy_task = staggered
+			self.core_engine.set_weight_copy_queue(staggered)
 		layers_per_pass = len(plan.layer_sequence)
 		# Record indices: one frame's records in (sorted type, in-frame
 		# position) order, identical on every member.

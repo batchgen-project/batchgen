@@ -326,3 +326,54 @@ def install_record_kinds(
         else:
             kinds[module] = "Replica"
     return kinds
+
+
+def stagger_task_for_member(
+    task: Mapping[str, Sequence[str]],
+    plan: FramePlan,
+    owners: Mapping[str, int],
+    ordered_group: Sequence[int],
+    rank: int,
+) -> dict[str, list[str]]:
+    """Reorder each layer's records for `rank`: its own block first, then
+    the other owners' blocks starting at the next member round-robin.
+
+    Record identity is canonical by name (``plan.position``), so the walk
+    order is free within a layer. The canonical walk made every member
+    traverse owners in the same order, so the group's seven readers
+    converged on ONE owner at a time and shared that owner's egress
+    (~1/7th each) while the other owners' links sat idle, and a member
+    only published its own block after pulling every earlier owner's.
+    Own-first publishes immediately; the stagger spreads the readers
+    across all owners' egress at once.
+    """
+    group = list(ordered_group)
+    me = group.index(rank)
+    size = len(group)
+    out: dict[str, list[str]] = {}
+    for module_type, names in task.items():
+        if not names:
+            out[module_type] = list(names)
+            continue
+        layer_order: list[int] = []
+        by_layer: dict[int, list[str]] = {}
+        for name in names:
+            layer_position, _ = plan.position[name]
+            if layer_position not in by_layer:
+                by_layer[layer_position] = []
+                layer_order.append(layer_position)
+            by_layer[layer_position].append(name)
+
+        def walk_key(name: str) -> tuple[int, int]:
+            _, expert = plan.position[name]
+            owner_member = group.index(owners[name])
+            return (owner_member - me) % size, expert if expert is not None else 0
+
+        reordered: list[str] = []
+        for layer_position in layer_order:
+            bucket = by_layer[layer_position]
+            if len(bucket) > 1:
+                bucket = sorted(bucket, key=walk_key)
+            reordered.extend(bucket)
+        out[module_type] = reordered
+    return out

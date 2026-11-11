@@ -124,3 +124,53 @@ def test_record_kinds_group_of_two():
     assert kinds["routed_expert_0_0"] == "HostShared"
     assert kinds["routed_expert_0_4"] == "Replica"
     assert kinds["attn_1"] == "Replica"
+
+
+def test_stagger_puts_own_block_first_and_rotates():
+    from batchgen.weight_replica_group import stagger_task_for_member
+
+    task = _glm_task(layers=2, experts=8)
+    plan = derive_frame_plan(task)
+    group = [0, 1, 2, 3]
+    owners = derive_owner_map(group, task, plan)
+
+    for rank in group:
+        staggered = stagger_task_for_member(task, plan, owners, group, rank)
+        # Same record set per type; grammar (and the canonical plan) intact.
+        for module_type in task:
+            assert sorted(staggered[module_type]) == sorted(task[module_type])
+        assert derive_frame_plan(staggered) == plan
+        # Within each layer, the member's own block leads and the owners
+        # follow round-robin from the next member.
+        routed = staggered["routed_expert"]
+        per_layer = len(routed) // 2
+        for layer_slice in (routed[:per_layer], routed[per_layer:]):
+            owner_walk = [group.index(owners[name]) for name in layer_slice]
+            me = group.index(rank)
+            expected = [
+                (me + step) % len(group)
+                for step in range(len(group))
+                for _ in range(per_layer // len(group))
+            ]
+            assert owner_walk == expected
+        # Idempotent: staggering a staggered task changes nothing.
+        assert stagger_task_for_member(
+            staggered, plan, owners, group, rank
+        ) == staggered
+
+    # Members disagree on walk order (that is the point).
+    assert stagger_task_for_member(
+        task, plan, owners, group, 0
+    ) != stagger_task_for_member(task, plan, owners, group, 1)
+
+
+def test_stagger_leaves_single_record_layers_alone():
+    from batchgen.weight_replica_group import stagger_task_for_member
+
+    task = _glm_task(layers=3, experts=8)
+    plan = derive_frame_plan(task)
+    group = [0, 1]
+    owners = derive_owner_map(group, task, plan)
+    staggered = stagger_task_for_member(task, plan, owners, group, 1)
+    assert staggered["attn"] == task["attn"]
+    assert staggered["shared_expert"] == task["shared_expert"]
