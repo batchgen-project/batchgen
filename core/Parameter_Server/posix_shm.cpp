@@ -533,8 +533,15 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                         "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
                 } else {
                     auto touch_start = std::chrono::high_resolution_clock::now();
+                    // Stride by the BASE page size: with host THP
+                    // disabled ([never]) the shmem mapping faults in 4K
+                    // pages, and a 2MB stride populated only one page in
+                    // 512 - the serial weight loader then first-touched
+                    // the rest on its own node, which is where the random
+                    // per-lifetime placement came from. Under active THP
+                    // the extra writes land in already-faulted blocks.
                     bool ok = touch_pages(logger, ptr, allocated_size,
-                                          huge_page_size,
+                                          page_size,
                                           /*multi_threaded=*/true);
                     auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - touch_start).count();
