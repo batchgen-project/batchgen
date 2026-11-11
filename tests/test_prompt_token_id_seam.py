@@ -137,6 +137,8 @@ def _scheduler(tmp_path, worker, tokenizer, lines):
         no_incremental_save=False, parse_thinking=False, parse_tool_call=False,
     )
     scheduler = bs.BatchScheduler(storage, worker, args)
+    scheduler.max_model_len = 4096
+    scheduler._deployment_ready.set()
     scheduler._get_tokenizer = lambda model: tokenizer
     scheduler._scheduling_pool.set_capacity(8)
     scheduler._pool_initialized = True

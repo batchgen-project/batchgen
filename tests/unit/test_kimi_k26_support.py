@@ -168,6 +168,7 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
 
     tokenizer = _FakeTokenizer()
     scheduler = BatchScheduler.__new__(BatchScheduler)
+    scheduler.max_model_len = 4096
     scheduler._get_tokenizer = lambda model: tokenizer
 
     request = ChatCompletionRequest(
@@ -192,7 +193,7 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
     assert rejections == {}
 
     assert [p.tolist() for p in prompts] == [[7, 8, 9]]
-    assert max_tokens == [None]
+    assert max_tokens == [4093]
     assert sampling_params == [{"temperature": None, "top_p": 1.0, "top_k": None}]
     assert tokenizer.kwargs["thinking"] is False
     assert tokenizer.kwargs["preserve_thinking"] is True
