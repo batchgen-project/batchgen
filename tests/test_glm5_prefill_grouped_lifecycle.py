@@ -223,7 +223,7 @@ def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
         s3_tma_desc=object(),
     )
 
-    def _dispatch(hidden_states, indices, *_args):
+    def _dispatch(hidden_states, indices, *_args, **_kwargs):
         calls["dispatch"].append((hidden_states[:, 0].tolist(), indices.clone()))
         return object(), object(), _args[-1]
 
