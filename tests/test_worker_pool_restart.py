@@ -202,9 +202,7 @@ def _manager(monkeypatch):
     manager._resume_hook = lambda: None
     manager._fail_in_flight_hook = lambda reason: 2
     manager._scheduler_generation_hook = lambda: None
-    manager._pool_init_params_hook = lambda: {
-        "max_output_len": 8192, "max_context_length": 65536,
-    }
+    manager._pool_init_params_hook = lambda: {"max_output_len": 8192}
     manager._retire_channels_hook = None
     manager._restart_timeout_s = 10.0
     # Single node: the real coordinator is built, and every call through it
@@ -318,8 +316,7 @@ def test_restart_rotates_cohort_queues_and_releases_all_after_teardown(monkeypat
     assert len(manager.request_queue.items) == 1
     init_msg = manager.request_queue.items[0]
     assert init_msg["type"] == "init"
-    assert init_msg["max_output_len"] == 8192
-    assert init_msg["max_context_length"] == 65536
+    assert init_msg == {"type": "init", "max_output_len": 8192}
     assert manager.response_queue.calls == []
     assert manager.response_queue.empty()
 

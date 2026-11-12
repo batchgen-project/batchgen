@@ -49,7 +49,7 @@ def test_pool_intake_entry_carries_each_request_flag():
     asyncio.run(
         scheduler._process_batch_pool_mode(
             "batch-1",
-            SimpleNamespace(batchgen_debug=None, max_context_length=None),
+            SimpleNamespace(batchgen_debug=None),
             requests,
             prompts=["p0", "p1"],
             per_request_max_tokens=[8, 8],

@@ -1540,7 +1540,6 @@ class WorkerManager:
             self.request_queue.put({
                 "type": "init",
                 "max_output_len": init_params.get("max_output_len", 4096),
-                "max_context_length": init_params.get("max_context_length"),
             })
             spawn_to_ready_s = time.monotonic() - spawn_start
             if coordinated:

@@ -1010,11 +1010,9 @@ def _server_worker_main_impl(
 				logging.info(f"Rank {global_rank}: Pool mode init received")
 				try:
 					current_max_output = task_data.get("max_output_len", 4096)
-					max_context_length = task_data.get("max_context_length", None)
 
 					# Initialize worker with pool capacity (no sequences yet)
-					worker.Init(None, current_max_output, 0,
-						max_context_length=max_context_length)
+					worker.Init(None, current_max_output, 0)
 
 					# Set admission and response queues for persistent generate()
 					worker.set_admission_queue(request_queue)

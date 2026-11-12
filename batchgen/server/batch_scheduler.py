@@ -587,7 +587,6 @@ class BatchScheduler:
         """Pool capacity for a worker generation's init message."""
         return {
             "max_output_len": getattr(self, "_pool_max_output_len", 4096),
-            "max_context_length": getattr(self, "_pool_max_context_length", None),
         }
 
     async def _run(self) -> None:
@@ -1415,8 +1414,6 @@ class BatchScheduler:
             self._pool_max_output_len = max_tokens
         else:
             self._pool_max_output_len = max(self._pool_max_output_len, max_tokens)
-        if not hasattr(self, '_pool_max_context_length'):
-            self._pool_max_context_length = batch.max_context_length
 
         # Store per-request metadata for output JSONL building
         self._pool_request_meta[batch_id] = {}
