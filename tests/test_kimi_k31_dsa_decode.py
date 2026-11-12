@@ -664,6 +664,24 @@ def test_wrapper_appends_both_host_regions(writer, monkeypatch):
     ]
 
 
+def test_wrapper_appends_nothing_when_no_callback_is_bound(writer, monkeypatch):
+    """The startup decode probe's seam: both Host-append callbacks are None,
+    and the DSA step still runs (writing its index key to the aux GPU region)
+    without raising — the aux callback is required only when the latent one
+    is bound."""
+    from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearAttnWrapper
+
+    lengths = [3, 21]
+    primary, aux, seq_ids = _caches(lengths)
+    _bind_decode(monkeypatch, primary, aux, seq_ids, lengths,
+                 primary_cb=None, aux_cb=None)
+    with torch.no_grad():
+        out = KimiLinearAttnWrapper._forward_decode_dsa(
+            SimpleNamespace(module=_module(), layer_idx=1), torch.randn(2, 1, 64))
+    assert out.shape == (2, 1, 64)
+    assert len(writer.calls) == 1  # the aux GPU cache still got this token
+
+
 def test_wrapper_refuses_to_append_the_latent_alone(writer, monkeypatch):
     from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearAttnWrapper
 

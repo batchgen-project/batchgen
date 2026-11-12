@@ -1,7 +1,9 @@
 """CUDA-free contracts for the Kimi-Linear startup decode probe."""
 
+import gc
 import sys
 import types
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -129,6 +131,9 @@ class FakeDecodeModel:
         self.vocab = vocab
         self.hidden = hidden
         self.calls = 0
+        # Optional hook a test installs to observe the class state the probe
+        # publishes for the step (synthetic managers, batch metadata).
+        self.probe_recorder = None
 
     def parameters(self):
         yield torch.zeros(1, dtype=torch.float32)
@@ -136,6 +141,8 @@ class FakeDecodeModel:
     def __call__(self, input_ids=None, position_ids=None, **kwargs):
         assert input_ids is not None and input_ids.shape[1] == 1
         assert position_ids is not None and position_ids.shape == input_ids.shape
+        if self.probe_recorder is not None:
+            self.probe_recorder()
         bsz = input_ids.shape[0]
         hidden = torch.zeros(bsz, 1, self.hidden)
         for layer in self.model.layers:
@@ -180,6 +187,18 @@ def _fake_kda_wrapper():
     wrapper = object.__new__(KimiLinearKDAWrapper)
     wrapper.module = SimpleNamespace()
     return wrapper
+
+
+# Larger than the fake deployment page size (64), so the DSA arm's aliased
+# page tables carry a genuine shared-history entry next to the per-row write
+# entry, and smaller than any real index_topk so the CPU fakes stay tiny.
+DSA_TOPK = 100
+DSA_HEAD_DIM = 128
+PAGE_SIZE = 64
+
+
+def _dsa_indexer(topk=DSA_TOPK, head_dim=DSA_HEAD_DIM):
+    return SimpleNamespace(index_topk=topk, index_head_dim=head_dim)
 
 
 def _build_probe_manager(monkeypatch, *, num_slots=8, cap=4, indexer=None,
@@ -286,17 +305,39 @@ def test_probe_refuses_wrong_phase(monkeypatch):
         manager.startup_decode_probe_step(4)
 
 
-def test_probe_refuses_dsa_variant_by_name(monkeypatch):
+def test_probe_refuses_dsa_indexer_without_geometry(monkeypatch):
     manager, state_manager, _, _ = _build_probe_manager(
-        monkeypatch, indexer=object()
+        monkeypatch, indexer=SimpleNamespace()
     )
     before = state_manager.snapshot()
 
     with pytest.raises(
-        StartupDecodeProbeError, match="DSA decode probe not yet supported"
+        StartupDecodeProbeError, match="DSA indexer geometry"
     ):
         manager.startup_decode_probe_step(4)
     # Refused before any slot was touched.
+    assert state_manager.snapshot() == before
+
+
+def test_probe_refuses_disagreeing_dsa_index_head_dims(monkeypatch):
+    manager, state_manager, _, _ = _build_probe_manager(
+        monkeypatch, indexer=_dsa_indexer()
+    )
+    manager.model.model.layers.append(
+        SimpleNamespace(
+            self_attn=_fake_mla_wrapper(
+                indexer=SimpleNamespace(
+                    index_topk=DSA_TOPK, index_head_dim=DSA_HEAD_DIM // 2
+                )
+            )
+        )
+    )
+    before = state_manager.snapshot()
+
+    with pytest.raises(
+        StartupDecodeProbeError, match="disagreeing DSA index_head_dim"
+    ):
+        manager.startup_decode_probe_step(4)
     assert state_manager.snapshot() == before
 
 
@@ -386,3 +427,151 @@ def test_probe_releases_slots_and_restores_state_on_step_failure(monkeypatch):
     assert "forward" not in gate.__dict__
     assert AttnWrapperBase.gpu_paged_kv_manager is None
     assert AttnWrapperBase.cur_batch is None
+
+
+# --------------------------------------------------------------------------- #
+#  Kimi-K3.1 DSA arm
+# --------------------------------------------------------------------------- #
+
+
+def _expected_aliased_table(bsz, past=DSA_TOPK, page_size=PAGE_SIZE):
+    pages_per_row = (past + 1 + page_size - 1) // page_size
+    table = torch.zeros(bsz, pages_per_row, dtype=torch.int32)
+    table[:, past // page_size] = torch.arange(1, bsz + 1, dtype=torch.int32)
+    return table
+
+
+def test_probe_dsa_arm_installs_long_rows_and_synthetic_aux(monkeypatch):
+    manager, _, _, _ = _build_probe_manager(monkeypatch, indexer=_dsa_indexer())
+    seen = {}
+
+    def record():
+        primary = AttnWrapperBase.gpu_paged_kv_manager
+        aux = AttnWrapperBase.gpu_paged_kv_manager_aux
+        assert aux is not None
+        aux_blocked, aux_v, aux_table = aux.get_layer_kv_with_page_table(1)
+        _, _, primary_table = primary.get_layer_kv_with_page_table(1)
+        seen.update(
+            aux_shape=tuple(aux_blocked.shape),
+            aux_dtype=aux_blocked.dtype,
+            aux_v=aux_v,
+            aux_table=aux_table.clone(),
+            primary_table=primary_table.clone(),
+            aux_page_size=aux.config.page_size_tokens,
+            primary_page_size=primary.config.page_size_tokens,
+            slot_map=dict(aux._gpu_page_table_manager.seq_id_to_slot),
+            cur_batch=list(AttnWrapperBase.cur_batch),
+            cache_seqlens=AttnWrapperBase.cache_seqlens.clone(),
+            max_seqlen=AttnWrapperBase.max_seqlen,
+            position_ids=AttnWrapperBase.position_ids.clone(),
+            callbacks=(
+                AttnWrapperBase.kv_append_callback,
+                AttnWrapperBase.kv_append_callback_aux,
+            ),
+        )
+
+    manager.model.probe_recorder = record
+    manager.startup_decode_probe_step(4)
+
+    # The page-split FP8 carrier: index_head_dim e4m3 bytes + 4 scale bytes
+    # per token, one K head, plan_bsz + 1 physical pages (shared history
+    # page 0 + one write page per row), at the deployment page size.
+    assert seen["aux_shape"] == (5, PAGE_SIZE, 1, DSA_HEAD_DIM + 4)
+    assert seen["aux_dtype"] is torch.uint8
+    assert seen["aux_v"] is None
+    assert seen["aux_page_size"] == PAGE_SIZE
+    assert seen["primary_page_size"] == PAGE_SIZE
+
+    # Every row is minimally LONG (index_topk + 1), so the sparse selection
+    # path is the one measured, never the dense fallback.
+    assert seen["cache_seqlens"].tolist() == [DSA_TOPK + 1] * 4
+    assert seen["max_seqlen"] == DSA_TOPK + 1
+    assert seen["position_ids"].flatten().tolist() == [DSA_TOPK] * 4
+
+    expected = _expected_aliased_table(4)
+    assert torch.equal(seen["aux_table"], expected)
+    assert torch.equal(seen["primary_table"], expected)
+
+    # The aux slot indirection resolves every synthetic sequence id, and no
+    # Host-append callback is bound during the probe (the DSA wrapper then
+    # appends nothing instead of raising).
+    assert seen["slot_map"] == {
+        sid: row for row, sid in enumerate(seen["cur_batch"])
+    }
+    assert seen["callbacks"] == (None, None)
+
+
+def test_probe_dsa_synthetic_aux_write_read_round_trip(monkeypatch):
+    """The aux surface addresses like the real manager: each row's write
+    position resolves through seq_id_to_slot + the page table to its OWN
+    physical page, and bytes written there read back intact."""
+    manager, _, _, _ = _build_probe_manager(monkeypatch, indexer=_dsa_indexer())
+
+    def record():
+        aux = AttnWrapperBase.gpu_paged_kv_manager_aux
+        page_size = aux.config.page_size_tokens
+        blocked, _, table = aux.get_layer_kv_with_page_table(0)
+        pos = DSA_TOPK
+        slot_of = aux._gpu_page_table_manager.seq_id_to_slot
+        pages = []
+        for row, sid in enumerate(AttnWrapperBase.cur_batch):
+            page = int(table[slot_of[sid], pos // page_size])
+            pages.append(page)
+            blocked[page, pos % page_size, 0, :DSA_HEAD_DIM] = row + 1
+        assert len(set(pages)) == len(pages)  # write pages never alias
+        for row, sid in enumerate(AttnWrapperBase.cur_batch):
+            page = int(table[slot_of[sid], pos // page_size])
+            got = blocked[page, pos % page_size, 0, :DSA_HEAD_DIM]
+            assert torch.equal(
+                got, torch.full((DSA_HEAD_DIM,), row + 1, dtype=torch.uint8)
+            )
+            # History entries alias the shared read-only zero page and were
+            # not touched by any row's write.
+            history_page = int(table[slot_of[sid], 0])
+            assert history_page == 0
+            assert int(blocked[history_page].to(torch.int64).sum()) == 0
+
+    manager.model.probe_recorder = record
+    manager.startup_decode_probe_step(4)
+
+
+def test_two_dsa_probe_calls_free_aux_and_leave_pool_identical(monkeypatch):
+    manager, state_manager, gate, layer_pool = _build_probe_manager(
+        monkeypatch, indexer=_dsa_indexer()
+    )
+    initial = state_manager.snapshot()
+    saved_attention = {
+        name: getattr(AttnWrapperBase, name)
+        for name in (
+            "gpu_paged_kv_manager",
+            "gpu_paged_kv_manager_aux",
+            "cache_seqlens",
+            "max_seqlen",
+            "cur_batch",
+            "position_ids",
+            "kv_append_callback",
+            "kv_append_callback_aux",
+        )
+    }
+    aux_refs = []
+    manager.model.probe_recorder = lambda: aux_refs.append(
+        weakref.ref(AttnWrapperBase.gpu_paged_kv_manager_aux)
+    )
+
+    manager.startup_decode_probe_step(4)
+    assert state_manager.snapshot() == initial
+    manager.startup_decode_probe_step(4)
+    assert state_manager.snapshot() == initial
+    assert manager.model.calls == 2
+
+    # Every synthetic aux surface is dropped with the step: nothing retains
+    # it once the finally-restore has run.
+    manager.model.probe_recorder = None
+    gc.collect()
+    assert len(aux_refs) == 2
+    assert all(ref() is None for ref in aux_refs)
+
+    assert "forward" not in gate.__dict__
+    assert layer_pool.cur_batch_ids == []
+    for name, value in saved_attention.items():
+        assert getattr(AttnWrapperBase, name) is value

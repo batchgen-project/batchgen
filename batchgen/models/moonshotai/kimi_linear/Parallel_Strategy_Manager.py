@@ -105,6 +105,14 @@ _KDA_GRAPH_SCRATCH_SLOTS = 1
 # id is somehow already mapped.
 _KDA_PROBE_SEQ_ID_BASE = -3_000_000_001
 
+# Per-token fp32 scale bytes of DeepGEMM's page-split FP8 index-key carrier.
+# The authoritative constant is
+# ``batchgen_kernels.attention.dsa.indexer_k_quant.SCALE_BYTES_PER_TOKEN``;
+# it is not imported here because that package's ``__init__`` needs triton
+# (absent on CPU test environments), and the layout itself is a fixed kernel
+# ABI the real writer validates (``cache_is_page_split``) before any launch.
+_DSA_PAGE_SPLIT_SCALE_BYTES = 4
+
 
 class StartupDecodeProbeError(RuntimeError):
     """The startup decode probe cannot honor its cap-width contract."""
@@ -1561,7 +1569,25 @@ class KimiLinearParallelStrategyManager:
         - installs a tiny synthetic paged-KV surface for the NoPE-MLA layers
           at the deployment page size (never a guessed one), holding the MLA
           LATENT geometry (``kv_lora_rank + qk_rope_head_dim`` per token, one
-          KV head) with one past token per row;
+          KV head). Physical pages are O(batch): the page-table entry that
+          holds each row's write position maps to that row's own page, and
+          every history entry maps to one shared read-only zero page (the
+          probe writes only the new token, so sharing history pages is
+          race-free at any synthetic context length);
+        - on the Kimi-K3.1 DSA variant (``module.indexer`` present) also
+          installs a synthetic AUXILIARY index-key surface with the same page
+          geometry in DeepGEMM's page-split FP8 carrier
+          (``index_head_dim`` e4m3 bytes + 4 scale bytes per token, one K
+          head) plus the sequence->slot map ``dsa_decode_forward`` resolves,
+          and sets every row's context to ``index_topk + 1`` tokens, because
+          a row at or under ``index_topk`` runs the dense K3 decode and the
+          probe would never execute the sparse selection kernels (the fused
+          index-K writer, the page-split top-k scorer and the sparse MLA
+          attention all run REAL at cap width). Host-append callbacks stay
+          None for both regions, which ``_forward_decode_dsa`` tolerates by
+          appending nothing. Honest exclusion: the scorer's context width is
+          ``index_topk + 1``, the minimal long context, so transients that
+          grow with a longer decode context are not measured here;
         - drives every configured resident-EP MoE layer at a fabricated
           round-robin uniform top-k routing through the real EP collectives
           (symmetric shapes on all ranks), and finishes the step through the
@@ -1582,10 +1608,10 @@ class KimiLinearParallelStrategyManager:
         Named refusals (StartupDecodeProbeError): no CUDA; width above the
         configured cap; missing model, EP communicator, or KDA state manager;
         wrong phase; no deployment page size; insufficient free KDA slots;
-        streamed (non-resident) decode MoE; and the Kimi-K3.1 DSA decode
-        variant — its auxiliary index-key manager surface is not yet
-        synthesized honestly, so K3.1 publishes a truthful "unavailable"
-        instead of a faked measurement.
+        streamed (non-resident) decode MoE (K3.1's planner defaults decode to
+        resident_ep like K3's, so this names the fallback, not the default);
+        and a DSA indexer without positive ``index_topk``/``index_head_dim``
+        geometry or with a per-layer ``index_head_dim`` disagreement.
         """
         if not torch.cuda.is_available():
             raise StartupDecodeProbeError(
@@ -1627,13 +1653,35 @@ class KimiLinearParallelStrategyManager:
             layer.self_attn for layer in layers
             if isinstance(layer.self_attn, KimiLinearKDAWrapper)
         ]
-        for wrapper in mla_wrappers:
-            if getattr(wrapper.module, "indexer", None) is not None:
+        # Kimi-K3.1 DSA variant: the probe fabricates the auxiliary index-key
+        # surface, so it only needs the indexer GEOMETRY here — index_topk to
+        # make every synthetic row long (a row at or under index_topk decodes
+        # on the dense K3 path and the sparse kernels would never run) and
+        # index_head_dim to size the page-split FP8 carrier.
+        dsa_modules = [
+            wrapper.module for wrapper in mla_wrappers
+            if getattr(wrapper.module, "indexer", None) is not None
+        ]
+        dsa_index_topk = 0
+        dsa_index_head_dim = 0
+        for dsa_module in dsa_modules:
+            indexer = dsa_module.indexer
+            topk = int(getattr(indexer, "index_topk", 0) or 0)
+            head_dim = int(getattr(indexer, "index_head_dim", 0) or 0)
+            if topk <= 0 or head_dim <= 0:
                 raise StartupDecodeProbeError(
-                    "DSA decode probe not yet supported: Kimi-K3.1 sparse "
-                    "decode needs an auxiliary index-key paged-KV surface the "
-                    "probe does not synthesize honestly"
+                    "startup decode probe requires positive DSA indexer "
+                    f"geometry, got index_topk={topk}, "
+                    f"index_head_dim={head_dim}"
                 )
+            if dsa_index_head_dim not in (0, head_dim):
+                raise StartupDecodeProbeError(
+                    "startup decode probe found disagreeing DSA "
+                    f"index_head_dim values ({dsa_index_head_dim} vs "
+                    f"{head_dim}); one auxiliary carrier cannot serve both"
+                )
+            dsa_index_topk = max(dsa_index_topk, topk)
+            dsa_index_head_dim = head_dim
         moe_blocks = [
             layer.block_sparse_moe for layer in layers
             if getattr(layer, "block_sparse_moe", None) is not None
@@ -1730,64 +1778,86 @@ class KimiLinearParallelStrategyManager:
         patched_gates = []
         allocated_sids = []
 
-        probe_engine_config = self.engine_config
         num_layers = len(layers)
+
+        # The decode kernels support only the deployment page size; at this
+        # startup seam the worker's manager may not be installed on the
+        # wrapper, so the page size comes from the ENGINE CONFIG, with the
+        # live manager honored when present. The real DSA deployment asserts
+        # equal primary/aux page sizes (DualKVCacheCoordinator), so one value
+        # serves both synthetic regions.
+        source_config = getattr(
+            saved_attention_state["gpu_paged_kv_manager"], "config", None
+        )
+        page_size = int(
+            getattr(source_config, "page_size_tokens", 0)
+            or getattr(
+                getattr(self.engine_config, "Device_Paged_KV_Config", None),
+                "page_size",
+                0,
+            )
+            or 0
+        )
+        if page_size <= 0 and mla_wrappers:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no deployment page size"
+            )
+
+        # Synthetic decode context. Dense K3 keeps the plan's single past
+        # token. The K3.1 DSA step routes any row with
+        # cache_seqlen <= index_topk to the dense path, so the probe makes
+        # every row MINIMALLY LONG (index_topk + 1 tokens): the fused index-K
+        # writer, the page-split top-k scorer and the sparse MLA attention
+        # all execute with their real cap-width shapes.
+        probe_past = dsa_index_topk if dsa_modules else plan.past_tokens
+        if page_size > 0:
+            pages_per_row = (probe_past + 1 + page_size - 1) // page_size
+            write_entry = probe_past // page_size
+        else:
+            # No MLA layers: no paged surface is built (refused above
+            # otherwise), so no page geometry exists either.
+            pages_per_row = 0
+            write_entry = 0
+
+        def _aliased_page_table() -> torch.Tensor:
+            """[plan_bsz, pages_per_row] int32 over plan_bsz + 1 real pages.
+
+            The entry holding the write position maps to that row's own page
+            (1 + row); every history entry maps to the shared read-only zero
+            page 0. The probe writes only the new token, so sharing history
+            pages is race-free, and the synthetic caches stay O(batch) pages
+            at any synthetic context length (the DSA arm's index_topk + 1
+            context would otherwise need O(batch * index_topk) real tokens).
+            """
+            table = torch.zeros(
+                plan_bsz, pages_per_row, dtype=torch.int32, device=device
+            )
+            table[:, write_entry] = torch.arange(
+                1, plan_bsz + 1, dtype=torch.int32, device=device
+            )
+            return table
 
         class _SyntheticPagedKV:
             """Minimal paged-KV surface for the Kimi NoPE-MLA decode.
 
             ``mla_decoding_nope_with_pagekv`` consumes exactly ``.device``,
             ``update_layer_decode_new_token(...)`` and
-            ``get_layer_kv_with_page_table(layer_idx=...)``; MLA stores no V,
-            so no V cache is allocated and None is returned in its place.
+            ``get_layer_kv_with_page_table(layer_idx=...)``; the K3.1 sparse
+            step (``dsa_decode_forward``) additionally reads
+            ``.config.page_size_tokens``. MLA stores no V, so no V cache is
+            allocated and None is returned in its place.
             """
 
             def __init__(self):
-                # The decode kernel supports only the deployment page size; at
-                # this startup seam the worker's manager may not be installed
-                # on the wrapper, so the page size comes from the ENGINE
-                # CONFIG, with the live manager honored when present.
-                source_manager = saved_attention_state["gpu_paged_kv_manager"]
-                source_config = getattr(source_manager, "config", None)
-                page_size = int(
-                    getattr(source_config, "page_size_tokens", 0)
-                    or getattr(
-                        getattr(
-                            probe_engine_config, "Device_Paged_KV_Config", None
-                        ),
-                        "page_size",
-                        0,
-                    )
-                    or 0
-                )
-                if page_size <= 0:
-                    raise StartupDecodeProbeError(
-                        "startup decode probe found no deployment page size"
-                    )
-                if page_size < plan.past_tokens + 1:
-                    raise StartupDecodeProbeError(
-                        "startup decode probe needs past_tokens + 1 to fit one "
-                        f"page (page_size={page_size})"
-                    )
-                pages_per_row = (
-                    plan.past_tokens + 1 + page_size - 1
-                ) // page_size
                 self.device = device
                 self.page_size = page_size
-                self.page_table = torch.arange(
-                    plan_bsz * pages_per_row,
-                    dtype=torch.int32,
-                    device=device,
-                ).view(plan_bsz, pages_per_row)
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size
+                )
+                self.page_table = _aliased_page_table()
                 # One latent head per token: [L, pages, page_size, 1, latent].
                 self.k_cache = torch.zeros(
-                    (
-                        num_layers,
-                        plan_bsz * pages_per_row,
-                        page_size,
-                        1,
-                        latent_dim,
-                    ),
+                    (num_layers, plan_bsz + 1, page_size, 1, latent_dim),
                     dtype=hidden_dtype,
                     device=device,
                 )
@@ -1827,6 +1897,48 @@ class KimiLinearParallelStrategyManager:
             def get_layer_kv_with_page_table(self, layer_idx):
                 return self.k_cache[layer_idx], None, self.page_table
 
+        class _SyntheticPagedKVAux:
+            """Minimal AUXILIARY (index-key) surface for the K3.1 DSA decode.
+
+            ``dsa_decode_forward`` consumes exactly ``.device``,
+            ``.config.page_size_tokens``,
+            ``._gpu_page_table_manager.seq_id_to_slot`` (the aux slot
+            indirection ``batch_slot_indices`` resolves) and
+            ``get_layer_kv_with_page_table(layer_idx)``. The cache is
+            DeepGEMM's page-split FP8 carrier the real aux manager allocates
+            (``cache_is_page_split``): per token, ``index_head_dim`` e4m3 key
+            bytes plus one fp32 scale, as BYTES of a 1-byte-element tensor
+            ``[pages, page_size, 1, index_head_dim + SCALE_BYTES_PER_TOKEN]``.
+            Zero bytes decode to all-zero keys and scales — finite, so the
+            ReLU-gated scorer and the sparse attention stay NaN-free.
+            """
+
+            def __init__(self):
+                self.device = device
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size
+                )
+                self.page_table = _aliased_page_table()
+                self.k_cache = torch.zeros(
+                    (
+                        num_layers,
+                        plan_bsz + 1,
+                        page_size,
+                        1,
+                        dsa_index_head_dim + _DSA_PAGE_SPLIT_SCALE_BYTES,
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                self._gpu_page_table_manager = types.SimpleNamespace(
+                    seq_id_to_slot={
+                        sid: row for row, sid in enumerate(synthetic_sids)
+                    }
+                )
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return self.k_cache[layer_idx], None, self.page_table
+
         try:
             # Force the eager decode path for the probe: the graph adapter's
             # replays bind the worker's real page tables and slot buffers,
@@ -1839,20 +1951,25 @@ class KimiLinearParallelStrategyManager:
             AttnWrapperBase.gpu_paged_kv_manager = (
                 _SyntheticPagedKV() if mla_wrappers else None
             )
-            AttnWrapperBase.gpu_paged_kv_manager_aux = None
+            AttnWrapperBase.gpu_paged_kv_manager_aux = (
+                _SyntheticPagedKVAux() if dsa_modules else None
+            )
             AttnWrapperBase.cache_seqlens = torch.full(
-                (plan_bsz,), plan.past_tokens + 1,
+                (plan_bsz,), probe_past + 1,
                 dtype=torch.int32,
                 device=device,
             )
-            AttnWrapperBase.max_seqlen = plan.past_tokens + 1
+            AttnWrapperBase.max_seqlen = probe_past + 1
             AttnWrapperBase.cur_batch = list(synthetic_sids)
             AttnWrapperBase.position_ids = torch.full(
-                (plan_bsz, 1), plan.past_tokens,
+                (plan_bsz, 1), probe_past,
                 dtype=torch.long,
                 device=device,
             )
             AttnWrapperBase.attention_mask = None
+            # Both Host-append callbacks stay None for the probe;
+            # _forward_decode_dsa appends nothing in that case (it requires
+            # the aux callback only when the latent one is bound).
             AttnWrapperBase.kv_append_callback = None
             AttnWrapperBase.kv_append_callback_aux = None
 
@@ -1905,7 +2022,7 @@ class KimiLinearParallelStrategyManager:
                 (plan_bsz, 1), dtype=torch.long, device=device
             )
             position_ids = torch.full(
-                (plan_bsz, 1), plan.past_tokens,
+                (plan_bsz, 1), probe_past,
                 dtype=torch.long,
                 device=device,
             )
