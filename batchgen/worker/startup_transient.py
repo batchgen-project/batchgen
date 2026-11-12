@@ -85,6 +85,7 @@ class StartupTransient:
     padding_bsz: int
     allocator_gib: Optional[float] = None
     external_gib: Optional[float] = None
+    retained_gib: Optional[float] = None
     deterministic: Optional[bool] = None
     unavailable: Optional[str] = None
 
@@ -151,16 +152,24 @@ def transient_runs_agree(
 def measure_eager(
     step: Callable[[], None], *, cuda: Any, device: int, seam: str, padding_bsz: int
 ) -> StartupTransient:
-    """Run the synthetic decode step twice and gate the two allocator peaks.
+    """Warm the step once, then run it twice and gate the two allocator peaks.
 
-    Published allocator value: the larger of the two peaks. External value:
-    non-allocator growth across both runs together.
+    The first-ever execution creates one-time state the later runs find
+    already present (library workspaces, communicator buffers), so it is run
+    unmeasured and what it leaves allocated is published as ``retained``: a
+    permanent occupancy the budget must also cover, distinct from the
+    per-step transient. The two measured runs are steady state, so their
+    peaks must agree; published allocator value: the larger of the two.
+    External value: non-allocator growth across the warm run and both
+    measured runs together.
 
     Slice-1 deviation from the design: a mismatch is logged at ERROR and the
     struct records ``deterministic=False``; it does not fail startup, because
     nothing sizes from this value yet. Once the reservation feeds the pool
     budget, a mismatch must fail startup.
     """
+    warm_before, warm_after = _run_measured(cuda, device, step)
+    retained = warm_after.allocated - warm_before.allocated
     first_before, first_after = _run_measured(cuda, device, step)
     second_before, second_after = _run_measured(cuda, device, step)
     first = allocator_transient_bytes(first_before, first_after)
@@ -178,7 +187,8 @@ def measure_eager(
         seam=seam,
         padding_bsz=padding_bsz,
         allocator_gib=max(first, second) / GIB,
-        external_gib=(second_after.external - first_before.external) / GIB,
+        external_gib=(second_after.external - warm_before.external) / GIB,
+        retained_gib=retained / GIB,
         deterministic=agree,
     )
 
@@ -244,6 +254,12 @@ def reduce_across_ranks(
             padding_bsz=head.padding_bsz,
             allocator_gib=max(item.allocator_gib for _, item in column),
             external_gib=max(item.external_gib for _, item in column),
+            retained_gib=(
+                max(values) if (values := [
+                    item.retained_gib for _, item in column
+                    if item.retained_gib is not None
+                ]) else None
+            ),
             deterministic=all(gates) if gates else None,
         ))
     return reduced
@@ -256,9 +272,14 @@ def format_ledger_line(scope: str, transients: Sequence[StartupTransient]) -> st
         if item.unavailable is not None:
             parts.append(f"{item.flavor}=unavailable({item.unavailable})")
         else:
+            retained = (
+                f"retained_gib:{item.retained_gib:.6f},"
+                if item.retained_gib is not None else ""
+            )
             parts.append(
                 f"{item.flavor}=allocator_gib:{item.allocator_gib:.6f},"
                 f"external_gib:{item.external_gib:.6f},"
+                f"{retained}"
                 f"deterministic:{item.deterministic}"
             )
     head = transients[0] if transients else None
