@@ -88,6 +88,9 @@ PINS = {
                 "expert_counters",
                 "topk_pos",
                 "cu_seqlens",
+                # Replica of the grouped-GEMM backend's row alignment
+                # (2026-11-12): 64 default, 128 for the m-grouped backend.
+                "row_align",
             ],
             "returns": None,
         },
