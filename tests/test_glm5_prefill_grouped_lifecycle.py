@@ -175,6 +175,14 @@ def test_prefill_gate_routes_in_bounded_ordered_chunks():
 def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
     monkeypatch,
 ):
+    # Window threading is backend-agnostic; this wiring test asserts the
+    # incumbent ptrs chain, so pin that backend (the default m-grouped
+    # backend builds dense ring views these mock tensors cannot satisfy).
+    monkeypatch.setattr(
+        glm5_model,
+        "_glm5_prefill_grouped_gemm_backend",
+        lambda: "cute_ptrs",
+    )
     calls = {"gate": [], "dispatch": [], "reduce": [], "shared": []}
 
     class _Gate:
@@ -215,7 +223,7 @@ def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
         s3_tma_desc=object(),
     )
 
-    def _dispatch(hidden_states, indices, *_args):
+    def _dispatch(hidden_states, indices, *_args, **_kwargs):
         calls["dispatch"].append((hidden_states[:, 0].tolist(), indices.clone()))
         return object(), object(), _args[-1]
 
@@ -237,7 +245,9 @@ def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
         return output
 
     monkeypatch.setattr(glm5_model, "_glm5_dispatch_scatter_ragged", _dispatch)
-    monkeypatch.setattr(glm5_model, "_glm5_act_quant_ragged", lambda *_args: None)
+    monkeypatch.setattr(
+        glm5_model, "_glm5_act_quant_ragged", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         glm5_model,
         "grouped_fp8_blockwise_fused_s1_ptrs",
