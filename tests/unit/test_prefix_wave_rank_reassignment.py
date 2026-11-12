@@ -15,6 +15,7 @@ import torch
 
 from batchgen.query_book import bind_query_book_slot, release_query_book_slot
 from tests.worker.worker_fakes import attach_identity
+from tests.worker_method_source import load_prefill_engine_methods
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -35,9 +36,31 @@ def _worker_class():
 
 def _worker_methods(*names):
     """Exec the named methods on a fresh namespace of fakes."""
+    moved = {
+        "_prefix_rank_packing_mode",
+        "_prefix_rank_cost_profile_disabled",
+        "_cached_prefix_rank_cost_profile",
+    }
+    if any(name in moved for name in names):
+        namespace = {
+            "List": List,
+            "hashlib": hashlib,
+            "logging": logging,
+            "torch": torch,
+        }
+        loaded = {}
+        for name in names:
+            if name in moved:
+                loaded[name] = load_prefill_engine_methods([name], namespace)[name]
+        remaining = [name for name in names if name not in moved]
+    else:
+        loaded = {}
+        remaining = list(names)
+    if not remaining:
+        return loaded
     wanted = [node for node in _worker_class().body
-              if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert len(wanted) == len(names), [node.name for node in wanted]
+              if isinstance(node, ast.FunctionDef) and node.name in remaining]
+    assert len(wanted) == len(remaining), [node.name for node in wanted]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List,
@@ -51,7 +74,8 @@ def _worker_methods(*names):
         "release_query_book_slot": release_query_book_slot,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
-    return {name: namespace[name] for name in names}
+    loaded.update({name: namespace[name] for name in remaining})
+    return loaded
 
 
 def _assignment_method():

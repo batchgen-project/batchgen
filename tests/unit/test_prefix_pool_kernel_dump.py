@@ -499,12 +499,12 @@ def test_a_wrong_pool_write_is_caught_on_exactly_the_pages_it_damaged(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_the_worker_reads_both_flags_through_the_batch_debug_seam():
     source = Path(__file__).resolve().parents[2].joinpath(
-        "batchgen", "batchgen_worker.py"
+        "batchgen", "worker", "prefill_engine.py"
     ).read_text()
 
-    assert "def _new_pool_kernel_dump_recorder(self, wave):" in source
+    assert "def _new_pool_kernel_dump_recorder(self, worker, wave):" in source
     assert "pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)" in source
-    seam = source.split("def _new_pool_kernel_dump_recorder")[1].split("\n\tdef ")[0]
+    seam = source.split("    def _new_pool_kernel_dump_recorder")[1].split("\n    def ")[0]
     # One cached read per wave, shared with the other pooled probes, and the
     # flag decision precedes the import so the off path imports nothing.
     assert "self._pool_probe_debug(wave)" in seam

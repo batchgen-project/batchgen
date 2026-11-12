@@ -4279,9 +4279,12 @@ def test_worker_runs_missing_weight_passes_outside_the_local_row_guard():
 
 
 def test_worker_counts_the_same_prefill_plan_that_execution_uses():
-    path = ROOT / "batchgen" / "batchgen_worker.py"
-    count = _function(path, "BatchGenWorker", "_prefill_model_pass_count")
-    execute = _function(path, "BatchGenWorker", "prefill_prepacked")
+    path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
+    count = _function(path, "PrefillEngine", "_prefill_model_pass_count")
+    execute = _function(
+        ROOT / "batchgen" / "batchgen_worker.py", "BatchGenWorker",
+        "prefill_prepacked",
+    )
 
     def calls_plan(function):
         return sum(

@@ -30,6 +30,7 @@ from batchgen.prefix_reuse.executor_cost import (
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+ENGINE = Path(__file__).resolve().parents[2] / "batchgen" / "worker" / "prefill_engine.py"
 
 K3_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 SM90 = (9, 0)
@@ -50,15 +51,27 @@ def _method_ast(name):
                 if isinstance(node, ast.FunctionDef) and node.name == name)
 
 
+def _engine_method_ast(name):
+    tree = ast.parse(ENGINE.read_text())
+    klass = next(node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine")
+    return next(node for node in klass.body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
 @functools.lru_cache(maxsize=4)
 def _methods(names):
     module = ast.fix_missing_locations(
-        ast.Module(body=[_method_ast(name) for name in names], type_ignores=[])
+        ast.Module(body=[_engine_method_ast(name) for name in names], type_ignores=[])
     )
     scope = {"List": List, "Optional": Optional, "torch": torch,
              "logging": SimpleNamespace(info=lambda *a, **k: None)}
-    exec(compile(module, str(WORKER), "exec"), scope)
-    return {name: scope[name] for name in names}
+    exec(compile(module, str(ENGINE), "exec"), scope)
+    return {
+        name: (lambda worker, *args, _fn=scope[name], **kwargs:
+               _fn(None, worker, *args, **kwargs))
+        for name in names
+    }
 
 
 class _Props:
@@ -219,7 +232,7 @@ def test_both_packer_call_sites_pass_the_batch_arm(method):
 
 
 def test_the_cache_is_keyed_and_never_a_single_attribute():
-    body = ast.unparse(_method_ast("_cached_prefix_rank_cost_profile"))
+    body = ast.unparse(_engine_method_ast("_cached_prefix_rank_cost_profile"))
     assert "_prefix_rank_cost_profiles" in body
     assert "key = bool(disabled)" in body
     # The old single-attribute cache is what made the arm un-flippable.
