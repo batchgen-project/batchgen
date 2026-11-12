@@ -45,6 +45,21 @@ def test_provided_converted_dir_is_the_conversion_output(recorded_calls):
     ]
 
 
+def test_path_valued_converted_dir_is_normalized_to_str(recorded_calls):
+    from pathlib import Path
+
+    from batchgen.models.glm.glm5.converted_ckpt import resolve_converted_ckpt_dir
+
+    resolved = resolve_converted_ckpt_dir(
+        "/cache/GLM-5.3", Path("/local/glm53_converted_ckpt")
+    )
+    assert resolved == "/local/glm53_converted_ckpt"
+    assert type(resolved) is str
+    assert recorded_calls == [
+        {"input_dir": "/cache/GLM-5.3", "output_dir": "/local/glm53_converted_ckpt"}
+    ]
+
+
 def test_absent_converted_dir_keeps_the_cache_default(recorded_calls):
     from batchgen.models.glm.glm5.converted_ckpt import resolve_converted_ckpt_dir
 
