@@ -260,7 +260,9 @@ _H20_W32 = K3EngineProfile(
     family=MachineFamily.H20,
     num_nodes=4,
     shard_latent_projections=True,
-    shard_vocab_parallel=False,
+    # DIAGNOSTIC BRANCH ONLY (tairan/k3-vocab-diag): vocab-parallel forced ON
+    # to reproduce batchgen-k3-vocab-parallel-h20-corruption on world32.
+    shard_vocab_parallel=True,
     kda_user_slots=128,
     kda_slots_basis=(
         "measured: 4-node world32 run 2026-10-29, 128 rows/node resident "
