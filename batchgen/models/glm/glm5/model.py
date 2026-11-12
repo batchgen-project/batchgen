@@ -1466,8 +1466,11 @@ class Glm5PrefillMoEBuffers:
         )
         # Second S1 output for the unfused backend (gate and up are separate
         # dense GEMMs there); allocated on first use so the incumbent arm
-        # never pays for it.
+        # never pays for it. The fp32 SFB stacks follow the same rule.
         self.s1_partner = None
+        self.sfb_gate = None
+        self.sfb_up = None
+        self.sfb_down = None
 
         self.expert_counts = torch.zeros(
             self.num_experts, dtype=torch.int32, device=device
@@ -1549,6 +1552,25 @@ class Glm5PrefillMoEBuffers:
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+
+    def ensure_deepgemm_scale_stacks(self, n_blocks: int, k_blocks: int):
+        """Persistent fp32 SFB stacks for the m-grouped backend.
+
+        Weight scales are small per-expert resident tensors in separate
+        allocations (they do not ride the ring), so the dense [E, ...] stacks
+        are filled by one stack-copy per projection at each layer's first
+        forward chunk instead of a dense view.
+        """
+        if getattr(self, "sfb_gate", None) is None:
+            E = self.num_experts
+            self.sfb_gate = torch.empty(
+                E, n_blocks, k_blocks, dtype=torch.float32, device=self.device
+            )
+            self.sfb_up = torch.empty_like(self.sfb_gate)
+            self.sfb_down = torch.empty(
+                E, k_blocks, n_blocks, dtype=torch.float32, device=self.device
+            )
+        return self.sfb_gate, self.sfb_up, self.sfb_down
 
 
 # ============================================================================
@@ -3106,22 +3128,30 @@ class Glm5MoE(nn.Module):
                     )
                 (gate_v, gate_s, up_v, up_s, down_v, down_s) = views
 
-                def _scale_stack(members, n_blocks, k_blocks):
-                    stack = dense_group_view(members)[:, :n_blocks, :k_blocks]
-                    return (
-                        stack if stack.is_contiguous() else stack.contiguous()
-                    )
-
                 # Block counts come from the acquired [N, K] ring views.
                 n_blk = gate_v[0].shape[0] // 128
                 k_blk = gate_v[0].shape[1] // 128
+                sfb_gate, sfb_up, sfb_down = buf.ensure_deepgemm_scale_stacks(
+                    n_blk, k_blk
+                )
+
+                def _fill_scales(stack, members, rows, cols):
+                    # Weight scales are per-expert resident tensors in
+                    # separate allocations; copy them into the persistent
+                    # stack (one stack op per projection per layer).
+                    torch.stack(
+                        [member[:rows, :cols] for member in members],
+                        out=stack,
+                    )
+                    return stack
+
                 deepgemm_weights = (
                     dense_group_view(gate_v),
-                    _scale_stack(gate_s, n_blk, k_blk),
+                    _fill_scales(sfb_gate, gate_s, n_blk, k_blk),
                     dense_group_view(up_v),
-                    _scale_stack(up_s, n_blk, k_blk),
+                    _fill_scales(sfb_up, up_s, n_blk, k_blk),
                     dense_group_view(down_v),
-                    _scale_stack(down_s, k_blk, n_blk),
+                    _fill_scales(sfb_down, down_s, k_blk, n_blk),
                 )
                 self._prefill_deepgemm_weights = deepgemm_weights
             row_align = deepgemm_m_alignment()
