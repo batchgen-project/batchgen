@@ -19,14 +19,17 @@ Key differences from DeepSeek V3 PSM:
 
 import gc
 import logging
+import operator
 import os
 import time
 import types
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
 from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
+from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.phase_lifecycle import (
     AdmitContext,
     ExitMode,
@@ -51,6 +54,103 @@ def _synchronize_prefill_preloads():
     """Keep one rank's forward from overlapping another rank's preload."""
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+# Reserved sequence-id space for the startup decode probe. Real sequence ids
+# are non-negative worker-assigned globals; GLM-5's prefix-pool segment pseudo
+# sids are ``-(rank + 1 + world_size * counter)`` (batchgen_worker.py
+# ``_next_pool_segment_sid``) — small negatives that grow by one per segment.
+# Probing from -3_000_000_001 downward is outside both for any realistic
+# campaign, and the probe's synthetic surfaces own their whole seq->slot map,
+# so no shared pool can collide with them.
+_GLM5_PROBE_SEQ_ID_BASE = -3_000_000_001
+
+# Per-token fp32 scale bytes of DeepGEMM's page-split FP8 index-key carrier.
+# The authoritative constant is
+# ``batchgen_kernels.attention.dsa.indexer_k_quant.SCALE_BYTES_PER_TOKEN``;
+# it is not imported here because that package's ``__init__`` needs triton
+# (absent on CPU test environments), and the layout itself is a fixed kernel
+# ABI the real writer validates (``cache_is_page_split``) before any launch.
+_DSA_PAGE_SPLIT_SCALE_BYTES = 4
+
+
+class StartupDecodeProbeError(RuntimeError):
+    """The startup decode probe cannot honor its cap-width contract."""
+
+
+@dataclass(frozen=True)
+class StartupDecodeProbePlan:
+    """The bounded synthetic decode shape used by the startup probe."""
+
+    batch_size: int
+    past_tokens: int = 1
+
+
+def plan_startup_decode_probe(
+    padding_bsz: int, configured_cap: int
+) -> StartupDecodeProbePlan:
+    """Validate and describe one cap-width synthetic decode step.
+
+    Local copy of the gpt-oss/kimi-linear probe seam
+    (batchgen/models/moonshotai/kimi_linear/Parallel_Strategy_Manager.py):
+    model families do not import one another's modules, so the helper is
+    duplicated here rather than cross-imported.
+    """
+    try:
+        if isinstance(padding_bsz, bool) or isinstance(configured_cap, bool):
+            raise TypeError("bool is not a batch-width integer")
+        requested = operator.index(padding_bsz)
+        cap = operator.index(configured_cap)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "startup decode probe requires integer padding_bsz and configured cap"
+        ) from exc
+    if requested <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe requires padding_bsz > 0, got {requested}"
+        )
+    if cap <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe has no configured positive cap (got {cap})"
+        )
+    if requested > cap:
+        raise StartupDecodeProbeError(
+            "startup decode probe width exceeds configured decode cap: "
+            f"padding_bsz={requested}, configured_cap={cap}"
+        )
+    return StartupDecodeProbePlan(batch_size=requested)
+
+
+def uniform_expert_assignment(
+    num_rows: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device=None,
+) -> torch.Tensor:
+    """Return a row-major, round-robin top-k assignment over all experts.
+
+    Local copy of the gpt-oss/kimi-linear helper (same rationale as
+    ``plan_startup_decode_probe``).
+    """
+    try:
+        if any(isinstance(value, bool) for value in (num_rows, num_experts, top_k)):
+            raise TypeError("bool is not an assignment dimension")
+        rows = operator.index(num_rows)
+        experts = operator.index(num_experts)
+        k = operator.index(top_k)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "uniform expert assignment requires integer dimensions"
+        ) from exc
+    if rows < 0 or experts <= 0 or k <= 0 or k > experts:
+        raise StartupDecodeProbeError(
+            "invalid uniform expert assignment shape: "
+            f"rows={rows}, experts={experts}, top_k={k}"
+        )
+    row_starts = (torch.arange(rows, device=device, dtype=torch.long) * k) % experts
+    offsets = torch.arange(k, device=device, dtype=torch.long)
+    return (row_starts[:, None] + offsets[None, :]) % experts
 
 
 class GLM5ParallelStrategyManager:
@@ -902,9 +1002,541 @@ class GLM5ParallelStrategyManager:
         from .model import Glm5MoE
         Glm5MoE._rank_token_counts = counts
 
+    def startup_decode_probe_step(self, padding_bsz: int) -> None:
+        """Run one cap-width synthetic DSA decode step for startup accounting.
+
+        The worker owns sequence admission, paged-KV pool pages and the
+        per-step decode metadata for real rows; at this startup seam none of
+        those rows exist yet. The probe therefore:
+
+        - installs a tiny synthetic PRIMARY paged-KV surface holding the MLA
+          latent geometry (``kv_lora_rank + qk_rope_head_dim`` per token, one
+          KV head, bf16) at the deployment page size (never a guessed one).
+          Physical pages are O(batch): the page-table entry that holds each
+          row's write position maps to that row's own page, and every history
+          entry maps to one shared read-only zero page (the probe writes only
+          the new token, so sharing history pages is race-free at any
+          synthetic context length);
+        - installs a synthetic AUXILIARY index-key surface with the same page
+          geometry in the layout the deployment allocates: DeepGEMM's
+          page-split FP8 carrier (``index_head_dim`` e4m3 bytes + 4 scale
+          bytes per token, uint8) for the releases whose geometry reuses
+          top-k across layers (GLM-5.2/5.3, the same
+          ``SPARSE_PREFILL_MODEL_TYPES`` predicate the host-KV profiles key
+          on), and the bf16 AoS carrier for GLM-5/5.1. Both surfaces expose
+          the ``_gpu_page_table_manager.seq_id_to_slot`` indirection the
+          eager selector resolves (reserved synthetic sequence ids,
+          ``_GLM5_PROBE_SEQ_ID_BASE`` downward);
+        - makes every row's context ``index_topk + 1`` tokens, because a row
+          at or under ``index_topk`` runs the dense all-short FA3 path and
+          the probe would never execute the sparse selection kernels (the
+          fused index-K writer, the page-split top-k scorer / AoS scoring
+          pipeline and the selected-token sparse FA3 attention all run REAL
+          at cap width). On GLM-5.2/5.3 the skip_topk shared layers reuse the
+          carried top-k of the preceding full layer, exactly as in serving.
+          Host-append callbacks stay None for both regions, so nothing is
+          appended host-side. Honest exclusion: the scorer's context width is
+          ``index_topk + 1``, the minimal long context, so transients that
+          grow with a longer decode context are not measured here;
+        - forces the eager decode path for the whole step
+          (``batchgen_debug.glm5_dsa_mode/glm5_moe_mode = "eager"``): graph
+          replays bind the worker's real page tables and shared graph
+          buffers, which this synthetic step must not touch. At the startup
+          seam no decode graph exists yet anyway — the probe runs BEFORE
+          ``_warmup_cuda_graphs`` in the persistent lifecycle — and the
+          full finally-restore below leaves the instance exactly as the
+          capture found it;
+        - drives every configured decode MoE layer at a fabricated
+          round-robin uniform top-k routing through the real EP collectives
+          (symmetric shapes on all ranks) by patching the layer's
+          ``_gate_decode`` in its instance dict (no gate parameter changes,
+          no retained probe-only attribute), and finishes the step through
+          the LM head and ``sample_tokens``.
+
+        Width semantics: GLM-5 decode attention is pure DP — every rank holds
+        its own ``padding_bsz`` rows (the per-rank cap the worker configures
+        via ``configure_decoding(padding_bsz=...)``), and the MoE path
+        all-gathers ``num_tokens_per_rank == padding_bsz`` rows per rank, the
+        exact ``set_num_tokens_per_rank`` layout the worker syncs per step.
+
+        Named refusals (StartupDecodeProbeError): no CUDA; width above the
+        configured cap; missing model or decode phase; a decode instance
+        without the DSA indexer attribute (``use_dense_mla`` decode is not
+        probed); missing/invalid DSA indexer geometry or disagreeing
+        per-layer ``index_head_dim``; a skip_topk first layer (no carried
+        top-k to reuse); no configured decode MoE layers; an EP-unconfigured,
+        offloaded or partially resident (streamed) decode MoE — a streamed
+        layer's experts flow through the worker's H2D copy engine, which has
+        no admission-independent probe surface; a missing EP communicator in
+        a multi-rank world; and no deployment page size.
+        """
+        if not torch.cuda.is_available():
+            raise StartupDecodeProbeError(
+                "startup decode probe requires CUDA; refusing to measure on CPU"
+            )
+
+        configured_cap = getattr(self, "padding_bsz", None)
+        if configured_cap is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires configure_decoding() to set a cap"
+            )
+        plan = plan_startup_decode_probe(padding_bsz, configured_cap)
+        plan_bsz = plan.batch_size
+
+        model = getattr(self, "model", None)
+        if model is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires a configured decode model"
+            )
+        if getattr(AttnWrapperBase, "phase", None) != "decode":
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the decode phase to be live"
+            )
+        if getattr(GLM5ExpertWrapper, "phase", None) != "decode":
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the expert wrappers in decode phase"
+            )
+
+        layers = list(model.model.layers)
+        attn_wrappers = [
+            layer.self_attn for layer in layers
+            if isinstance(layer.self_attn, GLM5AttnWrapper)
+        ]
+        if len(attn_wrappers) != len(layers):
+            raise StartupDecodeProbeError(
+                "startup decode probe requires every attention module wrapped "
+                "as GLM5AttnWrapper for decode"
+            )
+
+        # GLM-5 decode is the DSA path: layers carry an ``indexer`` attribute
+        # (a live Glm5Indexer on full layers, None on GLM-5.2/5.3 skip_topk
+        # shared layers). A ``use_dense_mla`` instance constructs no indexer
+        # attribute at all and decodes on the dense FlashMLA fallback, which
+        # this probe does not fabricate surfaces for.
+        dsa_attr_wrappers = [
+            wrapper for wrapper in attn_wrappers
+            if hasattr(wrapper.module, "indexer")
+        ]
+        if not dsa_attr_wrappers:
+            raise StartupDecodeProbeError(
+                "startup decode probe covers the GLM-5 DSA decode path only; "
+                "a use_dense_mla decode instance has no indexer to probe"
+            )
+        if len(dsa_attr_wrappers) != len(attn_wrappers):
+            raise StartupDecodeProbeError(
+                "startup decode probe found a mix of DSA and dense-MLA "
+                "attention layers; one synthetic surface cannot serve both"
+            )
+        indexer_modules = [
+            wrapper.module.indexer for wrapper in attn_wrappers
+            if wrapper.module.indexer is not None
+        ]
+        if not indexer_modules:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no live DSA indexer layer: every "
+                "layer is skip_topk, so no top-k is ever computed to reuse"
+            )
+        if getattr(attn_wrappers[0].module, "skip_topk", False):
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the first attention layer to "
+                "compute DSA top-k; a skip_topk first layer has no carried "
+                "top-k to reuse"
+            )
+        dsa_index_topk = 0
+        dsa_index_head_dim = 0
+        for indexer in indexer_modules:
+            topk = int(getattr(indexer, "index_topk", 0) or 0)
+            head_dim = int(getattr(indexer, "index_head_dim", 0) or 0)
+            if topk <= 0 or head_dim <= 0:
+                raise StartupDecodeProbeError(
+                    "startup decode probe requires positive DSA indexer "
+                    f"geometry, got index_topk={topk}, "
+                    f"index_head_dim={head_dim}"
+                )
+            if dsa_index_head_dim not in (0, head_dim):
+                raise StartupDecodeProbeError(
+                    "startup decode probe found disagreeing DSA "
+                    f"index_head_dim values ({dsa_index_head_dim} vs "
+                    f"{head_dim}); one auxiliary carrier cannot serve both"
+                )
+            dsa_index_topk = max(dsa_index_topk, topk)
+            dsa_index_head_dim = head_dim
+
+        moe_blocks = [
+            layer.mlp for layer in layers
+            if getattr(getattr(layer, "mlp", None), "gate", None) is not None
+            and hasattr(layer.mlp, "num_experts_per_tok")
+        ]
+        if not moe_blocks:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no configured decode MoE layers"
+            )
+        for moe in moe_blocks:
+            persistent = getattr(moe, "num_persistent_local_experts", None)
+            per_rank = getattr(moe, "experts_per_rank", None)
+            if persistent is None or per_rank is None:
+                raise StartupDecodeProbeError(
+                    "startup decode probe requires EP-configured decode MoE "
+                    "layers (_configure_decode_moe has not run)"
+                )
+            if getattr(moe, "enable_ep_offloading", False) or persistent != per_rank:
+                raise StartupDecodeProbeError(
+                    "startup decode probe supports fully resident local-expert "
+                    "decode MoE only; a streamed/offloaded decode MoE layer "
+                    "has no resident shard to probe without the worker's H2D "
+                    "streamer"
+                )
+            if self.world_size > 1 and getattr(moe, "comm", None) is None:
+                raise StartupDecodeProbeError(
+                    "startup decode probe requires the configured EP "
+                    "communicator on every decode MoE layer"
+                )
+
+        device = self.engine_config.Basic_Config.device_torch
+
+        # MLA latent geometry comes from the live attention module: the paged
+        # cache stores one 1-head latent token of kv_lora_rank + qk_rope_head_dim
+        # (what the selector's paged write stores and what the FA3 sparse
+        # attention reads back through the selected physical token ids).
+        sample_mla = attn_wrappers[0].module
+        latent_dim = int(getattr(sample_mla, "kv_lora_rank", 0)) + int(
+            getattr(sample_mla, "qk_rope_head_dim", 0)
+        )
+        if latent_dim <= 0:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires positive MLA latent geometry"
+            )
+
+        num_layers = len(layers)
+        synthetic_sids = [_GLM5_PROBE_SEQ_ID_BASE - i for i in range(plan_bsz)]
+
+        # The decode kernels support only the deployment page size; at this
+        # startup seam the worker's manager may not be installed on the
+        # wrapper, so the page size comes from the ENGINE CONFIG, with the
+        # live manager honored when present. The real DSA deployment asserts
+        # equal primary/aux page sizes (DualKVCacheCoordinator), so one value
+        # serves both synthetic regions.
+        source_config = getattr(
+            AttnWrapperBase.gpu_paged_kv_manager, "config", None
+        )
+        page_size = int(
+            getattr(source_config, "page_size_tokens", 0)
+            or getattr(
+                getattr(self.engine_config, "Device_Paged_KV_Config", None),
+                "page_size",
+                0,
+            )
+            or 0
+        )
+        if page_size <= 0:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no deployment page size"
+            )
+
+        # Aux carrier layout, from the same release geometry the deployment
+        # allocates from (releases.py): a top-k-reusing checkpoint (GLM-5.2 /
+        # GLM-5.3) stores page-split FP8 index keys, GLM-5/5.1 stores bf16
+        # AoS. The eager writer and scorer both dispatch on the cache layout
+        # (``cache_is_page_split``), so a mis-declared carrier fails loud in
+        # the real kernels rather than silently probing the wrong format.
+        page_split_aux = (
+            getattr(self.loaded_model_config, "model_type", None)
+            in SPARSE_PREFILL_MODEL_TYPES
+        )
+        if page_split_aux:
+            aux_carrier_dim = dsa_index_head_dim + _DSA_PAGE_SPLIT_SCALE_BYTES
+            aux_dtype = torch.uint8
+        else:
+            aux_carrier_dim = dsa_index_head_dim
+            aux_dtype = torch.bfloat16
+
+        # Synthetic decode context: the eager DSA step routes any row with
+        # cache_seqlen <= index_topk to the dense all-short path, so the probe
+        # makes every row MINIMALLY LONG (index_topk + 1 tokens): the fused
+        # index-K writer, the top-k scorer and the selected-token sparse FA3
+        # attention all execute with their real cap-width shapes.
+        probe_past = dsa_index_topk
+        pages_per_row = (probe_past + 1 + page_size - 1) // page_size
+        write_entry = probe_past // page_size
+
+        def _aliased_page_table() -> torch.Tensor:
+            """[plan_bsz, pages_per_row] int32 over plan_bsz + 1 real pages.
+
+            The entry holding the write position maps to that row's own page
+            (1 + row); every history entry maps to the shared read-only zero
+            page 0. The probe writes only the new token, so sharing history
+            pages is race-free, and the synthetic caches stay O(batch) pages
+            at any synthetic context length (the index_topk + 1 context would
+            otherwise need O(batch * index_topk) real tokens).
+            """
+            table = torch.zeros(
+                plan_bsz, pages_per_row, dtype=torch.int32, device=device
+            )
+            table[:, write_entry] = torch.arange(
+                1, plan_bsz + 1, dtype=torch.int32, device=device
+            )
+            return table
+
+        slot_map = {sid: row for row, sid in enumerate(synthetic_sids)}
+
+        class _SyntheticPagedKV:
+            """Minimal PRIMARY paged-KV surface for the GLM-5 DSA decode.
+
+            The eager selector (``build_glm5_dsa_flashmla_inputs``) consumes
+            exactly ``.device``, ``.config.page_size_tokens``,
+            ``._gpu_page_table_manager.seq_id_to_slot`` (the batch-order slot
+            build), ``update_layer_decode_new_token(..., slot_indices=...)``
+            and ``get_layer_kv_with_page_table(layer_idx)``. MLA stores no V,
+            so no V cache is allocated and None is returned in its place.
+            """
+
+            def __init__(self):
+                self.device = device
+                self.page_size = page_size
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size
+                )
+                self.page_table = _aliased_page_table()
+                self._gpu_page_table_manager = types.SimpleNamespace(
+                    seq_id_to_slot=dict(slot_map)
+                )
+                # One latent head per token: [L, pages, page_size, 1, latent].
+                self.k_cache = torch.zeros(
+                    (num_layers, plan_bsz + 1, page_size, 1, latent_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+
+            def update_layer_decode_new_token(
+                self,
+                *,
+                k_tensor,
+                v_tensor,
+                sequence_lengths,
+                layer_idx,
+                slot_indices=None,
+                **_kwargs,
+            ):
+                if v_tensor is not None:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe synthetic KV holds the MLA "
+                        "latent only; no V cache exists to write"
+                    )
+                positions = sequence_lengths.to(dtype=torch.long)
+                if slot_indices is None:
+                    rows = torch.arange(
+                        positions.shape[0], device=self.page_table.device,
+                        dtype=torch.long,
+                    )
+                else:
+                    rows = slot_indices.to(
+                        dtype=torch.long, device=self.page_table.device,
+                    )
+                page_entries = positions // self.page_size
+                offsets = positions % self.page_size
+                pages = self.page_table[rows].gather(
+                    1, page_entries[:, None]
+                ).squeeze(1)
+                self.k_cache[layer_idx, pages, offsets] = k_tensor[:, 0].to(
+                    self.k_cache.dtype
+                )
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return self.k_cache[layer_idx], None, self.page_table
+
+        class _SyntheticPagedKVAux:
+            """Minimal AUXILIARY (index-key) surface for the GLM-5 DSA decode.
+
+            The eager selector consumes exactly ``.device``,
+            ``.config.page_size_tokens``, ``.config.kv_dtype`` /
+            ``.config.k_head_dim`` (``aux_manager_applies_hadamard`` builds
+            its meta probe from them), ``._gpu_page_table_manager
+            .seq_id_to_slot`` and ``get_layer_kv_with_page_table(layer_idx)``;
+            the write goes through ``write_aux_indexer_k``, which dispatches
+            on the cache layout itself. Page-split FP8 zero bytes decode to
+            all-zero keys and scales — finite, so the ReLU-gated scorer and
+            the sparse attention stay NaN-free; bf16 AoS zeros are trivially
+            finite.
+            """
+
+            def __init__(self):
+                self.device = device
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size,
+                    kv_dtype=aux_dtype,
+                    k_head_dim=aux_carrier_dim,
+                )
+                self.page_table = _aliased_page_table()
+                self._gpu_page_table_manager = types.SimpleNamespace(
+                    seq_id_to_slot=dict(slot_map)
+                )
+                self.k_cache = torch.zeros(
+                    (num_layers, plan_bsz + 1, page_size, 1, aux_carrier_dim),
+                    dtype=aux_dtype,
+                    device=device,
+                )
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return self.k_cache[layer_idx], None, self.page_table
+
+        saved_attention_state = {
+            name: getattr(AttnWrapperBase, name)
+            for name in (
+                "gpu_paged_kv_manager",
+                "gpu_paged_kv_manager_aux",
+                "cache_seqlens",
+                "max_seqlen",
+                "cur_batch",
+                "position_ids",
+                "attention_mask",
+                "kv_append_callback",
+                "kv_append_callback_aux",
+                "batchgen_debug",
+            )
+        }
+        # GLM-5-owned per-step class state the worker normally resets before
+        # every decode step; the probe is its own step, so it sets and
+        # restores all of it.
+        saved_glm5_wrapper_state = {
+            name: getattr(GLM5AttnWrapper, name)
+            for name in (
+                "_dsa_short_count",
+                "_dsa_prev_topk_indices",
+                "glm5_decode_primary_slot_indices",
+                "glm5_decode_aux_slot_indices",
+                "glm5_dsa_graph_forward_state",
+                "glm5_dsa_flashmla_graph_metadata",
+            )
+        }
+        saved_rank_token_counts = Glm5MoE._rank_token_counts
+        saved_moe_ntp = [
+            (moe, getattr(moe, "num_tokens_per_rank", None))
+            for moe in moe_blocks
+        ]
+        patched_gates = []
+
+        try:
+            # Force the eager decode path for both the DSA attention and the
+            # MoE: graph replays bind the worker's real page tables and
+            # shared graph buffers, which this synthetic step must not touch.
+            # The configured batch debug dict is restored below.
+            AttnWrapperBase.batchgen_debug = {
+                "glm5_dsa_mode": "eager",
+                "glm5_moe_mode": "eager",
+            }
+            # Every synthetic row is long, so the worker's per-step short-row
+            # hint is 0 and no selector falls back to a host-side reduction.
+            GLM5AttnWrapper._dsa_short_count = 0
+            GLM5AttnWrapper._dsa_prev_topk_indices = None
+            GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+            GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
+            GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+            GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
+            # No rank padding in the probe: every rank's plan_bsz rows are
+            # real, so dispatch masks nothing.
+            Glm5MoE._rank_token_counts = None
+
+            AttnWrapperBase.gpu_paged_kv_manager = _SyntheticPagedKV()
+            AttnWrapperBase.gpu_paged_kv_manager_aux = _SyntheticPagedKVAux()
+            AttnWrapperBase.cache_seqlens = torch.full(
+                (plan_bsz,), probe_past + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            AttnWrapperBase.max_seqlen = probe_past + 1
+            AttnWrapperBase.cur_batch = list(synthetic_sids)
+            AttnWrapperBase.position_ids = torch.full(
+                (plan_bsz, 1), probe_past,
+                dtype=torch.long,
+                device=device,
+            )
+            AttnWrapperBase.attention_mask = None
+            # Both Host-append callbacks stay None for the probe; the eager
+            # selector then appends nothing host-side.
+            AttnWrapperBase.kv_append_callback = None
+            AttnWrapperBase.kv_append_callback_aux = None
+
+            # The worker syncs this scalar before every decode step; GLM-5
+            # decode is pure DP, so every rank drives its full plan_bsz rows.
+            for moe in moe_blocks:
+                if hasattr(moe, "set_num_tokens_per_rank"):
+                    moe.set_num_tokens_per_rank(plan_bsz)
+
+            # Make the routed workload uniform without changing any gate
+            # parameter or retaining a probe-only module attribute: the
+            # decode gate seam is the layer's ``_gate_decode`` (the gate
+            # module's ``forward`` serves prefill only).
+            for moe in moe_blocks:
+                gate = moe.gate
+                num_experts = int(gate.num_experts)
+                top_k = int(gate.num_experts_per_tok)
+                original = moe.__dict__.get("_gate_decode", None)
+
+                def _uniform_gate_decode(
+                    x,
+                    *,
+                    _num_experts=num_experts,
+                    _top_k=top_k,
+                ):
+                    rows = x.reshape(-1, x.shape[-1]).shape[0]
+                    topk_idx = uniform_expert_assignment(
+                        rows,
+                        _num_experts,
+                        _top_k,
+                        device=x.device,
+                    ).to(torch.int32)
+                    topk_weight = torch.full(
+                        (rows, _top_k),
+                        1.0 / _top_k,
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+                    return topk_idx, topk_weight
+
+                moe.__dict__["_gate_decode"] = _uniform_gate_decode
+                patched_gates.append((moe, original))
+
+            input_ids = torch.zeros(
+                (plan_bsz, 1), dtype=torch.long, device=device
+            )
+            position_ids = torch.full(
+                (plan_bsz, 1), probe_past,
+                dtype=torch.long,
+                device=device,
+            )
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+            )
+            logits = outputs.logits[:, -1, :]
+            from batchgen.sampling import sample_tokens
+
+            sampled_tokens = sample_tokens(
+                logits, temperature=1.0, top_p=1.0, top_k=0
+            )
+            del sampled_tokens, logits, outputs
+            del position_ids, input_ids
+        finally:
+            for moe, original in reversed(patched_gates):
+                if original is None:
+                    moe.__dict__.pop("_gate_decode", None)
+                else:
+                    moe.__dict__["_gate_decode"] = original
+            for moe, ntp in saved_moe_ntp:
+                if ntp is not None and hasattr(moe, "set_num_tokens_per_rank"):
+                    moe.set_num_tokens_per_rank(ntp)
+            Glm5MoE._rank_token_counts = saved_rank_token_counts
+            for name, value in saved_glm5_wrapper_state.items():
+                setattr(GLM5AttnWrapper, name, value)
+            for name, value in saved_attention_state.items():
+                setattr(AttnWrapperBase, name, value)
+
     def _init_decoding_padding_bsz(self, padding_bsz):
         env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
         max_rank_bsz = int(env_max_bsz) if env_max_bsz else padding_bsz
+        # The configured per-rank decode cap; startup_decode_probe_step
+        # validates its requested width against it.
+        self.padding_bsz = max_rank_bsz
         if self.rank == 0:
             logging.info(f"[DECODE] Padding batch size: {max_rank_bsz}")
 
