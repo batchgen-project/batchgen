@@ -3011,8 +3011,10 @@ class Glm5MoE(nn.Module):
                 stack = dense_group_view(views)[:, :n_blocks, :k_blocks]
                 return stack if stack.is_contiguous() else stack.contiguous()
 
-            n_blk = self.config.moe_intermediate_size // 128
-            k_blk = self.config.hidden_size // 128
+            # Block counts come from the acquired weight tensors themselves
+            # ([N, K] fp8 ring views), not from the model config.
+            n_blk = gate_views[0].shape[0] // 128
+            k_blk = gate_views[0].shape[1] // 128
             self._prefill_deepgemm_weights = (
                 dense_group_view(gate_views),
                 _scale_stack(gate_scale_views, n_blk, k_blk),
