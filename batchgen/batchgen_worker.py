@@ -12504,6 +12504,14 @@ class BatchGenWorker:
 			default_reason,
 		)
 
+	def _prefill_host_view_is_dual(self) -> bool:
+		# S5a rewrite carve-out #5 (spec §S5b F3 block): the engine module must
+		# stay importable without the CUDA/native kv_cache chain, so the
+		# DualHostKVCoordinator isinstance stays on the worker (this file
+		# already imports the class) and the moved body reads this predicate
+		# through the rebound self.
+		return isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator)
+
 	def _prefill_pool_segment_host_pages(self) -> int:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_prefill_engine", None)

@@ -353,7 +353,10 @@ def _layout_worker(*, dual, engine_layers, indexer_layers, indexer_dim,
                    cached=None):
     """A fake worker holding only what ``_prefill_pool_layout`` reads."""
     names = ["_prefill_pool_layout", "_prefill_pool_psm_layout"]
-    wanted = [copy.deepcopy(_worker_method_node(name)) for name in names]
+    # Worker-shaped predicate (S5a carve-out #5): lifted engine bodies call it
+    # on the rebound self, so bind it worker-shaped rather than engine-shaped.
+    predicate = copy.deepcopy(_worker_method_node("_prefill_host_view_is_dual"))
+    wanted = [copy.deepcopy(_worker_method_node(name)) for name in names] + [predicate]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {"DualHostKVCoordinator": _FakeDualHostKVCoordinator}
     exec(compile(module, str(ENGINE), "exec"), namespace)
@@ -387,6 +390,9 @@ def _layout_worker(*, dual, engine_layers, indexer_layers, indexer_dim,
                 worker,
             ),
         )
+    worker._prefill_host_view_is_dual = types.MethodType(
+        namespace["_prefill_host_view_is_dual"], worker
+    )
     geometry = SimpleNamespace(
         num_layers=kv_num_layers, logical_to_physical_layer=kv_layer_map)
     return worker, geometry

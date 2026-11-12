@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 from batchgen.prefill.prepack import build_prefill_micro_batches
 
 
@@ -1049,7 +1048,7 @@ class PrefillEngine:
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
-        if not isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+        if not self._prefill_host_view_is_dual():
             return True, (), 0
         psm_layout = self._prefill_pool_psm_layout()
         with_v = bool(psm_layout and int(psm_layout["v_head_dim"]) > 0)
