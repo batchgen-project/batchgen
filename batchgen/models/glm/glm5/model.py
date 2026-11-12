@@ -145,6 +145,29 @@ def _glm5_moe_debug_mode() -> Optional[str]:
     return mode if mode in {"graph", "eager"} else None
 
 
+def _glm5_prefill_grouped_gemm_backend() -> str:
+    """Grouped prefill S1/S3 GEMM backend.
+
+    Default ``deepgemm`` runs the adopted m-grouped contiguous backend over
+    dense field-major ring views; ``cute_ptrs`` keeps the incumbent pointer
+    kernels for A/B comparisons (batchgen_debug key ``prefill_grouped_gemm``,
+    batch-level like every other debug key). A mistyped value is refused
+    rather than read as a default, because a silently ignored arm switch
+    would make the two arms the same run.
+    """
+    value = _glm5_moe_debug_dict().get("prefill_grouped_gemm")
+    if value is None:
+        return "deepgemm"
+    if not isinstance(value, str):
+        raise ValueError("prefill_grouped_gemm must be a string")
+    mode = value.strip().lower()
+    if mode not in {"deepgemm", "cute_ptrs"}:
+        raise ValueError(
+            f"prefill_grouped_gemm must be 'deepgemm' or 'cute_ptrs', got {value!r}"
+        )
+    return mode
+
+
 def _glm5_moe_router_mode() -> str:
     """Router GEMM implementation for eager GLM-5 MoE decode.
 
@@ -1435,9 +1458,16 @@ class Glm5PrefillMoEBuffers:
         self.intermediate_size = int(intermediate_size)
         self.topk = int(topk)
         self.device = device
+        # Sized for the strictest backend row alignment (the m-grouped
+        # contiguous GEMM needs 128-row group segments; the CuTe ptrs arm's
+        # 64-aligned layout always fits inside it).
         self.capacity = _glm5_ragged_row_capacity(
-            self.token_window, self.topk, self.num_experts
+            self.token_window, self.topk, self.num_experts, row_align=128
         )
+        # Second S1 output for the unfused backend (gate and up are separate
+        # dense GEMMs there); allocated on first use so the incumbent arm
+        # never pays for it.
+        self.s1_partner = None
 
         self.expert_counts = torch.zeros(
             self.num_experts, dtype=torch.int32, device=device
@@ -1509,6 +1539,16 @@ class Glm5PrefillMoEBuffers:
             self.intermediate_size,
             total_bytes / (1024**3),
         )
+
+    def ensure_s1_partner(self) -> None:
+        """Allocate the unfused backend's second S1 output on first use."""
+        if self.s1_partner is None:
+            self.s1_partner = torch.empty(
+                self.capacity,
+                self.intermediate_size,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
 
 
 # ============================================================================
@@ -2890,6 +2930,9 @@ class Glm5MoE(nn.Module):
         stage = stage_bank[layer_idx]
         keys = []
         prototypes = None
+        gate_views, gate_scale_views = [], []
+        up_views, up_scale_views = [], []
+        down_views, down_scale_views = [], []
         core_engine = self.experts[0].core_engine
         shared = self.shared_experts
         shared_key = None
@@ -2920,6 +2963,12 @@ class Glm5MoE(nn.Module):
                 stage[3, expert_idx] = up_scale.data_ptr()
                 stage[4, expert_idx] = down.data_ptr()
                 stage[5, expert_idx] = down_scale.data_ptr()
+                gate_views.append(gate)
+                gate_scale_views.append(gate_scale)
+                up_views.append(up)
+                up_scale_views.append(up_scale)
+                down_views.append(down)
+                down_scale_views.append(down_scale)
                 if prototypes is None:
                     prototypes = (
                         gate,
@@ -2951,6 +3000,27 @@ class Glm5MoE(nn.Module):
         self._prefill_prepared_keys = keys
         self._prefill_weight_prototypes = prototypes
         self._prefill_shared_key = shared_key
+        self._prefill_deepgemm_weights = None
+        if _glm5_prefill_grouped_gemm_backend() == "deepgemm":
+            # Built once per acquired layer: dense [E, N, K] views over the
+            # field-major ring (pointer-verified, fails loud on a non-dense
+            # ring) and exact-extent fp32 scale stacks.
+            from batchgen.moe.grouped_fp8_deepgemm_moe import dense_group_view
+
+            def _scale_stack(views, n_blocks, k_blocks):
+                stack = dense_group_view(views)[:, :n_blocks, :k_blocks]
+                return stack if stack.is_contiguous() else stack.contiguous()
+
+            n_blk = self.config.moe_intermediate_size // 128
+            k_blk = self.config.hidden_size // 128
+            self._prefill_deepgemm_weights = (
+                dense_group_view(gate_views),
+                _scale_stack(gate_scale_views, n_blk, k_blk),
+                dense_group_view(up_views),
+                _scale_stack(up_scale_views, n_blk, k_blk),
+                dense_group_view(down_views),
+                _scale_stack(down_scale_views, k_blk, n_blk),
+            )
 
     def _queue_prefill_grouped_releases(self) -> None:
         """Transfer this layer's acquired slots to the fenced retire queue."""
@@ -3028,6 +3098,25 @@ class Glm5MoE(nn.Module):
         topk = self.num_experts_per_tok
         output = torch.empty_like(hidden_flat)
 
+        backend = _glm5_prefill_grouped_gemm_backend()
+        deepgemm_weights = getattr(self, "_prefill_deepgemm_weights", None)
+        if backend == "deepgemm" and deepgemm_weights is None:
+            raise RuntimeError(
+                "GLM-5 grouped prefill: the m-grouped backend is selected but "
+                "the layer's dense weight views were not prepared"
+            )
+        if backend == "deepgemm":
+            from batchgen.moe.grouped_fp8_deepgemm_moe import (
+                build_grouped_layout,
+                deepgemm_m_alignment,
+                grouped_fp8_deepgemm_gemm,
+            )
+
+            row_align = deepgemm_m_alignment()
+            buf.ensure_s1_partner()
+        else:
+            row_align = 64
+
         gate_w, gate_scale, up_w, up_scale, down_w, down_scale = prototypes
         for start, end, topk_weights, topk_indices_i32 in (
             _glm5_iter_prefill_gate_chunks(
@@ -3047,6 +3136,7 @@ class Glm5MoE(nn.Module):
                 buf.expert_counters,
                 buf.cu_seqlens,
                 buf.topk_pos[: window_tokens * topk],
+                row_align=row_align,
             )
             _glm5_act_quant_ragged(
                 buf.dispatched_x,
@@ -3054,7 +3144,66 @@ class Glm5MoE(nn.Module):
                 cu_seqlens,
                 buf.x_fp8,
                 buf.x_scale,
+                row_align=row_align,
             )
+            if backend == "deepgemm":
+                gate_d, gate_sfb, up_d, up_sfb, down_d, down_sfb = (
+                    deepgemm_weights
+                )
+                # Static per-chunk row bound (host-known), so no device value
+                # is read on the hot path; rows past the reserved layout keep
+                # grouped id -1 and are skipped by the GEMM scheduler.
+                m_chunk = min(
+                    buf.capacity,
+                    _glm5_ragged_row_capacity(
+                        window_tokens, topk, buf.num_experts,
+                        row_align=row_align,
+                    ),
+                )
+                grouped_layout = build_grouped_layout(
+                    counts, cu_seqlens, m_chunk, row_align, validate=False
+                )
+                x_fp8 = buf.x_fp8.view(torch.float8_e4m3fn)
+                grouped_fp8_deepgemm_gemm(
+                    x_fp8, buf.x_scale, gate_d, gate_sfb,
+                    output=buf.intermediate[:m_chunk],
+                    grouped_layout=grouped_layout,
+                )
+                grouped_fp8_deepgemm_gemm(
+                    x_fp8, buf.x_scale, up_d, up_sfb,
+                    output=buf.s1_partner[:m_chunk],
+                    grouped_layout=grouped_layout,
+                )
+                torch.nn.functional.silu(
+                    buf.intermediate[:m_chunk], inplace=True
+                )
+                buf.intermediate[:m_chunk].mul_(buf.s1_partner[:m_chunk])
+                _glm5_act_quant_ragged(
+                    buf.intermediate,
+                    counts,
+                    cu_seqlens,
+                    buf.inter_fp8,
+                    buf.inter_scale,
+                    row_align=row_align,
+                )
+                grouped_fp8_deepgemm_gemm(
+                    buf.inter_fp8.view(torch.float8_e4m3fn),
+                    buf.inter_scale,
+                    down_d, down_sfb,
+                    output=buf.expert_out[:m_chunk],
+                    grouped_layout=grouped_layout,
+                )
+                _glm5_reduce_ordered(
+                    buf.expert_out,
+                    topk_pos,
+                    topk_indices_i32,
+                    topk_weights,
+                    window_tokens,
+                    hidden_size,
+                    topk,
+                    output=output[start:end],
+                )
+                continue
             grouped_fp8_blockwise_fused_s1_ptrs(
                 buf.x_fp8.view(torch.float8_e4m3fn),
                 buf.x_scale,

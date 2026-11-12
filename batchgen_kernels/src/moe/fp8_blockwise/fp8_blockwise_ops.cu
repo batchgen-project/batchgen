@@ -137,7 +137,8 @@ __global__ void act_quant_3d_kernel(
 // walking any other expert fails the owner check and is skipped. Each written
 // row is therefore produced exactly once, by the same per-row code.
 // ============================================================================
-#define RAGGED_ROW_ALIGN 64
+// Row alignment is a runtime argument of act_quant_ragged, matching the
+// value given to dispatch_scatter_ragged for the same layout.
 #define RAGGED_QUANT_THREADS 128
 #define RAGGED_ROWS_PER_BLOCK 16
 
@@ -268,7 +269,7 @@ act_quant_ragged_kernel(
     float* __restrict__ scale,                       // [num_k_blocks, max_rows]
     const int32_t* __restrict__ seqlens,             // [E]
     const int32_t* __restrict__ cu_seqlens,          // [E + 1]
-    int E, int max_rows, int K, int num_k_blocks
+    int E, int max_rows, int K, int num_k_blocks, int row_align
 ) {
     // Rows the original one-block-per-row grid could reach: blockIdx.x in
     // [0, max_rows), minus every row outside [cu_seqlens[0], cu_seqlens[E]).
@@ -301,8 +302,8 @@ act_quant_ragged_kernel(
         if (e < E) {
             start = cu_seqlens[e];
             const int64_t valid_e = seqlens[e];
-            const int64_t span_e = (valid_e + RAGGED_ROW_ALIGN - 1) /
-                                   RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+            const int64_t span_e = (valid_e + row_align - 1) /
+                                   row_align * row_align;
             r_begin = row_begin > start ? row_begin - start : 0;
             const int64_t r_end = span_e < row_end - start ? span_e : row_end - start;
             len = r_end > r_begin ? r_end - r_begin : 0;
@@ -348,8 +349,8 @@ act_quant_ragged_kernel(
             if (lo != c0 + lo_j) continue;  // owned (and written) by expert lo
             const int64_t rel = row - cu_seqlens[lo];
             const int64_t valid_tokens = seqlens[lo];
-            const int64_t span = (valid_tokens + RAGGED_ROW_ALIGN - 1) /
-                                 RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+            const int64_t span = (valid_tokens + row_align - 1) /
+                                 row_align * row_align;
             if (rel >= span) continue;
             act_quant_ragged_row<kVec>(x, y, scale, row, rel < valid_tokens,
                                        max_rows, K, num_k_blocks);
@@ -560,9 +561,13 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_ragged(
     torch::Tensor seqlens,
     torch::Tensor cu_seqlens,
     torch::Tensor y,
-    torch::Tensor scale
+    torch::Tensor scale,
+    int64_t row_align
 ) {
     constexpr int64_t kInt32Max = 2147483647;
+    TORCH_CHECK(row_align > 0 && (row_align & (row_align - 1)) == 0 &&
+                    row_align <= kInt32Max,
+                "row_align must be a positive power of two, got ", row_align);
     TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
     const auto device = x.device();
     check_ragged_cuda_tensor(x, device, "x");
@@ -609,7 +614,8 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_ragged(
             seqlens.data_ptr<int32_t>(),
             cu_seqlens.data_ptr<int32_t>(),
             static_cast<int>(E), static_cast<int>(max_rows),
-            static_cast<int>(K), static_cast<int>(num_k_blocks));
+            static_cast<int>(K), static_cast<int>(num_k_blocks),
+            static_cast<int>(row_align));
     };
     if (vec) {
         launch(act_quant_ragged_kernel<true>, act_quant_ragged_grid<true>(device, max_rows));

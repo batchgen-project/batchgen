@@ -16,7 +16,7 @@ __global__ void count_tokens_3d_kernel(
     const int32_t* __restrict__ topk_indices,
     int32_t* __restrict__ expert_counts,
     int32_t* __restrict__ topk_pos,
-    int NK, int expert_start, int E_local
+    int NK, int expert_start, int E_local, int row_align
 ) {
     extern __shared__ int32_t s_counts[];
     const int tid = threadIdx.x;
@@ -143,7 +143,10 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
 // offsets stay on device; launch geometry depends only on host shapes
 // (N, K, E_local), so the call is CUDA-graph capturable.
 // ============================================================================
-#define RAGGED_ROW_ALIGN 64
+// Row alignment is a runtime argument of dispatch_scatter_ragged: the
+// grouped-GEMM backend dictates it (the CuTe ptrs kernels accept 64, the
+// m-grouped contiguous backend requires 128), and it is shared with the
+// matching act-quant span walk, so callers pass one value to both.
 static constexpr int64_t kRaggedInt32Max = 2147483647;
 
 __global__ void count_tokens_ragged_kernel(
@@ -180,8 +183,8 @@ __global__ void count_tokens_ragged_kernel(
         int64_t offset = 0;
         for (int e = 0; e < E_local; e++) {
             cu_seqlens[e] = (int32_t)offset;
-            offset += ((int64_t)s_counts[e] + RAGGED_ROW_ALIGN - 1) &
-                      ~(int64_t)(RAGGED_ROW_ALIGN - 1);
+            offset += ((int64_t)s_counts[e] + row_align - 1) &
+                      ~(int64_t)(row_align - 1);
         }
         cu_seqlens[E_local] = (int32_t)offset;
     }
@@ -237,7 +240,8 @@ __global__ void scatter_tokens_ragged_kernel(
 // Worst-case rows needed by dispatch_scatter_ragged: every nonzero local
 // expert may add up to 63 pad rows, and the aligned total is a multiple of 64.
 static int64_t ragged_capacity_rows(
-    int64_t num_tokens, int64_t top_k, int64_t num_local_experts
+    int64_t num_tokens, int64_t top_k, int64_t num_local_experts,
+    int64_t row_align
 ) {
     TORCH_CHECK(num_tokens >= 0 && num_tokens <= kRaggedInt32Max,
                 "num_tokens out of range: ", num_tokens);
@@ -245,8 +249,8 @@ static int64_t ragged_capacity_rows(
     TORCH_CHECK(num_local_experts > 0 && num_local_experts <= kRaggedInt32Max,
                 "num_local_experts out of range: ", num_local_experts);
     const int64_t nk = num_tokens * top_k;
-    const int64_t rows = nk + (RAGGED_ROW_ALIGN - 1) * std::min(num_local_experts, nk);
-    return rows / RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+    const int64_t rows = nk + (row_align - 1) * std::min(num_local_experts, nk);
+    return rows / row_align * row_align;
 }
 
 static void check_ragged_cuda_tensor(
@@ -266,8 +270,12 @@ std::vector<torch::Tensor> dispatch_scatter_ragged(
     torch::Tensor expert_counts,
     torch::Tensor expert_counters,
     torch::Tensor topk_pos,
-    torch::Tensor cu_seqlens
+    torch::Tensor cu_seqlens,
+    int64_t row_align
 ) {
+    TORCH_CHECK(row_align > 0 && (row_align & (row_align - 1)) == 0 &&
+                    row_align <= kRaggedInt32Max,
+                "row_align must be a positive power of two, got ", row_align);
     TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
     const auto device = x.device();
     check_ragged_cuda_tensor(x, device, "x");
@@ -295,7 +303,7 @@ std::vector<torch::Tensor> dispatch_scatter_ragged(
     TORCH_CHECK(expert_start >= 0 && expert_start + E <= kRaggedInt32Max,
                 "expert_start out of range: ", expert_start);
 
-    const int64_t capacity = ragged_capacity_rows(N, K, E);
+    const int64_t capacity = ragged_capacity_rows(N, K, E, row_align);
     const int64_t NK = N * K;
     TORCH_CHECK(NK * WARP_SIZE + 256 <= kRaggedInt32Max,
                 "N*K too large for scatter launch: ", NK);
@@ -325,7 +333,8 @@ std::vector<torch::Tensor> dispatch_scatter_ragged(
             expert_counters.data_ptr<int32_t>(),
             cu_seqlens.data_ptr<int32_t>(),
             topk_pos.data_ptr<int32_t>(),
-            static_cast<int>(NK), static_cast<int>(expert_start), static_cast<int>(E));
+            static_cast<int>(NK), static_cast<int>(expert_start), static_cast<int>(E),
+            static_cast<int>(row_align));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 

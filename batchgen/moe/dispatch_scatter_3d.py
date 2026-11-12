@@ -119,11 +119,13 @@ def dispatch_scatter_ragged(
     expert_counters: torch.Tensor,
     topk_pos: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    row_align: int = 64,
 ):
     """Route tokens from flat [G, H] into a compact ragged [rows, H] buffer.
 
     Expert e owns rows ``[cu_seqlens[e], cu_seqlens[e+1])`` where
-    ``cu_seqlens[e+1] - cu_seqlens[e] == align64(expert_counts[e])``. Only the
+    ``cu_seqlens[e+1] - cu_seqlens[e]`` is ``expert_counts[e]`` rounded up to
+    ``row_align`` (the grouped-GEMM backend's per-group row alignment). Only the
     first ``expert_counts[e]`` rows of each span are written; pad rows keep
     their previous contents (``act_quant_ragged`` never reads them).
 
@@ -134,13 +136,13 @@ def dispatch_scatter_ragged(
         x: Input tokens [G, H] BF16
         topk_indices: Expert assignments [G, K] int32 (non-local ids skipped)
         act_buffer: Pre-allocated [rows, H] BF16 large enough for all routed
-            rows plus up to 63 alignment rows per non-empty local expert
+            rows plus up to row_align-1 alignment rows per non-empty local expert
         expert_start: Global index of first local expert
         num_local_experts: Number of local experts (E_local)
         expert_counts: Pre-allocated [E_local] int32 (overwritten)
         expert_counters: Pre-allocated [E_local] int32 scratch (overwritten)
         topk_pos: Pre-allocated [G*K] int32 (absolute row or -1 if non-local)
-        cu_seqlens: Pre-allocated [E_local + 1] int32 (64-aligned offsets)
+        cu_seqlens: Pre-allocated [E_local + 1] int32 (row_align-aligned offsets)
 
     Returns:
         (expert_counts, cu_seqlens, topk_pos) — the caller-owned buffers.
@@ -150,6 +152,7 @@ def dispatch_scatter_ragged(
         x, topk_indices, act_buffer,
         expert_start, num_local_experts,
         expert_counts, expert_counters, topk_pos, cu_seqlens,
+        int(row_align),
     )
 
 

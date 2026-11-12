@@ -223,10 +223,11 @@ def ragged_row_capacity(
     max_global_tokens: int,
     topk: int,
     num_local_experts: int,
+    row_align: int = ROW_ALIGN,
 ) -> int:
-    """Return the static row capacity for 64-row-aligned expert segments."""
+    """Return the static row capacity for row_align-aligned expert segments."""
     live_rows = int(max_global_tokens) * int(topk)
-    raw_rows = live_rows + int(num_local_experts) * (ROW_ALIGN - 1)
+    raw_rows = live_rows + int(num_local_experts) * (int(row_align) - 1)
     return (
         (raw_rows + _CAPACITY_BLOCK - 1) // _CAPACITY_BLOCK
     ) * _CAPACITY_BLOCK
@@ -258,6 +259,7 @@ def dispatch_scatter_ragged(
     expert_counters: torch.Tensor,
     cu_seqlens: torch.Tensor,
     topk_pos: torch.Tensor,
+    row_align: int = ROW_ALIGN,
 ):
     """Dispatch through the current compact-ragged wrapper API."""
     return _dispatch_scatter_ragged(
@@ -270,6 +272,7 @@ def dispatch_scatter_ragged(
         expert_counters,
         topk_pos,
         cu_seqlens,
+        int(row_align),
     )
 
 
@@ -279,6 +282,7 @@ def act_quant_ragged(
     cu_seqlens: torch.Tensor,
     output: torch.Tensor,
     scale: torch.Tensor,
+    row_align: int = ROW_ALIGN,
 ) -> None:
     """Quantize live ragged rows into caller-owned output buffers."""
     _require_ops_module().act_quant_ragged(
@@ -287,6 +291,7 @@ def act_quant_ragged(
         cu_seqlens,
         output,
         scale,
+        int(row_align),
     )
 
 
