@@ -113,6 +113,7 @@ def build_grouped_layout(
     cu_seqlens: Tensor,
     total_rows: int,
     alignment: Optional[int] = None,
+    validate: bool = True,
 ) -> Tensor:
     """int32 [total_rows] row->group map with -1 padding holes.
 
@@ -120,7 +121,10 @@ def build_grouped_layout(
     row count in the reserved activation buffer; rows between
     ``cu_seqlens[g] + seqlens[g]`` and ``cu_seqlens[g + 1]`` are alignment
     padding and carry -1. Each group's START must sit on the DeepGEMM row
-    alignment or the API rejects the layout, so this validates it up front.
+    alignment or the API rejects the layout. ``validate`` reads the layout
+    back to the host to check that, which synchronizes the stream - callers
+    on a steady-state path whose dispatch structurally produces the required
+    alignment (it was given the same value) pass ``validate=False``.
     """
     if alignment is None:
         alignment = deepgemm_m_alignment()
@@ -130,13 +134,15 @@ def build_grouped_layout(
         raise ValueError("cu_seqlens must have one more entry than seqlens")
     starts = cu_seqlens[:-1]
     ends = cu_seqlens[1:]
-    if bool((starts % alignment != 0).any()):
-        raise ValueError(
-            f"a group start is not {alignment}-row aligned; the ragged "
-            "dispatch alignment does not match the GEMM backend"
-        )
-    if int(ends[-1]) > total_rows:
-        raise ValueError("cu_seqlens exceeds the reserved rows")
+    if validate:
+        # gpu-sync: allow layout validation off the steady-state path
+        if bool((starts % alignment != 0).any()):
+            raise ValueError(
+                f"a group start is not {alignment}-row aligned; the ragged "
+                "dispatch alignment does not match the GEMM backend"
+            )
+        if int(ends[-1]) > total_rows:
+            raise ValueError("cu_seqlens exceeds the reserved rows")
     device = seqlens.device
     grouped = torch.full(
         (total_rows,), -1, dtype=torch.int32, device=device
@@ -169,35 +175,24 @@ def _scale_rows_first(scale: Tensor, rows: int) -> Tensor:
 def grouped_fp8_deepgemm_gemm(
     x_fp8: Tensor,
     x_scale: Tensor,
-    weights: Sequence[Tensor],
-    weight_scales: Sequence[Tensor],
-    seqlens: Tensor,
-    cu_seqlens: Tensor,
+    b: Tensor,
+    sfb: Tensor,
+    *,
     output: Tensor,
-    grouped_layout: Optional[Tensor] = None,
+    grouped_layout: Tensor,
 ) -> Tensor:
-    """One m-grouped contiguous GEMM over per-expert ring tensors.
+    """One m-grouped contiguous GEMM over a dense weight stack.
 
-    ``weights[g]`` is expert ``g``'s fp8 [N, K] ring view and
-    ``weight_scales[g]`` its fp32 [N/128, K/128(+pad)] view, both in GROUP
-    ORDER (the slot order the rows were dispatched in). ``output`` is bf16
-    [rows, N].
+    ``b`` is the dense fp8 [G, N, K] stack (built once per layer with
+    :func:`dense_group_view` over the field-major ring) and ``sfb`` its
+    exact-extent fp32 [G, N/128, K/128] scales. ``output`` is bf16 [m, N]
+    and ``grouped_layout`` the int32 [m] row map from
+    :func:`build_grouped_layout` in the same group order.
     """
-    symbol, alignment = _get_deepgemm()
+    symbol, _ = _get_deepgemm()
     rows = output.shape[0]
-    b = dense_group_view(list(weights))
-    n_blocks = b.shape[1] // _QUANT_BLOCK
-    k_blocks = b.shape[2] // _QUANT_BLOCK
-    sfb_full = dense_group_view(list(weight_scales))
-    sfb = sfb_full[:, :n_blocks, :k_blocks]
-    if not sfb.is_contiguous():
-        # Scale stacks may carry column padding (k_blocks_pad4); the GEMM
-        # wants the exact extent. One small fp32 copy per call.
-        sfb = sfb.contiguous()
-    if grouped_layout is None:
-        grouped_layout = build_grouped_layout(
-            seqlens, cu_seqlens, rows, alignment
-        )
+    if grouped_layout.shape[0] != rows:
+        raise ValueError("grouped_layout rows must match the output rows")
     sfa = _scale_rows_first(x_scale, rows)
     symbol((x_fp8[:rows], sfa), (b, sfb), output, grouped_layout)
     return output
