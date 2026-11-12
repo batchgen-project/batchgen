@@ -9745,9 +9745,17 @@ class BatchGenWorker:
 		*,
 		local_bsz: int,
 		global_bsz: int,
+		sequences=None,
 	) -> bool:
 		"""Start a batch-debug-gated nsys prefill capture window."""
-		debug = self._batchgen_debug or {}
+		# Batch-level debug flags live on the admitted sequences
+		# (self._batchgen_debug is never populated on this path), so the
+		# per-batch merge is the only reader that sees them.
+		debug = (
+			self._active_batchgen_debug_for_sequences(sequences)
+			or self._batchgen_debug
+			or {}
+		)
 		if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
 			return False
 
@@ -10480,6 +10488,12 @@ class BatchGenWorker:
 					_prefill_profile_active = self._nsys_prefill_profile_begin(
 						local_bsz=len(local_prefill_indices),
 						global_bsz=len(prefill_uuids),
+						sequences=[
+							seq for seq in (
+								self.global_batch.get_sequence(uuid)
+								for uuid in prefill_uuids
+							) if seq is not None
+						],
 					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
