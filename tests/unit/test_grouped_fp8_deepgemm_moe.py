@@ -70,3 +70,29 @@ def test_grouped_layout_rejects_overflow():
     cu_seqlens = torch.tensor([0, 256])
     with pytest.raises(ValueError, match="exceeds"):
         build_grouped_layout(seqlens, cu_seqlens, 128, alignment=128)
+
+
+def test_grouped_layout_applies_expert_to_group_permutation():
+    # A staggered ring delivers each member its own experts first, so the
+    # dense stack is a rotation of expert-id order; rows must map to the
+    # expert's SLOT position, not its id.
+    seqlens = torch.tensor([3, 2, 1])
+    cu_seqlens = torch.tensor([0, 128, 256, 384])
+    group_ids = torch.tensor([2, 0, 1], dtype=torch.int32)
+    grouped = build_grouped_layout(
+        seqlens, cu_seqlens, 384, alignment=128, group_ids=group_ids
+    )
+    assert grouped[:3].tolist() == [2, 2, 2]
+    assert grouped[128:130].tolist() == [0, 0]
+    assert int(grouped[256]) == 1
+    assert int(grouped[3]) == -1 and int(grouped[257]) == -1
+
+
+def test_grouped_layout_rejects_short_group_ids():
+    seqlens = torch.tensor([3, 2])
+    cu_seqlens = torch.tensor([0, 128, 256])
+    with pytest.raises(ValueError, match="group_ids"):
+        build_grouped_layout(
+            seqlens, cu_seqlens, 256, alignment=128,
+            group_ids=torch.tensor([0], dtype=torch.int32),
+        )
