@@ -262,7 +262,11 @@ from batchgen.worker.decode import (
 	DecodeScheduler,
 	DecodeCapacitySnapshot,
 	reduce_decode_capacity_snapshot,
-	estimate_max_decode_replica_batch,
+)
+from batchgen.cuda_graph.buckets import (
+	DecodeWidthExceedsGraphBucketError,
+	check_decode_width_within_buckets,
+	decode_graph_bucket_sizes,
 )
 from batchgen.worker.shared_prefix_charge import (
 	SharedPrefixLedger,
@@ -5353,6 +5357,11 @@ class BatchGenWorker:
 		)
 		args = getattr(self, "args", None)
 		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
+		# The derived ladder can top out above the flag (at the per-rank
+		# decode width); the page table must address every row of that bucket.
+		decode_graph_top_bucket = (
+			self._decode_graph_top_bucket() if engine_config is not None else None
+		)
 		return PageTableCapacityRequest(
 			engine_module_global_batch_size=engine_module_global_batch_size,
 			engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
@@ -5360,6 +5369,7 @@ class BatchGenWorker:
 			model_max_position_embeddings=model_max_position_embeddings,
 			args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
 			engine_basic_decode_graph_max_bucket=engine_basic_decode_graph_max_bucket,
+			decode_graph_top_bucket=decode_graph_top_bucket,
 		)
 
 	def _cuda_graph_page_table_token_capacity(self) -> int:
@@ -10104,7 +10114,7 @@ class BatchGenWorker:
 			else:
 				prefill_key = self._desired_phase_key("prefill")
 				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
-				self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+				self._load_decode_model(comm=self.comm)
 				self._init_gpu_kv_with_actual_size()
 				# This lifecycle captures no decode graph at startup; any
 				# capture happens at the first decode configure.
@@ -10165,9 +10175,10 @@ class BatchGenWorker:
 			self.parallel_manager.set_comm(self.comm)
 
 		# Decode first: configure_decoding materializes the stacked MXFP4 EP
-		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
-		# the runtime decode path applies to its own estimate, so the padded MoE
-		# buffers are already sized for the largest batch that can be admitted.
+		# shard that both phases keep resident. _load_decode_model sizes it at
+		# the per-rank decode width (_max_decode_rank_bsz), the same width the
+		# runtime decode configure and the decode admission cap use, so the
+		# padded MoE buffers are already sized for the largest admitted batch.
 		# This decode entry precedes any prefill entry, so the worker's record
 		# of the prefill mode these instances are built for must be primed
 		# here: the decode phase key carries it, and a None here against the
@@ -10176,7 +10187,7 @@ class BatchGenWorker:
 		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
 		self._prefill_moe_mode_in_effect = startup_prefill_mode
 		with self._startup_phase("decode-shard-build"):
-			self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+			self._load_decode_model(comm=self.comm)
 
 		# Then hand the built model to the prefill mode this weight topology
 		# will actually use, so the first admission inherits this phase directly
@@ -10767,32 +10778,17 @@ class BatchGenWorker:
 				# NOTE: Barrier removed - tensor sync operations below provide synchronization
 
 				# ============ STEP A: Load model FIRST (needed for accurate GPU KV size) ============
-				# Estimate max sequences per rank for buffer allocation
-				# Use PREFILLED + ON_HOLD + IN_DECODE as upper bound
-				prefilled_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))
-				onhold_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
-				in_decode_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE))
-				total_candidates = prefilled_count + onhold_count + in_decode_count
-				# TP attention replicates one group's sequences across all G ranks,
-				# so each rank needs the per-group batch, not total/world_size.
-				max_num_seq_estimate = estimate_max_decode_replica_batch(
-					total_candidates,
-					self.world_size,
-					self._decode_attn_tp_size(),
-				)
-				# Ensure at least some minimum
-				max_num_seq_estimate = max(max_num_seq_estimate, 16)
-				# Cap per-rank decode batch so the MoE buffer's mtp (= round_up(world_size *
-				# this)) stays bounded — a large candidate pool must NOT inflate the padded
-				# buffers (that re-OOMs init). The page-boundary admission also caps in-decode
-				# at this value (decode.py max_rank_bsz), so the buffer never overflows.
-				max_num_seq_estimate = min(max_num_seq_estimate, self._max_decode_rank_bsz())
-
+				# The decode configure is sized at the per-rank decode width
+				# (_max_decode_rank_bsz), never at an estimate of this wave's
+				# candidates: the padded MoE buffers, the GPU KV pool measured
+				# after them and the decode admission cap (_decode_padding_bsz)
+				# all derive from that one width, so a cold configure and a
+				# reused instance build the same ledger.
 				logging.info(
 					f"[DECODE] Rank {self.rank}: entering decode configure "
-					f"(max_num_seq_estimate={max_num_seq_estimate})"
+					f"(decode_width={self._max_decode_rank_bsz()})"
 				)
-				self._load_decode_model(max_num_seq_estimate, self.comm)
+				self._load_decode_model(self.comm)
 
 				if torch.cuda.is_available():
 					free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -11723,7 +11719,7 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
 
-	def _load_decode_model(self, max_num_seq: int, comm=None) -> None:
+	def _load_decode_model(self, comm=None) -> None:
 		"""
 		Load model for decoding phase. Must be called ONCE at the start of decode phase,
 		BEFORE batch selection, so we know actual GPU KV capacity.
@@ -11733,13 +11729,17 @@ class BatchGenWorker:
 		- Single-node with EP offloading: partial persistence based on offloading_ratio
 		- Single-node without offloading: all experts persistent
 
+		The per-rank buffer width is always the decode width
+		(``_max_decode_rank_bsz``), the single source every decode configure
+		and the decode admission cap (``_decode_padding_bsz``) derive from.
+
 		Args:
-			max_num_seq: Maximum number of sequences per rank for buffer allocation.
 			comm: NCCL communicator for distributed MoE forward.
 		"""
 		desired_key = self._desired_phase_key("decode")
-		reuse_requested = self._request_phase_instance_reuse()
-		padding_bsz = self._max_decode_rank_bsz() if reuse_requested else max_num_seq
+		self._request_phase_instance_reuse()
+		padding_bsz = self._max_decode_rank_bsz()
+		self._check_decode_width_within_graph_buckets(padding_bsz)
 		phase_changed, resumed = self._transition_phase(
 			desired_key, comm=comm, max_num_seq=padding_bsz
 		)
@@ -11807,7 +11807,100 @@ class BatchGenWorker:
 		) or 0)
 		if self._decode_attn_tp_size() > 1 and planned > _MAX_DECODE_RANK_BSZ:
 			return planned
+		if explicit is None and legacy is None:
+			# On a whole-model-graph deployment the bucket flag is the width
+			# knob: raising --cuda-graph-max-bucket-size widens decode with it,
+			# so capture above the admission width cannot exist (the bucket
+			# set and this width share one source). An explicit env cap or a
+			# TP-planner value still wins above.
+			flag_bucket = int(getattr(
+				getattr(self, "args", None), "cuda_graph_max_bucket_size", 0,
+			) or 0)
+			if (
+				flag_bucket > _MAX_DECODE_RANK_BSZ
+				and self._whole_model_decode_graphs_requested()
+			):
+				return flag_bucket
 		return _MAX_DECODE_RANK_BSZ
+
+	def _whole_model_decode_graphs_requested(self) -> bool:
+		"""Whether this deployment requests whole-model decode graphs: GLM-5
+		whole-model, GPT-OSS-120B or Kimi K2.5 under ``--enable-cuda-graph``.
+		Eager deployments answer False, and nothing that keys on this
+		predicate changes for them."""
+		args = getattr(self, "args", None)
+		if args is None or getattr(args, "disable_cuda_graphs", False):
+			return False
+		model_name = getattr(self, "model_name", None)
+		if (
+			"glm" in (model_name or "").lower()
+			and self._glm5_whole_model_graph_requested_for_current_batch()
+		):
+			return True
+		return cli_enables_whole_model_graph(
+			model_name,
+			enable_cuda_graph=getattr(args, "enable_cuda_graph", False),
+		)
+
+	def _decode_graph_bucket_sizes(self) -> list:
+		"""The decode graph bucket ladder: the configured ladder with its top
+		raised to the per-rank decode width (``_max_decode_rank_bsz``) when
+		the width is wider, and the width itself always a bucket."""
+		return decode_graph_bucket_sizes(
+			int(self.args.cuda_graph_max_bucket_size),
+			int(self.args.cuda_graph_num_buckets),
+			self._max_decode_rank_bsz(),
+		)
+
+	def _decode_graph_top_bucket(self) -> Optional[int]:
+		"""Largest decode graph bucket when whole-model graphs are requested,
+		else None."""
+		if not self._whole_model_decode_graphs_requested():
+			return None
+		return max(self._decode_graph_bucket_sizes())
+
+	def _assert_decode_step_within_graph_buckets(self, max_rank_bsz: int) -> None:
+		"""Decode-step invariant on a whole-model graph deployment: the step's
+		globally-synced max per-rank batch fits the top bucket. The top is the
+		captured ladder's when a graph is live, else the derived ladder's.
+		Admission is bounded by the decode width the ladder covers, so a wider
+		step is a regression; every rank sees the same width and raises
+		together. Eager deployments return without a check."""
+		bucketing = getattr(self, "_whole_model_bucketing", None)
+		if (
+			getattr(self, "_whole_model_graph", False)
+			and getattr(self, "_cuda_graph_manager", None) is not None
+			and bucketing is not None
+		):
+			top = int(max(bucketing.bucket_sizes))
+		elif self._whole_model_decode_graphs_requested():
+			top = int(max(self._decode_graph_bucket_sizes()))
+		else:
+			return
+		if int(max_rank_bsz) <= top:
+			return
+		raise DecodeWidthExceedsGraphBucketError(
+			f"Rank {self.rank}: decode step max per-rank batch {int(max_rank_bsz)} "
+			"exceeds the largest whole-model decode graph bucket "
+			f"{top} while decode admission is "
+			f"bounded by the per-rank decode width {self._max_decode_rank_bsz()} "
+			f"(admission cap _decode_padding_bsz="
+			f"{getattr(self, '_decode_padding_bsz', None)}); refusing to run the "
+			"step eager. Raise --cuda-graph-max-bucket-size to at least "
+			f"{int(max_rank_bsz)} and report the admission path that exceeded "
+			"the decode width."
+		)
+
+	def _check_decode_width_within_graph_buckets(self, decode_width: int) -> None:
+		"""Configure-time invariant: on a deployment that requests whole-model
+		decode graphs, the planned per-rank decode width fits the ladder that
+		will be captured. Raises ``DecodeWidthExceedsGraphBucketError``;
+		a no-op on eager deployments."""
+		if not self._whole_model_decode_graphs_requested():
+			return
+		check_decode_width_within_buckets(
+			decode_width, self._decode_graph_bucket_sizes()
+		)
 
 	def _log_decode_parameter_residency(self) -> None:
 		"""One-line HBM breakdown of the decode model's resident parameters and
@@ -12090,17 +12183,19 @@ class BatchGenWorker:
 		self.set_phase("prefill")
 		self._install_prefill_weight_copy_pipeline(False)
 		decode_key = self._desired_phase_key("decode")
+		decode_width = self._max_decode_rank_bsz()
+		self._check_decode_width_within_graph_buckets(decode_width)
 		_, resumed = self._transition_phase(
 			decode_key,
 			comm=self.comm,
-			max_num_seq=self._max_decode_rank_bsz(),
+			max_num_seq=decode_width,
 		)
 		if resumed:
 			self._remap_reused_kv_pool()
 		self._assert_phase_switch_clean("prefill_to_decode", reused=resumed)
 		self.set_phase("decode")
 		self._install_decode_weight_copy_queue()
-		self._decode_padding_bsz = self._max_decode_rank_bsz()
+		self._decode_padding_bsz = decode_width
 		self._init_gpu_kv_with_actual_size()
 		capture = self._glm5_whole_model_graph_requested_for_current_batch()
 
@@ -19231,61 +19326,6 @@ class BatchGenWorker:
 			whole_reason,
 		)
 
-	@staticmethod
-	def _generate_bucket_sizes(max_bucket: int, num_buckets: int) -> list:
-		"""Generate exactly num_buckets bucket sizes from 1 to max_bucket.
-
-		Uses geometric spacing for initial placement with magnitude-aware
-		rounding (small values exact, large values rounded to clean multiples).
-		Fills any gaps from rounding collisions by splitting the largest gaps.
-		Caps at max_bucket if num_buckets > max_bucket.
-
-		Examples:
-		  max=256, num=9  → [1,2,4,8,16,32,64,128,256]
-		  max=256, num=16 → [1,2,3,4,6,10,14,20,28,40,56,80,128,160,192,256]
-		  max=16,  num=16 → [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
-		"""
-		import math
-		num_buckets = min(num_buckets, max_bucket)
-		if num_buckets <= 1:
-			return [max_bucket]
-
-		def _round_nice(x):
-			"""Round to nearest clean multiple that scales with magnitude."""
-			if x <= 8:
-				return int(round(x))
-			log2 = int(math.log2(x))
-			step = max(1 << (log2 - 2), 1)
-			return max(1, round(x / step) * step)
-
-		# Geometric spacing with nice rounding
-		ratio = max_bucket ** (1.0 / (num_buckets - 1))
-		sizes = set()
-		for i in range(num_buckets):
-			sizes.add(max(1, _round_nice(ratio ** i)))
-		sizes.add(1)
-		sizes.add(max_bucket)
-		sizes = sorted(sizes)
-
-		# Fill gaps from rounding collisions
-		while len(sizes) < num_buckets:
-			best_gap, best_idx = 0, -1
-			for i in range(len(sizes) - 1):
-				gap = sizes[i + 1] - sizes[i]
-				if gap > best_gap:
-					best_gap = gap
-					best_idx = i
-			if best_gap < 2:
-				break
-			mid = _round_nice((sizes[best_idx] + sizes[best_idx + 1]) / 2)
-			if mid <= sizes[best_idx] or mid >= sizes[best_idx + 1]:
-				mid = (sizes[best_idx] + sizes[best_idx + 1]) // 2
-			if mid in sizes or mid <= sizes[best_idx] or mid >= sizes[best_idx + 1]:
-				break
-			sizes.insert(best_idx + 1, mid)
-
-		return sizes
-
 	def _make_glm5_whole_model_capture_inputs(
 		self,
 		*,
@@ -19418,14 +19458,23 @@ class BatchGenWorker:
 		# Detect K2.5 model for specialized graph segment
 		_is_k25 = is_kimi_k25_backend_model(self.model_name)
 
-		max_bucket = self.args.cuda_graph_max_bucket_size
-		num_buckets = self.args.cuda_graph_num_buckets
-		# Generate exactly num_buckets geometrically-spaced bucket sizes.
-		# e.g. max=256, num=9  → [1,2,4,8,16,32,64,128,256]
-		# e.g. max=256, num=16 → [1,2,3,4,6,10,14,20,28,40,56,80,128,160,192,256]
-		# e.g. max=16,  num=16 → [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
-		bucket_sizes = self._generate_bucket_sizes(max_bucket, num_buckets)
-		logging.info(f"CUDA graph bucket sizes: {bucket_sizes} (max={max_bucket}, num_buckets={num_buckets})")
+		# The ladder covers the per-rank decode width: decode admission is
+		# bounded by that width, so every admitted step has a bucket to
+		# replay and a step above the top bucket is an invariant violation,
+		# not an eager fallback.
+		bucket_sizes = self._decode_graph_bucket_sizes()
+		decode_width = self._max_decode_rank_bsz()
+		check_decode_width_within_buckets(decode_width, bucket_sizes)
+		if not getattr(self, "_decode_graph_ladder_logged", False):
+			logging.info(
+				"CUDA graph bucket sizes: %s (decode_width=%d, "
+				"--cuda-graph-max-bucket-size=%d, --cuda-graph-num-buckets=%d)",
+				bucket_sizes,
+				decode_width,
+				int(self.args.cuda_graph_max_bucket_size),
+				int(self.args.cuda_graph_num_buckets),
+			)
+			self._decode_graph_ladder_logged = True
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
@@ -21042,49 +21091,39 @@ class BatchGenWorker:
 				# composes per-layer captures internally; no separate
 				# layer-graph dispatch is needed.
 
+				# Decode admission is bounded by the per-rank decode width and
+				# the bucket ladder is derived to cover it, so on a graph
+				# deployment no step is wider than the top bucket; one that is
+				# fails loud here instead of running eager.
+				self._assert_decode_step_within_graph_buckets(_max_bs)
 				_glm5_whole_graph_active = bool(
 					getattr(self, "_glm5_whole_model_graph", False)
 					and self._cuda_graph_manager is not None
 				)
-				_glm5_whole_graph_over_bucket = False
 				if _glm5_whole_graph_active:
-					try:
-						_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
-					except ValueError:
-						_glm5_whole_graph_over_bucket = True
-						_glm5_whole_graph_active = False
-					else:
-						# An all_short capture never runs indexer scoring, so a
-						# step whose longest context exceeds index_topk must NOT
-						# replay it: top-k selection would be silently skipped.
-						# Leaving the graph here either falls back to eager
-						# (correct top-k) or, under a required graph, raises
-						# below with reason=all_short_exceeded.
-						_glm5_all_short_exceeded = bool(
-							getattr(self, "_glm5_whole_model_all_short", False)
-							and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
-							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-							> int(self._glm5_whole_model_index_topk)
-						)
-						_glm5_whole_graph_active = (
-							not _glm5_all_short_exceeded
-							and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
-							and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
-							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
-							and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
-						)
-				elif self._glm5_whole_model_graph_requested_for_current_batch():
-					try:
-						configured_max_bucket = int(self.args.cuda_graph_max_bucket_size)
-					except AttributeError:
-						pass
-					else:
-						_glm5_whole_graph_over_bucket = _max_bs > configured_max_bucket
+					_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+					# An all_short capture never runs indexer scoring, so a
+					# step whose longest context exceeds index_topk must NOT
+					# replay it: top-k selection would be silently skipped.
+					# Leaving the graph here either falls back to eager
+					# (correct top-k) or, under a required graph, raises
+					# below with reason=all_short_exceeded.
+					_glm5_all_short_exceeded = bool(
+						getattr(self, "_glm5_whole_model_all_short", False)
+						and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+						> int(self._glm5_whole_model_index_topk)
+					)
+					_glm5_whole_graph_active = (
+						not _glm5_all_short_exceeded
+						and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
+						and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
+						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
+						and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
+					)
 				if (
 					self._glm5_whole_model_graph_requested_for_current_batch()
-					and self._glm5_whole_model_graph_requested_for_current_batch()
 					and not _glm5_whole_graph_active
-					and not _glm5_whole_graph_over_bucket
 				):
 					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
 					if _required_reason in self._WHOLE_GRAPH_EAGER_SERVABLE_REASONS:
@@ -21106,7 +21145,6 @@ class BatchGenWorker:
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
 					and self._cuda_graph_manager is not None
-					and _max_bs <= self._whole_model_bucketing._max_bucket
 					and (
 						not getattr(self, "_glm5_whole_model_graph", False)
 						or _glm5_whole_graph_active
