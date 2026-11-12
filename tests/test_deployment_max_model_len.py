@@ -318,6 +318,8 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         set_phase=lambda phase: None, _install_prefill_weight_copy_pipeline=lambda _: None,
         _desired_phase_key=lambda phase: PhaseKey(phase, "streamed", ()),
         _max_decode_rank_bsz=lambda: 8,
+        _check_decode_width_within_graph_buckets=lambda width: events.append(
+            ("width_check", width)),
         _assert_phase_switch_clean=lambda *args, **kwargs: None,
         _install_decode_weight_copy_queue=lambda: None,
         _init_gpu_kv_with_actual_size=lambda: events.append("verify_pool"),
@@ -335,8 +337,9 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
 
     worker._probe_startup_transient = probe
     build(worker)
-    assert events == ["prefill", "decode", "verify_pool", "probe"] + (
+    assert events == ["prefill", ("width_check", 8), "decode", "verify_pool", "probe"] + (
         ["capture"] if capture else []) + ["prefill"]
+    assert worker._decode_padding_bsz == 8
 
     def refuse():
         raise MaxModelLenCapacityError(129, capacity(available_pages=1))
@@ -345,7 +348,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
     worker._init_gpu_kv_with_actual_size = refuse
     with pytest.raises(MaxModelLenCapacityError):
         build(worker)
-    assert events == ["prefill", "decode"]
+    assert events == ["prefill", ("width_check", 8), "decode"]
 
 
 def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget(tmp_path):

@@ -355,6 +355,7 @@ PINS = {
                 "model_max_position_embeddings",
                 "args_cuda_graph_max_bucket_size",
                 "engine_basic_decode_graph_max_bucket",
+                "decode_graph_top_bucket",
             ],
             "members": {},
             "public_methods": [],

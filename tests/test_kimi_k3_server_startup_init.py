@@ -325,8 +325,8 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
         ("preload_runtime_extensions",)
     )
     worker._ensure_pynccl_communicator = lambda: trace.append(("ensure_pynccl",))
-    worker._load_decode_model = lambda bsz, comm=None: trace.append(
-        ("load_decode_model", bsz, comm)
+    worker._load_decode_model = lambda comm=None: trace.append(
+        ("load_decode_model", comm)
     )
     def transition(key):
         trace.append(("phase_enter", key.phase, key.prefill_moe_mode))
@@ -380,7 +380,7 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
         ("set_comm", "pynccl"),
         # Resident decode materializes the stacked MXFP4 EP shard, sized for
         # the largest per-rank batch the runtime decode path can admit.
-        ("load_decode_model", 128, "pynccl"),
+        ("load_decode_model", "pynccl"),
         # Then the topology's own prefill mode, so the first admission finds
         # the streamed-SP8 buffers already attached.
         ("set_prefill_moe_mode", "streamed_sp8"),
@@ -654,17 +654,19 @@ def test_kimi_k3_startup_fails_closed_when_a_runtime_extension_is_missing(
 
 
 def test_kimi_k3_startup_uses_the_runtime_decode_batch_cap():
-    # The startup decode build is sized by the same per-rank cap the decode
-    # path applies to its own estimate (_max_decode_rank_bsz: the generic
-    # guard, lifted to the planner's per-node cap for TP-group models), so the
-    # padded MoE buffers built here already fit the worst admitted batch.
+    # The startup decode build is sized by the same per-rank decode width the
+    # runtime decode configure uses (_max_decode_rank_bsz: the generic guard,
+    # lifted to the planner's per-node cap for TP-group models), so the padded
+    # MoE buffers built here already fit the worst admitted batch. The width
+    # is not a caller argument: _load_decode_model derives it itself, so no
+    # call site can size a decode configure differently.
     startup = _body_source(
         _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
     )
-    assert "self._load_decode_model(self._max_decode_rank_bsz()" in startup
-    assert "_max_decode_rank_bsz" in _calls(
-        _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
-    )
+    assert "self._load_decode_model(comm=self.comm)" in startup
+    load = _function(WORKER, "_load_decode_model", "BatchGenWorker")
+    assert [a.arg for a in load.args.args] == ["self", "comm"]
+    assert "_max_decode_rank_bsz" in _calls(load)
 
 
 def test_kimi_k3_startup_is_idempotent():
