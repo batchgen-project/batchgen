@@ -89,10 +89,15 @@ class GLM5_Parameter_Server:
             native_log_level(), self.enable_hugetlbfs, self.enable_thp
         )
 
-        # Convert checkpoint files
-        from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        # Convert checkpoint files. A caller-provided converted_ckpt_dir is the
+        # conversion's output directory, so a pre-converted checkpoint kept
+        # outside the cache dir (for example on node-local storage) is honored;
+        # None keeps the converter's <cache_dir>/converted_ckpt default.
+        from batchgen.models.glm.glm5.converted_ckpt import resolve_converted_ckpt_dir
+
+        self.converted_ckpt_dir = resolve_converted_ckpt_dir(
+            self.cache_dir, self.converted_ckpt_dir
+        )
 
         # Size the reservation from the converted metadata instead of a fixed
         # per-dtype constant.
