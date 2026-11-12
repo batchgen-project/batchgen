@@ -133,10 +133,12 @@ Each model uses different special tokens for thinking and tool calls. BatchGen's
 | Model | Thinking Format | Tool Call Format |
 |-------|----------------|-----------------|
 | DeepSeek-R1 | `<think>...</think>` | `<｜tool▁call▁begin｜>name\n{args}<｜tool▁call▁end｜>` |
-| GPT-OSS-120B | `<\|channel\|>analysis<\|message\|>...` | `<\|call\|>{json}` |
+| GPT-OSS-120B | `<\|channel\|>analysis<\|message\|>...<\|end\|>` | `<\|channel\|>commentary to=functions.NAME <\|constrain\|>json<\|message\|>{args}<\|call\|>` |
 | Kimi-K2.5 | `<think>...</think>` | Not yet supported |
 | GLM-5 | `<think>...</think>` | `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` |
 | MiniMax-M2.5 | `<think>...</think>` | `<minimax:tool_call><invoke name="...">...</invoke></minimax:tool_call>` |
+
+GPT-OSS-120B writes its output in the harmony format, whose message markers are special tokens. Run the server with `--detokenization-include-special-tokens` as well, so the decoded text keeps them; without it the markers are stripped (`analysis...assistantfinal...`) and the output is returned raw in `content`. Decode stops at `<|call|>`, so a tool-calling turn ends with exactly one call; `content` is empty unless the model wrote a `final` or `commentary` preamble message first. A malformed or truncated message (for example a tool call cut off before `<|call|>` by `max_tokens`) is returned raw in `content` and logged as a warning.
 
 ---
 

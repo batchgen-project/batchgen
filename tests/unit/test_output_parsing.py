@@ -19,10 +19,6 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _DS_TOOL_RE = re.compile(
     r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁end｜>", re.DOTALL
 )
-_HARMONY_CHANNEL_RE = re.compile(
-    r"<\|channel\|>(.*?)<\|message\|>(.*?)(?=<\|channel\|>|<\|return\|>|$)",
-    re.DOTALL,
-)
 
 
 def parse_thinking_r1(text: str) -> tuple[Optional[str], str]:
@@ -50,47 +46,6 @@ def parse_tool_calls_deepseek(text: str) -> tuple[Optional[list], str]:
         })
     visible = _DS_TOOL_RE.sub("", text).strip()
     return tool_calls, visible
-
-
-def parse_thinking_harmony(text: str) -> tuple[Optional[str], str]:
-    channels = {}
-    for m in _HARMONY_CHANNEL_RE.finditer(text):
-        channel_name = m.group(1).strip()
-        channel_content = m.group(2).strip()
-        channels[channel_name] = channel_content
-    if not channels:
-        return None, text
-    reasoning = channels.get("analysis")
-    visible = channels.get("final", text)
-    return reasoning, visible
-
-
-def parse_tool_calls_gptoss(text: str) -> tuple[Optional[list], str]:
-    if "<|call|>" not in text:
-        return None, text
-    parts = text.split("<|call|>")
-    visible = parts[0].strip()
-    tool_calls = []
-    for raw_call in parts[1:]:
-        raw_call = raw_call.strip()
-        for tok in ("<|return|>", "<|end|>"):
-            if raw_call.endswith(tok):
-                raw_call = raw_call[: -len(tok)].strip()
-        try:
-            payload = json.loads(raw_call)
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {
-                    "name": payload.get("name", ""),
-                    "arguments": json.dumps(
-                        payload.get("parameters", payload.get("arguments", {}))
-                    ),
-                },
-            })
-        except json.JSONDecodeError:
-            pass
-    return tool_calls or None, visible
 
 
 # ---- Tests ----
@@ -154,55 +109,6 @@ def test_deepseek_parse_tool_calls():
     assert calls[0]["function"]["arguments"] == "{}"
 
     print("  PASS: DeepSeek parse_tool_calls")
-
-
-def test_harmony_parse_thinking():
-    # Analysis + final
-    text = "<|channel|>analysis<|message|>Let me think...<|channel|>final<|message|>The answer is 42."
-    reasoning, visible = parse_thinking_harmony(text)
-    assert reasoning == "Let me think..."
-    assert visible == "The answer is 42."
-
-    # No channels
-    reasoning, visible = parse_thinking_harmony("Plain text")
-    assert reasoning is None
-    assert visible == "Plain text"
-
-    # Only final (no analysis)
-    text = "<|channel|>final<|message|>Just the answer."
-    reasoning, visible = parse_thinking_harmony(text)
-    assert reasoning is None
-    assert visible == "Just the answer."
-
-    # With <|return|> at end
-    text = "<|channel|>analysis<|message|>thinking<|channel|>final<|message|>answer<|return|>"
-    reasoning, visible = parse_thinking_harmony(text)
-    assert reasoning == "thinking"
-    assert visible == "answer"
-
-    print("  PASS: Harmony parse_thinking")
-
-
-def test_gptoss_parse_tool_calls():
-    # Tool call with <|call|>
-    text = 'Some response<|call|>{"name": "search", "parameters": {"query": "hello"}}'
-    calls, visible = parse_tool_calls_gptoss(text)
-    assert calls is not None
-    assert len(calls) == 1
-    assert calls[0]["function"]["name"] == "search"
-    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "hello"}
-    assert visible == "Some response"
-
-    # No tool calls
-    calls, visible = parse_tool_calls_gptoss("plain text")
-    assert calls is None
-
-    # Multiple tool calls
-    text = 'text<|call|>{"name": "a", "parameters": {}}<|call|>{"name": "b", "parameters": {}}'
-    calls, visible = parse_tool_calls_gptoss(text)
-    assert len(calls) == 2
-
-    print("  PASS: GPT-OSS parse_tool_calls")
 
 
 def test_combined_thinking_and_tool_calls():
@@ -407,8 +313,6 @@ if __name__ == "__main__":
     print("Running output parsing tests...")
     test_r1_parse_thinking()
     test_deepseek_parse_tool_calls()
-    test_harmony_parse_thinking()
-    test_gptoss_parse_tool_calls()
     test_combined_thinking_and_tool_calls()
     test_glm5_parse_tool_calls()
     test_minimax_parse_tool_calls()
