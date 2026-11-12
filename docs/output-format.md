@@ -140,6 +140,20 @@ Each model uses different special tokens for thinking and tool calls. BatchGen's
 
 GPT-OSS-120B writes its output in the harmony format, whose message markers are special tokens. Run the server with `--detokenization-include-special-tokens` as well, so the decoded text keeps them; without it the markers are stripped (`analysis...assistantfinal...`) and the output is returned raw in `content`. Decode stops at `<|call|>`, so a tool-calling turn ends with exactly one call; `content` is empty unless the model wrote a `final` or `commentary` preamble message first. A malformed or truncated message (for example a tool call cut off before `<|call|>` by `max_tokens`) is returned raw in `content` and logged as a warning.
 
+### GPT-OSS-120B tool conversations
+
+Pass tools in the request's `tools` field (OpenAI function-calling format); do not write them into the system message. GPT-OSS renders the conversation in the harmony format:
+
+- `tools` become a developer message declaring a `functions` namespace, and the system message names the `commentary` channel for tool calls.
+- An assistant message with `tool_calls` renders as one harmony call per entry (`<|start|>assistant to=functions.NAME<|channel|>commentary <|constrain|>json<|message|>ARGS<|call|>`), after its `content` (as a `commentary` preamble) when that is non-empty. Its `reasoning_content` is kept while the tool turn is still open (no final assistant answer after it) and dropped once a final answer follows, as harmony prescribes.
+- A `tool` message renders as the result of the function its `tool_call_id` refers to (`<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>RESULT<|end|>`); without `tool_call_id` its `name` gives the function.
+
+To continue after a tool call, send the assistant message exactly as returned (`content`, `reasoning_content`, `tool_calls`) followed by one `tool` message per call, and keep `tools` in the request.
+
+Each tool's JSON-schema `parameters` is converted to a TypeScript-like declaration. Converted: `type` `string`, `number`, `integer`, `boolean`, `array` (with or without `items`), `object` (`properties`, `required` for non-optional fields, nested objects); a list of scalar types with `null` (`["string", "null"]`); string `enum`; `description`, `title` and `examples` as comments; `default` as a comment. Validation keywords that do not change the value type (`format`, `minimum`, `maxLength`, `pattern`, ...) and `additionalProperties: true|false` are ignored. Any other construct (`anyOf`/`oneOf`/`allOf`, `$ref`/`$defs`, `const`, non-string `enum`, tuple `items`, map-typed `additionalProperties`, unknown keywords) is not approximated: that property is declared `any` with its raw JSON schema in a comment, so the model still sees the whole contract.
+
+A request the format cannot carry is rejected with a message naming the problem: a tool that is not `{"type": "function", ...}`, a missing, duplicate or whitespace-containing function name, `parameters` that is not an object, `function.arguments` that is not a string, or a `tool` message whose `tool_call_id` matches no earlier call.
+
 ---
 
 ## Parsing Results in Python

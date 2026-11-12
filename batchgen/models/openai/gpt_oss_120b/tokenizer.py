@@ -31,6 +31,10 @@ GPT-OSS tokenizer specifications:
 - PAD token: <|endoftext|> (ID: 199999)
 - Stop tokens: <|return|>, <|endoftext|>, <|call|> (``generation_config.json``)
 
+Chat prompts are rendered in the harmony format by
+:func:`render_harmony_prompt` (``apply_chat_template``), including request
+``tools``, assistant ``tool_calls`` history and ``tool`` result messages.
+
 Output parsing (``--parse-thinking`` / ``--parse-tool-call``) reads the
 harmony message grammar. Its markers (``<|start|>``, ``<|channel|>``,
 ``<|message|>``, ``<|end|>``, ``<|call|>``, ...) are special tokens, so the
@@ -44,7 +48,6 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import tiktoken
@@ -53,11 +56,13 @@ import torch
 from batchgen.config.base_tokenizer import BaseTokenizer
 from batchgen.config.tokenizer_assets import O200K_BASE, load_tiktoken_ranks
 from batchgen.config.tokenizer_registry import register_tokenizer
+from batchgen.models.openai.gpt_oss_120b.harmony_tools import (
+    FUNCTIONS_NAMESPACE,
+    render_functions_namespace,
+    validate_function_name,
+)
 
 logger = logging.getLogger(__name__)
-
-# Tokenizer config files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
 
 # GPT-OSS-120B special token IDs (from OpenAI reference)
 GPT_OSS_BOS_TOKEN_ID = 199998   # <|startoftext|>
@@ -295,6 +300,195 @@ def _join(parts: List[str]) -> str:
     return "\n\n".join(p for p in (s.strip() for s in parts) if p)
 
 
+# ---- Harmony prompt grammar ----
+#
+# One harmony message per chat message, in order; the prompt ends with
+# ``<|start|>assistant`` when a generation prompt is requested:
+#
+#   <|start|>system<|message|>CONTENT\n\n# Valid channels: ...<|end|>
+#   <|start|>developer<|message|># Tools ... namespace functions {...}<|end|>
+#   <|start|>user<|message|>CONTENT<|end|>
+#   <|start|>assistant<|channel|>final<|message|>CONTENT<|end|>
+#   <|start|>assistant<|channel|>analysis<|message|>REASONING<|end|>
+#   <|start|>assistant<|channel|>commentary<|message|>PREAMBLE<|end|>
+#   <|start|>assistant to=functions.NAME<|channel|>commentary <|constrain|>json<|message|>ARGS<|call|>
+#   <|start|>functions.NAME to=assistant<|channel|>commentary<|message|>RESULT<|end|>
+#
+# The developer message exists only when the request has tools; it follows
+# the leading system message, which then also names the tool channel. A past
+# turn ended by a final answer keeps no reasoning (harmony drops it); the
+# reasoning of tool-calling assistant messages after the last final answer
+# (the turn still in progress) is kept, so the model sees why it called.
+
+_H_SYSTEM_SUFFIX = (
+    "\n\n# Valid channels: analysis, commentary, final. "
+    "Channel must be included for every message."
+)
+_H_TOOL_CHANNEL_NOTE = (
+    "\nCalls to these tools must go to the commentary channel: 'functions'."
+)
+_H_JSON_CONTENT_TYPE = _H_CONSTRAIN + "json"
+
+
+def _text_field(message: dict, field: str, index: int, *, optional: bool = False) -> str:
+    value = message.get(field)
+    if value is None and optional:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"messages[{index}] ({message.get('role')!r}): {field!r} must be a "
+            f"string, got {type(value).__name__}"
+        )
+    return value
+
+
+def _tool_call_parts(call: object, where: str) -> Tuple[str, str, Optional[str]]:
+    """(name, arguments, id) of one OpenAI ``tool_calls`` entry."""
+    if not isinstance(call, dict):
+        raise ValueError(f"{where}: a tool call must be an object, got {type(call).__name__}")
+    if call.get("type", "function") != "function":
+        raise ValueError(f"{where}: only function tool calls are supported, got type={call.get('type')!r}")
+    function = call.get("function")
+    if not isinstance(function, dict):
+        raise ValueError(f"{where}: 'function' must be an object")
+    name = validate_function_name(function.get("name"), where)
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        raise ValueError(
+            f"{where}: function.arguments must be the JSON-encoded string the "
+            f"model produced, got {type(arguments).__name__}"
+        )
+    call_id = call.get("id")
+    if call_id is not None and not isinstance(call_id, str):
+        raise ValueError(f"{where}: id must be a string, got {type(call_id).__name__}")
+    return name, arguments, call_id
+
+
+def _message(role_header: str, channel: Optional[str], body: str, terminator: str = _H_END) -> str:
+    channel_part = "" if channel is None else _H_CHANNEL + channel
+    return f"{_H_START}{role_header}{channel_part}{_H_MESSAGE}{body}{terminator}"
+
+
+def render_harmony_prompt(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    add_generation_prompt: bool = False,
+) -> str:
+    """Render OpenAI chat messages (and tools) as a GPT-OSS harmony prompt.
+
+    Raises ``ValueError`` for a conversation the harmony format cannot carry
+    faithfully: an unknown role, missing text, a malformed tool call, or a
+    ``tool`` message that names no earlier call.
+    """
+    if not isinstance(messages, list):
+        raise ValueError(f"messages must be a list, got {type(messages).__name__}")
+    if tools is not None and not isinstance(tools, list):
+        raise ValueError(f"tools must be a list, got {type(tools).__name__}")
+    developer = None
+    if tools:
+        developer = _message(
+            "developer", None, render_functions_namespace(tools)
+        )
+
+    def has_calls(message: dict) -> bool:
+        return message.get("role") == "assistant" and bool(message.get("tool_calls"))
+
+    # Reasoning is kept only for tool-calling messages after the last final
+    # assistant answer: the turn the model is still working on.
+    last_final = max(
+        (
+            i for i, m in enumerate(messages)
+            if isinstance(m, dict) and m.get("role") == "assistant" and not has_calls(m)
+        ),
+        default=-1,
+    )
+
+    parts: List[str] = []
+    leading_system = bool(messages) and isinstance(messages[0], dict) and messages[0].get("role") == "system"
+    if developer is not None and not leading_system:
+        parts.append(developer)
+    call_names: Dict[str, str] = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"messages[{index}] must be an object, got {type(message).__name__}")
+        role = message.get("role")
+        if role == "system":
+            body = _text_field(message, "content", index) + _H_SYSTEM_SUFFIX
+            if developer is not None and index == 0:
+                body += _H_TOOL_CHANNEL_NOTE
+            parts.append(_message("system", None, body))
+            if developer is not None and index == 0:
+                parts.append(developer)
+        elif role == "user":
+            parts.append(_message("user", None, _text_field(message, "content", index)))
+        elif role == "assistant" and not has_calls(message):
+            parts.append(_message(
+                "assistant", "final", _text_field(message, "content", index)
+            ))
+        elif role == "assistant":
+            calls = message["tool_calls"]
+            if not isinstance(calls, list):
+                raise ValueError(f"messages[{index}]: tool_calls must be a list")
+            reasoning = _text_field(message, "reasoning_content", index, optional=True)
+            if reasoning and index > last_final:
+                parts.append(_message("assistant", "analysis", reasoning))
+            preamble = _text_field(message, "content", index, optional=True)
+            if preamble:
+                parts.append(_message("assistant", "commentary", preamble))
+            for call_index, call in enumerate(calls):
+                name, arguments, call_id = _tool_call_parts(
+                    call, f"messages[{index}].tool_calls[{call_index}]"
+                )
+                if call_id is not None:
+                    call_names[call_id] = name
+                parts.append(_message(
+                    f"assistant to={FUNCTIONS_NAMESPACE}.{name}",
+                    f"commentary {_H_JSON_CONTENT_TYPE}",
+                    arguments,
+                    _H_CALL,
+                ))
+        elif role == "tool":
+            name = _tool_result_name(message, index, call_names)
+            parts.append(_message(
+                f"{FUNCTIONS_NAMESPACE}.{name} to={_H_ASSISTANT}",
+                "commentary",
+                _text_field(message, "content", index),
+            ))
+        else:
+            raise ValueError(
+                f"messages[{index}]: role {role!r} is not supported by the "
+                f"GPT-OSS chat format (system, user, assistant, tool)"
+            )
+    if add_generation_prompt:
+        parts.append(_H_START + _H_ASSISTANT)
+    return "".join(parts)
+
+
+def _tool_result_name(message: dict, index: int, call_names: Dict[str, str]) -> str:
+    """The function a ``tool`` message answers: its call id's, else its name."""
+    call_id = message.get("tool_call_id")
+    name = message.get("name")
+    where = f"messages[{index}] (tool)"
+    if call_id is not None:
+        if call_id not in call_names:
+            raise ValueError(
+                f"{where}: tool_call_id {call_id!r} matches no earlier "
+                f"assistant tool call"
+            )
+        if name is not None and name != call_names[call_id]:
+            raise ValueError(
+                f"{where}: name {name!r} disagrees with tool_call_id "
+                f"{call_id!r}, which called {call_names[call_id]!r}"
+            )
+        return call_names[call_id]
+    if name is None:
+        raise ValueError(
+            f"{where}: needs tool_call_id (or name) to say which function "
+            f"returned this result"
+        )
+    return validate_function_name(name, where)
+
+
 def _get_tiktoken_tokenizer() -> tiktoken.Encoding:
     """Create GPT-OSS tiktoken tokenizer.
 
@@ -355,27 +549,12 @@ class GPTOssTokenizer(BaseTokenizer):
         self.eos_token = "<|return|>"
         self.pad_token = "<|endoftext|>"
 
-        # Load chat template from tokenizer_config.json if available
-        self.chat_template = self._load_chat_template()
-
         logger.info(
             f"GPT-OSS tokenizer initialized (tiktoken o200k_harmony): "
             f"vocab_size={self.vocab_size}, "
             f"bos={self.bos_token_id}, eos={self.eos_token_id}, "
             f"stop_ids={sorted(self.eos_token_ids)}, pad={self.pad_token_id}"
         )
-
-    def _load_chat_template(self) -> Optional[str]:
-        """Load chat template from tokenizer_config.json if available."""
-        config_file = TOKENIZER_DIR / "tokenizer_config.json"
-        if config_file.exists():
-            try:
-                with open(config_file, "r") as f:
-                    config = json.load(f)
-                return config.get("chat_template")
-            except Exception as e:
-                logger.warning(f"Failed to load chat template: {e}")
-        return None
 
     def encode(
         self,
@@ -474,54 +653,33 @@ class GPTOssTokenizer(BaseTokenizer):
 
     def apply_chat_template(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[dict],
         tokenize: bool = True,
         add_generation_prompt: bool = False,
+        tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> Union[str, List[int]]:
-        """Apply chat template to format messages.
-
-        Uses the Jinja2 chat_template from tokenizer_config.json to format
-        a list of chat messages into a prompt string.
+        """Render chat messages as a harmony prompt (see render_harmony_prompt).
 
         Args:
-            messages: List of message dicts with 'role' and 'content' keys
-            tokenize: If True, return token IDs; if False, return string
-            add_generation_prompt: Whether to add generation prompt at the end
-            **kwargs: Additional arguments passed to template
-
-        Returns:
-            Formatted prompt string (if tokenize=False) or token IDs (if tokenize=True)
+            messages: OpenAI chat messages (system/user/assistant/tool).
+            tokenize: If True, return token IDs; if False, return the string.
+            add_generation_prompt: End with ``<|start|>assistant``.
+            tools: OpenAI function tools; rendered as the developer message's
+                ``functions`` namespace.
+            **kwargs: Other chat-template switches the server forwards for
+                every model (``enable_thinking``, ``clear_thinking``, ...).
+                GPT-OSS has no such switch (its reasoning level is the
+                system message's ``Reasoning:`` line), so they do not change
+                the prompt.
 
         Raises:
-            ValueError: If no chat template is available
+            ValueError: the conversation or a tool definition cannot be
+                rendered faithfully (the message names which one).
         """
-        if not self.chat_template:
-            raise ValueError(
-                "This tokenizer does not have a chat_template. "
-                "Cannot apply chat template formatting."
-            )
-
-        try:
-            from jinja2 import Template, StrictUndefined
-        except ImportError:
-            raise ImportError(
-                "jinja2 is required for apply_chat_template. "
-                "Install it with: pip install jinja2"
-            )
-
-        # Create Jinja2 template
-        template = Template(self.chat_template, undefined=StrictUndefined)
-
-        # Render the template with messages and special tokens
-        rendered = template.render(
-            messages=messages,
-            bos_token=self.bos_token or "",
-            eos_token=self.eos_token or "",
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
+        rendered = render_harmony_prompt(
+            messages, tools=tools, add_generation_prompt=add_generation_prompt
         )
-
         if tokenize:
             return self.encode(rendered, add_special_tokens=False)
         return rendered
