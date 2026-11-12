@@ -257,6 +257,28 @@ def test_probe_with_cuda_measures_the_model_step_and_reduces_over_ranks():
     assert captured["unavailable"] == "this lifecycle captures no decode graph at startup"
 
 
+def test_probe_with_cuda_survives_a_failing_step_and_names_the_failure(caplog):
+    # Report-only contract: a defect in one model's synthetic step must not
+    # kill its deployments; the eager flavor publishes the failure by name.
+    cuda = FakeCuda()
+
+    class Manager:
+        def startup_decode_probe_step(self, padding_bsz):
+            raise RuntimeError("synthetic step blew up")
+
+    dist = SimpleNamespace(is_initialized=lambda: False, all_gather_object=None)
+    probe = _worker_probe(cuda_available=True, cuda=cuda, dist=dist)
+    worker = _worker(world_size=1, parallel_manager=Manager())
+    import logging as _logging
+    with caplog.at_level(_logging.ERROR, logger=st.__name__):
+        probe(worker, seam=st.SEAM_DEPLOYMENT_PREPARE, capture=None)
+    eager, captured = worker.startup_transient
+    assert eager["unavailable"] == "probe step failed: RuntimeError: synthetic step blew up"
+    assert eager["allocator_gib"] is None
+    assert captured["unavailable"] == "this lifecycle captures no decode graph at startup"
+    assert any("eager probe step failed" in r.message for r in caplog.records)
+
+
 def test_probe_with_cuda_names_a_manager_without_the_step():
     class GptOssManager:
         pass
