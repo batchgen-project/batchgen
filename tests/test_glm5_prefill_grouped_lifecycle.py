@@ -175,6 +175,14 @@ def test_prefill_gate_routes_in_bounded_ordered_chunks():
 def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
     monkeypatch,
 ):
+    # Window threading is backend-agnostic; this wiring test asserts the
+    # incumbent ptrs chain, so pin that backend (the default m-grouped
+    # backend builds dense ring views these mock tensors cannot satisfy).
+    monkeypatch.setattr(
+        glm5_model,
+        "_glm5_prefill_grouped_gemm_backend",
+        lambda: "cute_ptrs",
+    )
     calls = {"gate": [], "dispatch": [], "reduce": [], "shared": []}
 
     class _Gate:
