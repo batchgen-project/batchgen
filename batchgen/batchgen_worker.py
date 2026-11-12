@@ -12175,10 +12175,24 @@ class BatchGenWorker:
 				f"{type(pm).__name__} provides no cap-sized synthetic decode step",
 			)
 		else:
-			eager = transient.measure_eager(
-				lambda: step(padding_bsz),
-				cuda=cuda, device=self.local_rank, seam=seam, padding_bsz=padding_bsz,
-			)
+			try:
+				eager = transient.measure_eager(
+					lambda: step(padding_bsz),
+					cuda=cuda, device=self.local_rank, seam=seam, padding_bsz=padding_bsz,
+				)
+			except Exception as exc:
+				# The synthetic step is a measurement, not startup work: while
+				# the value is report-only, a probe defect on one model must
+				# not kill every deployment of it. Published by name instead;
+				# once the reservation feeds the pool budget, this becomes a
+				# startup failure.
+				transient.logger.exception(
+					"[STARTUP_TRANSIENT] rank=%s eager probe step failed", self.rank
+				)
+				eager = transient.StartupTransient.missing(
+					transient.FLAVOR_EAGER, seam, padding_bsz,
+					f"probe step failed: {type(exc).__name__}: {exc}",
+				)
 		if capture is None:
 			captured = transient.StartupTransient.missing(
 				transient.FLAVOR_CAPTURE, seam, padding_bsz,
