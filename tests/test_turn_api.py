@@ -327,7 +327,7 @@ def test_admit_message_carries_identity_and_batches_carry_none(tmp_path):
 
         scheduler._wait_and_finalize_batch = no_finalizer
         await scheduler._process_batch_pool_mode(
-            "batch_1", SimpleNamespace(batchgen_debug=None, max_context_length=None),
+            "batch_1", SimpleNamespace(batchgen_debug=None),
             requests, [np.asarray(_encode("p"), dtype=np.int32)], [4], None)
         body = io_struct.TurnRequest(**_turn_body("sub", parent="main"))
         waiter = scheduler.submit_turn("turn_x", body, time.time())
@@ -668,8 +668,8 @@ def test_e2e_turns_coexist_with_a_running_batch(tmp_path):
             "body": {"model": MODEL, "messages": [{"role": "user", "content": f"b{i}"}],
                      "max_tokens": 4}}) for i in range(3)).encode())
         assert ok, error
-        batch = SimpleNamespace(batchgen_debug=None, max_context_length=None,
-                                temperature=None, top_p=None, top_k=None)
+        batch = SimpleNamespace(batchgen_debug=None, temperature=None,
+                                top_p=None, top_k=None)
         built = await scheduler._build_prompts(requests, _Tokenizer())
         prompts, max_tokens, sampling, rejections = (
             scheduler._convert_requests_to_worker_inputs(requests, built, batch))

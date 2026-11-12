@@ -1593,7 +1593,6 @@ class BatchGenWorker:
 		self._stop_token_ids: set = set()
 		self.max_input_length = 0
 		self.max_decoding_length = 0
-		self.max_context_length = None  # Set per-batch from client; None = use model max
 		self.model_context_length = None  # Updated from model config during init
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -1655,7 +1654,7 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
-	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
+	def Init(self, max_input_length, max_decoding_length, num_queries):
 		"""
 		Initialize/reconfigure before the persistent generate() loop starts.
 		- First call: performs full initialization of core_engine, parallel_manager, etc.
@@ -1675,7 +1674,6 @@ class BatchGenWorker:
 			                     each admission entry carries that sequence's own
 			                     budget (``kv_token_budget``).
 			num_queries: Number of queries in the global batch.
-			max_context_length: Maximum total context length (prompt + decode). None = use model max.
 		"""
 		# Update batch-specific parameters
 		# max_input_length can be None - will be set during tokenization
@@ -1686,7 +1684,6 @@ class BatchGenWorker:
 		else:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
-		self.max_context_length = max_context_length
 
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		
@@ -9715,8 +9712,7 @@ class BatchGenWorker:
 		# Use Init() to set up core components (model, tokenizer, KV config)
 		# num_queries=0 means no sequences yet — they'll come via admission
 		if not self._core_initialized:
-			self.Init(None, self.max_decoding_length, 0,
-				max_context_length=self.max_context_length)
+			self.Init(None, self.max_decoding_length, 0)
 
 		# Initialize empty global batch
 		self.global_batch = SequenceBatch()
@@ -19433,7 +19429,7 @@ class BatchGenWorker:
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-		# Use model's max_position_embeddings (not max_context_length) so the
+		# Use model's max_position_embeddings (not the deployment max_model_len) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()

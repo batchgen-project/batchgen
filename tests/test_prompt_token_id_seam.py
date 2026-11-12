@@ -125,7 +125,7 @@ def _scheduler(tmp_path, worker, tokenizer, lines):
         updates=updates,
         load_batch=lambda batch_id: SimpleNamespace(
             status=bs.BatchStatus.VALIDATING, input_file_id=input_id,
-            max_decoding_length=None, max_context_length=None,
+            max_decoding_length=None,
             batchgen_debug=None, temperature=None, top_p=None, top_k=None),
         load_metadata=lambda file_id: {"id": file_id},
         update_batch_status=lambda batch_id, status, **kwargs: updates.append(

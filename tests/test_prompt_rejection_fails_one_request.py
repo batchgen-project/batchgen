@@ -63,7 +63,6 @@ def _scheduler(tmp_path, lines):
             status=bs.BatchStatus.VALIDATING,
             input_file_id=input_id,
             max_decoding_length=None,
-            max_context_length=None,
             batchgen_debug=None,
             temperature=None,
             top_p=None,

@@ -70,7 +70,6 @@ PINS = {
                         "max_input_length",
                         "max_decoding_length",
                         "num_queries",
-                        "max_context_length",
                     ],
                     "returns": None,
                 },

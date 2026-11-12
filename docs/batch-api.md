@@ -172,7 +172,7 @@ Create a batch job from an uploaded input file.
 | `completion_window` | string | No | `24h` | Completion time window |
 | `metadata` | object | No | None | Arbitrary metadata |
 | `max_decoding_length` | int | No | None | Batch-level fallback max output tokens (see [Input Format](input-format.md#output-length-priority)) |
-| `max_context_length` | int | No | None | Max total context length (prompt + decode). None = model maximum. |
+| `max_context_length` | int | No | None | Deprecated and ignored (logged as a warning). The deployment `max_model_len` (`GET /v1/models`) bounds prompt + completion for every request; limit decode length with `max_tokens` / `max_completion_tokens` per request or `max_decoding_length` per batch. |
 | `temperature` | float | No | None | Default sampling temperature. Per-request values override. |
 | `top_p` | float | No | None | Default nucleus sampling threshold. Per-request values override. |
 | `top_k` | int | No | None | Default top-k filtering. Per-request values override. |
@@ -202,7 +202,6 @@ is not serving (during a worker-pool restart or after the pool went down), and
   "error": null,
   "metadata": null,
   "max_decoding_length": 1024,
-  "max_context_length": null,
   "temperature": null,
   "top_p": null,
   "top_k": null
