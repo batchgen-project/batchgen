@@ -157,6 +157,39 @@ static void pass_numbering() {
                  {"Cannot install weight copy tasks", "are open"});
 }
 
+static void scheduled_allocation_is_cyclic() {
+    // An installed schedule makes slot assignment cyclic: indices advance
+    // modulo the ring regardless of WHICH slots retirement freed first, so a
+    // frame's cohort is always a contiguous, non-wrapping window (the layout
+    // a dense grouped-GEMM weight operand requires).
+    WeightSlotTable table = make(4);
+    CHECK(table.begin_pass() == 1);
+    const int64_t s0 = produce(table);
+    const int64_t s1 = produce(table);
+    const int64_t s2 = produce(table);
+    CHECK(s0 == 0 && s1 == 1 && s2 == 2);
+    // Free slot 0 FIRST, then slot 1: first-free would hand out 0 next;
+    // cyclic allocation must hand out 3, then wrap to 0.
+    consume(table, "e0");
+    consume(table, "e1");
+    const int64_t s3 = produce(table);
+    CHECK(s3 == 3);
+    const int64_t s4 = produce(table);
+    CHECK(s4 == 0);
+    // Cyclic position blocks on ITS slot even while others are free: slot 1
+    // is free, slot 2 (the next position... position 5 -> index 1) ...
+    const int64_t s5 = produce(table);
+    CHECK(s5 == 1);
+    // Next position is index 2, still held: reserve refuses although no
+    // other constraint would.
+    CHECK(!table.reserve(E).has_value());
+    consume(table, "e2");
+    consume(table, "e3");
+    consume(table, "e4");
+    consume(table, "e5");
+    table.end_pass(1);
+}
+
 static void producer_cursor_and_parking() {
     WeightSlotTable table = make(2);
     // No open pass: the type parks at the head of pass 1.
@@ -734,6 +767,7 @@ static void a_distributed_abort_loses_the_schedule() {
 
 int main() {
     pass_numbering();
+    scheduled_allocation_is_cyclic();
     producer_cursor_and_parking();
     claim_and_land();
     lease_and_release();

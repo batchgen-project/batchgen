@@ -184,6 +184,7 @@ class WeightSlotTable {
             }
         }
         this->slots_[module_type].assign(static_cast<size_t>(count), Slot{});
+        this->next_slot_[module_type] = 0;
     }
 
     // Append FREE slots until `module_type` has at least `count`.
@@ -245,6 +246,7 @@ class WeightSlotTable {
         }
         this->pending_skips_.clear();
         this->pass_counts_.clear();
+        this->next_slot_.clear();
         this->next_pass_ = 1;
     }
 
@@ -495,6 +497,31 @@ class WeightSlotTable {
         auto found = this->slots_.find(module_type);
         if (found == this->slots_.end()) {
             return std::nullopt;
+        }
+        const auto scheduled = this->lists_.find(module_type);
+        if (scheduled != this->lists_.end() && !scheduled->second.empty() &&
+            !found->second.empty()) {
+            // A type with an installed cyclic schedule allocates its slots
+            // cyclically too: the producer acquires in schedule order, so
+            // slot index tracks schedule position modulo the ring, and every
+            // frame's cohort is a contiguous, non-wrapping window of the
+            // arena (ring size is a whole number of frames) - the layout a
+            // dense grouped-GEMM weight operand requires. First-free
+            // assignment instead scatters a frame across whatever slots
+            // asynchronous retirement freed first.
+            int64_t& next = this->next_slot_[module_type];
+            if (next >= static_cast<int64_t>(found->second.size())) {
+                next = 0;
+            }
+            Slot& slot = found->second[static_cast<size_t>(next)];
+            if (slot.state != WeightSlotState::kFree) {
+                return std::nullopt;
+            }
+            slot = Slot{};
+            slot.state = WeightSlotState::kFilling;
+            const int64_t index = next;
+            next = (next + 1) % static_cast<int64_t>(found->second.size());
+            return index;
         }
         for (size_t index = 0; index < found->second.size(); ++index) {
             Slot& slot = found->second[index];
@@ -1220,6 +1247,9 @@ class WeightSlotTable {
     std::unordered_map<std::string, Installed> installed_;
     std::unordered_map<std::string, std::vector<std::string>> lists_;
     std::unordered_map<std::string, Cursor> cursors_;
+    // Next slot index per type under the cyclic allocation of an installed
+    // schedule; untouched (and unused) for types without one.
+    std::unordered_map<std::string, int64_t> next_slot_;
     std::deque<int64_t> open_passes_;
     int64_t next_pass_ = 1;
     std::map<int64_t, std::map<std::string, PassCounts>> pass_counts_;
