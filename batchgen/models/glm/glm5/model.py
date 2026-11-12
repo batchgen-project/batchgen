@@ -3053,6 +3053,13 @@ class Glm5MoE(nn.Module):
             )
             self._prefill_prepared_keys = None
             self._prefill_weight_prototypes = None
+            # The per-expert ring views and the dense stacks built from them
+            # keep the ring arena's storage alive; holding them across the
+            # retire (and the phase switch) pins the whole prefill expert
+            # ring in HBM and starves the decode KV pool.
+            self._prefill_expert_weight_views = None
+            self._prefill_deepgemm_weights = None
+            self._prefill_deepgemm_group_ids = None
 
         if self._prefill_shared_key is not None:
             if self._prefill_shared_release_event is None:
