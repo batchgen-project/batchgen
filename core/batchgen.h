@@ -121,7 +121,9 @@ class BatchGen {
                                  std::vector<int64_t>>& peer_fds,
         const std::unordered_map<std::string,
                                  std::vector<int64_t>>& peer_bytes,
-        const std::unordered_map<std::string, int64_t>& strides);
+        const std::unordered_map<
+            std::string,
+            std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields);
     // (fd, mapped bytes) of the type's single prefill ring segment; the
     // caller owns the fd and closes it once every peer has imported.
     std::pair<int64_t, int64_t> ring_segment_export_fd(
