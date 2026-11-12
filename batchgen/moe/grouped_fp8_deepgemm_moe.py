@@ -114,8 +114,15 @@ def build_grouped_layout(
     total_rows: int,
     alignment: Optional[int] = None,
     validate: bool = True,
+    group_ids: Optional[Tensor] = None,
 ) -> Tensor:
     """int32 [total_rows] row->group map with -1 padding holes.
+
+    ``group_ids`` (int32 [experts], optional) remaps expert segment ``e`` to
+    group index ``group_ids[e]`` - the dense weight stack's order need not be
+    the dispatch's expert-id order (a staggered ring delivers each member its
+    own experts first, so slot order is a per-member rotation of expert ids).
+    Without it the identity mapping is used.
 
     ``cu_seqlens[g]`` is group ``g``'s first row and ``seqlens[g]`` its live
     row count in the reserved activation buffer; rows between
@@ -132,6 +139,10 @@ def build_grouped_layout(
         raise ValueError("seqlens and cu_seqlens must be 1-D")
     if cu_seqlens.numel() != seqlens.numel() + 1:
         raise ValueError("cu_seqlens must have one more entry than seqlens")
+    if group_ids is not None and (
+        group_ids.ndim != 1 or group_ids.numel() != seqlens.numel()
+    ):
+        raise ValueError("group_ids must map every expert segment")
     starts = cu_seqlens[:-1]
     ends = cu_seqlens[1:]
     if validate:
@@ -148,7 +159,11 @@ def build_grouped_layout(
         (total_rows,), -1, dtype=torch.int32, device=device
     )
     groups = seqlens.numel()
-    ids = torch.arange(groups, dtype=torch.int32, device=device)
+    ids = (
+        group_ids.to(device=device, dtype=torch.int32)
+        if group_ids is not None
+        else torch.arange(groups, dtype=torch.int32, device=device)
+    )
     row = torch.arange(total_rows, dtype=cu_seqlens.dtype, device=device)
     # Row r belongs to group g when cu_seqlens[g] <= r < cu_seqlens[g]+seqlens[g].
     bucket = torch.bucketize(row, ends, right=True).clamp_(max=groups - 1)

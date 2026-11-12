@@ -3128,6 +3128,24 @@ class Glm5MoE(nn.Module):
                     )
                 (gate_v, gate_s, up_v, up_s, down_v, down_s) = views
 
+                # The ring delivers each member its OWN experts first (the
+                # staggered walk), so slot order is a per-member rotation of
+                # expert-id order. The dense stacks must be in SLOT order
+                # (the pointer check requires ascending uniform stride), and
+                # the grouped layout maps each expert's rows to its slot
+                # position instead of its id.
+                slot_order = sorted(
+                    range(len(gate_v)), key=lambda e: gate_v[e].data_ptr()
+                )
+                expert_to_group = torch.empty(
+                    len(gate_v), dtype=torch.int32, device=gate_v[0].device
+                )
+                for position, expert in enumerate(slot_order):
+                    expert_to_group[expert] = position
+
+                def _slot_sorted(members):
+                    return [members[e] for e in slot_order]
+
                 # Block counts come from the acquired [N, K] ring views.
                 n_blk = gate_v[0].shape[0] // 128
                 k_blk = gate_v[0].shape[1] // 128
@@ -3138,22 +3156,27 @@ class Glm5MoE(nn.Module):
                 def _fill_scales(stack, members, rows, cols):
                     # Weight scales are per-expert resident tensors in
                     # separate allocations; copy them into the persistent
-                    # stack (one stack op per projection per layer).
+                    # stack (one stack op per projection per layer), in the
+                    # same slot order as the weight stacks.
                     torch.stack(
-                        [member[:rows, :cols] for member in members],
+                        [
+                            members[e][:rows, :cols]
+                            for e in slot_order
+                        ],
                         out=stack,
                     )
                     return stack
 
                 deepgemm_weights = (
-                    dense_group_view(gate_v),
+                    dense_group_view(_slot_sorted(gate_v)),
                     _fill_scales(sfb_gate, gate_s, n_blk, k_blk),
-                    dense_group_view(up_v),
+                    dense_group_view(_slot_sorted(up_v)),
                     _fill_scales(sfb_up, up_s, n_blk, k_blk),
-                    dense_group_view(down_v),
+                    dense_group_view(_slot_sorted(down_v)),
                     _fill_scales(sfb_down, down_s, k_blk, n_blk),
                 )
                 self._prefill_deepgemm_weights = deepgemm_weights
+                self._prefill_deepgemm_group_ids = expert_to_group
             row_align = deepgemm_m_alignment()
             buf.ensure_s1_partner()
         else:
@@ -3203,7 +3226,8 @@ class Glm5MoE(nn.Module):
                     ),
                 )
                 grouped_layout = build_grouped_layout(
-                    counts, cu_seqlens, m_chunk, row_align, validate=False
+                    counts, cu_seqlens, m_chunk, row_align, validate=False,
+                    group_ids=self._prefill_deepgemm_group_ids,
                 )
                 x_fp8 = buf.x_fp8.view(torch.float8_e4m3fn)
                 grouped_fp8_deepgemm_gemm(
