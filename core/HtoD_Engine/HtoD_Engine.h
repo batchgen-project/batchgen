@@ -125,7 +125,9 @@ class HtoD_Engine {
                                  std::vector<int64_t>>& peer_fds,
         const std::unordered_map<std::string,
                                  std::vector<int64_t>>& peer_bytes,
-        const std::unordered_map<std::string, int64_t>& strides);
+        const std::unordered_map<
+            std::string,
+            std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields);
     // Syncs and destroys the pull streams, drops the imported segments and
     // the control-block view, clears the reclaim gate. The caller has run
     // the group barrier first.
@@ -302,7 +304,11 @@ class HtoD_Engine {
         torch::Tensor block_backing;  // keep-alive of the shared mapping view
         // per type: per member, base pointer of their single ring segment
         std::unordered_map<std::string, std::vector<void*>> segment_base;
-        std::unordered_map<std::string, int64_t> stride;
+        // per type: {block base offset, per-slot stride, payload bytes}
+        // for every field of a slot, in the arena's field order.
+        std::unordered_map<std::string,
+                           std::vector<std::tuple<int64_t, int64_t, int64_t>>>
+            fields;
         // imported peer segment mappings (unmapped at uninstall)
         std::vector<std::shared_ptr<batchgen_vmm::VmmPeerImport>> keepalive;
         std::vector<cudaStream_t> pull_streams;  // one per member

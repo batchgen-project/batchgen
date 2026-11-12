@@ -128,7 +128,8 @@ class BatchGen {
         const std::string& module_type);
     void uninstall_replica_plan();
     std::vector<torch::Tensor> ring_segments(const std::string& module_type);
-    int64_t ring_stride(const std::string& module_type);
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> ring_field_layout(
+        const std::string& module_type);
     void save_compressed_kv();
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&

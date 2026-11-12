@@ -121,7 +121,14 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
     std::sort(names.begin(), names.end());
     std::vector<Field> fields;
     fields.reserve(names.size());
-    int64_t stride = 0;
+    // Field-major arenas: one contiguous block PER FIELD across all slots,
+    // instead of one block per slot. Every consumer reads per-field tensors
+    // (the HtoD producer copies field by field and the GEMM paths take
+    // per-slot pointers), and a run of consecutive slots then exposes each
+    // field as one dense [slots, *shape] region whenever the field's byte
+    // size is already kAlign-aligned - which is what a grouped GEMM that
+    // requires a dense [groups, N, K] operand consumes directly.
+    int64_t total = 0;
     for (const auto& name : names) {
         const auto& shape = shapes->second.at(name);
         const torch::Dtype dtype = get_tensor_dtype(
@@ -132,8 +139,11 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
         }
         const int64_t nbytes =
             numel * static_cast<int64_t>(c10::elementSize(dtype));
-        fields.push_back(Field{name, shape, dtype, stride, nbytes});
-        stride += (nbytes + kAlign - 1) / kAlign * kAlign;
+        const int64_t field_stride = (nbytes + kAlign - 1) / kAlign * kAlign;
+        // Field{offset = this field's block base, nbytes}; the per-slot
+        // stride within the block is field_stride.
+        fields.push_back(Field{name, shape, dtype, total, nbytes});
+        total += count * field_stride;
     }
     const auto options =
         torch::TensorOptions()
@@ -144,20 +154,34 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
     // node peers as a POSIX fd mapping of exactly this range (slice 2c). The
     // tensor view keeps the mapping alive; releasing the last view unmaps
     // and returns the memory immediately, outside the torch pool.
+    // Field-major layout: a slot is several per-field ranges rather than one
+    // contiguous span, so the replica pull addresses records through the
+    // per-field table (ring_field_layout) instead of one slot stride.
     const int device = this->engine_config_.basic_config.device;
     auto backing =
-        std::make_shared<batchgen_vmm::VmmRingSegment>(device, count * stride);
+        std::make_shared<batchgen_vmm::VmmRingSegment>(device, total);
     const torch::Tensor storage = torch::from_blob(
-        backing->data(), {count * stride}, [backing](void*) {}, options);
+        backing->data(), {total}, [backing](void*) {}, options);
     this->segments_[module_type].push_back(storage);
     this->segment_backings_[module_type].push_back(backing);
-    this->segment_strides_[module_type] = stride;
+    auto& layout = this->segment_fields_[module_type];
+    layout.clear();
+    for (const Field& field : fields) {
+        const int64_t field_stride =
+            (field.nbytes + kAlign - 1) / kAlign * kAlign;
+        layout.push_back(RingFieldRange{field.offset, field_stride,
+                                        field.nbytes});
+    }
     buffers.reserve(buffers.size() + static_cast<size_t>(count));
     for (int64_t index = 0; index < count; ++index) {
         module_weight_tensor_map slot;
         for (const Field& field : fields) {
+            const int64_t field_stride =
+                (field.nbytes + kAlign - 1) / kAlign * kAlign;
             slot[field.name] = storage
-                                   .narrow(0, index * stride + field.offset,
+                                   .narrow(0,
+                                           field.offset +
+                                               index * field_stride,
                                            field.nbytes)
                                    .view(field.dtype)
                                    .view(field.shape);
@@ -734,10 +758,13 @@ std::pair<void*, int64_t> GPU_Weight_Buffer::ring_segment_base(
     return {backing->data(), static_cast<int64_t>(backing->mapped_bytes())};
 }
 
-int64_t GPU_Weight_Buffer::ring_stride(const std::string& module_type) const {
+std::vector<GPU_Weight_Buffer::RingFieldRange>
+GPU_Weight_Buffer::ring_field_layout(const std::string& module_type) const {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    auto found = this->segment_strides_.find(module_type);
-    return found == this->segment_strides_.end() ? 0 : found->second;
+    auto found = this->segment_fields_.find(module_type);
+    return found == this->segment_fields_.end()
+               ? std::vector<RingFieldRange>{}
+               : found->second;
 }
 
 GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {

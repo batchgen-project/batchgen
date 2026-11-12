@@ -11288,14 +11288,16 @@ class BatchGenWorker:
 		types = sorted(plan.frame_size)
 		own_fds = {}
 		own_bytes = {}
-		strides = {}
+		field_layouts = {}
 		for module_type in types:
 			fd, mapped = self.core_engine.ring_segment_export_fd(module_type)
 			own_fds[module_type] = int(fd)
 			own_bytes[module_type] = int(mapped)
-			strides[module_type] = int(
-				self.core_engine.ring_stride(module_type)
-			)
+			field_layouts[module_type] = [
+				(int(offset), int(stride), int(nbytes))
+				for offset, stride, nbytes in
+				self.core_engine.ring_field_layout(module_type)
+			]
 		_mark("export")
 		peer_fds = {t: [-1] * len(group) for t in types}
 		peer_bytes = {t: [0] * len(group) for t in types}
@@ -11368,7 +11370,7 @@ class BatchGenWorker:
 				block_tensor,
 				peer_fds,
 				peer_bytes,
-				strides,
+				field_layouts,
 			)
 		finally:
 			for module_type in types:

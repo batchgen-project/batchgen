@@ -183,7 +183,17 @@ class GPU_Weight_Buffer {
         const std::string& module_type) const;
     std::vector<torch::Tensor> ring_segments(
         const std::string& module_type) const;
-    int64_t ring_stride(const std::string& module_type) const;
+    // One entry per field of the type's slot layout, in sorted field-name
+    // order: {block base offset in the segment, per-slot stride within the
+    // block, payload bytes}. Slot i's field f spans
+    // [offset + i * stride, + nbytes).
+    struct RingFieldRange {
+        int64_t offset = 0;
+        int64_t stride = 0;
+        int64_t nbytes = 0;
+    };
+    std::vector<RingFieldRange> ring_field_layout(
+        const std::string& module_type) const;
 
    private:
     void reclaimCompletedReleasesLocked();
@@ -210,7 +220,8 @@ class GPU_Weight_Buffer {
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<batchgen_vmm::VmmRingSegment>>>
         segment_backings_;
-    std::unordered_map<std::string, int64_t> segment_strides_;
+    std::unordered_map<std::string, std::vector<RingFieldRange>>
+        segment_fields_;
     /* Thread safe buffers management */
     mutable std::mutex mutex_;
     std::condition_variable cv_;

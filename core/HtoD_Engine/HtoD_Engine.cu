@@ -522,7 +522,9 @@ void HtoD_Engine::install_replica_plan(
     torch::Tensor control_block,
     const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
     const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
-    const std::unordered_map<std::string, int64_t>& strides) {
+    const std::unordered_map<
+        std::string,
+        std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields) {
     if (this->HtoD_worker_.joinable()) {
         throw std::runtime_error(
             "install_replica_plan requires a stopped producer");
@@ -599,9 +601,16 @@ void HtoD_Engine::install_replica_plan(
                 "peer byte sizes of " + module_type +
                 " must hold one entry per member");
         }
-        auto stride = strides.find(module_type);
-        if (stride == strides.end() || stride->second <= 0) {
-            throw std::runtime_error("missing ring stride for " + module_type);
+        auto field_layout = fields.find(module_type);
+        if (field_layout == fields.end() || field_layout->second.empty()) {
+            throw std::runtime_error("missing ring field layout for " +
+                                     module_type);
+        }
+        for (const auto& [offset, stride, nbytes] : field_layout->second) {
+            if (offset < 0 || stride <= 0 || nbytes <= 0 || nbytes > stride) {
+                throw std::runtime_error("invalid ring field range of " +
+                                         module_type);
+            }
         }
         const auto [own_base, own_bytes] =
             this->gpu_weight_buffer_.ring_segment_base(module_type);
@@ -631,7 +640,7 @@ void HtoD_Engine::install_replica_plan(
             bases.push_back(import->data());
             runtime->keepalive.push_back(std::move(import));
         }
-        runtime->stride[module_type] = stride->second;
+        runtime->fields[module_type] = field_layout->second;
     }
     runtime->pull_streams.resize(group_size, nullptr);
     for (int64_t member = 0; member < group_size; ++member) {
@@ -1094,15 +1103,13 @@ void HtoD_Engine::HtoD_Worker() {
                             std::to_string(flat) + " without publishing " +
                             module_name);
                     }
-                    const int64_t stride = plan.stride.at(module_type);
-                    char* src = static_cast<char*>(
-                                    plan.segment_base.at(module_type)
-                                        [role->owner_member]) +
-                                static_cast<int64_t>(slot_index) * stride;
-                    char* dst = static_cast<char*>(
-                                    plan.segment_base.at(module_type)
-                                        [plan.member_index]) +
-                                buffer_idx * stride;
+                    const auto& field_layout = plan.fields.at(module_type);
+                    char* src_base = static_cast<char*>(
+                        plan.segment_base.at(module_type)
+                            [role->owner_member]);
+                    char* dst_base = static_cast<char*>(
+                        plan.segment_base.at(module_type)
+                            [plan.member_index]);
                     cudaStream_t stream =
                         plan.pull_streams[role->owner_member];
                     {
@@ -1110,15 +1117,27 @@ void HtoD_Engine::HtoD_Worker() {
                             this->producer_section_ns_[kSecDrain]);
                         this->drain_landings_(true);
                     }
-                    CUDA_CHECK(cudaMemcpyAsync(dst, src,
-                                               static_cast<size_t>(stride),
-                                               cudaMemcpyDeviceToDevice,
-                                               stream));
+                    // Field-major arena: a slot is one range per field, so
+                    // the pull is one copy per field instead of one slot-
+                    // stride span.
+                    uint64_t pulled_bytes = 0;
+                    for (const auto& [offset, field_stride, nbytes] :
+                         field_layout) {
+                        char* src = src_base + offset +
+                                    static_cast<int64_t>(slot_index) *
+                                        field_stride;
+                        char* dst = dst_base + offset +
+                                    buffer_idx * field_stride;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            dst, src, static_cast<size_t>(nbytes),
+                            cudaMemcpyDeviceToDevice, stream));
+                        pulled_bytes += static_cast<uint64_t>(nbytes);
+                    }
                     PendingLanding landing;
                     landing.module_type = module_type;
                     landing.module_name = module_name;
                     landing.buffer_idx = buffer_idx;
-                    landing.bytes = static_cast<uint64_t>(stride);
+                    landing.bytes = pulled_bytes;
                     landing.replica_pull = true;
                     landing.pass = next.pass;
                     landing.has_role = true;

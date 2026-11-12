@@ -459,7 +459,9 @@ void BatchGen::install_replica_plan(
     torch::Tensor control_block,
     const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
     const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
-    const std::unordered_map<std::string, int64_t>& strides) {
+    const std::unordered_map<
+        std::string,
+        std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields) {
     std::vector<HtoD_Engine::ReplicaModuleInstall> installs;
     installs.reserve(modules.size());
     for (const auto& [module_type, module, kind, owner, layer_position,
@@ -476,7 +478,7 @@ void BatchGen::install_replica_plan(
     this->h2d_engine_.install_replica_plan(
         member_index, group_size, layers_per_pass, records_per_frame,
         installs, std::move(control_block),
-        peer_fds, peer_bytes, strides);
+        peer_fds, peer_bytes, fields);
 }
 
 std::pair<int64_t, int64_t> BatchGen::ring_segment_export_fd(
@@ -495,8 +497,14 @@ std::vector<torch::Tensor> BatchGen::ring_segments(
     return this->gpu_weight_buffer_.ring_segments(module_type);
 }
 
-int64_t BatchGen::ring_stride(const std::string& module_type) {
-    return this->gpu_weight_buffer_.ring_stride(module_type);
+std::vector<std::tuple<int64_t, int64_t, int64_t>>
+BatchGen::ring_field_layout(const std::string& module_type) {
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> out;
+    for (const auto& range :
+         this->gpu_weight_buffer_.ring_field_layout(module_type)) {
+        out.emplace_back(range.offset, range.stride, range.nbytes);
+    }
+    return out;
 }
 
 
