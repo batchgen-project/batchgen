@@ -57,9 +57,11 @@ class FakeCuda:
     def memory_reserved(self, device):
         return self.reserved
 
-    def transient(self, peak_bytes, reserved_growth=0, external_growth=0):
-        """Allocate ``peak_bytes`` and free them, as one decode step would."""
+    def transient(self, peak_bytes, reserved_growth=0, external_growth=0,
+                  retained_bytes=0):
+        """Allocate ``peak_bytes``, free them, optionally retain some."""
         self.peak = max(self.peak, self.allocated + peak_bytes)
+        self.allocated += retained_bytes
         self.reserved += reserved_growth
         self.external += external_growth
 
@@ -83,28 +85,33 @@ def test_runs_agree_within_exactly_one_allocator_block():
 
 # ---- measurement arithmetic ---------------------------------------------------
 
-def test_eager_measures_exact_peak_and_external_growth_over_both_runs():
+def test_eager_measures_exact_peak_and_external_growth_over_all_runs():
     cuda = FakeCuda()
     runs = []
 
     def step():
-        # First run creates a lazy communicator buffer; the second finds it.
+        # The warm (first-ever) run creates one-time state: a lazy external
+        # communicator buffer plus allocator-held workspaces that stay
+        # allocated. The measured runs find them already present.
+        first = not runs
         cuda.transient(64 * MiB, reserved_growth=4 * MiB,
-                       external_growth=0 if runs else 32 * MiB)
+                       external_growth=32 * MiB if first else 0,
+                       retained_bytes=16 * MiB if first else 0)
         runs.append(1)
 
     result = st.measure_eager(step, cuda=cuda, device=0, **_probe())
-    assert len(runs) == 2 and cuda.resets == 2
+    assert len(runs) == 3 and cuda.resets == 3
     assert result.flavor == st.FLAVOR_EAGER
     assert result.allocator_gib * st.GIB == 64 * MiB
     # reserved growth is allocator memory and is not counted as external
     assert result.external_gib * st.GIB == 32 * MiB
+    assert result.retained_gib * st.GIB == 16 * MiB
     assert result.deterministic is True and result.unavailable is None
 
 
 def test_eager_mismatch_logs_loudly_and_does_not_fail_startup(caplog):
     cuda = FakeCuda()
-    peaks = iter([64 * MiB, 64 * MiB + st.ALLOCATOR_BLOCK_BYTES + 1])
+    peaks = iter([64 * MiB, 64 * MiB, 64 * MiB + st.ALLOCATOR_BLOCK_BYTES + 1])
     with caplog.at_level(logging.ERROR, logger=st.__name__):
         result = st.measure_eager(
             lambda: cuda.transient(next(peaks)), cuda=cuda, device=0, **_probe()
@@ -198,11 +205,11 @@ def test_probe_without_cuda_publishes_unavailable_and_still_captures(caplog):
     assert calls == [1]
     assert worker.startup_transient == [
         {"flavor": "eager", "seam": st.SEAM_PERSISTENT_BUILD, "padding_bsz": 8,
-         "allocator_gib": None, "external_gib": None, "deterministic": None,
-         "unavailable": "CUDA is unavailable"},
+         "allocator_gib": None, "external_gib": None, "retained_gib": None,
+         "deterministic": None, "unavailable": "CUDA is unavailable"},
         {"flavor": "capture", "seam": st.SEAM_PERSISTENT_BUILD, "padding_bsz": 8,
-         "allocator_gib": None, "external_gib": None, "deterministic": None,
-         "unavailable": "CUDA is unavailable"},
+         "allocator_gib": None, "external_gib": None, "retained_gib": None,
+         "deterministic": None, "unavailable": "CUDA is unavailable"},
     ]
     lines = [r.getMessage() for r in caplog.records]
     assert any(line.startswith("[STARTUP_TRANSIENT] rank=0 ") for line in lines)
@@ -250,7 +257,7 @@ def test_probe_with_cuda_measures_the_model_step_and_reduces_over_ranks():
     probe = _worker_probe(cuda_available=True, cuda=cuda, dist=dist)
     worker = _worker(world_size=2, parallel_manager=Manager())
     probe(worker, seam=st.SEAM_DEPLOYMENT_PREPARE, capture=None)
-    assert seen == [8, 8]
+    assert seen == [8, 8, 8]
     eager, captured = worker.startup_transient
     assert eager["allocator_gib"] * st.GIB == 2 * 64 * MiB
     assert eager["deterministic"] is True and eager["unavailable"] is None
