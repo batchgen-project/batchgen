@@ -1159,16 +1159,36 @@ class GptOssParallelStrategyManager:
         ]
         patched_routers = []
 
+        probe_engine_config = self.engine_config
+
         class _SyntheticPagedKV:
             """Minimal paged KV surface consumed by the GPT-OSS wrapper."""
 
             def __init__(self):
+                # The decode kernel supports only the deployment page size
+                # (block_size); at this startup seam the wrapper's manager is
+                # not installed yet, so the page size comes from the engine
+                # config, with the live manager honored when present.
                 source_manager = saved_attention_state["gpu_paged_kv_manager"]
                 source_config = getattr(source_manager, "config", None)
                 page_size = int(
-                    getattr(source_config, "page_size_tokens", 2) or 2
+                    getattr(source_config, "page_size_tokens", 0)
+                    or getattr(
+                        getattr(probe_engine_config, "Device_Paged_KV_Config", None),
+                        "page_size",
+                        0,
+                    )
+                    or 0
                 )
-                page_size = max(page_size, plan.past_tokens + 1)
+                if page_size <= 0:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe found no deployment page size"
+                    )
+                if page_size < plan.past_tokens + 1:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe needs past_tokens + 1 to fit one "
+                        f"page (page_size={page_size})"
+                    )
                 pages_per_row = (
                     plan.past_tokens + 1 + page_size - 1
                 ) // page_size
