@@ -245,7 +245,9 @@ def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
         return output
 
     monkeypatch.setattr(glm5_model, "_glm5_dispatch_scatter_ragged", _dispatch)
-    monkeypatch.setattr(glm5_model, "_glm5_act_quant_ragged", lambda *_args: None)
+    monkeypatch.setattr(
+        glm5_model, "_glm5_act_quant_ragged", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         glm5_model,
         "grouped_fp8_blockwise_fused_s1_ptrs",
