@@ -453,6 +453,7 @@ class StartupTransientObject(BaseModel):
     padding_bsz: int
     allocator_gib: Optional[float] = None
     external_gib: Optional[float] = None
+    retained_gib: Optional[float] = None
     deterministic: Optional[bool] = None
     unavailable: Optional[str] = None
 
