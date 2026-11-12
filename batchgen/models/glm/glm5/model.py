@@ -3000,29 +3000,16 @@ class Glm5MoE(nn.Module):
         self._prefill_prepared_keys = keys
         self._prefill_weight_prototypes = prototypes
         self._prefill_shared_key = shared_key
+        # Raw per-expert ring views, in acquisition (slot) order. The dense
+        # [E, N, K] stacks for the m-grouped backend are built lazily at the
+        # layer's first forward chunk (where they are consumed and validated);
+        # the lifecycle itself never needs them.
+        self._prefill_expert_weight_views = (
+            gate_views, gate_scale_views,
+            up_views, up_scale_views,
+            down_views, down_scale_views,
+        )
         self._prefill_deepgemm_weights = None
-        if _glm5_prefill_grouped_gemm_backend() == "deepgemm":
-            # Built once per acquired layer: dense [E, N, K] views over the
-            # field-major ring (pointer-verified, fails loud on a non-dense
-            # ring) and exact-extent fp32 scale stacks.
-            from batchgen.moe.grouped_fp8_deepgemm_moe import dense_group_view
-
-            def _scale_stack(views, n_blocks, k_blocks):
-                stack = dense_group_view(views)[:, :n_blocks, :k_blocks]
-                return stack if stack.is_contiguous() else stack.contiguous()
-
-            # Block counts come from the acquired weight tensors themselves
-            # ([N, K] fp8 ring views), not from the model config.
-            n_blk = gate_views[0].shape[0] // 128
-            k_blk = gate_views[0].shape[1] // 128
-            self._prefill_deepgemm_weights = (
-                dense_group_view(gate_views),
-                _scale_stack(gate_scale_views, n_blk, k_blk),
-                dense_group_view(up_views),
-                _scale_stack(up_scale_views, n_blk, k_blk),
-                dense_group_view(down_views),
-                _scale_stack(down_scale_views, k_blk, n_blk),
-            )
 
     def _queue_prefill_grouped_releases(self) -> None:
         """Transfer this layer's acquired slots to the fenced retire queue."""
@@ -3101,19 +3088,42 @@ class Glm5MoE(nn.Module):
         output = torch.empty_like(hidden_flat)
 
         backend = _glm5_prefill_grouped_gemm_backend()
-        deepgemm_weights = getattr(self, "_prefill_deepgemm_weights", None)
-        if backend == "deepgemm" and deepgemm_weights is None:
-            raise RuntimeError(
-                "GLM-5 grouped prefill: the m-grouped backend is selected but "
-                "the layer's dense weight views were not prepared"
-            )
         if backend == "deepgemm":
             from batchgen.moe.grouped_fp8_deepgemm_moe import (
                 build_grouped_layout,
                 deepgemm_m_alignment,
+                dense_group_view,
                 grouped_fp8_deepgemm_gemm,
             )
 
+            deepgemm_weights = self._prefill_deepgemm_weights
+            if deepgemm_weights is None:
+                views = getattr(self, "_prefill_expert_weight_views", None)
+                if views is None:
+                    raise RuntimeError(
+                        "GLM-5 grouped prefill: the m-grouped backend is "
+                        "selected but the layer's ring views were not prepared"
+                    )
+                (gate_v, gate_s, up_v, up_s, down_v, down_s) = views
+
+                def _scale_stack(members, n_blocks, k_blocks):
+                    stack = dense_group_view(members)[:, :n_blocks, :k_blocks]
+                    return (
+                        stack if stack.is_contiguous() else stack.contiguous()
+                    )
+
+                # Block counts come from the acquired [N, K] ring views.
+                n_blk = gate_v[0].shape[0] // 128
+                k_blk = gate_v[0].shape[1] // 128
+                deepgemm_weights = (
+                    dense_group_view(gate_v),
+                    _scale_stack(gate_s, n_blk, k_blk),
+                    dense_group_view(up_v),
+                    _scale_stack(up_s, n_blk, k_blk),
+                    dense_group_view(down_v),
+                    _scale_stack(down_s, k_blk, n_blk),
+                )
+                self._prefill_deepgemm_weights = deepgemm_weights
             row_align = deepgemm_m_alignment()
             buf.ensure_s1_partner()
         else:
