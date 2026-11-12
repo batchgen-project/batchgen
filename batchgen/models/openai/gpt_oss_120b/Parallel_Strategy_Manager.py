@@ -24,7 +24,9 @@ Optimized for single H20 GPU with MXFP4 quantization.
 
 import gc
 import logging
+import operator
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
@@ -40,6 +42,75 @@ from batchgen.phase_lifecycle import (
     PhaseEnterContext,
     PhaseKey,
 )
+
+
+class StartupDecodeProbeError(RuntimeError):
+    """The startup decode probe cannot honor its cap-width contract."""
+
+
+@dataclass(frozen=True)
+class StartupDecodeProbePlan:
+    """The bounded synthetic decode shape used by the startup probe."""
+
+    batch_size: int
+    past_tokens: int = 1
+
+
+def plan_startup_decode_probe(
+    padding_bsz: int, configured_cap: int
+) -> StartupDecodeProbePlan:
+    """Validate and describe one cap-width synthetic decode step."""
+    try:
+        if isinstance(padding_bsz, bool) or isinstance(configured_cap, bool):
+            raise TypeError("bool is not a batch-width integer")
+        requested = operator.index(padding_bsz)
+        cap = operator.index(configured_cap)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "startup decode probe requires integer padding_bsz and configured cap"
+        ) from exc
+    if requested <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe requires padding_bsz > 0, got {requested}"
+        )
+    if cap <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe has no configured positive cap (got {cap})"
+        )
+    if requested > cap:
+        raise StartupDecodeProbeError(
+            "startup decode probe width exceeds configured decode cap: "
+            f"padding_bsz={requested}, configured_cap={cap}"
+        )
+    return StartupDecodeProbePlan(batch_size=requested)
+
+
+def uniform_expert_assignment(
+    num_rows: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device=None,
+) -> torch.Tensor:
+    """Return a row-major, round-robin top-k assignment over all experts."""
+    try:
+        if any(isinstance(value, bool) for value in (num_rows, num_experts, top_k)):
+            raise TypeError("bool is not an assignment dimension")
+        rows = operator.index(num_rows)
+        experts = operator.index(num_experts)
+        k = operator.index(top_k)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "uniform expert assignment requires integer dimensions"
+        ) from exc
+    if rows < 0 or experts <= 0 or k <= 0 or k > experts:
+        raise StartupDecodeProbeError(
+            "invalid uniform expert assignment shape: "
+            f"rows={rows}, experts={experts}, top_k={k}"
+        )
+    row_starts = (torch.arange(rows, device=device, dtype=torch.long) * k) % experts
+    offsets = torch.arange(k, device=device, dtype=torch.long)
+    return (row_starts[:, None] + offsets[None, :]) % experts
 
 
 class GptOssParallelStrategyManager:
@@ -980,6 +1051,290 @@ class GptOssParallelStrategyManager:
         )
 
         return self.model, self.weight_copy_task
+
+    @torch.inference_mode()
+    def startup_decode_probe_step(self, padding_bsz: int) -> None:
+        """Run one cap-width synthetic decode step for startup accounting.
+
+        The worker owns real sequence admission and paged-KV pool pages.  At
+        this seam those rows do not exist yet, so the probe creates a tiny
+        in-memory paged-KV manager with one past token per row.  This runs the
+        real paged decode kernel without allocating or mutating pool pages.
+        It also runs every configured MoE layer, the cap-sized EP
+        buffers/collectives, the LM head, and sampling.  Temporary metadata,
+        graph state, and router overrides are restored before return.
+        """
+        if not torch.cuda.is_available():
+            raise StartupDecodeProbeError(
+                "startup decode probe requires CUDA; refusing to measure on CPU"
+            )
+
+        configured_cap = getattr(self, "padding_bsz", None)
+        if configured_cap is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires configure_decoding() to set a cap"
+            )
+        plan = plan_startup_decode_probe(padding_bsz, configured_cap)
+
+        model = getattr(self, "model", None)
+        if model is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires a configured decode model"
+            )
+        if self.world_size > 1 and self.comm is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the configured EP communicator"
+            )
+
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+        if getattr(AttnWrapperBase, "phase", "decode") != "decode":
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the decode phase to be live"
+            )
+
+        layers = list(getattr(getattr(model, "model", None), "layers", ()))
+        decode_moes = [
+            layer.mlp
+            for layer in layers
+            if hasattr(getattr(layer, "mlp", None), "router")
+        ]
+        if not decode_moes:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no configured decode MoE layers"
+            )
+
+        plan_bsz = plan.batch_size
+        local_rank = getattr(self, "local_rank", None)
+        if local_rank is None:
+            local_rank = torch.cuda.current_device()
+        device = torch.device("cuda", int(local_rank))
+        try:
+            hidden_dtype = next(model.parameters()).dtype
+        except StopIteration as exc:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires model parameters"
+            ) from exc
+
+        sample_attn = getattr(layers[0], "self_attn", None)
+        num_kv_heads = int(
+            getattr(
+                sample_attn,
+                "num_kv_heads",
+                getattr(self.model_config, "num_key_value_heads", 0),
+            )
+        )
+        head_dim = int(
+            getattr(sample_attn, "head_dim", getattr(self.model_config, "head_dim", 0))
+        )
+        if num_kv_heads <= 0 or head_dim <= 0:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires positive KV head geometry"
+            )
+        saved_attention_state = {
+            name: getattr(AttnWrapperBase, name)
+            for name in (
+                "gpu_paged_kv_manager",
+                "cache_seqlens",
+                "max_seqlen",
+                "cur_batch",
+                "position_ids",
+                "attention_mask",
+                "kv_append_callback",
+                "kv_append_callback_aux",
+            )
+        }
+        saved_sinks = [
+            (layer.self_attn, getattr(layer.self_attn, "sinks", None))
+            for layer in layers
+            if hasattr(layer, "self_attn")
+        ]
+        saved_graph_state = [
+            (
+                layer,
+                getattr(layer, "cuda_graph_manager", None),
+                getattr(layer, "_full_attn_segment_name", None),
+                getattr(layer, "_moe_segment_name", None),
+            )
+            for layer in layers
+        ]
+        patched_routers = []
+
+        probe_engine_config = self.engine_config
+
+        class _SyntheticPagedKV:
+            """Minimal paged KV surface consumed by the GPT-OSS wrapper."""
+
+            def __init__(self):
+                # The decode kernel supports only the deployment page size
+                # (block_size); at this startup seam the wrapper's manager is
+                # not installed yet, so the page size comes from the engine
+                # config, with the live manager honored when present.
+                source_manager = saved_attention_state["gpu_paged_kv_manager"]
+                source_config = getattr(source_manager, "config", None)
+                page_size = int(
+                    getattr(source_config, "page_size_tokens", 0)
+                    or getattr(
+                        getattr(probe_engine_config, "Device_Paged_KV_Config", None),
+                        "page_size",
+                        0,
+                    )
+                    or 0
+                )
+                if page_size <= 0:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe found no deployment page size"
+                    )
+                if page_size < plan.past_tokens + 1:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe needs past_tokens + 1 to fit one "
+                        f"page (page_size={page_size})"
+                    )
+                pages_per_row = (
+                    plan.past_tokens + 1 + page_size - 1
+                ) // page_size
+                self.page_size = page_size
+                self.page_table = torch.arange(
+                    plan_bsz * pages_per_row,
+                    dtype=torch.int32,
+                    device=device,
+                ).view(plan_bsz, pages_per_row)
+                self.k_cache = torch.zeros(
+                    (
+                        len(layers),
+                        plan_bsz * pages_per_row,
+                        page_size,
+                        num_kv_heads,
+                        head_dim,
+                    ),
+                    dtype=hidden_dtype,
+                    device=device,
+                )
+                self.v_cache = torch.zeros_like(self.k_cache)
+
+            def update_layer_decode_new_token(
+                self,
+                *,
+                k_tensor,
+                v_tensor,
+                sequence_lengths,
+                layer_idx,
+                batch_slice=None,
+                **_kwargs,
+            ):
+                if batch_slice is not None:
+                    start, end = batch_slice
+                    rows = slice(start, end)
+                    lengths = sequence_lengths[start:end]
+                else:
+                    rows = slice(None)
+                    lengths = sequence_lengths
+                lengths = lengths.to(dtype=torch.long)
+                page_indices = lengths // self.page_size
+                offsets = lengths % self.page_size
+                pages = self.page_table[rows].gather(
+                    1, page_indices[:, None]
+                ).squeeze(1)
+                self.k_cache[layer_idx, pages, offsets] = k_tensor[:, 0]
+                if v_tensor is not None:
+                    self.v_cache[layer_idx, pages, offsets] = v_tensor[:, 0]
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return (
+                    self.k_cache[layer_idx],
+                    self.v_cache[layer_idx],
+                    self.page_table,
+                )
+
+        try:
+            # Disable graph replay for this eager probe.  The startup caller
+            # captures graphs only after this step, and the original state is
+            # restored below if a lifecycle already installed one.
+            for layer, _manager, _attn_name, _moe_name in saved_graph_state:
+                layer.cuda_graph_manager = None
+                layer._full_attn_segment_name = None
+                layer._moe_segment_name = None
+
+            synthetic_kv = _SyntheticPagedKV()
+            AttnWrapperBase.gpu_paged_kv_manager = synthetic_kv
+            AttnWrapperBase.cache_seqlens = torch.full(
+                (plan_bsz,), plan.past_tokens + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            AttnWrapperBase.max_seqlen = plan.past_tokens + 1
+            AttnWrapperBase.cur_batch = None
+            AttnWrapperBase.position_ids = None
+            AttnWrapperBase.attention_mask = None
+            AttnWrapperBase.kv_append_callback = None
+            AttnWrapperBase.kv_append_callback_aux = None
+
+            # Make the routed workload uniform without changing any router
+            # parameters or retaining a probe-only module attribute.
+            for moe in decode_moes:
+                router = moe.router
+                num_experts = int(moe.total_experts)
+                top_k = int(moe.num_experts_per_tok)
+                original = router.__dict__.get("forward", None)
+
+                def _uniform_router_forward(
+                    hidden_states,
+                    *,
+                    _num_experts=num_experts,
+                    _top_k=top_k,
+                ):
+                    assignments = uniform_expert_assignment(
+                        hidden_states.shape[0],
+                        _num_experts,
+                        _top_k,
+                        device=hidden_states.device,
+                    )
+                    logits = torch.full(
+                        (hidden_states.shape[0], _num_experts),
+                        -1.0,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    return logits.scatter(1, assignments, 1.0)
+
+                router.__dict__["forward"] = _uniform_router_forward
+                patched_routers.append((router, original))
+
+            input_ids = torch.zeros(
+                (plan_bsz, 1), dtype=torch.long, device=device
+            )
+            position_ids = torch.full(
+                (plan_bsz, 1), plan.past_tokens,
+                dtype=torch.long,
+                device=device,
+            )
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = outputs.logits[:, -1, :]
+            from batchgen.sampling import sample_tokens
+            sampled_tokens = sample_tokens(
+                logits, temperature=1.0, top_p=1.0, top_k=0
+            )
+            del sampled_tokens, logits, outputs, synthetic_kv
+            del position_ids, input_ids
+        finally:
+            for router, original in reversed(patched_routers):
+                if original is None:
+                    router.__dict__.pop("forward", None)
+                else:
+                    router.__dict__["forward"] = original
+            for layer_attn, sinks in saved_sinks:
+                layer_attn.sinks = sinks
+            for layer, manager, attn_name, moe_name in saved_graph_state:
+                layer.cuda_graph_manager = manager
+                layer._full_attn_segment_name = attn_name
+                layer._moe_segment_name = moe_name
+            for name, value in saved_attention_state.items():
+                setattr(AttnWrapperBase, name, value)
 
     def get_weight_copy_task(self) -> Dict[str, List[str]]:
         """Return the weight copy task mapping."""
