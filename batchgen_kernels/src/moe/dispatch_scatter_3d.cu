@@ -16,7 +16,7 @@ __global__ void count_tokens_3d_kernel(
     const int32_t* __restrict__ topk_indices,
     int32_t* __restrict__ expert_counts,
     int32_t* __restrict__ topk_pos,
-    int NK, int expert_start, int E_local, int row_align
+    int NK, int expert_start, int E_local
 ) {
     extern __shared__ int32_t s_counts[];
     const int tid = threadIdx.x;
@@ -155,7 +155,7 @@ __global__ void count_tokens_ragged_kernel(
     int32_t* __restrict__ expert_counters,
     int32_t* __restrict__ cu_seqlens,
     int32_t* __restrict__ topk_pos,
-    int NK, int expert_start, int E_local
+    int NK, int expert_start, int E_local, int row_align
 ) {
     extern __shared__ int32_t s_counts[];
     const int tid = threadIdx.x;
