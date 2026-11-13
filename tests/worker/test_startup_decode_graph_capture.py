@@ -65,6 +65,8 @@ _METHOD_NAMES = [
     "_warmup_cuda_graphs",
     "_setup_cuda_graphs",
     "_decode_graph_capture_needed_at_configure",
+    "_assert_decode_graph_capture_allowed",
+    "_record_decode_graph_capture",
     "_glm5_whole_model_graph_current_bucket_missing",
     "_whole_model_decode_graphs_requested",
     "_glm5_whole_model_graph_requested_for_current_batch",
