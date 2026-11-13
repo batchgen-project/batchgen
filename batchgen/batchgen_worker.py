@@ -11390,14 +11390,8 @@ class BatchGenWorker:
 		live = self._live_phase_key
 		if live == desired:
 			return False, False
-		resumed = False
 		if live is not None:
 			exit_mode = self._phase_exit_mode(live, desired)
-			resumed = (
-				desired.phase == "decode"
-				and exit_mode is ExitMode.SUSPEND
-				and self.parallel_manager.holds_instance("decode")
-			)
 			self._prepare_phase_exit(live, desired)
 			if live.phase == "decode":
 				if exit_mode is ExitMode.RETIRE:
@@ -11411,6 +11405,15 @@ class BatchGenWorker:
 				if live.phase != "decode":
 					self._destroy_gpu_paged_kv_cache()
 				self.deep_free_model_memory()
+		# A decode entry resumes exactly when the manager still holds a decode
+		# instance after the outgoing phase has exited: that is the instance
+		# phase_enter activates. It does not depend on how the outgoing phase
+		# left — a manager that keeps no prefill instance retires prefill and
+		# still resumes its kept decode instance.
+		resumed = (
+			desired.phase == "decode"
+			and self.parallel_manager.holds_instance("decode")
+		)
 		if desired.phase == "decode":
 			self.init_nvshmem()
 		elif hasattr(self.parallel_manager, "set_comm"):
@@ -12115,6 +12118,31 @@ class BatchGenWorker:
 				"decode graph state of a reused instance; it is captured once "
 				"per process and must survive every phase switch"
 			)
+
+	def _assert_decode_graph_capture_allowed(self) -> None:
+		"""Capture-once on the reuse lifecycle, for every decode graph path.
+
+		The building switch captures a reused instance's graphs and every
+		later activation replays them. Getting here again means their state
+		was torn down; recapturing would hide that, and it needs model state
+		(fused attention pointers, MoE pointer tables) a torn-down instance no
+		longer has. The criticality probe's armed recapture is the one
+		exception: it releases only the graph state, never the model state.
+		"""
+		if (
+			getattr(self, "_decode_graph_captures", 0) > 0
+			and self.parallel_manager.holds_instance("decode")
+			and not getattr(self, "_criticality_probe_recapture", False)
+		):
+			raise RuntimeError(
+				f"Rank {self.rank}: decode graph capture requested again for a "
+				"reused decode instance; its graphs are captured once per "
+				"process and their state must survive every phase switch"
+			)
+
+	def _record_decode_graph_capture(self) -> None:
+		"""Count one completed decode graph capture for the live decode owner."""
+		self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
 
 	def _assert_decode_attention_weights_registered(self) -> None:
 		"""A reused decode instance keeps its resident attention weights.
@@ -19546,23 +19574,7 @@ class BatchGenWorker:
 						"configure-time capture; using eager decode instead of recapturing"
 					)
 					return
-			# Capture-once on the reuse lifecycle: the building switch captures a
-			# reused instance's graphs and every later activation replays them.
-			# Getting here again means their state was torn down; recapturing
-			# would hide that, and it needs model state (fused attention
-			# pointers, MoE pointer tables) a torn-down instance no longer has.
-			# Same exception for the criticality probe's recapture: it
-			# releases only the graph state, never the model state above.
-			if (
-				getattr(self, "_decode_graph_captures", 0) > 0
-				and self.parallel_manager.holds_instance("decode")
-				and not getattr(self, "_criticality_probe_recapture", False)
-			):
-				raise RuntimeError(
-					f"Rank {self.rank}: decode graph capture requested again for a "
-					"reused decode instance; its graphs are captured once per "
-					"process and their state must survive every phase switch"
-				)
+			self._assert_decode_graph_capture_allowed()
 
 			from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 				Glm5WholeModelSegment,
@@ -19950,7 +19962,7 @@ class BatchGenWorker:
 				)
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
-			self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
+			self._record_decode_graph_capture()
 			self._criticality_probe_recapture = False
 			# Phase B: hand the just-captured segment to the adapter so its
 			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
@@ -20015,6 +20027,9 @@ class BatchGenWorker:
 					stats["total_capture_time_ms"],
 				)
 			return
+
+		# Every other decode graph path is under the same capture-once rule.
+		self._assert_decode_graph_capture_allowed()
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
 		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
@@ -20136,6 +20151,7 @@ class BatchGenWorker:
 			self._whole_model_segment_name = _K25_WM_NAME
 			self._whole_model_bucketing = bucketing
 			self._whole_model_segment = whole_seg
+			self._record_decode_graph_capture()
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
 				logging.info(
@@ -20291,6 +20307,7 @@ class BatchGenWorker:
 				logging.info(
 					f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
 				)
+		self._record_decode_graph_capture()
 
 	def decoding_continuous(
 		self,
