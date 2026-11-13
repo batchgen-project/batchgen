@@ -56,12 +56,20 @@ WORKER_LIFECYCLE_SOURCE = (
     / "worker_lifecycle_engine.py"
 )
 WORKER_LIFECYCLE_CLASS = "WorkerLifecycleEngine"
-# The worker-seam engines (S8, S7, S9) whose methods the worker reaches through
+KV_CAPACITY_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "kv_capacity_engine.py"
+)
+KV_CAPACITY_CLASS = "KVCapacityEngine"
+# The worker-seam engines (S8, S7, S9, S10a) whose methods the worker reaches through
 # same-name canonical delegators.
 DELEGATED_ENGINES = (
     (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
     (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
     (WORKER_LIFECYCLE_SOURCE, WORKER_LIFECYCLE_CLASS),
+    (KV_CAPACITY_SOURCE, KV_CAPACITY_CLASS),
 )
 
 
@@ -254,8 +262,8 @@ def step_observability_method_names() -> set:
 def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     """The body a worker method runs, in the worker's own shape.
 
-    For a method S8/S7/S9 moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
-    / ``WorkerLifecycleEngine``
+    For a method S8/S7/S9/S10a moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
+    / ``WorkerLifecycleEngine`` / ``KVCapacityEngine``
     the worker keeps a canonical delegator; the statements that run are the
     engine's, so this returns the engine method converted back by
     :func:`engine_method_as_worker_method`. Every other name resolves to the
@@ -272,7 +280,7 @@ def worker_shaped_method_node(name: str) -> ast.FunctionDef:
 
 
 def delegated_method_names() -> set:
-    """Every worker method whose body lives in a delegated engine (S8/S7/S9)."""
+    """Every worker method whose body lives in a delegated engine (S8/S7/S9/S10a)."""
     names: set = set()
     for source, class_name in DELEGATED_ENGINES:
         names |= set(_class_methods(source, class_name))

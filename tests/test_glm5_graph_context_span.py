@@ -38,7 +38,7 @@ from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
 from tests.worker.worker_fakes import make_graph_state
 from tests.worker_method_source import (
     STEP_OBSERVABILITY_SOURCE,
-    step_observability_method_names,
+    delegated_method_names,
     worker_shaped_method_node,
 )
 
@@ -56,8 +56,9 @@ def _worker_class() -> ast.ClassDef:
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
-    # S7: the span warning runs in StepObservabilityEngine (worker delegates).
-    if name in step_observability_method_names():
+    # S7/S10a: the span warning (StepObservabilityEngine) and the KV pool
+    # sizing (KVCapacityEngine) run in their engines (worker delegates).
+    if name in delegated_method_names():
         return worker_shaped_method_node(name)
     for stmt in _worker_class().body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name == name:
