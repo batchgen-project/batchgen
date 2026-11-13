@@ -333,27 +333,65 @@ def test_configure_runs_before_the_graph_warmup_decision_and_can_trigger_it():
     assert "self._criticality_probe_recapture" in ast.unparse(returned[0].value)
 
 
-def test_capture_path_admits_only_the_armed_recapture():
-    setup = _method_ast("_setup_cuda_graphs")
-    guards = [
-        node for node in ast.walk(setup)
+def _guards(method, predicate):
+    return [
+        node for node in ast.walk(method)
         if isinstance(node, ast.If)
-        and (
-            "holds_instance" in ast.unparse(node.test)
-            or ast.unparse(node.test).startswith("capture_attempted")
-        )
+        and predicate(ast.unparse(node.test))
         and any(isinstance(n, (ast.Raise, ast.Return)) for n in node.body)
     ]
-    assert len(guards) == 2
-    for guard in guards:
-        assert "_criticality_probe_recapture" in ast.unparse(guard.test)
+
+
+def test_capture_path_admits_only_the_armed_recapture():
+    setup = _method_ast("_setup_cuda_graphs")
+    # The GLM-5 changed-state guard stays inline; the capture-once guard is
+    # shared by every decode graph path.
+    inline = _guards(setup, lambda test: test.startswith("capture_attempted"))
+    assert len(inline) == 1
+    assert "_criticality_probe_recapture" in ast.unparse(inline[0].test)
+    assert not _guards(setup, lambda test: "holds_instance" in test)
+    once = _guards(
+        _method_ast("_assert_decode_graph_capture_allowed"),
+        lambda test: "holds_instance" in test,
+    )
+    assert len(once) == 1
+    assert "_criticality_probe_recapture" in ast.unparse(once[0].test)
     src = ast.unparse(setup)
     assert src.index("install_criticality_probe(") < src.index(
         "manager.warmup_and_capture_buckets"
     )
-    assert src.index("self._decode_graph_captures = ") < src.rindex(
+    assert src.index("self._record_decode_graph_capture()") < src.rindex(
         "self._criticality_probe_recapture = False"
     )
+
+
+def test_every_decode_graph_capture_is_guarded_then_counted():
+    # Each capture call is preceded by the capture-once guard and followed by
+    # a count, so a reused instance of any model is captured once per process.
+    src = ast.unparse(_method_ast("_setup_cuda_graphs"))
+    guard = "self._assert_decode_graph_capture_allowed()"
+    record = "self._record_decode_graph_capture()"
+    captures = [
+        index
+        for call in ("warmup_and_capture_buckets(", "warmup_and_capture_all(")
+        for index in _find_all(src, call)
+    ]
+    guards = _find_all(src, guard)
+    records = _find_all(src, record)
+    assert captures and len(guards) == 2
+    for capture in captures:
+        assert any(g < capture for g in guards)
+        assert any(r > capture for r in records)
+    counter = ast.unparse(_method_ast("_record_decode_graph_capture"))
+    assert "self._decode_graph_captures = " in counter
+
+
+def _find_all(text, needle):
+    found, start = [], 0
+    while (index := text.find(needle, start)) >= 0:
+        found.append(index)
+        start = index + 1
+    return found
 
 
 def test_release_drops_the_installed_probe():
