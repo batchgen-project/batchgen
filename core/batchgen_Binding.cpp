@@ -731,6 +731,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &DistributedWeightDaemon::FinishCohortSwap,
              py::arg("timeout_seconds"),
              py::call_guard<py::gil_scoped_release>())
+        // Polled every second by the worker monitor while the pool serves;
+        // the GIL is released so even a brief mutex wait never stalls the
+        // cluster heartbeat thread.
+        .def("status", &DistributedWeightDaemon::Status,
+             py::call_guard<py::gil_scoped_release>())
         .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
         .def("stop", &DistributedWeightDaemon::Stop);
     
