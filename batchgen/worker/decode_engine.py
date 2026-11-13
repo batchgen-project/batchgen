@@ -967,8 +967,6 @@ class DecoupledGpuDecode:
                             graph_probe_hidden_states=graph_probe_hidden_states,
                             eager_tokens=eager_tokens_for_compare,
                             graph_tokens=graph_tokens_for_compare,
-                            atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
-                            rtol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
                         )
                         _log = logging.info if compare["ok"] else logging.error
                         _log(
