@@ -8,8 +8,13 @@ through ``KVCacheManager``, the host-KV health line, the per-rank decode cap
 and the per-group host views.
 
 S10b added the host-KV watermark request and reclaimable-prefix credit, and
-the host-capacity due checks and collective transaction helpers. S10c (page boundary, GPU allocation, load, host append, eviction)
-adds to this engine. The frozen S5
+the host-capacity due checks and collective transaction helpers. S10c added
+GPU KV page allocation and release (with host-identity page dedup), the
+decode KV append to host, the host-to-GPU KV load, the decode capacity
+snapshot and the page-boundary decision request. Parked on the worker pending
+the layer-map ruling: _page_boundary_fast, _finalize_async_load_minimal,
+_put_sequences_on_hold, _try_load_new_sequences, _compute_boundary_decisions
+(and the S10a/S10b parked methods). The frozen S5
 straddlers ``_mirror_group_host_kv`` and ``_release_host_kv_pages_for_batch``
 stay on the worker.
 
@@ -24,18 +29,23 @@ from __future__ import annotations
 import dataclasses as _dataclasses
 import gc
 import logging
+import math
 import os
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
-from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
-from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
+from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
+from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator, DualPoolPageKeys
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.kv_cache.host_kv_health import format_host_kv_health
 from batchgen.native_loader import core_engine
+from batchgen.worker.boundary import BoundaryDecisionRequest, BoundarySeqMeta
+from batchgen.worker.decode import DecodeCapacitySnapshot, reduce_decode_capacity_snapshot
+from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
 from batchgen.worker.kv_manager import (
     GPU_KV_POOL_HEADROOM_GB,
     KVCacheManager,
@@ -65,6 +75,39 @@ _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128")
 # If set, overrides the automatic calculation. Otherwise, size is computed as:
 # gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
+
+# Optional gate for expensive/critical diagnostics (default off in production)
+BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
+
+
+def _normalize_aux_kv_entry(entry) -> tuple:
+    """(layer_idx, k_tensor, v_tensor, scale_tensor) of a deferred aux append.
+
+    A page-split FP8 aux region needs the fp32 per-token scales alongside the
+    quantized keys, so a producer may append a 4-tuple; a bf16 AoS producer
+    keeps appending a 3-tuple and gets ``scale_tensor=None``.
+    """
+
+    if len(entry) == 4:
+        return tuple(entry)
+    if len(entry) == 3:
+        layer_idx, k_tensor, v_tensor = entry
+        return layer_idx, k_tensor, v_tensor, None
+    raise RuntimeError(
+        "deferred aux KV entry must be (layer_idx, k_tensor, v_tensor) or "
+        f"(layer_idx, k_tensor, v_tensor, scale_tensor); got {len(entry)} fields"
+    )
+
+
+@dataclass
+class _DualKVLoadPointers:
+    sequence_tensor: torch.Tensor
+    primary_k_ptrs: torch.Tensor
+    primary_v_ptrs: Optional[torch.Tensor]
+    primary_page_counts: torch.Tensor
+    aux_k_ptrs: torch.Tensor
+    aux_v_ptrs: Optional[torch.Tensor]
+    aux_page_counts: torch.Tensor
 
 
 class KVCapacityEngine:
@@ -1519,3 +1562,1180 @@ class KVCapacityEngine:
         )
         dist.all_reduce(decision, op=dist.ReduceOp.MIN)
         return bool(int(decision.item()))
+
+    # ---- GPU KV page allocation and release --------------------------------
+
+    def _collective_gpu_kv_allocation_preflight(
+        self, worker, required_pages: int, free_pages: int
+    ) -> bool:
+        """Require every rank to approve a GPU-KV allocation before mutation."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        local_can_allocate = int(required_pages >= 0 and required_pages <= free_pages)
+        if self.world_size == 1:
+            return bool(local_can_allocate)
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "distributed process group is required for GPU-KV allocation preflight"
+            )
+        can_allocate = torch.tensor(
+            [local_can_allocate], dtype=torch.int32, device=self.torch_device
+        )
+        dist.all_reduce(can_allocate, op=dist.ReduceOp.MIN)
+        return bool(int(can_allocate.item()))
+
+    def _allocate_gpu_kv_two_page_buffer(
+        self, worker, 
+        local_sequence_ids: List[int],
+        load_from_host: bool = True,
+        collective_preflight: bool = False,
+    ) -> bool:
+        """
+        Allocate GPU KV pages using two-page buffer strategy.
+    
+        Returns:
+            True if allocation succeeded, False otherwise.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        manager = self.gpu_paged_kv_cache_manager
+        if manager is None:
+            if collective_preflight:
+                return self._collective_gpu_kv_allocation_preflight(0, 0)
+            return False
+        if not manager.is_initialized:
+            if collective_preflight:
+                return self._collective_gpu_kv_allocation_preflight(0, 0)
+            return False
+        if not local_sequence_ids:
+            if collective_preflight:
+                return self._collective_gpu_kv_allocation_preflight(
+                    0, manager.get_stats().num_free_pages
+                )
+            return True
+    
+        global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+    
+        pages_per_seq = []
+        total_pages = 0
+    
+        # DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
+        alloc_details = []
+        for local_idx in local_sequence_ids:
+            uuid = self._local_to_uuid_map[local_idx]
+            seq = self.global_batch.get_sequence(uuid)
+            pages = seq.get_gpu_pages_for_two_page_buffer()
+            pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
+            total_pages += pages
+        
+            # Track details for resuming sequences (decoded_length > 0)
+            if seq.decoded_length > 0:
+                alloc_details.append({
+                    'uuid': uuid[:8],
+                    'global_idx': seq.global_idx,
+                    'decoded_length': seq.decoded_length,
+                    'current_context_length': seq.current_context_length,
+                    'pages_allocating': pages,
+                    'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
+                })
+    
+        if alloc_details and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
+            logging.debug(
+                f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
+            )
+
+        free_pages = manager.get_stats().num_free_pages
+        # With prefix sharing the physical demand is lower than the logical
+        # page sum: a Host page already mapped (or repeated in this batch)
+        # costs nothing. The preview runs the allocator's own validation, so
+        # a demand it accepts cannot fail validation at allocation time.
+        try:
+            page_keys = self._host_identity_page_keys(
+                manager, global_ids, pages_per_seq
+            )
+            demand_pages = (
+                total_pages
+                if page_keys is None
+                else manager.count_new_shared_pages(
+                    global_ids, pages_per_seq, page_keys
+                )
+            )
+        except Exception:
+            if collective_preflight:
+                # The failed rank still joins the collective so peers cannot
+                # advance into allocation while this rank raises.
+                self._collective_gpu_kv_allocation_preflight(1, 0)
+            raise
+        if collective_preflight:
+            if not self._collective_gpu_kv_allocation_preflight(
+                demand_pages, free_pages
+            ):
+                logging.warning(
+                    f"Rank {self.rank}: collective GPU KV allocation preflight failed "
+                    f"(need {demand_pages} of {total_pages} logical, "
+                    f"local free {free_pages})"
+                )
+                return False
+        elif demand_pages > free_pages:
+            logging.error(
+                f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
+                f"only {free_pages} free"
+            )
+            # Don't set gpu_pages_allocated since we're failing
+            return False
+    
+        try:
+            self._allocate_gpu_pages_with_host_identity(
+                manager, global_ids, pages_per_seq
+            )
+        except RuntimeError as exc:
+            if "Insufficient free pages" not in str(exc):
+                raise
+            logging.error(
+                "Rank %s cannot allocate shared GPU KV pages: %s",
+                self.rank,
+                exc,
+            )
+            return False
+
+        # Now safe to update tracking.
+        for local_idx in local_sequence_ids:
+            uuid = self._local_to_uuid_map[local_idx]
+            seq = self.global_batch.get_sequence(uuid)
+            pages = seq.get_gpu_pages_for_two_page_buffer()
+            seq.gpu_pages_allocated = pages
+            # Mark that this sequence has received its initial GPU reservation
+            seq.mark_initial_gpu_reservation_done()
+    
+        manager.rebuild_page_table(global_ids)
+
+        if load_from_host:
+            self._load_host_kv_to_gpu(manager, global_ids)
+    
+        # Track in set
+        for local_idx in local_sequence_ids:
+            uuid = self._local_to_uuid_map[local_idx]
+            self._sequences_with_gpu_kv.add(uuid)
+    
+        # Rebuild page table with ALL active sequences
+        all_active_global_ids = []
+        for uuid in self._sequences_with_gpu_kv:
+            if uuid in self._uuid_to_local_map:
+                seq = self.global_batch.get_sequence(uuid)
+                all_active_global_ids.append(seq.global_idx)
+        all_active_global_ids.sort()
+    
+        if all_active_global_ids:
+            manager.rebuild_page_table(all_active_global_ids)
+
+        # DIAGNOSTIC: Log page table order after allocation for debugging order mismatch (debug-only / opt-in)
+        if manager and manager._gpu_page_table_manager and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
+            final_slot_order = list(manager._gpu_page_table_manager.slot_to_seq_id) if manager._gpu_page_table_manager.slot_to_seq_id else []
+            logging.debug(
+                f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer finished. "
+                f"input_global_ids={global_ids[:5]}{'...' if len(global_ids) > 5 else ''} (len={len(global_ids)}), "
+                f"all_active_sorted={all_active_global_ids[:5]}{'...' if len(all_active_global_ids) > 5 else ''} (len={len(all_active_global_ids)}), "
+                f"final_slot_to_seq_id={final_slot_order[:5]}{'...' if len(final_slot_order) > 5 else ''} (len={len(final_slot_order)})"
+            )
+
+        logging.debug(
+            f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
+        )
+        return True
+
+    def _extend_gpu_kv_allocation(self, worker, uuids: List[str]) -> bool:
+        """
+        Extend GPU KV allocation for sequences that need more pages.
+    
+        Returns:
+            True if all extensions succeeded, False if insufficient pages
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        manager = self.gpu_paged_kv_cache_manager
+        if manager is None:
+            return False
+    
+        free_pages = manager.get_stats().num_free_pages
+    
+        extensions_needed = []
+        total_additional = 0
+    
+        for uuid in uuids:
+            if uuid not in self._uuid_to_local_map:
+                continue
+            seq = self.global_batch.get_sequence(uuid)
+            additional = seq.get_additional_gpu_pages_needed()
+            if additional > 0:
+                extensions_needed.append((uuid, additional))
+                total_additional += additional
+    
+        if total_additional > free_pages:
+            logging.warning(
+                f"Rank {self.rank}: Insufficient GPU pages for extension: "
+                f"need {total_additional}, have {free_pages}"
+            )
+            return False
+    
+        # Perform extensions
+        for uuid, additional in extensions_needed:
+            seq = self.global_batch.get_sequence(uuid)
+            local_idx = self._uuid_to_local_map[uuid]
+            global_id = seq.global_idx
+        
+            # Extend allocation
+            new_total_pages = seq.gpu_pages_allocated + additional
+            new_total_tokens = new_total_pages * self.PAGE_SIZE
+        
+            manager.extend_pages_for_sequence(global_id, new_total_tokens)
+            seq.gpu_pages_allocated = new_total_pages
+    
+        return True
+
+    def _shared_page_identity_sources(self, worker, manager):
+        """The pools whose GPU pages can be deduplicated by Host page id.
+
+        Returns one ``(pool name, GPU manager, Host worker view)`` triple per
+        pool, or ``None`` when shared-page identity does not apply at all.
+        ``None`` is the single condition behind BOTH the allocator and the
+        decode admission credit: plain allocation gives every row its own
+        physical copy, so a credit there would charge for a copy that was
+        really made.
+
+        A DSA model (GLM-5.x, DeepSeek-V3.2) runs TWO pools -- primary MLA
+        latent KV and auxiliary indexer KV -- backed by two separate Host KV
+        regions. Each pool therefore gets its own Host worker view, which is
+        its own key space; group 0 is the MLA region and group 1 the indexer
+        region (``DualHostKVCoordinator.views_by_group``), matching
+        primary/auxiliary on the GPU side.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        if manager is None or not self.enable_prefix_cache:
+            return None
+        if isinstance(manager, DualKVCacheCoordinator):
+            host_view = getattr(self, "host_paged_kv_worker_view", None)
+            if not isinstance(host_view, DualHostKVCoordinator):
+                return None
+            views = host_view.views_by_group()
+            primary_view = views.get(0)
+            auxiliary_view = views.get(1)
+            if primary_view is None or auxiliary_view is None:
+                return None
+            return (
+                ("primary", manager.primary, primary_view),
+                ("auxiliary", manager.auxiliary, auxiliary_view),
+            )
+        worker_view = getattr(
+            self.core_engine, "host_paged_kv_worker_view", None
+        )
+        if worker_view is None:
+            return None
+        return (("primary", manager, worker_view),)
+
+    def _host_identity_page_keys(
+        self, worker,
+        manager,
+        global_sequence_ids: Sequence[int],
+        sequence_tokens: Sequence[int],
+    ):
+        """The page-key argument for ``manager``'s keyed allocation, or ``None``.
+
+        One manager: a list of Host page id rows, one row per sequence, in
+        logical page order -- equal ids mean one physical GPU page.
+
+        A DSA dual coordinator: ``DualPoolPageKeys``, which carries that same
+        row list ONCE PER POOL. The two pools are separate Host KV regions, so
+        a Host page id identifies content only inside its own region and the
+        two key spaces must never be crossed; each pool deduplicates on its
+        own ids.
+
+        ``None`` means shared-page identity does not apply (prefix cache off,
+        or the Host views that define the identity are not bound) and plain
+        allocation is used.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        sources = self._shared_page_identity_sources(manager)
+        if sources is None:
+            return None
+        rows_by_pool: Dict[str, List[List[int]]] = {}
+        for pool_name, pool_manager, worker_view in sources:
+            rows_by_pool[pool_name] = self._pool_host_identity_page_keys(
+                pool_name,
+                pool_manager,
+                worker_view,
+                global_sequence_ids,
+                sequence_tokens,
+            )
+        if isinstance(manager, DualKVCacheCoordinator):
+            return DualPoolPageKeys.from_rows(
+                rows_by_pool["primary"], rows_by_pool["auxiliary"]
+            )
+        return rows_by_pool["primary"]
+
+    def _pool_host_identity_page_keys(
+        self, worker,
+        pool_name: str,
+        pool_manager,
+        worker_view,
+        global_sequence_ids: Sequence[int],
+        sequence_tokens: Sequence[int],
+    ) -> List[List[int]]:
+        """One pool's Host page ids behind each sequence's GPU reservation."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        host_tables = worker_view.build_page_table(global_sequence_ids)
+        page_size = int(pool_manager.config.page_size_tokens)
+        page_keys: List[List[int]] = []
+        for sequence_id, tokens, host_pages in zip(
+            global_sequence_ids, sequence_tokens, host_tables
+        ):
+            required = math.ceil(int(tokens) / page_size)
+            if len(host_pages) < required:
+                raise RuntimeError(
+                    f"Host page table ({pool_name} pool) is shorter than GPU "
+                    f"reservation: sequence={sequence_id}, "
+                    f"host_pages={len(host_pages)}, required={required}"
+                )
+            page_keys.append([int(page) for page in host_pages[:required]])
+        self._assert_private_writable_page_keys(
+            pool_name, pool_manager, global_sequence_ids, page_keys, page_size
+        )
+        return page_keys
+
+    def _assert_private_writable_page_keys(
+        self, worker,
+        pool_name: str,
+        pool_manager,
+        global_sequence_ids: Sequence[int],
+        page_keys: Sequence[Sequence[int]],
+        page_size: int,
+    ) -> None:
+        """Fail loud if a page the row will WRITE carries a shared key.
+
+        Sharing a physical page is safe only for a committed prefix, which is
+        immutable and page aligned. Everything from the row's write head on is
+        its private tail: decode writes the new token at position
+        ``current_context_length`` (``update_layer_decode_new_token``), i.e.
+        into logical page ``current_context_length // page_size``, and every
+        later page of the reservation is future tail. Those pages come from
+        the row's OWN Host reservation, so their Host page ids -- the keys --
+        are private by construction; this states that invariant as a check
+        instead of trusting it, because a shared key here would let two rows
+        write one physical page.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        write_heads: List[int] = []
+        for sequence_id in global_sequence_ids:
+            sequence = self.global_batch.get_sequence_by_global_idx(
+                int(sequence_id)
+            )
+            if sequence is None:
+                raise RuntimeError(
+                    "shared GPU page identity needs the row's context length: "
+                    f"global sequence {sequence_id} is not in the batch"
+                )
+            write_heads.append(
+                int(sequence.current_context_length) // int(page_size)
+            )
+        rows_per_key: Dict[int, int] = {}
+        for row in page_keys:
+            for key in row:
+                rows_per_key[int(key)] = rows_per_key.get(int(key), 0) + 1
+        for sequence_id, row, write_head in zip(
+            global_sequence_ids, page_keys, write_heads
+        ):
+            for index in range(max(0, write_head), len(row)):
+                key = int(row[index])
+                if (
+                    rows_per_key[key] > 1
+                    or pool_manager.is_shared_page_key_mapped(key)
+                ):
+                    raise RuntimeError(
+                        f"{pool_name} GPU pool: sequence {sequence_id} would "
+                        f"share writable logical page {index} (write head "
+                        f"{write_head}); only a committed prefix page may be "
+                        "shared"
+                    )
+
+    def _allocate_gpu_pages_with_host_identity(
+        self, worker,
+        manager,
+        global_sequence_ids: Sequence[int],
+        sequence_tokens: Sequence[int],
+    ):
+        """Share GPU pages when sequences reference the same Host page ids."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+
+        page_keys = self._host_identity_page_keys(
+            manager, global_sequence_ids, sequence_tokens
+        )
+        if page_keys is None:
+            return manager.allocate_pages_for_sequences(
+                global_sequence_ids, sequence_tokens
+            )
+        allocations = manager.allocate_pages_for_sequences_with_page_keys(
+            global_sequence_ids,
+            sequence_tokens,
+            page_keys,
+        )
+        if self.prefix_cache_debug_stats:
+            sharing = manager.get_prefix_gpu_share_stats()
+            new_physical_pages = {
+                int(page)
+                for row in allocations.values()
+                for page in row
+            }
+            # Both pools request the same logical page count per row, so the
+            # primary rows describe the request for either shape.
+            primary_rows = (
+                page_keys.primary
+                if isinstance(page_keys, DualPoolPageKeys)
+                else page_keys
+            )
+            self._emit_prefix_cache_metric(
+                "prefix_gpu_share",
+                sequences=len(global_sequence_ids),
+                requested_logical_pages=sum(len(row) for row in primary_rows),
+                new_physical_pages=len(new_physical_pages),
+                logical_page_references=sharing.logical_page_references,
+                physical_pages=sharing.physical_pages,
+                keyed_physical_pages=sharing.keyed_physical_pages,
+                multi_referenced_pages=sharing.multi_referenced_pages,
+                reused_logical_references=sharing.reused_logical_references,
+            )
+        return allocations
+
+    def _release_gpu_kv_pages(self, worker, local_sequence_ids: List[int]) -> None:
+        """Return GPU KV pages associated with the provided local sequence ids."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        manager = self.gpu_paged_kv_cache_manager
+        if manager is None or not local_sequence_ids:
+            return
+    
+        global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+    
+        if not global_sequence_ids:
+            return
+    
+        # All call sites now intersect `my_completed` with `_sequences_with_gpu_kv`
+        # before reaching here, so a KeyError from the manager indicates a real
+        # bookkeeping bug (the source-of-truth set drifted from the manager's
+        # state). Surface it loudly instead of swallowing.
+        manager.free_pages_for_sequences(global_sequence_ids)
+        # NOTE: No sync needed - page deallocation is synchronous to the allocator
+        logging.debug(
+            f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
+        )
+
+        self._release_kda_state_slots(global_sequence_ids)
+
+        # FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
+        for local_idx in local_sequence_ids:
+            uuid = self._local_to_uuid_map.get(local_idx)
+            if uuid:
+                self._sequences_with_gpu_kv.discard(uuid)
+                seq = self.global_batch.get_sequence(uuid)
+                if seq is not None:
+                    seq.gpu_pages_allocated = 0
+
+    def _release_kda_state_slots(self, worker, global_sequence_ids: List[int]) -> None:
+        """Release Kimi-Linear KDA state independently of paged GPU KV."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        self._traj.free_kda_sequences(global_sequence_ids)
+
+    # ---- Decode KV append to host ------------------------------------------
+
+    def _flush_deferred_kv_to_host(self, worker) -> None:
+        """Flush all deferred KV host offload entries accumulated during forward.
+
+        Batch-launch D2H copies for all layers (primary MLA KV + the DSA
+        auxiliary indexer KV if present). The C++ async append APIs order their
+        dedicated D2H stream after the producer stream with a CUDA event, so this
+        function must not synchronize the CPU with the producer stream first.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        entries = getattr(self, '_deferred_kv_entries', [])
+        entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
+        if not entries and not entries_aux:
+            return
+
+        worker_view = getattr(self, '_deferred_kv_worker_view', None)
+        batch_info = getattr(self, '_deferred_kv_batch', None)
+        aux_view = getattr(self, '_deferred_kv_worker_view_aux', None)
+        if entries_aux and aux_view is None:
+            raise RuntimeError(
+                "DSA auxiliary host KV worker view is required for deferred aux KV offload"
+            )
+        if (worker_view is None or batch_info is None) and not aux_view:
+            self._deferred_kv_entries = []
+            self._deferred_kv_entries_aux = []
+            return
+
+        sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
+        if sequence_ids is not None and sequence_lengths is not None:
+            self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
+
+        def _assert_deferred_kv_rows(cache_name: str, layer_idx: int, tensor: torch.Tensor) -> None:
+            if sequence_ids is None:
+                return
+            if tensor.shape[0] != len(sequence_ids):
+                raise RuntimeError(
+                    f"{cache_name} deferred KV row mismatch at layer {layer_idx}: "
+                    f"tensor_rows={tensor.shape[0]}, sequence_ids={len(sequence_ids)}, "
+                    f"gids={sequence_ids[:8] if sequence_ids is not None else []}, "
+                    f"write_pos={sequence_lengths[:8] if sequence_lengths is not None else []}"
+                )
+
+        # Fire all D2H copies
+        if not hasattr(self, '_pending_kv_append_tensors'):
+            self._pending_kv_append_tensors = []
+
+        _use_uva_kernel = os.environ.get(
+            "BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1") == "1"
+
+        if _use_uva_kernel and hasattr(worker_view, "async_append_decode_kv_to_host_batched_kernel"):
+            if entries and worker_view is not None and sequence_ids is not None:
+                _prepared_entries = []
+                for layer_idx, k_tensor, v_tensor in entries:
+                    if k_tensor.dim() == 3:
+                        k_tensor = k_tensor.unsqueeze(2)
+                    if v_tensor is not None and v_tensor.dim() == 3:
+                        v_tensor = v_tensor.unsqueeze(2)
+                    _assert_deferred_kv_rows("primary", layer_idx, k_tensor)
+                    if v_tensor is not None:
+                        _assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
+                    _prepared_entries.append((layer_idx, k_tensor, v_tensor))
+                    self._pending_kv_append_tensors.append(k_tensor)
+                    if v_tensor is not None:
+                        self._pending_kv_append_tensors.append(v_tensor)
+                task = worker_view.async_append_decode_kv_to_host_batched_kernel(
+                    entries=_prepared_entries,
+                    sequence_ids=sequence_ids,
+                    sequence_lengths=sequence_lengths,
+                )
+                if task is not None:
+                    self._pending_kv_append_tasks.append(task)
+
+            if entries_aux and aux_view is not None and sequence_ids is not None:
+                _prepared_aux = []
+                for layer_idx, k_tensor, v_tensor, scale_tensor in (
+                    _normalize_aux_kv_entry(entry) for entry in entries_aux
+                ):
+                    if k_tensor.dim() == 3:
+                        k_tensor = k_tensor.unsqueeze(2)
+                    _assert_deferred_kv_rows("aux", layer_idx, k_tensor)
+                    _prepared_aux.append((layer_idx, k_tensor, None, scale_tensor))
+                    self._pending_kv_append_tensors.append(k_tensor)
+                    if scale_tensor is not None:
+                        self._pending_kv_append_tensors.append(scale_tensor)
+                task = aux_view.async_append_decode_kv_to_host_batched_kernel(
+                    entries=_prepared_aux,
+                    sequence_ids=sequence_ids,
+                    sequence_lengths=sequence_lengths,
+                )
+                if task is not None:
+                    self._pending_kv_append_tasks.append(task)
+        else:
+            if entries and worker_view is not None and sequence_ids is not None:
+                for layer_idx, k_tensor, v_tensor in entries:
+                    if k_tensor.dim() == 3:
+                        k_tensor = k_tensor.unsqueeze(2)
+                    if v_tensor is not None and v_tensor.dim() == 3:
+                        v_tensor = v_tensor.unsqueeze(2)
+                    _assert_deferred_kv_rows("primary", layer_idx, k_tensor)
+                    if v_tensor is not None:
+                        _assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
+
+                    task = worker_view.async_append_decode_kv_to_host(
+                        layer_idx=layer_idx,
+                        sequence_ids=sequence_ids,
+                        k_tensor=k_tensor,
+                        v_tensor=v_tensor,
+                        sequence_lengths=sequence_lengths,
+                    )
+
+                    self._pending_kv_append_tensors.append(k_tensor)
+                    if v_tensor is not None:
+                        self._pending_kv_append_tensors.append(v_tensor)
+                    if task is not None:
+                        self._pending_kv_append_tasks.append(task)
+
+            if entries_aux and aux_view is not None and sequence_ids is not None:
+                for layer_idx, k_tensor, v_tensor, scale_tensor in (
+                    _normalize_aux_kv_entry(entry) for entry in entries_aux
+                ):
+                    if k_tensor.dim() == 3:
+                        k_tensor = k_tensor.unsqueeze(2)
+                    _assert_deferred_kv_rows("aux", layer_idx, k_tensor)
+
+                    task = aux_view.async_append_decode_kv_to_host(
+                        layer_idx=layer_idx,
+                        sequence_ids=sequence_ids,
+                        k_tensor=k_tensor,
+                        v_tensor=None,
+                        sequence_lengths=sequence_lengths,
+                        scale_tensor=scale_tensor,
+                    )
+
+                    self._pending_kv_append_tensors.append(k_tensor)
+                    if scale_tensor is not None:
+                        self._pending_kv_append_tensors.append(scale_tensor)
+                    if task is not None:
+                        self._pending_kv_append_tasks.append(task)
+
+        # This function only LAUNCHES the D2H append tasks. The decode loop
+        # drains them every step right after the sampled-token readback, in
+        # a step-split slot of its own; see [KV_APPEND_DRAIN] in
+        # ``decoding_continuous`` for why that drain must stay per step.
+        self._deferred_kv_entries = []
+        self._deferred_kv_entries_aux = []
+        self._deferred_kv_batch = None
+        self._deferred_kv_worker_view = None
+        self._deferred_kv_worker_view_aux = None
+
+    def _ensure_host_kv_append_capacity(
+        self, worker,
+        sequence_ids: List[int],
+        sequence_lengths: List[int],
+    ) -> None:
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        if len(sequence_ids) != len(sequence_lengths):
+            raise RuntimeError(
+                f"host KV append metadata mismatch: ids={len(sequence_ids)} lengths={len(sequence_lengths)}"
+            )
+        if self.global_batch is None:
+            return
+        # Resolve through SequenceBatch's maintained gid index. This runs on
+        # every decode step, so rebuilding a gid -> entry dict here cost one
+        # dict comprehension over the whole batch per step.
+        grow_requests = []
+        for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
+            seq = self.global_batch.get_sequence_by_global_idx(int(global_idx))
+            if seq is None:
+                raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
+            if int(write_pos) < 0:
+                raise RuntimeError(
+                    f"host KV append negative write position for gid={global_idx}: {write_pos}"
+                )
+            required_tokens = int(write_pos) + 1
+            if int(seq.host_token_capacity) <= 0:
+                raise RuntimeError(
+                    f"host KV append for unallocated gid={global_idx}: "
+                    f"write_pos={write_pos}, host_token_capacity={seq.host_token_capacity}, "
+                    f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
+                    f"status={seq.status.name}"
+                )
+            if required_tokens > int(seq.kv_token_budget):
+                raise RuntimeError(
+                    f"host KV append would exceed token budget for gid={global_idx}: "
+                    f"required_tokens={required_tokens}, kv_token_budget={seq.kv_token_budget}, "
+                    f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
+                    f"status={seq.status.name}"
+                )
+            if required_tokens > int(seq.host_token_capacity):
+                # The guards above bound required_tokens to the token budget,
+                # so the owner's budget cap never engages here.
+                growth_pages = seq.get_host_growth_pages(
+                    required_tokens - int(seq.host_token_capacity)
+                )
+                grow_requests.append((int(global_idx), growth_pages))
+
+        if not grow_requests:
+            return
+
+        # Host pages are allocated only by the rank-0 boundary planner.  A
+        # deferred append is already inside a decode interval whose reservation
+        # was validated before forward; reaching this branch means the scheduler
+        # violated that invariant.  Growing here would bypass completion release,
+        # eviction, mirrored DSA allocation, and G>1 host ownership.
+        raise RuntimeError(
+            "host KV append reached without a boundary reservation: "
+            f"requests={grow_requests[:8]}; decode must enter the page-boundary "
+            "planner before issuing the forward"
+        )
+
+    def _aux_layers_with_slots(self, worker):
+        """Logical layer ids that have a slot in the aux (indexer) KV pools.
+
+        None = no layer mapping (every engine layer has an aux slot). GLM-5.2
+        maps only its 21 indexer layers; skip layers' index-K is never read,
+        so decode appends for them are dropped at the queueing choke points —
+        the mapped host view hard-fails on unmapped layers by design.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        cached = getattr(self, "_aux_layers_with_slots_cache", False)
+        if cached is not False:
+            return cached
+        coord = getattr(self, "gpu_paged_kv_cache_manager", None)
+        aux_mgr = getattr(coord, "auxiliary", None)
+        if aux_mgr is None:
+            return None  # aux not initialized yet; do not cache
+        aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
+        result = None
+        if aux_map is not None:
+            result = frozenset(
+                l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
+            )
+        self._aux_layers_with_slots_cache = result
+        return result
+
+    def _append_decode_kv_to_host_aux_async(
+        self, worker,
+        layer_idx: int,
+        batch: List[int],
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor = None,
+        scale_tensor: torch.Tensor = None,
+    ) -> None:
+        """Fire-and-forget auxiliary (indexer) KV append to host.
+
+        Uses the auxiliary host worker view and the shared pending task list,
+        so one flush drains primary and auxiliary appends together.
+
+        ``scale_tensor`` carries the fp32 per-token scales that a page-split
+        FP8 aux region requires alongside the quantized keys; an AoS region
+        rejects it. The host view validates the pairing, so a producer that
+        forgets the scales fails loud instead of leaving a page's scale region
+        at its previous contents.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+        if aux_view is None or not batch:
+            return
+        valid_layers = self._aux_layers_with_slots()
+        if valid_layers is not None and layer_idx not in valid_layers:
+            return
+
+        sequence_ids = []
+        sequence_lengths = []
+        for local_idx in batch:
+            uuid = self._local_to_uuid_map[local_idx]
+            seq = self.global_batch.get_sequence(uuid)
+            sequence_ids.append(seq.global_idx)
+            write_pos = seq.current_context_length - 1
+            sequence_lengths.append(write_pos)
+
+        if k_tensor.dim() == 3:
+            k_tensor = k_tensor.unsqueeze(2)
+
+        # Launch async D2H — no CPU-side sync needed (same as primary path).
+        task = aux_view.async_append_decode_kv_to_host(
+            layer_idx=layer_idx,
+            sequence_ids=sequence_ids,
+            k_tensor=k_tensor,
+            v_tensor=None,
+            sequence_lengths=sequence_lengths,
+            scale_tensor=scale_tensor,
+        )
+
+        if not hasattr(self, '_pending_kv_append_tensors'):
+            self._pending_kv_append_tensors = []
+        self._pending_kv_append_tensors.append(k_tensor)
+        if scale_tensor is not None:
+            self._pending_kv_append_tensors.append(scale_tensor)
+
+        if task is not None:
+            self._pending_kv_append_tasks.append(task)
+
+        MAX_PENDING_KV_TASKS = 256
+        if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
+            self._wait_pending_kv_append_tasks()
+
+    def _wait_pending_kv_append_tasks(
+        self, worker,
+        *,
+        sync_distributed_errors: bool = False,
+        defer_errors: bool = False,
+        device_sync: bool = True,
+    ) -> int:
+        """
+        Wait for all pending KV append tasks at page boundary.
+        Returns the number of tasks that were waited for.
+    
+        CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
+        Without this, KV data may not be fully written to host memory when
+        sequences are later resumed, causing KV corruption.
+
+        ``device_sync=False`` is only for the deferred-readback decode step,
+        where the next forward is already enqueued and a device-wide sync
+        would wait for it; see _finish_deferred_decode_step for why each
+        task's own copy-stream sync suffices there.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
+        if not hasattr(self, '_pending_kv_append_tasks'):
+            if sync_distributed_errors:
+                error_payload = {
+                    "rank": self.rank,
+                    "errors": list(deferred_errors),
+                } if deferred_errors else None
+                all_errors = [None] * self.world_size
+                dist.all_gather_object(all_errors, error_payload)
+                if hasattr(self, "_deferred_kv_append_wait_errors"):
+                    self._deferred_kv_append_wait_errors.clear()
+                flat_errors = [e for e in all_errors if e is not None]
+                if flat_errors:
+                    raise RuntimeError(
+                        f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
+                    )
+            elif deferred_errors and not defer_errors:
+                raise RuntimeError(
+                    f"Rank {self.rank}: KV append/offload failed: {deferred_errors[:4]}"
+                )
+            return 0
+    
+        num_tasks = len(self._pending_kv_append_tasks)
+        wait_errors = list(deferred_errors)
+        if deferred_errors and hasattr(self, "_deferred_kv_append_wait_errors"):
+            self._deferred_kv_append_wait_errors.clear()
+        for task in self._pending_kv_append_tasks:
+            if task is not None:
+                try:
+                    task.wait()
+                except Exception as e:
+                    wait_errors.append(f"{type(e).__name__}: {e}")
+    
+        # CRITICAL FIX: Sync CUDA after waiting for tasks
+        # The async tasks use a separate CUDA stream for D2H copies.
+        # Even though each task internally syncs its stream via cudaEventSynchronize,
+        # we need a full device sync to ensure ALL pending operations complete
+        # before we allow GPU pages to be freed/reused.
+        if device_sync and num_tasks > 0 and not wait_errors:
+            try:
+                torch.cuda.synchronize(self.torch_device)
+            except Exception as e:
+                wait_errors.append(f"{type(e).__name__}: {e}")
+    
+        self._pending_kv_append_tasks.clear()
+    
+        # CRITICAL: Clear tensor references AFTER tasks complete
+        # Tensors can now be safely garbage collected / memory reused
+        if hasattr(self, '_pending_kv_append_tensors'):
+            self._pending_kv_append_tensors.clear()
+
+        if sync_distributed_errors:
+            error_payload = {
+                "rank": self.rank,
+                "errors": wait_errors,
+            } if wait_errors else None
+            all_errors = [None] * self.world_size
+            dist.all_gather_object(all_errors, error_payload)
+            flat_errors = [e for e in all_errors if e is not None]
+            if flat_errors:
+                raise RuntimeError(
+                    f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
+                )
+        elif wait_errors and defer_errors:
+            if not hasattr(self, "_deferred_kv_append_wait_errors"):
+                self._deferred_kv_append_wait_errors = []
+            self._deferred_kv_append_wait_errors.extend(wait_errors)
+        elif wait_errors:
+            raise RuntimeError(
+                f"Rank {self.rank}: KV append/offload failed: {wait_errors[:4]}"
+            )
+    
+        return num_tasks
+
+    # ---- Host-to-GPU KV load -----------------------------------------------
+
+    def _prepare_dual_kv_load_pointers(
+        self, worker,
+        gpu_manager: DualKVCacheCoordinator,
+        new_global_ids: List[int],
+        existing_global_ids: Optional[List[int]] = None,
+    ) -> _DualKVLoadPointers:
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        if not isinstance(gpu_manager, DualKVCacheCoordinator):
+            raise RuntimeError("DSA dual KV load requires DualKVCacheCoordinator")
+        if not new_global_ids:
+            raise ValueError("_prepare_dual_kv_load_pointers requires non-empty sequence ids")
+
+        sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
+        try:
+            gpu_manager.rebuild_page_table(new_global_ids)
+
+            primary_order = list(gpu_manager.primary._gpu_page_table_manager.slot_to_seq_id)
+            aux_order = list(gpu_manager.auxiliary._gpu_page_table_manager.slot_to_seq_id)
+            if primary_order != new_global_ids or aux_order != new_global_ids:
+                raise RuntimeError(
+                    f"DSA dual load page-table order mismatch: requested={new_global_ids[:10]} "
+                    f"primary={primary_order[:10]} aux={aux_order[:10]}"
+                )
+
+            primary_k, primary_v = gpu_manager.primary.get_padded_3d_page_pointers()
+            primary_counts = gpu_manager.primary.export_active_sequence_page_counts()
+            aux_k, aux_v = gpu_manager.auxiliary.get_padded_3d_page_pointers()
+            aux_counts = gpu_manager.auxiliary.export_active_sequence_page_counts()
+            if primary_counts.tolist() != aux_counts.tolist():
+                raise RuntimeError(
+                    f"DSA dual load page-count mismatch: "
+                    f"primary={primary_counts.tolist()} aux={aux_counts.tolist()}"
+                )
+
+            return _DualKVLoadPointers(
+                sequence_tensor=sequence_tensor,
+                primary_k_ptrs=primary_k,
+                primary_v_ptrs=primary_v,
+                primary_page_counts=primary_counts,
+                aux_k_ptrs=aux_k,
+                aux_v_ptrs=aux_v,
+                aux_page_counts=aux_counts,
+            )
+        finally:
+            if existing_global_ids:
+                gpu_manager.rebuild_page_table(existing_global_ids)
+            else:
+                gpu_manager.clear_page_table()
+
+    def _launch_dual_host_kv_load(self, worker, pointers: _DualKVLoadPointers) -> DualAsyncKVTask:
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        host_view = self.host_paged_kv_worker_view
+        if not isinstance(host_view, DualHostKVCoordinator):
+            raise RuntimeError("DSA dual KV load requires DualHostKVCoordinator")
+        return host_view.async_load_layer_paged_kv_to_device_dual(
+            sequence_ids=pointers.sequence_tensor,
+            primary_active_page_counts=pointers.primary_page_counts,
+            primary_k_device_ptrs=pointers.primary_k_ptrs,
+            primary_v_device_ptrs=pointers.primary_v_ptrs,
+            aux_active_page_counts=pointers.aux_page_counts,
+            aux_k_device_ptrs=pointers.aux_k_ptrs,
+            aux_v_device_ptrs=pointers.aux_v_ptrs,
+            tensors=pointers,
+        )
+
+    def _load_host_kv_to_gpu(
+        self, worker,
+        manager: GPUPagedKVCacheManager,
+        global_sequence_ids: List[int],
+    ) -> None:
+        """Copy prefetched host KV pages into the GPU cache."""
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        if not global_sequence_ids:
+            return
+        copy_start = time.perf_counter()
+        worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+        if worker_view is None:
+            raise RuntimeError("Host paged KV worker view is not bound to the core engine")
+    
+        # DIAGNOSTIC: Check if these are resuming sequences (have decoded tokens)
+        resuming_seq_info = []
+        for global_idx in global_sequence_ids:
+            # Find the sequence by global_idx
+            for uuid, local_idx in self._uuid_to_local_map.items():
+                seq = self.global_batch.get_sequence(uuid)
+                if seq and seq.global_idx == global_idx and seq.decoded_length > 0:
+                    resuming_seq_info.append({
+                        'global_idx': global_idx,
+                        'decoded_length': seq.decoded_length,
+                        'current_context_length': seq.current_context_length,
+                    })
+                    break
+    
+        if resuming_seq_info and BATCHGEN_CB_DEBUG:
+            logging.debug(
+                f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
+            )
+    
+        logging.debug(
+            f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
+            f"{len(global_sequence_ids)} sequences..."
+        )
+
+        if isinstance(manager, DualKVCacheCoordinator):
+            pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)
+            load_task = self._launch_dual_host_kv_load(pointers)
+        else:
+            sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
+            k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+            active_sequence_page_counts = manager.export_active_sequence_page_counts()
+            load_task = worker_view.async_load_layer_paged_kv_to_device(
+                sequence_ids=sequence_tensor,
+                active_page_counts=active_sequence_page_counts,
+                k_device_ptrs=k_ptrs,
+                v_device_ptrs=v_ptrs,
+            )
+    
+        # Wait for load to complete (this is synchronous load path used during prefill)
+        load_task.wait()
+        # CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
+        torch.cuda.synchronize(self.torch_device)
+
+        load_duration = time.perf_counter() - copy_start
+        logging.debug(
+            "Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
+            self.rank, len(global_sequence_ids), load_duration,
+        )
+
+    # ---- Decode capacity snapshot ------------------------------------------
+
+    def _snapshot_decode_capacity(self, worker) -> DecodeCapacitySnapshot:
+        """Collect the live GPU-KV capacity before decode admission.
+
+        Total pages are immutable after initialization and must match on every
+        rank.  Free pages are dynamic; the pure reducer takes the tightest rank
+        in each replicated attention group so the admission plan is safe for all
+        ranks that will allocate the selected sequence.
+
+        The whole read — local stats and the cross-rank all_gather — runs inside
+        the manager's ``capacity_snapshot()`` section (#424), so the phase
+        switch cannot release the pool underneath a decision that is already
+        being taken against it: a release attempted here fails loud instead of
+        producing a plan for pages that no longer exist.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        manager = self.gpu_paged_kv_cache_manager
+        if manager is None or not manager.is_initialized:
+            raise RuntimeError(
+                "GPU KV manager must be initialized before taking a decode capacity snapshot"
+            )
+        with manager.capacity_snapshot():
+            stats = manager.get_stats()
+            local = torch.tensor(
+                [int(stats.num_total_pages), int(stats.num_free_pages)],
+                dtype=torch.int64,
+                device=self.torch_device,
+            )
+            if self.world_size == 1:
+                rank_stats = [local]
+            else:
+                if not dist.is_initialized():
+                    raise RuntimeError(
+                        "distributed process group is required for a multi-rank decode capacity snapshot"
+                    )
+                rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
+                dist.all_gather(rank_stats, local)
+        return reduce_decode_capacity_snapshot(
+            tuple(int(item[0].item()) for item in rank_stats),
+            tuple(int(item[1].item()) for item in rank_stats),
+            world_size=self.world_size,
+            attn_tp_size=self._decode_attn_tp_size(),
+        )
+
+    # ---- Page-boundary decision request ------------------------------------
+
+    def _make_boundary_decision_request(
+        self, worker,
+        decode_uuids: List[str],
+        global_seq_state: Dict[str, Dict],
+        global_candidate_info: Dict[str, Dict],
+        per_rank_free: List[int],
+        per_rank_total: List[int],
+        chunk_size: int,
+        per_node_host_stats: Optional[List[Dict[str, int]]],
+    ) -> BoundaryDecisionRequest:
+        """Snapshot the boundary-decision inputs (rank 0 only).
+
+        ``seq_meta`` is sourced from ``global_batch`` (rank 0 holds every
+        sequence) for the union of decode + loadable-candidate uuids,
+        replacing the handler's direct ``global_batch`` reads. Entries are
+        omitted for uuids with no sequence — the handler treats a missing
+        entry as ``global_idx = inf`` / ``priority = 0``, matching the
+        legacy ``if seq is not None else ...`` fallbacks.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        seq_meta: Dict[str, BoundarySeqMeta] = {}
+        for uuid in set(decode_uuids) | set(global_candidate_info.keys()):
+            seq = self.global_batch.get_sequence(uuid)
+            if seq is None:
+                continue
+            seq_meta[uuid] = BoundarySeqMeta(
+                global_idx=seq.global_idx,
+                priority=getattr(seq, 'priority', 0),
+                current_context_length=getattr(seq, 'current_context_length', 0),
+                host_token_capacity=getattr(seq, 'host_token_capacity', 0),
+                host_pages_allocated=getattr(seq, 'host_pages_allocated', 0),
+            )
+        return BoundaryDecisionRequest(
+            decode_uuids=tuple(decode_uuids),
+            global_seq_state=global_seq_state,
+            global_candidate_info=global_candidate_info,
+            per_rank_free=tuple(per_rank_free),
+            per_rank_total=tuple(per_rank_total),
+            chunk_size=chunk_size,
+            per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
+            seq_meta=seq_meta,
+            world_size=self.world_size,
+            num_gpus_per_node=self.local_world_size,
+            max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
+            enable_host_kv_eviction=self.enable_host_kv_eviction,
+            attn_tp_size=self._decode_attn_tp_size(),
+        )
+
+    def _integrate_pending_async_load(
+        self, worker,
+        pending_async_task: Optional[object],
+        pending_load_uuids: List[str],
+        pending_load_local_indices: List[int],
+        pending_load_global_ids: List[int],
+        decode_uuids: List[str],
+        batch: List[int],
+        gpu_manager,
+    ) -> Tuple[List[str], List[int]]:
+        """Complete an in-flight boundary GPU-KV load and fold its rows in.
+
+        A launched boundary load has already allocated GPU pages -- and
+        registered their shared-page keys -- for rows that are NOT yet in
+        ``decode_uuids``; only the finalize step moves them in. Every decode
+        exit that drops its pending-load state must therefore run this first:
+        an exit that forgets the pending rows strands their GPU pages (no
+        later path frees pages for a row outside ``decode_uuids``), and the
+        next load of such a row finds its own stale keyed pages still mapped
+        and fails the writable-page sharing guard, which the collective
+        converts into a cohort-fatal SCHED_INVARIANT.
+
+        All ranks hold identical ``pending_load_uuids`` and reach this from
+        broadcast boundary decisions, so the wait/barrier/finalize protocol
+        stays rank-aligned.
+        """
+        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
+        # worker keeps every original self. spelling. The engine is stateless.
+        self = worker
+        if pending_async_task is not None:
+            pending_async_task.wait()
+            torch.cuda.synchronize(self.torch_device)
+        dist.barrier()
+        return self._finalize_async_load_minimal(
+            pending_async_task,
+            pending_load_uuids,
+            pending_load_local_indices,
+            pending_load_global_ids,
+            decode_uuids,
+            batch,
+            gpu_manager,
+        )

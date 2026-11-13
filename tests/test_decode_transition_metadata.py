@@ -5,6 +5,7 @@ import pytest
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.prefill import compute_prefill_host_reservation
+from tests.worker_method_source import delegated_method_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,10 +111,9 @@ def test_unified_trajectory_eviction_does_not_require_legacy_token_tensor():
 
 
 def test_synchronous_host_to_gpu_load_uses_dual_dsa_path():
-    source = WORKER.read_text()
-    start = source.index("\tdef _load_host_kv_to_gpu(")
-    end = source.index("\n\tdef _release_gpu_kv_pages", start)
-    body = source[start:end]
+    # S10c: the load runs in KVCapacityEngine; its source segment is located
+    # by AST, not by tab delimiters.
+    body = delegated_method_source("_load_host_kv_to_gpu")
 
     dual_branch = body.index("if isinstance(manager, DualKVCacheCoordinator):")
     dual_prepare = body.index(

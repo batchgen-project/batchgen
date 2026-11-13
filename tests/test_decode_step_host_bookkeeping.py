@@ -23,6 +23,8 @@ next to this one.
 import ast
 from pathlib import Path
 
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
 SOURCE = WORKER.read_text()
@@ -35,6 +37,9 @@ def _method(name):
         tree = ast.parse(ENGINE.read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DecoupledGpuDecode")
         return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    # S10c: a delegated method resolves to its engine body (worker shape).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(n for n in ast.walk(TREE)
                 if isinstance(n, ast.FunctionDef) and n.name == name)
 

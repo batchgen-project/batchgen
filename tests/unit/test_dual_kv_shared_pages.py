@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Sequence
 import pytest
 import torch
 
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_shaped_methods
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -613,7 +613,8 @@ class _HostView:
         return [list(self._tables[int(sid)]) for sid in sequence_ids]
 
 
-_METHODS = load_worker_methods(
+# S10c: the identity-key helpers run in KVCapacityEngine (shaped bodies).
+_METHODS = load_worker_shaped_methods(
     [
         "_shared_page_identity_sources",
         "_host_identity_page_keys",
