@@ -391,13 +391,6 @@ else:
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
 
-# Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
-# Default: enabled (recommended always on). Use --no-prepack to disable.
-BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
-
-# Optional runtime checks for NaN/Inf in KV tensors (disabled by default)
-BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == '1'
-
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
@@ -6214,23 +6207,6 @@ class BatchGenWorker:
 					f"({100-final_stats['free_percent']}% utilized)"
 				)
 
-	def _get_gpu_kv_free_pages(self) -> int:
-		if self._kv_stats_compare:
-			legacy = self._legacy_get_gpu_kv_free_pages()
-			native = self._make_kv_cache_manager().get_gpu_free_pages()
-			assert legacy == native, f"kv_stats compare mismatch: get_gpu_kv_free_pages legacy={legacy} native={native}"
-			return native if self._kv_stats_native else legacy
-		if self._kv_stats_native:
-			return self._make_kv_cache_manager().get_gpu_free_pages()
-		return self._legacy_get_gpu_kv_free_pages()
-
-	def _legacy_get_gpu_kv_free_pages(self) -> int:
-		"""Get current free pages from GPU KV cache."""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			return 0
-		return manager.get_stats().num_free_pages
-
 	# ============ UUID/Index Conversion Helpers ============
 	#
 	# Thin delegations to `batchgen.worker.indexing.IndexManager`. The worker
@@ -6472,65 +6448,6 @@ class BatchGenWorker:
 
 	# ============ QueryBook Buffer Pool ============
 
-	def _ensure_buffer_pool(
-		self,
-		required_rows: int,
-		required_input_width: int,
-		required_decode_width: int,
-		reason: str,
-	) -> None:
-		"""Retired compatibility hook; the trajectory pool is fixed at init.
-
-		COLLECTIVE: every rank must call this with identical arguments. They do,
-		because both call sites derive the requirement from the tokenized batch,
-		which is all-gathered to every rank before this runs.
-
-		The old dense ``input_ids``/``decoded_tokens`` pool and its dynamic-growth
-		path are intentionally unreachable. Production admissions use the fixed
-		int32 ``QueryBook`` reservation made during worker initialization.
-		"""
-		raise RuntimeError("dynamic QueryBookBufferPool growth is retired")
-		# Kept below only for source compatibility with old checkpoints.
-		old = self._buffer_pool
-		# Kept as explicit symbols for compatibility with the collective pool
-		# contract and its structural regression tests; prompt storage itself is
-		# now handled by the trajectory book.
-		_exchange = self._exchange_node_memfd_identity
-		_barrier = dist.barrier
-		if old is not None and required_rows <= old.num_sequences and required_decode_width <= old.max_decoding_length:
-			return
-
-		rows = max(required_rows, old.num_sequences if old is not None else 0)
-		in_w = 0
-		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
-
-		new_pool = QueryBookBufferPool(
-			num_sequences=rows,
-			input_ids_width=in_w,
-			max_decoding_length=dec_w,
-			pad_token_id=self.pad_token_id,
-			input_ids_buffer=None,
-			input_ids_memfd=None,
-		)
-		private_gib = rows * dec_w * 8 / 2**30
-		if old is None:
-			logging.info(
-				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
-				f"input_ids_width={in_w}, decoded_width={dec_w} -> prompt tokens in the trajectory book, decoded_tokens "
-				f"{private_gib:.3f} GiB per rank"
-			)
-		else:
-			logging.warning(
-				f"Rank {self.rank}: QueryBook pool GROWN ({reason}): rows "
-				f"{old.num_sequences}->{rows}, decoded_width "
-				f"{old.max_decoding_length}->{dec_w}"
-			)
-			new_pool.adopt(old)
-		self._buffer_pool = new_pool
-		if old is not None:
-			self._rebind_buffer_pool_views()
-			self._retire_buffer_pool(old)
-
 	def _exchange_node_memfd_identity(self, pid: int, fd: int) -> Tuple[int, int]:
 		"""Publish this rank's ``input_ids`` memfd identity, take its node's.
 
@@ -6555,41 +6472,6 @@ class BatchGenWorker:
 			)
 			creator = gathered[creator_rank]
 			return int(creator[0].item()), int(creator[1].item())
-
-	def _retire_buffer_pool(self, old: QueryBookBufferPool) -> None:
-		"""Drop a superseded generation's descriptor but keep its mapping alive.
-
-		Views handed out before the grow may still be referenced somewhere this
-		rebind does not reach; unmapping under them would segfault. Closing the
-		fd keeps /proc/<pid>/fd from accumulating one entry per grow — the
-		kernel frees the pages once the last mapping goes, i.e. at process exit,
-		however that exit happens.
-		"""
-		self._retired_buffer_pools.append(old)
-		if old.input_ids_memfd is not None:
-			old.input_ids_memfd.release_fd()
-
-	def _rebind_buffer_pool_views(self) -> None:
-		"""Repoint every live sequence and query-book entry at the current pool."""
-		pool = self._buffer_pool
-		rebound = 0
-		for seq in self.global_batch:
-			slot = getattr(seq, '_buffer_slot', -1)
-			if slot < 0:
-				continue
-			input_ids_view = self._prompt_tensors.get(seq.uuid)
-			if input_ids_view is None:
-				continue
-			decoded_view = pool.get_decoded_tokens_view(slot)
-			seq.input_ids = input_ids_view
-			seq.decoded_tokens = decoded_view
-			local_idx = self._uuid_to_local_map.get(seq.uuid)
-			if local_idx is not None and self.query_book and local_idx in self.query_book:
-				entry = self.query_book[local_idx]
-				entry.encoded["input_ids"] = input_ids_view
-				entry.decoded_tokens = decoded_view
-			rebound += 1
-		logging.warning(f"Rank {self.rank}: rebound {rebound} sequences onto the grown QueryBook pool")
 
 	# ============ KV-Driven Batch Preparation ============
 
@@ -17788,121 +17670,6 @@ class BatchGenWorker:
 		)
 		self._nvshmem_initialized_this_run = True
 		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
-
-	def _init_torch_dist(self):
-		# Use maximum timeout (about 24 days) to handle long server idle periods
-		# timedelta max is about 999999999 days, but NCCL has internal limits
-		# 35791 minutes ≈ 24.8 days, which is close to the max NCCL supports
-		timeout = timedelta(days=24)
-		try:
-			dist.init_process_group(
-				backend="nccl",
-				init_method="tcp://" + self.dist_init_addr,
-				world_size=self.world_size,
-				rank=self.global_rank,
-				device_id=torch.device(f"cuda:{self.local_rank}"),
-				timeout=timeout,
-			)
-			logging.info(f"Rank {self.rank}: torch.distributed initialized with timeout={timeout}")
-		except RuntimeError as e:
-			logging.error(f"Failed to initialize torch distributed: {e}")
-			raise
-
-	def _ensure_dist_healthy(self) -> bool:
-		"""
-		Ensure torch.distributed is healthy before starting a new batch.
-
-		This performs a lightweight health check first. Only if the check fails
-		does it attempt to reinitialize with coordinated retries.
-
-		The key insight is: DON'T destroy a working connection. Only reinit if broken.
-
-		Returns True if healthy, False if reinit failed after all retries.
-		"""
-		MAX_REINIT_RETRIES = 5
-		INITIAL_RETRY_DELAY = 2.0  # seconds
-
-		# Step 1: Check if dist is even initialized
-		if not dist.is_initialized():
-			logging.warning(f"Rank {self.rank}: torch.distributed not initialized, attempting init...")
-			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
-
-		# Step 2: Quick health check - use async op with short timeout
-		try:
-			health_tensor = torch.ones(1, device=self.torch_device)
-			work = dist.all_reduce(health_tensor, op=dist.ReduceOp.SUM, async_op=True)
-
-			# Wait with short timeout (10 seconds should be enough for healthy connection)
-			success = work.wait(timeout=timedelta(seconds=10))
-			if not success:
-				raise RuntimeError("Health check timed out")
-
-			expected = float(self.world_size)
-			if abs(health_tensor.item() - expected) > 1e-6:
-				raise RuntimeError(f"Health check mismatch: got {health_tensor.item()}, expected {expected}")
-
-			logging.debug(f"Rank {self.rank}: torch.distributed health check passed")
-			return True
-
-		except Exception as e:
-			logging.warning(f"Rank {self.rank}: torch.distributed health check failed: {e}")
-			logging.info(f"Rank {self.rank}: Attempting coordinated reinit...")
-			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
-
-	def _coordinated_dist_reinit(self, max_retries: int, initial_delay: float) -> bool:
-		"""
-		Perform coordinated torch.distributed reinitialization with retries.
-
-		The challenge: when NCCL is broken, we can't use NCCL to coordinate.
-		Solution: Use exponential backoff retries. Rank 0 (which hosts TCPStore)
-		will eventually be ready when other ranks retry.
-
-		Args:
-			max_retries: Maximum number of reinit attempts
-			initial_delay: Initial delay between retries (doubles each attempt)
-
-		Returns:
-			True if reinit succeeded, False otherwise
-		"""
-		delay = initial_delay
-
-		for attempt in range(max_retries):
-			logging.info(f"Rank {self.rank}: Reinit attempt {attempt + 1}/{max_retries}")
-
-			# Step 1: Clean up existing process group
-			if dist.is_initialized():
-				try:
-					dist.destroy_process_group()
-					logging.debug(f"Rank {self.rank}: Destroyed existing process group")
-				except Exception as e:
-					logging.warning(f"Rank {self.rank}: Error destroying process group: {e}")
-
-			# Step 2: Clean up PyNccl communicator (must be done after destroying dist)
-			if hasattr(self, 'comm') and self.comm is not None:
-				try:
-					self.comm.destroy()
-					logging.debug(f"Rank {self.rank}: Destroyed PyNccl communicator")
-				except Exception as e:
-					logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {e}")
-				self.comm = None
-
-			# Step 3: Wait before retry (exponential backoff)
-			# Rank 0 waits less so it sets up TCPStore first
-			rank_delay = delay * (0.5 if self.rank == 0 else 1.0)
-			logging.debug(f"Rank {self.rank}: Waiting {rank_delay:.1f}s before reinit...")
-			time.sleep(rank_delay)
-
-			# Step 4: Try to reinitialize
-			try:
-				self._init_torch_dist()
-				logging.info(f"Rank {self.rank}: torch.distributed reinitialized successfully on attempt {attempt + 1}")
-				return True
-			except Exception as e:
-				logging.warning(f"Rank {self.rank}: Reinit attempt {attempt + 1} failed: {e}")
-				delay *= 2  # Exponential backoff
-
-		logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed after {max_retries} attempts")
-		return False
 
 	def _check_and_reinit_pynccl(self) -> bool:
 		"""
