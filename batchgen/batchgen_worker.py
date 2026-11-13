@@ -12621,330 +12621,16 @@ class BatchGenWorker:
 		)
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
-		"""Prefill a planned wave: each pooled segment once, then every tail."""
-		from batchgen.models.wrappers.attention import AttnWrapperBase
-		from batchgen.prefix_reuse.wave_plan import prefill_plan_work
-
-		wave = self._prefill_pool_wave
-		if wave.pool is None:
-			self._construct_prefill_pool(wave)
-		index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
-		order = [index_of[self._local_to_uuid_map[local_idx]] for local_idx in batch]
-		if sorted(order) != list(range(len(wave.uuids))):
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill batch does not match the planned wave"
-			)
-		workspace = int(
-			self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_prepacked_pool(
+			self,
+			batch,
 		)
-		lm_weight = self.model.lm_head.weight
-		lm_bias = getattr(self.model.lm_head, "bias", None)
-		# The three model seams prefill_prepacked also goes through, duck-typed
-		# so they collapse to the plain path: K3 carries a per-layer block
-		# residual and ends on a depth mix, streamed-SP8 keeps only a row shard
-		# of the final hidden state, and its lm_head is vocab-parallel.
-		use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-		gather_last_token_hidden = getattr(
-			self.parallel_manager, "gather_prefill_last_token_hidden", None
-		)
-		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
-		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
-		epilogue_trace = self._new_pool_epilogue_tracer(wave)
-		if epilogue_trace is not None:
-			# The wave boundary is the earliest point this seam can stamp: the
-			# plan and the Host attachment happen in the reservation
-			# transaction, before this method is entered.
-			epilogue_trace.phase(
-				"wave_begin",
-				# Rows, so loaded segments do not count: they run none.
-				rows=len(wave.computed_segments()) + len(wave.global_ids),
-				tokens=wave.plan.computed_tokens,
-				chunks=len(wave.plan.chunks),
-			)
-		tokens_by_index = {}
-		executed = 0
-		workspace_peak = 0
-		reserved_peak = 0
-		base_alloc, base_reserved, base_other = self._prefill_pool_base
-		# As in prefill_prepacked: layers offload through these views, and a DSA
-		# model writes its indexer keys through the aux one.
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-		AttnWrapperBase.prefill_pool = wave.pool
-		# A recurrent layer forks a row's state from its parent segment's state
-		# slot, which is keyed by that segment's pseudo sequence id.
-		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
-		# A LOADED segment ran no row, so it left no recurrent state to fork:
-		# its reader resumes from the slot the trajectory restore bound before
-		# this wave, which the level cut verifies.
-		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
-			sorted(wave.materialized)
-		)
-		# The pool row of an engine layer comes from the model's own pool
-		# layout, never from a KV cache's layer mapping: a cache that keeps
-		# every layer resolves to itself and would index past the pool.
-		pool_layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
-		AttnWrapperBase.prefill_pool_layer_map = (
-			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
-		)
-		# Always reassigned, never left over: a wave that died before its
-		# verification point cannot leak its records into the next one.
-		AttnWrapperBase.prefill_pool_offload_recorder = (
-			self._new_pool_offload_check_recorder(wave)
-		)
-		# Staging for the wave's loads; None unless it materializes something.
-		materialized_loader = self._materialized_segment_loader(wave)
-		materialized_tokens = 0
-		offload_recorder_handed_off = False
-		try:
-			start = time.perf_counter()
-			for chunk_index, chunk in enumerate(
-				tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0))
-			):
-				self.feed_watchdog()
-				self._weight_passes.begin(
-					carry=chunk_index + 1 < len(wave.plan.chunks)
-				)
-				rows = wave.executor.build(chunk)
-				if epilogue_trace is not None:
-					epilogue_trace.chunk_begin(
-						epilogue_trace.chunk + 1,
-						rows=len(rows.items),
-						tokens=int(rows.input_ids.numel()),
-					)
-				host_ids, host_starts = wave.row_host_targets(rows)
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
-				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
-				AttnWrapperBase.prepack_num_sequences = len(rows.items)
-				AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
-				AttnWrapperBase.position_ids = rows.position_ids
-				AttnWrapperBase.cur_batch = host_ids
-				AttnWrapperBase.prefill_pool_batch = rows
-				AttnWrapperBase.prefill_pool_row_starts = host_starts
-				# Before the forward, never during it: every layer's pool row
-				# holds the committed prefix by the time any row attends over
-				# it, and a failure here has not yet touched the forward.
-				materialized_tokens += self._load_materialized_segments(
-					wave, rows, materialized_loader
-				)
-				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
-				block_residual = (
-					self.model.model._new_block_residual(hidden_states)
-					if use_attn_res else None
-				)
-				for decoder_layer in self.model.model.layers:
-					if use_attn_res:
-						hidden_states, block_residual = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-							block_residual=block_residual,
-						)
-					else:
-						hidden_states = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-						)[0]
-				if rows.tail_wave_indices:
-					if use_attn_res:
-						# Mix-then-norm over every row: the depth mix needs each
-						# row's own residual (kimi_linear/model.py:904-913).
-						hidden_dim = hidden_states.shape[2]
-						batch_sz, seq_sz = hidden_states.shape[:2]
-						hidden_states = self.model.model._apply_output_attn_res(
-							hidden_states.view(-1, hidden_dim), block_residual
-						).view(batch_sz, seq_sz, hidden_dim)
-					if gather_last_token_hidden is None:
-						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
-						if epilogue_trace is not None:
-							# No gather exists on this manager, so the rank
-							# holds every row. record_unsharded_gather asserts
-							# that against the manager instead of trusting
-							# this branch: a hand-written single-rank record on
-							# a sharded path would report a broken multi-rank
-							# gather as healthy.
-							self._record_unsharded_epilogue_gather(
-								epilogue_trace,
-								last_hidden,
-								num_global_rows=int(rows.input_ids.numel()),
-							)
-					else:
-						# Streamed-SP8 holds only this rank's row shard, so the
-						# tail rows are reassembled over the group.
-						last_hidden = gather_last_token_hidden(
-							self.model.model.norm(hidden_states),
-							rows.tail_rows,
-							int(rows.input_ids.numel()),
-							**(
-								{"trace": epilogue_trace}
-								if epilogue_trace is not None
-								else {}
-							),
-						)
-					logits = (
-						self.model.lm_head.forward(last_hidden).float()
-						if vocab_parallel_head
-						else torch.nn.functional.linear(
-							last_hidden, lm_weight, lm_bias
-						).float()
-					)
-					selected = self._select_tokens(
-						logits,
-						[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
-					)
-					for row, index in enumerate(rows.tail_wave_indices):
-						tokens_by_index[index] = selected[row]
-					if epilogue_trace is not None:
-						# The pairing side of the trace: the row -> wave index
-						# -> uuid -> global id chain, beside the gather-side
-						# facts the recorder already holds.
-						epilogue_trace.emit(
-							table_rows=[
-								row for row, item in enumerate(rows.items)
-								if item.kind == "tail"
-							],
-							tail_rows=rows.tail_rows.tolist(),
-							wave_indices=list(rows.tail_wave_indices),
-							global_ids=list(wave.global_ids),
-							uuids=list(wave.uuids),
-							tokens=[int(token) for token in selected],
-							# The SAME tensor _select_tokens consumed: full
-							# vocabulary in both branches (the vocab-parallel
-							# head all-gathers before returning).
-							logits=logits,
-						)
-				del hidden_states
-				# Dropped before the next chunk seeds its own buffer, so the two
-				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
-				block_residual = None
-				self._weight_passes.end()
-				executed += int(rows.input_ids.numel())
-				wave.executor.finish(chunk)
-				if epilogue_trace is not None:
-					epilogue_trace.chunk_end(
-						rows=len(rows.items),
-						tokens=int(rows.input_ids.numel()),
-					)
-				# Allocated bytes are what a chunk needs. The allocator's reserve
-				# grows into whatever the pool left free and drops cached blocks
-				# only when a cudaMalloc fails, so it is reported, not checked.
-				free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
-				reserved_now = torch.cuda.memory_reserved(self.local_rank)
-				reserved_peak = max(
-					reserved_peak,
-					torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
-					+ (device_total - free_now - reserved_now) - base_other,
-				)
-				peak = torch.cuda.max_memory_allocated(self.local_rank) - base_alloc
-				workspace_peak = max(workspace_peak, peak)
-				if peak > workspace:
-					raise RuntimeError(
-						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
-						f"{workspace} B kept beside the prefix pool"
-					)
-			prefill_s = time.perf_counter() - start
-			if epilogue_trace is not None:
-				# The last stamp a rank emits before it leaves the pooled
-				# prefill: comparing wave_end across the two nodes is what
-				# shows whether one group entered decode while the other was
-				# still inside a pooled chunk.
-				epilogue_trace.phase(
-					"wave_end",
-					elapsed_ms=prefill_s * 1e3,
-					tokens=executed,
-					chunks=len(wave.plan.chunks),
-				)
-			if executed != wave.plan.computed_tokens:
-				raise RuntimeError(
-					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
-					f"{wave.plan.computed_tokens}"
-				)
-			wave.executor.close()
-			# The wave reached its end, so the offload recorder is handed to
-			# _verify_prefill_pool_offload_bytes - which runs after the D2H has
-			# retired, outside this method - and only it may clear the recorder.
-			offload_recorder_handed_off = True
-		finally:
-			if wave.pool.free_pages != wave.pool.num_pages:
-				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
-			# A segment's recurrent state is keyed by its pseudo sequence id and
-			# has to live across the chunks that continue it, so it is released
-			# here — the wave is over and no later batch carries those ids.
-			self._release_kda_state_slots(list(wave.segment_sids.values()))
-			if materialized_loader is not None:
-				for group_loader in materialized_loader.values():
-					group_loader.release()
-			# Probe recorder teardown, unconditional: a wave that died anywhere
-			# above must not leave its records attached to a class attribute or
-			# to a pool the next wave inherits. The dump recorder is finished
-			# either way - it writes per chunk, nothing consumes it later - and
-			# the offload recorder is dropped UNLESS this wave completed and
-			# handed it to the post-D2H verification step.
-			wave.pool.kernel_dump = None
-			if not offload_recorder_handed_off:
-				AttnWrapperBase.prefill_pool_offload_recorder = None
-			wave.pool.k = wave.pool.v = wave.pool.indexer = None
-			AttnWrapperBase.prefill_pool = None
-			AttnWrapperBase.prefill_pool_batch = None
-			AttnWrapperBase.prefill_pool_row_starts = None
-			AttnWrapperBase.prefill_pool_segment_sids = None
-			AttnWrapperBase.prefill_pool_materialized_segments = ()
-			AttnWrapperBase.prefill_pool_layer_map = None
-			AttnWrapperBase.prepack_mode = False
-			AttnWrapperBase.prepack_cu_seqlens = None
-			AttnWrapperBase.prepack_max_seqlen = None
-			AttnWrapperBase.prepack_num_sequences = None
-			AttnWrapperBase.prepack_seq_lengths = None
-			torch.cuda.empty_cache()
-		work = prefill_plan_work(wave.plan)
-		new_tokens = torch.stack([tokens_by_index[index] for index in order])
-		# Ledger-contract fields the prepacked path already carries
-		# (prefill_metrics_proposal.md): without seq_len_* a single-S run
-		# cannot bind its FLOPs model, and without the sampled ids a pooled
-		# wave has no determinism witness, so pooled waves were falling out
-		# of prefill_report entirely. The wave is complete and the barrier
-		# above has drained the compute stream, so the tolist() is a
-		# wave-boundary scalar transfer, same as the prepacked emission.
-		wave_seq_lens = [
-			int(self.global_batch.get_sequence(uuid).prompt_length)
-			for uuid in wave.uuids
-		]
-		logging.info("[METRICS] " + json.dumps({
-			"component": "prefix_pool",
-			"phase": "prefill",
-			"rank": self.rank,
-			"sequences": len(order),
-			"prompt_tokens": wave.plan.prompt_tokens,
-			"computed_tokens": executed,
-			"full_attention_pairs": work.full_attention_pairs,
-			"item_rows": work.item_rows,
-			"saved_tokens": wave.plan.prompt_tokens - executed,
-			"materialized_tokens": materialized_tokens,
-			"materialized_segments": len(wave.materialized),
-			"segments": len(wave.plan.segments),
-			"chunks": len(wave.plan.chunks),
-			"threshold": wave.plan.threshold,
-			"pool_pages": wave.pool.num_pages,
-			"peak_pool_pages": wave.plan.peak_pool_pages,
-			"workspace_peak_bytes": workspace_peak,
-			"reserved_peak_bytes": reserved_peak,
-			"prefill_s": prefill_s,
-			"seq_len_min": min(wave_seq_lens) if wave_seq_lens else 0,
-			"seq_len_max": max(wave_seq_lens) if wave_seq_lens else 0,
-			"world_size": self.world_size,
-			"first_sampled_token_ids": (
-				new_tokens.reshape(-1).tolist()[:16]
-			),
-		}, separators=(",", ":")))
-		return self._write_prefill_tokens(batch, new_tokens)
 
 	def _pool_probe_debug(self, wave):
 		# The engine receives this worker as its sole state collaborator.
@@ -13917,871 +13603,185 @@ class BatchGenWorker:
 	# ============ Prefill and Decode ============
 
 	def prefill(self, batch: list[int]):
-		"""
-		Handle the prefill for a batch.
-		batch: list of local indices
-		"""
-		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
-		# loop. Without this binding, GLM-5's prefill indexer-K offload at
-		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
-		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
-		# populated for prompt tokens and any later decode past 2048 tokens
-		# reads unwritten aux pages.
-		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
-		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
-		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
-		# the host aux cache instead of early-returning on a None view.
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = False
-
-		# Dynamic padding: find max length within THIS batch, not global max
-		# This is critical for long-tailed distributions
-		batch_seq_lengths = []
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			batch_seq_lengths.append(int(seq.prompt_length))
-		batch_max_len = max(batch_seq_lengths)
-
-		# Pad each sequence to batch_max_len and construct attention masks on-the-fly
-		padded_input_ids = []
-		padded_attention_masks = []
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			prompt_len = seq.prompt_length
-			seq_input_ids = self._trajectory_tokens(
-				seq, length=prompt_len, dtype=torch.int64
-			).view(1, -1)
-			seq_len = seq_input_ids.shape[1]
-
-			# Construct attention mask from prompt_length (1s for valid tokens, 0s for padding)
-			seq_attention_mask = torch.zeros((1, seq_len), dtype=torch.int64)
-			seq_attention_mask[0, :prompt_len] = 1
-
-			if seq_len < batch_max_len:
-				# Pad with zeros (left-aligned tokens, right-padded)
-				pad_len = batch_max_len - seq_len
-				seq_input_ids = torch.cat([
-					seq_input_ids,
-					torch.zeros((1, pad_len), dtype=seq_input_ids.dtype)
-				], dim=1)
-				seq_attention_mask = torch.cat([
-					seq_attention_mask,
-					torch.zeros((1, pad_len), dtype=seq_attention_mask.dtype)
-				], dim=1)
-
-			padded_input_ids.append(seq_input_ids)
-			padded_attention_masks.append(seq_attention_mask)
-
-		input_ids = torch.cat(padded_input_ids, dim=0)
-		attention_masks = torch.cat(padded_attention_masks, dim=0)
-
-		num_prefill_micro_batches = math.ceil(
-			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine.prefill(
+			self,
+			batch,
 		)
-		prefill_micro_batch_input_ids = torch.split(
-			input_ids,
-			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
-		)
-		prefill_micro_batch_attention_masks = torch.split(
-			attention_masks,
-			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
-		)
-		if self.rank == 0:
-			logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
-
-		cur_batch_start = 0
-		output_tokens = []
-
-		with self._weight_passes.scope("prefill"):
-			for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
-				# Feed watchdog during long prefill operations
-				self.feed_watchdog()
-				self._weight_passes.begin(
-					carry=micro_batch_idx + 1 < num_prefill_micro_batches
-				)
-
-				with torch.inference_mode():
-					Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
-					Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
-						prefill_micro_batch_attention_masks[micro_batch_idx]
-					)
-
-					cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
-					cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
-
-					# Pass local indices - the C++ layer handles rank offset internally
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
-
-					cur_batch_start += cur_batch_size
-					assert len(cur_batch_local) == cur_batch_size
-
-					outputs = self.model(
-						prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
-						attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
-						use_cache=False,
-					)
-					cur_batch_sequences = [
-						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-						for local_idx in cur_batch_local
-					]
-					new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
-					self._weight_passes.end()
-					output_tokens.append(new_tokens)
-
-		new_tokens = torch.cat(output_tokens, dim=0)
-
-		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
-		new_tokens_cpu = new_tokens.cpu()
-		self._append_trajectory_batch(batch, new_tokens_cpu)
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			seq.decoded_length += 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
-
-			# MODIFIED: Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
-				seq.eos_reached = True
-
-		return new_tokens
 
 	def prefill_prepacked(self, batch: list[int]):
-		"""
-		Handle prefill for a batch using prepack optimization.
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine.prefill_prepacked(
+			self,
+			batch,
+		)
 
-		Prepack combines multiple shorter sequences into rows to minimize padding waste,
-		which is especially beneficial for MLP/MoE layers.
+	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._write_prefill_tokens(
+			self,
+			batch,
+			new_tokens,
+		)
 
-		Args:
-			batch: list of local indices
-		"""
-		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
-		# loop. Without this binding, GLM-5's prefill indexer-K offload at
-		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
-		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
-		# populated for prompt tokens and any later decode past 2048 tokens
-		# reads unwritten aux pages.
-		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
-		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
-		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
-		# the host aux cache instead of early-returning on a None view.
+	# ============ PREFILL MODEL-STATE BINDER (S5b) ============
+	# The worker implements PrefillModelStateBinder (batchgen/worker/prefill_engine.py):
+	# every model-wrapper class-state statement the moved prefill bodies made
+	# stays here, one method per contiguous run of the original body, moved
+	# verbatim; PrefillEngine calls each at its run's former position, so the
+	# engine module never names a model wrapper.
+
+	def _bind_prefill_host_views(self) -> None:
+		"""Bind the host KV worker views the prefill forward offloads through."""
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
-		if self._prefill_pool_wave is not None:
-			with self._weight_passes.scope("prefill"):
-				return self._prefill_prepacked_pool(batch)
-
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = False
-
-		# Collect input_ids and attention_masks as lists for prepacking
-		input_ids_list = []
-		attention_mask_list = []
-		seq_lengths = []
-		full_seq_lengths = []
-		compute_cached_tokens = []
-		attached_tokens = []
-		prefix_lookup_results = []
-
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			# NO truncation: every prompt is tokenized to its OWN length.
-			# An earlier `[:, :self.max_input_length]` slice silently dropped
-			# the tail of long LongBench prompts when max_input_length was
-			# carried over from a smaller earlier admit batch, causing the
-			# model to "continue" mid-sentence instead of answering. Bind
-			# everything to seq.prompt_length directly.
-			L = seq.prompt_length
-			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
-			compute_cached = (
-				prefix_state.compute_cached_tokens
-				if prefix_state is not None
-				else 0
-			)
-			attached = (
-				prefix_state.attached_tokens
-				if prefix_state is not None
-				else 0
-			)
-			query_len = L - compute_cached
-			if query_len <= 0:
-				raise RuntimeError(
-					"prefix prefill must compute at least one prompt token"
-				)
-			# Suffix-only prefill: materialize just the uncached span of the
-			# trajectory; the cached prefix is attached as resident paged KV.
-			input_ids = self._trajectory_tokens(
-				seq, start=compute_cached, length=query_len, dtype=torch.int64
-			).view(1, -1)
-			seq_lengths.append(query_len)
-			full_seq_lengths.append(L)
-			compute_cached_tokens.append(compute_cached)
-			attached_tokens.append(attached)
-			prefix_lookup_results.append(
-				prefix_state.lookup_result if prefix_state is not None else None
-			)
-
-			# Per-seq mask marks the L valid positions for the prepacker.
-			# Causal attention is enforced by FA varlen + cu_seqlens.
-			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
-			attention_mask[0, :query_len] = 1
-
-			input_ids_list.append(input_ids)
-			attention_mask_list.append(attention_mask)
-
-		# Prepack sequences
-		# Row capacity is set by planner in config (None = no limit, use max sequence length)
-		row_capacity = self.engine_config.Module_Batching_Config.prepack_row_capacity
-		prepack_meta = prepack_sequences(
-			input_ids_list,
-			attention_mask_list,
-			row_capacity=row_capacity,
-			device=self.torch_device,
+	def _bind_prefill_pool_segments(self, wave) -> None:
+		"""Bind one pool wave's views, pool, segment sids and loaded segments."""
+		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		AttnWrapperBase.prefill_pool = wave.pool
+		# A recurrent layer forks a row's state from its parent segment's state
+		# slot, which is keyed by that segment's pseudo sequence id.
+		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
+		# A LOADED segment ran no row, so it left no recurrent state to fork:
+		# its reader resumes from the slot the trajectory restore bound before
+		# this wave, which the level cut verifies.
+		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
+			sorted(wave.materialized)
 		)
 
-		# Log prepack statistics
-		if self.rank == 0:
-			stats = get_prepack_stats(prepack_meta)
-			logging.info(
-				f"Prepack stats: {stats['num_sequences']} seqs -> {stats['num_packed_rows']} rows, "
-				f"padding saved: {stats['padding_saved']} tokens, "
-				f"efficiency: {stats['packing_efficiency']:.2%}"
-			)
-
-		# Create flattened tensors for prepacked forward
-		# Flatten packed_input_ids to [total_tokens]
-		total_tokens = sum(prepack_meta.original_seq_lengths)
-
-		# Extract only valid tokens (non-padding) in order
-		packed_input_ids_flat = []
-		packed_position_ids_flat = []
-
-		for seq_idx in range(prepack_meta.num_original_sequences):
-			row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
-			seq_len = prepack_meta.original_seq_lengths[seq_idx]
-
-			# Extract tokens for this sequence
-			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
-			packed_input_ids_flat.append(seq_input_ids)
-
-			# Prefix-hit suffixes retain their original absolute positions.
-			position_start = compute_cached_tokens[seq_idx]
-			packed_position_ids_flat.append(torch.arange(
-				position_start,
-				position_start + seq_len,
-				device=self.torch_device,
-			))
-
-		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
-		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
-
-		# Split sequences into micro-batches based on TOKEN count (not sequence count)
-		# This prevents OOM when sequences have varying lengths
-		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
-		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-		num_sequences = prepack_meta.num_original_sequences
-		seq_lengths_list = prepack_meta.original_seq_lengths
-
-		# Create micro-batches bounded by token count, optionally also by sum(L^2)
-		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
-		# on one micro-batch when a single very long sequence is present.
-		# The planner's token cap is a bound between sequence boundaries.  A
-		# single K3 prompt may itself be much larger than that cap, so the
-		# ordinary greedy planner cannot split it and would still co-reside two
-		# 262K-token sequences in one decoder pass.  That pass allocates the
-		# block-attention-residual scratch for *all* rows and exceeded H20 HBM
-		# before the first streamed-SP8 expert layer.  K3's KDA/MLA state is
-		# persistent per sequence, so keeping each long sequence in its own
-		# prepack pass preserves the state contract; it is not a token-axis
-		# split pretending to be a resumable model forward.
-		micro_batches, l2_cap, _use_single_sequence_mb = (
-			self._plan_prefill_micro_batches(
-				seq_lengths_list, full_seq_lengths, compute_cached_tokens
-			)
+	def _bind_prefill_pool_layer_state(self, wave, pool_layout) -> None:
+		"""Bind the wave's pool layer map and its fresh offload recorder."""
+		AttnWrapperBase.prefill_pool_layer_map = (
+			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
-		total_tokens_all = sum(seq_lengths_list)
-		if (
-			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-			and self.parallel_manager.prefill_uses_resident_ep()
-		):
-			# Pass counts were aligned across ALL ranks before this call (a
-			# rank with no local rows never enters here, so no collective may
-			# live in this function); ranks short of the global count pad with
-			# collective-only passes afterwards.
-			global_passes = getattr(self, "_prefill_global_passes", None)
-			if global_passes is not None and len(micro_batches) > global_passes:
-				raise RuntimeError(
-					"resident-EP prefill planned more micro-batches than the "
-					f"aligned global count: {len(micro_batches)} > {global_passes}"
-				)
-
-		if self.rank == 0:
-			logging.info(
-				f"Prepacked prefill: {len(micro_batches)} micro batches, "
-				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
-				+ (", single-sequence long-prompt guard" if _use_single_sequence_mb else "")
-				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
-			)
-
-		output_tokens = []
-		prefill_sequences = [
-			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-			for local_idx in batch
-		]
-		prefill_debug = (
-			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
 		)
-		_k3_profile_enabled = self._debug_flag_enabled(
-			prefill_debug.get("k3_prefill_profile")
+
+	def _install_prefill_pool_rows(self, rows, host_ids, host_starts) -> None:
+		"""Install one pool chunk's packed-row metadata on the attention wrappers."""
+		AttnWrapperBase.prepack_mode = True
+		AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
+		AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
+		AttnWrapperBase.prepack_num_sequences = len(rows.items)
+		AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
+		AttnWrapperBase.position_ids = rows.position_ids
+		AttnWrapperBase.cur_batch = host_ids
+		AttnWrapperBase.prefill_pool_batch = rows
+		AttnWrapperBase.prefill_pool_row_starts = host_starts
+
+	def _drop_prefill_pool_offload_recorder(self) -> None:
+		"""Drop the wave's offload recorder (not handed to verification)."""
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+
+	def _unbind_prefill_pool_segments(self) -> None:
+		"""Clear every pool-wave binding the wrappers carried for the wave."""
+		AttnWrapperBase.prefill_pool = None
+		AttnWrapperBase.prefill_pool_batch = None
+		AttnWrapperBase.prefill_pool_row_starts = None
+		AttnWrapperBase.prefill_pool_segment_sids = None
+		AttnWrapperBase.prefill_pool_materialized_segments = ()
+		AttnWrapperBase.prefill_pool_layer_map = None
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
+
+	def _bind_prefill_step_metadata(self, attention_mask) -> None:
+		"""Bind one padded prefill micro-batch's mask and derived positions."""
+		Attn_Wrapper.attention_mask = attention_mask
+		Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
+			attention_mask
 		)
-		_k3_profile_logits = []
-		# Batch-level ``batchgen_debug.glm5_lmhead_fp32``: read once here,
-		# like ``k3_prefill_profile`` above, so the per-micro-batch lm_head
-		# epilogue below costs one local bool test.
-		_lmhead_fp32 = self._debug_flag_enabled(
-			prefill_debug.get("glm5_lmhead_fp32")
+
+	def _bind_prefill_step_batch(self, cur_batch_local) -> None:
+		"""Bind the global sequence ids of one padded prefill micro-batch."""
+		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+
+	def _install_prefill_prepack_metadata(
+		self,
+		batch_cu_seqlens,
+		batch_max_seqlen,
+		batch_num_seqs,
+		batch_seq_lengths,
+		batch_position_ids_flat,
+		batch_spans,
+		prefix_materialization,
+		batch_full_seq_lengths,
+		batch_compute_cached,
+		batch_attached_tokens,
+	) -> None:
+		"""Install one prepacked micro-batch's metadata on the wrappers."""
+		Attn_Wrapper.prepack_mode = True
+		Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
+		Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
+		Attn_Wrapper.prepack_num_sequences = batch_num_seqs
+		Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
+		Attn_Wrapper.position_ids = batch_position_ids_flat
+		Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
+
+		# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
+		# which does NOT offload KV to host, causing decode to read garbage.
+		AttnWrapperBase.prepack_mode = True
+		AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+		AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
+		AttnWrapperBase.prepack_num_sequences = batch_num_seqs
+		AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+		AttnWrapperBase.prepack_full_seq_lengths = (
+			batch_full_seq_lengths
+			if prefix_materialization is not None
+			else None
 		)
-		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
-		# same keys as the pooled wave, so one armed batch traces whichever
-		# prefill runs (the first batch on a fresh server, or reuse OFF).
-		# None in production: ``prefill_debug`` is read once above for
-		# ``k3_prefill_profile``, and this one membership test on it is the
-		# whole cost of the trace being off - no tracer, no import.
-		unpooled_trace = None
-		if _EPILOGUE_TRACE_DEBUG_FLAG in prefill_debug:
-			from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
-			from batchgen.prefix_reuse.probe_guard import run_probe
-
-			unpooled_trace = run_probe(
-				"epilogue_trace.setup",
-				lambda: tracer_from_debug(
-					prefill_debug, rank=self.rank, path="unpooled"
-				),
-				rank=self.rank,
-			)
-		if unpooled_trace is not None:
-			logging.info(
-				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
-				"micro_batches=%s probe_token=%s",
-				self.rank, len(prefill_sequences), len(micro_batches),
-				unpooled_trace.probe_token,
-			)
-
-		# Pure forward wall time: started here so configure_prefill (already
-		# reported separately as `Config completed`) is NEVER folded in.
-		_prefill_forward_t0 = time.perf_counter()
-		with torch.inference_mode(), self._weight_passes.scope("prefill"):
-			for batch_idx, (seq_start, seq_end) in tqdm(
-				enumerate(micro_batches),
-				total=len(micro_batches),
-				desc="Prepacked Prefill",
-				disable=(self.rank != 0)  # Only show progress on rank 0
-			):
-				# Feed watchdog during long prefill operations
-				self.feed_watchdog()
-				self._weight_passes.begin(carry=batch_idx + 1 < len(micro_batches))
-
-				# Get sequences for this micro-batch
-				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
-				batch_full_seq_lengths = full_seq_lengths[seq_start:seq_end]
-				batch_compute_cached = compute_cached_tokens[seq_start:seq_end]
-				batch_attached_tokens = attached_tokens[seq_start:seq_end]
-				batch_lookup_results = prefix_lookup_results[seq_start:seq_end]
-				batch_num_seqs = seq_end - seq_start
-
-				# Extract tokens for this micro-batch
-				batch_input_ids = []
-				batch_position_ids = []
-				token_offset = sum(seq_lengths_list[:seq_start])  # Offset into flat tensors
-
-				for seq_idx in range(seq_start, seq_end):
-					seq_len = seq_lengths_list[seq_idx]
-					# Calculate where this sequence's tokens are in the flat tensor
-					seq_token_start = sum(seq_lengths_list[:seq_idx])
-					seq_token_end = seq_token_start + seq_len
-
-					batch_input_ids.append(packed_input_ids_flat[seq_token_start:seq_token_end])
-					batch_position_ids.append(packed_position_ids_flat[seq_token_start:seq_token_end])
-
-				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
-				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
-				if (
-					hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-					and self.parallel_manager.prefill_uses_resident_ep()
-				):
-					self._sync_prefill_moe_rank_counts(
-						int(batch_input_ids_flat.numel()),
-						reason=f"prefill_microbatch_{batch_idx}",
-					)
-
-				batch_local_indices = batch[seq_start:seq_end]
-				local_to_global_seq_id_map = {}
-				for local_idx in batch_local_indices:
-					uuid = self._local_to_uuid_map.get(local_idx)
-					if uuid is None:
-						raise RuntimeError(
-							f"Rank {self.rank}: missing UUID for prefill local_idx={local_idx}"
-						)
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is None:
-						raise RuntimeError(
-							f"Rank {self.rank}: missing SequenceEntry for prefill uuid={uuid[:8]}"
-						)
-					local_to_global_seq_id_map[local_idx] = seq.global_idx
-
-				batch_spans = build_prefill_sequence_spans(
-					batch_local_indices,
-					batch_seq_lengths,
-					self._local_to_uuid_map,
-					local_to_global_seq_id_map,
-				)
-				# Pinned source + non_blocking: a pageable H2D here blocks the
-				# host until the copy lands, i.e. once per micro-batch.
-				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
-					dtype=torch.int32,
-				).pin_memory().to(self.torch_device, non_blocking=True)
-				batch_max_seqlen = max(batch_seq_lengths)
-				prefix_materialization = None
-				if any(tokens > 0 for tokens in batch_compute_cached):
-					if any(result is None for result in batch_lookup_results):
-						raise RuntimeError(
-							"prefix-hit microbatch is missing lookup results"
-						)
-					from batchgen.prefix_reuse.materialization import (
-						materialize_gpt_oss_prefixes,
-					)
-
-					host_page_tokens = int(
-						self.prefix_cache_runtime_config.group_specs[0]
-						.raw_page_tokens
-					)
-					# Sized by the same function the micro-batch planner
-					# capped against the prefill-phase prefix KV budget.
-					gpu_config = self._prefix_materialization_kv_config(
-						batch_full_seq_lengths
-					)
-					temporary_manager = GPUPagedKVCacheManager(
-						config=gpu_config,
-						device=self.local_rank,
-					)
-					temporary_manager.initialize()
-					prefix_materialization = materialize_gpt_oss_prefixes(
-						gpu_manager=temporary_manager,
-						host_worker_view=(
-							self.core_engine.host_paged_kv_worker_view
-						),
-						coordinator=self.prefix_cache_coordinator,
-						lookup_results=batch_lookup_results,
-						sequence_ids=(
-							prefill_sequence_spans_to_global_seq_ids(batch_spans)
-						),
-						prompt_lengths=batch_full_seq_lengths,
-						compute_cached_tokens=batch_compute_cached,
-						raw_page_tokens=host_page_tokens,
-						collect_metrics=self.prefix_cache_debug_stats,
-						host_page_bytes_all_layers=(
-							self.prefix_cache_runtime_config
-							.host_page_bytes_all_layers
-						),
-					)
-					self._prefix.active_prefix_materializations.append(
-						prefix_materialization
-					)
-
-				# Set up Attn_Wrapper for this micro-batch.
-				# These class attrs are the per-step worker->model contract read
-				# by attention wrappers; see semantics in
-				#   batchgen-context/architecture/PSM_WORKER_CONTRACT.md (§2)
-				Attn_Wrapper.prepack_mode = True
-				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
-				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
-				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
-				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
-				Attn_Wrapper.position_ids = batch_position_ids_flat
-				Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
-
-				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
-				# which does NOT offload KV to host, causing decode to read garbage.
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
-				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
-				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
-				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
-				AttnWrapperBase.prepack_full_seq_lengths = (
-					batch_full_seq_lengths
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prepack_compute_cached_tokens = (
-					batch_compute_cached
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prepack_attached_tokens = (
-					batch_attached_tokens
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prefill_prefix_materialization = (
-					prefix_materialization
-				)
-				AttnWrapperBase.position_ids = batch_position_ids_flat
-				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(
-					batch_input_ids_flat.to(self.torch_device, dtype=torch.int64)
-				)
-
-				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-				hidden_states = inputs_embeds.unsqueeze(0)
-				# unsqueeze is a VIEW, so `hidden_states` already keeps the
-				# embedding storage alive for exactly as long as layer 0 needs
-				# it. Keeping `inputs_embeds` bound as well pins that storage
-				# for the WHOLE stack instead -- 1.75 GiB dead across layers
-				# 1-92 at S=131,072 / H=7168 / bf16
-				# (batchgen_design/model_support/kimi_k3/
-				#  PREFILL_MEMORY_AUDIT.md section 7, fix 4).
-				del inputs_embeds
-
-				# Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
-				# classic residual body, so the per-layer state has to be carried
-				# here. Without it every layer sees a zero-width residual and the
-				# model runs happily while computing something that is not K3 --
-				# wrong text, no error. Mirrors KimiLinearModel.forward
-				# (kimi_linear/model.py:880-910), which is the eager reference.
-				use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-				block_residual = None
-				if use_attn_res:
-					# Zero-column view of a buffer preallocated for ALL the
-					# stack's block boundaries, so the per-boundary `cat` never
-					# holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
-					# GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
-					# `block_residual = None` above is load-bearing: it drops
-					# the previous micro-batch's view before the next buffer is
-					# allocated.
-					block_residual = self.model.model._new_block_residual(hidden_states)
-
-				# DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
-				# bookkeeping is CPU-side, no sync) and independent of the
-				# allocator-history trace, so it still localises the peak layer
-				# if the trace ring buffer wraps.
-				_memprof_layers = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
-				# The allocator-history ring buffer only holds the LAST max_entries
-				# events, and one K3 prefill emits ~2e7 of them (896-expert
-				# moe_infer loop x 92 layers), so a whole-forward trace only ever
-				# retains the tail. The HBM peak is set in the FIRST layer, so
-				# BATCHGEN_MEM_PROFILE_STOP_LAYER=N dumps and stops recording right
-				# after layer N: a short, wrap-free trace of the window that
-				# actually contains the peak.
-				_memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
-
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					if use_attn_res:
-						hidden_states, block_residual = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-							block_residual=block_residual,
-						)
-					else:
-						layer_outputs = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-						)
-						hidden_states = layer_outputs[0]
-					if _memprof_layers:
-						logging.info(
-							f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
-							f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
-							f"alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
-							f"cum_peak={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
-							f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
-							f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
-						)
-						if layer_idx == _memprof_stop_layer:
-							_p = os.path.join(
-								os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
-								f"memprof_rank{self.rank}_thru_layer{layer_idx}_{int(time.time())}.pickle",
-							)
-							torch.cuda.memory._dump_snapshot(_p)
-							torch.cuda.memory._record_memory_history(enabled=None)
-							logging.info(
-								f"[MEMPROF] Rank {self.rank}: stop-layer snapshot -> {_p} "
-								f"(peak_alloc so far={torch.cuda.max_memory_allocated()/2**30:.3f}GiB)"
-							)
-
-				# Output depth-mix, then norm -- that ORDER is load-bearing
-				# (kimi_linear/model.py:904-913).
-				if use_attn_res:
-					hidden_dim = hidden_states.shape[2]
-					batch_sz, seq_sz = hidden_states.shape[:2]
-					hidden_states = self.model.model._apply_output_attn_res(
-						hidden_states.view(-1, hidden_dim), block_residual
-					).view(batch_sz, seq_sz, hidden_dim)
-
-				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
-
-				# Extract last token hidden states for each sequence
-				last_token_indices = batch_cu_seqlens[1:] - 1
-				gather_last_token_hidden = getattr(
-					self.parallel_manager,
-					"gather_prefill_last_token_hidden",
-					None,
-				)
-				if gather_last_token_hidden is None:
-					last_token_hidden = hidden_states[
-						0, last_token_indices, :
-					]
-					if unpooled_trace is not None:
-						# Genuinely single-rank: this manager has no gather, so
-						# the rank holds every row. Asserted inside, not
-						# assumed - see _record_unsharded_epilogue_gather.
-						unpooled_trace.begin_chunk(batch_idx)
-						self._record_unsharded_epilogue_gather(
-							unpooled_trace,
-							last_token_hidden,
-							num_global_rows=int(hidden_states.shape[1]),
-						)
-				else:
-					# The tracer goes INTO the real gather, exactly as on the
-					# pooled path: under streamed-SP8 this rank holds only a
-					# row shard, and the shard bounds, the owned mask and the
-					# norms either side of the all-reduce are visible only in
-					# there. Writing a tp=0/1 record out here instead would
-					# report a broken multi-rank gather as healthy.
-					if unpooled_trace is not None:
-						unpooled_trace.begin_chunk(batch_idx)
-					last_token_hidden = gather_last_token_hidden(
-						hidden_states,
-						last_token_indices,
-						batch_input_ids_flat.numel(),
-						**(
-							{"trace": unpooled_trace}
-							if unpooled_trace is not None
-							else {}
-						),
-					)
-
-				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-				# Opt into FP32-cast via batchgen_debug.glm5_lmhead_fp32 for
-				# debugging (batch-level only; no env guard).
-				if getattr(self.model.lm_head, "tp_size", 1) > 1:
-					# vocab-parallel head (K3 TP8): the module all_gathers the
-					# full logits; the raw shard weight must not be used here.
-					# .forward skips the decode-only pre-hook (``[:, -1, :]``
-					# expects [bsz, seq, H]; this input is the gathered [n, H]).
-					logits = self.model.lm_head.forward(last_token_hidden).float()
-				elif _lmhead_fp32:
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
-				if _k3_profile_enabled:
-					_k3_profile_logits.append(logits.detach())
-
-				batch_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in batch_local_indices
-				]
-				batch_new_tokens = self._select_tokens(logits, batch_sequences)
-				if batch_new_tokens.shape[0] != batch_num_seqs:
-					raise RuntimeError(
-						f"Rank {self.rank}: prefill token selection shape mismatch, "
-						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
-					)
-				if unpooled_trace is not None:
-					# One line per sequence, from the SAME logits the token
-					# choice consumed. The gather-side facts were recorded by
-					# the gather itself (or, where no gather exists, by the
-					# asserted single-rank helper), so nothing is hand-written
-					# here: the chunk was opened before the gather so those
-					# records survive to this line.
-					unpooled_trace.emit(
-						table_rows=list(range(batch_num_seqs)),
-						tail_rows=last_token_indices.tolist(),
-						wave_indices=list(range(batch_num_seqs)),
-						global_ids=[int(seq.global_idx) for seq in batch_sequences],
-						uuids=[str(seq.uuid) for seq in batch_sequences],
-						tokens=[int(token) for token in batch_new_tokens],
-						logits=logits,
-					)
-				output_tokens.append(batch_new_tokens)
-				self._weight_passes.end()
-
-				if prefix_materialization is not None:
-					AttnWrapperBase.retire_pending_prefill_offloads(
-						device=self.torch_device,
-						reason="before releasing prefix materialization",
-					)
-					self._close_prefix_materialization(
-						prefix_materialization,
-						empty_cuda_cache=True,
-					)
-					self._prefix.active_prefix_materializations.remove(
-						prefix_materialization
-					)
-					AttnWrapperBase.prefill_prefix_materialization = None
-
-
-		# Keep the historical host-enqueue boundary for backwards-compatible
-		# diagnostics, then establish two stronger completion boundaries. A host
-		# perf-counter sample alone does not prove that a non-default CUDA stream
-		# has finished, and the last layer's KV D2H task is intentionally not on
-		# the compute stream.
-		_prefill_forward_host_s = time.perf_counter() - _prefill_forward_t0
-		torch.cuda.current_stream(self.torch_device).synchronize()
-		_prefill_forward_gpu_complete_s = time.perf_counter() - _prefill_forward_t0
-		# The FIRST generated tokens, straight out of prefill: a cross-check
-		# of the response path (max_tokens=1 requests complete right after
-		# prefill). Read once per wave after the completion boundary above,
-		# never per micro-batch, so it adds no host-device sync. Rank 0 only;
-		# ids only (the worker has no tokenizer -- decode them client-side).
-		if self.rank == 0 and output_tokens:
-			_ids = torch.cat([t.reshape(-1) for t in output_tokens]).tolist()
-			logging.info(
-				"[PREFILL] first sampled token ids: %s ... last: %s (n=%d)",
-				_ids[:16], _ids[-8:], len(_ids))
-		_num_final_kv_tasks = AttnWrapperBase.retire_pending_prefill_offloads(
-			device=self.torch_device,
-			reason="prefill metrics KV-ready boundary",
+		AttnWrapperBase.prepack_compute_cached_tokens = (
+			batch_compute_cached
+			if prefix_materialization is not None
+			else None
 		)
-		_prefill_kv_ready_s = time.perf_counter() - _prefill_forward_t0
-		if _k3_profile_enabled:
-			_k3_profile_topk = []
-			for profile_logits in _k3_profile_logits:
-				top_values, top_indices = torch.topk(
-					profile_logits,
-					k=min(8, profile_logits.shape[-1]),
-					dim=-1,
-				)
-				_k3_profile_topk.append({
-					"ids": top_indices.cpu().tolist(),
-					"values": top_values.cpu().tolist(),
-				})
-			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
-				KimiK3MXFP4ExpertWrapper,
-			)
-			from batchgen.moe.streamed_sp8_mxfp4 import (
-				StreamedSP8MXFP4MoELayer,
-			)
-			free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
-			# The top-k ``.cpu()`` transfers above have drained the compute stream.
-			# Pending ingress events precede the ready events that stream waited on,
-			# so every timing pair is complete before ``elapsed_time`` is queried.
-			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
-				"rank": self.rank,
-				"hbm": {
-					"current_allocated_bytes": torch.cuda.memory_allocated(
-						self.local_rank
-					),
-					"current_reserved_bytes": torch.cuda.memory_reserved(
-						self.local_rank
-					),
-					"peak_allocated_bytes": torch.cuda.max_memory_allocated(
-						self.local_rank
-					),
-					"peak_reserved_bytes": torch.cuda.max_memory_reserved(
-						self.local_rank
-					),
-					"free_bytes": free_hbm,
-					"total_bytes": total_hbm,
-				},
-				"weight_stream": self.core_engine.get_weight_stream_profile(),
-				# The exact module counts of the profiled forward's passes.
-				"weight_passes": self._weight_passes.totals,
-				"expert_consumer": (
-					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
-				),
-				"streamed_sp8": (
-					StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
-				),
-				"logit_topk": _k3_profile_topk,
-			}, separators=(",", ":")))
-
-		# Structured prefill record, one JSON line per rank that actually ran a
-		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
-		# report tool prefers this over scraping the tqdm bar, which is
-		# presentation, not an API.
-		#
-		# Deliberately NOT gated on rank 0, departing from the proposal's
-		# "rank 0 only". prefill_prepacked runs only under
-		# `if local_prefill_indices:`, and the tqdm bar above is
-		# disable=(self.rank != 0) -- so when rank 0 owns none of the batch
-		# there is neither a bar nor a rank-0 line anywhere in the log, and the
-		# run reports `Prefill: 0.0s` with nothing to scrape. That is exactly
-		# what the 131,069-token run produced when rank 2 owned the sequence.
-		# Every participating rank emits its own tagged line; the wall time for
-		# the batch is the MAX of each timing field over the emitting ranks.
-		# `prefill_s` retains its historical host-forward meaning; schema-aware
-		# reporters use `prefill_kv_ready_s` as the canonical capability boundary.
-		# The legacy/full-attention path does not build a WavePrefixPlan, but it
-		# still has the same workload geometry. Keep the stress metric contract
-		# comparable: every prompt is recomputed, one item row is emitted per
-		# sequence, and each FA3 micro-batch is one chunk. Causal pairs are the
-		# exact full-attention work count for each prompt.
-		legacy_full_attention_pairs = sum(
-			(int(seq_len) * (int(seq_len) + 1)) // 2
-			for seq_len in seq_lengths_list
+		AttnWrapperBase.prepack_attached_tokens = (
+			batch_attached_tokens
+			if prefix_materialization is not None
+			else None
 		)
-		logging.info("[METRICS] %s", json.dumps({
-			"component": "prefill_full_attention",
-			"phase": "prefill",
-			"prefill_metrics_contract": "forward-host+gpu-complete+kv-ready-v1",
-			"prefill_s": _prefill_forward_host_s,
-			"prefill_forward_host_s": _prefill_forward_host_s,
-			"prefill_forward_gpu_complete_s": _prefill_forward_gpu_complete_s,
-			"prefill_kv_ready_s": _prefill_kv_ready_s,
-			"final_kv_offload_tasks_retired": _num_final_kv_tasks,
-			"sequences": num_sequences,
-			"prompt_tokens": total_tokens_all,
-			"computed_tokens": total_tokens_all,
-			"full_attention_pairs": legacy_full_attention_pairs,
-			"item_rows": num_sequences,
-			"chunks": len(micro_batches),
-			"saved_tokens": 0,
-			"recomputed_tokens": total_tokens_all,
-			"tokens_total": total_tokens_all,
-			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
-			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,
-			"micro_batches": len(micro_batches),
-			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
-			"world_size": self.world_size,
-			"rank": self.rank,
-			# Guarded: the proposal's unguarded output_tokens[0] is an IndexError
-			# on a rank that ran zero micro-batches.
-			"first_sampled_token_ids": (
-				output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
-			),
-		}, separators=(",", ":")))
+		AttnWrapperBase.prefill_prefix_materialization = (
+			prefix_materialization
+		)
+		AttnWrapperBase.position_ids = batch_position_ids_flat
+		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-		# Reset prepack mode
+	def _retire_prefill_pending_offloads(self, device, reason):
+		"""Retire pending prefill KV offloads; returns the retired task count."""
+		return AttnWrapperBase.retire_pending_prefill_offloads(
+			device=device,
+			reason=reason,
+		)
+
+	def _clear_prefill_prefix_materialization(self) -> None:
+		"""Detach the released prefix materialization from the wrappers."""
+		AttnWrapperBase.prefill_prefix_materialization = None
+
+	def _reset_prefill_prepack_metadata(self) -> None:
+		"""Reset the prepack metadata after the prepacked forward loop."""
 		Attn_Wrapper.prepack_mode = False
 		Attn_Wrapper.prepack_cu_seqlens = None
 		Attn_Wrapper.prepack_max_seqlen = None
@@ -14799,37 +13799,69 @@ class BatchGenWorker:
 		AttnWrapperBase.prepack_attached_tokens = None
 		AttnWrapperBase.prefill_prefix_materialization = None
 
-		# Log timing summary for GPT-OSS if timing was enabled
-		self._log_prefill_timing()
+	# S5b model-name routing (spec F3): the moved prefill bodies read these
+	# model-family constants through the worker so no model-name literal enters
+	# batchgen/worker/. Each returns exactly the original string constant.
 
-		new_tokens = torch.cat(output_tokens, dim=0)
-		return self._write_prefill_tokens(batch, new_tokens)
+	def _prefill_deepseek_family_name(self) -> str:
+		return "deepseek"
 
-	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
-		"""Store each sequence's first generated token (batch order)."""
-		if new_tokens.shape[0] != len(batch):
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill writeback shape mismatch, "
-				f"got {new_tokens.shape[0]} rows for {len(batch)} local sequences"
-			)
+	def _k3_prefill_profile_flag_name(self) -> str:
+		return "k3_prefill_profile"
 
-		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		new_tokens_cpu = new_tokens.cpu()
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
-			# The unified book owns the append position. Keep the scalar
-			# completion counter in lockstep for fresh prefill and KV re-entry.
-			seq.decoded_length += 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+	def _glm5_lmhead_fp32_flag_name(self) -> str:
+		return "glm5_lmhead_fp32"
 
-			# Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
-				seq.eos_reached = True
+	def _new_prefill_temporary_gpu_kv_manager(self, gpu_config) -> GPUPagedKVCacheManager:
+		# S5b carve-out #6 (spec §S5b): the engine module must stay importable
+		# without the native kv_cache chain, so the temporary prefix-hit GPU KV
+		# manager is constructed here, where the class is already imported.
+		return GPUPagedKVCacheManager(
+			config=gpu_config,
+			device=self.local_rank,
+		)
 
-		return new_tokens
+	def _emit_k3_prefill_profile_log(self, k3_profile_topk) -> None:
+		"""Log the per-rank K3 prefill profile record (one JSON line)."""
+		from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+			KimiK3MXFP4ExpertWrapper,
+		)
+		from batchgen.moe.streamed_sp8_mxfp4 import (
+			StreamedSP8MXFP4MoELayer,
+		)
+		free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
+		# The top-k ``.cpu()`` transfers above have drained the compute stream.
+		# Pending ingress events precede the ready events that stream waited on,
+		# so every timing pair is complete before ``elapsed_time`` is queried.
+		logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
+			"rank": self.rank,
+			"hbm": {
+				"current_allocated_bytes": torch.cuda.memory_allocated(
+					self.local_rank
+				),
+				"current_reserved_bytes": torch.cuda.memory_reserved(
+					self.local_rank
+				),
+				"peak_allocated_bytes": torch.cuda.max_memory_allocated(
+					self.local_rank
+				),
+				"peak_reserved_bytes": torch.cuda.max_memory_reserved(
+					self.local_rank
+				),
+				"free_bytes": free_hbm,
+				"total_bytes": total_hbm,
+			},
+			"weight_stream": self.core_engine.get_weight_stream_profile(),
+			# The exact module counts of the profiled forward's passes.
+			"weight_passes": self._weight_passes.totals,
+			"expert_consumer": (
+				KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
+			),
+			"streamed_sp8": (
+				StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
+			),
+			"logit_topk": k3_profile_topk,
+		}, separators=(",", ":")))
 
 	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 

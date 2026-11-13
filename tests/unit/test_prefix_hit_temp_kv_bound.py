@@ -30,6 +30,8 @@ from batchgen.prefix_reuse.materialization import (
     temporary_kv_pages,
 )
 from tests.worker_method_source import (
+    PREFILL_ENGINE_CLASS,
+    PREFILL_ENGINE_SOURCE,
     WORKER_SOURCE,
     load_prefill_engine_methods,
     load_worker_methods,
@@ -503,11 +505,19 @@ def test_split_materialization_reaches_the_same_final_state():
 # ------------------------------------------------ structural wiring
 
 
+# S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+_ENGINE_FORWARDS = {"prefill_prepacked"}
+
+
 def _method(name):
-    tree = ast.parse(WORKER_SOURCE.read_text())
+    source, owner = (
+        (PREFILL_ENGINE_SOURCE, PREFILL_ENGINE_CLASS) if name in _ENGINE_FORWARDS
+        else (WORKER_SOURCE, "BatchGenWorker")
+    )
+    tree = ast.parse(source.read_text())
     cls = next(
         n for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "BatchGenWorker"
+        if isinstance(n, ast.ClassDef) and n.name == owner
     )
     return next(
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name

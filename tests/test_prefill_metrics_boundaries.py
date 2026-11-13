@@ -15,6 +15,12 @@ import ast
 from pathlib import Path
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+# S5b: prefill_prepacked's body moved verbatim to PrefillEngine (self = worker
+# rebinding is its first statement after the docstring).
+ENGINE = (
+    Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "prefill_engine.py"
+)
+ENGINE_METHODS = {"prefill_prepacked"}
 
 CONTRACT = "forward-host+gpu-complete+kv-ready-v1"
 TIMING_FIELDS = {
@@ -25,10 +31,14 @@ TIMING_FIELDS = {
 
 
 def _method(name):
-    tree = ast.parse(WORKER.read_text())
-    worker = next(n for n in tree.body
-                  if isinstance(n, ast.ClassDef) and n.name == "BatchGenWorker")
-    return next(n for n in worker.body
+    path, owner = (
+        (ENGINE, "PrefillEngine") if name in ENGINE_METHODS
+        else (WORKER, "BatchGenWorker")
+    )
+    tree = ast.parse(path.read_text())
+    klass = next(n for n in tree.body
+                 if isinstance(n, ast.ClassDef) and n.name == owner)
+    return next(n for n in klass.body
                 if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
@@ -107,12 +117,11 @@ def test_boundaries_are_ordered_and_adjacent_after_forward_loop():
     assert stream.func.value.attr == "cuda"
     assert len(stream.args) == 1 and _is_self_attr(stream.args[0], "torch_device")
 
-    # AttnWrapperBase.retire_pending_prefill_offloads(device=..., reason=...)
+    # self._retire_prefill_pending_offloads(device=..., reason=...): the S5b
+    # binder method returning AttnWrapperBase.retire_pending_prefill_offloads.
     call = body[retire].value
     assert isinstance(call, ast.Call)
-    assert call.func.attr == "retire_pending_prefill_offloads"
-    assert isinstance(call.func.value, ast.Name)
-    assert call.func.value.id == "AttnWrapperBase"
+    assert _is_self_attr(call.func, "_retire_prefill_pending_offloads")
     kwargs = {kw.arg: kw.value for kw in call.keywords}
     assert set(kwargs) == {"device", "reason"}
     assert _is_self_attr(kwargs["device"], "torch_device")

@@ -3,10 +3,12 @@ from pathlib import Path
 
 
 def test_k3_prefill_profile_locals_are_defined_in_prepacked_scope():
-    worker_path = (
-        Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    engine_path = (
+        Path(__file__).resolve().parents[1]
+        / "batchgen" / "worker" / "prefill_engine.py"
     )
-    tree = ast.parse(worker_path.read_text())
+    tree = ast.parse(engine_path.read_text())
     function = next(
         node
         for node in tree.body
@@ -55,6 +57,20 @@ def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
         for node in worker.body
         if isinstance(node, ast.FunctionDef)
     }
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    engine_tree = ast.parse(
+        (worker_path.parent / "worker" / "prefill_engine.py").read_text()
+    )
+    engine = next(
+        node
+        for node in engine_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine"
+    )
+    functions["prefill_prepacked"] = next(
+        node
+        for node in engine.body
+        if isinstance(node, ast.FunctionDef) and node.name == "prefill_prepacked"
+    )
 
     for function_name in ("_config_prefill_for_batch", "prefill_prepacked"):
         calls = [
