@@ -112,7 +112,7 @@ def fused_paged_gather(
     return out.view(B, num_tokens, num_heads, head_dim)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pages_per_seq"])
 def _dense_paged_gather_kernel(
     blocked_kv_ptr,
     block_table_ptr,
@@ -120,10 +120,17 @@ def _dense_paged_gather_kernel(
     num_tokens,
     D: tl.constexpr,
     page_size: tl.constexpr,
-    max_pages_per_seq: tl.constexpr,
+    max_pages_per_seq,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    """Kernel revision r2: ``max_pages_per_seq`` is a runtime int outside the
+    specialisation key (``do_not_specialize``). r1 took it as a
+    ``tl.constexpr``; eager GLM-5/5.1 decode hands the ACTIVE page-table
+    width, which follows the longest live sequence, so every new width was a
+    new binary. The width only enters the in-table compare, the last-column
+    clamp and the row offset ``pid_b * width`` (int32 in both revisions), so
+    r2's outputs are bit-identical to r1's."""
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
 

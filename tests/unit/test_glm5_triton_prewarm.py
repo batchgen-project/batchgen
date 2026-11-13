@@ -315,6 +315,66 @@ def test_dense_gather_block_t_thresholds():
         "any", "d16"]
 
 
+@pytest.mark.parametrize("topk", [16, 2048, 4095, 4096, 5000, 40000])
+def test_dense_gather_spans_reach_every_eager_key(topk):
+    """The eager gather's key is (BLOCK_T, int_class(span)); its width is
+    outside the key (kernel revision r2). Every (batch, span > topk) pair
+    must hit a key some one-row witness span hits."""
+    witnessed = {(TP.gather_block_t(1, s), TP.int_class(s))
+                 for s in TP.dense_gather_spans(topk)}
+    reached = {(TP.gather_block_t(b, s), TP.int_class(s))
+               for b in (1, 2, 3, 8, 64, 128)
+               for s in range(topk + 1, topk + 40_000, 7)}
+    reached |= {(TP.gather_block_t(1, s), TP.int_class(s))
+                for s in (topk + 1, -(-(topk + 1) // 16) * 16, 4096, 4097,
+                          32768, 32769, 32784) if s > topk}
+    assert reached <= witnessed
+    assert all(s > topk for s in TP.dense_gather_spans(topk))
+    assert TP.dense_gather_spans(2048) == (2049, 2064, 4097, 4112, 32769,
+                                           32784)
+
+
+def test_eager_transform_and_gather_entries():
+    names = _geometry_names(BUCKETS)
+    eager = [n for n in names if n.startswith("selected_positions/eager/")]
+    assert eager == [f"selected_positions/eager/{d}/{s}"
+                     for d in ("int32", "int64") for s in ("slots", "batch")]
+    gathers = [n for n in names if n.startswith("dense_gather/eager/")]
+    assert gathers == [f"dense_gather/eager/n{s}"
+                       for s in TP.dense_gather_spans(2048)]
+    split = _geometry_names(BUCKETS, aux_page_split=True)
+    # The page-split cache never reaches the dense gather; every format
+    # reaches the eager transform.
+    assert not [n for n in split if n.startswith("dense_gather/")]
+    assert [n for n in split if n.startswith("selected_positions/eager/")] == (
+        eager)
+
+
+def test_eager_transform_and_gather_runners():
+    g = _geometry(primary_width=17, aux_width=33)
+    for dtype in TP.EAGER_TOPK_DTYPES:
+        for with_slots in (True, False):
+            rec = _Recorder()
+            TP._run_selected_positions_eager(g, 2048, dtype, with_slots,
+                                             "cpu", fn=rec)
+            (args, kwargs), = rec.calls
+            assert args[0].shape == (1, 17) and args[0].dtype == torch.int32
+            assert args[1].dtype == torch.int32
+            assert args[2].shape == (1, 2048) and args[2].dtype == dtype
+            assert args[3].dtype == args[4].dtype == torch.int32
+            assert kwargs["page_size"] == 64
+            assert "num_valid_tokens" not in kwargs
+            assert (kwargs["primary_slot_indices"] is not None) is with_slots
+
+    rec = _Recorder()
+    TP._run_dense_gather(_shapes(), g, 4097, torch.bfloat16, "cpu", fn=rec)
+    (args, kwargs), = rec.calls
+    cache, table, span, page_size = args
+    assert cache.shape == (1, 64, 1, 128) and cache.dtype == torch.bfloat16
+    assert table.shape == (1, 33) and table.dtype == torch.int32
+    assert (span, page_size, kwargs) == (4097, 64, {})
+
+
 def test_next_power_of_2():
     assert [TP.next_power_of_2(v) for v in (1, 2, 3, 64, 65, 3169)] == [
         1, 2, 4, 64, 128, 4096]
@@ -564,7 +624,7 @@ def test_section_d_logging(caplog):
     expected = {"absorb_container": "BF16AbsorbWeights", "moe_3d_ready": True,
                 "use_dense_mla": False, "index_topk": 2048,
                 "hidden_size": 6144, "enable_deepep": False,
-                "aux_page_split": True, "eager_width_constexpr": True}
+                "aux_page_split": True, "eager_width_runtime": True}
     with caplog.at_level(logging.INFO, logger=TP.logger.name):
         TP.log_section_d(expected, rank=3)
     messages = [r.getMessage() for r in caplog.records]

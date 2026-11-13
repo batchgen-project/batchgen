@@ -187,11 +187,11 @@ def test_page_split_scale_bytes_match_the_cache_format():
 # --------------------------------------------------------------------------- #
 #  Inventory pin
 # --------------------------------------------------------------------------- #
-def _scan_calls():
+def _scan_calls(root=_ROOT):
     """``(path, enclosing function, callee) -> count`` over the inventory."""
     files = set()
     for rel in DGP.INVENTORY_PATHS:
-        path = _ROOT / rel
+        path = root / rel
         files.update([path] if path.is_file() else path.rglob("*.py"))
     callees = set(DGP.INVENTORY_CALLEES)
     found = collections.Counter()
@@ -224,9 +224,29 @@ def _scan_calls():
     for path in sorted(files):
         if path.name in ("triton_prewarm.py", "deepgemm_prewarm.py"):
             continue
-        rel = path.relative_to(_ROOT).as_posix()
+        rel = path.relative_to(root).as_posix()
         Visitor(rel).visit(ast.parse(path.read_text()))
     return found
+
+
+def test_inventory_scan_reaches_a_deepgemm_call_under_batchgen_moe(tmp_path):
+    """The shared MoE layer is scanned: a DeepGEMM kernel call added there
+    must be named by the site table (or it fails the pin above)."""
+    call = ("import deep_gemm\n"
+            "def grouped(a, b, out, layout):\n"
+            "    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, layout)\n")
+    for rel in ("batchgen/moe/planted_contiguous.py",
+                "batchgen/elsewhere/planted.py"):
+        (tmp_path / rel).parent.mkdir(parents=True)
+        (tmp_path / rel).write_text(call)
+    for rel in DGP.INVENTORY_PATHS:
+        if not (tmp_path / rel).exists():
+            (tmp_path / rel).mkdir(parents=True)
+    assert "batchgen/moe" in DGP.INVENTORY_PATHS
+    assert dict(_scan_calls(tmp_path)) == {
+        ("batchgen/moe/planted_contiguous.py", "grouped",
+         "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): 1,
+    }
 
 
 def test_inventory_names_every_deepgemm_call():
@@ -540,30 +560,34 @@ def test_version_mismatch_warns_with_both_versions(monkeypatch, caplog):
     assert caplog.records == []
 
 
-def test_late_compiles_are_counted_logged_and_strict(monkeypatch, tmp_path,
-                                                     caplog):
+def test_late_compiles_are_named_logged_and_strict(monkeypatch, tmp_path,
+                                                   caplog):
     monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(DGP, "_BASELINE", None)
+    monkeypatch.setattr(DGP, "_UNARMED_REPORTED", set())
     cache = tmp_path / "cache"
     assert DGP.jit_cache_dir() == cache
-    assert DGP.cache_kernel_count() == 0
-    # Before the first geometry phase there is nothing to compare against.
+    assert DGP.cache_kernel_names() == frozenset()
+    # Before the guard is armed nothing is known: None, not "no compile".
     (cache / "kernel.sm90_fp8_gemm_1d2d.a").mkdir(parents=True)
-    assert DGP.check_late_compiles(0, "configure_prefill") == 0
+    assert DGP.check_late_compiles(0, "configure_prefill") is None
     (cache / "tmp.partial").mkdir()
     (cache / "kernel.stray_file").write_text("")
-    assert DGP.record_baseline(0) == 1
-    assert DGP.check_late_compiles(0, "configure_prefill") == 0
+    assert DGP.record_baseline(0) == {"kernel.sm90_fp8_gemm_1d2d.a"}
+    assert DGP.check_late_compiles(0, "configure_prefill") == ()
     (cache / "kernel.sm90_fp8_gemm_1d2d.b").mkdir()
     (cache / "kernel.transpose_fp32.c").mkdir()
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger=DGP.logger.name):
-        assert DGP.check_late_compiles(3, "configure_decoding") == 2
+        assert DGP.check_late_compiles(3, "configure_decoding") == (
+            "kernel.sm90_fp8_gemm_1d2d.b", "kernel.transpose_fp32.c")
     message, = [r.getMessage() for r in caplog.records]
     assert message.startswith("[GLM5_DEEPGEMM_WARMUP] rank=3 DeepGEMM "
                               "compiled 2 kernels after the prewarm")
     assert "configure_decoding" in message
-    # Reported once: the baseline moves to the new count.
-    assert DGP.check_late_compiles(3, "configure_prefill") == 0
+    assert "sm90_fp8_gemm_1d2d x1, transpose_fp32 x1" in message
+    # Reported once: the baseline takes in the new names.
+    assert DGP.check_late_compiles(3, "configure_prefill") == ()
     (cache / "kernel.sm90_paged_mqa_logits_metadata.d").mkdir()
     with pytest.raises(DGP.LateDeepGemmCompileError, match="compiled 1"):
         DGP.check_late_compiles(0, "configure_prefill", strict=True)

@@ -94,6 +94,7 @@ with every ``masked_m`` zero, so the kernel loads no tile of them (a fresh
 copy would be close to a GiB per projection).
 """
 
+import collections
 import logging
 import os
 from dataclasses import dataclass
@@ -291,6 +292,7 @@ INVENTORY_PATHS = (
     "batchgen/attention/mla/fa3_backend.py",
     "batchgen/attention/mla/flashmla_backend.py",
     "batchgen/gemm/w8a8_deepgemm.py",
+    "batchgen/moe",
     "batchgen_kernels/attention/dsa",
 )
 INVENTORY_CALLEES = (
@@ -764,45 +766,77 @@ def jit_cache_dir() -> Path:
     return Path(root) / "cache"
 
 
-def cache_kernel_count(path: Optional[Path] = None) -> int:
-    """Compiled kernels in the cache: its ``kernel.*`` directories."""
+def cache_kernel_names(path: Optional[Path] = None) -> frozenset:
+    """Compiled kernels in the cache: the names of its ``kernel.*``
+    directories (``kernel.<family>.<hash>``)."""
     path = jit_cache_dir() if path is None else Path(path)
     try:
         names = os.listdir(path)
     except FileNotFoundError:
-        return 0
-    return sum(1 for name in names
-               if name.startswith("kernel.") and (path / name).is_dir())
+        return frozenset()
+    return frozenset(name for name in names
+                     if name.startswith("kernel.") and (path / name).is_dir())
 
 
-_BASELINE: Optional[int] = None
+def kernel_family(name: str) -> str:
+    """``kernel.<family>.<hash>`` -> ``<family>``: the DeepGEMM kernel that
+    a cache entry instantiates."""
+    parts = name.split(".")
+    return parts[1] if len(parts) > 1 else name
 
 
-def record_baseline(rank) -> int:
-    """The cache's kernel count once the geometry phase is done; later
-    compiles are measured against it."""
+# The kernel names the cache held when the guard was armed (None: not armed).
+# A set, not a count: a late compile that lands while another entry leaves
+# the cache keeps the count but adds a name.
+_BASELINE: Optional[frozenset] = None
+# Call sites already told that the guard is not armed (one WARNING each).
+_UNARMED_REPORTED: set = set()
+
+
+def record_baseline(rank) -> frozenset:
+    """Arm the guard: snapshot the cache's kernel names. Later compiles are
+    the names that are not in it."""
     global _BASELINE
-    _BASELINE = cache_kernel_count()
-    logger.info("%s rank=%s DeepGEMM cache %s holds %d kernels after the "
-                "prewarm", LOG_TAG, rank, jit_cache_dir(), _BASELINE)
+    _BASELINE = cache_kernel_names()
+    logger.info("%s rank=%s DeepGEMM cache %s holds %d kernels; late-compile "
+                "guard armed on their names", LOG_TAG, rank, jit_cache_dir(),
+                len(_BASELINE))
     return _BASELINE
 
 
-def check_late_compiles(rank, where: str, strict: bool = False) -> int:
-    """Kernels DeepGEMM compiled since the baseline (0 before the first
-    geometry phase). Logged at WARNING; ``strict`` raises instead. The cache
-    is node-wide, so the count includes every rank of the node."""
+def check_late_compiles(rank, where: str,
+                        strict: bool = False) -> Optional[Tuple[str, ...]]:
+    """The kernel names DeepGEMM compiled since the baseline, sorted, each
+    reported once (logged at WARNING with its family; ``strict`` raises).
+    The cache is node-wide, so the names include every rank of the node.
+
+    None when the guard is not armed: nothing is known about the compiles
+    at ``where``, and that is logged at WARNING (once per call site) rather
+    than passed off as "no late compile".
+    """
     global _BASELINE
     if _BASELINE is None:
-        return 0
-    count = cache_kernel_count()
-    late = count - _BASELINE
-    if late <= 0:
-        return 0
-    message = (f"DeepGEMM compiled {late} kernels after the prewarm "
-               f"(cache {jit_cache_dir()}: {_BASELINE} -> {count}, seen at "
-               f"{where})")
-    _BASELINE = count
+        if where not in _UNARMED_REPORTED:
+            _UNARMED_REPORTED.add(where)
+            logger.warning(
+                "%s rank=%s DeepGEMM late-compile guard not armed at %s: no "
+                "kernel-name baseline is recorded yet, so kernels DeepGEMM "
+                "compiles here are NOT checked", LOG_TAG, rank, where,
+            )
+        return None
+    names = cache_kernel_names()
+    late = tuple(sorted(names - _BASELINE))
+    if not late:
+        return ()
+    families = collections.Counter(kernel_family(name) for name in late)
+    message = (
+        f"DeepGEMM compiled {len(late)} kernels after the prewarm (seen at "
+        f"{where}, cache {jit_cache_dir()}): families "
+        + ", ".join(f"{family} x{count}"
+                    for family, count in sorted(families.items()))
+        + "; names " + ", ".join(late)
+    )
+    _BASELINE = _BASELINE | names
     logger.warning("%s rank=%s %s", LOG_TAG, rank, message)
     if strict:
         raise LateDeepGemmCompileError(message)
