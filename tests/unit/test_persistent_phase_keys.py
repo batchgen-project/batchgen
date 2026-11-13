@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from batchgen.phase_lifecycle import ExitMode, PhaseEnterContext, PhaseKey
+from tests.worker_method_source import worker_shaped_method_node
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -118,7 +119,9 @@ def _function(source, name):
 
 def test_deep_free_keeps_graph_state_of_a_held_decode_instance():
     source = WORKER.read_text()
-    deep_free = ast.unparse(_function(source, "deep_free_model_memory"))
+    # S9: deep free and the release run in WorkerLifecycleEngine (the worker
+    # delegates); read the bodies that run, in the worker's shape.
+    deep_free = ast.unparse(worker_shaped_method_node("deep_free_model_memory"))
     assert "self._cuda_graph_manager = None" not in deep_free
     guard = "if not self.parallel_manager.holds_instance('decode'):"
     assert guard in deep_free
@@ -127,7 +130,7 @@ def test_deep_free_keeps_graph_state_of_a_held_decode_instance():
     )
     # S2 made GraphRuntime (self._graph) the owner of decode-graph state;
     # the pinned spellings follow the owned fields.
-    release = ast.unparse(_function(source, "_release_decode_graph_state"))
+    release = ast.unparse(worker_shaped_method_node("_release_decode_graph_state"))
     assert "self._graph.cuda_graph_manager = None" in release
     assert "self._graph.cuda_graph_adapter.release_context()" in release
     assert "self._graph.decode_graph_captures = 0" in release

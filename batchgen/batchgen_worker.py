@@ -200,6 +200,7 @@ from batchgen.worker.decode_engine import (
 	DecoupledGpuDecode,
 )
 from batchgen.worker.prefill_engine import PrefillEngine
+from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
 from batchgen.worker.step_observability_engine import StepObservabilityEngine
 from batchgen.worker.rank_sync_engine import RankSyncEngine
 
@@ -1145,6 +1146,7 @@ class BatchGenWorker:
 		# owns the cuda-graph-layer imports this module used to make.
 		self._graph = GraphRuntime()
 		self._prefill_engine = PrefillEngine()
+		self._worker_lifecycle_engine = WorkerLifecycleEngine()
 		self._step_observability_engine = StepObservabilityEngine()
 		self._rank_sync_engine = RankSyncEngine()
 		# SyncCoordinator instantiated lazily on first use so we don't
@@ -1563,62 +1565,19 @@ class BatchGenWorker:
 		return self.seq_table.next_local_idx
 
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
-		"""
-		Initialize/reconfigure before the persistent generate() loop starts.
-		- First call: performs full initialization of core_engine, parallel_manager, etc.
-		- Subsequent calls: only updates batch parameters.
-
-		Every caller runs before generate_persistent(), i.e. while global_batch
-		is still None; the per-batch state reset the legacy path needed between
-		two global batches went away with that path.
-
-		Args:
-			max_input_length: Maximum input length hint. If None, will be determined dynamically
-			                  during tokenization as the longest prompt in the batch.
-			                  For first initialization, a default of 8192 is used if None.
-			max_decoding_length: Decode-budget hint for init-time sizing. In
-			                     pool mode it is the budget of the first batch the
-			                     server saw, so nothing may cap a sequence with it:
-			                     each admission entry carries that sequence's own
-			                     budget (``kv_token_budget``).
-			num_queries: Number of queries in the global batch.
-			max_context_length: Maximum total context length (prompt + decode). None = use model max.
-		"""
-		# Update batch-specific parameters
-		# max_input_length can be None - will be set during tokenization
-		# For first initialization, use a reasonable default if None (needed for scheduler)
-		if max_input_length is None or max_input_length <= 0:
-			# Default hint for scheduler; actual value determined during tokenization
-			self.max_input_length = 8192 if not self._core_initialized else 0
-		else:
-			self.max_input_length = max_input_length
-		self.max_decoding_length = max_decoding_length
-		self.max_context_length = max_context_length
-
-		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
-		
-		# One-time initialization (only on first call)
-		if not self._core_initialized:
-			self._initialize_core_components(num_queries)
-			self._core_initialized = True
-		else:
-			# Just update the num_queries and batch-related config
-			self._update_batch_config(num_queries)
-
-		# Freeze this rank's identity. G (`_decode_attn_tp_size`) reads the
-		# parallel strategy manager, which `_initialize_core_components`
-		# constructs, so this is the earliest point it is knowable. Every
-		# field is stable for the process lifetime, so a re-Init rebuilds an
-		# equal object.
-		self.rank_ctx = RankContext(
-			rank=self.rank,
-			world_size=self.world_size,
-			local_rank=self.local_rank,
-			local_world_size=self.local_world_size,
-			decode_group_size=self._decode_attn_tp_size(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.Init(
+			self,
+			max_input_length,
+			max_decoding_length,
+			num_queries,
+			max_context_length,
 		)
-
-		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
@@ -3293,23 +3252,28 @@ class BatchGenWorker:
 			pass  # Not GPT-OSS or module not available
 
 	def set_watchdog(self, watchdog) -> None:
-		"""
-		Set the watchdog for stuck detection during inference.
-
-		The watchdog will be fed periodically during generation to prevent
-		false timeout detection on long-running inference.
-
-		Args:
-			watchdog: Watchdog instance with a feed() method, or None to disable
-		"""
-		self._watchdog = watchdog
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_watchdog(
+			self,
+			watchdog,
+		)
 
 	def set_decode_watchdog(self, watchdog) -> None:
-		"""Set a per-decode-step watchdog. Starts disabled; enabled only during decode."""
-		self._decode_watchdog = watchdog
-		# Start disabled — only enable around actual decode iterations
-		if hasattr(watchdog, '_active'):
-			watchdog._active = False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_decode_watchdog(
+			self,
+			watchdog,
+		)
 
 	# This worker's slot in the server's shared startup-phase record, installed
 	# by the supervisor.  The null default keeps every phase-reporting step
@@ -3318,21 +3282,28 @@ class BatchGenWorker:
 	_startup_phase_reporter = NULL_STARTUP_PHASE_REPORTER
 
 	def set_startup_phase_reporter(self, reporter) -> None:
-		"""Install the handle this worker reports its startup phases through.
-
-		Like the cohort-shutdown probe below, the shape behind it -- a
-		lock-free shared record the server polls -- stays in the supervisor;
-		this class only ever says which phase it has entered.
-		"""
-		self._startup_phase_reporter = reporter
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_startup_phase_reporter(
+			self,
+			reporter,
+		)
 
 	def _startup_phase(self, name: str):
-		"""Report one named startup phase for the duration of the body.
-
-		``name`` must be one of ``batchgen.worker.startup_phases.STARTUP_PHASES``;
-		the reporter refuses anything else.
-		"""
-		return self._startup_phase_reporter.phase(name)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._startup_phase(
+			self,
+			name,
+		)
 
 	def set_cohort_shutdown_probe(self, probe) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -3658,25 +3629,48 @@ class BatchGenWorker:
 		return self._cohort_shutdown_observed
 
 	def feed_watchdog(self) -> None:
-		"""Feed the watchdog to prevent timeout during long operations."""
-		if self._watchdog is not None:
-			self._watchdog.feed()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.feed_watchdog(
+			self,
+		)
 
 	def feed_decode_watchdog(self) -> None:
-		"""Feed the decode watchdog at the start of each decode step."""
-		if self._decode_watchdog is not None:
-			self._decode_watchdog.feed()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.feed_decode_watchdog(
+			self,
+		)
 
 	def enable_decode_watchdog(self) -> None:
-		"""Enable decode watchdog monitoring (call before decode loop)."""
-		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
-			self._decode_watchdog._active = True
-			self._decode_watchdog.feed()  # Reset timer
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.enable_decode_watchdog(
+			self,
+		)
 
 	def disable_decode_watchdog(self) -> None:
-		"""Disable decode watchdog monitoring (call after decode loop)."""
-		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
-			self._decode_watchdog._active = False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.disable_decode_watchdog(
+			self,
+		)
 
 	@contextmanager
 	def disable_watchdog(self):
@@ -4468,29 +4462,16 @@ class BatchGenWorker:
 		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
-		"""
-		Update configuration for a new batch without reinitializing heavy components.
-		Called on subsequent Init() calls after the first.
-		"""
-		logging.info(f"Rank {self.rank}: Updating batch config for new batch")
-		
-		# Update engine config with new batch parameters
-		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
-		self.engine_config.Basic_Config.set_max_prompt_length(self.max_input_length)
-		self.engine_config.Basic_Config.num_queries = num_queries
-		
-		# Update input_arguments for any components that might reference them
-		if hasattr(self, 'input_arguments'):
-			self.input_arguments.max_prompt_length = self.max_input_length
-			self.input_arguments.padding_length = self.max_input_length
-			self.input_arguments.max_decoding_length = self.max_decoding_length
-			self.input_arguments.num_queries = num_queries
-		
-		# Reset per-batch state
-		self.query_book = None
-		self.model_batch_book = {}
-		
-		logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._update_batch_config(
+			self,
+			num_queries,
+		)
 
 	def _update_config_after_tokenization(self) -> None:
 		"""
@@ -8882,29 +8863,15 @@ class BatchGenWorker:
 		self._deployment_length_verified = True
 
 	def prepare_deployment(self) -> None:
-		"""Resolve and verify L against decode residency before worker readiness.
-
-		The measured provisional budget is retained for every model and mode;
-		it reserves the configured fraction's slack for later allocations. A
-		measured per-cap eager transient reservation is a separate requirement.
-		"""
-		with self._startup_phase("model-build"):
-			if not self._core_initialized:
-				self.Init(None, 1, 0)
-		with self._startup_phase("communicator-init"):
-			self._ensure_pynccl_communicator()
-		with self._startup_phase("decode-shard-build"):
-			if self._persistent_phase_enabled():
-				self._build_persistent_phase_instances()
-			else:
-				prefill_key = self._desired_phase_key("prefill")
-				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
-				self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
-				self._init_gpu_kv_with_actual_size()
-				self._transition_phase(prefill_key)
-				self.set_phase("prefill")
-				self._install_prefill_weight_copy_pipeline(False)
-		logging.info("Deployment max_model_len verified: %s", self.model_context_length)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.prepare_deployment(
+			self,
+		)
 
 	def prepare_kimi_k3_startup(self) -> None:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
@@ -10119,14 +10086,15 @@ class BatchGenWorker:
 		)
 
 	def _verify_manager_phase_contract(self) -> None:
-		"""Refuse service when the active manager misses a required hook."""
-		errors = verify_phase_contract(self.parallel_manager)
-		if errors:
-			raise RuntimeError(
-				f"phase lifecycle contract failed for "
-				f"{type(self.parallel_manager).__name__}: "
-				+ "; ".join(errors)
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._verify_manager_phase_contract(
+			self,
+		)
 
 	def _phase_exit_mode(self, live: PhaseKey, desired: PhaseKey) -> ExitMode:
 		"""Select suspend only when the outgoing instance can resume safely."""
@@ -17139,152 +17107,34 @@ class BatchGenWorker:
 		)
 
 	def _unregister_fp8_weights(self):
-		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
-		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
-			return
-
-		# Models whose MoE layers don't expose DeepSeek-style `.mlp` (e.g.
-		# Kimi-Linear uses `.block_sparse_moe` with BF16 experts) have no FP8
-		# weights to unregister.
-		_fkd = self.loaded_model_config.first_k_dense_replace
-		if _fkd < len(self.model.model.layers) and not hasattr(
-			self.model.model.layers[_fkd], 'mlp'
-		):
-			return
-
-		for layer_idx in range(len(self.model.model.layers)):
-			attn_module = self.model.model.layers[layer_idx].self_attn
-			if hasattr(attn_module, '_unregister_fp8_weights'):
-				attn_module._unregister_fp8_weights()
-			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
-				shared_experts = getattr(self.model.model.layers[layer_idx].mlp, 'shared_experts', None)
-				if shared_experts is not None and hasattr(shared_experts, '_unregister_fp8_weights'):
-					shared_experts._unregister_fp8_weights()
-				for routed_expert_idx in range(self.model_config.num_local_experts):
-					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
-						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
-				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
-					self.model.model.layers[layer_idx].mlp.cleanup()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._unregister_fp8_weights(
+			self,
+		)
 
 	def _release_decode_graph_state(self) -> None:
-		"""Drop the decode instance's captured graphs and their bookkeeping."""
-		self._graph.cuda_graph_manager = None
-		self._graph.whole_model_segment = None
-		self._graph.glm5_whole_model_all_short = False
-		self._graph.glm5_whole_model_index_topk = 0
-		self._graph.whole_model_bucketing = None
-		self._graph.glm5_whole_model_capture_input_ids = None
-		self._graph.whole_model_graph = False
-		# The K2.5 capture's two descriptors go with the graphs they describe,
-		# so a later capture of any mode starts from the field defaults.
-		self._graph.k25_whole_model_graph = False
-		self._graph.whole_model_segment_name = None
-		self._graph.glm5_whole_model_graph = False
-		self._graph.glm5_whole_model_graph_failed_buckets = set()
-		self._graph.glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._graph.glm5_whole_model_graph_signature = None
-		self._graph.glm5_whole_model_graph_unavailable_reason = None
-		# The probe's spin nodes live in the graphs dropped above.
-		self._criticality_probe = None
-		# Adapter holds Python refs to model/segment/KV manager via _ctx;
-		# without release_context() the captured segment's static KV buffers
-		# survive empty_cache() and prefill OOMs on the next batch.
-		if self._graph.cuda_graph_adapter is not None:
-			self._graph.cuda_graph_adapter.release_context()
-		# A later decode instance is a new owner and captures its own graphs.
-		self._graph.decode_graph_captures = 0
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._release_decode_graph_state(
+			self,
+		)
 
 	def deep_free_model_memory(self):
-		"""Release model memory without CPU transfer overhead.
-
-		Previous implementation moved model to CPU before deletion, causing
-		unnecessary PCIe traffic for large models. This minimal approach:
-		1. Synchronizes CUDA to ensure pending ops complete
-		2. Deletes model reference directly
-		3. Releases memory back to CUDA allocator
-		"""
-		if not hasattr(self, 'model') or self.model is None:
-			return
-
-		self._phase_mem_switch_index = (
-			getattr(self, "_phase_mem_switch_index", 0) + 1
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.deep_free_model_memory(
+			self,
 		)
-		self._log_phase_memory_ledger("deep_free_enter")
-
-		# Stage timings on every rank: the first decode configure after the
-		# streamed wave-1 prefill spent 34 s here on rank 0 (r30) / ~30 s on
-		# node 1 (r29), intermittently, with nothing logged.
-		_df_t0 = time.perf_counter()
-		# Ensure all GPU operations complete before deletion
-		if torch.cuda.is_available():
-			torch.cuda.synchronize(self.torch_device)
-		_df_t1 = time.perf_counter()
-
-		# Free WGMMA shared buffers if they exist (class-level, survives model deletion).
-		# Only when the GLM-5 model module is already loaded: importing it here
-		# on a non-GLM-5 server walks the GLM-5 JIT extensions -- MEASURED r33
-		# (K3, 2x8 H200, shared TORCH_EXTENSIONS_DIR): del=30.2 s on every rank
-		# of one node (0.2 s on the other) at the first decode configure.
-		_glm5_model_module = sys.modules.get("batchgen.models.glm.glm5.model")
-		if _glm5_model_module is not None:
-			Glm5MoE = getattr(_glm5_model_module, "Glm5MoE", None)
-			if Glm5MoE is not None and getattr(Glm5MoE, '_wgmma_shared_bufs', None) is not None:
-				Glm5MoE._wgmma_shared_bufs.free_buffers()
-				Glm5MoE._wgmma_shared_bufs = None
-				Glm5MoE._wgmma_next_layer_id = 0
-
-		# Delete model directly without CPU transfer
-		del self.model
-		self.model = None
-		# Decode graph state belongs to the decode instance that captured it.
-		# A held decode instance replays those graphs on its next activation
-		# (capture-once), so freeing the live prefill model must not drop
-		# them; they go when the decode instance itself is retired, whose
-		# phase_exit clears the manager's hold before this runs.
-		if not self.parallel_manager.holds_instance("decode"):
-			self._release_decode_graph_state()
-
-		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
-		# (INT4 contiguous weight buffers, MoE class-level buffers)
-		_df_t2 = time.perf_counter()
-		if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-			pm = self.parallel_manager
-			if hasattr(pm, "_release_streamed_sp8_prefill"):
-				pm._release_streamed_sp8_prefill()
-			# The worker is not the only owner of the model: the parallel strategy
-			# manager keeps its own reference from configure_prefill/
-			# configure_decoding. Leaving that reference set is what made this
-			# function a measured no-op on the decode->prefill switch (allocated
-			# bytes unchanged across the call): the decode model was really freed
-			# later, by the refcount drop when configure_prefill rebound pm.model,
-			# so it stayed resident through the KV destroy and the first part of the
-			# prefill configure. Dropping it here is what makes the function free
-			# what its name says it frees.
-			#
-			# Persistent instances own their model tuples; the guard keeps those
-			# references intact while a suspend transition is in progress.
-			if not getattr(pm, "persistent_phase_instances", False):
-				if getattr(pm, "model", None) is not None:
-					pm.model = None
-			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
-				if hasattr(pm, attr):
-					delattr(pm, attr)
-		_df_t3 = time.perf_counter()
-
-		# Release memory
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		_df_t4 = time.perf_counter()
-		gc.collect()
-		logging.info(
-			f"[DECODE] Rank {self.rank}: deep_free_model_memory sync={_df_t1 - _df_t0:.1f}s "
-			f"del={_df_t2 - _df_t1:.1f}s release_streamed={_df_t3 - _df_t2:.1f}s "
-			f"empty_cache={_df_t4 - _df_t3:.1f}s gc={time.perf_counter() - _df_t4:.1f}s"
-		)
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		# After empty_cache: what is still held here is what this switch
-		# did NOT give back, which is the number the rebuild path's
-		# net-zero invariant is read from.
-		self._log_phase_memory_ledger("deep_free_done")
