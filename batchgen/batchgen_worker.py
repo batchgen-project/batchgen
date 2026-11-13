@@ -3767,27 +3767,27 @@ class BatchGenWorker:
 		causes stay distinguishable in the logs.  ``os._exit`` runs no atexit
 		hook and no stream flush, so the marker is flushed first or it is lost.
 
-		The import is local because ``server_worker_main_loop`` imports this
-		module; by the time any rank can reach here that module is loaded, since
-		it is what arms the probe this path depends on.
+		The status, the path marker and the pre-exit flush are the worker exit
+		protocol the supervisor uses too; both take them from
+		``batchgen.eventlog.process``, so there is one definition of each.
 		"""
-		from batchgen.eventlog.process import record_exit
-		from batchgen.server_worker_main_loop import (
-			_EXIT_PATH_SELF_EXIT,
-			_WORKER_SELF_EXIT_CODE,
-			_flush_worker_logs,
+		from batchgen.eventlog.process import (
+			EXIT_PATH_SELF_EXIT,
+			WORKER_SELF_EXIT_CODE,
+			flush_logs_before_exit,
+			record_exit,
 		)
 
 		logging.error(
 			"[shutdown] worker exit path=%s rank=%s pid=%s reason=%s",
-			_EXIT_PATH_SELF_EXIT,
+			EXIT_PATH_SELF_EXIT,
 			self.rank,
 			os.getpid(),
 			_COHORT_QUIESCE_DEADLINE_REASON,
 		)
-		_flush_worker_logs()
-		record_exit(_WORKER_SELF_EXIT_CODE, _COHORT_QUIESCE_DEADLINE_REASON)
-		os._exit(_WORKER_SELF_EXIT_CODE)
+		flush_logs_before_exit()
+		record_exit(WORKER_SELF_EXIT_CODE, _COHORT_QUIESCE_DEADLINE_REASON)
+		os._exit(WORKER_SELF_EXIT_CODE)
 
 	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
 		"""Let LOCAL in-flight decode work finish before the ordered teardown.
