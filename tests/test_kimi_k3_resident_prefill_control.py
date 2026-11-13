@@ -3658,7 +3658,7 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     ]
     get_weights = source[
         source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights"):
-        source.index("int64_t GPU_Weight_Buffer::begin_pass()")
+        source.index("int64_t GPU_Weight_Buffer::begin_pass(")
     ]
 
     # Release goes through the slot table, which looks the (name, pass) key
