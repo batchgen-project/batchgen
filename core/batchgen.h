@@ -109,6 +109,29 @@ class BatchGen {
         // std::string module_key);
     py::dict get_tensor(std::string module_key);
     void start_h2d_worker();
+    // Node replica transport (spec v4 slice 2): plan install/uninstall and
+    // the ring-segment surface python shares across the cohort.
+    void install_replica_plan(
+        int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+        uint32_t records_per_frame,
+        const std::vector<std::tuple<std::string, std::string, int64_t,
+                                     int64_t, int64_t, int64_t>>& modules,
+        torch::Tensor control_block,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_fds,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_bytes,
+        const std::unordered_map<
+            std::string,
+            std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields);
+    // (fd, mapped bytes) of the type's single prefill ring segment; the
+    // caller owns the fd and closes it once every peer has imported.
+    std::pair<int64_t, int64_t> ring_segment_export_fd(
+        const std::string& module_type);
+    void uninstall_replica_plan();
+    std::vector<torch::Tensor> ring_segments(const std::string& module_type);
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> ring_field_layout(
+        const std::string& module_type);
     void save_compressed_kv();
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&
@@ -125,7 +148,7 @@ class BatchGen {
      * forward. */
     // Arms the next pass and returns its id (0: nothing installed). Arming a
     // second pass while one is open is the explicit carry; a third throws.
-    int64_t begin_weight_pass();
+    int64_t begin_weight_pass(bool produce_only = false);
     // Waits until the producer is past the end of pass_id (the oldest open
     // pass) and its copies and releases completed, asserts that it holds no
     // slot, skip or daemon lease, and closes it. Returns {"pass", "copied",

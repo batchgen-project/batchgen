@@ -10,6 +10,7 @@ outside the locks the request path takes.
 
 import re
 from pathlib import Path
+import pathlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,7 +111,7 @@ def test_failure_is_visible_to_waiters_and_cleared_by_a_queue_install():
     get_weights = _section(
         buffer,
         "module_weight_tensor_map GPU_Weight_Buffer::get_weights(",
-        "int64_t GPU_Weight_Buffer::begin_pass()",
+        "int64_t GPU_Weight_Buffer::begin_pass(bool produce_only)",
     )
     assert "this->waitWithoutStallLocked(lock, module_name," in get_weights
     assert "this->slots_.lease(module_name)" in get_weights
@@ -211,9 +212,11 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
     cancelled = weights.index("if (!fetched.has_value()) {")
     cancel_end = weights.index("break;", cancelled)
     cancel_path = weights[cancelled:cancel_end]
-    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
-    pop = weights.index(".try_pop(module_name)")
-    push = weights.index(".push(module_name)")
+    # The replica branch above the host flow has its own claim/pop/push;
+    # the host-path invariant is anchored after the host fetch.
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(", fetch)
+    pop = weights.index(".try_pop(module_name)", fetch)
+    push = weights.index(".push(module_name)", fetch)
     # Peek before the fetch; claim, pop and push back only after it
     # succeeded, once per module of every pass.
     assert peek < fetch < cancelled < claim < pop < push
@@ -236,9 +239,10 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
 def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     weights = _weight_section()
     fetch = weights.index("get_module_weights_storage(")
-    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(", fetch)
     assert fetch < claim
-    skipped = weights[claim:weights.index("this->set_producer_state_(ProducerState::kCopying")]
+    skipped = weights[claim:weights.index(
+        "this->set_producer_state_(ProducerState::kCopying", claim)]
     # A skipped remote module is acquired and released without a copy, so the
     # daemon FIFO still advances, and it goes back on the tail. The cursor
     # moves past it only after the lease is released.
@@ -252,7 +256,7 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     head = weights[:fetch]
     assert "if (next.kind == WeightProduction::kCopy) {" in head
     assert head.index("if (next.kind == WeightProduction::kCopy) {") < head.index(
-        "acquireEmptyBuffer(module_type)"
+        "acquireEmptyBuffer("
     )
 
     buffer = BUFFER.read_text()
@@ -270,14 +274,25 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
 
 
 def test_lease_is_released_before_the_copy_lands():
+    # L-E2: the lease travels with the deferred landing (bounded in-flight
+    # queue) and complete_landing_ releases it before the slot turns PRESENT,
+    # so no FILLING slot of a pass implies no daemon lease of it.
+    source = pathlib.Path("core/HtoD_Engine/HtoD_Engine.cu").read_text()
     weights = _weight_section()
-    copying = weights.index("ProducerState::kCopying")
-    release = weights.index("this->weights_storage_.release_module(module_name);", copying)
-    complete = weights.index("this->gpu_weight_buffer_.weights_copy_complete(", copying)
-    # No FILLING slot of a pass implies no daemon lease of it.
+    copying = weights.index(
+        "ProducerState::kCopying",
+        weights.index("get_module_weights_storage("),
+    )
+    handoff = weights.index("landing.host_lease = true;", copying)
+    # the producer's local flag clears once the landing owns the lease
+    assert weights.index("lease_held = false;", handoff) > handoff
+    landing = source[source.index("void HtoD_Engine::complete_landing_"):
+                     source.index("bool HtoD_Engine::drain_landings_")]
+    release = landing.index("release_module(landing.module_name);")
+    complete = landing.index("weights_copy_complete(")
     assert release < complete
-    assert "const bool present =" in weights[complete - 80:complete]
-    assert "this->released_on_landing_modules_" in weights[complete:]
+    assert "const bool present =" in landing[complete - 80:complete]
+    assert "this->released_on_landing_modules_" in landing[complete:]
     buffer = BUFFER.read_text()
     landed = _section(
         buffer,
@@ -484,7 +499,7 @@ def test_bindings_expose_passes_skip_and_status():
     binding = BINDING.read_text()
     assert '.def("skip_weight_modules", &BatchGen::skip_weight_modules,' in binding
     assert '.def("weight_stream_status", &BatchGen::weight_stream_status)' in binding
-    assert '.def("begin_weight_pass", &BatchGen::begin_weight_pass)' in binding
+    assert '.def("begin_weight_pass", &BatchGen::begin_weight_pass,' in binding
     assert '.def("end_weight_pass", &BatchGen::end_weight_pass,\n             py::arg("pass_id"))' in binding
     assert '.def("cancel_weight_pass", &BatchGen::cancel_weight_pass,\n             py::arg("pass_id"))' in binding
 
@@ -605,3 +620,15 @@ def test_deleted_symbols_are_gone_from_python_callers():
 def test_dead_python_modules_are_deleted():
     for relative in DEAD_MODULES:
         assert not (PACKAGE / relative).exists(), relative
+
+
+def test_inflight_landing_bound_counts_host_leases_only():
+    """The make_space bound exists to cap leased host staging; counting
+    replica pulls (which hold no lease) against it serialized the per-owner
+    pull streams into a per-layer supply tail (seen in an nsys capture)."""
+    text = (ROOT / "core/HtoD_Engine/HtoD_Engine.cu").read_text()
+    assert "pending_host_landings_ >= kMaxInFlightLandings" in text
+    assert "pending_landings_.size() >= kMaxInFlightLandings" not in text
+    # Counter stays consistent on every dequeue path.
+    assert text.count("--this->pending_host_landings_;") == 2
+    assert text.count("++this->pending_host_landings_;") == 1

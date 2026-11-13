@@ -23,8 +23,10 @@
 #include "pybind11/stl.h"
 #include "spdlog/spdlog.h"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <future>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -35,6 +37,8 @@
 
 #include "../GPU_KV_Buffer/GPU_KV_Buffer.h"
 #include "../GPU_Weight_Buffer/GPU_Weight_Buffer.h"
+#include "../GPU_Weight_Buffer/replica_control_block.h"
+#include "../GPU_Weight_Buffer/weight_replica_plan.h"
 #include "../KV_Storage/KV_Storage.h"
 #include "../Weights_Storage/Weights_Storage.h"
 #include "../data_structures.h"
@@ -90,6 +94,45 @@ class HtoD_Engine {
     WeightPassAbort abort_weight_passes();
     // Un-parks the producer: a pass was armed or a task was queued.
     void wake_producer();
+
+    /* Node replica transport (spec v4 slice 2). Installed per prefill phase
+       by the worker when the replica group has more than one member; the
+       uninstalled engine behaves as the single-member group (every record
+       HostPrivate). Install and uninstall run only while the producer is
+       stopped. */
+    struct ReplicaModuleInstall {
+        std::string module_type;
+        std::string module;
+        uint8_t kind = 1;          // WeightRecordKind: 0 shared 1 private 2 replica
+        int32_t owner_member = 0;  // index into the ordered group
+        uint32_t layer_position = 0;
+        uint32_t record_index = 0;  // within one frame, identical on every member
+        // Index into the install's sorted type order; barrier words are per
+        // (member, type) because frame completion is monotone only within a
+        // type (ring depths differ across types).
+        uint32_t type_index = 0;
+    };
+    // peer_fds: per type, one exported VMM fd per group member in group
+    // order, -1 for this member (whose base comes from the local ring).
+    // peer_bytes: the exporter's padded mapping size for each fd. The caller
+    // keeps ownership of the fds and closes them after this returns.
+    void install_replica_plan(
+        int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+        uint32_t records_per_frame,
+        const std::vector<ReplicaModuleInstall>& modules,
+        torch::Tensor control_block,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_fds,
+        const std::unordered_map<std::string,
+                                 std::vector<int64_t>>& peer_bytes,
+        const std::unordered_map<
+            std::string,
+            std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields);
+    // Syncs and destroys the pull streams, drops the imported segments and
+    // the control-block view, clears the reclaim gate. The caller has run
+    // the group barrier first.
+    void uninstall_replica_plan();
+    bool replica_plan_installed() const { return this->replica_plan_ != nullptr; }
     // Throws when the node daemon still leases this worker a module of pass
     // or an earlier one. A lease of the module in flight for a later
     // (carried) pass is allowed.
@@ -173,6 +216,7 @@ class HtoD_Engine {
     std::unordered_map<std::string, uint64_t> copied_modules_;
     std::unordered_map<std::string, uint64_t> skipped_modules_;
     std::unordered_map<std::string, uint64_t> released_on_landing_modules_;
+    std::unordered_map<std::string, uint64_t> replica_pulled_modules_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};
@@ -184,4 +228,113 @@ class HtoD_Engine {
     std::thread HtoD_worker_;
     void HtoD_Worker();
     void blocking_copy_(void* dst, void* src, int64_t size);
+
+    /* L-E2: event-deferred landings. The producer issues every weight tensor
+       copy asynchronously and runs a module's landing actions (host lease
+       release, slot completion, replica publish and barrier marks) when its
+       stream event completes. One blocking sync per tensor made the wave
+       wall track MODULE COUNT instead of bytes (ABBA 2026-11-11: an 8x byte
+       reduction moved the wall 0%); with deferral the stream is
+       bandwidth-bound and landings stay correct because nothing is published
+       or marked PRESENT before the copy's event. Producer thread only. */
+    struct PendingLanding {
+        cudaEvent_t event = nullptr;
+        cudaEvent_t profile_start = nullptr;  // only when profiling
+        std::string module_type;
+        std::string module_name;
+        int64_t buffer_idx = -1;
+        uint64_t bytes = 0;
+        bool host_lease = false;    // release_module at completion
+        bool replica_pull = false;  // counters; no publish
+        int64_t pass = 0;           // produce-only release decision at landing
+        bool has_role = false;
+        uint8_t role_kind = 1;
+        uint32_t role_type_index = 0;
+        uint32_t role_record_index = 0;
+        uint64_t flat = 0;
+    };
+    // Bounds HOST STAGING only: at most this many modules' host leases are
+    // held by in-flight copies (~1.5 GB leased staging at 64; at 8 the
+    // producer sat issue-to-completion locked at the ~0.5 ms/record event
+    // cadence per the drain accounting). Replica pulls hold no host lease and
+    // are bounded by ring-slot claims, so they do not count: bounding them
+    // here limited issue depth to two 32-record owner blocks and serialized
+    // the per-owner pull streams into a per-layer supply tail the compute
+    // could not hide (seen in an nsys capture).
+    static constexpr size_t kMaxInFlightLandings = 64;
+    // Producer-loop section accounting (producer thread writes without a
+    // lock; weight_stream_status reads approximately - diagnostics only).
+    // Indices into producer_section_ns_.
+    enum ProducerSection : size_t {
+        kSecNext = 0,      // next_production cursor read
+        kSecAcquire,       // acquireEmptyBuffer (successful)
+        kSecFetch,         // host storage fetch
+        kSecClaim,         // claim_for_copy
+        kSecIssue,         // tensor copy issue + event ops
+        kSecDrain,         // drain_landings_ calls in the record path
+        kSecPullGate,      // replica barrier-A poll iterations
+        kSecCount
+    };
+    uint64_t producer_section_ns_[kSecCount] = {0};
+    uint64_t producer_records_ = 0;
+    uint64_t producer_ring_full_ = 0;  // acquireEmptyBuffer returned none
+    std::deque<PendingLanding> pending_landings_;
+    size_t pending_host_landings_ = 0;  // host_lease entries; producer thread
+    void complete_landing_(PendingLanding& landing);
+    // Complete finished landings (front first; completion keeps issue
+    // order). With make_space, block on the oldest when the queue is full.
+    bool drain_landings_(bool make_space);
+    void flush_landings_(bool swallow_errors);
+
+    /* Replica transport runtime. Written only while the producer is stopped;
+       read by the producer thread. */
+    struct ReplicaPlanRuntime {
+        int64_t member_index = 0;
+        int64_t group_size = 1;
+        uint64_t layers_per_pass = 0;
+        uint32_t records_per_frame = 0;
+        // Sorted module types of the installed plan; barrier words, owned
+        // and total record counts are per type (a frame of a partly covered
+        // pass — GLM dense-prefix layers — has no records of some types).
+        std::unordered_map<std::string, size_t> type_index;
+        std::vector<std::vector<uint32_t>> owned_per_type_pos;
+        std::vector<std::vector<uint32_t>> total_per_type_pos;
+        std::unordered_map<std::string, ReplicaModuleInstall> modules;
+        ReplicaControlBlock block;
+        torch::Tensor block_backing;  // keep-alive of the shared mapping view
+        // per type: per member, base pointer of their single ring segment
+        std::unordered_map<std::string, std::vector<void*>> segment_base;
+        // per type: {block base offset, per-slot stride, payload bytes}
+        // for every field of a slot, in the arena's field order.
+        std::unordered_map<std::string,
+                           std::vector<std::tuple<int64_t, int64_t, int64_t>>>
+            fields;
+        // imported peer segment mappings (unmapped at uninstall)
+        std::vector<std::shared_ptr<batchgen_vmm::VmmPeerImport>> keepalive;
+        std::vector<cudaStream_t> pull_streams;  // one per member
+        // Frame bookkeeping per (type, flat frame), producer thread only.
+        // Barrier words post for the CONTIGUOUS prefix of complete frames
+        // per type (cursors below), never in completion order: deferred
+        // landings and immediate skip marks finish out of order, and a word
+        // that jumps past an incomplete frame tells every peer that frame
+        // landed (early reclaim race) before throwing on the late post.
+        std::map<std::pair<size_t, uint64_t>, uint32_t> owned_landed;
+        std::map<std::pair<size_t, uint64_t>, uint32_t> terminal;
+        std::map<std::pair<size_t, uint64_t>,
+                 std::chrono::steady_clock::time_point> wait_since;
+        // Next frame each barrier may post, per type; initialized from the
+        // first record of the type the producer meets (its lowest frame).
+        std::vector<uint64_t> a_cursor;
+        std::vector<uint64_t> b_cursor;
+        std::vector<bool> cursor_init;
+        ReplicaPlanRuntime(ReplicaControlBlock attached)
+            : block(attached) {}
+    };
+    std::unique_ptr<ReplicaPlanRuntime> replica_plan_;
+    // Producer-side frame hooks; no-ops without an installed plan.
+    void replica_mark_terminal_(size_t type, uint64_t flat_frame);
+    void replica_mark_owned_landed_(size_t type, uint64_t flat_frame);
+    void replica_note_issue_(size_t type, uint64_t flat_frame);
+    void replica_advance_a_(size_t type);
+    void replica_advance_b_(size_t type);
 };

@@ -420,6 +420,27 @@ static void skips() {
     CHECK(summary.by_type.at(E).released_on_landing == 1);
 }
 
+static void produce_only_and_reclaim_gate() {
+    WeightSlotTable table = make(3);
+    CHECK(table.begin_pass() == 1);
+    const int64_t slot = produce(table);  // e0
+    const auto released = table.release_unconsumed("e0", 7);
+    CHECK(released.index == slot);
+    CHECK(table.state_at(E, slot) == S::kPendingRelease);
+    CHECK(table.pass_counts().at(1).at(E).produce_only == 1);
+
+    EXPECT_THROW(table.reclaim(E, slot), {"all peers", "B(frame 7)"});
+    CHECK(table.state_at(E, slot) == S::kPendingRelease);
+    CHECK(!table.reclaim(E, slot, [](int64_t frame) {
+        return frame == 8;
+    }));
+    CHECK(table.state_at(E, slot) == S::kPendingRelease);
+    CHECK(table.reclaim(E, slot, [](int64_t frame) {
+        return frame == 7;
+    }));
+    CHECK(table.state_at(E, slot) == S::kFree);
+}
+
 static void carry_is_keyed_by_pass() {
     // A ring larger than the list: the carried copy of a module coexists
     // with its copy in the current pass.
@@ -751,6 +772,7 @@ int main() {
     claim_and_land();
     lease_and_release();
     skips();
+    produce_only_and_reclaim_gate();
     carry_is_keyed_by_pass();
     cancel_the_current_pass();
     cancel_a_carried_pass();

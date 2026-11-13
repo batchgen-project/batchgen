@@ -43,6 +43,7 @@ def test_glm5_planner_keeps_full_persistent_single_node_h200_decode():
     assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 0
     assert config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"] == 512
     assert config.GPU_Buffer_Config.num_prefill_module_buffer["shared_expert"] == 2
+    assert config.GPU_Buffer_Config.num_prefill_module_buffer["attn"] == 2
 
 
 
@@ -54,3 +55,4 @@ def test_glm5_planner_keeps_full_persistent_two_node_decode():
     assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 0
     assert config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"] == 512
     assert config.GPU_Buffer_Config.num_prefill_module_buffer["shared_expert"] == 2
+    assert config.GPU_Buffer_Config.num_prefill_module_buffer["attn"] == 2

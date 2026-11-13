@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "../data_structures.h"
+#include "GPU_Weight_Buffer/vmm_ring_segment.h"
 #include "../utils.h"
 #include "weight_slot_table.h"
 
@@ -85,7 +86,19 @@ class GPU_Weight_Buffer {
     module_weight_tensor_map get_weights(const std::string& module_name);
 
     /* Passes */
-    int64_t begin_pass();
+    // produce_only: the pass is marked before the producer can observe it
+    // (same lock), so no record of it is ever pulled for a consumer that
+    // will not run.
+    int64_t begin_pass(bool produce_only = false);
+    bool pass_produce_only(int64_t pass);
+    // Replica record of a produce-only pass: cursor past it, no slot; the
+    // engine counts it at barrier B.
+    void decline_produce_only(const std::string& module_type,
+                              const std::string& module_name);
+    // PRESENT -> PENDING_RELEASE for an owned record with no consumer; the
+    // reclaim stays gated on every peer passing barrier B of frame.
+    void release_unconsumed(const std::string& module_name, int64_t pass,
+                            int64_t frame);
     SkipCounts cancel_pass(int64_t pass);
     // Waits until the producer is past the end of pass, none of its slots is
     // FILLING and every pending asynchronous release has completed.
@@ -137,6 +150,17 @@ class GPU_Weight_Buffer {
 
     static constexpr std::chrono::seconds kStallTimeout{300};
 
+    // Node replica transport: the reclaim gate for HostShared slots. The
+    // engine installs a predicate over the cohort control block's barrier
+    // B; nullptr means no gate (every reclaim proceeds on its event alone).
+    void set_peer_release_gate(
+        std::function<bool(const std::string&, int64_t)> gate);
+    // Reclaims every pending release at a pass boundary, honoring the peer
+    // gate (polls; throws after kStallTimeout).
+    void drainPendingReleasesGatedLocked(std::unique_lock<std::mutex>& lock);
+    void arm_peer_release_gate(const std::string& module_type, int64_t index,
+                               int64_t frame);
+
    private:
     struct PendingRelease {
         cudaEvent_t event;
@@ -145,6 +169,33 @@ class GPU_Weight_Buffer {
 
     // Appends count slots of module_type carved from one allocation.
     void append_ring_slots_(const std::string& module_type, int64_t count);
+
+   public:
+    // The segment tensors backing a type's ring, in grow order, and the
+    // shared per-slot stride. Every rank lays a type out identically, so a
+    // peer addresses slot i of segment s as base + i * stride.
+    // Export the single ring segment of a type as (POSIX fd, mapped bytes).
+    // The caller owns the fd. Throws unless the type has exactly one segment.
+    std::pair<int, int64_t> ring_segment_export_fd(
+        const std::string& module_type) const;
+    // Base pointer and padded size of the single ring segment of a type.
+    std::pair<void*, int64_t> ring_segment_base(
+        const std::string& module_type) const;
+    std::vector<torch::Tensor> ring_segments(
+        const std::string& module_type) const;
+    // One entry per field of the type's slot layout, in sorted field-name
+    // order: {block base offset in the segment, per-slot stride within the
+    // block, payload bytes}. Slot i's field f spans
+    // [offset + i * stride, + nbytes).
+    struct RingFieldRange {
+        int64_t offset = 0;
+        int64_t stride = 0;
+        int64_t nbytes = 0;
+    };
+    std::vector<RingFieldRange> ring_field_layout(
+        const std::string& module_type) const;
+
+   private:
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
     // Waits for every pending release and returns its slots to FREE.
@@ -163,6 +214,14 @@ class GPU_Weight_Buffer {
     std::shared_ptr<spdlog::logger> logger_;
 
     std::unordered_map<std::string, weight_buffers> buffers_;
+    std::unordered_map<std::string, std::vector<torch::Tensor>> segments_;
+    // VMM backings of the segments, in the same order; exported to node
+    // peers by fd (slice 2c). Cleared wherever segments_ is cleared.
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<batchgen_vmm::VmmRingSegment>>>
+        segment_backings_;
+    std::unordered_map<std::string, std::vector<RingFieldRange>>
+        segment_fields_;
     /* Thread safe buffers management */
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -171,6 +230,8 @@ class GPU_Weight_Buffer {
     std::optional<std::string> producer_failure_;  // under mutex_
     uint64_t progress_epoch_ = 0;                  // under mutex_
     std::deque<PendingRelease> pending_releases_;
+    // (module type, frame) -> every member passed B; under mutex_
+    std::function<bool(const std::string&, int64_t)> peer_release_gate_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

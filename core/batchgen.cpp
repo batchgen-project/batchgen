@@ -353,8 +353,8 @@ py::dict BatchGen::weight_stream_status() {
     return this->h2d_engine_.weight_stream_status();
 }
 
-int64_t BatchGen::begin_weight_pass() {
-    const int64_t pass = this->gpu_weight_buffer_.begin_pass();
+int64_t BatchGen::begin_weight_pass(bool produce_only) {
+    const int64_t pass = this->gpu_weight_buffer_.begin_pass(produce_only);
     if (pass != 0) {
         this->h2d_engine_.wake_producer();
     }
@@ -449,6 +449,62 @@ py::dict BatchGen::get_tensor(std::string module_key)
 
 void BatchGen::start_h2d_worker() {
     this->h2d_engine_.Start();
+}
+
+void BatchGen::install_replica_plan(
+    int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+    uint32_t records_per_frame,
+    const std::vector<std::tuple<std::string, std::string, int64_t, int64_t,
+                                 int64_t, int64_t>>& modules,
+    torch::Tensor control_block,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
+    const std::unordered_map<
+        std::string,
+        std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields) {
+    std::vector<HtoD_Engine::ReplicaModuleInstall> installs;
+    installs.reserve(modules.size());
+    for (const auto& [module_type, module, kind, owner, layer_position,
+                      record_index] : modules) {
+        HtoD_Engine::ReplicaModuleInstall install;
+        install.module_type = module_type;
+        install.module = module;
+        install.kind = static_cast<uint8_t>(kind);
+        install.owner_member = static_cast<int32_t>(owner);
+        install.layer_position = static_cast<uint32_t>(layer_position);
+        install.record_index = static_cast<uint32_t>(record_index);
+        installs.push_back(std::move(install));
+    }
+    this->h2d_engine_.install_replica_plan(
+        member_index, group_size, layers_per_pass, records_per_frame,
+        installs, std::move(control_block),
+        peer_fds, peer_bytes, fields);
+}
+
+std::pair<int64_t, int64_t> BatchGen::ring_segment_export_fd(
+    const std::string& module_type) {
+    const auto [fd, bytes] =
+        this->gpu_weight_buffer_.ring_segment_export_fd(module_type);
+    return {static_cast<int64_t>(fd), bytes};
+}
+
+void BatchGen::uninstall_replica_plan() {
+    this->h2d_engine_.uninstall_replica_plan();
+}
+
+std::vector<torch::Tensor> BatchGen::ring_segments(
+    const std::string& module_type) {
+    return this->gpu_weight_buffer_.ring_segments(module_type);
+}
+
+std::vector<std::tuple<int64_t, int64_t, int64_t>>
+BatchGen::ring_field_layout(const std::string& module_type) {
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> out;
+    for (const auto& range :
+         this->gpu_weight_buffer_.ring_field_layout(module_type)) {
+        out.emplace_back(range.offset, range.stride, range.nbytes);
+    }
+    return out;
 }
 
 
