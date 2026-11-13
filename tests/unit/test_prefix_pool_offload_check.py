@@ -516,23 +516,24 @@ def _engine_method(name):
 
 
 def _worker_probe_keys():
-    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+    """``_POOL_PROBE_DEBUG_KEYS`` as prefill_engine.py declares it.
 
     The keys live as module-level literals so the probe-off path never
     imports a probe module; ``tests/unit/test_pool_probe_debug_seam.py`` pins
-    them against this module's own ``DEBUG_FLAG``.
+    them against this module's own ``DEBUG_FLAG``. Their only reader is
+    PrefillEngine's probe seam, so the engine module holds the one copy.
     """
 
     literals = {
         node.targets[0].id: node.value.value
-        for node in WORKER_TREE.body
+        for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign) and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
     }
     assign = next(
-        node for node in WORKER_TREE.body
+        node for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
