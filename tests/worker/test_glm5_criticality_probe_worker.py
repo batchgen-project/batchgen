@@ -41,6 +41,7 @@ from batchgen.models.glm.glm5.criticality_probe import (
     CriticalityProbeSpec,
 )
 from batchgen.models.glm.glm5.cuda_graph_adapter import Glm5CudaGraphAdapter
+from tests.worker.worker_fakes import make_graph_state
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -104,7 +105,9 @@ def _worker(*, adapter="glm5", installed=None, enable_cuda_graph=True):
     worker = cls()
     worker.rank = 0
     worker.args = SimpleNamespace(enable_cuda_graph=enable_cuda_graph, disable_cuda_graphs=False)
-    worker._cuda_graph_adapter = _adapter() if adapter == "glm5" else adapter
+    worker._graph = make_graph_state(
+        cuda_graph_adapter=_adapter() if adapter == "glm5" else adapter
+    )
     worker._criticality_probe = installed
     worker._criticality_probe_request = None
     worker._criticality_probe_recapture = False
@@ -121,7 +124,7 @@ def test_inactive_round_keeps_the_graph():
         worker._configure_criticality_probe(debug)
         assert worker._criticality_probe_request is None
         assert worker._criticality_probe_recapture is False
-        assert worker._cuda_graph_adapter._round_criticality_probe_request is None
+        assert worker._graph.cuda_graph_adapter._round_criticality_probe_request is None
     assert log.lines == []
 
 
@@ -131,7 +134,7 @@ def test_first_probe_round_arms_one_recapture():
     spec = CriticalityProbeSpec.parse(_RAW)
     assert worker._criticality_probe_request == spec.signature()
     assert worker._criticality_probe_recapture is True
-    assert worker._cuda_graph_adapter._round_criticality_probe_request == spec.signature()
+    assert worker._graph.cuda_graph_adapter._round_criticality_probe_request == spec.signature()
     assert len(log.lines) == 1
 
 
@@ -407,7 +410,7 @@ def test_decode_loop_updates_the_table_before_each_glm5_replay_and_tags_the_pair
     loop = _method_ast("decoding_continuous")
     replays = [
         node for node in ast.walk(loop)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._cuda_graph_manager.replay"
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._graph.cuda_graph_manager.replay"
     ]
     glm5_replays = [
         node for node in replays
