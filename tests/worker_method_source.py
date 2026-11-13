@@ -42,6 +42,19 @@ RANK_SYNC_SOURCE = (
     / "rank_sync_engine.py"
 )
 RANK_SYNC_CLASS = "RankSyncEngine"
+STEP_OBSERVABILITY_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "step_observability_engine.py"
+)
+STEP_OBSERVABILITY_CLASS = "StepObservabilityEngine"
+# The worker-seam engines (S8, S7) whose methods the worker reaches through
+# same-name canonical delegators.
+DELEGATED_ENGINES = (
+    (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
+    (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
+)
 
 
 def load_worker_methods(
@@ -225,17 +238,24 @@ def rank_sync_method_names() -> set:
     return set(_class_methods(RANK_SYNC_SOURCE, RANK_SYNC_CLASS))
 
 
+def step_observability_method_names() -> set:
+    """The worker methods whose bodies live in ``StepObservabilityEngine`` (S7)."""
+    return set(_class_methods(STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS))
+
+
 def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     """The body a worker method runs, in the worker's own shape.
 
-    For a method S8 moved into ``RankSyncEngine`` the worker keeps a canonical
-    delegator; the statements that run are the engine's, so this returns the
-    engine method converted back by :func:`engine_method_as_worker_method`.
-    Every other name resolves to the worker class method itself.
+    For a method S8/S7 moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
+    the worker keeps a canonical delegator; the statements that run are the
+    engine's, so this returns the engine method converted back by
+    :func:`engine_method_as_worker_method`. Every other name resolves to the
+    worker class method itself.
     """
-    engine = _class_methods(RANK_SYNC_SOURCE, RANK_SYNC_CLASS)
-    if name in engine:
-        return engine_method_as_worker_method(engine[name])
+    for source, class_name in DELEGATED_ENGINES:
+        engine = _class_methods(source, class_name)
+        if name in engine:
+            return engine_method_as_worker_method(engine[name])
     worker = _class_methods(WORKER_SOURCE, WORKER_CLASS)
     if name not in worker:
         raise AssertionError(f"{WORKER_CLASS} has no method {name}")
