@@ -21,6 +21,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+# S8: the communicator helpers run in RankSyncEngine (the worker delegates).
+RANK_SYNC = ROOT / "batchgen" / "worker" / "rank_sync_engine.py"
 MAIN_LOOP = ROOT / "batchgen" / "server_worker_main_loop.py"
 KIMI_LINEAR_SERVING = (
     ROOT
@@ -913,7 +915,7 @@ def test_generate_reuses_the_pynccl_communicator_helper():
 
 
 def test_pynccl_helper_keeps_the_collective_creation_contract():
-    helper = _function(WORKER, "_ensure_pynccl_communicator", "BatchGenWorker")
+    helper = _function(RANK_SYNC, "_ensure_pynccl_communicator", "RankSyncEngine")
     source = _body_source(helper)
     calls = _calls(helper)
 
