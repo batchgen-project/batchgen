@@ -1,10 +1,9 @@
 """Decode CUDA-graph state of one ``BatchGenWorker`` rank.
 
-``GraphRuntime`` exclusively owns the 29 pieces of coupled graph state that
+``GraphRuntime`` exclusively owns the 18 pieces of coupled graph state that
 used to be loose worker attributes: the manager/adapter handles, the
 whole-model capture flags (model-agnostic and GLM-5), the capture-once
-counter, the span-warn rate limiter, and the Phase-C residue fields that are
-still initialized and reset by the worker's teardown.
+counter, and the span-warn rate limiter.
 
 It also owns every ``batchgen.cuda_graph`` import the worker used to make:
 the manager/bucketing constructors, the adapter ABC used by the startup type
@@ -35,8 +34,8 @@ import logging
 class GraphRuntime:
     """The worker's decode-graph state machine, as owned state.
 
-    Three asymmetries of today's lifecycle are reproduced here exactly and
-    are PINNED, NOT ENDORSED -- fixing any of them would change behavior and
+    Two asymmetries of today's lifecycle are reproduced here exactly and
+    are PINNED, NOT ENDORSED -- fixing either would change behavior and
     belongs in its own slice:
 
     * ``k25_whole_model_graph`` and ``whole_model_segment_name`` are written
@@ -47,8 +46,12 @@ class GraphRuntime:
       failing bucket to ``glm5_whole_model_graph_failed_buckets``, so the
       buckets already captured in that episode are dropped with the manager
       yet stay eligible for the next warmup.
-    * ``decode_graph_captures`` deliberately survives the worker's deep free
-      while every other field resets: it is the capture-once guard.
+
+    ``decode_graph_captures`` is the capture-once guard of a reused decode
+    instance. It is reset to 0, together with the captured-graph fields, by
+    the worker's ``_release_decode_graph_state``, which the deep free calls
+    only when the decode instance is NOT held; a held instance keeps all of
+    its graph state, the counter included, across the deep free.
     """
 
     def __init__(self) -> None:
@@ -62,9 +65,6 @@ class GraphRuntime:
         # BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL env gate is retired -- adapters
         # are now the production path, not a migration toggle.
         self.cuda_graph_adapter = None
-        self.cuda_graph_adapter_dual = True
-        self.glm5_moe_cuda_graph_manager = None
-        self.glm5_layer_cuda_graph_manager = None
 
         # --- whole-model graph state (model-agnostic names) -------------
         self.whole_model_graph = False
@@ -98,19 +98,6 @@ class GraphRuntime:
         self.glm5_whole_model_all_short = False
         self.glm5_whole_model_index_topk = 0
         self.glm5_whole_model_capture_input_ids = None
-
-        # --- Phase-C retired-mode residue -------------------------------
-        # Initialized and reset by the worker's teardown, with no live reader
-        # beyond the phase-switch asserts. Moved as-is: deleting them is a
-        # separate dead-code slice.
-        self.glm5_layer_graph_failed_buckets = set()
-        self.glm5_layer_graph_capture_attempted_for_batch = False
-        self.glm5_layer_graph_signature = None
-        self.glm5_layer_graph_max_seqlen = None
-        self.glm5_moe_graph_failed_buckets = set()
-        self.glm5_dsa_graph_capture_attempted_for_batch = False
-        self.glm5_moe_graph_capture_attempted_for_batch = False
-        self.glm5_dsa_graph_page_table_change_after_capture_logged = False
 
     # ------------------------------------------------------------------ #
     # cuda_graph-layer constructors
@@ -209,6 +196,4 @@ class GraphRuntime:
         """
         self.cuda_graph_adapter = None
         self.cuda_graph_manager = None
-        self.glm5_moe_cuda_graph_manager = None
-        self.glm5_layer_cuda_graph_manager = None
         self.whole_model_segment = None

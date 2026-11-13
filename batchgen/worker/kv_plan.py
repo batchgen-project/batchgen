@@ -12,8 +12,10 @@ in some cases twice:
 * the watermark credit for reclaimable retained prefix pages
   (``credit_reclaimable_pages``), the pure part only.
 * the provisional GPU KV pool formula ``total * frac - used``
-  (``provisional_pool_gb``). Its two call sites keep their intentionally
-  different failure policies (warn-and-floor vs. fail-loud) on the worker.
+  (``provisional_pool_gb``), its single definition. Its worker call sites
+  keep their intentionally different failure policies (warn-and-floor at
+  startup sizing, fail-loud at the measured decode-entry sizing, raw value in
+  the post-capture log) on the worker.
 * the page-rounded effective host-KV chunk size (``effective_chunk_size``).
 * the "this row has no next-token runway" predicate
   (``host_capacity_due``).

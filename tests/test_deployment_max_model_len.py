@@ -23,6 +23,8 @@ from batchgen.config.max_model_len import (
     verify_max_model_len,
 )
 from batchgen.worker.kv_manager import KVCacheManager
+from batchgen.worker.kv_plan import provisional_pool_gb
+from batchgen.worker.rank_context import node_of_rank
 from tests.test_kv_fixed_address_page_table import MANAGER
 from tests.test_prompt_rejection_fails_one_request import (
     _chat_line, _items, _scheduler,
@@ -113,8 +115,10 @@ def test_real_page_table_rows_use_length_not_batch_hints(page_size, prompt, deco
 
 
 def test_pool_input_matches_the_residency_formula():
-    assert KVCacheManager.provisional_pool_gb(20, 8, 0.75) == 7
-    assert KVCacheManager.provisional_pool_gb(20, 16, 0.75) == -1
+    # One owner (kv_plan): ``total * frac - used``; no floor on this path.
+    assert provisional_pool_gb(20, 0.75, 8, floor_gb=None) == 7
+    assert provisional_pool_gb(20, 0.75, 16, floor_gb=None) == -1
+    assert not hasattr(KVCacheManager, "provisional_pool_gb")
 
 
 def test_launch_limit_is_a_worker_argument():
@@ -175,7 +179,7 @@ def test_pool_is_verified_before_allocation_and_recreation_uses_cached_size():
         "torch": SimpleNamespace(cuda=cuda, tensor=torch.tensor, float64=torch.float64),
         "dist": SimpleNamespace(all_reduce=reduce_pool, ReduceOp=SimpleNamespace(MIN="MIN")),
         "KVCacheManager": KVCacheManager, "logging": logging, "gc": gc,
-        "GPU_KV_POOL_HEADROOM_GB": 2,
+        "GPU_KV_POOL_HEADROOM_GB": 2, "provisional_pool_gb": provisional_pool_gb,
     })["_init_gpu_kv_with_actual_size"]
     worker = SimpleNamespace(
         gpu_paged_kv_cache_manager=None, _phase="decode", rank=0, local_rank=0,
@@ -234,6 +238,7 @@ def test_worker_collects_remote_host_regions_before_accepting_length(monkeypatch
         "verify_max_model_len": verify_max_model_len,
         "QueryBook": SimpleNamespace(TOKEN_BYTES=4),
         "dist": SimpleNamespace(all_gather_object=gather),
+        "node_of_rank": node_of_rank,
     })["_verify_deployment_max_model_len"]
     worker = SimpleNamespace(
         huggingface_ckpt_name="test-model", rank=0, local_rank=0,

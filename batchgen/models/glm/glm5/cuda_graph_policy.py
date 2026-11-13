@@ -165,21 +165,3 @@ def glm5_moe_graph_bucket_capacity(
         return None
     return bucket, int(world_size) * bucket
 
-
-def should_warmup_cuda_graphs_before_decode(
-    *,
-    graph_manager_is_initialized: bool,
-    global_batch_has_queueing: bool,
-    model_name: str | None,
-    enable_cuda_graph: bool = False,
-    environ: Mapping[str, str] | None = None,
-) -> bool:
-    if graph_manager_is_initialized:
-        return False
-    if not global_batch_has_queueing:
-        return True
-    return glm5_any_cuda_graph_requested_for_model(
-        model_name,
-        enable_cuda_graph=enable_cuda_graph,
-        environ=environ,
-    )

@@ -1,19 +1,20 @@
 """The worker's decode CUDA-graph state machine, as owned by ``GraphRuntime``.
 
-These tests pin what the worker's 29 loose graph attributes guaranteed before
-S2 moved them here:
+These tests pin what the worker's loose graph attributes guaranteed before
+S2 moved them here (29 then; 18 since S6 deleted the eleven Phase-C fields
+that nothing ever set):
 
 * the initial value of every field, because the seven that the worker never
   set in ``__init__`` were read through ``getattr(self, name, <falsy>)`` --
   the field initializers ARE those defaults, and a direct read is only
   equivalent while that holds;
-* the capture-once counter surviving the deep free that resets everything
-  else;
+* the capture-once counter: reset with the captured graphs when the decode
+  instance is released, kept (with all graph state) while it is held;
 * failed-bucket quarantine;
 * the single owner of bucket-size generation;
 * the startup adapter backstop and the shutdown drop order.
 
-Three of today's asymmetries are pinned here as PINNED, NOT ENDORSED: they
+Two of today's asymmetries are pinned here as PINNED, NOT ENDORSED: they
 are reproduced exactly because S2 is behavior-neutral, and each is a separate
 fix.
 """
@@ -29,6 +30,7 @@ import pytest
 from batchgen.cuda_graph.adapter import GraphMode, ModelCudaGraphAdapter
 from batchgen.cuda_graph.buckets import generate_bucket_sizes
 from batchgen.worker.graph_runtime import GraphRuntime
+from tests.worker_method_source import load_worker_methods
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WORKER_SRC = _ROOT / "batchgen" / "batchgen_worker.py"
@@ -50,9 +52,6 @@ LATE_INIT = {
 INITIAL = {
     "cuda_graph_manager": None,
     "cuda_graph_adapter": None,
-    "cuda_graph_adapter_dual": True,
-    "glm5_moe_cuda_graph_manager": None,
-    "glm5_layer_cuda_graph_manager": None,
     "whole_model_graph": False,
     "decode_graph_captures": 0,
     "decode_graph_span_warn_monotonic": None,
@@ -62,16 +61,24 @@ INITIAL = {
     "glm5_whole_model_graph_state_change_after_capture_logged": False,
     "glm5_whole_model_graph_signature": None,
     "glm5_whole_model_graph_unavailable_reason": None,
-    "glm5_layer_graph_failed_buckets": set(),
-    "glm5_layer_graph_capture_attempted_for_batch": False,
-    "glm5_layer_graph_signature": None,
-    "glm5_layer_graph_max_seqlen": None,
-    "glm5_moe_graph_failed_buckets": set(),
-    "glm5_dsa_graph_capture_attempted_for_batch": False,
-    "glm5_moe_graph_capture_attempted_for_batch": False,
-    "glm5_dsa_graph_page_table_change_after_capture_logged": False,
     **LATE_INIT,
 }
+
+# The Phase-C retired-mode fields S6 deleted: never set to a non-default value
+# by any writer, read only by two phase-switch asserts that saw them None.
+DELETED_PHASE_C_FIELDS = (
+    "cuda_graph_adapter_dual",
+    "glm5_moe_cuda_graph_manager",
+    "glm5_layer_cuda_graph_manager",
+    "glm5_layer_graph_failed_buckets",
+    "glm5_layer_graph_capture_attempted_for_batch",
+    "glm5_layer_graph_signature",
+    "glm5_layer_graph_max_seqlen",
+    "glm5_moe_graph_failed_buckets",
+    "glm5_dsa_graph_capture_attempted_for_batch",
+    "glm5_moe_graph_capture_attempted_for_batch",
+    "glm5_dsa_graph_page_table_change_after_capture_logged",
+)
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
@@ -106,7 +113,7 @@ def _graph_fields_assigned_in(method: ast.FunctionDef) -> set:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_runtime_owns_exactly_the_twentynine_graph_fields():
+def test_the_runtime_owns_exactly_the_eighteen_graph_fields():
     graph = GraphRuntime()
     own = {
         name
@@ -114,7 +121,19 @@ def test_the_runtime_owns_exactly_the_twentynine_graph_fields():
         if not name.startswith("_")
     }
     assert own == set(INITIAL), (own ^ set(INITIAL))
-    assert len(own) == 29, len(own)
+    assert len(own) == 18, len(own)
+
+
+def test_the_phase_c_fields_are_gone_from_runtime_worker_and_engine():
+    assert not set(DELETED_PHASE_C_FIELDS) & set(vars(GraphRuntime()))
+    sources = [
+        _WORKER_SRC.read_text(),
+        (_ROOT / "batchgen" / "worker" / "decode_engine.py").read_text(),
+        (_ROOT / "batchgen" / "worker" / "graph_runtime.py").read_text(),
+    ]
+    for name in DELETED_PHASE_C_FIELDS:
+        for src in sources:
+            assert name not in src, name
 
 
 @pytest.mark.parametrize("name,expected", sorted(INITIAL.items(), key=lambda kv: kv[0]))
@@ -165,21 +184,103 @@ def test_the_capture_counter_increments_per_capture_episode():
     assert graph.decode_graph_captures == 1
 
 
-def test_the_capture_counter_survives_the_deep_free_that_resets_the_rest():
-    """PINNED, NOT ENDORSED (asymmetry, deliberate): the counter is the guard.
+def _release_decode_graph_state():
+    return load_worker_methods(["_release_decode_graph_state"], {})[
+        "_release_decode_graph_state"
+    ]
 
-    ``deep_free_model_memory`` resets the graph state field by field. The
-    capture-once counter is deliberately NOT in that list -- it is what makes
-    a second capture on a reused instance fatal.
+
+def test_the_capture_counter_is_reset_when_the_decode_instance_is_released():
+    """The counter is the capture-once guard of a reused decode instance.
+
+    The deep free does not touch graph state itself: it calls
+    ``_release_decode_graph_state`` only when the decode instance is NOT held,
+    and that release resets the counter together with the captured graphs
+    (a later decode instance is a new owner and captures its own).
     """
-    reset = _graph_fields_assigned_in(_worker_method("deep_free_model_memory"))
+    deep_free = _worker_method("deep_free_model_memory")
+    assert not _graph_fields_assigned_in(deep_free)
+    deep_free_src = ast.unparse(deep_free)
+    guard = 'if not self.parallel_manager.holds_instance(\'decode\'):'
+    assert guard in deep_free_src
+    assert deep_free_src.count("self._release_decode_graph_state()") == 1
+    assert deep_free_src.index(guard) < deep_free_src.index(
+        "self._release_decode_graph_state()"
+    )
 
-    assert "decode_graph_captures" not in reset
+    reset = _graph_fields_assigned_in(_worker_method("_release_decode_graph_state"))
+    assert "decode_graph_captures" in reset
     assert reset <= set(INITIAL), reset - set(INITIAL)
-    # Everything the deep free does reset returns to its initial value.
+
     graph = GraphRuntime()
+    graph.decode_graph_captures = 1
+    graph.cuda_graph_manager = object()
+    graph.whole_model_graph = True
+    worker = SimpleNamespace(_graph=graph, _criticality_probe=object())
+    _release_decode_graph_state()(worker)
+    assert graph.decode_graph_captures == 0
+    # Everything the release resets returns to its initial value.
     for name in reset:
         assert getattr(graph, name) == INITIAL[name], name
+    assert worker._criticality_probe is None
+
+
+def _deep_free_worker(*, held: bool):
+    """A fake worker on which the real deep free and release can run (CPU)."""
+    import gc
+    import logging
+    import time
+
+    methods = load_worker_methods(
+        ["deep_free_model_memory", "_release_decode_graph_state"],
+        {
+            "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+            "sys": SimpleNamespace(modules={}),
+            "time": time,
+            "gc": gc,
+            "logging": logging,
+        },
+    )
+    graph = GraphRuntime()
+    graph.decode_graph_captures = 1
+    graph.cuda_graph_manager = object()
+    graph.whole_model_segment = object()
+    graph.whole_model_graph = True
+    worker = SimpleNamespace(
+        _graph=graph,
+        _criticality_probe=object(),
+        model=object(),
+        rank=0,
+        parallel_manager=SimpleNamespace(
+            holds_instance=lambda name: held and name == "decode",
+            persistent_phase_instances=False,
+            model=None,
+        ),
+        _log_phase_memory_ledger=lambda tag: None,
+    )
+    worker._release_decode_graph_state = (
+        lambda: methods["_release_decode_graph_state"](worker)
+    )
+    methods["deep_free_model_memory"](worker)
+    return worker
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_the_deep_free_releases_graph_state_only_for_an_unheld_instance(held):
+    worker = _deep_free_worker(held=held)
+    graph = worker._graph
+    assert worker.model is None
+    if held:
+        # A held instance replays its graphs on its next activation.
+        assert graph.decode_graph_captures == 1
+        assert graph.cuda_graph_manager is not None
+        assert graph.whole_model_segment is not None
+        assert graph.whole_model_graph is True
+    else:
+        assert graph.decode_graph_captures == 0
+        assert graph.cuda_graph_manager is None
+        assert graph.whole_model_segment is None
+        assert graph.whole_model_graph is False
 
 
 def test_three_fields_are_left_stale_by_the_deep_free():
@@ -437,12 +538,10 @@ def test_make_batch_state_builds_the_adapter_snapshot():
 # --------------------------------------------------------------------------- #
 
 
-def test_drop_refs_clears_exactly_the_five_retaining_refs():
+def test_drop_refs_clears_exactly_the_three_retaining_refs():
     graph = GraphRuntime()
     graph.cuda_graph_adapter = _RealAdapter()
     graph.cuda_graph_manager = object()
-    graph.glm5_moe_cuda_graph_manager = object()
-    graph.glm5_layer_cuda_graph_manager = object()
     graph.whole_model_segment = object()
     graph.whole_model_graph = True
     graph.decode_graph_captures = 1
@@ -452,12 +551,11 @@ def test_drop_refs_clears_exactly_the_five_retaining_refs():
     for name in (
         "cuda_graph_adapter",
         "cuda_graph_manager",
-        "glm5_moe_cuda_graph_manager",
-        "glm5_layer_cuda_graph_manager",
         "whole_model_segment",
     ):
         assert getattr(graph, name) is None, name
-    # Nothing else is touched: the ordered shutdown nulled these five only.
+    # Nothing else is touched: the ordered shutdown nulls these three only
+    # (the two Phase-C managers it also nulled were deleted in S6).
     assert graph.whole_model_graph is True
     assert graph.decode_graph_captures == 1
 
@@ -490,8 +588,6 @@ def test_the_adapter_ref_is_dropped_before_the_manager_and_the_segment():
     assert order == [
         "cuda_graph_adapter",
         "cuda_graph_manager",
-        "glm5_moe_cuda_graph_manager",
-        "glm5_layer_cuda_graph_manager",
         "whole_model_segment",
     ], order
 

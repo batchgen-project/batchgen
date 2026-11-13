@@ -75,12 +75,8 @@ REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
 # and no sleep, no probe read at all.
 _DECODE_EVENT_SPIN_BUDGET_S = 0.002
 _DECODE_EVENT_POLL_INTERVAL_S = 1e-4
-# ``_wait_decode_tokens``' two outcomes.  COMPLETED is exactly what
-# ``synchronize()`` guarantees: the step's device work is done and its readback
-# buffers hold this step's tokens.  ABANDONED means the cohort is being torn
-# down and the event may never fire, so none of the step's outputs may be read.
-_DECODE_WAIT_COMPLETED = "completed"
-_DECODE_WAIT_ABANDONED = "abandoned"
+# ``_wait_decode_tokens``' two outcomes (_DECODE_WAIT_COMPLETED /
+# _DECODE_WAIT_ABANDONED) have one owner, decode_engine, imported below.
 # Returned by _finish_deferred_decode_step when the cohort teardown flag was
 # seen after the step's host-KV drain (the deferred twin of the post-drain
 # flag check in the undeferred step).
@@ -221,7 +217,14 @@ from batchgen.worker.graph_runtime import GraphRuntime
 from batchgen.worker.trajectory_store import TrajectoryStore
 from batchgen.worker.prefix_reuse_state import PrefixReuseState
 from batchgen.worker import decode_engine as _decode_engine
-from batchgen.worker.decode_engine import DecoupledGpuDecode
+from batchgen.worker.decode_engine import (
+	BATCHGEN_CB_DEBUG,
+	BATCHGEN_DECODE_ASSERT,
+	BATCHGEN_MULTI_BATCH_DIAG,
+	_DECODE_WAIT_ABANDONED,
+	_DECODE_WAIT_COMPLETED,
+	DecoupledGpuDecode,
+)
 from batchgen.worker.prefill_engine import PrefillEngine
 
 
@@ -382,14 +385,8 @@ if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
 else:
 	nvshmem_init = None
 
-# Debug logging level for continuous batching page boundary
-BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
-
-# Optional decode-time invariant check: assert cache_seqlens <= gpu_pages_allocated * PAGE_SIZE
-BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
-
-# Multi-batch diagnostic logging for investigating metadata corruption
-BATCHGEN_MULTI_BATCH_DIAG = os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
+# BATCHGEN_CB_DEBUG / BATCHGEN_DECODE_ASSERT / BATCHGEN_MULTI_BATCH_DIAG are
+# evaluated once, by their single owner decode_engine (imported above).
 
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
@@ -6953,7 +6950,7 @@ class BatchGenWorker:
 		every rank reaches every collective, and the deficit is computed on the
 		leader inside its MAX-reduced failure flag.
 		"""
-		node_id = self.rank // self.local_world_size
+		node_id = node_of_rank(self.rank, self.local_world_size)
 		self._reclaim_host_prefix_pages_collective(
 			lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
 			reason="host_reserve",
@@ -6978,7 +6975,7 @@ class BatchGenWorker:
 		fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
 		list, identical on every rank.
 		"""
-		node_id = self.rank // self.local_world_size
+		node_id = node_of_rank(self.rank, self.local_world_size)
 		group_size = self._decode_attn_tp_size()
 
 		def node_growth_deficit() -> int:
@@ -6997,7 +6994,7 @@ class BatchGenWorker:
 					owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
 				else:
 					owner = seq.assigned_rank
-				if int(owner) // self.local_world_size == node_id:
+				if node_of_rank(int(owner), self.local_world_size) == node_id:
 					node_growth_pages += int(growth_pages)
 			if node_growth_pages == 0:
 				return 0
@@ -9378,7 +9375,7 @@ class BatchGenWorker:
 		# This is the same split used by _initialize_gpu_kv_manager_fixed_size:
 		# all regions have equal page counts, each page spans its physical layers.
 		gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
-		node = self.rank // self.local_world_size
+		node = node_of_rank(self.rank, self.local_world_size)
 		capacities = []
 		host_views = self._host_views_by_group()
 		for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
@@ -10281,12 +10278,12 @@ class BatchGenWorker:
 				has_queueing = self.global_batch.has_queueing()
 				glm5_whole_graph_requested = (
 					self._glm5_whole_model_graph_requested_for_current_batch()
-					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
 				# Phase C: layer / DSA / MoE / segmented graph modes are retired;
 				# only the whole-model graph remains for GLM-5. Warmup triggers
-				# when (a) the generic should_warmup helper says so, or (b) the
-				# whole-model graph is requested but its bucket is missing.
+				# when (a) no graph manager exists yet and either no prefill is
+				# queued or a GLM-5 graph is requested, or (b) the whole-model
+				# graph is requested but its manager or bucket is missing.
 				if self._graph.cuda_graph_manager is not None:
 					generic_cuda_graph_warmup_needed = False
 				elif not has_queueing:
@@ -10570,8 +10567,6 @@ class BatchGenWorker:
 				name
 				for name in (
 					"cuda_graph_manager",
-					"glm5_moe_cuda_graph_manager",
-					"glm5_layer_cuda_graph_manager",
 					"whole_model_segment",
 				)
 				if getattr(self._graph, name, None) is not None
@@ -11310,8 +11305,6 @@ class BatchGenWorker:
 			getattr(self._graph, name, None) is not None
 			for name in (
 				"cuda_graph_manager",
-				"glm5_moe_cuda_graph_manager",
-				"glm5_layer_cuda_graph_manager",
 				"whole_model_segment",
 			)
 		)
@@ -11604,8 +11597,8 @@ class BatchGenWorker:
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_gb
 
-		local_pool_gb = KVCacheManager.provisional_pool_gb(
-			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		local_pool_gb = provisional_pool_gb(
+			total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
 		)
 		self._verify_deployment_max_model_len(local_pool_gb)
 		# Identical page counts are required by decode admission. The tightest
@@ -15442,7 +15435,6 @@ class BatchGenWorker:
 		model_name_l = model_name.lower()
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
-			and "glm" in model_name_l
 		)
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
 			if glm5_whole_graph_enabled:
@@ -15660,8 +15652,7 @@ class BatchGenWorker:
 		# legacy `_glm5_force_segmented_graph_eager` wrap stays for the
 		# compare-mode eager re-run path (used in the legacy whole-model
 		# compare branch that still wraps `self.model.model(...)`).
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" in model_name_l and self._glm5_whole_model_graph_requested_for_current_batch():
+		if self._glm5_whole_model_graph_requested_for_current_batch():
 			with self._glm5_force_segmented_graph_eager():
 				return _forward()
 		return _forward()
@@ -16146,21 +16137,14 @@ class BatchGenWorker:
 		# Use model's max_position_embeddings (not max_context_length) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		# Phase C: only whole-model graph remains for GLM-5 (other modes retired).
-		# The dsa/moe/dsa_full/layer enables are pinned False so the now-dead
-		# downstream branches stay typeable until a subsequent commit deletes
-		# them outright. The whole-model graph is the only live path here.
-		glm5_dsa_graph_enabled = False
-		glm5_dsa_full_graph_enabled = False
-		glm5_moe_graph_enabled = False
-		glm5_layer_graph_enabled = False
+		# Phase C: only the whole-model graph remains for GLM-5 (the dsa / moe /
+		# dsa_full / layer modes are retired and their branches deleted).
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
-			and "glm" in model_name_l
 		)
 		if glm5_whole_graph_enabled:
-			whole_graph_required = self._glm5_whole_model_graph_requested_for_current_batch()
+			# The request is the requirement: requested here means required.
+			whole_graph_required = glm5_whole_graph_enabled
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 			capture_attempted = bool(
@@ -17205,41 +17189,23 @@ class BatchGenWorker:
 		else:
 			AttnWrapperBase.kv_append_callback_aux = None
 
-	def _read_decode_max_seqlen_for_all_short(self):
-		return int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-
-	def _read_decode_max_seqlen_for_graph_span(self):
-		return int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-
-	def _read_decode_max_seqlen_for_warning(self):
-		return int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-
-	def _read_decode_max_seqlen_for_adapter(self):
+	# One reader per bound decode-step term (S6 fold: the S4b binder named
+	# one reader per call site; the bodies were identical, and ``Attn_Wrapper``
+	# is ``AttnWrapperBase``).
+	def _read_decode_max_seqlen(self):
 		return int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
 
 	def _read_decode_cur_batch(self):
 		return tuple(getattr(AttnWrapperBase, "cur_batch", None) or ())
 
-	def _read_decode_cache_seqlens_for_adapter(self):
+	def _read_decode_cache_seqlens(self):
 		return AttnWrapperBase.cache_seqlens
 
-	def _read_decode_cache_seqlens_for_replay(self):
-		return AttnWrapperBase.cache_seqlens
-
-	def _read_decode_position_ids_for_adapter(self):
+	def _read_decode_position_ids(self):
 		return AttnWrapperBase.position_ids
 
-	def _read_decode_position_ids_for_probe(self):
-		return Attn_Wrapper.position_ids
-
-	def _read_decode_position_ids_for_model(self):
-		return Attn_Wrapper.position_ids
-
-	def _read_decode_attention_mask_for_probe(self):
-		return Attn_Wrapper.attention_mask
-
-	def _read_decode_attention_mask_for_model(self):
-		return Attn_Wrapper.attention_mask
+	def _read_decode_attention_mask(self):
+		return AttnWrapperBase.attention_mask
 
 	def _read_decode_kv_append_callbacks(self):
 		return (
@@ -18038,21 +18004,11 @@ class BatchGenWorker:
 	def _release_decode_graph_state(self) -> None:
 		"""Drop the decode instance's captured graphs and their bookkeeping."""
 		self._graph.cuda_graph_manager = None
-		self._graph.glm5_moe_cuda_graph_manager = None
-		self._graph.glm5_layer_cuda_graph_manager = None
-		self._graph.glm5_layer_graph_failed_buckets = set()
-		self._graph.glm5_layer_graph_capture_attempted_for_batch = False
-		self._graph.glm5_layer_graph_signature = None
-		self._graph.glm5_layer_graph_max_seqlen = None
-		self._graph.glm5_dsa_graph_capture_attempted_for_batch = False
-		self._graph.glm5_moe_graph_capture_attempted_for_batch = False
-		self._graph.glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._graph.whole_model_segment = None
 		self._graph.glm5_whole_model_all_short = False
 		self._graph.glm5_whole_model_index_topk = 0
 		self._graph.whole_model_bucketing = None
 		self._graph.glm5_whole_model_capture_input_ids = None
-		self._graph.glm5_moe_graph_failed_buckets = set()
 		self._graph.whole_model_graph = False
 		self._graph.glm5_whole_model_graph = False
 		self._graph.glm5_whole_model_graph_failed_buckets = set()

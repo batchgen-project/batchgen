@@ -2938,11 +2938,15 @@ _WORKER_QUIESCE_MEMBERS = (
 _WORKER_DECODE_WAIT_CONSTANTS = (
     "_DECODE_EVENT_SPIN_BUDGET_S",
     "_DECODE_EVENT_POLL_INTERVAL_S",
-    "_DECODE_WAIT_COMPLETED",
-    "_DECODE_WAIT_ABANDONED",
     "_COHORT_QUIESCE_DEADLINE_S",
     "_COHORT_QUIESCE_POLL_INTERVAL_S",
     "_COHORT_QUIESCE_DEADLINE_REASON",
+)
+# The wait's two outcomes have one owner, decode_engine (S6 F6); the worker
+# imports them, so they are lifted from the engine module.
+_ENGINE_DECODE_WAIT_CONSTANTS = (
+    "_DECODE_WAIT_COMPLETED",
+    "_DECODE_WAIT_ABANDONED",
 )
 
 
@@ -2971,19 +2975,23 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
     instead of ending pytest, and a shortened deadline where waiting out the
     real 5 s would only make the suite slow.
     """
-    tree = _worker_tree()
-    constants = [
-        node for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id in _WORKER_DECODE_WAIT_CONSTANTS
-            for target in node.targets
+    def _lift(tree, names):
+        found = [
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in names
+                for target in node.targets
+            )
+        ]
+        assert len(found) == len(names), (
+            "a decode-wait module constant was renamed or removed: "
+            f"{[ast.unparse(node.targets[0]) for node in found]}"
         )
-    ]
-    assert len(constants) == len(_WORKER_DECODE_WAIT_CONSTANTS), (
-        "a decode-wait module constant was renamed or removed: "
-        f"{[ast.unparse(node.targets[0]) for node in constants]}"
+        return found
+
+    constants = _lift(_worker_tree(), _WORKER_DECODE_WAIT_CONSTANTS) + _lift(
+        ast.parse(DECODE_ENGINE_PATH.read_text()), _ENGINE_DECODE_WAIT_CONSTANTS
     )
     members = [
         node for node in _worker_class().body
