@@ -14,9 +14,9 @@ that nothing ever set):
 * the single owner of bucket-size generation;
 * the startup adapter backstop and the shutdown drop order.
 
-Two of today's asymmetries are pinned here as PINNED, NOT ENDORSED: they
-are reproduced exactly because S2 is behavior-neutral, and each is a separate
-fix.
+One of today's asymmetries (the capture-OOM bookkeeping gap) is pinned here
+as PINNED, NOT ENDORSED: it is reproduced exactly because S2 is
+behavior-neutral, and it is a separate fix.
 """
 
 from __future__ import annotations
@@ -246,6 +246,8 @@ def _deep_free_worker(*, held: bool):
     graph.cuda_graph_manager = object()
     graph.whole_model_segment = object()
     graph.whole_model_graph = True
+    graph.k25_whole_model_graph = True
+    graph.whole_model_segment_name = "k25_whole_model"
     worker = SimpleNamespace(
         _graph=graph,
         _criticality_probe=object(),
@@ -276,29 +278,35 @@ def test_the_deep_free_releases_graph_state_only_for_an_unheld_instance(held):
         assert graph.cuda_graph_manager is not None
         assert graph.whole_model_segment is not None
         assert graph.whole_model_graph is True
+        assert graph.k25_whole_model_graph is True
+        assert graph.whole_model_segment_name == "k25_whole_model"
     else:
         assert graph.decode_graph_captures == 0
         assert graph.cuda_graph_manager is None
         assert graph.whole_model_segment is None
         assert graph.whole_model_graph is False
+        assert graph.k25_whole_model_graph is False
+        assert graph.whole_model_segment_name is None
 
 
-def test_three_fields_are_left_stale_by_the_deep_free():
-    """PINNED, NOT ENDORSED: the K2.5 flags and the span-warn stamp.
+def test_the_decode_release_resets_the_k25_descriptors():
+    """S6 (declared change): the K2.5 capture's two descriptors are released
+    with the graphs they describe.
 
     ``k25_whole_model_graph`` / ``whole_model_segment_name`` are written only
-    by the K2.5 capture and reset by neither the release helper nor the deep
-    free, so a deep free followed by a capture in another mode reads a stale
-    True / stale name. Reproduced exactly; fixing it is its own slice.
+    by the K2.5 capture. They used to survive the decode-instance release, so
+    a release followed by a capture of another mode started from a stale True
+    / stale name (unobservable on the replay path, which also requires the
+    released manager). The release now returns both to their defaults.
     """
-    reset = _graph_fields_assigned_in(_worker_method("deep_free_model_memory"))
-    for name in ("k25_whole_model_graph", "whole_model_segment_name"):
-        assert name not in reset, name
-    released = _graph_fields_assigned_in(
-        _worker_method("_release_glm5_whole_model_graph_state")
-    )
-    for name in ("k25_whole_model_graph", "whole_model_segment_name"):
-        assert name not in released, name
+    reset = _graph_fields_assigned_in(_worker_method("_release_decode_graph_state"))
+    assert {"k25_whole_model_graph", "whole_model_segment_name"} <= reset
+    graph = GraphRuntime()
+    graph.k25_whole_model_graph = True
+    graph.whole_model_segment_name = "k25_whole_model"
+    _release_decode_graph_state()(SimpleNamespace(_graph=graph, _criticality_probe=None))
+    assert graph.k25_whole_model_graph is False
+    assert graph.whole_model_segment_name is None
 
 
 def test_the_oom_rollback_quarantines_only_the_failing_bucket():

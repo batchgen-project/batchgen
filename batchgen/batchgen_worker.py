@@ -18010,6 +18010,10 @@ class BatchGenWorker:
 		self._graph.whole_model_bucketing = None
 		self._graph.glm5_whole_model_capture_input_ids = None
 		self._graph.whole_model_graph = False
+		# The K2.5 capture's two descriptors go with the graphs they describe,
+		# so a later capture of any mode starts from the field defaults.
+		self._graph.k25_whole_model_graph = False
+		self._graph.whole_model_segment_name = None
 		self._graph.glm5_whole_model_graph = False
 		self._graph.glm5_whole_model_graph_failed_buckets = set()
 		self._graph.glm5_whole_model_graph_capture_attempted_for_batch = False
