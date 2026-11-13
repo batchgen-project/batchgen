@@ -287,8 +287,8 @@ class BatchScheduler:
         # keyed by its turn id; the completion listener resolves its waiter's
         # future directly, with no batch tracker and no output file.
         self._turn_waiters: Dict[str, _TurnWaiter] = {}
-        # Aborted turns already sent to a worker. The worker still finishes
-        # them (there is no worker-side cancel); their completion is dropped.
+        # Aborted turns already sent to a worker. The worker is told to cancel
+        # them; their completion is dropped.
         self._detached_turns: set = set()
         # A turn submission wakes an idle drain at once instead of at its next
         # 0.1 s poll.
@@ -363,6 +363,69 @@ class BatchScheduler:
 
     async def enqueue(self, batch_id: str) -> None:
         await self._queue.put(batch_id)
+
+    def cancel_batch(self, batch_id: str) -> Any:
+        """Cancel a validating or in-progress batch. Runs on the scheduler loop.
+
+        A batch with no request on a worker is CANCELLED at once. Otherwise it
+        becomes CANCELLING: its queued requests are removed, the worker is told
+        to stop its admitted sequences (each returns through the normal
+        completion path, which releases its KV and token storage), every
+        result of the batch is discarded, and the batch is CANCELLED when the
+        worker has returned the last slot it held. Raises KeyError for an
+        unknown batch and ValueError for a status that cannot be cancelled.
+        """
+        batch = self.storage.load_batch(batch_id)
+        if batch is None:
+            raise KeyError(batch_id)
+        if batch.status not in {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS}:
+            raise ValueError(
+                f"Cannot cancel batch with status '{batch.status}'. "
+                "Valid statuses: validating, in_progress"
+            )
+        now = int(time.time())
+        tracker = self._scheduling_pool.get_batch_tracker(batch_id)
+        if tracker is None:
+            # Not registered with the pool yet (validating, or queued behind
+            # another batch): _process_batch skips a cancelled batch.
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.CANCELLED,
+                cancelling_at=now, cancelled_at=now,
+            )
+            return self.storage.load_batch(batch_id)
+        tracker.cancelled = True
+        self.storage.update_batch_status(
+            batch_id, BatchStatus.CANCELLING, cancelling_at=now
+        )
+        purged = self._intake_pool.remove_batch_entries(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
+        held = self._held_request_ids(batch_id)
+        logger.info(
+            "[POOL] Batch %s cancelling: %d queued requests removed, %d on "
+            "the worker", batch_id, purged, len(held),
+        )
+        if held:
+            self.worker.request_queue.put({"type": "cancel", "batch_id": batch_id})
+        else:
+            self._finish_cancellation(batch_id)
+        return self.storage.load_batch(batch_id)
+
+    def _held_request_ids(self, batch_id: str) -> set:
+        """Requests of *batch_id* a worker still holds a scheduling slot for."""
+        return self._scheduling_pool.active_request_ids(
+            self._pool_request_meta.get(batch_id, {})
+        )
+
+    def _finish_cancellation(self, batch_id: str) -> None:
+        """Release the scheduler state of a cancelled batch and persist it."""
+        self._intake_pool.remove_batch_entries(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
+        self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._pool_request_meta.pop(batch_id, None)
+        self.storage.update_batch_status(
+            batch_id, BatchStatus.CANCELLED, cancelled_at=int(time.time())
+        )
+        logger.info("[POOL] Batch %s cancelled", batch_id)
 
     def quiesce(self) -> None:
         """Stop dispatching new work while retaining the upstream queues."""
@@ -1173,10 +1236,9 @@ class BatchScheduler:
 
         Returns "dequeued" when the turn was still in the IntakePool (it never
         reaches a worker), "detached" when it was already admitted, or None
-        for a turn that is not pending. A detached turn runs to completion on
-        the worker -- the worker has no per-request cancel, the same as
-        /v1/batches/{id}/cancel -- and its completion is discarded. Runs on the
-        scheduler loop.
+        for a turn that is not pending. A detached turn is cancelled on the
+        worker, which stops it at its next scheduling boundary; its completion
+        is discarded. Runs on the scheduler loop.
         """
         waiter = self._turn_waiters.pop(turn_id, None)
         if waiter is None:
@@ -1186,6 +1248,9 @@ class BatchScheduler:
         outcome = "dequeued" if removed else "detached"
         if not removed:
             self._detached_turns.add(turn_id)
+            # A turn is a one-entry batch keyed by its id: the worker ends it
+            # and its completion is discarded as a detached turn.
+            self.worker.request_queue.put({"type": "cancel", "batch_id": turn_id})
         if not waiter.future.done():
             waiter.future.set_exception(TurnError(
                 409, "turn_aborted", f"turn {turn_id} was aborted: {reason}",
@@ -1470,7 +1535,11 @@ class BatchScheduler:
             tracker = self._scheduling_pool.get_batch_tracker(batch_id)
             if tracker is None:
                 return
-            if tracker.is_complete:
+            if tracker.cancelled:
+                # The cancel owns this batch's terminal status; the timeout
+                # below still fails a cancellation the worker never finishes.
+                pass
+            elif tracker.is_complete:
                 break
             if getattr(tracker, 'error', None):
                 logger.error(f"[POOL] Batch {batch_id} failed: {tracker.error}")
@@ -1662,6 +1731,7 @@ class BatchScheduler:
                 tracker is None
                 or tracker.is_complete
                 or getattr(tracker, "is_failed", False)
+                or tracker.cancelled
             ):
                 dropped[entry.batch_id] = dropped.get(entry.batch_id, 0) + 1
                 continue
@@ -1672,7 +1742,7 @@ class BatchScheduler:
             self._stale_intake_batches.add(batch_id)
             logger.warning(
                 "[POOL] Discarding %d queued requests of batch %s: the batch "
-                "is no longer active (failed, complete, or finalized)",
+                "is no longer active (failed, cancelled, complete, or finalized)",
                 count,
                 batch_id,
             )
@@ -1682,6 +1752,10 @@ class BatchScheduler:
         """Mark all in-progress batches as failed. Called on fatal listener error."""
         failed = 0
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
+            if tracker.cancelled:
+                # The fatal ended every sequence the cancel was waiting for.
+                self._finish_cancellation(batch_id)
+                continue
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
                 # A failed batch must send nothing more to any worker (its
@@ -1790,6 +1864,12 @@ class BatchScheduler:
                             tracker = self._scheduling_pool.get_batch_tracker(
                                 batch_id
                             )
+                            if tracker is not None and tracker.cancelled:
+                                # Its slot is freed above; the result of a
+                                # cancelled batch is never published.
+                                if not self._held_request_ids(batch_id):
+                                    self._finish_cancellation(batch_id)
+                                continue
                             if tracker is None or getattr(tracker, "is_failed", False):
                                 # The batch failed or was discarded while the
                                 # worker still ran this request. Its slot is

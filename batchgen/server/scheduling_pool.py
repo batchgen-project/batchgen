@@ -30,6 +30,10 @@ class BatchTracker:
     priority: Priority = Priority.NORMAL
     created_at: float = field(default_factory=time.time)
     error: Optional[str] = None  # Set on fatal failure (worker crash, timeout)
+    # Set when a cancel is accepted: the batch admits nothing more, its
+    # results are discarded, and it ends CANCELLED once the worker has
+    # returned every slot it holds.
+    cancelled: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -150,6 +154,11 @@ class SchedulingPool:
         """Get the slot index for a request, or None."""
         with self._lock:
             return self._active_slots.get(request_id)
+
+    def active_request_ids(self, request_ids) -> Set[str]:
+        """The subset of *request_ids* that a worker still holds a slot for."""
+        with self._lock:
+            return set(request_ids).intersection(self._active_slots)
 
     # -------------------- Batch Tracking --------------------
 

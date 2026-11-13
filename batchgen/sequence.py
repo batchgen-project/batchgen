@@ -111,6 +111,7 @@ class SequenceEntry:
         'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
         'sampling_params',       # Per-request sampling params for this sequence
         'ignore_eos',            # Per-request: EOS/stop tokens do not end the sequence
+        'cancelled',             # Its batch was cancelled: the sequence is done
         # Agent-session identity of a /v1/turns request (None for batch work)
         'traj_id',
         'session_id',
@@ -127,13 +128,15 @@ class SequenceEntry:
     )
 
     VALID_TRANSITIONS = {
-        SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL},
+        # QUEUEING/EVICTED -> COMPLETED: a cancelled sequence that was never
+        # (re-)prefilled ends without entering prefill.
+        SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL, SequenceStatus.COMPLETED},
         SequenceStatus.IN_PREFILL: {SequenceStatus.PREFILLED},
         SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED},
         SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.COMPLETED: set(),
-        SequenceStatus.EVICTED: {SequenceStatus.IN_PREFILL},  # Re-enters via prefill recompute
+        SequenceStatus.EVICTED: {SequenceStatus.IN_PREFILL, SequenceStatus.COMPLETED},  # Re-enters via prefill recompute
     }
 
     # Page size for KV cache (tokens per page)
@@ -193,6 +196,7 @@ class SequenceEntry:
         self.priority: int = 0  # 0=NORMAL, 1=HIGH
         self.sampling_params: Optional[Dict] = None
         self.ignore_eos: bool = False
+        self.cancelled: bool = False
         self.traj_id: Optional[str] = None
         self.session_id: Optional[str] = None
         self.parent_session_id: Optional[str] = None

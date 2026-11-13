@@ -565,27 +565,17 @@ def create_app(
 
     @app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
     async def cancel_batch(request: Request, batch_id: str):
-        storage: StorageManager = request.app.state.storage
-        batch = storage.load_batch(batch_id)
-        if not batch:
+        # The scheduler owns cancellation: it stops admitted work on the
+        # worker and decides when the batch is cancelled.
+        scheduler: BatchScheduler = request.app.state.scheduler
+        try:
+            return scheduler.cancel_batch(batch_id)
+        except KeyError:
             raise HTTPException(
                 status_code=404, detail=f"Batch '{batch_id}' not found"
             )
-
-        cancellable = {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS}
-        if batch.status not in cancellable:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot cancel batch with status '{batch.status}'."
-                f" Valid statuses: validating, in_progress",
-            )
-
-        now = int(time.time())
-        storage.update_batch_status(
-            batch_id, BatchStatus.CANCELLED, cancelling_at=now, cancelled_at=now
-        )
-        updated = storage.load_batch(batch_id)
-        return updated
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     # ==================== Turn and Session Endpoints ====================
 
