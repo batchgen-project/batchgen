@@ -323,9 +323,14 @@ def test_configure_runs_before_the_graph_warmup_decision_and_can_trigger_it():
         node for node in ast.walk(generate)
         if isinstance(node, ast.If)
         and any(n.lineno == warmup[0] for n in ast.walk(node) if isinstance(n, ast.Call))
-        and "generic_cuda_graph_warmup_needed" in ast.unparse(node.test)
+        and "_decode_graph_capture_needed_at_configure" in ast.unparse(node.test)
     )
-    assert "self._criticality_probe_recapture" in ast.unparse(trigger.test)
+    assert trigger is not None
+    decision = _method_ast("_decode_graph_capture_needed_at_configure")
+    returned = [node for node in ast.walk(decision) if isinstance(node, ast.Return)]
+    assert len(returned) == 1
+    assert "generic_cuda_graph_warmup_needed" in ast.unparse(returned[0].value)
+    assert "self._criticality_probe_recapture" in ast.unparse(returned[0].value)
 
 
 def test_capture_path_admits_only_the_armed_recapture():

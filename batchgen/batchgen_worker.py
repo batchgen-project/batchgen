@@ -10102,6 +10102,13 @@ class BatchGenWorker:
 		Both lifecycles probe the startup decode transient at the per-rank cap
 		right after the pool is sized (``_probe_startup_transient``); it is
 		published, not yet reserved.
+
+		On the default lifecycle a decode instance the strategy manager keeps
+		across the switch to prefill has its decode graphs captured here,
+		inside that probe and before readiness
+		(``_startup_decode_graph_capture``); every later activation replays
+		them. An instance the manager rebuilds per phase captures at its
+		decode configure.
 		"""
 		with self._startup_phase("model-build"):
 			if not self._core_initialized:
@@ -10116,10 +10123,9 @@ class BatchGenWorker:
 				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
 				self._load_decode_model(comm=self.comm)
 				self._init_gpu_kv_with_actual_size()
-				# This lifecycle captures no decode graph at startup; any
-				# capture happens at the first decode configure.
 				self._probe_startup_transient(
-					seam=_startup_transient.SEAM_DEPLOYMENT_PREPARE, capture=None
+					seam=_startup_transient.SEAM_DEPLOYMENT_PREPARE,
+					capture=self._startup_decode_graph_capture(prefill_key),
 				)
 				self._transition_phase(prefill_key)
 				self.set_phase("prefill")
@@ -10949,33 +10955,12 @@ class BatchGenWorker:
 					self._active_batchgen_debug_for_sequences(global_decode_sequences)
 				)
 
-				# CUDA Graph Warmup (configure-time, one-time for whole-model GLM).
-				# Whole-model graph captures every configured bucket before decode;
-				# segmented GLM-5 paths retain their existing partial-capture policy.
-				from batchgen.models.glm.glm5.cuda_graph_policy import (
-					should_warmup_cuda_graphs_before_decode,
-				)
-
+				# CUDA Graph Warmup (configure-time). A decode instance kept
+				# across phases had its graphs captured before readiness
+				# (_startup_decode_graph_capture), so this finds them and
+				# captures nothing.
 				has_queueing = self.global_batch.has_queueing()
-				glm5_whole_graph_requested = (
-					self._glm5_whole_model_graph_requested_for_current_batch()
-					and "glm" in (getattr(self, "model_name", "") or "").lower()
-				)
-				# Phase C: layer / DSA / MoE / segmented graph modes are retired;
-				# only the whole-model graph remains for GLM-5. Warmup triggers
-				# when (a) the generic should_warmup helper says so, or (b) the
-				# whole-model graph is requested but its bucket is missing.
-				generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
-					graph_manager_is_initialized=self._cuda_graph_manager is not None,
-					global_batch_has_queueing=has_queueing,
-					model_name=getattr(self, "model_name", None),
-					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
-				)
-				if generic_cuda_graph_warmup_needed or (
-					glm5_whole_graph_requested and self._cuda_graph_manager is None
-				) or self._glm5_whole_model_graph_current_bucket_missing() or (
-					self._criticality_probe_recapture
-				):
+				if self._decode_graph_capture_needed_at_configure(has_queueing):
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
@@ -12198,18 +12183,11 @@ class BatchGenWorker:
 		self._decode_padding_bsz = decode_width
 		self._init_gpu_kv_with_actual_size()
 		capture = self._glm5_whole_model_graph_requested_for_current_batch()
-
-		def capture_decode_graphs() -> None:
-			self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
-			self._current_decode_max_rank_batch_size = 1
-			self._bind_decode_attention_metadata_for_graph_config([])
-			self._warmup_cuda_graphs()
-
 		# The probe runs the capture exactly once whether or not it can
 		# measure it, so capture behavior is unchanged by the probe.
 		self._probe_startup_transient(
 			seam=_startup_transient.SEAM_PERSISTENT_BUILD,
-			capture=capture_decode_graphs if capture else None,
+			capture=self._capture_startup_decode_graphs if capture else None,
 		)
 		self._transition_phase(prefill_key)
 		self.set_phase("prefill")
@@ -12220,6 +12198,70 @@ class BatchGenWorker:
 			time.perf_counter() - start,
 			capture,
 		)
+
+	def _startup_decode_graph_capture(
+		self, next_key: PhaseKey
+	) -> Optional[Callable[[], None]]:
+		"""The decode graph capture the default lifecycle runs before readiness.
+
+		Asked at the startup decode configure, right before the switch to
+		``next_key``. Decode graphs belong to the decode instance that captured
+		them. When the strategy manager keeps that instance across the switch
+		(the exit-mode decision ``_transition_phase`` makes next is SUSPEND,
+		i.e. ``holds_instance("decode")``), every later activation replays its
+		graphs, so they are captured here, once per process, and the first
+		decode configure finds ``_cuda_graph_manager`` set and captures nothing.
+		A manager that retires its decode instance on the switch (build-always
+		managers; a rank streaming part of its routed experts) rebuilds it, and
+		its graphs, at every decode configure, so this returns None for it, as
+		for every deployment that requests no whole-model decode graph.
+		"""
+		if not self._whole_model_decode_graphs_requested():
+			return None
+		live = self._live_phase_key
+		if live is None or live.phase != "decode":
+			raise RuntimeError(
+				f"Rank {self.rank}: startup decode graph capture is decided at "
+				f"the startup decode configure, which requires a live decode "
+				f"phase; live phase key={live!r}"
+			)
+		if self._phase_exit_mode(live, next_key) is not ExitMode.SUSPEND:
+			return None
+		return self._capture_startup_decode_graphs
+
+	def _capture_startup_decode_graphs(self) -> None:
+		"""Capture the whole decode graph bucket ladder before readiness.
+
+		No decode row exists yet: every rank binds an empty local batch and the
+		global maximum is pinned to one row, which makes ``_setup_cuda_graphs``
+		capture every bucket of ``_decode_graph_bucket_sizes``. Shared by both
+		lifecycles that keep their decode instance.
+
+		A capture that returns without graphs fails the startup: otherwise the
+		capture silently moves back to the first decode configure, after
+		readiness.
+
+		Prewarm seam: a decode JIT prewarm (Triton/DeepGEMM) belongs right
+		before ``_warmup_cuda_graphs`` below, where the KV pool is sized and
+		the decode instance is live.
+		"""
+		captures = getattr(self, "_decode_graph_captures", 0)
+		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
+		self._current_decode_max_rank_batch_size = 1
+		self._bind_decode_attention_metadata_for_graph_config([])
+		self._warmup_cuda_graphs()
+		if (
+			getattr(self, "_decode_graph_captures", 0) != captures + 1
+			or not self._decode_graph_state_present()
+		):
+			raise RuntimeError(
+				f"Rank {self.rank}: startup decode graph capture produced no "
+				f"decode graphs (captures {captures} -> "
+				f"{getattr(self, '_decode_graph_captures', 0)}, graph state "
+				f"present={self._decode_graph_state_present()}); the graphs "
+				"are requested and the decode instance is kept, so they must "
+				"be captured before readiness"
+			)
 
 	def _probe_startup_transient(
 		self, *, seam: str, capture: Optional[Callable[[], None]]
@@ -19070,6 +19112,38 @@ class BatchGenWorker:
 				"none" if requested is None else "probe",
 			)
 		self._criticality_probe_recapture = True
+
+	def _decode_graph_capture_needed_at_configure(self, has_queueing: bool) -> bool:
+		"""Whether this decode configure runs the CUDA graph warmup/capture.
+
+		Phase C: layer / DSA / MoE / segmented graph modes are retired; only
+		the whole-model graph remains for GLM-5. Warmup triggers when (a) the
+		generic should_warmup helper says so, (b) the whole-model graph is
+		requested but no graph manager exists, (c) the current bucket is
+		missing, or (d) a changed criticality probe request armed a recapture.
+		A decode instance whose graphs were captured before readiness answers
+		False on every configure.
+		"""
+		from batchgen.models.glm.glm5.cuda_graph_policy import (
+			should_warmup_cuda_graphs_before_decode,
+		)
+
+		glm5_whole_graph_requested = (
+			self._glm5_whole_model_graph_requested_for_current_batch()
+			and "glm" in (getattr(self, "model_name", "") or "").lower()
+		)
+		generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
+			graph_manager_is_initialized=self._cuda_graph_manager is not None,
+			global_batch_has_queueing=has_queueing,
+			model_name=getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
+		return bool(
+			generic_cuda_graph_warmup_needed
+			or (glm5_whole_graph_requested and self._cuda_graph_manager is None)
+			or self._glm5_whole_model_graph_current_bucket_missing()
+			or self._criticality_probe_recapture
+		)
 
 	def _glm5_whole_model_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
