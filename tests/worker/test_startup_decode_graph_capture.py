@@ -45,6 +45,7 @@ from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.phase_lifecycle import ExitMode, PhaseKey
 from batchgen.worker import startup_transient as st
 from tests.unit.test_startup_transient import FakeCuda
+from tests.worker.worker_fakes import make_graph_state
 from tests.worker_method_source import load_worker_methods
 
 MiB = 1024 * 1024
@@ -124,14 +125,14 @@ def _record_capture(worker, gpu_manager):
     """What the real whole-model capture tail of ``_setup_cuda_graphs`` leaves
     set once its ladder is captured (manager, flags, signature, counter)."""
     bucketing = BatchSizeBucketing(BUCKETS)
-    worker._cuda_graph_manager = FakeGraphManager(bucketing)
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._whole_model_bucketing = bucketing
-    worker._whole_model_segment = SimpleNamespace(max_seqlen=1 << 17)
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_signature = worker._glm5_whole_model_graph_capture_signature()
-    worker._decode_graph_captures += 1
+    worker._graph.cuda_graph_manager = FakeGraphManager(bucketing)
+    worker._graph.whole_model_graph = True
+    worker._graph.glm5_whole_model_graph = True
+    worker._graph.whole_model_bucketing = bucketing
+    worker._graph.whole_model_segment = SimpleNamespace(max_seqlen=1 << 17)
+    worker._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
+    worker._graph.glm5_whole_model_graph_signature = worker._glm5_whole_model_graph_capture_signature()
+    worker._graph.decode_graph_captures += 1
 
 
 def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
@@ -185,14 +186,10 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
         torch_device="cpu", model_context_length=4096, startup_transient=None,
         _core_initialized=True, _live_phase_key=None, _phase=None,
         _prefill_moe_mode_in_effect=None, _decode_padding_bsz=None,
-        _decode_graph_captures=0, _decode_graph_ladder_logged=True,
-        _cuda_graph_manager=None, _glm5_moe_cuda_graph_manager=None,
-        _glm5_layer_cuda_graph_manager=None, _whole_model_segment=None,
-        _whole_model_graph=False, _glm5_whole_model_graph=False,
-        _glm5_whole_model_graph_failed_buckets=set(),
-        _glm5_whole_model_graph_capture_attempted_for_batch=False,
-        _glm5_whole_model_graph_unavailable_reason=None,
-        _glm5_whole_model_graph_signature=None,
+        _decode_graph_ladder_logged=True,
+        # S2: the decode-graph state is GraphRuntime's (its defaults are the
+        # former None/False/0/set() fixtures).
+        _graph=make_graph_state(),
         _criticality_probe_recapture=False,
         _current_decode_local_batch_size=0, _current_decode_max_rank_batch_size=0,
         setup_calls=0, events=events,
@@ -248,8 +245,8 @@ def test_retained_instance_captures_inside_the_probe_before_the_prefill_switch()
         "graph_setup", "pool_finalized",
         ("to_prefill", ExitMode.SUSPEND),
     ]
-    assert worker._decode_graph_captures == 1
-    assert worker._cuda_graph_manager is not None
+    assert worker._graph.decode_graph_captures == 1
+    assert worker._graph.cuda_graph_manager is not None
     # No CUDA here: the capture still ran exactly once, and the flavor names why
     # it carries no value.
     assert worker.startup_transient[1]["flavor"] == st.FLAVOR_CAPTURE
@@ -263,7 +260,7 @@ def test_first_two_decode_intervals_reuse_the_startup_graphs():
     _decode_interval(worker, max_rank_batch=3)
     _decode_interval(worker, max_rank_batch=8)
     assert worker.setup_calls == 1
-    assert worker._decode_graph_captures == 1
+    assert worker._graph.decode_graph_captures == 1
     assert worker.events.count("graph_setup") == 1
 
 
@@ -282,15 +279,15 @@ def test_real_setup_reentered_with_the_graphs_present_captures_nothing():
     worker._current_decode_max_rank_batch_size = 2
     worker._warmup_cuda_graphs()
     assert worker.setup_calls == 2
-    assert worker._decode_graph_captures == 1
+    assert worker._graph.decode_graph_captures == 1
 
 
 def test_real_setup_refuses_to_recapture_a_torn_down_retained_instance():
     worker = _worker(GLM5, retains_decode=True, graphs=True)
     worker.prepare_deployment()
-    worker._cuda_graph_manager = None
-    worker._glm5_whole_model_graph = False
-    worker._whole_model_segment = None
+    worker._graph.cuda_graph_manager = None
+    worker._graph.glm5_whole_model_graph = False
+    worker._graph.whole_model_segment = None
     # The reuse switch names the teardown first ...
     with pytest.raises(RuntimeError, match="tore down the captured decode graph state"):
         worker._assert_decode_graph_state_kept("prefill->decode")
@@ -300,7 +297,7 @@ def test_real_setup_refuses_to_recapture_a_torn_down_retained_instance():
     with pytest.raises(RuntimeError, match="its graphs are captured once per process"):
         worker._warmup_cuda_graphs()
     assert worker.setup_calls == 2
-    assert worker._decode_graph_captures == 1
+    assert worker._graph.decode_graph_captures == 1
 
 
 def test_capture_flavor_is_measured_on_the_default_lifecycle():
@@ -333,7 +330,7 @@ def test_capture_flavor_is_measured_on_the_default_lifecycle():
     assert captured["allocator_gib"] * st.GIB == 64 * MiB
     assert captured["external_gib"] * st.GIB == 8 * MiB
     assert eager["unavailable"] is None
-    assert worker._decode_graph_captures == 1
+    assert worker._graph.decode_graph_captures == 1
 
 
 def test_a_requested_startup_capture_that_produces_no_graph_fails_the_startup():
@@ -374,8 +371,8 @@ def test_no_startup_capture_without_a_retained_instance_and_requested_graphs(
         "comm", "decode_build", "pool_sized", ("to_prefill", exit_mode),
     ]
     assert worker.setup_calls == 0
-    assert worker._decode_graph_captures == 0
-    assert worker._cuda_graph_manager is None
+    assert worker._graph.decode_graph_captures == 0
+    assert worker._graph.cuda_graph_manager is None
     assert worker.startup_transient[1] == st.StartupTransient.missing(
         st.FLAVOR_CAPTURE, st.SEAM_DEPLOYMENT_PREPARE, 8, NO_STARTUP_CAPTURE,
     ).as_dict()

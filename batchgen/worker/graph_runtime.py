@@ -9,8 +9,12 @@ still initialized and reset by the worker's teardown.
 It also owns every ``batchgen.cuda_graph`` import the worker used to make:
 the manager/bucketing constructors, the adapter ABC used by the startup type
 backstop, the per-step ``BatchState`` snapshot, the model-agnostic
-eager-vs-graph compare, and bucket-size generation. ``batchgen_worker.py``
-therefore names no ``batchgen.cuda_graph`` module at all.
+eager-vs-graph compare, and bucket-size generation. The one exception is
+main's decode-width ladder (``batchgen.cuda_graph.buckets``:
+``decode_graph_bucket_sizes``, ``check_decode_width_within_buckets``,
+``DecodeWidthExceedsGraphBucketError``), which the worker imports directly
+since the rebase onto main 1c372209; routing it through this class is a
+follow-up, not part of the rebase.
 
 What this class is NOT, in this slice: a capture/replay engine. The capture,
 eligibility, and replay logic stays in the worker and reads this object's

@@ -11419,10 +11419,10 @@ class BatchGenWorker:
 		Admission is bounded by the decode width the ladder covers, so a wider
 		step is a regression; every rank sees the same width and raises
 		together. Eager deployments return without a check."""
-		bucketing = getattr(self, "_whole_model_bucketing", None)
+		bucketing = self._graph.whole_model_bucketing
 		if (
-			getattr(self, "_whole_model_graph", False)
-			and getattr(self, "_cuda_graph_manager", None) is not None
+			self._graph.whole_model_graph
+			and self._graph.cuda_graph_manager is not None
 			and bucketing is not None
 		):
 			top = int(max(bucketing.bucket_sizes))
@@ -11680,7 +11680,7 @@ class BatchGenWorker:
 		exception: it releases only the graph state, never the model state.
 		"""
 		if (
-			getattr(self, "_decode_graph_captures", 0) > 0
+			self._graph.decode_graph_captures > 0
 			and self.parallel_manager.holds_instance("decode")
 			and not getattr(self, "_criticality_probe_recapture", False)
 		):
@@ -11692,7 +11692,7 @@ class BatchGenWorker:
 
 	def _record_decode_graph_capture(self) -> None:
 		"""Count one completed decode graph capture for the live decode owner."""
-		self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
+		self._graph.decode_graph_captures = self._graph.decode_graph_captures + 1
 
 	def _assert_decode_attention_weights_registered(self) -> None:
 		"""A reused decode instance keeps its resident attention weights.
@@ -11838,19 +11838,19 @@ class BatchGenWorker:
 		before ``_warmup_cuda_graphs`` below, where the KV pool is sized and
 		the decode instance is live.
 		"""
-		captures = getattr(self, "_decode_graph_captures", 0)
+		captures = self._graph.decode_graph_captures
 		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
 		self._current_decode_max_rank_batch_size = 1
 		self._bind_decode_attention_metadata_for_graph_config([])
 		self._warmup_cuda_graphs()
 		if (
-			getattr(self, "_decode_graph_captures", 0) != captures + 1
+			self._graph.decode_graph_captures != captures + 1
 			or not self._decode_graph_state_present()
 		):
 			raise RuntimeError(
 				f"Rank {self.rank}: startup decode graph capture produced no "
 				f"decode graphs (captures {captures} -> "
-				f"{getattr(self, '_decode_graph_captures', 0)}, graph state "
+				f"{self._graph.decode_graph_captures}, graph state "
 				f"present={self._decode_graph_state_present()}); the graphs "
 				"are requested and the decode instance is kept, so they must "
 				"be captured before readiness"
@@ -18610,14 +18610,14 @@ class BatchGenWorker:
 			and "glm" in (getattr(self, "model_name", "") or "").lower()
 		)
 		generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
-			graph_manager_is_initialized=self._cuda_graph_manager is not None,
+			graph_manager_is_initialized=self._graph.cuda_graph_manager is not None,
 			global_batch_has_queueing=has_queueing,
 			model_name=getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 		)
 		return bool(
 			generic_cuda_graph_warmup_needed
-			or (glm5_whole_graph_requested and self._cuda_graph_manager is None)
+			or (glm5_whole_graph_requested and self._graph.cuda_graph_manager is None)
 			or self._glm5_whole_model_graph_current_bucket_missing()
 			or self._criticality_probe_recapture
 		)

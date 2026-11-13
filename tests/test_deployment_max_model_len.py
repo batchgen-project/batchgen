@@ -29,6 +29,7 @@ from tests.test_prompt_rejection_fails_one_request import (
     _chat_line, _items, _scheduler,
 )
 from tests.test_batch_in_progress_failure import bs
+from tests.worker.worker_fakes import make_graph_state
 from tests.worker_method_source import load_worker_methods
 
 
@@ -321,8 +322,8 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
 
     def captured_graphs():
         events.append("capture")
-        worker._decode_graph_captures += 1
-        worker._cuda_graph_manager = object()
+        worker._graph.decode_graph_captures += 1
+        worker._graph.cuda_graph_manager = object()
     worker = SimpleNamespace(
         rank=0, comm=None, parallel_manager=SimpleNamespace(decode_instance=None),
         _transition_phase=lambda key, **kwargs: (events.append(key.phase) or True, False),
@@ -338,7 +339,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _sync_decode_moe_rank_counts=lambda *args, **kwargs: None,
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
         _warmup_cuda_graphs=captured_graphs,
-        _decode_graph_captures=0, _cuda_graph_manager=None,
+        _graph=make_graph_state(),
     )
     worker._capture_startup_decode_graphs = (
         lambda: methods["_capture_startup_decode_graphs"](worker))
