@@ -14,6 +14,7 @@ BatchGen includes three watchdog mechanisms and a health endpoint for detecting 
 
 - **General/decode watchdog**: On timeout, the watchdog sends `SIGQUIT` to the parent process, triggering graceful shutdown. The `/health` endpoint returns `503 Unhealthy` if the server is still reachable during shutdown.
 - **Startup watchdog**: On timeout, the process exits immediately with code 1 and error logs. Since `/health` isn't serving yet during startup (uvicorn blocks on worker initialization), the caller detects failure via the process exit code.
+- **Startup phase budgets** (`--startup-phase-timeout-scale`, always on): each named startup phase (weight-store staging, host KV allocation, model build, the communicator rendezvous, ...) of the server and of every rank has a budget, and a phase that stays past it fails the start-up with a CRITICAL line naming the rank, the phase and the seconds. On several nodes the budget of the communicator rendezvous starts only once every node has reached it; until then the waiting ranks are not charged, and a WARNING once a minute names each node not yet there and what it is doing (for example `node 3 (node 3 server in host-kv-allocation for 1100s)`).
 
 ---
 

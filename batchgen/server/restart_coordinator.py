@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,10 @@ def _down_key(generation: int, node: int) -> str:
     return f"down/{generation}/node{node}"
 
 
+def _startup_key(node: int) -> str:
+    return f"startup/node{node}"
+
+
 def _alive_key(node: int) -> str:
     return f"alive/node{node}"
 
@@ -277,6 +281,16 @@ class RestartCoordinator:
         # A dead store is never closed or released, only kept: its own
         # teardown may block on the very socket that hangs.
         self._abandoned_store: Optional[Any] = None
+        # Start-up progress shared between nodes (see publish_startup_progress):
+        # this node's latest value and the one last written, each peer's last
+        # read value, and when this node first saw every node reach a phase.
+        self._startup_lock = threading.Lock()
+        self._startup_active = False
+        self._local_startup: Optional[str] = None
+        self._local_reached: FrozenSet[str] = frozenset()
+        self._published_startup: Optional[str] = None
+        self._peer_startup: Dict[int, Dict[str, Any]] = {}
+        self._all_reached_at: Dict[str, float] = {}
         self._follower: Optional[threading.Thread] = None
         self._heartbeat: Optional[threading.Thread] = None
         self._watchdog: Optional[threading.Thread] = None
@@ -684,11 +698,92 @@ class RestartCoordinator:
                 return node, age
         return None
 
+    # ---------------------- Start-up progress ----------------------
+    def publish_startup_progress(
+        self, progress: str, reached: FrozenSet[str]
+    ) -> None:
+        """This node's start-up progress, for the peers' startup watchdogs.
+
+        Makes no store call: the heartbeat thread writes the value, and the
+        follower reads the peers' values, so the watchdog that calls this
+        never blocks on a store that stopped answering.
+        """
+        if not self.enabled:
+            return
+        value = json.dumps(
+            {"progress": progress, "reached": sorted(reached)}, sort_keys=True
+        )
+        with self._startup_lock:
+            self._local_startup = value
+            self._local_reached = frozenset(reached)
+            self._startup_active = True
+
+    def end_startup_progress(self) -> None:
+        """Start-up is over here: stop publishing and reading progress."""
+        with self._startup_lock:
+            self._startup_active = False
+
+    def all_nodes_reached_for_s(self, phase: str) -> Optional[float]:
+        """Seconds since this node saw every node reach ``phase``, or None
+        while some node has not. Judged on this node's clock only."""
+        with self._startup_lock:
+            reached = phase in self._local_reached and all(
+                phase in self._peer_startup.get(node, {}).get("reached", ())
+                for node in range(self._nnodes)
+                if node != self._node_rank
+            )
+            if not reached:
+                return None
+            first = self._all_reached_at.setdefault(phase, self._clock())
+        return self._clock() - first
+
+    def nodes_not_reached(self, phase: str) -> List[str]:
+        """``node <n> (<its progress>)`` for each node not yet in ``phase``."""
+        missing = []
+        with self._startup_lock:
+            if phase not in self._local_reached:
+                missing.append(f"node {self._node_rank} (this node)")
+            for node in range(self._nnodes):
+                if node == self._node_rank:
+                    continue
+                peer = self._peer_startup.get(node)
+                if peer is None:
+                    missing.append(f"node {node} (no start-up progress published yet)")
+                elif phase not in peer.get("reached", ()):
+                    missing.append(f"node {node} ({peer.get('progress', '?')})")
+        return missing
+
+    def _publish_startup(self, store: Any) -> None:
+        with self._startup_lock:
+            if not self._startup_active or self._local_startup == self._published_startup:
+                return
+            value = self._local_startup
+        store.set(_startup_key(self._node_rank), value)
+        with self._startup_lock:
+            self._published_startup = value
+
+    def _read_peer_startup(self, store: Any) -> None:
+        with self._startup_lock:
+            if not self._startup_active:
+                return
+        for node in range(self._nnodes):
+            if node == self._node_rank:
+                continue
+            key = _startup_key(node)
+            if not store.check([key]):
+                continue
+            value = json.loads(_text(store.get(key)))
+            with self._startup_lock:
+                self._peer_startup[node] = value
+
     # ---------------------- Heartbeat ----------------------
     def _beat(self) -> None:
-        """Advance this node's heartbeat by one tick."""
+        """Advance this node's heartbeat by one tick, and publish its
+        start-up progress when that changed."""
         try:
-            self._require_store().add(_alive_key(self._node_rank), 1)
+            store = self._require_store()
+            store.add(_alive_key(self._node_rank), 1)
+            self._publish_startup(store)
         except Exception as exc:
             self._record_control_error(exc)
             return
@@ -806,6 +901,7 @@ class RestartCoordinator:
                 if hooks.on_peer_lost is not None
                 else None
             )
+            self._read_peer_startup(self._require_store())
         except Exception as exc:
             self._record_control_error(exc)
             return self._error_backoff_s

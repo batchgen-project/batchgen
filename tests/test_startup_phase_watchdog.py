@@ -55,7 +55,9 @@ class FakeClock:
 
 def record(slots=3, clock=None):
     clock = clock or FakeClock()
-    return StartupPhaseRecord(slots, [0.0] * (slots * 3), clock=clock), clock
+    return StartupPhaseRecord(
+        slots, [0.0] * (slots * StartupPhaseRecord._FIELDS), clock=clock
+    ), clock
 
 
 def labels(slots):
@@ -112,7 +114,7 @@ def test_a_slot_being_written_reads_as_unavailable_rather_than_stuck():
     clock.advance(5.0)
     assert phases.read(2) == (PHASE_DECODE_SHARD_BUILD, 5.0)
     # Simulate a writer caught between its two counter bumps.
-    phases._array[2 * 3] += 1.0
+    phases._array[2 * StartupPhaseRecord._FIELDS] += 1.0
     assert phases.read(2) is None
 
 
@@ -333,7 +335,7 @@ def test_a_breach_handler_that_raises_does_not_kill_the_thread(caplog):
 def test_a_record_that_cannot_be_read_is_logged_and_retried(caplog):
     class Hostile(StartupPhaseRecord):
         def __init__(self):
-            super().__init__(1, [0.0, 0.0, 0.0])
+            super().__init__(1, [0.0] * StartupPhaseRecord._FIELDS)
             self.reads = 0
 
         def read(self, slot):

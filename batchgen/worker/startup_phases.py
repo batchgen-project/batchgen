@@ -35,7 +35,10 @@ import contextlib
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol,
+    Sequence, Tuple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,8 @@ PHASE_DECODE_SHARD_BUILD = "decode-shard-build"
 PHASE_PREFILL_CONFIGURE = "prefill-configure"
 #: One-time buffer/handshake prewarm that must not land on the first request.
 PHASE_PREWARM = "prewarm"
+#: The server's own host KV cache allocation, before any worker exists.
+PHASE_HOST_KV_ALLOCATION = "host-kv-allocation"
 
 #: Every phase a startup may report, in wire order: a record stores a phase's
 #: INDEX in this tuple, so a name may be appended but never moved or removed.
@@ -71,7 +76,15 @@ STARTUP_PHASES: Tuple[str, ...] = (
     PHASE_DECODE_SHARD_BUILD,
     PHASE_PREFILL_CONFIGURE,
     PHASE_PREWARM,
+    PHASE_HOST_KV_ALLOCATION,
 )
+
+#: Phases that wait for ranks on every node. Their budget runs from the
+#: moment this node has seen every node reach the phase, not from a local
+#: rank's entry: a node still loading before its workers exist is not a
+#: stalled rendezvous, and charging its delay to the ranks waiting for it
+#: fails the cohort while blaming the earliest arrivals.
+CROSS_NODE_PHASES: FrozenSet[str] = frozenset({PHASE_COMMUNICATOR_INIT})
 
 _PHASE_INDEX: Dict[str, int] = {
     name: index for index, name in enumerate(STARTUP_PHASES)
@@ -128,8 +141,10 @@ class StartupPhaseRecord:
     is either idle or holds (phase, entry time).
     """
 
-    #: Per slot: sequence counter, phase index, entry time.
-    _FIELDS = 3
+    #: Per slot: sequence counter, phase index, entry time, and the bitmask
+    #: of every phase the slot has entered since its last reset (a phase a
+    #: rank passed between two watchdog polls still counts as reached).
+    _FIELDS = 4
     #: Phase index of a slot that is in no tracked phase.
     _IDLE = -1
 
@@ -175,13 +190,16 @@ class StartupPhaseRecord:
             )
         return slot * self._FIELDS
 
-    def _store(self, slot: int, index: int, entered_at: float) -> None:
+    def _store(
+        self, slot: int, index: int, entered_at: float, reached: float
+    ) -> None:
         base = self._base(slot)
         array = self._array
-        # Odd while the pair below is being written, even once it is stable.
+        # Odd while the fields below are being written, even once stable.
         array[base] = array[base] + 1.0
         array[base + 1] = float(index)
         array[base + 2] = entered_at
+        array[base + 3] = reached
         array[base] = array[base] + 1.0
 
     def reset(self, slots: Optional[Sequence[int]] = None) -> None:
@@ -191,15 +209,27 @@ class StartupPhaseRecord:
         cohort's slots must not still hold the previous one's phases.
         """
         for slot in range(self.slots) if slots is None else slots:
-            self._store(slot, self._IDLE, 0.0)
+            self._store(slot, self._IDLE, 0.0, 0.0)
 
     def enter(self, slot: int, phase: str) -> None:
         """``slot`` has just entered ``phase``; its budget starts now."""
-        self._store(slot, _phase_index(phase), self._clock())
+        index = _phase_index(phase)
+        reached = int(self._array[self._base(slot) + 3]) | (1 << index)
+        self._store(slot, index, self._clock(), float(reached))
 
     def leave(self, slot: int) -> None:
         """``slot`` is in no tracked phase, so no budget applies to it."""
-        self._store(slot, self._IDLE, 0.0)
+        reached = self._array[self._base(slot) + 3]
+        self._store(slot, self._IDLE, 0.0, reached)
+
+    def reached(self) -> FrozenSet[str]:
+        """Every phase any slot has entered since its last reset."""
+        mask = 0
+        for slot in range(self.slots):
+            mask |= int(self._array[self._base(slot) + 3])
+        return frozenset(
+            name for index, name in enumerate(STARTUP_PHASES) if mask & (1 << index)
+        )
 
     def read(self, slot: int) -> Optional[Tuple[str, float]]:
         """``(phase, seconds in it)`` for ``slot``.
@@ -294,6 +324,24 @@ class NullStartupPhaseReporter:
 NULL_STARTUP_PHASE_REPORTER = NullStartupPhaseReporter()
 
 
+class ClusterRendezvous(Protocol):
+    """What the watchdog needs from the other nodes, without a blocking call.
+
+    ``publish`` hands this node's startup progress to whatever carries it to
+    the peers; the two readers answer from what the peers last published.
+    None of the three may block on the network: a watchdog thread stuck in a
+    store call could not fire for any other slot.
+    """
+
+    def publish_startup_progress(
+        self, progress: str, reached: FrozenSet[str]
+    ) -> None: ...
+
+    def all_nodes_reached_for_s(self, phase: str) -> Optional[float]: ...
+
+    def nodes_not_reached(self, phase: str) -> List[str]: ...
+
+
 class StartupPhaseWatchdog:
     """Fails a startup that has stopped inside one phase, with the evidence.
 
@@ -320,6 +368,9 @@ class StartupPhaseWatchdog:
         budgets: Optional[Dict[str, float]] = None,
         default_budget_s: float = DEFAULT_PHASE_BUDGET_S,
         log: Optional[logging.Logger] = None,
+        cluster: Optional[ClusterRendezvous] = None,
+        wait_log_interval_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if len(slot_labels) != record.slots:
             raise ValueError(
@@ -341,6 +392,12 @@ class StartupPhaseWatchdog:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._fired = False
+        # Multi-node: carries this node's progress to the peers and says when
+        # every node has reached a cross-node phase. None on one node.
+        self._cluster = cluster
+        self._wait_log_interval_s = wait_log_interval_s
+        self._clock = clock
+        self._last_wait_log: Dict[str, float] = {}
 
     @property
     def fired(self) -> bool:
@@ -365,13 +422,58 @@ class StartupPhaseWatchdog:
             live.append((label, current[0], current[1]))
         return live
 
+    @staticmethod
+    def _progress(snapshot: List[Tuple[str, str, float]]) -> str:
+        """This node's startup progress as a peer's diagnostic names it."""
+        if not snapshot:
+            return "between startup phases"
+        label, phase, seconds = max(snapshot, key=lambda item: item[2])
+        return f"{label} in {phase} for {seconds:.0f}s"
+
+    def _waiting_for_peers(
+        self, label: str, phase: str, seconds: float
+    ) -> None:
+        """Log, at most once per interval and phase, which nodes a local
+        rank is still waiting for in a cross-node phase."""
+        now = self._clock()
+        last = self._last_wait_log.get(phase)
+        if last is not None and now - last < self._wait_log_interval_s:
+            return
+        self._last_wait_log[phase] = now
+        self._log.warning(
+            "[startup-watchdog] %s has waited %.0fs in %r for nodes that have "
+            "not reached it: %s; its %.0fs budget starts once every node has",
+            label,
+            seconds,
+            phase,
+            "; ".join(self._cluster.nodes_not_reached(phase)),
+            self.budget_s(phase),
+        )
+
     def poll(self) -> Optional[str]:
-        """One pass over the record; the breach reason, or None."""
-        stuck = [
-            (label, phase, seconds, self.budget_s(phase))
-            for label, phase, seconds in self.snapshot()
-            if seconds > self.budget_s(phase)
-        ]
+        """One pass over the record; the breach reason, or None.
+
+        A slot in a cross-node phase is charged from when this node saw every
+        node reach that phase (or from its own entry, if later); until every
+        node has, it is not charged at all and the nodes it waits for are
+        logged by name.
+        """
+        snapshot = self.snapshot()
+        if self._cluster is not None:
+            self._cluster.publish_startup_progress(
+                self._progress(snapshot), self._record.reached()
+            )
+        stuck = []
+        for label, phase, seconds in snapshot:
+            budget = self.budget_s(phase)
+            if phase in CROSS_NODE_PHASES and self._cluster is not None:
+                together = self._cluster.all_nodes_reached_for_s(phase)
+                if together is None:
+                    self._waiting_for_peers(label, phase, seconds)
+                    continue
+                seconds = min(seconds, together)
+            if seconds > budget:
+                stuck.append((label, phase, seconds, budget))
         if not stuck:
             return None
         for label, phase, seconds, budget in stuck:
@@ -431,6 +533,8 @@ class StartupPhaseWatchdog:
 
 
 __all__ = [
+    "CROSS_NODE_PHASES",
+    "ClusterRendezvous",
     "DEFAULT_PHASE_BUDGET_S",
     "DEFAULT_POLL_INTERVAL_S",
     "NULL_STARTUP_PHASE_REPORTER",
@@ -439,6 +543,7 @@ __all__ = [
     "PHASE_COMMUNICATOR_INIT",
     "PHASE_DECODE_SHARD_BUILD",
     "PHASE_EXTENSION_PRELOAD",
+    "PHASE_HOST_KV_ALLOCATION",
     "PHASE_MODEL_BUILD",
     "PHASE_MODEL_EXTENSION_PRELOAD",
     "PHASE_PREFILL_CONFIGURE",
