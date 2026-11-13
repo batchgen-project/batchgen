@@ -13,7 +13,8 @@ from typing import List
 import pytest
 import torch
 
-from batchgen.query_book import bind_local_sequence_to_query_book, release_local_query_slot
+from batchgen.query_book import bind_query_book_slot, release_query_book_slot
+from tests.worker.worker_fakes import attach_identity
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -47,7 +48,7 @@ def _worker_methods(*names):
             all_gather=lambda out, value: [item.copy_(value) for item in out]
         ),
         "SequenceStatus": SequenceStatus,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in names}
@@ -80,12 +81,13 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         old = "a" if rank == 0 else "b"
         new = "b" if rank == 0 else "a"
         worker_state = SimpleNamespace(
-            rank=rank, world_size=2, global_batch=batch,
+            global_batch=batch,
             prefix_cache_runtime_config=SimpleNamespace(
                 group_specs=[SimpleNamespace(raw_page_tokens=2)]),
-            _uuid_to_local_map={old: 4}, _local_to_uuid_map={4: old},
-            query_book={4: object()}, _free_local_indices=set(),
+            query_book={4: object()},
         )
+        attach_identity(worker_state, rank=rank, world_size=2,
+                        local_world_size=2, bound={old: 4})
         # Prompts live in the trajectory book after admission.
         worker_state._trajectory_tokens = (
             lambda seq, length=None, **_: prompts[seq.uuid][:length]
@@ -108,14 +110,15 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         assert seqs[new].assigned_rank == rank
 
         # Config prefill binds the new owner into the released local slot.
-        idx, next_idx = bind_local_sequence_to_query_book(
+        # The freed slot must be reused, so the never-used counter must not
+        # advance -- the same pair the raw-container helper used to return.
+        counter_before = worker_state.seq_table.next_local_idx
+        idx = bind_query_book_slot(
             new, seqs[new], query_book=worker_state.query_book,
-            local_to_uuid_map=worker_state._local_to_uuid_map,
-            uuid_to_local_map=worker_state._uuid_to_local_map,
-            free_local_indices=worker_state._free_local_indices,
-            next_local_idx=5,
+            table=worker_state.seq_table,
         )
-        assert (idx, next_idx) == (4, 5)
+        assert idx == 4
+        assert worker_state.seq_table.next_local_idx == counter_before
         assert worker_state._local_to_uuid_map == {4: new}
 
 
@@ -164,7 +167,7 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         assign_rank=lambda uuid, owner: setattr(seqs[uuid], "assigned_rank", owner),
     )
     worker_state = SimpleNamespace(
-        rank=rank, world_size=world_size, global_batch=batch, local_rank=rank,
+        global_batch=batch,
         model_name="gpt-oss-120b", torch_device=torch.device("cpu"),
         # A cached profile keeps the CUDA device-name lookup out of this test.
         # Pre-seeded cache (keyed by the A/B arm, False = profile arm),
@@ -177,10 +180,11 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         _active_batchgen_debug_for_sequences=lambda batch_sequences: {
             "prefix_rank_assignment_mode": "packing_v2"
         },
-        _uuid_to_local_map=dict(slots), _local_to_uuid_map={v: k for k, v in slots.items()},
         query_book={index: object() for index in slots.values()},
-        _free_local_indices=set(),
     )
+    attach_identity(worker_state, rank=rank, world_size=world_size,
+                    local_world_size=world_size, local_rank=rank,
+                    bound=dict(slots))
     worker_state._prefix_rank_packing_mode = types.MethodType(
         _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
         worker_state,

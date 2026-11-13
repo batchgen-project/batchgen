@@ -20,8 +20,9 @@ import numpy as np
 import pytest
 import torch
 
-from batchgen.query_book import release_local_query_slot
+from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
+from tests.worker.worker_fakes import attach_identity
 from tests.worker_method_source import load_worker_functions, load_worker_methods
 
 # What the other rank contributes to the next all_gather_object.
@@ -40,7 +41,8 @@ _METHODS = load_worker_methods(
         "SequenceEntry": SequenceEntry,
         "logging": logging,
         "time": time,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
+        "_release_tokenizer_arenas": lambda **_: None,
         "_admitted_prompt_ids": load_worker_functions(
             ["_admitted_prompt_ids"], {"np": np, "torch": torch},
         )["_admitted_prompt_ids"],
@@ -65,15 +67,16 @@ class _Worker:
     _decode_attn_tp_size = _METHODS["_decode_attn_tp_size"]
 
     def __init__(self, rank, owner_rank=0, attn_tp_size=1):
-        self.rank = rank
         self.owner_rank = owner_rank
         self.parallel_manager = SimpleNamespace(attn_tp_size=attn_tp_size)
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
-        self._uuid_to_local_map = {}
-        self._local_to_uuid_map = {}
+        # `world_size` is the class attribute above; read it rather than
+        # restating it, so the two cannot drift.
+        attach_identity(self, rank=rank, world_size=self.world_size,
+                        local_world_size=self.world_size,
+                        decode_group_size=attn_tp_size)
         self.query_book = {}
-        self._free_local_indices = set()
         self._prefix_sequence_states = {}
         self._response_queue = queue.Queue() if rank == 0 else None
 
@@ -170,7 +173,7 @@ def test_owner_reads_cached_tokens_from_its_prefix_state():
     worker = _Worker(rank=0, owner_rank=0)
     worker._admit_sequences_from_message({"entries": [_TURN_ENTRY]})
     seq = worker.global_batch.get_sequence("turn_abc")
-    worker._uuid_to_local_map["turn_abc"] = 0
+    worker.seq_table.bind("turn_abc", 0)
     worker.query_book[0] = object()
     worker._prefix_sequence_states[seq.global_idx] = SimpleNamespace(
         compute_cached_tokens=32
@@ -216,7 +219,7 @@ def test_batch_completion_without_prefix_cache_reports_zero_cached():
 def _bind_locally(worker, uuid, cached=None):
     """Hold ``uuid`` in this rank's local maps; ``cached`` is its prefix state."""
     seq = worker.global_batch.get_sequence(uuid)
-    worker._uuid_to_local_map[uuid] = 0
+    worker.seq_table.bind(uuid, 0)
     worker.query_book[0] = object()
     if cached is not None:
         worker._prefix_sequence_states[seq.global_idx] = SimpleNamespace(

@@ -25,13 +25,15 @@ from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
+
+from tests.worker.worker_fakes import attach_identity
 import torch
 
 from batchgen.prefix_reuse.eviction import (
     EvictedPageRecorder,
     retire_node_frontiers,
 )
-from batchgen.query_book import release_local_query_slot
+from batchgen.query_book import release_query_book_slot
 from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotArena,
     SnapshotLayout,
@@ -129,7 +131,7 @@ def _worker_methods(dist):
         "describe_prefill_blockers": describe_prefill_blockers,
         "prefill_reclaim_target_pages": prefill_reclaim_target_pages,
         "prefill_host_reserve_page_deficit": prefill_host_reserve_page_deficit,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
         "SequenceStatus": SequenceStatus,
         "_sequence_module": sequence_module,
     }
@@ -406,10 +408,11 @@ class FakeWorker:
         committer=None, rank=0, local_rank=0, world_size=1, local_world_size=1,
         dist=None, trajectory_book=None,
     ):
-        self.rank = rank
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.local_world_size = local_world_size
+        attach_identity(
+            self,
+            rank=rank, world_size=world_size,
+            local_world_size=local_world_size, local_rank=local_rank,
+        )
         self.torch_device = torch.device("cpu")
         self.enable_host_kv_eviction = False
         self.enable_prefix_cache = True
@@ -438,10 +441,7 @@ class FakeWorker:
         self._prefill_pool_wave = None
         # Request-lifecycle surfaces a per-request rejection has to release.
         self._trajectory_book = trajectory_book
-        self._uuid_to_local_map = {}
-        self._local_to_uuid_map = {}
         self.query_book = {}
-        self._free_local_indices = set()
         self._response_queue = FakeResponseQueue()
         self.published_capacity = 0
         self._pool_mode = pool_mode
