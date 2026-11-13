@@ -1933,6 +1933,36 @@ struct DistributedWeightDaemon::Impl {
         return cohort_epoch;
     }
 
+    // The two failure latches, named as in the summary. failure_mutex and
+    // cohort_mutex are taken one after the other, never together, and each
+    // only for a copy. A fault text carries bytes a worker sent, so the dump
+    // replaces invalid UTF-8 instead of throwing.
+    std::string Status() {
+        nlohmann::json status;
+        status["network_ready"] = network_ready.load();
+        {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            const bool transport_failed = failed.load();
+            status["failed"] = transport_failed;
+            status["failure"] = failure_message;
+            status["failure_class"] =
+                transport_failed ? "transport_fatal" : "none";
+        }
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            status["cohort"] = {
+                {"epoch", cohort_epoch},
+                {"state", cohort_state_name(cohort_state)},
+                {"faulted", cohort_faulted},
+                {"fault", cohort_fault},
+                {"fault_class",
+                 cohort_faulted ? "cohort_recoverable" : "none"},
+            };
+        }
+        return status.dump(-1, ' ', false,
+                           nlohmann::json::error_handler_t::replace);
+    }
+
     std::uint64_t BeginCohortSwap() {
         if (!started.load()) {
             fail("distributed weights daemon is not started");
@@ -2222,6 +2252,8 @@ std::string DistributedWeightDaemon::FinishCohortSwap(
     double timeout_seconds) {
     return impl_->FinishCohortSwap(timeout_seconds);
 }
+
+std::string DistributedWeightDaemon::Status() { return impl_->Status(); }
 
 void DistributedWeightDaemon::PrepareStop() { impl_->PrepareStop(); }
 
