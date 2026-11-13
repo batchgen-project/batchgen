@@ -2,15 +2,17 @@
 
 GLM-5.2 stores indexer keys in DeepGEMM's page-split FP8 layout and must score
 them with ``deep_gemm.fp8_paged_mqa_logits`` (the ReLU-gated GLM-5
-aggregation). GLM-5, 5.1 and 5.3 keep bf16 AoS pages and the retired no-ReLU
-Triton scorer. Picking the wrong one is silent -- a misread cache still
+aggregation). GLM-5 and 5.1 keep bf16 AoS pages and the Triton scorer, which
+computes the same ReLU-gated aggregation (pinned numerically by
+``test_glm5_indexer_triton_relu_formula.py``). Picking the wrong one is
+silent -- a misread cache still
 produces 2048 plausible indices -- so the selector is pinned here from source:
 
 * all three production scorer sites (one eager, two graph segments) branch on
   the cache format, not on a model name or an SM version;
 * the page-split arm reaches DeepGEMM with no ``try``/``except`` and no
   gather, so GLM-5.2 cannot silently fall back to the bf16 scorer;
-* the retired scorer survives only on the AoS arm;
+* the bf16 Triton scorer survives only on the AoS arm;
 * the DeepGEMM JIT is warmed before any capture can need it.
 
 These are source-contract tests: importing the segment or model modules pulls
@@ -89,7 +91,7 @@ def test_graph_segment_scorer_branches_on_the_cache_format(class_name):
     page_split_calls = _call_names(branch)
     assert page_split_calls[_DEEPGEMM_SCORER] == 1
     assert page_split_calls[_TRITON_SCORER] == 0
-    # The retired scorer is reachable ONLY outside the page-split branch.
+    # The bf16 Triton scorer is reachable ONLY outside the page-split branch.
     total = _call_names(fn)
     assert total[_DEEPGEMM_SCORER] == 1
     assert total[_TRITON_SCORER] == 1
@@ -174,7 +176,7 @@ def test_eager_page_split_path_has_no_fallback():
     assert not [n for n in ast.walk(fn) if isinstance(n, ast.Try)]
 
 
-def test_eager_aos_path_keeps_the_retired_triton_scorer():
+def test_eager_aos_path_keeps_the_bf16_triton_scorer():
     fn = _method(_tree(_MODEL_SRC), "Glm5Indexer", "score_and_select_paged")
     src = ast.unparse(fn)
     assert "fused_score_pipeline" in src

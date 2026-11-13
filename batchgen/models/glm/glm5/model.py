@@ -542,7 +542,7 @@ class Glm5Indexer(nn.Module):
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
-    def score_and_select(
+    def score_and_select_relu_gated(
         self,
         q_a: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -551,15 +551,37 @@ class Glm5Indexer(nn.Module):
         positions: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Score cached tokens via MQA Q@K and select top-K.
+        """ReLU-gated scoring: score = (relu(Q·K * softmax_scale) * head_gates).sum(heads).
 
-        K is already RoPE'd + Hadamard'd in cache.
-        Q gets: wq_b -> reshape -> RoPE -> Hadamard -> score against cached K.
+        REFERENCE ONLY -- not a fallback. The production ReLU-gated
+        implementations are ``deep_gemm.fp8_paged_mqa_logits`` for page-split
+        FP8 caches (GLM-5.2, 5.3) and the Triton scorers built on
+        ``_relu_gated_head_sum`` for bf16 AoS caches (GLM-5, 5.1), reached
+        through ``_score_and_select_paged_fp8`` / ``fused_score_pipeline``
+        (eager) and the DSA graph segments' ``_score_and_topk`` (captured).
+        This function stays as the readable
+        statement of the formula those kernels compute, and as the fp32 oracle
+        the top-k overlap acceptance measures against; it is deliberately NOT
+        wired into decode, because it materializes a dense ``[batch, n_heads,
+        max_seqlen]`` fp32 score tensor (hundreds of GB at production batch and
+        context) and would be a second, differently-quantized ReLU path able to
+        drift from the captured graph.
+
+        ``F.relu`` is applied to per-head scores BEFORE head-weighting. Without
+        ReLU, negative per-head scores cancel positive ones from other heads
+        during the sum, distorting the top-K selection vs the training-time
+        formulation of GLM-5's indexer. The bf16 Triton scorers fold the
+        positive ``softmax_scale`` into the head gates, which is exact because
+        ``relu(c * x) == c * relu(x)`` for ``c > 0``.
+
+        Also masks ``positions >= cache_seqlens`` with ``-inf`` BEFORE the sum
+        rather than after, so padded positions can't leak any post-ReLU energy
+        into the aggregate.
 
         Args:
             q_a: [batch, 1, q_lora_rank] — q_a intermediate from main attention
             hidden_states: [batch, 1, hidden_size] — for head gate scoring
-            cached_k: [batch, max_seqlen, head_dim] — gathered indexer K (128-dim, with RoPE+Hadamard)
+            cached_k: [batch, max_seqlen, head_dim] — gathered indexer K (RoPE+Hadamard applied)
             cache_seqlens: [batch] — valid lengths
             positions: [batch] or [batch, 1] — current token positions for Q RoPE
             max_seqlen: max sequence length (int) to avoid CPU-GPU sync
@@ -576,102 +598,10 @@ class Glm5Indexer(nn.Module):
             from batchgen.attention.mla.fa3_backend import w8a16_gemm
             q = w8a16_gemm(self.wq_b.weight.data, self.wq_b_scale, q_a)
         else:
-            q = self.wq_b(q_a)  # [batch, 1, n_heads * head_dim]
-        q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
-
-        # Apply RoPE + Hadamard to Q (must match cached K processing)
-        if positions is not None and self.rotary_emb is not None:
-            if _fused_rope_hadamard_fn is not None:
-                cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), max_seqlen)
-                # Reshape [B, n_heads, 128] → [B*n_heads, 128], expand positions
-                B = q.shape[0]
-                q_flat = q.reshape(-1, self.index_head_dim)
-                pos_expanded = positions.reshape(-1).repeat_interleave(self.index_n_heads)
-                q = _fused_rope_hadamard_fn(
-                    q_flat.to(torch.bfloat16), cos.float(), sin.float(),
-                    pos_expanded, scale=self.index_head_dim ** -0.5,
-                ).reshape(B, self.index_n_heads, self.index_head_dim).to(q.dtype)
-            else:
-                q = self._apply_rope_to_q(q, positions)
-                q = _hadamard_transform(q.to(torch.bfloat16)).to(q.dtype)
-
-        # MQA: K is [batch, max_seqlen, head_dim] — no per-head dim
-        # Q @ K^T: [batch, n_heads, 1, head_dim] @ [batch, 1, head_dim, max_seqlen]
-        q = q.unsqueeze(2)  # [batch, n_heads, 1, head_dim]
-        cached_k_t = cached_k.transpose(1, 2).unsqueeze(1)  # [batch, 1, head_dim, max_seqlen]
-        scores = torch.matmul(q, cached_k_t)  # [batch, n_heads, 1, max_seqlen]
-        scores = scores.squeeze(2)  # [batch, n_heads, max_seqlen]
-
-        # Head gate weighting (reference: weights * n_heads^-0.5 * softmax_scale)
-        head_gates = self.weights_proj(hidden_states.squeeze(1))  # [batch, n_heads]
-        head_gates = head_gates.float() * (self.index_n_heads ** -0.5) * self.softmax_scale
-        scores = scores * head_gates.unsqueeze(-1)  # [batch, n_heads, max_seqlen]
-
-        # Mask invalid positions
-        position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
-        mask = position_indices >= cache_seqlens.unsqueeze(1)
-        scores.masked_fill_(mask.unsqueeze(1), float("-inf"))
-
-        # Aggregate across heads and select top-K
-        aggregated = scores.sum(dim=1)  # [batch, max_seqlen]
-        # Clamp topk: index_topk is fixed hyperparameter, max_seqlen is Python int.
-        # Per-sequence masking (-inf) handles varying lengths within the batch.
-        effective_topk = min(self.index_topk, max_seqlen)
-        _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
-        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
-
-    def score_and_select_relu_gated(
-        self,
-        q_a: torch.Tensor,
-        hidden_states: torch.Tensor,
-        cached_k: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-    ) -> torch.Tensor:
-        """ReLU-gated scoring: score = (relu(Q·K * softmax_scale) * head_gates).sum(heads).
-
-        REFERENCE ONLY -- not a fallback. The production ReLU-gated implementation
-        is ``deep_gemm.fp8_paged_mqa_logits``, reached through
-        ``_score_and_select_paged_fp8`` (eager) and the DSA graph segments'
-        ``_score_and_topk`` (captured). This function stays as the readable
-        statement of the formula those kernels compute, and as the fp32 oracle
-        the top-k overlap acceptance measures against; it is deliberately NOT
-        wired into decode, because it materializes a dense ``[batch, n_heads,
-        max_seqlen]`` fp32 score tensor (hundreds of GB at production batch and
-        context) and would be a second, differently-quantized ReLU path able to
-        drift from the captured graph.
-
-        Two differences vs ``score_and_select``:
-
-        1. ``F.relu`` is applied to per-head scores BEFORE head-weighting. Without
-           ReLU, negative per-head scores cancel positive ones from other heads
-           during the sum, distorting the top-K selection vs the training-time
-           formulation of GLM-5's indexer.
-        2. ``softmax_scale`` multiplies the Q·K product directly (not folded into
-           ``head_gates``). Equivalent when ReLU is absent, but with ReLU the
-           ordering matters because scaling the input changes which values clip
-           to zero.
-
-        Also masks ``positions >= cache_seqlens`` with ``-inf`` BEFORE the sum
-        rather than after, so padded positions can't leak any post-ReLU energy
-        into the aggregate.
-
-        Args, returns: same as ``score_and_select``.
-        """
-        batch_size = q_a.shape[0]
-        if max_seqlen is None:
-            max_seqlen = cached_k.shape[1]
-
-        # Q from shared q_a intermediate (same as score_and_select).
-        if hasattr(self, 'wq_b_scale'):
-            from batchgen.attention.mla.fa3_backend import w8a16_gemm
-            q = w8a16_gemm(self.wq_b.weight.data, self.wq_b_scale, q_a)
-        else:
             q = self.wq_b(q_a)
         q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
 
-        # RoPE + Hadamard on Q (same as score_and_select).
+        # RoPE + Hadamard on Q (must match cached K processing).
         if positions is not None and self.rotary_emb is not None:
             if _fused_rope_hadamard_fn is not None:
                 cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), max_seqlen)
@@ -730,7 +660,7 @@ class Glm5Indexer(nn.Module):
 
         Gathers indexer K from paged cache into contiguous tensor using
         cached gather indices (reused across layers within a decode step),
-        then delegates to score_and_select.
+        then scores it with the ReLU-gated ``fused_score_pipeline``.
 
         ``q_index_raw`` ([batch, index_n_heads, index_head_dim]) is the wq_b
         projection when the caller already computed it inside the merged
@@ -780,8 +710,9 @@ class Glm5Indexer(nn.Module):
                 q_index_raw=q_index_raw,
             )
 
-        # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1 -- keep
-        # the retired no-ReLU Triton scorer over a dense gather. GLM-5.2 and
+        # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1 -- score
+        # with the Triton kernels over a dense gather; they compute the same
+        # ReLU-gated formula as DeepGEMM (`_relu_gated_head_sum`). GLM-5.2 and
         # GLM-5.3 cannot reach this branch: their cache is page-split, and a
         # mis-sized cache is named by `cache_is_page_split` rather than
         # falling through.
