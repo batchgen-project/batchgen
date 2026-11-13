@@ -386,7 +386,7 @@ def test_every_decode_graph_capture_is_guarded_then_counted():
         assert any(g < capture for g in guards)
         assert any(r > capture for r in records)
     counter = ast.unparse(_method_ast("_record_decode_graph_capture"))
-    assert "self._decode_graph_captures = " in counter
+    assert "self._graph.decode_graph_captures = " in counter
 
 
 def _find_all(text, needle):
