@@ -513,7 +513,7 @@ class TestFalsyZeroEdgeCases:
         worker_max = 1000
         seq = SequenceEntry(
             uuid="test", global_idx=0, prompt_length=10,
-            max_decode_length=50, text="test"
+            max_decode_length=50
         )
         seq.decoded_length = 60
         # Per-seq check: completed (60 >= 50)

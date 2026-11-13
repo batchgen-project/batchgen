@@ -13,8 +13,10 @@ differences a capture forces.
 
 Route B: the index keys live in DeepGEMM's page-split FP8 layout and are scored
 by the ReLU-gated ``fp8_paged_mqa_logits``; attention over the selected keys
-runs on FlashAttention-3 against a page-size-1 view of the resident latent
-cache, so the selected KV is never gathered. These are the production
+runs through ``batchgen.attention.mla.sparse_dispatch`` (FlashAttention-3
+against a page-size-1 view on Hopper, flashinfer trtllm-gen sparse MLA on
+Blackwell) over the resident latent cache, so the selected KV is never
+gathered. These are the production
 page-split DSA kernels; this module drives them for Kimi's NoPE gated MLA.
 
 Per step, in order:
@@ -37,9 +39,9 @@ Per step, in order:
    ``sum_h (w_h H^-0.5) relu(D^-0.5 q_h . k)`` does, up to FP8 rounding.
 4. **Sparse attention**: ``transform_selected_positions_out`` maps each row's
    logical selection (all keys for a short row, its top-k for a long one) to
-   physical token ids, which act as FA3's page table with ``qv`` = the
-   absorbed query: ``softmax(scale (q_pe . k_pe + q_abs . c)) c`` — the same
-   MLA attention FlashMLA computes over the 576-wide latent.
+   physical token ids, the sparse seam's token rows, with the absorbed
+   query: ``softmax(scale (q_pe . k_pe + q_abs . c)) c`` — the same MLA
+   attention FlashMLA computes over the 576-wide latent.
 5. Out-absorb, sigmoid output gate, ``o_proj``, TP reduce — the dense path's
    own statements.
 
@@ -53,6 +55,8 @@ from typing import NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from batchgen.attention.mla.sparse_dispatch import sparse_mla_decode
 
 from .dsa_index_rotation import (
     KERNEL_INDEX_HEAD_DIM,
@@ -110,18 +114,6 @@ def _latent_token_writer():
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
     return run_paged_kv_token_update_fused
-
-
-def _fa3_with_kvcache():
-    from flash_attn_interface import flash_attn_with_kvcache
-
-    return flash_attn_with_kvcache
-
-
-def _sparse_fa3_num_splits() -> int:
-    from batchgen.attention.dsa.fa3_split_policy import GLM5_SPARSE_FA3_NUM_SPLITS
-
-    return GLM5_SPARSE_FA3_NUM_SPLITS
 
 
 # --------------------------------------------------------------------------- #
@@ -293,7 +285,8 @@ def sparse_mla_attention(
     page_size: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """FA3 over the selected PHYSICAL tokens; ``[B, 1, H, kv_lora_rank]``.
+    """Sparse MLA over the selected PHYSICAL tokens; ``[B, 1, H, kv_lora_rank]``
+    (``batchgen.attention.mla.sparse_dispatch``).
 
     ``primary_page_table`` rows are batch rows, the convention the dense K3
     decode hands FlashMLA, so no slot indirection is passed. Rows at or beyond
@@ -312,20 +305,8 @@ def sparse_mla_attention(
         page_size=int(page_size),
         num_valid_tokens=num_valid_tokens,
     )
-    lora = module.kv_lora_rank
-    flat_kv = mla_blocked_k.view(-1, 1, 1, mla_blocked_k.shape[-1])
-    return _fa3_with_kvcache()(
-        q=q_pe,
-        k_cache=flat_kv[..., lora:],
-        v_cache=flat_kv[..., :lora],
-        qv=absorbed_q,
-        page_table=physical,
-        cache_seqlens=lengths,
-        softmax_scale=float(module.scaling),
-        causal=True,
-        num_splits=_sparse_fa3_num_splits(),
-        return_softmax_lse=False,
-    )
+    return sparse_mla_decode(
+        q_pe, absorbed_q, mla_blocked_k, physical, lengths, float(module.scaling))
 
 
 # --------------------------------------------------------------------------- #

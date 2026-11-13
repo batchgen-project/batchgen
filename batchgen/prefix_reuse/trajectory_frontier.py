@@ -1157,7 +1157,7 @@ class TrajectoryFrontierRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Session -> owning serve group map (the admission pin)
+# Session -> owning serve group map (admission residency)
 # ---------------------------------------------------------------------------
 
 
@@ -1199,10 +1199,9 @@ class TrajectorySessionGroupIndex:
     ONE registry for that group, so a continuation that lands on a different
     group is a clean MISS no matter how exactly its tokens match. Default group
     assignment knows nothing about sessions, so consecutive batches place a
-    session's continuations wherever the balancer likes -- in the dual-node
-    run that was the opposite group every time. This map is the admission-side
-    input that fixes it: the owning group of every committed session, known to
-    EVERY rank.
+    session's continuations wherever the balancer likes. This map supplies
+    the owning group and resident boundary of every committed session to
+    EVERY rank, so placement can credit the work a restore would save.
 
     Why every rank: group assignment runs identically on all ranks and its
     output must agree, so the map it consults has to be world-identical. Every
@@ -1221,18 +1220,21 @@ class TrajectorySessionGroupIndex:
     for that case.
 
     This map decides SCHEDULING only. A resolution is a digest match, not the
-    token-level predicate: the lookup on the pinned group still decides hit or
+    token-level predicate: the lookup on the chosen group still decides hit or
     miss on the tokens themselves, so a digest collision costs a placement,
     never a wrong reuse.
     """
 
-    __slots__ = ("_by_session", "_index", "_boundaries", "_pins")
+    __slots__ = (
+        "_by_session", "_index", "_boundaries", "_honored_on_owner", "_placed_offgroup"
+    )
 
     def __init__(self) -> None:
         self._by_session: dict[str, SessionGroupEntry] = {}
         self._index: dict[str, SessionGroupEntry] | None = None
         self._boundaries: tuple[int, ...] | None = None
-        self._pins = 0
+        self._honored_on_owner = 0
+        self._placed_offgroup = 0
 
     # -- read ---------------------------------------------------------------
 
@@ -1240,10 +1242,16 @@ class TrajectorySessionGroupIndex:
         return len(self._by_session)
 
     @property
-    def pins(self) -> int:
-        """Sequences this rank stamped onto a session's owning group."""
+    def honored_on_owner(self) -> int:
+        """Continuations placed on the group holding their resident prefix."""
 
-        return self._pins
+        return self._honored_on_owner
+
+    @property
+    def placed_offgroup(self) -> int:
+        """Continuations placed elsewhere for a planned full recompute."""
+
+        return self._placed_offgroup
 
     @property
     def entries(self) -> tuple[SessionGroupEntry, ...]:
@@ -1256,10 +1264,13 @@ class TrajectorySessionGroupIndex:
     def get(self, session_key: str) -> SessionGroupEntry | None:
         return self._by_session.get(str(session_key))
 
-    def record_pin(self) -> None:
-        """Count one sequence placed by this map, for the drain row."""
+    def record_pin(self, *, placed_on_owner: bool) -> None:
+        """Count the final placement of one continuation, for the drain row."""
 
-        self._pins += 1
+        if placed_on_owner:
+            self._honored_on_owner += 1
+        else:
+            self._placed_offgroup += 1
 
     # -- write --------------------------------------------------------------
 

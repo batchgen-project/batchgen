@@ -36,8 +36,11 @@ write_fp8``                           graph steps)
                                       prefill scorer (``fast_topk_2048_out``)
 ``deep_gemm``                         ``fp8_paged_mqa_logits`` (+ metadata) on
                                       decode, ``fp8_mqa_logits`` on prefill
-``flash_attn_interface``              FA3 ``qv`` sparse attention (decode and
-                                      prefill)
+sparse attention modules              ``sparse_dispatch.site_symbols()`` for
+                                      the device: FA3 ``qv`` on Hopper;
+                                      flashinfer trtllm-gen sparse MLA
+                                      (decode) and ``flash_mla`` sparse
+                                      prefill on Blackwell
 ====================================  ========================================
 
 Triton kernels on the same paths (the selection transform, the scorer
@@ -49,7 +52,7 @@ DeepGEMM JIT kernels (one per aligned batch) is not done here.
 from __future__ import annotations
 
 import importlib
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 #: The fused LayerNorm + identity-RoPE + e4m3 quantize + page-split write of a
 #: decode step's index keys (``indexer.indexer_k_norm_rope_write_fp8``).
@@ -67,7 +70,9 @@ K31_DSA_AOT_EXTENSIONS: Tuple[str, ...] = (
     FAST_TOPK_EXTENSION,
 )
 
-#: Third-party modules the DSA paths call, and the callables they need.
+#: Third-party modules the DSA indexer calls, and the callables it needs. The
+#: sparse-attention modules depend on the device and come from
+#: ``batchgen.attention.mla.sparse_dispatch.site_symbols()``.
 K31_DSA_SITE_SYMBOLS: Dict[str, Tuple[str, ...]] = {
     "deep_gemm": (
         "fp8_paged_mqa_logits",
@@ -75,7 +80,6 @@ K31_DSA_SITE_SYMBOLS: Dict[str, Tuple[str, ...]] = {
         "get_num_sms",
         "fp8_mqa_logits",
     ),
-    "flash_attn_interface": ("flash_attn_with_kvcache",),
 }
 
 
@@ -124,6 +128,7 @@ def require_servable_indexer(dsa) -> None:
 
 def preload_dsa_runtime(
     import_module: Callable[[str], object] = importlib.import_module,
+    attention_symbols: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> Tuple[str, ...]:
     """Import every DSA extension and check every third-party symbol.
 
@@ -132,9 +137,16 @@ def preload_dsa_runtime(
     dev-JIT fallback at the first DSA layer. A loaded extension stays in
     ``sys.modules``, so the kernels' own lazy loaders resolve to it later.
 
+    ``attention_symbols`` defaults to the sparse-attention seam's modules for
+    this device (``sparse_dispatch.site_symbols()``).
+
     Returns the names resolved, in order. Raises :class:`DsaRuntimeError`
     naming the first missing piece.
     """
+    if attention_symbols is None:
+        from batchgen.attention.mla.sparse_dispatch import site_symbols
+
+        attention_symbols = site_symbols()
     resolved = []
     for name in K31_DSA_AOT_EXTENSIONS:
         try:
@@ -146,7 +158,7 @@ def preload_dsa_runtime(
                 "at serve time"
             ) from exc
         resolved.append(name)
-    for module_name, symbols in K31_DSA_SITE_SYMBOLS.items():
+    for module_name, symbols in {**K31_DSA_SITE_SYMBOLS, **attention_symbols}.items():
         try:
             module = import_module(module_name)
         except ImportError as exc:

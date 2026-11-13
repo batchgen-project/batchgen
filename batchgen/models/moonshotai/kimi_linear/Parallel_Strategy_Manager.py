@@ -33,9 +33,11 @@ Read that first when modifying this file or batchgen_worker.py.
 """
 
 import logging
+import operator
 import os
 import time
 import types
+from dataclasses import dataclass
 
 import torch
 
@@ -90,6 +92,105 @@ def _replace_param(root_module, dotted_name, tensor):
 # user sequences. The planner allocates the pool as ``sequence_slots + 1``
 # (planner.py kda_state_slots); this is that "+ 1".
 _KDA_GRAPH_SCRATCH_SLOTS = 1
+
+# Reserved synthetic sequence ids for the startup decode probe's KDA slots.
+# The id only has to be distinct from everything that can hold a slot in the
+# same KDAStateGPUManager: admitted sequences are non-negative, the decode
+# graph's scratch slot is GRAPH_SCRATCH_SEQ_ID = -1_000_001
+# (cuda_graph_segments.py), and prefix-pool segment pseudo sids are
+# ``-(rank + 1 + world_size * counter)`` (batchgen_worker.py
+# ``_next_pool_segment_sid``) — small negatives that grow by one per segment.
+# Probing from -3_000_000_001 downward is outside all of these for any
+# realistic campaign, and ``startup_decode_probe_step`` still refuses if an
+# id is somehow already mapped.
+_KDA_PROBE_SEQ_ID_BASE = -3_000_000_001
+
+# Per-token fp32 scale bytes of DeepGEMM's page-split FP8 index-key carrier.
+# The authoritative constant is
+# ``batchgen_kernels.attention.dsa.indexer_k_quant.SCALE_BYTES_PER_TOKEN``;
+# it is not imported here because that package's ``__init__`` needs triton
+# (absent on CPU test environments), and the layout itself is a fixed kernel
+# ABI the real writer validates (``cache_is_page_split``) before any launch.
+_DSA_PAGE_SPLIT_SCALE_BYTES = 4
+
+
+class StartupDecodeProbeError(RuntimeError):
+    """The startup decode probe cannot honor its cap-width contract."""
+
+
+@dataclass(frozen=True)
+class StartupDecodeProbePlan:
+    """The bounded synthetic decode shape used by the startup probe."""
+
+    batch_size: int
+    past_tokens: int = 1
+
+
+def plan_startup_decode_probe(
+    padding_bsz: int, configured_cap: int
+) -> StartupDecodeProbePlan:
+    """Validate and describe one cap-width synthetic decode step.
+
+    Local copy of the gpt-oss probe seam
+    (batchgen/models/openai/gpt_oss_120b/Parallel_Strategy_Manager.py):
+    model families do not import one another's modules, so the helper is
+    duplicated here rather than cross-imported.
+    """
+    try:
+        if isinstance(padding_bsz, bool) or isinstance(configured_cap, bool):
+            raise TypeError("bool is not a batch-width integer")
+        requested = operator.index(padding_bsz)
+        cap = operator.index(configured_cap)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "startup decode probe requires integer padding_bsz and configured cap"
+        ) from exc
+    if requested <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe requires padding_bsz > 0, got {requested}"
+        )
+    if cap <= 0:
+        raise StartupDecodeProbeError(
+            f"startup decode probe has no configured positive cap (got {cap})"
+        )
+    if requested > cap:
+        raise StartupDecodeProbeError(
+            "startup decode probe width exceeds configured decode cap: "
+            f"padding_bsz={requested}, configured_cap={cap}"
+        )
+    return StartupDecodeProbePlan(batch_size=requested)
+
+
+def uniform_expert_assignment(
+    num_rows: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device=None,
+) -> torch.Tensor:
+    """Return a row-major, round-robin top-k assignment over all experts.
+
+    Local copy of the gpt-oss helper (same rationale as
+    ``plan_startup_decode_probe``).
+    """
+    try:
+        if any(isinstance(value, bool) for value in (num_rows, num_experts, top_k)):
+            raise TypeError("bool is not an assignment dimension")
+        rows = operator.index(num_rows)
+        experts = operator.index(num_experts)
+        k = operator.index(top_k)
+    except (TypeError, ValueError) as exc:
+        raise StartupDecodeProbeError(
+            "uniform expert assignment requires integer dimensions"
+        ) from exc
+    if rows < 0 or experts <= 0 or k <= 0 or k > experts:
+        raise StartupDecodeProbeError(
+            "invalid uniform expert assignment shape: "
+            f"rows={rows}, experts={experts}, top_k={k}"
+        )
+    row_starts = (torch.arange(rows, device=device, dtype=torch.long) * k) % experts
+    offsets = torch.arange(k, device=device, dtype=torch.long)
+    return (row_starts[:, None] + offsets[None, :]) % experts
 
 
 class KimiLinearParallelStrategyManager:
@@ -1263,6 +1364,10 @@ class KimiLinearParallelStrategyManager:
             )
         if comm is not None:
             self._comm = comm
+        if padding_bsz is not None:
+            # The per-rank decode cap this configure was sized for; the startup
+            # decode probe refuses any width above it.
+            self.padding_bsz = int(padding_bsz)
         build_seconds = 0.0
         if self.model is None:
             # The rebuild drops the streamed-SP8 buffer reference without
@@ -1447,6 +1552,513 @@ class KimiLinearParallelStrategyManager:
             )
         return self._decode_graph.prewarm_decode_graphs()
 
+    @torch.inference_mode()
+    def startup_decode_probe_step(self, padding_bsz: int) -> None:
+        """Run one cap-width synthetic decode step for startup accounting.
+
+        The worker owns sequence admission, paged-KV pool pages, and KDA slot
+        lifetime for real rows; at this startup seam none of those rows exist
+        yet. The probe therefore:
+
+        - allocates ``padding_bsz`` KDA state slots through the REAL
+          ``KDAStateGPUManager`` under reserved synthetic sequence ids
+          (``_KDA_PROBE_SEQ_ID_BASE`` downward) and releases every one of
+          them in ``finally``, so the pool's free count and sequence map end
+          exactly as they began (the caller runs this step three times —
+          warm + two measured — and the two measured runs must agree);
+        - installs a tiny synthetic paged-KV surface for the NoPE-MLA layers
+          at the deployment page size (never a guessed one), holding the MLA
+          LATENT geometry (``kv_lora_rank + qk_rope_head_dim`` per token, one
+          KV head). Physical pages are O(batch): the page-table entry that
+          holds each row's write position maps to that row's own page, and
+          every history entry maps to one shared read-only zero page (the
+          probe writes only the new token, so sharing history pages is
+          race-free at any synthetic context length);
+        - on the Kimi-K3.1 DSA variant (``module.indexer`` present) also
+          installs a synthetic AUXILIARY index-key surface with the same page
+          geometry in DeepGEMM's page-split FP8 carrier
+          (``index_head_dim`` e4m3 bytes + 4 scale bytes per token, one K
+          head) plus the sequence->slot map ``dsa_decode_forward`` resolves,
+          and sets every row's context to ``index_topk + 1`` tokens, because
+          a row at or under ``index_topk`` runs the dense K3 decode and the
+          probe would never execute the sparse selection kernels (the fused
+          index-K writer, the page-split top-k scorer and the sparse MLA
+          attention all run REAL at cap width). Host-append callbacks stay
+          None for both regions, which ``_forward_decode_dsa`` tolerates by
+          appending nothing. Honest exclusion: the scorer's context width is
+          ``index_topk + 1``, the minimal long context, so transients that
+          grow with a longer decode context are not measured here;
+        - drives every configured resident-EP MoE layer at a fabricated
+          round-robin uniform top-k routing through the real EP collectives
+          (symmetric shapes on all ranks), and finishes the step through the
+          LM head and ``sample_tokens``.
+
+        Width semantics (per-rank vs attention group): ``padding_bsz`` is the
+        PER-RANK decode cap the worker configures
+        (``configure_decoding(padding_bsz=...)``). At attention group size
+        G == 1 that is simply this rank's row count. At G > 1 a serve group
+        replicates every row onto all G of its ranks, so the per-rank cap
+        counts the GROUP's rows as seen by this rank's attention: the probe
+        allocates ``padding_bsz`` KDA slots and ``padding_bsz`` MLA rows on
+        every rank (each rank holds its own head shard of the same rows),
+        while the MoE path scatters them into G distinct DP slices of
+        ``ceil(padding_bsz / G)`` rows per rank — exactly the
+        ``set_num_tokens_per_rank`` layout the worker syncs per step.
+
+        Named refusals (StartupDecodeProbeError): no CUDA; width above the
+        configured cap; missing model, EP communicator, or KDA state manager;
+        wrong phase; no deployment page size; insufficient free KDA slots;
+        streamed (non-resident) decode MoE (K3.1's planner defaults decode to
+        resident_ep like K3's, so this names the fallback, not the default);
+        and a DSA indexer without positive ``index_topk``/``index_head_dim``
+        geometry or with a per-layer ``index_head_dim`` disagreement.
+        """
+        if not torch.cuda.is_available():
+            raise StartupDecodeProbeError(
+                "startup decode probe requires CUDA; refusing to measure on CPU"
+            )
+
+        configured_cap = getattr(self, "padding_bsz", None)
+        if configured_cap is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires configure_decoding() to set a cap"
+            )
+        plan = plan_startup_decode_probe(padding_bsz, configured_cap)
+        plan_bsz = plan.batch_size
+
+        model = self.model
+        if model is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires a configured decode model"
+            )
+        if self.world_size > 1 and self._comm is None:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the configured EP communicator"
+            )
+        if getattr(AttnWrapperBase, "phase", None) != "decode":
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the decode phase to be live"
+            )
+        if getattr(KimiLinearExpertWrapper, "phase", None) != "decode":
+            raise StartupDecodeProbeError(
+                "startup decode probe requires the expert wrappers in decode phase"
+            )
+
+        layers = list(model.model.layers)
+        mla_wrappers = [
+            layer.self_attn for layer in layers
+            if isinstance(layer.self_attn, KimiLinearAttnWrapper)
+        ]
+        kda_wrappers = [
+            layer.self_attn for layer in layers
+            if isinstance(layer.self_attn, KimiLinearKDAWrapper)
+        ]
+        # Kimi-K3.1 DSA variant: the probe fabricates the auxiliary index-key
+        # surface, so it only needs the indexer GEOMETRY here — index_topk to
+        # make every synthetic row long (a row at or under index_topk decodes
+        # on the dense K3 path and the sparse kernels would never run) and
+        # index_head_dim to size the page-split FP8 carrier.
+        dsa_modules = [
+            wrapper.module for wrapper in mla_wrappers
+            if getattr(wrapper.module, "indexer", None) is not None
+        ]
+        dsa_index_topk = 0
+        dsa_index_head_dim = 0
+        for dsa_module in dsa_modules:
+            indexer = dsa_module.indexer
+            topk = int(getattr(indexer, "index_topk", 0) or 0)
+            head_dim = int(getattr(indexer, "index_head_dim", 0) or 0)
+            if topk <= 0 or head_dim <= 0:
+                raise StartupDecodeProbeError(
+                    "startup decode probe requires positive DSA indexer "
+                    f"geometry, got index_topk={topk}, "
+                    f"index_head_dim={head_dim}"
+                )
+            if dsa_index_head_dim not in (0, head_dim):
+                raise StartupDecodeProbeError(
+                    "startup decode probe found disagreeing DSA "
+                    f"index_head_dim values ({dsa_index_head_dim} vs "
+                    f"{head_dim}); one auxiliary carrier cannot serve both"
+                )
+            dsa_index_topk = max(dsa_index_topk, topk)
+            dsa_index_head_dim = head_dim
+        moe_blocks = [
+            layer.block_sparse_moe for layer in layers
+            if getattr(layer, "block_sparse_moe", None) is not None
+        ]
+        if not moe_blocks:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no configured decode MoE layers"
+            )
+        for moe in moe_blocks:
+            if getattr(moe, "_resident_ep_moe", None) is None:
+                raise StartupDecodeProbeError(
+                    "startup decode probe supports resident-EP decode MoE "
+                    "only; a streamed decode MoE layer has no resident shard "
+                    "to probe without the worker's H2D streamer"
+                )
+
+        state_manager = KimiLinearKDAWrapper.state_manager
+        slot_manager = KimiLinearKDAWrapper.slot_manager
+        if kda_wrappers and (state_manager is None or slot_manager is None):
+            raise StartupDecodeProbeError(
+                "startup decode probe requires initialized KDA state pools"
+            )
+
+        device = self.engine_config.Basic_Config.device_torch
+        try:
+            hidden_dtype = next(model.parameters()).dtype
+        except StopIteration as exc:
+            raise StartupDecodeProbeError(
+                "startup decode probe requires model parameters"
+            ) from exc
+
+        # MLA latent geometry comes from the live attention module: the paged
+        # cache stores one 1-head latent token of kv_lora_rank + qk_rope_head_dim
+        # (what update_layer_decode_new_token receives and what
+        # get_layer_kv_with_page_table must hand back to mla_paged_decode).
+        latent_dim = 0
+        if mla_wrappers:
+            sample_mla = mla_wrappers[0].module
+            latent_dim = int(getattr(sample_mla, "kv_lora_rank", 0)) + int(
+                getattr(sample_mla, "qk_rope_head_dim", 0)
+            )
+            if latent_dim <= 0:
+                raise StartupDecodeProbeError(
+                    "startup decode probe requires positive MLA latent geometry"
+                )
+
+        synthetic_sids = [_KDA_PROBE_SEQ_ID_BASE - i for i in range(plan_bsz)]
+        if kda_wrappers:
+            stats = state_manager.get_stats()
+            if stats.num_free_state_items < plan_bsz:
+                raise StartupDecodeProbeError(
+                    "startup decode probe needs "
+                    f"{plan_bsz} free KDA state slots, only "
+                    f"{stats.num_free_state_items} are free"
+                )
+            for sid in synthetic_sids:
+                if state_manager.has_sequence_state_item(sid):
+                    raise StartupDecodeProbeError(
+                        f"startup decode probe synthetic sequence id {sid} "
+                        "already holds a KDA state slot"
+                    )
+
+        saved_attention_state = {
+            name: getattr(AttnWrapperBase, name)
+            for name in (
+                "gpu_paged_kv_manager",
+                "gpu_paged_kv_manager_aux",
+                "cache_seqlens",
+                "max_seqlen",
+                "cur_batch",
+                "position_ids",
+                "attention_mask",
+                "kv_append_callback",
+                "kv_append_callback_aux",
+                "batchgen_debug",
+            )
+        }
+        saved_kda_step_state = [
+            (pool, pool.cur_batch_ids, pool.has_initial_state,
+             pool.cur_decode_slots)
+            for pool in KimiLinearKDAWrapper.layer_pools.values()
+        ]
+        decode_graph = self._decode_graph
+        saved_graph_mode = decode_graph.mode if decode_graph is not None else None
+
+        from batchgen.moe.fused_moe_bf16_resident import ResidentEPMoELayer
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        saved_ntp = (
+            ResidentEPMoELayer.num_tokens_per_rank,
+            ResidentEPMXFP4MoELayer.num_tokens_per_rank,
+        )
+        patched_gates = []
+        allocated_sids = []
+
+        num_layers = len(layers)
+
+        # The decode kernels support only the deployment page size; at this
+        # startup seam the worker's manager may not be installed on the
+        # wrapper, so the page size comes from the ENGINE CONFIG, with the
+        # live manager honored when present. The real DSA deployment asserts
+        # equal primary/aux page sizes (DualKVCacheCoordinator), so one value
+        # serves both synthetic regions.
+        source_config = getattr(
+            saved_attention_state["gpu_paged_kv_manager"], "config", None
+        )
+        page_size = int(
+            getattr(source_config, "page_size_tokens", 0)
+            or getattr(
+                getattr(self.engine_config, "Device_Paged_KV_Config", None),
+                "page_size",
+                0,
+            )
+            or 0
+        )
+        if page_size <= 0 and mla_wrappers:
+            raise StartupDecodeProbeError(
+                "startup decode probe found no deployment page size"
+            )
+
+        # Synthetic decode context. Dense K3 keeps the plan's single past
+        # token. The K3.1 DSA step routes any row with
+        # cache_seqlen <= index_topk to the dense path, so the probe makes
+        # every row MINIMALLY LONG (index_topk + 1 tokens): the fused index-K
+        # writer, the page-split top-k scorer and the sparse MLA attention
+        # all execute with their real cap-width shapes.
+        probe_past = dsa_index_topk if dsa_modules else plan.past_tokens
+        if page_size > 0:
+            pages_per_row = (probe_past + 1 + page_size - 1) // page_size
+            write_entry = probe_past // page_size
+        else:
+            # No MLA layers: no paged surface is built (refused above
+            # otherwise), so no page geometry exists either.
+            pages_per_row = 0
+            write_entry = 0
+
+        def _aliased_page_table() -> torch.Tensor:
+            """[plan_bsz, pages_per_row] int32 over plan_bsz + 1 real pages.
+
+            The entry holding the write position maps to that row's own page
+            (1 + row); every history entry maps to the shared read-only zero
+            page 0. The probe writes only the new token, so sharing history
+            pages is race-free, and the synthetic caches stay O(batch) pages
+            at any synthetic context length (the DSA arm's index_topk + 1
+            context would otherwise need O(batch * index_topk) real tokens).
+            """
+            table = torch.zeros(
+                plan_bsz, pages_per_row, dtype=torch.int32, device=device
+            )
+            table[:, write_entry] = torch.arange(
+                1, plan_bsz + 1, dtype=torch.int32, device=device
+            )
+            return table
+
+        class _SyntheticPagedKV:
+            """Minimal paged-KV surface for the Kimi NoPE-MLA decode.
+
+            ``mla_decoding_nope_with_pagekv`` consumes exactly ``.device``,
+            ``update_layer_decode_new_token(...)`` and
+            ``get_layer_kv_with_page_table(layer_idx=...)``; the K3.1 sparse
+            step (``dsa_decode_forward``) additionally reads
+            ``.config.page_size_tokens``. MLA stores no V, so no V cache is
+            allocated and None is returned in its place.
+            """
+
+            def __init__(self):
+                self.device = device
+                self.page_size = page_size
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size
+                )
+                self.page_table = _aliased_page_table()
+                # One latent head per token: [L, pages, page_size, 1, latent].
+                self.k_cache = torch.zeros(
+                    (num_layers, plan_bsz + 1, page_size, 1, latent_dim),
+                    dtype=hidden_dtype,
+                    device=device,
+                )
+
+            def update_layer_decode_new_token(
+                self,
+                *,
+                k_tensor,
+                v_tensor,
+                sequence_lengths,
+                layer_idx,
+                batch_slice=None,
+                **_kwargs,
+            ):
+                if batch_slice is not None:
+                    start, end = batch_slice
+                    rows = slice(start, end)
+                    lengths = sequence_lengths[start:end]
+                else:
+                    rows = slice(None)
+                    lengths = sequence_lengths
+                lengths = lengths.to(dtype=torch.long)
+                page_indices = lengths // self.page_size
+                offsets = lengths % self.page_size
+                pages = self.page_table[rows].gather(
+                    1, page_indices[:, None]
+                ).squeeze(1)
+                self.k_cache[layer_idx, pages, offsets] = k_tensor[:, 0].to(
+                    self.k_cache.dtype
+                )
+                if v_tensor is not None:
+                    raise StartupDecodeProbeError(
+                        "startup decode probe synthetic KV holds the MLA "
+                        "latent only; no V cache exists to write"
+                    )
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return self.k_cache[layer_idx], None, self.page_table
+
+        class _SyntheticPagedKVAux:
+            """Minimal AUXILIARY (index-key) surface for the K3.1 DSA decode.
+
+            ``dsa_decode_forward`` consumes exactly ``.device``,
+            ``.config.page_size_tokens``,
+            ``._gpu_page_table_manager.seq_id_to_slot`` (the aux slot
+            indirection ``batch_slot_indices`` resolves) and
+            ``get_layer_kv_with_page_table(layer_idx)``. The cache is
+            DeepGEMM's page-split FP8 carrier the real aux manager allocates
+            (``cache_is_page_split``): per token, ``index_head_dim`` e4m3 key
+            bytes plus one fp32 scale, as BYTES of a 1-byte-element tensor
+            ``[pages, page_size, 1, index_head_dim + SCALE_BYTES_PER_TOKEN]``.
+            Zero bytes decode to all-zero keys and scales — finite, so the
+            ReLU-gated scorer and the sparse attention stay NaN-free.
+            """
+
+            def __init__(self):
+                self.device = device
+                self.config = types.SimpleNamespace(
+                    page_size_tokens=page_size
+                )
+                self.page_table = _aliased_page_table()
+                self.k_cache = torch.zeros(
+                    (
+                        num_layers,
+                        plan_bsz + 1,
+                        page_size,
+                        1,
+                        dsa_index_head_dim + _DSA_PAGE_SPLIT_SCALE_BYTES,
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                self._gpu_page_table_manager = types.SimpleNamespace(
+                    seq_id_to_slot={
+                        sid: row for row, sid in enumerate(synthetic_sids)
+                    }
+                )
+
+            def get_layer_kv_with_page_table(self, layer_idx):
+                return self.k_cache[layer_idx], None, self.page_table
+
+        try:
+            # Force the eager decode path for the probe: the graph adapter's
+            # replays bind the worker's real page tables and slot buffers,
+            # which this synthetic step must not touch. The configured mode
+            # (and any batchgen_debug override) is restored below.
+            if decode_graph is not None:
+                decode_graph.set_mode("eager")
+            AttnWrapperBase.batchgen_debug = None
+
+            AttnWrapperBase.gpu_paged_kv_manager = (
+                _SyntheticPagedKV() if mla_wrappers else None
+            )
+            AttnWrapperBase.gpu_paged_kv_manager_aux = (
+                _SyntheticPagedKVAux() if dsa_modules else None
+            )
+            AttnWrapperBase.cache_seqlens = torch.full(
+                (plan_bsz,), probe_past + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            AttnWrapperBase.max_seqlen = probe_past + 1
+            AttnWrapperBase.cur_batch = list(synthetic_sids)
+            AttnWrapperBase.position_ids = torch.full(
+                (plan_bsz, 1), probe_past,
+                dtype=torch.long,
+                device=device,
+            )
+            AttnWrapperBase.attention_mask = None
+            # Both Host-append callbacks stay None for the probe;
+            # _forward_decode_dsa appends nothing in that case (it requires
+            # the aux callback only when the latent one is bound).
+            AttnWrapperBase.kv_append_callback = None
+            AttnWrapperBase.kv_append_callback_aux = None
+
+            if kda_wrappers:
+                for sid in synthetic_sids:
+                    slot_manager.alloc(sid)
+                    allocated_sids.append(sid)
+
+            # The worker syncs this scalar before every decode step; the
+            # probe is its own symmetric step at the cap, so every rank sets
+            # the same post-scatter DP share.
+            G = max(1, int(self._attn_tp_size))
+            self.set_num_tokens_per_rank(-(-plan_bsz // G))
+
+            # Make the routed workload uniform without changing any gate
+            # parameter or retaining a probe-only module attribute.
+            for moe in moe_blocks:
+                gate = moe.gate
+                num_experts = int(gate.num_experts)
+                top_k = int(gate.top_k)
+                original = gate.__dict__.get("forward", None)
+
+                def _uniform_gate_forward(
+                    hidden_states,
+                    *,
+                    _num_experts=num_experts,
+                    _top_k=top_k,
+                ):
+                    rows = hidden_states.reshape(
+                        -1, hidden_states.shape[-1]
+                    ).shape[0]
+                    topk_idx = uniform_expert_assignment(
+                        rows,
+                        _num_experts,
+                        _top_k,
+                        device=hidden_states.device,
+                    )
+                    topk_weight = torch.full(
+                        (rows, _top_k),
+                        1.0 / _top_k,
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                    return topk_idx, topk_weight
+
+                gate.__dict__["forward"] = _uniform_gate_forward
+                patched_gates.append((gate, original))
+
+            input_ids = torch.zeros(
+                (plan_bsz, 1), dtype=torch.long, device=device
+            )
+            position_ids = torch.full(
+                (plan_bsz, 1), probe_past,
+                dtype=torch.long,
+                device=device,
+            )
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+            )
+            logits = outputs.logits[:, -1, :]
+            from batchgen.sampling import sample_tokens
+
+            sampled_tokens = sample_tokens(
+                logits, temperature=1.0, top_p=1.0, top_k=0
+            )
+            del sampled_tokens, logits, outputs
+            del position_ids, input_ids
+        finally:
+            for gate, original in reversed(patched_gates):
+                if original is None:
+                    gate.__dict__.pop("forward", None)
+                else:
+                    gate.__dict__["forward"] = original
+            (
+                ResidentEPMoELayer.num_tokens_per_rank,
+                ResidentEPMXFP4MoELayer.num_tokens_per_rank,
+            ) = saved_ntp
+            if allocated_sids and state_manager is not None:
+                state_manager.release_sequence_states(allocated_sids)
+            for pool, cur_ids, has_init, cur_slots in saved_kda_step_state:
+                pool.cur_batch_ids = cur_ids
+                pool.has_initial_state = has_init
+                pool.cur_decode_slots = cur_slots
+            if decode_graph is not None and saved_graph_mode is not None:
+                decode_graph.set_mode(saved_graph_mode)
+            for name, value in saved_attention_state.items():
+                setattr(AttnWrapperBase, name, value)
+
     def _init_resident_ep_decode(self):
         """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
         attach a ResidentEPMoELayer to every MoE block.
@@ -1460,9 +2072,10 @@ class KimiLinearParallelStrategyManager:
         if self._resident_ep_built:
             self._assert_resident_ep_attached()
             return
-        assert self._comm is not None, (
+        assert self.world_size == 1 or self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
-            "it via configure_decoding(comm=...) or set_comm)"
+            "it via configure_decoding(comm=...) or set_comm); world_size 1 "
+            "runs without collectives and needs none"
         )
         cfg = self.loaded_model_config
         device = self.engine_config.Basic_Config.device_torch
@@ -1531,6 +2144,20 @@ class KimiLinearParallelStrategyManager:
                 "streamed-SP8 prefill requires a positive routed-expert "
                 "prefill ring depth"
             )
+        # Both bounds come from the planner (the machine profile row on TP8);
+        # a missing value is a planning error, never a default.
+        batching = self.engine_config.Module_Batching_Config
+        planned_rows = {}
+        for name in (
+            "k3_prefill_grouped_chunk_rows",
+            "k3_prefill_collective_stripe_threshold_rows",
+        ):
+            planned_rows[name] = int(getattr(batching, name, 0) or 0)
+            if planned_rows[name] <= 0:
+                raise RuntimeError(
+                    f"streamed-SP8 prefill requires a planned positive "
+                    f"Module_Batching_Config.{name}; the planner did not set it"
+                )
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
@@ -1605,16 +2232,10 @@ class KimiLinearParallelStrategyManager:
                     if self._latent_projections_sharded()
                     else moe.routed_expert_up_proj
                 ),
-                chunk_rows=int(getattr(
-                    self.engine_config.Module_Batching_Config,
-                    "k3_prefill_grouped_chunk_rows",
-                    2_048,
-                )),
-                collective_stripe_threshold_rows=int(getattr(
-                    self.engine_config.Module_Batching_Config,
-                    "k3_prefill_collective_stripe_threshold_rows",
-                    32_768,
-                )),
+                chunk_rows=planned_rows["k3_prefill_grouped_chunk_rows"],
+                collective_stripe_threshold_rows=planned_rows[
+                    "k3_prefill_collective_stripe_threshold_rows"
+                ],
             )
             shared = getattr(moe, "shared_experts", None)
             if shared is not None:

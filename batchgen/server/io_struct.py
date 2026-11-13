@@ -7,11 +7,14 @@ request/response shapes for batch execution, file management, and worker input.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, root_validator, validator
+
+logger = logging.getLogger(__name__)
 
 
 class ChatMessage(BaseModel):
@@ -216,11 +219,34 @@ class CreateBatchRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
-    max_context_length: Optional[int] = Field(default=None, ge=1)  # Max total context (prompt + decode). None = use model max.
+    # Deprecated: accepted so existing callers keep working, then discarded.
+    # The deployment max_model_len bounds every request's prompt + completion.
+    max_context_length: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Deprecated and ignored. The deployment max_model_len (published "
+            "on GET /v1/models) bounds prompt + completion for every request."
+        ),
+        json_schema_extra={"deprecated": True},
+    )
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
     batchgen_debug: Optional[Dict[str, Any]] = None
+
+    @validator("max_context_length")
+    def discard_max_context_length(cls, value: Optional[int]) -> None:
+        if value is not None:
+            logger.warning(
+                "POST /v1/batches: max_context_length=%d is deprecated and "
+                "ignored. The deployment max_model_len (published on GET "
+                "/v1/models) bounds prompt + completion for every request; "
+                "limit decode length with max_tokens / max_completion_tokens "
+                "per request or max_decoding_length per batch.",
+                value,
+            )
+        return None
 
 
 class BatchObject(BaseModel):
@@ -241,7 +267,6 @@ class BatchObject(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None
-    max_context_length: Optional[int] = None  # None = use model max
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -272,7 +297,6 @@ def build_batch_object_from_create_request(
         expires_at=expires_at,
         metadata=body.metadata,
         max_decoding_length=body.max_decoding_length,
-        max_context_length=body.max_context_length,
         temperature=body.temperature,
         top_p=body.top_p,
         top_k=body.top_k,
@@ -295,6 +319,7 @@ class ListBatchesResponse(BaseModel):
 class BatchError(BaseModel):
     code: str
     message: str
+    status_code: Optional[int] = None
 
 
 class Usage(BaseModel):
@@ -439,6 +464,24 @@ def _normalize_result_value(value: Any) -> Any:
 # ======================== Model Metadata ========================
 
 
+class StartupTransientObject(BaseModel):
+    """One flavor of the startup decode transient, maximum over ranks.
+
+    Measured at the startup decode configure at the per-rank cap. Report-only:
+    the pool budget does not deduct it. GiB fields are null exactly when
+    ``unavailable`` names why the flavor was not measured.
+    """
+
+    flavor: Literal["eager", "capture"]
+    seam: str
+    padding_bsz: int
+    allocator_gib: Optional[float] = None
+    external_gib: Optional[float] = None
+    retained_gib: Optional[float] = None
+    deterministic: Optional[bool] = None
+    unavailable: Optional[str] = None
+
+
 class ModelObject(BaseModel):
     """OpenAI-compatible model object with BatchGen extensions."""
 
@@ -447,7 +490,14 @@ class ModelObject(BaseModel):
     created: int
     owned_by: str = "batchgen"
     max_context_length: int = Field(
-        description="Maximum context length (prompt + completion tokens)"
+        description="Deployment prompt + completion limit (alias of max_model_len)"
+    )
+    max_model_len: Optional[int] = Field(
+        default=None, description="Verified deployment prompt + completion limit"
+    )
+    startup_transient: Optional[List[StartupTransientObject]] = Field(
+        default=None,
+        description="Measured startup decode transient per flavor (report-only)",
     )
 
 

@@ -37,6 +37,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from batchgen.attention.varlen_dispatch import varlen_attention_func
 from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 
 from .config import is_k3_model_type
@@ -200,10 +201,6 @@ def mla_prefill_nope_prepacked(
     chunk (``same_chunk_ancestors``). The 576-wide latent is returned either
     way: the Host cache keeps the latent, never the expanded heads.
     """
-    # FA3 (flash_attn_interface); FA2 `flash_attn` is not installed on the
-    # H20 node. Same kwargs; the tuple return is normalized below.
-    from flash_attn_interface import flash_attn_varlen_func
-
     total_tokens = hidden_states_2d.shape[0]
 
     if self.q_lora_rank is not None:
@@ -242,7 +239,7 @@ def mla_prefill_nope_prepacked(
     value_states = value_states.contiguous()
 
     if pool_batch is None:
-        attn_output = flash_attn_varlen_func(
+        attn_output = varlen_attention_func(
             query_states,
             key_states,
             value_states,
@@ -402,16 +399,10 @@ def mla_decoding_nope_with_pagekv(
         attn_output: (bsz, 1, hidden)
         k_tensor: (bsz, 1, 1, 576) new KV (already written into pages)
     """
-    # K3's pure-BF16 NoPE path only consumes the two FlashMLA entry points.
-    # Importing the legacy BatchGen backend here also imports fa3_backend and
-    # DeepGEMM, neither of which participates in this forward.  The K3 server
-    # has already imported, validated, and kernel-warmed flash_mla before HTTP
-    # readiness, so this cached import performs no first-admission setup.
-    from flash_mla import (
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-
+    # The dense paged decode itself goes through the capability-selected seam
+    # (batchgen.attention.mla.paged_decode): flash_mla on Hopper, flashinfer
+    # trtllm-gen on Blackwell. It avoids the legacy BatchGen MLA backend, which
+    # would import fa3_backend and DeepGEMM for nothing.
     if gpu_paged_kv_manager is None:
         raise ValueError("gpu_paged_kv_manager must be provided")
     bsz, q_len, _ = hidden_states.size()
@@ -484,19 +475,15 @@ def mla_decoding_nope_with_pagekv(
     query_states[:, :, :, self.kv_lora_rank :] = q_pe
     query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, self.num_heads, 1
-    )
-    attn_out, _ = flash_mla_with_kvcache(
+    from batchgen.attention.mla.paged_decode import mla_paged_decode
+
+    attn_out = mla_paged_decode(
         query_states,
         blocked_k,
         block_table,
         cache_seqlens,
         self.kv_lora_rank,
-        tile_scheduler_metadata,
-        num_splits,
         self.scaling,
-        True,
     )
 
     attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)

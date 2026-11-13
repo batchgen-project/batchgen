@@ -23,6 +23,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip("fastapi")
@@ -72,18 +73,31 @@ MODEL = "gpt-oss-120b"
 CONTEXT = 4096  # the served model's context length in these tests
 
 
+def _encode(text):
+    return [ord(ch) for ch in text]
+
+
+def _decode(token_ids):
+    return "".join(chr(t) for t in token_ids)
+
+
 class _Tokenizer:
-    """Chat-template stand-in: renders role/content pairs verbatim."""
+    """Chat-template stand-in: role/content pairs verbatim, one id per char."""
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
-        assert tokenize is False and add_generation_prompt is True
-        return "".join(f"<{m['role']}>{m.get('content') or ''}" for m in messages) + "<assistant>"
+        assert tokenize is True and add_generation_prompt is True
+        return _encode(
+            "".join(f"<{m['role']}>{m.get('content') or ''}" for m in messages)
+            + "<assistant>")
+
+    def __call__(self, texts, **kwargs):
+        return {"input_ids": [_encode(text) for text in texts]}
 
 
 class _FakeWorker:
     """Answers admit entries on the real request/response channels.
 
-    An entry whose text contains HOLD is admitted but answered only after
+    An entry whose prompt contains HOLD is admitted but answered only after
     ``release`` is set; one containing TOO_LONG gets the worker's per-request
     context_length_exceeded error.
     """
@@ -100,6 +114,14 @@ class _FakeWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
+        self.response_queue.put({
+            "type": "deployment_capacity",
+            "max_model_len": CONTEXT,
+            "startup_transient": [{
+                "flavor": "eager", "seam": "startup-deployment-prepare",
+                "padding_bsz": 1, "unavailable": "CUDA is unavailable",
+            }],
+        })
         self.response_queue.put({
             "type": "trajectory_pool_capacity",
             "capacity_semantics_version": 1,
@@ -134,7 +156,7 @@ class _FakeWorker:
             for entry in msg["entries"]:
                 admitted_at = time.time()
                 self.admitted.append(entry)
-                if "HOLD" in entry["text"] and not self.release.is_set():
+                if "HOLD" in _decode(entry["input_ids"]) and not self.release.is_set():
                     held.append((entry, admitted_at))
                 else:
                     self._answer(entry, admitted_at)
@@ -145,15 +167,15 @@ class _FakeWorker:
             "request_id": entry["request_id"],
             "batch_id": entry["batch_id"],
             "text": f"reply to {entry['request_id']}",
-            "prompt_length": len(entry["text"]),
+            "prompt_length": len(entry["input_ids"]),
             "decoded_length": 3,
             "finish_reason": "stop",
             "cached_tokens": 7,
-            "computed_tokens": len(entry["text"]) - 7,
+            "computed_tokens": len(entry["input_ids"]) - 7,
             "admitted_at": admitted_at,
             "completed_at": time.time(),
         }
-        if "TOO_LONG" in entry["text"]:
+        if "TOO_LONG" in _decode(entry["input_ids"]):
             item = {
                 "type": "completion",
                 "request_id": entry["request_id"],
@@ -191,6 +213,8 @@ def _scheduler(tmp_path, worker):
         parse_tool_call=False,
     )
     scheduler = bs.BatchScheduler(_Storage(tmp_path), worker, args)
+    scheduler.max_model_len = CONTEXT
+    scheduler._deployment_ready.set()
     scheduler._get_tokenizer = lambda model: _Tokenizer()
     # The fake worker needs no init message (WorkerManager sends it for a
     # real generation before worker_generation_ready()).
@@ -303,8 +327,8 @@ def test_admit_message_carries_identity_and_batches_carry_none(tmp_path):
 
         scheduler._wait_and_finalize_batch = no_finalizer
         await scheduler._process_batch_pool_mode(
-            "batch_1", SimpleNamespace(batchgen_debug=None, max_context_length=None),
-            requests, ["p"], [4], None)
+            "batch_1", SimpleNamespace(batchgen_debug=None),
+            requests, [np.asarray(_encode("p"), dtype=np.int32)], [4], None)
         body = io_struct.TurnRequest(**_turn_body("sub", parent="main"))
         waiter = scheduler.submit_turn("turn_x", body, time.time())
         drain = asyncio.ensure_future(scheduler._drain_intake_to_worker())
@@ -321,7 +345,9 @@ def test_admit_message_carries_identity_and_batches_carry_none(tmp_path):
         "traj-1", "sub", "main")
     assert turn["batch_id"] == "turn_x" and turn["max_tokens"] == 16
     # Rendered by the batch path: GPT-OSS gets its reasoning system message.
-    assert turn["text"] == "<system>Reasoning: low<user>hi<assistant>"
+    assert turn["input_ids"].dtype == np.int32
+    assert _decode(turn["input_ids"]) == "<system>Reasoning: low<user>hi<assistant>"
+    assert "text" not in turn
     assert turn["sampling_params"]["temperature"] == 0.5
     batch = entries["c0@batch_1"]
     assert (batch["traj_id"], batch["session_id"], batch["parent_session_id"]) == (
@@ -494,7 +520,6 @@ def test_submit_rejections(tmp_path):
         scheduler = _scheduler(tmp_path, _ns_worker())
         cases = {
             "n": _turn_body("s1", n=2),
-            "max": {k: v for k, v in _turn_body("s1").items() if k != "max_tokens"},
             "model": _turn_body("s1", model="DeepSeek-V3"),
         }
         out = {}
@@ -512,7 +537,6 @@ def test_submit_rejections(tmp_path):
     scheduler, out = asyncio.run(run())
     assert out == {
         "n": (400, "unsupported_n"),
-        "max": (400, "max_tokens_required"),
         "model": (400, "model_mismatch"),
         "full": (429, "capacity_exceeded"),
     }
@@ -597,8 +621,7 @@ def test_e2e_rejections_and_gates(tmp_path):
     assert out["unknown"].status_code == 404
     assert out["unknown"].json()["detail"]["code"] == "session_not_found"
     assert out["no_session"].status_code == 422
-    assert out["no_max"].status_code == 400
-    assert out["no_max"].json()["detail"]["code"] == "max_tokens_required"
+    assert out["no_max"].status_code == 200
     assert out["too_long"].status_code == 400
     assert out["too_long"].json()["detail"] == {
         "code": "context_length_exceeded",
@@ -645,10 +668,11 @@ def test_e2e_turns_coexist_with_a_running_batch(tmp_path):
             "body": {"model": MODEL, "messages": [{"role": "user", "content": f"b{i}"}],
                      "max_tokens": 4}}) for i in range(3)).encode())
         assert ok, error
-        batch = SimpleNamespace(batchgen_debug=None, max_context_length=None,
-                                temperature=None, top_p=None, top_k=None)
+        batch = SimpleNamespace(batchgen_debug=None, temperature=None,
+                                top_p=None, top_k=None)
+        built = await scheduler._build_prompts(requests, _Tokenizer())
         prompts, max_tokens, sampling, rejections = (
-            scheduler._convert_requests_to_worker_inputs(requests, batch))
+            scheduler._convert_requests_to_worker_inputs(requests, built, batch))
         assert rejections == {}
         for sid in ("a", "b"):
             await client.post("/v1/sessions", json={"traj_id": f"traj-{sid}", "session_id": sid})

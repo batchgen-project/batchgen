@@ -1,64 +1,45 @@
-"""AST-isolated delegation tests for the GPT-OSS phase-lifecycle hooks.
+"""Phase-lifecycle hook contract of the GPT-OSS strategy manager.
 
-The GPT-OSS manager keeps no suspended phase instance (resident experts,
-every transition rebuilds), so ``phase_enter`` always builds, ``admit`` and
-``phase_exit`` are documented no-ops, and the only delegates are
-``configure_prefill`` / ``configure_decoding``. Imports neither torch nor
-the production manager.
+GPT-OSS follows the reusable-instance lifecycle: a kept decode instance is
+resumed by ``activate_decoding``, decode SUSPEND releases its routed experts,
+RETIRE drops it, and the prefill instance is never kept (it replicates every
+routed expert). The production manager is used with its build and
+activation delegates recorded, so the dispatch itself is what is tested.
 """
 
-import ast
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import (
+    GptOssParallelStrategyManager,
+)
 from batchgen.phase_lifecycle import (
     AdmitContext,
     ExitMode,
     PhaseEnterContext,
     PhaseKey,
+    verify_phase_contract,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
-PSM = (
-    ROOT / "batchgen" / "models" / "openai" / "gpt_oss_120b"
-    / "Parallel_Strategy_Manager.py"
-)
 
-HOOKS = ("phase_enter", "admit", "phase_exit", "holds_instance")
+class _Arena:
+    def __init__(self, mapped):
+        self.is_mapped = mapped
 
 
-def _isolated_manager_class():
-    tree = ast.parse(PSM.read_text())
-    source_class = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "GptOssParallelStrategyManager"
-    )
-    methods = [
-        node for node in source_class.body
-        if isinstance(node, ast.FunctionDef) and node.name in HOOKS
-    ]
-    assert len(methods) == len(HOOKS)
-    cls = ast.ClassDef(
-        name="Isolated", bases=[], keywords=[], body=methods,
-        decorator_list=[],
-    )
-    module = ast.Module(body=[cls], type_ignores=[])
-    ast.fix_missing_locations(module)
-    ns = {
-        "PhaseKey": PhaseKey, "PhaseEnterContext": PhaseEnterContext,
-        "AdmitContext": AdmitContext, "ExitMode": ExitMode,
-    }
-    exec(compile(module, str(PSM), "exec"), ns)
-    return ns["Isolated"]
-
-
-class _Recorder(_isolated_manager_class()):
-    def __init__(self):
+class _Recorder(GptOssParallelStrategyManager):
+    def __init__(self, *, kept=False, mapped=False):
+        self.rank = 0
         self.calls = []
+        self.comm = object()
+        self.padding_bsz = 96
+        self.model = object()
+        self.weight_copy_task = {"attn": []}
         self._prefill_result = (object(), {"p": ["t"]})
         self._decode_result = (object(), {"d": ["t"]})
+        self.decode_instance = self._decode_result if kept else None
+        self._expert_arena = _Arena(mapped) if (kept or mapped) else None
 
     def configure_prefill(self):
         self.calls.append(("configure_prefill",))
@@ -68,57 +49,139 @@ class _Recorder(_isolated_manager_class()):
         self.calls.append(("configure_decoding", padding_bsz, comm))
         return self._decode_result
 
+    def activate_decoding(self):
+        self.calls.append(("activate_decoding",))
+        return self.decode_instance
 
-def test_prefill_enter_always_builds():
-    m = _Recorder()
-    key = PhaseKey("prefill", None)
-    out = m.phase_enter(key, PhaseEnterContext())
+    def release_decode_routed_experts(self):
+        self.calls.append(("release",))
+        self._expert_arena.is_mapped = False
+
+
+def test_production_manager_satisfies_the_phase_contract():
+    manager = object.__new__(GptOssParallelStrategyManager)
+    assert verify_phase_contract(manager) == []
+
+
+def test_prefill_enter_always_builds_and_is_never_held():
+    m = _Recorder(kept=True, mapped=False)
+    out = m.phase_enter(PhaseKey("prefill", None), PhaseEnterContext())
     assert out is m._prefill_result
     assert m.calls == [("configure_prefill",)]
-
-
-def test_holds_instance_is_false_for_both_phases():
-    m = _Recorder()
     assert m.holds_instance("prefill") is False
-    assert m.holds_instance("decode") is False
 
 
-def test_decode_enter_forwards_ctx_and_requires_fields():
+@pytest.mark.parametrize("kept", [False, True])
+def test_holds_instance_reports_the_kept_decode_instance(kept):
+    assert _Recorder(kept=kept).holds_instance("decode") is kept
+
+
+def test_decode_enter_builds_with_the_context_forwarded():
     m = _Recorder()
-    key = PhaseKey("decode", None)
     comm = object()
-    out = m.phase_enter(key, PhaseEnterContext(comm=comm, max_num_seq=96))
+    out = m.phase_enter(
+        PhaseKey("decode", None), PhaseEnterContext(comm=comm, max_num_seq=96)
+    )
     assert out is m._decode_result
     assert m.calls == [("configure_decoding", 96, comm)]
+
+
+def test_decode_enter_resumes_the_kept_instance():
+    m = _Recorder(kept=True)
+    out = m.phase_enter(
+        PhaseKey("decode", None),
+        PhaseEnterContext(comm=m.comm, max_num_seq=m.padding_bsz),
+    )
+    assert out is m.decode_instance
+    assert m.calls == [("activate_decoding",)]
+
+
+@pytest.mark.parametrize("field", ["comm", "width"])
+def test_decode_resume_refuses_a_context_the_instance_was_not_built_for(field):
+    m = _Recorder(kept=True)
+    ctx = PhaseEnterContext(
+        comm=object() if field == "comm" else m.comm,
+        max_num_seq=m.padding_bsz + (1 if field == "width" else 0),
+    )
+    with pytest.raises(RuntimeError, match="retired and rebuilt"):
+        m.phase_enter(PhaseKey("decode", None), ctx)
+    assert m.calls == []
+
+
+@pytest.mark.parametrize("kept", [False, True])
+def test_decode_enter_requires_both_context_fields(kept):
+    m = _Recorder(kept=kept)
+    key = PhaseKey("decode", None)
     with pytest.raises(ValueError, match="comm"):
         m.phase_enter(key, PhaseEnterContext(max_num_seq=96))
     with pytest.raises(ValueError, match="max_num_seq"):
-        m.phase_enter(key, PhaseEnterContext(comm=comm))
-
-
-def test_admit_and_exit_are_no_ops_with_no_delegate_calls():
-    m = _Recorder()
-    for phase in ("prefill", "decode"):
-        key = PhaseKey(phase, None)
-        m.admit(key, AdmitContext(uuids=["u"]))
-        m.phase_exit(key, ExitMode.SUSPEND)
-        m.phase_exit(key, ExitMode.RETIRE)
+        m.phase_enter(key, PhaseEnterContext(comm=m.comm))
     assert m.calls == []
+
+
+def test_decode_suspend_releases_the_routed_experts_and_keeps_the_instance():
+    m = _Recorder(kept=True, mapped=True)
+    m.phase_exit(PhaseKey("decode", None), ExitMode.SUSPEND)
+    assert m.calls == [("release",)]
+    assert m.holds_instance("decode") is True
+    assert m.decode_experts_resident is False
+
+
+@pytest.mark.parametrize("kept,mapped", [(False, False), (True, False), (False, True)])
+def test_decode_suspend_without_a_resident_kept_instance_fails_loud(kept, mapped):
+    m = _Recorder(kept=kept, mapped=mapped)
+    with pytest.raises(RuntimeError, match="must RETIRE"):
+        m.phase_exit(PhaseKey("decode", None), ExitMode.SUSPEND)
+    assert m.calls == []
+
+
+def test_decode_retire_drops_the_instance_and_unmaps_the_arena():
+    m = _Recorder(kept=True, mapped=True)
+    m.phase_exit(PhaseKey("decode", None), ExitMode.RETIRE)
+    assert m.calls == [("release",)]
+    assert m.holds_instance("decode") is False
+    assert m.model is None and m.weight_copy_task == {}
+
+
+def test_retire_of_an_unmapped_or_unkept_phase_releases_nothing():
+    m = _Recorder(kept=True, mapped=False)
+    m.phase_exit(PhaseKey("decode", None), ExitMode.RETIRE)
+    assert m.calls == [] and m.decode_instance is None
+    m = _Recorder(kept=True, mapped=True)
+    m.phase_exit(PhaseKey("prefill", None), ExitMode.RETIRE)
+    # Retiring prefill leaves the kept decode instance and its experts alone.
+    assert m.calls == [] and m.holds_instance("decode") is True
+    assert m.model is None
+
+
+def test_prefill_suspend_and_admit_make_no_delegate_call():
+    m = _Recorder(kept=True, mapped=True)
+    m.phase_exit(PhaseKey("prefill", None), ExitMode.SUSPEND)
+    for phase in ("prefill", "decode"):
+        m.admit(PhaseKey(phase, None), AdmitContext(uuids=["u"]))
+    assert m.calls == []
+
+
+def test_persistent_phase_instances_flag_is_refused():
+    m = _Recorder()
+    assert m.persistent_phase_instances is False
+    m.persistent_phase_instances = False
+    with pytest.raises(RuntimeError, match="persistent-phase-instances"):
+        m.persistent_phase_instances = True
 
 
 def test_bad_phase_and_mode_raise():
     m = _Recorder()
-
-    class _FakeKey:
-        phase = "embed"
-        prefill_moe_mode = None
-        profile_overrides = ()
-
+    bad_key = SimpleNamespace(
+        phase="embed", prefill_moe_mode=None, profile_overrides=()
+    )
     with pytest.raises(ValueError):
-        m.phase_enter(_FakeKey(), PhaseEnterContext())
+        m.phase_enter(bad_key, PhaseEnterContext())
     with pytest.raises(ValueError):
-        m.admit(_FakeKey(), AdmitContext(uuids=[]))
+        m.admit(bad_key, AdmitContext(uuids=[]))
     with pytest.raises(ValueError):
-        m.phase_exit(_FakeKey(), ExitMode.SUSPEND)
+        m.phase_exit(bad_key, ExitMode.SUSPEND)
+    with pytest.raises(ValueError):
+        m.holds_instance("embed")
     with pytest.raises(ValueError):
         m.phase_exit(PhaseKey("prefill", None), "not-a-mode")

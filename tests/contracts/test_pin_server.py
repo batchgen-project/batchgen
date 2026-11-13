@@ -85,7 +85,6 @@ PINS = {
                 "error",
                 "metadata",
                 "max_decoding_length",
-                "max_context_length",
                 "temperature",
                 "top_p",
                 "top_k",
@@ -312,7 +311,7 @@ PINS = {
                 "batchgen_debug",
             ],
             "members": {},
-            "public_methods": [],
+            "public_methods": ["discard_max_context_length"],
             "methods": {},
         },
         "DeleteFileResponse": {

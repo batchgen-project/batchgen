@@ -10,6 +10,7 @@ from .cuda_routing import (
     dispatch_count_gather_cuda,
     reduce_weighted_scatter_cuda,
     FusedGateContext,
+    is_fused_gate_available,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "dispatch_count_gather_cuda",
     "reduce_weighted_scatter_cuda",
     "FusedGateContext",
+    "is_fused_gate_available",
 ]

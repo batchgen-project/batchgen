@@ -191,7 +191,6 @@ client = BatchGenHttpClient("http://127.0.0.1:10904")
 batch = client.submit_batch(
     input_file_path="input.jsonl",
     output_file_path="output.jsonl",
-    max_context_length=1_048_576,
 )
 print(batch["status"])
 ```

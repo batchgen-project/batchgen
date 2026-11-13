@@ -1,4 +1,4 @@
-"""M3 Slice 3a: the session -> owning-group pin at admission.
+"""Session residency as a cost credit at admission.
 
 A frontier registry is group-local, so a continuation that lands on a serve
 group other than the one holding its session is a clean MISS. These tests pin
@@ -7,9 +7,8 @@ the two halves of the fix:
 1. the WORLD map -- every group's leader publishes a compact session summary on
    the host-KV mirror's existing world-wide object gather, and EVERY rank folds
    every leader's summary into the same rank-local map;
-2. the PIN -- group assignment stamps a flag-on continuation onto its session's
-   owning group before the balancer sees it, and leaves everything else to
-   default assignment.
+2. RESIDENCY -- group assignment credits a continuation on its session's
+   owning group inside the packer objective, allowing a planned off-group miss.
 
 Pure Python, no GPU and no torch: the frontier module is loaded by path and the
 worker methods are compiled out of the module's AST onto a namespace of fakes,
@@ -19,6 +18,8 @@ exactly as the other prefix-reuse unit tests do.
 import ast
 import copy
 import importlib.util
+import logging
+import random
 import sys
 import types
 from pathlib import Path
@@ -26,6 +27,16 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
+
+from batchgen.prefix_reuse.trajectory_restore import (
+    DECLINE_GROUP_MISMATCH,
+    TrajectoryRestorer,
+)
+from batchgen.prefix_reuse.wave_plan import (
+    plan_wave_prefix_sharing,
+    prefill_plan_work,
+    validate_wave_prefix_plan,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -330,7 +341,7 @@ def test_an_empty_map_is_falsy_and_resolves_nothing():
         )
         is None
     )
-    assert index.pins == 0
+    assert index.honored_on_owner == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +373,7 @@ def _worker_methods(names, globals_=None):
         "List": List,
         "Optional": Optional,
         "logging": _SilentLogging(),
+        "SequenceStatus": SimpleNamespace(QUEUEING="QUEUEING", IN_PREFILL="IN_PREFILL", EVICTED="EVICTED"),
         **(globals_ or {}),
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
@@ -442,6 +454,7 @@ def stub_modules(monkeypatch):
         ),
     )
     frontier_package = types.ModuleType("batchgen.prefix_reuse")
+    frontier_package.__path__ = [str(_REPO_ROOT / "batchgen" / "prefix_reuse")]
     monkeypatch.setitem(sys.modules, "batchgen.prefix_reuse", frontier_package)
     monkeypatch.setitem(
         sys.modules, "batchgen.prefix_reuse.trajectory_frontier", _FRONTIER
@@ -666,11 +679,13 @@ def _assign_worker(
     methods = _worker_methods(
         [
             "_assign_decode_dp_groups",
-            "_pin_trajectory_session_groups",
+            "_trajectory_session_residency",
             "_trajectory_commit_requested",
             "_active_batchgen_debug_for_sequences",
             "_decode_attn_tp_size",
             "_trajectory_restore_fields",
+            "_pack_decode_dp_groups_for_sharing",
+            "_prefix_rank_packing_mode",
         ]
     )
     worker = SimpleNamespace(
@@ -683,15 +698,20 @@ def _assign_worker(
         global_batch=_FakeBatch(seqs),
         enable_prefix_cache=True,
         prefix_cache_runtime_config=SimpleNamespace(
-            namespace_digest=NAMESPACE
+            namespace_digest=NAMESPACE,
+            group_specs=[SimpleNamespace(raw_page_tokens=PAGE_TOKENS)],
         ),
+        engine_config=SimpleNamespace(Module_Batching_Config=SimpleNamespace(
+            prefill_micro_batch_token_cap=1024,
+        )),
+        _cached_prefix_rank_cost_profile=lambda disabled: None,
+        _prefix_rank_cost_profile_disabled=lambda seqs: False,
         _batchgen_debug=debug,
         # The real worker latches this when an admitted sequence carries
         # per-request debug flags; these sequences do, so the merge path the
         # pin depends on stays reachable.
         _any_sequence_batchgen_debug=True,
-        # These fakes exercise the balancer path, not main's sharing-aware
-        # packer: no in-wave prefix pool is configured for them.
+        # Residency selects the real packer without the packing_v2 flag.
         _prefill_prefix_pool_enabled=lambda: False,
         _trajectory_book=SimpleNamespace(
             has_sequence=lambda uuid: uuid in tokens_by_uuid
@@ -724,6 +744,7 @@ def _sequence(uuid, *, prompt_length, debug="on"):
         global_idx=int(uuid[-1]),
         prompt_length=prompt_length,
         decode_dp_group=None,
+        status="QUEUEING",
         # Real Sequence field read by the balancer path: a first admission
         # has no eviction history.
         evicted_from_dp_group=None,
@@ -742,13 +763,12 @@ def _folded_index():
     return index
 
 
-def test_the_pin_stamps_the_owning_group_and_leaves_others_to_the_balancer(
+def test_residency_credits_the_owner_and_packs_other_prompts(
     stub_modules,
 ):
     index = _folded_index()
-    # A continuation of the group-1 session plus two prompts that continue
-    # nothing. Lengths are equal, so without the pin the balancer would place
-    # the first candidate on group 0.
+    # A continuation of the group-1 session plus two unrelated prompts.
+    # Residency favors group 1 while the unrelated prompts pool on group 0.
     seqs = {
         "seq1": _sequence("seq1", prompt_length=len(G1_CONTINUATION)),
         "seq2": _sequence("seq2", prompt_length=len(UNRELATED_PROMPT)),
@@ -767,27 +787,31 @@ def test_the_pin_stamps_the_owning_group_and_leaves_others_to_the_balancer(
         tokens_by_uuid=tokens,
     )
 
+    assert worker._trajectory_session_residency(list(seqs), num_groups=2) == {
+        "seq1": (1, len(G1_TOKENS)),
+    }
+    assert all(seq.decode_dp_group is None for seq in seqs.values())
+    assert index.honored_on_owner == index.placed_offgroup == 0
     worker._assign_decode_dp_groups(["seq1", "seq2", "seq3"])
 
     assert seqs["seq1"].decode_dp_group == 1
-    assert index.pins == 1
-    # Without the pin the balancer would have put the longest candidate on
-    # group 0 -- the empty-world placement -- which is the parity flip the pin
-    # exists to stop.
+    assert index.honored_on_owner == 1
+    # Without residency, a single candidate starts on group 0.
     assert _DP_GROUP.assign_decode_dp_groups(
         [len(G1_CONTINUATION)], 2, prior_load=[0.0, 0.0]
     ) == [0]
-    # The pinned sequence's L^2 was charged to group 1 before the balancer
-    # ran, so the two unpinned prompts go to the now-lighter group 0 instead
-    # of being placed as if group 1 were empty.
+    # The unrelated prompts share their computed prefix on group 0.
     assert [seqs["seq2"].decode_dp_group, seqs["seq3"].decode_dp_group] == [
         0,
         0,
     ]
-    assert worker._trajectory_restore_fields() == {"trajectory_group_pins": 1}
+    assert worker._trajectory_restore_fields() == {
+        "trajectory_group_honored_on_owner": 1,
+        "trajectory_group_placed_offgroup": 0,
+    }
 
 
-def test_the_pin_is_idempotent_across_repeated_assignment(stub_modules):
+def test_residency_placement_is_idempotent_across_repeated_assignment(stub_modules):
     index = _folded_index()
     seqs = {"seq1": _sequence("seq1", prompt_length=len(G0_CONTINUATION))}
     worker = _assign_worker(
@@ -803,7 +827,7 @@ def test_the_pin_is_idempotent_across_repeated_assignment(stub_modules):
 
     assert seqs["seq1"].decode_dp_group == 0
     # The second pass skipped the already-grouped sequence before resolving.
-    assert index.pins == 1
+    assert index.honored_on_owner == 1
 
 
 def test_a_flag_off_batch_is_assigned_exactly_as_before(stub_modules):
@@ -832,10 +856,10 @@ def test_a_flag_off_batch_is_assigned_exactly_as_before(stub_modules):
         flag_off["seq1"].decode_dp_group,
         flag_off["seq2"].decode_dp_group,
     ] == expected
-    assert index.pins == 0
+    assert index.honored_on_owner == 0
 
 
-def test_no_map_means_no_pin_and_no_drain_field(stub_modules):
+def test_no_map_means_no_residency_and_no_drain_field(stub_modules):
     seqs = {"seq1": _sequence("seq1", prompt_length=len(G0_CONTINUATION))}
     worker = _assign_worker(
         world_size=4,
@@ -845,7 +869,7 @@ def test_no_map_means_no_pin_and_no_drain_field(stub_modules):
         tokens_by_uuid={"seq1": G0_CONTINUATION},
     )
 
-    assert worker._pin_trajectory_session_groups(["seq1"], num_groups=2) == {}
+    assert worker._trajectory_session_residency(["seq1"], num_groups=2) == {}
     worker._assign_decode_dp_groups(["seq1"])
     assert seqs["seq1"].decode_dp_group == 0  # pure balancer, empty world
     assert worker._trajectory_restore_fields() == {}
@@ -869,7 +893,7 @@ def test_a_session_owned_by_a_group_outside_the_world_is_refused(stub_modules):
         worker._assign_decode_dp_groups(["seq1"])
 
 
-def test_a_sequence_without_a_trajectory_reservation_is_not_pinned(
+def test_a_sequence_without_a_trajectory_reservation_has_no_residency(
     stub_modules,
 ):
     index = _folded_index()
@@ -882,5 +906,121 @@ def test_a_sequence_without_a_trajectory_reservation_is_not_pinned(
         tokens_by_uuid={},
     )
 
-    assert worker._pin_trajectory_session_groups(["seq1"], num_groups=2) == {}
-    assert index.pins == 0
+    assert worker._trajectory_session_residency(["seq1"], num_groups=2) == {}
+    assert index.honored_on_owner == 0
+
+
+def _resident_wave(size=96):
+    tokens = {f"seq{i:03}": G0_TOKENS + [1000 + i] * 4 for i in range(size)}
+    seqs = {uuid: _sequence(uuid, prompt_length=len(prompt)) for uuid, prompt in tokens.items()}
+    return seqs, tokens
+
+
+def test_resident_placement_is_identical_under_shuffled_orders(stub_modules):
+    expected = None
+    for seed in range(8):
+        seqs, tokens = _resident_wave()
+        uuids = list(seqs)
+        rng = random.Random(seed)
+        rng.shuffle(uuids)
+        seqs = {uuid: seqs[uuid] for uuid in uuids}
+        rng.shuffle(uuids)
+        tokens = {uuid: tokens[uuid] for uuid in uuids}
+        worker = _assign_worker(world_size=4, attn_tp_size=2, seqs=seqs,
+                                index=_folded_index(), tokens_by_uuid=tokens)
+        rng.shuffle(uuids)
+        residency = worker._trajectory_session_residency(uuids, num_groups=2)
+        assert list(residency) == sorted(uuids)
+        worker._assign_decode_dp_groups(uuids)
+        placed = {uuid: seq.decode_dp_group for uuid, seq in seqs.items()}
+        assert expected is None or placed == expected
+        expected = placed
+        index = worker._trajectory_session_groups
+        ideal_offgroup = (96 * 4 - len(G0_TOKENS)) / (2 * 4)
+        assert abs(index.placed_offgroup - ideal_offgroup) <= 1
+        assert index.honored_on_owner + index.placed_offgroup == 96
+
+
+def test_evicted_reentry_hard_pin_survives_residency_and_load(stub_modules):
+    seqs, tokens = _resident_wave(8)
+    evicted = _sequence("old0", prompt_length=1024)
+    evicted.evicted_from_dp_group = 0
+    evicted.status = "EVICTED"
+    seqs[evicted.uuid] = evicted
+    # No readable tokens for the re-entry: its saved group is the constraint.
+    worker = _assign_worker(world_size=4, attn_tp_size=2, seqs=seqs,
+                            index=_folded_index(), tokens_by_uuid=tokens)
+    worker._assign_decode_dp_groups(list(seqs))
+    assert evicted.decode_dp_group == 0
+    assert evicted.evicted_from_dp_group is None
+    assert {seqs[uuid].decode_dp_group for uuid in tokens} == {1}
+    assert worker._trajectory_session_groups.placed_offgroup == len(tokens)
+
+
+def test_no_residency_and_no_packing_keeps_existing_path(stub_modules):
+    seqs = {"seq0": _sequence("seq0", prompt_length=len(UNRELATED_PROMPT))}
+    worker = _assign_worker(world_size=4, attn_tp_size=2, seqs=seqs,
+                            index=_folded_index(), tokens_by_uuid={"seq0": UNRELATED_PROMPT})
+
+    def must_not_pack(*args, **kwargs):
+        pytest.fail("no residency and no packing_v2 must keep the existing path")
+
+    worker._pack_decode_dp_groups_for_sharing = must_not_pack
+    worker._assign_decode_dp_groups(list(seqs))
+    assert seqs["seq0"].decode_dp_group == 0
+
+
+def test_offgroup_continuations_miss_and_pool_full_prefix_once(stub_modules, caplog):
+    seqs, tokens = _resident_wave(12)
+    registry = _registry()
+    _begin(registry, tokens=G0_TOKENS, group_id=0)
+    index = TrajectorySessionGroupIndex()
+    index.fold([_summary(registry, group_id=0)])
+    worker = _assign_worker(world_size=4, attn_tp_size=2, seqs=seqs,
+                            index=index, tokens_by_uuid=tokens)
+    worker._assign_decode_dp_groups(list(reversed(seqs)))
+    offgroup = sorted(uuid for uuid, seq in seqs.items() if seq.decode_dp_group == 1)
+    assert len(offgroup) >= 2
+
+    # The real worker looks only in the serving group's registry. A fresh
+    # off-group registry misses at lookup, before any attachment can exist.
+    local_restorer = TrajectoryRestorer(
+        rank=2, committer=SimpleNamespace(registry=_registry()),
+        arena_reader=None, state_writer=None, attention_group_size=2,
+    )
+    lookup = _worker_methods(["_lookup_trajectory_frontiers"])["_lookup_trajectory_frontiers"]
+    worker._get_trajectory_restorer = lambda: local_restorer
+    worker._owns_host_kv = lambda seq: seq.decode_dp_group == 1
+    worker._trajectory_attachments = {}
+    with caplog.at_level(logging.INFO):
+        lookup(worker, offgroup)
+    assert worker._trajectory_attachments == {}
+    assert local_restorer.counters()["trajectory_hits"] == 0
+    assert local_restorer.counters()["trajectory_lookups"] == len(offgroup)
+
+    # If an owning-group attachment reaches the restore boundary instead,
+    # the existing group guard must attribute the decline as a planned miss.
+    restorer = TrajectoryRestorer(rank=0, committer=SimpleNamespace(registry=registry),
+                                  arena_reader=None, state_writer=None, attention_group_size=2)
+    for i, uuid in enumerate(offgroup):
+        attachment = restorer.lookup(namespace_digest=NAMESPACE,
+                                     prompt_token_ids=tokens[uuid], sequence_id=i)
+        assert attachment is not None
+        assert restorer.restore(attachment, serving_group_id=seqs[uuid].decode_dp_group,
+                                compute_cached_tokens=0) is None
+        assert attachment.consumed
+    assert restorer.live_attachments == 0
+    assert restorer.counters()[f"trajectory_decline_{DECLINE_GROUP_MISMATCH}"] == len(offgroup)
+    declines = [record.message for record in caplog.records if "reason=group_mismatch" in record.message]
+    assert len(declines) == len(offgroup)
+    assert all("planned_offgroup=true" in line for line in declines)
+
+    # The declined rows carry no restored/materialized prefix into the plan.
+    prompts = [tokens[uuid] for uuid in offgroup]
+    plan = plan_wave_prefix_sharing(prompts, block_tokens=PAGE_TOKENS,
+                                   pool_pages=128, chunk_tokens=1024)
+    validate_wave_prefix_plan(plan, prompts)
+    assert prefill_plan_work(plan).computed_tokens == len(G0_TOKENS) + len(prompts) * 4
+    assert len(plan.segments) == 1
+    assert plan.segments[0].token_start == 0
+    assert plan.segments[0].token_end == len(G0_TOKENS)

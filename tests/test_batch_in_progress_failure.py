@@ -70,16 +70,25 @@ def _line(custom_id, max_tokens=None):
     })
 
 
+class _Tokenizer:
+    """Encodes completion prompt text one id per character."""
+
+    def __call__(self, texts, **kwargs):
+        return {"input_ids": [[ord(ch) for ch in text] for text in texts]}
+
+
 def _scheduler(tmp_path, lines, max_decoding_length=None):
     input_id = "file-input"
     (tmp_path / input_id).write_bytes("\n".join(lines).encode())
     updates = []
     scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler.max_model_len = 4096
     scheduler.server_args = SimpleNamespace(model=MODEL)
     # The pool state BatchScheduler.__init__ creates; a failure releases it.
     scheduler._scheduling_pool = bs.SchedulingPool(capacity=4)
     scheduler._intake_pool = bs.IntakePool(max_capacity=16)
     scheduler._pool_request_meta = {}
+    scheduler._get_tokenizer = lambda model: _Tokenizer()
     scheduler.storage = SimpleNamespace(
         files_dir=tmp_path,
         load_batch=lambda batch_id: SimpleNamespace(
@@ -97,22 +106,22 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
     return scheduler, updates
 
 
-def test_missing_max_tokens_without_a_batch_default_fails_the_batch(tmp_path):
+def test_missing_max_tokens_defaults_to_remaining_deployment_context(tmp_path):
     scheduler, updates = _scheduler(
         tmp_path, [_line("has-limit", 16), _line("no-limit-a"), _line("no-limit-b")]
     )
+    submitted = {}
 
-    async def must_not_submit(*args, **kwargs):
-        raise AssertionError("a batch with unbounded requests reached the pool")
+    async def record_submit(batch_id, batch, requests, prompts,
+                            per_request_max_tokens, sampling_params, **kwargs):
+        submitted["max_tokens"] = per_request_max_tokens
+        submitted["lengths"] = [len(prompt) for prompt in prompts]
 
-    scheduler._process_batch_pool_mode = must_not_submit
+    scheduler._process_batch_pool_mode = record_submit
     asyncio.run(scheduler._process_batch("batch-1"))
-
-    statuses = [status for status, _ in updates]
-    assert statuses == [bs.BatchStatus.IN_PROGRESS, bs.BatchStatus.FAILED]
-    error = updates[-1][1]
-    assert "2/3 requests have no max_completion_tokens or max_tokens" in error
-    assert "['no-limit-a', 'no-limit-b']" in error
+    assert [status for status, _ in updates] == [bs.BatchStatus.IN_PROGRESS]
+    assert submitted["max_tokens"] == [
+        16, 4096 - submitted["lengths"][1], 4096 - submitted["lengths"][2]]
 
 
 def test_a_batch_default_covers_requests_without_max_tokens(tmp_path):
@@ -139,7 +148,7 @@ def test_any_exception_after_in_progress_ends_in_failed(tmp_path, stage):
     with the exception recorded, instead of only being logged by _run."""
     scheduler, updates = _scheduler(tmp_path, [_line("req-1", 16)])
 
-    def broken_render(requests, batch=None):
+    def broken_render(requests, built, batch=None):
         raise ValueError("request 'req-1': the chat template rejected it")
 
     async def broken_submit(*args, **kwargs):
@@ -173,7 +182,7 @@ def test_an_exception_after_pool_registration_releases_the_batch_state(tmp_path)
         scheduler._intake_pool.submit_batch(batch_id, [bs.IntakeEntry(
             request_id=f"req-1@{batch_id}",
             batch_id=batch_id,
-            raw_request={"text": prompts[0], "max_tokens": 16},
+            raw_request={"input_ids": prompts[0], "max_tokens": 16},
             priority=bs.Priority.NORMAL,
         )])
         scheduler._pool_request_meta[batch_id] = {f"req-1@{batch_id}": {}}

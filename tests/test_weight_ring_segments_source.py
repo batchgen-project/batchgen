@@ -52,8 +52,14 @@ def test_helper_carves_one_allocation_with_ordered_aligned_fields():
     assert "torch::zeros(" not in body
     assert "std::sort(names.begin(), names.end());" in body
     assert "constexpr int64_t kAlign = 256;" in body
-    assert "stride += (nbytes + kAlign - 1) / kAlign * kAlign;" in body
-    narrow = body.index(".narrow(0, index * stride + field.offset")
+    # Field-major arena: each field owns one contiguous block across all
+    # slots (a frame's slots then expose each field as a dense operand), and
+    # a slot's field is addressed at block base + slot * per-field stride.
+    assert "(nbytes + kAlign - 1) / kAlign * kAlign;" in body
+    assert "total += count * field_stride;" in body
+    narrow = body.index(".narrow(0,")
+    assert body.index("field.offset +", narrow) > narrow
+    assert body.index("index * field_stride", narrow) > narrow
     assert body.index(".view(field.dtype)") > narrow
     # A grow appends; it never clears or reallocates existing slots.
     assert "buffers.push_back(" in body

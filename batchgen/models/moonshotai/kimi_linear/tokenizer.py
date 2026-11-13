@@ -213,14 +213,21 @@ class KimiLinearTokenizer(BaseTokenizer):
             **kwargs: Additional arguments passed to underlying tokenizer
 
         Returns:
-            Formatted string or token IDs if tokenize=True
+            Formatted string, or with tokenize=True the token IDs
+            :meth:`encode` gives that string. The underlying tokenizer's own
+            tokenize=True path encodes through a different routine that
+            splits long runs differently, so its ids can differ from the
+            encode of the same rendered string.
         """
-        return self._tokenizer.apply_chat_template(
+        rendered = self._tokenizer.apply_chat_template(
             conversation,
-            tokenize=tokenize,
+            tokenize=False,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
+        if tokenize:
+            return self.encode(rendered)
+        return rendered
 
     def __call__(
         self,

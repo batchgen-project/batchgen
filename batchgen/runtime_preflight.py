@@ -146,6 +146,7 @@ _DSA_FP8_HOPPER_EXTENSIONS = _ext(
     "moe._C_fp8_blockwise_gemm",
     "moe._C_fp8_blockwise_ops",
     "moe._C_routing",
+    "moe._C_routing_wgmma",
     "attention._C_fused_indexer_k_write_fp8",
     "attention._C_fused_q_split",
     "attention._C_qkv_wgmma",
@@ -160,6 +161,43 @@ _KDA_HOPPER_EXTENSIONS = _ext(
     "moe._C_dispatch_scatter_3d",
     "moe._C_marlin_grouped_gemm",
     "moe._C_routing",
+    "moe._C_routing_wgmma",
+)
+
+# Generic CUDA extensions selected by BUILD_ARCH=sm103a.  The Blackwell Kimi
+# contracts use this set so a partial lane build fails before model startup.
+# _C_gqa_mha_decode_bf16 is excluded: it is a sourceless prebuilt binary for
+# the Hopper decode path (its consumer falls back on any non-(9,0) device),
+# so it cannot be rebuilt for this lane and is not reachable on it.
+_SM103A_EXTENSIONS = (
+    tuple(
+        extension
+        for extension in _COMMON_EXTENSIONS
+        if extension != "batchgen_kernels.attention._C_gqa_mha_decode_bf16"
+    )
+    + (
+        "batchgen_kernels.conv1d._C_causal_conv1d",
+        "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
+        "batchgen_kernels.moe._C_mxfp4_dequant_cute",
+        "batchgen_kernels.moe._C_mxfp4_dequant",
+        "batchgen_kernels.common._C_rmsnorm",
+        "batchgen_kernels.common._C_cuda_rmsnorm",
+        "batchgen_kernels.common._C_spin_delay",
+        "batchgen_kernels.common._C_mgn_ops",
+        "batchgen_kernels.moe._C_fused_moe_token_permutation",
+        "batchgen_kernels.attention._C_dsa_fast_topk",
+        "batchgen_kernels.attention._C_fast_hadamard_transform",
+        "batchgen_kernels.attention._C_fused_rope_hadamard",
+        "batchgen_kernels.moe._C_marlin_grouped_gemm",
+        "batchgen_kernels.moe._C_routing",
+        "batchgen_kernels.moe._C_dispatch_scatter_3d",
+        "batchgen_kernels.attention._C_fused_kv_norm_rope",
+        "batchgen_kernels.attention._C_fused_q_absorb",
+        "batchgen_kernels.attention._C_fused_q_split",
+        "batchgen_kernels.attention._C_fused_indexer_k_write_fp8",
+        "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+        "batchgen_kernels.attention._C_kda_fused_decode",
+    )
 )
 
 # These are exact model-type contracts, not family-wide fallback rules.  A new
@@ -172,6 +210,7 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_expert_mxfp4_wgmma",
             "moe._C_grouped_mxfp4_wgmma",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "attention._C_qkv_wgmma",
         ),
         require_deepgemm=True,
@@ -224,6 +263,7 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_fp8_blockwise_gemm",
             "moe._C_fp8_blockwise_ops",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "attention._C_fused_q_split",
             "attention._C_qkv_wgmma",
         ),
@@ -259,11 +299,75 @@ _CONTRACTS: dict[str, RuntimeContract] = {
             "moe._C_marlin_grouped_gemm",
             "moe._C_marlin_transform",
             "moe._C_routing",
+            "moe._C_routing_wgmma",
             "moe._C_single_expert_int4_wgmma",
             "attention._C_fused_q_split",
         ),
     ),
 }
+
+_KIMI_MODEL_TYPES = frozenset(
+    model_type
+    for identifier, model_type in _KNOWN_IDENTIFIER_PATTERNS
+    if identifier.startswith("Kimi")
+)
+
+def _blackwell_kimi_contract(contract: RuntimeContract) -> RuntimeContract:
+    """The Blackwell form of one Kimi contract.
+
+    flash_mla: legacy dense/sparse-prefill entry points (the K3.1 sparse
+    prefill); flashinfer: the dense paged MLA decode, varlen prefill and the
+    trtllm-gen sparse MLA decode. The generic sm103a lane set replaces the
+    Hopper extension set; the model's DSA indexer extensions and its DeepGEMM
+    requirement (paged and causal MQA logits, SM100-family kernels) carry over.
+    """
+    dsa = tuple(
+        name for name in _DSA_PAGE_SPLIT_INDEXER_EXTENSIONS
+        if name in contract.extensions and name not in _SM103A_EXTENSIONS
+    )
+    return RuntimeContract(
+        modules=("flash_mla", "flashinfer"),
+        extensions=_SM103A_EXTENSIONS + dsa,
+        require_deepgemm=contract.require_deepgemm,
+    )
+
+
+_BLACKWELL_KIMI_CONTRACTS = {
+    model_type: _blackwell_kimi_contract(contract)
+    for model_type, contract in _CONTRACTS.items()
+    if model_type in _KIMI_MODEL_TYPES
+}
+
+
+def _detect_runtime_capability() -> tuple[tuple[int, int], int | None]:
+    """Return one capability snapshot for backend and contract selection."""
+    if not torch.cuda.is_available():
+        return (9, 0), None
+    capability = tuple(torch.cuda.get_device_capability())
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return capability, properties.multi_processor_count
+
+
+def _decode_backend_for_capability(
+    capability: tuple[int, int], sm_count: int | None
+) -> str:
+    """Map the detected capability to the single decode backend table."""
+    if capability == (9, 0):
+        return "wgmma" if sm_count == 78 else "fa3"
+    if capability[0] == 10:
+        return "flashmla"
+    raise RuntimePreflightError(
+        f"unsupported CUDA compute capability {capability}; no decode backend"
+    )
+
+
+def _contract_for_capability(
+    model_type: str, capability: tuple[int, int]
+) -> RuntimeContract:
+    """Select the exact model contract from the one capability snapshot."""
+    if capability[0] == 10 and model_type in _BLACKWELL_KIMI_CONTRACTS:
+        return _BLACKWELL_KIMI_CONTRACTS[model_type]
+    return _CONTRACTS[model_type]
 
 
 def _site_roots() -> tuple[Path, ...]:
@@ -390,13 +494,25 @@ def _check_core_engine() -> None:
         )
 
 
+# Pinned Torch per CUDA channel. Keep in sync with the check in
+# scripts/build_source_runtime.sh.
+_TORCH_PINS = {"cu128": "2.9.0", "cu132": "2.15.0"}
+
+
 def _check_torch() -> None:
     version = torch.__version__
-    if not version.startswith("2.9.0"):
-        raise RuntimePreflightError(
-            f"Torch {version!r} is unsupported; expected 2.9.0 with the pinned CUDA ABI"
-        )
     expected_channel = os.environ.get("TORCH_CUDA_CHANNEL", "cu128")
+    pinned = _TORCH_PINS.get(expected_channel)
+    if pinned is None:
+        raise RuntimePreflightError(
+            f"TORCH_CUDA_CHANNEL {expected_channel!r} has no pinned Torch; "
+            f"expected one of {sorted(_TORCH_PINS)}"
+        )
+    if not version.startswith(pinned):
+        raise RuntimePreflightError(
+            f"Torch {version!r} is unsupported; expected {pinned} for "
+            f"{expected_channel} with the pinned CUDA ABI"
+        )
     expected_cuda = (
         f"{expected_channel[2:-1]}.{expected_channel[-1]}"
         if expected_channel.startswith("cu") and expected_channel[2:].isdigit()
@@ -517,15 +633,9 @@ def run_runtime_preflight(server_args: object) -> str:
         )
     _check_torch()
     model_type = _resolve_model_type(model)
-    contract = _CONTRACTS[model_type]
-    # H20 = sm_90 with 78 SMs; device names are not reliable across SKUs.
-    decode_backend = (
-        "wgmma"
-        if torch.cuda.is_available()
-        and torch.cuda.get_device_capability() == (9, 0)
-        and torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count == 78
-        else "fa3"
-    )
+    capability, sm_count = _detect_runtime_capability()
+    contract = _contract_for_capability(model_type, capability)
+    decode_backend = _decode_backend_for_capability(capability, sm_count)
     _check_tokenizer(model)
 
     for module_name in contract.modules:
@@ -538,9 +648,7 @@ def run_runtime_preflight(server_args: object) -> str:
         if module_name == "libucx":
             _check_ucx(module)
 
-    hopper = (
-        torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
-    )
+    hopper = capability == (9, 0) and sm_count is not None
     extensions = contract.extensions + (contract.hopper_extensions if hopper else ())
     for extension_name in extensions:
         _import_required(extension_name, origin=_ORIGIN_BATCHGEN)

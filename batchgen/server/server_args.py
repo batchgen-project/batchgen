@@ -245,6 +245,7 @@ class ServerArgs:
     enable_decode_preemption: bool = True
     # GPU memory fraction for KV cache: gpu_kv_size = GPU_mem * frac - model_size (default: 0.9)
     gpu_memory_frac: float = 0.9
+    max_model_len: Optional[int] = None
     # GPU page buffer settings for decode scheduling
     initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
     extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
@@ -600,6 +601,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable decode preemption. Interrupts decode to prefill new sequences when host KV is underutilized (default: enabled, recommended always on)",
     )
     parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Deployment prompt + completion limit (default: model context); -1 opts into startup auto-fit",
+    )
+    parser.add_argument(
         "--gpu-memory-frac",
         type=float,
         default=0.9,
@@ -931,6 +938,8 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_watermark < 0 or args.host_kv_watermark > 100:
         raise ValueError("host_kv_watermark must be between 0 and 100")
+    if args.max_model_len is not None and args.max_model_len != -1 and args.max_model_len < 2:
+        raise ValueError("max_model_len must be at least 2, or -1 for auto-fit")
     if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
         raise ValueError("gpu_memory_frac must be between 0 and 1.0")
     if args.initial_gpu_page_buffer <= 0:
@@ -1071,6 +1080,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_watermark=parsed.host_kv_watermark,
         enable_decode_preemption=True,  # Always enabled, recommended for all use cases
         gpu_memory_frac=parsed.gpu_memory_frac,
+        max_model_len=parsed.max_model_len,
         initial_gpu_page_buffer=parsed.initial_gpu_page_buffer,
         extension_gpu_page_buffer=parsed.extension_gpu_page_buffer,
         decision_frequency_pages=parsed.decision_frequency_pages,

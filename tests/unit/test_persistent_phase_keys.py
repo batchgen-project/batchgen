@@ -138,3 +138,32 @@ def test_persistent_builder_tells_the_manager_its_prefill_mode():
     set_mode = builder.index("pm.set_prefill_moe_mode(prefill_mode)")
     assert set_mode < builder.index("self._transition_phase(prefill_key)")
     assert "decode_key = self._desired_phase_key('decode')" in builder
+
+
+def test_k3_startup_primes_the_mode_before_the_decode_build():
+    """The K3 startup enters decode before any prefill; the worker's record
+    of the intended prefill mode must be primed first, or the decode key
+    carries None, the exit turns into RETIRE, and the resident shard stays
+    mapped under the prefill build."""
+    builder = ast.unparse(
+        _function(WORKER.read_text(), "prepare_kimi_k3_startup")
+    )
+    prime = builder.index(
+        "self._prefill_moe_mode_in_effect = startup_prefill_mode"
+    )
+    assert prime < builder.index("self._load_decode_model(")
+
+
+def test_decode_first_startup_suspends_on_the_switch_to_prefill():
+    events = []
+    worker = _worker(events)
+    worker._prefill_moe_mode_in_effect = "streamed"
+    worker.init_nvshmem = lambda: events.append("init_nvshmem")
+
+    worker._transition_phase(
+        worker._desired_phase_key("decode"), comm="comm", max_num_seq=8
+    )
+    worker._transition_phase(PhaseKey("prefill", "streamed"))
+
+    assert ("exit", "decode", ExitMode.SUSPEND) in events
+    assert "deep_free" not in events

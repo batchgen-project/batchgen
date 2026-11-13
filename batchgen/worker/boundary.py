@@ -191,6 +191,16 @@ class BoundaryHandler:
             m = seq_meta.get(uuid)
             return m.priority if m is not None else 0
 
+        def recompute_tokens(uuid: str) -> int:
+            """Tokens an eviction of ``uuid`` makes its re-prefill recompute."""
+            m = seq_meta.get(uuid)
+            if m is None:
+                raise RuntimeError(
+                    f"sequence {uuid} has no boundary seq_meta; its eviction "
+                    "cost is unknown"
+                )
+            return int(m.current_context_length)
+
         def host_owned_pages(uuid: str) -> int:
             """Pages releasing ``uuid`` returns to the Host pool (own chain only)."""
             state = global_seq_state[uuid]
@@ -211,10 +221,12 @@ class BoundaryHandler:
                 active_uuids.append(uuid)
 
         # Host KV growth + eviction decisions. Growth and eviction are planned
-        # together and eviction is strictly growth-driven: the plan reserves
-        # enough free pages for the remaining growth debt (plus the safety
-        # margin) after completed and evicted rows release their host pages,
-        # and evicts nothing when no active row carries growth debt.
+        # together and eviction is strictly growth-driven: each node's
+        # remaining growth debt is covered exactly (no pool-proportional
+        # margin) by free pages, completed-row releases, reclaimable retained
+        # prefix pages and, last, evicted rows' owned pages; nothing is
+        # evicted when no active row carries growth debt. Victims are the rows
+        # closing the most deficit pages per recompute token.
         host_growth_uuids = []
         host_growth_pages_list = []
         for uuid in active_uuids:
@@ -277,7 +289,9 @@ class BoundaryHandler:
 
                 total_pages = int(node_stats.get('num_total_pages', 0) or 0)
                 free_pages = int(node_stats.get('num_free_pages', 0) or 0)
-                safety_margin = int(total_pages * 0.05)
+                # Retained prefix pages the node leader can reclaim before
+                # growth (the execution phase releases them on demand).
+                reclaimable_pages = int(node_stats.get('num_reclaimable_pages', 0) or 0)
                 completed_host_pages = sum(
                     host_owned_pages(uuid) for uuid in node_completed_uuids
                 )
@@ -289,6 +303,8 @@ class BoundaryHandler:
                             eviction_candidates.append((uuid, {
                                 'decoded_length': state['decoded_length'],
                                 'host_owned_pages': host_owned_pages(uuid),
+                                'growth_pages': growth_pages_by_uuid.get(uuid, 0),
+                                'recompute_tokens': recompute_tokens(uuid),
                                 'global_idx': meta_global_idx(uuid),
                                 'priority': meta_priority(uuid),
                             }))
@@ -302,8 +318,8 @@ class BoundaryHandler:
                     free_pages=free_pages,
                     total_pages=total_pages,
                     completed_pages=completed_host_pages,
-                    safety_margin=safety_margin,
-                    strategy=EvictionStrategy.SHORTEST_FIRST,
+                    reclaimable_pages=reclaimable_pages,
+                    strategy=EvictionStrategy.GROWTH_COST_AWARE,
                     page_key='host_owned_pages',
                 )
                 host_evicted_uuids.extend(growth_plan.evicted_uuids)
@@ -322,11 +338,12 @@ class BoundaryHandler:
                         f"growth_rows_remaining={len(growth_plan.remaining_growth_uuids)} "
                         f"growth_pages_remaining={growth_plan.remaining_growth_needed} "
                         f"free={free_pages} completed_pages={completed_host_pages} "
+                        f"reclaimable_pages={reclaimable_pages} "
                         f"evict_rows={len(growth_plan.evicted_uuids)} evict_pages={growth_plan.freed_pages} "
                         f"growth_rows_evicted={growth_eviction_overlap} "
                         f"expected_free={growth_plan.expected_free_pages} "
                         f"required_free={growth_plan.required_free_pages} "
-                        f"safety={safety_margin} feasible={growth_plan.growth_feasible_after_eviction}"
+                        f"feasible={growth_plan.growth_feasible_after_eviction}"
                     )
                     if node_growth_uuids and (growth_plan.evicted_uuids or not growth_plan.growth_feasible_after_eviction):
                         detail_rows = []
@@ -356,8 +373,11 @@ class BoundaryHandler:
                         )
                 per_node_growth_plans[node] = {
                     'expected_free_pages': growth_plan.expected_free_pages,
-                    'safety_margin': safety_margin,
+                    'reclaimable_pages': reclaimable_pages,
                     'num_candidates': len(eviction_candidates),
+                    'free_pages': free_pages,
+                    'completed_pages': completed_host_pages,
+                    'evicted_pages': growth_plan.freed_pages,
                 }
         elif host_growth_uuids:
             scheduler_error = (
@@ -452,14 +472,38 @@ class BoundaryHandler:
                     )
                     logger.error(scheduler_error)
                     break
-                required_free = node_growth_pages + int(plan_info['safety_margin'])
+                required_free = node_growth_pages
                 if int(plan_info['expected_free_pages']) < required_free:
+                    # The planner stops short of feasibility only after it has
+                    # evicted every candidate. Every active row is a candidate
+                    # when eviction is enabled, and HOST_OWNED_PAGE gives each
+                    # grower >= 1 owned page, so every grower would have been
+                    # evicted and its debt cleared. Reaching here therefore
+                    # means a grower owns no page or eviction is disabled.
+                    rows = "; ".join(
+                        f"{uuid}(gid={meta_global_idx(uuid)},"
+                        f"owned={host_owned_pages(uuid)},"
+                        f"growth={remaining_growth_by_uuid[uuid]})"
+                        for uuid in host_growth_uuids
+                        if node_for_rank(
+                            host_owner_rank(global_seq_state.get(uuid, {}), uuid)
+                        ) == node
+                    )
                     scheduler_error = (
-                        f"[HOST_KV_GROWTH_PLAN] node {node} infeasible after eviction/on-hold planning; "
-                        f"growth_pages={node_growth_pages}, "
+                        "[SCHED_INVARIANT] [HOST_KV_GROWTH_PLAN] node "
+                        f"{node} growth infeasible after evicting every candidate: "
+                        "HOST_OWNED_PAGE requires each growing row to own >= 1 "
+                        "Host page and to be an eviction candidate; "
+                        f"eviction_enabled={enable_host_kv_eviction}, "
+                        f"candidates={plan_info['num_candidates']}, "
+                        f"free={plan_info['free_pages']}, "
+                        f"completed_pages={plan_info['completed_pages']}, "
+                        f"reclaimable_pages={plan_info['reclaimable_pages']}, "
+                        f"evicted_pages={plan_info['evicted_pages']}, "
                         f"expected_free={plan_info['expected_free_pages']}, "
-                        f"safety={plan_info['safety_margin']}, "
-                        f"candidates={plan_info['num_candidates']}"
+                        f"growth_pages={node_growth_pages}, "
+                        f"required_free={required_free}, "
+                        f"growers=[{rows}]"
                     )
                     logger.error(scheduler_error)
                     break

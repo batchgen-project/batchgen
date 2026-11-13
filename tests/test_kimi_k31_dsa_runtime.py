@@ -34,11 +34,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from batchgen.attention.mla import sparse_dispatch  # noqa: E402
 from batchgen.models.moonshotai.kimi_linear import dsa_runtime  # noqa: E402
 
 KERNELS = ROOT / "batchgen_kernels"
 DSA = KERNELS / "attention" / "dsa"
 KIMI = ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear"
+SEAM = ROOT / "batchgen" / "attention" / "mla" / "sparse_dispatch.py"
 
 
 def _tree(path: Path) -> ast.Module:
@@ -103,10 +105,34 @@ def test_the_third_party_callables_the_dsa_paths_call_are_declared():
     prefill = (KIMI / "dsa_sparse_prefill.py").read_text()
     assert "deep_gemm.fp8_mqa_logits" in prefill
     assert "fp8_mqa_logits" in dsa_runtime.K31_DSA_SITE_SYMBOLS["deep_gemm"]
-    fa3 = _function(_tree(KIMI / "dsa_decode.py"), "_fa3_with_kvcache")
+    # Sparse attention is the seam's: its per-backend declaration names
+    # exactly what each backend imports.
+    seam_tree = _tree(SEAM)
+    fa3 = _function(seam_tree, "_fa3_with_kvcache")
     assert _imports(fa3) == [("flash_attn_interface", ["flash_attn_with_kvcache"])]
-    assert dsa_runtime.K31_DSA_SITE_SYMBOLS["flash_attn_interface"] == (
-        "flash_attn_with_kvcache",)
+    assert sparse_dispatch.SITE_SYMBOLS["fa3"] == {
+        "flash_attn_interface": ("flash_attn_with_kvcache",)}
+    # The Blackwell decode launch is the one the dense seam shares.
+    decode = _function(seam_tree, "_trtllm_sparse_decode")
+    assert "trtllm_gen_mla.trtllm_gen_mla_decode" in ast.unparse(decode)
+    shared = _function(_tree(SEAM.parent / "trtllm_gen_mla.py"), "trtllm_gen_mla_decode")
+    prefill_seam = _function(seam_tree, "_flashmla_sparse_prefill")
+    assert _imports(shared) == [
+        ("flashinfer.mla", ["trtllm_batch_decode_with_kv_cache_mla"])]
+    assert _imports(prefill_seam) == [("flash_mla", ["flash_mla_sparse_fwd"])]
+    assert sparse_dispatch.SITE_SYMBOLS["blackwell"] == {
+        "flashinfer.mla": ("trtllm_batch_decode_with_kv_cache_mla",),
+        "flash_mla": ("flash_mla_sparse_fwd",),
+    }
+    assert "flash_attn_interface" not in dsa_runtime.K31_DSA_SITE_SYMBOLS
+
+
+def test_the_dsa_modules_reach_sparse_attention_only_through_the_seam():
+    for name in ("dsa_decode.py", "dsa_sparse_prefill.py"):
+        source = (KIMI / name).read_text()
+        assert "flash_attn_interface" not in source, name
+        assert "fa3_backend" not in source, name
+        assert "from batchgen.attention.mla.sparse_dispatch import" in source, name
 
 
 def test_the_retired_rotation_kernel_is_no_longer_declared():
@@ -198,6 +224,19 @@ def test_the_k31_contract_covers_the_model_declared_dsa_extensions():
     assert "flash_attn_interface" in runtime_preflight._CONTRACTS["kimi_k31"].modules
 
 
+def test_the_blackwell_k31_contract_carries_the_dsa_runtime():
+    """On 10.x the K3.1 contract swaps FA3 for the Blackwell sparse kernels
+    but keeps every DSA extension and DeepGEMM."""
+    from batchgen import runtime_preflight
+
+    contract = runtime_preflight._contract_for_capability("kimi_k31", (10, 3))
+    for name in dsa_runtime.K31_DSA_AOT_EXTENSIONS:
+        assert name in contract.extensions
+    assert contract.require_deepgemm
+    assert set(contract.modules) == {"flash_mla", "flashinfer"}
+    assert len(set(contract.extensions)) == len(contract.extensions)
+
+
 def test_declaration_has_no_duplicates_and_uses_full_module_names():
     names = dsa_runtime.K31_DSA_AOT_EXTENSIONS
     assert len(set(names)) == len(names)
@@ -208,10 +247,16 @@ def test_declaration_has_no_duplicates_and_uses_full_module_names():
 #  The preload                                                                #
 # --------------------------------------------------------------------------- #
 
+#: The Hopper seam's modules; the preload is handed them explicitly because
+#: the default resolves the device's backend.
+ATTN = sparse_dispatch.SITE_SYMBOLS["fa3"]
+
+
 def _site_module(missing=()):
     return SimpleNamespace(**{
         s: (lambda *a, **k: None)
-        for symbols in dsa_runtime.K31_DSA_SITE_SYMBOLS.values()
+        for table in (dsa_runtime.K31_DSA_SITE_SYMBOLS, ATTN)
+        for symbols in table.values()
         for s in symbols if s not in missing
     })
 
@@ -223,8 +268,9 @@ def test_the_preload_imports_everything_in_order():
         seen.append(name)
         return _site_module()
 
-    resolved = dsa_runtime.preload_dsa_runtime(importer)
-    expected = list(dsa_runtime.K31_DSA_AOT_EXTENSIONS) + list(dsa_runtime.K31_DSA_SITE_SYMBOLS)
+    resolved = dsa_runtime.preload_dsa_runtime(importer, ATTN)
+    expected = (list(dsa_runtime.K31_DSA_AOT_EXTENSIONS)
+                + list(dsa_runtime.K31_DSA_SITE_SYMBOLS) + list(ATTN))
     assert seen == expected and list(resolved) == expected
 
 
@@ -235,7 +281,7 @@ def test_a_missing_build_fails_the_preload_without_any_jit():
         return _site_module()
 
     with pytest.raises(dsa_runtime.DsaRuntimeError, match="_C_dsa_fast_topk is not built"):
-        dsa_runtime.preload_dsa_runtime(importer)
+        dsa_runtime.preload_dsa_runtime(importer, ATTN)
 
 
 def test_the_preload_uses_a_plain_import_not_the_dev_jit_loader():
@@ -253,7 +299,7 @@ def test_a_missing_third_party_callable_fails_the_preload():
 
     with pytest.raises(dsa_runtime.DsaRuntimeError,
                        match="deep_gemm.get_paged_mqa_logits_metadata"):
-        dsa_runtime.preload_dsa_runtime(importer)
+        dsa_runtime.preload_dsa_runtime(importer, ATTN)
 
 
 def test_an_unimportable_third_party_module_fails_the_preload():
@@ -263,7 +309,7 @@ def test_an_unimportable_third_party_module_fails_the_preload():
         return _site_module()
 
     with pytest.raises(dsa_runtime.DsaRuntimeError, match="needs deep_gemm"):
-        dsa_runtime.preload_dsa_runtime(importer)
+        dsa_runtime.preload_dsa_runtime(importer, ATTN)
 
 
 # --------------------------------------------------------------------------- #

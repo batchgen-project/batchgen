@@ -89,6 +89,19 @@ def coordinator_only_rejection(
     )
 
 
+def published_model_object(request: Request) -> ModelObject:
+    """Model metadata with the current worker generation's verified limit
+    and its report-only startup decode transient."""
+    scheduler = request.app.state.scheduler
+    length = scheduler.max_model_len
+    if length is None:
+        raise HTTPException(status_code=503, detail="deployment capacity is not ready")
+    return request.app.state.model_object.model_copy(update={
+        "max_model_len": length, "max_context_length": length,
+        "startup_transient": scheduler.startup_transient,
+    })
+
+
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
 QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /v1/models|^GET /health$")
@@ -213,8 +226,8 @@ def create_app(
             app.state.storage = storage
             app.state.scheduler = scheduler
 
-            # Build model metadata once for the server lifetime. Only use
-            # BatchGen-maintained configs; never fall back to HF config.json.
+            # Validate the model identity before starting the workers. The
+            # advertised length comes from their later capacity publication.
             detected_type = _detect_model_type_from_identifier(
                 server_args.model
             )
@@ -224,15 +237,6 @@ def create_app(
                     "BatchGen CONFIG_REGISTRY. Cannot serve /v1/models "
                     f"metadata. Registered types: {list(CONFIG_REGISTRY.keys())}"
                 )
-            model_config = CONFIG_REGISTRY[detected_type]()
-            model_id = Path(server_args.model).name
-            app.state.model_object = ModelObject(
-                id=model_id,
-                created=int(time.time()),
-                owned_by="batchgen",
-                max_context_length=model_config.max_position_embeddings,
-            )
-
             # Installed before the pool exists: worker.start() arms the
             # coordinator's follower, which may begin a coordinated restart as
             # soon as node 0 asks for one, with no request to carry a bridge.
@@ -242,6 +246,14 @@ def create_app(
             worker.start()
             await scheduler.start()
             scheduler_started = True
+            await asyncio.wait_for(scheduler.wait_for_deployment(), timeout=30)
+            app.state.model_object = ModelObject(
+                id=Path(server_args.model).name,
+                created=int(time.time()),
+                owned_by="batchgen",
+                max_context_length=scheduler.max_model_len,
+                max_model_len=scheduler.max_model_len,
+            )
             health_state.mark_startup_complete()
             e2e_elapsed = time.monotonic() - e2e_start
             logger.info(
@@ -290,11 +302,11 @@ def create_app(
 
     @app.get("/v1/models", response_model=ListModelsResponse)
     async def list_models(request: Request):
-        return ListModelsResponse(data=[request.app.state.model_object])
+        return ListModelsResponse(data=[published_model_object(request)])
 
     @app.get("/v1/models/{model_id:path}", response_model=ModelObject)
     async def retrieve_model(request: Request, model_id: str):
-        model_obj: ModelObject = request.app.state.model_object
+        model_obj = published_model_object(request)
         if model_id != model_obj.id:
             raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
         return model_obj

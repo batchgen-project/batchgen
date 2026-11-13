@@ -61,4 +61,59 @@ def generate_bucket_sizes(max_bucket: int, num_buckets: int) -> List[int]:
     return sizes_list
 
 
-__all__ = ["generate_bucket_sizes"]
+class DecodeWidthExceedsGraphBucketError(RuntimeError):
+    """The per-rank decode width is wider than the largest captured bucket.
+
+    On a deployment that requests whole-model decode graphs, decode admission
+    is bounded by the per-rank decode width and the bucket ladder is derived
+    to cover that width, so every admitted step has a graph to replay. A step
+    or a plan wider than the ladder's top bucket would silently run eager; it
+    is an invariant violation and fails loud instead.
+    """
+
+
+def decode_graph_bucket_sizes(
+    max_bucket: int, num_buckets: int, decode_width: int
+) -> List[int]:
+    """Bucket ladder for whole-model decode graphs at a per-rank decode width.
+
+    The ladder is ``generate_bucket_sizes`` over a top bucket of
+    ``max(max_bucket, decode_width)``: a width above the configured top
+    raises the top to the width, so every width decode admission can reach
+    has a captured bucket. ``decode_width`` itself is always a bucket, so a
+    step at full width replays its own graph instead of padding up to the
+    next bucket.
+    """
+    max_bucket = int(max_bucket)
+    decode_width = int(decode_width)
+    if max_bucket <= 0:
+        raise ValueError(f"max_bucket must be positive, got {max_bucket}")
+    if decode_width <= 0:
+        raise ValueError(f"decode_width must be positive, got {decode_width}")
+    sizes = generate_bucket_sizes(max(max_bucket, decode_width), int(num_buckets))
+    if decode_width not in sizes:
+        sizes = sorted(set(sizes) | {decode_width})
+    return sizes
+
+
+def check_decode_width_within_buckets(
+    decode_width: int, bucket_sizes: List[int]
+) -> None:
+    """Raise ``DecodeWidthExceedsGraphBucketError`` if no bucket covers the width."""
+    top = max(int(b) for b in bucket_sizes) if bucket_sizes else 0
+    if int(decode_width) > top:
+        raise DecodeWidthExceedsGraphBucketError(
+            f"per-rank decode width {int(decode_width)} exceeds the largest "
+            f"whole-model decode graph bucket {top} (buckets="
+            f"{sorted(int(b) for b in bucket_sizes)}); decode would run eager "
+            "above the bucket. Raise --cuda-graph-max-bucket-size to at least "
+            f"{int(decode_width)}."
+        )
+
+
+__all__ = [
+    "DecodeWidthExceedsGraphBucketError",
+    "check_decode_width_within_buckets",
+    "decode_graph_bucket_sizes",
+    "generate_bucket_sizes",
+]

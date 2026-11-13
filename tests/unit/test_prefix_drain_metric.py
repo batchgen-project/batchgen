@@ -15,6 +15,9 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
+import torch
+
 from batchgen.query_book import release_local_query_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 
@@ -33,7 +36,8 @@ _NAMESPACE = {
     "SequenceEntry": SequenceEntry,
     "logging": logging,
     "release_local_query_slot": release_local_query_slot,
-    "_release_tokenizer_arenas": lambda **_: None,
+    "np": np,
+    "torch": torch,
     "time": time,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
@@ -43,6 +47,7 @@ exec(compile(ast.fix_missing_locations(ast.Module(
             "_maybe_emit_prefix_drain_metric",
             "_trajectory_restore_fields",
             "_admit_sequences_from_message",
+            "_admitted_prompt_ids",
         )
     ],
     type_ignores=[],
@@ -53,7 +58,6 @@ class _Worker:
     rank = 1
     world_size = 1
     max_input_length = 1 << 20
-    max_decoding_length = 64
     _trajectory_book = None
     _response_queue = None
 
@@ -89,9 +93,9 @@ class _Worker:
     def _prefix_host_resource_fields(self):
         return {"active_attachments": self.active_attachments, "resident_nodes": 3}
 
-    # Admission collaborators: tokenization and query-book binding are out of
+    # Admission collaborators: prompt binding and query-book binding are out of
     # scope; the drain edge only needs the sequences to enter global_batch.
-    def _tokenize_admitted_sequences(self, uuids):
+    def _bind_admitted_prompts(self, uuids, prompt_ids):
         for uuid in uuids:
             self.global_batch.get_sequence(uuid).prompt_length = 4
 
@@ -104,7 +108,8 @@ class _Worker:
 
 def _admit(worker, *request_ids):
     worker._admit_sequences_from_message({"entries": [
-        {"request_id": rid, "text": "prompt", "batch_id": "b"}
+        {"request_id": rid, "input_ids": np.zeros(4, dtype=np.int32), "batch_id": "b",
+         "max_tokens": 64}
         for rid in request_ids
     ]})
 
@@ -267,19 +272,20 @@ def test_the_drain_row_carries_the_trajectory_attachment_counter():
     assert rows[0]["trajectory_live_attachments"] == 0
     assert rows[0]["trajectory_restores"] == 1
     assert rows[0]["trajectory_declines"] == 1
-    # No session map on this run, so the Slice 3a pin counter stays absent.
-    assert "trajectory_group_pins" not in rows[0]
+    # No session map on this run, so the residency placement counters stays absent.
+    assert "trajectory_group_honored_on_owner" not in rows[0]
 
 
-def test_the_drain_row_carries_the_session_group_pin_counter():
+def test_the_drain_row_splits_session_residency_placement_counts():
     """M3 Slice 3a: how many sequences the session map placed.
 
-    Reported from the map itself, so a rank that pinned sequences but holds no
-    restorer still accounts for its pins.
+    Reported from the map itself, so a rank that placed sequences but holds no
+    restorer still accounts for both placement outcomes.
     """
 
     class _Index:
-        pins = 3
+        honored_on_owner = 3
+        placed_offgroup = 2
 
     worker = _Worker()
     worker._trajectory_session_groups = _Index()
@@ -288,6 +294,7 @@ def test_the_drain_row_carries_the_session_group_pin_counter():
 
     rows = _drain_rows(worker)
     assert len(rows) == 1
-    assert rows[0]["trajectory_group_pins"] == 3
-    # No restorer on this rank: the pin counter does not depend on one.
+    assert rows[0]["trajectory_group_honored_on_owner"] == 3
+    assert rows[0]["trajectory_group_placed_offgroup"] == 2
+    # No restorer on this rank: the placement counters do not depend on one.
     assert "trajectory_lookups" not in rows[0]

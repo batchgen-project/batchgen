@@ -1540,7 +1540,6 @@ class WorkerManager:
             self.request_queue.put({
                 "type": "init",
                 "max_output_len": init_params.get("max_output_len", 4096),
-                "max_context_length": init_params.get("max_context_length"),
             })
             spawn_to_ready_s = time.monotonic() - spawn_start
             if coordinated:
@@ -1808,6 +1807,7 @@ class WorkerManager:
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,
             gpu_memory_frac=self.args.gpu_memory_frac,
+            max_model_len=self.args.max_model_len,
             initial_gpu_page_buffer=self.args.initial_gpu_page_buffer,
             extension_gpu_page_buffer=self.args.extension_gpu_page_buffer,
             decision_frequency_pages=self.args.decision_frequency_pages,

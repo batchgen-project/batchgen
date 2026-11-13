@@ -61,7 +61,7 @@ sys.path.insert(0, str(ROOT))
 from tests.kimi_k31_dsa_refs import (  # noqa: E402
     PML,
     QUANT,
-    fa3_ref,
+    install_sparse_attention_ref,
     head_gates_ref,
     install_fla_shim,
 )
@@ -205,6 +205,12 @@ def _install_flash_mla(monkeypatch):
     module.get_mla_metadata = get_mla_metadata
     module.flash_mla_with_kvcache = flash_mla_with_kvcache
     monkeypatch.setitem(sys.modules, "flash_mla", module)
+    # The dense seam resolves its backend from the device; pin the Hopper
+    # flash_mla backend (this stub has no use_legacy parameter).
+    from batchgen.attention.mla import paged_decode
+
+    monkeypatch.setattr(paged_decode, "_BACKEND", "flashmla")
+    monkeypatch.setattr(paged_decode, "_FLASHMLA_DENSE_KWARGS", None)
 
 
 @pytest.fixture()
@@ -214,8 +220,7 @@ def writer(monkeypatch):
     monkeypatch.setattr(dsa_decode, "_paged_scorer", lambda: paged_scorer_ref)
     monkeypatch.setattr(dsa_decode, "_head_gates", lambda: head_gates_ref)
     monkeypatch.setattr(dsa_decode, "_selected_positions", lambda: transform_ref)
-    monkeypatch.setattr(dsa_decode, "_fa3_with_kvcache", lambda: fa3_ref)
-    monkeypatch.setattr(dsa_decode, "_sparse_fa3_num_splits", lambda: 1)
+    install_sparse_attention_ref(monkeypatch)
     monkeypatch.setattr(rot, "_hadamard_predicate", lambda: QUANT.indexer_applies_hadamard)
     _install_flash_mla(monkeypatch)
     return ref
@@ -657,6 +662,24 @@ def test_wrapper_appends_both_host_regions(writer, monkeypatch):
         ("latent", 1, (2, 1, 1, LATENT)),
         ("index", 1, torch.float8_e4m3fn, (2,)),
     ]
+
+
+def test_wrapper_appends_nothing_when_no_callback_is_bound(writer, monkeypatch):
+    """The startup decode probe's seam: both Host-append callbacks are None,
+    and the DSA step still runs (writing its index key to the aux GPU region)
+    without raising — the aux callback is required only when the latent one
+    is bound."""
+    from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearAttnWrapper
+
+    lengths = [3, 21]
+    primary, aux, seq_ids = _caches(lengths)
+    _bind_decode(monkeypatch, primary, aux, seq_ids, lengths,
+                 primary_cb=None, aux_cb=None)
+    with torch.no_grad():
+        out = KimiLinearAttnWrapper._forward_decode_dsa(
+            SimpleNamespace(module=_module(), layer_idx=1), torch.randn(2, 1, 64))
+    assert out.shape == (2, 1, 64)
+    assert len(writer.calls) == 1  # the aux GPU cache still got this token
 
 
 def test_wrapper_refuses_to_append_the_latent_alone(writer, monkeypatch):

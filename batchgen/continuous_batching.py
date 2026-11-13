@@ -11,7 +11,10 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from batchgen.decode_dp_group import host_kv_owner_rank
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +95,9 @@ class BoundaryDecisions:
     new_load_uuids: List[str]            # Sequences to async-load into GPU
     decode_uuids_final: List[str]        # Final decode_uuids after all decisions
     scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
-    # node -> free Host pages the growth plan expects after completed/evicted
-    # releases and before growth (None when no node was planned)
+    # node -> Host pages the growth plan expects to be free after completed/
+    # evicted releases and the reclaim of retained prefix pages, before growth
+    # (None when no node was planned)
     host_planned_free_pages: Optional[Dict[int, int]] = None
 
 
@@ -115,6 +119,62 @@ def _reported_by_exact_group(ranks: List[int], group: Any, group_size: int) -> b
     return set(ranks) == expected
 
 
+def host_kv_owner_reports(
+    all_states: List[Optional[Dict[str, Dict[str, Any]]]],
+    group_size: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Per sequence, the gathered metadata report made by its Host-KV owner.
+
+    ``all_states[r]`` is rank ``r``'s ``{uuid: state}`` report. A sequence's
+    Host chain counters (``host_pages_allocated``, ``host_owned_pages``,
+    ``host_token_capacity``) have exactly one writer, the rank that owns its
+    Host KV:
+
+    * G==1: the owner is the only rank reporting the row, so its report is
+      returned as is.
+    * G>1: all G ranks of serve group g report the row, but only the leader
+      ``g*G`` attaches cached prefix pages and retains committed ones out of
+      the chain, so only the leader's ``host_owned_pages`` carries those
+      deductions. The leader's report is returned; the followers and every
+      rank outside the group take the counters from it.
+
+    A row reported without a serve group (evicted or completed, whose counters
+    every rank already zeroed) has no Host chain owner; its last report is
+    returned. A grouped row whose leader did not report raises: its canonical
+    counters are then unknown and any merge would guess.
+    """
+    G = int(group_size)
+    reports: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[str, Any] = {}
+    leader_reported: Set[str] = set()
+    for rank_idx, rank_state in enumerate(all_states):
+        for uuid, state in (rank_state or {}).items():
+            group = state.get("decode_dp_group") if G > 1 else None
+            if group is None:
+                if uuid not in groups:
+                    reports[uuid] = state
+                continue
+            groups[uuid] = group
+            if rank_idx == host_kv_owner_rank(group, G):
+                reports[uuid] = state
+                leader_reported.add(uuid)
+    missing = {
+        uuid: group for uuid, group in groups.items()
+        if uuid not in leader_reported
+    }
+    if missing:
+        raise RuntimeError(
+            "[SCHED_INVARIANT] HOST_KV_OWNER report missing: the serve-group "
+            "leader did not report these grouped sequences, so their Host chain "
+            "counters have no canonical source: "
+            + ", ".join(
+                f"{uuid}(group={group}, leader_rank={host_kv_owner_rank(group, G)})"
+                for uuid, group in sorted(missing.items())[:8]
+            )
+        )
+    return reports
+
+
 def validate_boundary_payload_alignment(
     decode_uuids: List[str],
     all_payloads: List[Optional[Dict[str, Any]]],
@@ -131,7 +191,11 @@ def validate_boundary_payload_alignment(
       ranks of its ``decode_dp_group`` g, so it must be reported by EXACTLY the G
       contiguous ranks ``[g*G, (g+1)*G)`` (``set(ranks) == set(range(g*G,(g+1)*G))``)
       and ownership is GROUP MEMBERSHIP (``rank // G == g``), not
-      ``assigned_rank == rank``.
+      ``assigned_rank == rank``. The G reports must also agree on
+      ``host_owned_pages``: the leader alone moves it at prefix attach and
+      commit, the post-prefill metadata sync hands its value to the
+      followers, and every later move is applied on all ranks, so two values
+      for one sequence mean the planner reads whichever rank merged last.
 
     Violations mean scheduler state is already corrupt enough that silently
     completing or dropping rows would hide data loss and can lead to long-tail
@@ -143,6 +207,7 @@ def validate_boundary_payload_alignment(
     candidate_reports: Dict[str, List[int]] = {}
     active_group: Dict[str, Any] = {}       # uuid -> decode_dp_group (G>1)
     candidate_group: Dict[str, Any] = {}
+    active_owned: Dict[str, Dict[int, Any]] = {}  # uuid -> rank -> host_owned_pages (G>1)
     active_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_bad_status: List[Tuple[str, int, Any]] = []
@@ -165,6 +230,9 @@ def validate_boundary_payload_alignment(
                 group = state.get("decode_dp_group") if isinstance(state, dict) else None
                 if group is not None:
                     active_group[uuid] = group
+                active_owned.setdefault(uuid, {})[rank_idx] = (
+                    state.get("host_owned_pages") if isinstance(state, dict) else None
+                )
                 # Owner check is group membership: rank // G == decode_dp_group.
                 if not isinstance(group, int) or rank_idx // G != group:
                     active_wrong_owner.append((uuid, rank_idx, group))
@@ -237,6 +305,19 @@ def validate_boundary_payload_alignment(
             errors.append(
                 "load candidates not reported by exactly their decode group's G ranks: "
                 f"{_format_ranked_reports(bad_candidate_card)}"
+            )
+        owned_diverged = {
+            uuid: per_rank for uuid, per_rank in active_owned.items()
+            if len(set(per_rank.values())) > 1
+        }
+        if owned_diverged:
+            errors.append(
+                "HOST_OWNED_PAGES diverged across serve-group ranks: "
+                + ", ".join(
+                    f"{uuid}(group={active_group.get(uuid)}, "
+                    f"host_owned_pages_by_rank={dict(sorted(per_rank.items()))})"
+                    for uuid, per_rank in sorted(owned_diverged.items())[:8]
+                )
             )
     else:
         duplicate_active = {
@@ -340,6 +421,10 @@ class EvictionStrategy(Enum):
     SHORTEST_FIRST = "shortest_first"  # Evict shortest-decoded first (keep longer)
     LONGEST_FIRST = "longest_first"  # Evict longest-decoded first
     FIFO = "fifo"  # First-in-first-out
+    # Host-KV growth planning only: evict the rows that close the most growth
+    # deficit pages (owned pages returned + growth debt retired) per token a
+    # later re-prefill must recompute.
+    GROWTH_COST_AWARE = "growth_cost_aware"
 
 
 class AdaptiveChunkSizer:
@@ -416,6 +501,11 @@ def select_sequences_for_eviction(
     Returns:
         (list of uuids to evict, total pages freed)
     """
+    if strategy == EvictionStrategy.GROWTH_COST_AWARE:
+        raise ValueError(
+            "EvictionStrategy.GROWTH_COST_AWARE scores host-KV growth debt and "
+            "is only valid in plan_host_kv_growth_evictions"
+        )
     if not sequences or pages_to_free <= 0:
         return [], 0
 
@@ -448,7 +538,7 @@ def select_sequences_for_eviction(
 
 @dataclass
 class HostKVGrowthEvictionPlan:
-    """Deterministic host-KV eviction plan that preserves growth headroom."""
+    """Deterministic host-KV eviction plan that covers the growth debt exactly."""
 
     evicted_uuids: List[str]
     freed_pages: int
@@ -458,6 +548,31 @@ class HostKVGrowthEvictionPlan:
     expected_free_pages: int
     required_free_pages: int
     growth_feasible_after_eviction: bool
+
+
+def _growth_cost_aware_key(item: Tuple[str, Dict[str, Any]], page_key: str):
+    """Sort key: most deficit pages closed per recompute token first.
+
+    benefit = owned pages the eviction returns + growth debt it retires;
+    cost = tokens the row's re-prefill recomputes (>= 1). Both are exact
+    integers, so the Fraction ordering is exact and identical on every rank.
+    Scores do not depend on which other rows are evicted, so one sort equals
+    greedy re-scoring after every pick.
+    """
+    uuid, state = item
+    for key in ("growth_pages", "recompute_tokens"):
+        if key not in state:
+            raise ValueError(
+                f"GROWTH_COST_AWARE eviction candidate {uuid} has no {key!r}"
+            )
+    benefit = int(state.get(page_key, 0) or 0) + int(state["growth_pages"])
+    cost = max(1, int(state["recompute_tokens"]))
+    return (
+        state.get("priority", 0),
+        Fraction(-benefit, cost),
+        state.get("global_idx", float("inf")),
+        uuid,
+    )
 
 
 def plan_host_kv_growth_evictions(
@@ -470,18 +585,22 @@ def plan_host_kv_growth_evictions(
     free_pages: int,
     total_pages: int,
     completed_pages: int,
-    safety_margin: int,
+    reclaimable_pages: int = 0,
     strategy: EvictionStrategy = EvictionStrategy.SHORTEST_FIRST,
-    page_key: str = "host_pages_allocated",
+    page_key: str = "host_owned_pages",
 ) -> HostKVGrowthEvictionPlan:
     """Plan host evictions so remaining active rows can grow before appending.
 
     The dynamic host-KV invariant is: after a boundary, every still-active row
     that needs host growth must either have enough free pages to grow, or must
-    have been removed from decode. This planner accounts for pages that will be
-    released by completed rows before growth, then selects deterministic
-    eviction candidates until the remaining growth debt plus the safety
-    reserve is satisfied.
+    have been removed from decode. The growth debt is covered exactly -- no
+    pool-proportional reserve -- by, in order: physical free pages, pages the
+    completed rows release, retained prefix pages the prefix cache can reclaim
+    (``reclaimable_pages``: resident, unattached, no pending load; the same
+    supply prefill admission counts), and finally the owned pages of evicted
+    rows. Staleness between this snapshot and the allocation is not a margin's
+    job: the execution phase re-checks the fresh allocator collectively and
+    fails loud.
 
     Eviction is strictly growth-driven: a full pool whose active rows carry no
     growth debt evicts nothing. Admission deliberately fills the pool with
@@ -489,12 +608,19 @@ def plan_host_kv_growth_evictions(
     out — an evicted row loses its whole decode state and re-enters as a full
     prompt recompute, which costs far more than whatever headroom the
     watermark would buy.
+
+    Candidates with no owned page are never evicted (HOST_OWNED_PAGE makes
+    every live row own >= 1), so each victim closes >= 1 deficit page and the
+    plan evicts at most ``ceil(deficit / min benefit)`` rows.
     """
     if len(host_growth_uuids) != len(host_growth_pages):
         raise ValueError("host_growth_uuids and host_growth_pages must align")
 
     completed_set = set(completed_uuids)
-    base_free = min(max(total_pages, 0), max(free_pages, 0) + max(completed_pages, 0))
+    base_free = min(
+        max(total_pages, 0),
+        max(free_pages, 0) + max(completed_pages, 0) + max(reclaimable_pages, 0),
+    )
     growth_by_uuid = {
         uuid: pages
         for uuid, pages in zip(host_growth_uuids, host_growth_pages)
@@ -502,7 +628,12 @@ def plan_host_kv_growth_evictions(
     }
     remaining_growth = sum(growth_by_uuid.values())
 
-    if strategy == EvictionStrategy.SHORTEST_FIRST:
+    if strategy == EvictionStrategy.GROWTH_COST_AWARE:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: _growth_cost_aware_key(x, page_key),
+        )
+    elif strategy == EvictionStrategy.SHORTEST_FIRST:
         sorted_candidates = sorted(
             eviction_candidates,
             key=lambda x: (
@@ -535,7 +666,7 @@ def plan_host_kv_growth_evictions(
 
     while True:
         expected_free = min(max(total_pages, 0), base_free + freed_pages)
-        required_free = remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
+        required_free = remaining_growth if remaining_growth > 0 else 0
         if expected_free >= required_free:
             break
 
@@ -559,10 +690,8 @@ def plan_host_kv_growth_evictions(
     remaining_growth_uuids = [uuid for uuid in host_growth_uuids if uuid in growth_by_uuid]
     remaining_growth_pages = [growth_by_uuid[uuid] for uuid in remaining_growth_uuids]
     expected_free = min(max(total_pages, 0), base_free + freed_pages)
-    required_free = (
-        remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
-    )
-    growth_feasible = remaining_growth == 0 or expected_free >= remaining_growth + max(safety_margin, 0)
+    required_free = remaining_growth if remaining_growth > 0 else 0
+    growth_feasible = remaining_growth == 0 or expected_free >= remaining_growth
 
     return HostKVGrowthEvictionPlan(
         evicted_uuids=evicted_uuids,

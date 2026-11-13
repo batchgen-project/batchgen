@@ -260,7 +260,6 @@ def run_batch_workflow(
     base_url: str,
     poll_interval: float = 5.0,
     timeout: Optional[float] = None,
-    max_context_length: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
@@ -272,7 +271,6 @@ def run_batch_workflow(
         base_url: Server base URL
         poll_interval: Seconds between status checks
         timeout: Maximum seconds to wait
-        max_context_length: Max total context (prompt + decode). Default 128K.
         temperature: Sampling temperature (None = greedy decoding)
         top_p: Nucleus sampling threshold (None = disabled)
 
@@ -293,7 +291,6 @@ def run_batch_workflow(
         endpoint="/v1/chat/completions",
         poll_interval=poll_interval,
         timeout=timeout,
-        max_context_length=max_context_length,
         temperature=temperature,
         top_p=top_p,
     )
@@ -345,12 +342,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--timeout", type=float, default=None, help="Maximum seconds to wait for batch"
-    )
-    parser.add_argument(
-        "--max_context_length",
-        type=int,
-        default=131072,
-        help="Max total context length (prompt + decode). Default 128K.",
     )
     parser.add_argument(
         "--temperature",
@@ -514,7 +505,6 @@ if __name__ == "__main__":
         base_url=base_url,
         poll_interval=args.poll_interval,
         timeout=args.timeout,
-        max_context_length=args.max_context_length,
         temperature=args.temperature,
         top_p=args.top_p,
     )

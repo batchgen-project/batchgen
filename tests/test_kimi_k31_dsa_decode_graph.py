@@ -45,7 +45,7 @@ sys.path.insert(0, str(ROOT))
 
 from tests.kimi_k31_dsa_refs import (  # noqa: E402
     QUANT,
-    fa3_ref,
+    install_sparse_attention_ref,
     head_gates_ref,
 )
 from tests.test_kimi_k31_dsa_decode import (  # noqa: E402
@@ -125,8 +125,7 @@ def refs(monkeypatch):
     monkeypatch.setattr(dsa_decode, "_latent_token_writer", lambda: latent)
     monkeypatch.setattr(dsa_decode, "_head_gates", lambda: head_gates_ref)
     monkeypatch.setattr(dsa_decode, "_selected_positions", lambda: transform_ref)
-    monkeypatch.setattr(dsa_decode, "_fa3_with_kvcache", lambda: fa3_ref)
-    monkeypatch.setattr(dsa_decode, "_sparse_fa3_num_splits", lambda: 1)
+    install_sparse_attention_ref(monkeypatch)
     monkeypatch.setattr(rot, "_hadamard_predicate", lambda: QUANT.indexer_applies_hadamard)
     _install_flash_mla(monkeypatch)
     return SimpleNamespace(writer=writer, latent=latent)

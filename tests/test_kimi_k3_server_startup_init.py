@@ -325,8 +325,8 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
         ("preload_runtime_extensions",)
     )
     worker._ensure_pynccl_communicator = lambda: trace.append(("ensure_pynccl",))
-    worker._load_decode_model = lambda bsz, comm=None: trace.append(
-        ("load_decode_model", bsz, comm)
+    worker._load_decode_model = lambda comm=None: trace.append(
+        ("load_decode_model", comm)
     )
     def transition(key):
         trace.append(("phase_enter", key.phase, key.prefill_moe_mode))
@@ -380,7 +380,7 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
         ("set_comm", "pynccl"),
         # Resident decode materializes the stacked MXFP4 EP shard, sized for
         # the largest per-rank batch the runtime decode path can admit.
-        ("load_decode_model", 128, "pynccl"),
+        ("load_decode_model", "pynccl"),
         # Then the topology's own prefill mode, so the first admission finds
         # the streamed-SP8 buffers already attached.
         ("set_prefill_moe_mode", "streamed_sp8"),
@@ -505,9 +505,25 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
     path, function_name
 ):
     decode = _function(path, function_name)
+    # Both K3 dense decodes (eager and graph) reach the kernel only through
+    # the capability-selected seam, never a kernel package directly.
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "batchgen.attention.mla.paged_decode"
+        and [alias.name for alias in node.names] == ["mla_paged_decode"]
+        for node in ast.walk(decode)
+    )
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and (node.module or "").split(".")[0] in ("flash_mla", "flashinfer")
+        for node in ast.walk(decode)
+    )
+    seam = ast.parse(
+        (ROOT / "batchgen" / "attention" / "mla" / "paged_decode.py").read_text()
+    )
     imported = {
         alias.name
-        for node in ast.walk(decode)
+        for node in ast.walk(seam)
         if isinstance(node, ast.ImportFrom) and node.module == "flash_mla"
         for alias in node.names
     }
@@ -522,8 +538,9 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
         for node in ast.walk(decode)
     )
 
-    # Whatever the real K3 consumers import is what startup must prove exists;
+    # Whatever the seam imports for Hopper is what startup must prove exists;
     # otherwise the readiness check can drift away from the failing path.
+    # (The Blackwell launch is proven by the warmup, which runs the seam.)
     source = _body_source(
         _function(WORKER, "_preload_kimi_k3_runtime_extensions", "BatchGenWorker")
     )
@@ -548,7 +565,9 @@ def test_kimi_k3_graph_mla_preserves_the_tp_output_reduce():
     )
 
 
-def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
+def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs(
+    monkeypatch,
+):
     trace = []
 
     class FakeTorch:
@@ -581,15 +600,14 @@ def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
             trace.append(value)
             return value
 
-    class FakeFlashMLA:
-        @staticmethod
-        def get_mla_metadata(cache_seqlens, num_q_tokens, num_kv_heads):
-            trace.append(("metadata", cache_seqlens, num_q_tokens, num_kv_heads))
-            return "metadata", "splits"
+    from batchgen.attention.mla import paged_decode
 
-        @staticmethod
-        def flash_mla_with_kvcache(*args, **kwargs):
-            trace.append(("decode", args, kwargs))
+    # The warmup runs the capability-selected seam the decode forward uses
+    # (flash_mla on Hopper, flashinfer trtllm-gen on Blackwell).
+    def seam(*args, **kwargs):
+        trace.append(("decode", args, kwargs))
+
+    monkeypatch.setattr(paged_decode, "mla_paged_decode", seam)
 
     warmup = _isolated_method(
         WORKER,
@@ -597,16 +615,16 @@ def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
         "_warmup_kimi_k3_flash_mla",
         {"torch": FakeTorch},
     ).__get__(SimpleNamespace(rank=11))
-    warmup(FakeFlashMLA)
+    warmup(object())
 
     assert trace[0] == "current_device"
-    assert ("zeros", (1, 1, 12, 576), "bfloat16", "cuda:3") in trace
-    assert ("zeros", (1, 64, 1, 576), "bfloat16", "cuda:3") in trace
-    metadata = next(item for item in trace if item[0] == "metadata")
-    assert metadata[2:] == (12, 1)
+    query = ("zeros", (1, 1, 12, 576), "bfloat16", "cuda:3")
+    blocked_k = ("zeros", (1, 64, 1, 576), "bfloat16", "cuda:3")
+    block_table = ("zeros", (1, 1), "int32", "cuda:3")
+    cache_seqlens = ("ones", (1,), "int32", "cuda:3")
     decode = next(item for item in trace if item[0] == "decode")
-    assert decode[1][4] == 512
-    assert decode[2] == {"causal": True}
+    assert decode[1] == (query, blocked_k, block_table, cache_seqlens, 512, 576 ** -0.5)
+    assert decode[2] == {}
     assert trace[-1] == ("synchronize", "cuda:3")
 
 
@@ -636,17 +654,19 @@ def test_kimi_k3_startup_fails_closed_when_a_runtime_extension_is_missing(
 
 
 def test_kimi_k3_startup_uses_the_runtime_decode_batch_cap():
-    # The startup decode build is sized by the same per-rank cap the decode
-    # path applies to its own estimate (_max_decode_rank_bsz: the generic
-    # guard, lifted to the planner's per-node cap for TP-group models), so the
-    # padded MoE buffers built here already fit the worst admitted batch.
+    # The startup decode build is sized by the same per-rank decode width the
+    # runtime decode configure uses (_max_decode_rank_bsz: the generic guard,
+    # lifted to the planner's per-node cap for TP-group models), so the padded
+    # MoE buffers built here already fit the worst admitted batch. The width
+    # is not a caller argument: _load_decode_model derives it itself, so no
+    # call site can size a decode configure differently.
     startup = _body_source(
         _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
     )
-    assert "self._load_decode_model(self._max_decode_rank_bsz()" in startup
-    assert "_max_decode_rank_bsz" in _calls(
-        _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
-    )
+    assert "self._load_decode_model(comm=self.comm)" in startup
+    load = _function(WORKER, "_load_decode_model", "BatchGenWorker")
+    assert [a.arg for a in load.args.args] == ["self", "comm"]
+    assert "_max_decode_rank_bsz" in _calls(load)
 
 
 def test_kimi_k3_startup_is_idempotent():

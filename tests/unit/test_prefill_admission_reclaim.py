@@ -22,7 +22,7 @@ import random
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 import torch
@@ -76,7 +76,12 @@ METHODS = (
     # The reserve-time seam: selection admits against free + reclaimable, so
     # this is where the reclaimable part is actually released.
     "_collective_prefill_host_capacity_ok",
+    "_reclaim_host_prefix_pages_collective",
     "_retry_prefill_host_capacity_after_reclaim",
+    # Boundary growth: the per-node reclaimable gather and the growth-time
+    # reclaim share the reserve-time collective helper above.
+    "_gather_host_kv_stats_by_node",
+    "_reclaim_host_prefix_pages_for_growth",
     "_prefill_pool_segment_host_pages",
     "_prefill_sequence_limits",
     "_trajectory_frontier_eviction_hook",
@@ -111,7 +116,8 @@ def _worker_methods(dist):
     assert {node.name for node in wanted} == set(METHODS)
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
-        "List": List, "Optional": Optional, "Sequence": Sequence,
+        "Callable": Callable, "List": List, "Optional": Optional,
+        "Sequence": Sequence,
         "Dict": Dict, "Tuple": Tuple, "hashlib": hashlib, "math": math,
         "logging": logging, "replace": dataclasses.replace, "torch": torch,
         "dist": dist, "core_engine": FakeCoreEngineModule,
@@ -1053,6 +1059,158 @@ def test_reserve_reclaim_deficit_rows_must_cover_this_node():
         worker._retry_prefill_host_capacity_after_reclaim(
             _owner_requests(1), {1: (NEED, 0)}
         )
+    assert coordinator.calls == []
+
+
+# --------------------------------------------------------------------------- #
+#  Boundary growth: reclaimable supply gathered, then released on demand
+# --------------------------------------------------------------------------- #
+
+
+def _grower(uuid, rank):
+    return SimpleNamespace(uuid=uuid, assigned_rank=rank, decode_dp_group=None)
+
+
+def test_gather_reports_reclaimable_retained_pages_per_node():
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+    )
+    [row] = worker._gather_host_kv_stats_by_node(pool)
+    assert row == {
+        "node_id": 0,
+        "num_free_pages": pool.get_stats().num_free_pages,
+        "num_total_pages": 400,
+        "num_reclaimable_pages": coordinator.count_releasable_pages(0),
+    }
+    assert row["num_reclaimable_pages"] > 0
+    # Read-only: the gather never evicts.
+    assert coordinator.calls == []
+
+    worker.enable_prefix_cache = False
+    [row] = worker._gather_host_kv_stats_by_node(pool)
+    assert row["num_reclaimable_pages"] == 0
+
+
+def test_gather_carries_peer_node_reclaimable_and_ignores_non_leaders():
+    pool = FakeHostPool(100)
+    coordinator = FakePrefixCoordinator(pool)
+    coordinator.retain(0, pages=pool.take(6), last_access=0)
+    # Ranks 0-1 are node 0, ranks 2-3 node 1; rank 2 leads node 1.
+    dist = FakeDist(rank=0, world_size=4, peers={
+        0: {1: [-1, 0, 0, -1], 2: [1, 9, 50, 7], 3: [-1, 0, 0, -1]},
+    })
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, sequences=[],
+        world_size=4, local_world_size=2, dist=dist,
+    )
+    rows = worker._gather_host_kv_stats_by_node(pool)
+    assert rows == [
+        {"node_id": 0, "num_free_pages": 94, "num_total_pages": 100,
+         "num_reclaimable_pages": 6},
+        {"node_id": 1, "num_free_pages": 9, "num_total_pages": 50,
+         "num_reclaimable_pages": 7},
+    ]
+    assert dist.calls == ["all_gather"]
+
+
+def test_gather_turns_a_reclaimable_count_failure_into_the_named_error():
+    class BrokenCoordinator(FakePrefixCoordinator):
+        def count_releasable_pages(self, group_id):
+            raise RuntimeError("coordinator lock poisoned")
+
+    pool = FakeHostPool(100)
+    worker = FakeWorker(
+        pool=pool, coordinator=BrokenCoordinator(pool), sequences=[],
+    )
+    with pytest.raises(RuntimeError, match="host-KV stats snapshot failed"):
+        worker._gather_host_kv_stats_by_node(pool)
+
+
+def test_growth_reclaim_releases_exactly_the_uncovered_growth():
+    pool, coordinator, committer, allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+    )
+    free_before = pool.get_stats().num_free_pages
+    growth = free_before + 9
+    entries = [
+        ("g0", growth - 4, _grower("g0", 0)),
+        ("g1", 4, _grower("g1", 0)),
+    ]
+    worker._reclaim_host_prefix_pages_for_growth(entries, pool)
+    # Targeted at the node's growth minus the physical free pages, no margin.
+    assert coordinator.calls == [({0: growth - free_before}, 0)]
+    assert pool.get_stats().num_free_pages >= growth
+    assert allocator.releases  # frontiers on the reclaimed pages retired
+    committer.registry.check_invariants()
+
+
+def test_growth_reclaim_is_a_no_op_when_free_pages_cover_the_growth():
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+    )
+    free_before = pool.get_stats().num_free_pages
+    entries = [("g0", free_before, _grower("g0", 0))]
+    assert worker._reclaim_host_prefix_pages_for_growth(entries, pool) == 0
+    assert coordinator.calls == []
+    assert pool.get_stats().num_free_pages == free_before
+
+
+def test_growth_reclaim_charges_only_this_nodes_growth():
+    """A peer node's growth never drives this node's reclaim."""
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    dist = FakeDist(rank=0, world_size=2, peers={0: {1: [0, 0]}})
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+        world_size=2, local_world_size=1, dist=dist,
+    )
+    entries = [("far", 10_000, _grower("far", 1))]
+    assert worker._reclaim_host_prefix_pages_for_growth(entries, pool) == 0
+    assert coordinator.calls == []
+    # Every rank still reaches the failure-flag collective.
+    assert dist.calls == ["all_reduce"]
+
+
+def test_growth_reclaim_keeps_followers_aligned_on_a_real_release():
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    free_before = pool.get_stats().num_free_pages
+    # Rank 1 shares node 0 and reclaims nothing itself.
+    dist = FakeDist(rank=0, world_size=2, peers={
+        0: {1: [0, 0]}, 1: {1: (0, None)}, 2: {1: [0]},
+    })
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+        world_size=2, local_world_size=2, dist=dist,
+    )
+    entries = [("g", free_before + 5, _grower("g", 1))]
+    reclaimed = worker._reclaim_host_prefix_pages_for_growth(entries, pool)
+    assert reclaimed >= 5
+    assert coordinator.calls == [({0: 5}, 0)]
+    assert dist.calls == ["all_reduce", "all_gather_object", "all_reduce"]
+
+
+def test_growth_reclaim_leader_failure_is_the_named_collective_error():
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, sequences=[],
+    )
+    entries = [("g", 1, _grower("g", 0))]
+    with pytest.raises(RuntimeError, match="host_growth eviction failed"):
+        worker._reclaim_host_prefix_pages_for_growth(entries, None)
     assert coordinator.calls == []
 
 

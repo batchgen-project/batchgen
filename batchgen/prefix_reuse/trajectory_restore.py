@@ -20,9 +20,21 @@ commit transaction and where the snapshot bytes physically live
    fallback, so the live-attachment counter returns to zero when the batch
    drains.
 
-Fail-safe by construction: every refusal releases the attachment and reports a
-named reason, and the sequence then proceeds as a full recompute. Nothing here
-blocks a wave, waits for a slot, or raises into the prefill path.
+Every refusal releases the attachment and reports a named reason. Nothing here
+blocks a wave or waits for a slot.
+
+WHETHER a row restores is the wave planner's decision, not this module's: the
+planner materializes the frontier and raises the row's compute start to
+exactly the snapshot boundary, and every attachment it does not plan is
+declined at plan time (``not_planned``) and recomputes from its own start.
+The restore therefore only checks that hand-off -- token identity and start
+== boundary -- and treats a failure of either as a broken invariant, raised
+after the attachment is consumed. And because the wave is already built
+around a planned row's start, ANY refusal of a row whose compute starts at
+the boundary (capacity, I/O, shard or group) is raised as
+``TrajectoryPlannedRestoreFailed`` after it is counted: that row cannot fall
+back to a recompute inside a fixed wave, and running it would compute its
+suffix on a state that does not hold its prefix.
 
 The H2D ordering contract
 -------------------------
@@ -47,7 +59,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, NoReturn, Sequence
 
 from batchgen.prefix_reuse.trajectory_commit import (
     PREFIX as COMMIT_LOG_PREFIX,
@@ -73,9 +85,10 @@ from batchgen.prefix_reuse.trajectory_commit import (  # noqa: E402
 
 PREFIX = "TRAJECTORY_RESTORE"
 
-# The ONE recoverable KDA failure: ``KDAStateGPUManager._ensure_state_item``
+# The ONE capacity KDA failure: ``KDAStateGPUManager._ensure_state_item``
 # refuses with this message when the free list is empty. Slot exhaustion is a
-# capacity outcome, not a bug, and it degrades to recompute without waiting.
+# capacity outcome, not a bug, and is named as such without waiting; for a
+# planned row it is then raised, since the planned wave cannot recompute it.
 _SLOT_PRESSURE_MARKERS = ("Insufficient free KDA state items",)
 
 
@@ -91,13 +104,73 @@ class TrajectoryRestoreError(RuntimeError):
 class KDAStateSlotsExhausted(TrajectoryRestoreError):
     """No free KDA state slot to restore a snapshot into.
 
-    The fail-safe outcome: the attachment is released and the sequence
-    recomputes its whole prompt. Never a wait, never a raise into prefill.
+    Named, never waited on: the attachment is released and the refusal is
+    counted as ``slots_exhausted``. A planned row then fails loud as
+    ``TrajectoryPlannedRestoreFailed``.
     """
 
 
 class TrajectoryAttachmentInvalid(TrajectoryRestoreError):
     """An attachment was used in a state the mechanism does not allow."""
+
+
+class TrajectoryRestorePlanDrift(TrajectoryRestoreError):
+    """A planned restore reached the apply step at the wrong suffix start.
+
+    The wave planner is what makes a restore exact: it raises a row's compute
+    start to exactly the snapshot boundary, and only such a row is handed to
+    the restore. A start that differs therefore means the planner and the
+    restore disagree about the row, which no fallback can repair -- the row
+    has no state for the tokens it was told it does not have to compute.
+    """
+
+
+class TrajectoryPlannedRestoreFailed(TrajectoryRestoreError):
+    """A row the wave plan committed to restore could not be given its state.
+
+    The plan set the row's compute start to exactly the snapshot boundary,
+    and the wave was built around that start before the restore runs: the
+    row's chunk items begin at the boundary, its prefix is a materialized
+    segment no row computes, and the wave's Host pages and state-slot budget
+    were sized for that shape. A refusal at apply time therefore has no
+    recovery -- recomputing the row from 0 would need chunk items the plan
+    does not contain -- and running the wave anyway computes the suffix on
+    a KDA state that does not hold the prefix. So every refusal of a planned
+    row is raised, after it is counted under its decline reason and the
+    attachment (if any) is consumed.
+
+    ``reason`` is the decline name the refusal is counted under (one of
+    ``DECLINE_REASONS``), or ``FAIL_NO_RESTORE_SOURCE`` when the restore
+    seam found a planned row with nothing to restore it from.
+    ``state_slot`` is the KDA slot the row was bound to when the refusal
+    happened, ``None`` when it was bound to none.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        detail: str,
+        rank: int,
+        sequence_id: int,
+        session_key: str,
+        boundary_tokens: int,
+        state_slot: int | None = None,
+    ) -> None:
+        self.reason = str(reason)
+        self.detail = str(detail)
+        self.rank = int(rank)
+        self.sequence_id = int(sequence_id)
+        self.session_key = str(session_key)
+        self.boundary_tokens = int(boundary_tokens)
+        self.state_slot = None if state_slot is None else int(state_slot)
+        super().__init__(
+            f"rank {self.rank}: sequence {self.sequence_id} (session "
+            f"{self.session_key}) is planned to resume at token "
+            f"{self.boundary_tokens} on a restored KDA state, but the restore "
+            f"failed ({self.reason}: {self.detail}; state_slot="
+            f"{self.state_slot}); the wave cannot run this row"
+        )
 
 
 class _RestoreDeclined(Exception):
@@ -107,12 +180,16 @@ class _RestoreDeclined(Exception):
     mirrored follower path share ONE implementation of read-slot-write and
     still report the same named reasons: two copies of that sequence would be
     two places for the fallback accounting to drift.
+
+    ``state_slot`` is the slot the sequence was bound to when the core gave
+    up, or ``None`` -- it is what a planned row's failure reports.
     """
 
-    def __init__(self, reason: str, detail: str):
+    def __init__(self, reason: str, detail: str, state_slot: int | None = None):
         super().__init__(f"{reason}: {detail}")
         self.reason = str(reason)
         self.detail = str(detail)
+        self.state_slot = None if state_slot is None else int(state_slot)
 
 
 # Reasons a hit does NOT end in a restore. Strings, not booleans, because the
@@ -126,11 +203,17 @@ class _RestoreDeclined(Exception):
 # carries.
 DECLINE_HEAD_SHARDED_GROUP = "head_sharded_group"
 DECLINE_GROUP_MISMATCH = "group_mismatch"
+# Since the wave planner decides restores, this one is an INVARIANT: it names
+# planner/restore drift and the restore raises after counting it.
 DECLINE_SUFFIX_OFFSET = "suffix_offset_mismatch"
 DECLINE_ARENA_MISSING = "arena_missing"
 DECLINE_ARENA_READ_FAILED = "arena_read_failed"
 DECLINE_SLOTS_EXHAUSTED = "slots_exhausted"
 DECLINE_SLOT_WRITE_FAILED = "slot_write_failed"
+# The wave plan did not materialize this row's frontier, so its compute start
+# is not the snapshot boundary and there is no restore to apply. Declined at
+# PLAN time, with the planner's own drop reason as the detail.
+DECLINE_NOT_PLANNED = "not_planned"
 
 DECLINE_REASONS = (
     DECLINE_HEAD_SHARDED_GROUP,
@@ -140,7 +223,13 @@ DECLINE_REASONS = (
     DECLINE_ARENA_READ_FAILED,
     DECLINE_SLOTS_EXHAUSTED,
     DECLINE_SLOT_WRITE_FAILED,
+    DECLINE_NOT_PLANNED,
 )
+
+# Not a decline: the restore seam found a row its wave plan committed to
+# restore with neither a live attachment nor a mirrored leader decision to
+# restore it from. Only ever the reason of a ``TrajectoryPlannedRestoreFailed``.
+FAIL_NO_RESTORE_SOURCE = "no_restore_source"
 
 
 # ---------------------------------------------------------------------------
@@ -686,14 +775,16 @@ class TrajectoryRestorer:
         reason: str,
         detail: str = "",
     ) -> None:
-        """Release an attachment and say by name why no restore happened."""
+        """Release an attachment and say by name why no restore happened.
 
-        if reason not in DECLINE_REASONS:
-            raise TrajectoryAttachmentInvalid(
-                f"unknown trajectory decline reason {reason!r}; known reasons "
-                "are " + ", ".join(DECLINE_REASONS)
-            )
-        self._declines[reason] = self._declines.get(reason, 0) + 1
+        For a row that recomputes from its own start: the plan-time
+        ``not_planned`` decline, and a shard or group refusal of a row whose
+        compute does not start at the boundary. A row whose compute DOES
+        start there is never declined -- it fails loud, see
+        ``TrajectoryPlannedRestoreFailed``.
+        """
+
+        self._count_decline(reason)
         self._logger.warning(
             "[%s] rank=%s seq=%s session=%s FALLBACK reason=%s boundary=%s "
             "%s; trajectory reuse degrades to full recompute",
@@ -703,9 +794,91 @@ class TrajectoryRestorer:
             attachment.session_key,
             reason,
             attachment.boundary_tokens,
-            detail,
+            _attributed_detail(reason, detail),
         )
         self.release(attachment)
+
+    def _count_decline(self, reason: str) -> None:
+        """Count one refusal under its name; an unknown name is refused."""
+
+        if reason not in DECLINE_REASONS:
+            raise TrajectoryAttachmentInvalid(
+                f"unknown trajectory decline reason {reason!r}; known reasons "
+                "are " + ", ".join(DECLINE_REASONS)
+            )
+        self._declines[reason] = self._declines.get(reason, 0) + 1
+
+    def _fail_planned(
+        self,
+        *,
+        reason: str,
+        detail: str,
+        sequence_id: int,
+        session_key: str,
+        boundary_tokens: int,
+        state_slot: int | None = None,
+        attachment: TrajectoryAttachment | None = None,
+    ) -> NoReturn:
+        """Count, log and raise the refusal of a row planned at the boundary.
+
+        Both restore paths end a planned row's refusal here, so the counter,
+        the log line and the raised error cannot differ between the leader
+        and a follower. The attachment, when there is one, is consumed first,
+        so the raise leaks no reference.
+        """
+
+        self._count_decline(reason)
+        self._logger.error(
+            "[%s] rank=%s seq=%s session=%s PLANNED_RESTORE_FAILED reason=%s "
+            "boundary=%s state_slot=%s %s; the row is planned to resume at "
+            "the boundary and cannot run without the restored state",
+            PREFIX,
+            self._rank,
+            int(sequence_id),
+            session_key,
+            reason,
+            int(boundary_tokens),
+            state_slot,
+            _attributed_detail(reason, detail),
+        )
+        if attachment is not None:
+            self.release(attachment)
+        raise TrajectoryPlannedRestoreFailed(
+            reason=reason,
+            detail=detail,
+            rank=self._rank,
+            sequence_id=int(sequence_id),
+            session_key=str(session_key),
+            boundary_tokens=int(boundary_tokens),
+            state_slot=state_slot,
+        )
+
+    def _refuse(
+        self,
+        attachment: TrajectoryAttachment,
+        *,
+        planned: bool,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """A shard or group refusal on the attachment path.
+
+        Raised iff the row is planned. ``planned`` is the plan handshake
+        itself (compute start == boundary): exactly the rows whose suffix
+        would otherwise run on a state that does not hold the prefix. Any
+        other row recomputes from its own start and is declined.
+        """
+
+        if planned:
+            self._fail_planned(
+                reason=reason,
+                detail=detail,
+                sequence_id=attachment.sequence_id,
+                session_key=attachment.session_key,
+                boundary_tokens=attachment.boundary_tokens,
+                attachment=attachment,
+            )
+        self.decline(attachment, reason=reason, detail=detail)
 
     # -- restore ------------------------------------------------------------
 
@@ -718,19 +891,32 @@ class TrajectoryRestorer:
     ) -> TrajectoryRestoreOutcome | None:
         """Write the pinned snapshot into a KDA slot, before suffix prefill.
 
-        ``None`` means the sequence recomputes: every path through it has
-        already released the attachment and logged the reason. Nothing here
-        raises into the prefill path.
+        ``None`` means the sequence recomputes from its own start: the
+        attachment is released and the reason logged. Only a row whose
+        compute does NOT start at the boundary can get it (a shard or group
+        refusal); such a row does not depend on the snapshot. Every refusal
+        of a row whose compute starts at the boundary -- shard, group, arena,
+        slot capacity or slot write -- is counted under its name and raised
+        as ``TrajectoryPlannedRestoreFailed``, after the attachment is
+        consumed: the wave is already built around that start.
 
-        ``compute_cached_tokens`` is the position the suffix prefill will start
-        at, and the restored state is the state after exactly
-        ``boundary_tokens`` tokens, so the two must be EQUAL. This is an
-        identity, not a tolerance: a suffix that starts one token early would
-        re-apply that token on top of a state that already contains it, and a
-        suffix that starts late would skip one. The full-hit case
-        (``compute_cached_tokens == prompt_length - 1``, the last token
-        recomputed so there is a logit to sample) therefore declines here
-        rather than restoring a state the forward would double-count.
+        Only a row the wave planner materialized reaches this call, and the
+        planner set its compute start to exactly the boundary. Two checks
+        guard that hand-off:
+
+        * token identity -- the prompt's first ``boundary_tokens`` tokens are
+          the frontier's (``lcp_tokens >= boundary_tokens``, which the
+          registry lookup established). A divergence below the boundary is a
+          lookup MISS and never yields an attachment, so an attachment that
+          fails this is invalid and is refused by raising;
+        * the plan handshake -- ``compute_cached_tokens`` is the position the
+          suffix prefill will start at, and the restored state is the state
+          after exactly ``boundary_tokens`` tokens, so the two must be EQUAL.
+          That is an identity, not a tolerance: a suffix that starts one token
+          early would re-apply that token on top of a state that already
+          contains it, and one that starts late would skip one. Since the
+          planner makes it true, a mismatch is planner/restore drift: it is
+          counted under ``suffix_offset_mismatch`` and then raised.
         """
 
         if attachment.consumed:
@@ -738,6 +924,19 @@ class TrajectoryRestorer:
                 f"trajectory attachment for session {attachment.session_key} "
                 "was already consumed; it cannot be restored"
             )
+        if int(attachment.lcp_tokens) < attachment.boundary_tokens:
+            # Consumed first, so the refusal leaks no reference.
+            self.release(attachment)
+            raise TrajectoryAttachmentInvalid(
+                f"trajectory attachment for session {attachment.session_key} "
+                f"(sequence {attachment.sequence_id}) agrees with the frontier "
+                f"on {int(attachment.lcp_tokens)} token(s), fewer than its "
+                f"{attachment.boundary_tokens}-token boundary; a lookup never "
+                "hands out such an attachment"
+            )
+        # The plan handshake: a row whose compute starts at the boundary is
+        # the plan's to restore, and the wave around it is already fixed.
+        planned = int(compute_cached_tokens) == attachment.boundary_tokens
         record_shards = int(attachment.record.shard_count)
         if record_shards != self._attention_group_size:
             # Slice 1c commits EVERY rank's head shard into one arena, so a
@@ -746,8 +945,9 @@ class TrajectoryRestorer:
             # different head split: window r of it is not this rank's heads,
             # and binding it would be wrong state no downstream assertion can
             # see. Refused by name rather than reinterpreted.
-            self.decline(
+            self._refuse(
                 attachment,
+                planned=planned,
                 reason=DECLINE_HEAD_SHARDED_GROUP,
                 detail=(
                     f"the record binds {record_shards} head shard(s) but this "
@@ -756,8 +956,9 @@ class TrajectoryRestorer:
             )
             return None
         if int(serving_group_id) != attachment.owning_group_id:
-            self.decline(
+            self._refuse(
                 attachment,
+                planned=planned,
                 reason=DECLINE_GROUP_MISMATCH,
                 detail=(
                     f"serving_group={int(serving_group_id)} but the snapshot "
@@ -765,40 +966,51 @@ class TrajectoryRestorer:
                 ),
             )
             return None
-        if int(compute_cached_tokens) != attachment.boundary_tokens:
-            self.decline(
-                attachment,
-                reason=DECLINE_SUFFIX_OFFSET,
-                detail=(
-                    f"suffix prefill starts at token "
-                    f"{int(compute_cached_tokens)} but the snapshot is the "
-                    f"state after {attachment.boundary_tokens} tokens"
-                ),
+        if not planned:
+            detail = (
+                f"suffix prefill starts at token {int(compute_cached_tokens)} "
+                "but the snapshot is the state after "
+                f"{attachment.boundary_tokens} tokens"
             )
-            return None
+            self.decline(
+                attachment, reason=DECLINE_SUFFIX_OFFSET, detail=detail
+            )
+            raise TrajectoryRestorePlanDrift(
+                f"sequence {attachment.sequence_id} (session "
+                f"{attachment.session_key}) reached the restore planned, but "
+                f"its {detail}; the wave plan and the restore disagree"
+            )
 
+        # From here on the row is planned, so every refusal is raised.
+        sequence_id = attachment.sequence_id
         arena = self._committer.arena_for(attachment.storage_handle)
         if arena is None:
-            self.decline(
-                attachment,
+            self._fail_planned(
                 reason=DECLINE_ARENA_MISSING,
                 detail=(
                     f"storage handle {attachment.storage_handle} has no "
                     "snapshot arena"
                 ),
+                sequence_id=sequence_id,
+                session_key=attachment.session_key,
+                boundary_tokens=attachment.boundary_tokens,
+                attachment=attachment,
             )
-            return None
 
-        sequence_id = attachment.sequence_id
         try:
             slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
                 arena=arena, layout=self._committer.layout, sequence_id=sequence_id
             )
         except _RestoreDeclined as declined:
-            self.decline(
-                attachment, reason=declined.reason, detail=declined.detail
+            self._fail_planned(
+                reason=declined.reason,
+                detail=declined.detail,
+                sequence_id=sequence_id,
+                session_key=attachment.session_key,
+                boundary_tokens=attachment.boundary_tokens,
+                state_slot=declined.state_slot,
+                attachment=attachment,
             )
-            return None
 
         # The restore is complete: the slot holds the committed state and the
         # sequence is bound to it. The attachment has done its job, so it is
@@ -836,14 +1048,15 @@ class TrajectoryRestorer:
 
     def _read_window_and_bind_slot(
         self, *, arena, layout, sequence_id: int
-    ) -> tuple[int, int, bool]:
+    ) -> tuple[int, int, bool, str]:
         """Read THIS rank's window and write it into the sequence's slot.
 
-        Returns ``(slot, bytes_written, had_slot)``. Every failure leaves the
-        pool exactly as it found it and is raised as ``_RestoreDeclined`` with
-        the name the caller reports -- the attachment path and the mirrored
-        follower path therefore produce identical reasons and identical
-        cleanup.
+        Returns ``(slot, bytes_written, had_slot, slot_digest)``. Every
+        failure leaves the pool exactly as it found it and is raised as
+        ``_RestoreDeclined`` with the name the caller reports, and the slot
+        the sequence was bound to when it failed -- the attachment path and
+        the mirrored follower path therefore produce identical reasons and
+        identical cleanup.
         """
 
         try:
@@ -871,7 +1084,7 @@ class TrajectoryRestorer:
                 DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
             ) from exc
         try:
-            self._state_writer.allocate_slot(int(sequence_id))
+            bound_slot = int(self._state_writer.allocate_slot(int(sequence_id)))
         except KDAStateSlotsExhausted as exc:
             raise _RestoreDeclined(DECLINE_SLOTS_EXHAUSTED, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - fail-safe by contract
@@ -912,7 +1125,9 @@ class TrajectoryRestorer:
                         int(sequence_id),
                     )
             raise _RestoreDeclined(
-                DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
+                DECLINE_SLOT_WRITE_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                state_slot=bound_slot,
             ) from exc
         try:
             # D2H readback of the slot just written, digested with the SAME
@@ -934,6 +1149,7 @@ class TrajectoryRestorer:
         layout,
         session_key: str,
         boundary_tokens: int,
+        lcp_tokens: int,
         owning_group_id: int,
         serving_group_id: int,
         compute_cached_tokens: int,
@@ -955,14 +1171,28 @@ class TrajectoryRestorer:
         to.
 
         ``None`` means this rank recomputes, with the reason named -- the same
-        reasons and the same counters as the attachment path.
+        reasons, the same counters and the same outcomes as the attachment
+        path: ``lcp_tokens`` is the LEADER's lookup agreement and must reach
+        the boundary, a suffix start other than the boundary is
+        planner/restore drift, counted and then raised, and every refusal of
+        a row whose compute starts at the boundary is counted and raised as
+        ``TrajectoryPlannedRestoreFailed``.
         """
 
+        if int(lcp_tokens) < int(boundary_tokens):
+            raise TrajectoryAttachmentInvalid(
+                f"the mirrored restore of sequence {int(sequence_id)} (session "
+                f"{session_key}) agrees with the frontier on {int(lcp_tokens)} "
+                f"token(s), fewer than its {int(boundary_tokens)}-token "
+                "boundary; the leader's lookup never hits such a prompt"
+            )
         self._lookups += 1
         self._hits += 1
+        planned = int(compute_cached_tokens) == int(boundary_tokens)
         shards = int(getattr(arena, "shard_count", 1))
         if shards != self._attention_group_size:
-            self._decline_mirrored(
+            self._refuse_mirrored(
+                planned=planned,
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
@@ -974,7 +1204,8 @@ class TrajectoryRestorer:
             )
             return None
         if int(serving_group_id) != int(owning_group_id):
-            self._decline_mirrored(
+            self._refuse_mirrored(
+                planned=planned,
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
@@ -985,32 +1216,38 @@ class TrajectoryRestorer:
                 ),
             )
             return None
-        if int(compute_cached_tokens) != int(boundary_tokens):
+        if not planned:
+            detail = (
+                f"suffix prefill starts at token {int(compute_cached_tokens)} "
+                f"but the snapshot is the state after {int(boundary_tokens)} "
+                "tokens"
+            )
             self._decline_mirrored(
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
                 reason=DECLINE_SUFFIX_OFFSET,
-                detail=(
-                    f"suffix prefill starts at token "
-                    f"{int(compute_cached_tokens)} but the snapshot is the "
-                    f"state after {int(boundary_tokens)} tokens"
-                ),
+                detail=detail,
             )
-            return None
+            raise TrajectoryRestorePlanDrift(
+                f"sequence {int(sequence_id)} (session {session_key}) reached "
+                f"the mirrored restore planned, but its {detail}; the wave "
+                "plan and the restore disagree"
+            )
         try:
             slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
                 arena=arena, layout=layout, sequence_id=int(sequence_id)
             )
         except _RestoreDeclined as declined:
-            self._decline_mirrored(
+            # The row is planned here, so the refusal is raised.
+            self._fail_planned(
+                reason=declined.reason,
+                detail=declined.detail,
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
-                reason=declined.reason,
-                detail=declined.detail,
+                state_slot=declined.state_slot,
             )
-            return None
         self._restores += 1
         self._logger.info(
             "[%s] rank=%s seq=%s session=%s RESTORED shard=%s/%s boundary=%s "
@@ -1051,12 +1288,7 @@ class TrajectoryRestorer:
     ) -> None:
         """Name a mirrored restore's fallback. No attachment to consume."""
 
-        if reason not in DECLINE_REASONS:
-            raise TrajectoryAttachmentInvalid(
-                f"unknown trajectory decline reason {reason!r}; known reasons "
-                "are " + ", ".join(DECLINE_REASONS)
-            )
-        self._declines[reason] = self._declines.get(reason, 0) + 1
+        self._count_decline(reason)
         self._logger.warning(
             "[%s] rank=%s seq=%s session=%s FALLBACK reason=%s boundary=%s "
             "%s; trajectory reuse degrades to full recompute",
@@ -1066,8 +1298,47 @@ class TrajectoryRestorer:
             session_key,
             reason,
             int(boundary_tokens),
-            detail,
+            _attributed_detail(reason, detail),
         )
+
+    def _refuse_mirrored(
+        self,
+        *,
+        planned: bool,
+        sequence_id: int,
+        session_key: str,
+        boundary_tokens: int,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """A mirrored shard or group refusal: raised iff the row is planned.
+
+        The mirrored twin of ``_refuse``, with the same outcome rule.
+        """
+
+        if planned:
+            self._fail_planned(
+                reason=reason,
+                detail=detail,
+                sequence_id=sequence_id,
+                session_key=session_key,
+                boundary_tokens=boundary_tokens,
+            )
+        self._decline_mirrored(
+            sequence_id=sequence_id,
+            session_key=session_key,
+            boundary_tokens=boundary_tokens,
+            reason=reason,
+            detail=detail,
+        )
+
+
+def _attributed_detail(reason: str, detail: str) -> str:
+    """A refusal's log detail; a group mismatch is attributed as off-group."""
+
+    if reason == DECLINE_GROUP_MISMATCH:
+        return "planned_offgroup=true " + detail
+    return detail
 
 
 __all__ = [
@@ -1077,18 +1348,22 @@ __all__ = [
     "DECLINE_ARENA_READ_FAILED",
     "DECLINE_GROUP_MISMATCH",
     "DECLINE_HEAD_SHARDED_GROUP",
+    "DECLINE_NOT_PLANNED",
     "DECLINE_REASONS",
     "DECLINE_SLOTS_EXHAUSTED",
     "DECLINE_SLOT_WRITE_FAILED",
     "DECLINE_SUFFIX_OFFSET",
+    "FAIL_NO_RESTORE_SOURCE",
     "HostKVSnapshotArenaReader",
     "KDAStateSlotsExhausted",
     "KDAStateSnapshotWriter",
     "PREFIX",
     "TrajectoryAttachment",
     "TrajectoryAttachmentInvalid",
+    "TrajectoryPlannedRestoreFailed",
     "TrajectoryRestoreError",
     "TrajectoryRestoreOutcome",
+    "TrajectoryRestorePlanDrift",
     "TrajectoryRestorer",
     "trajectory_reuse_enabled",
 ]

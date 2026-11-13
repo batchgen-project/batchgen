@@ -10,8 +10,12 @@ explicit and returns ``None`` rather than falling back.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+_unknown_capabilities_logged: set[tuple[int, int]] = set()
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,17 @@ def find_executor_cost_profile(
     check covered re-runs it before trusting the profile.
     """
 
+    capability = tuple(compute_capability)
+    if capability != (9, 0):
+        if capability not in _unknown_capabilities_logged:
+            logger.info(
+                "No executor cost profile for compute capability %d.%d; "
+                "running without a profile",
+                *capability,
+            )
+            _unknown_capabilities_logged.add(capability)
+        return None
+
     # Checkpoint ids carry an org prefix ("openai/gpt-oss-120b"); the profile
     # key is the exact model basename.
     model = (model_name or "").lower().rsplit("/", 1)[-1]
@@ -141,7 +156,7 @@ def find_executor_cost_profile(
         low, high = profile.memory_gib
         if (
             profile.model.lower() == model
-            and tuple(compute_capability) == profile.compute_capability
+            and capability == profile.compute_capability
             and low <= memory_gib <= high
             and group_size == profile.group_size
             and (profile.world_size is None or world_size == profile.world_size)

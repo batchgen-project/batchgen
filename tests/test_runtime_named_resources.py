@@ -171,7 +171,7 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     assert "close(this->weights_memfd_fd_)" in destructor
     assert "close(this->tensor_meta_memfd_fd_)" in destructor
     assert (
-        "free_shared_pinned_memory(this->log_level_, this->weight_ptr_,"
+        "unmap_shared_memory(this->log_level_, this->weight_ptr_,"
         in destructor
     )
     assert "memfd creator requires an output fd" in shm_source

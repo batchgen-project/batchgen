@@ -6,11 +6,14 @@ imports its siblings absolutely) and ``sys.modules`` is restored afterwards.
 """
 
 import importlib.util
+import itertools
+import json
 import os
 import random
 import subprocess
 import sys
 import types
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -163,7 +166,7 @@ def exact_rank_seconds(prompts, ranks, world, profile=GPTOSS):
     ]
 
 
-def pack(prompts, world=4, profile=GPTOSS, fixed=()):
+def pack(prompts, world=4, profile=GPTOSS, fixed=(), resident=()):
     return pack_wave_ranks(
         prompts,
         world_size=world,
@@ -171,6 +174,7 @@ def pack(prompts, world=4, profile=GPTOSS, fixed=()):
         chunk_tokens=CHUNK,
         profile=profile,
         fixed=fixed,
+        resident=resident,
     )
 
 
@@ -414,3 +418,130 @@ def test_rejects_bad_arguments():
         fixed=((1, 3.0),),
     )
     assert empty == RankPacking((), (0.0, 3.0), 0)
+
+
+@pytest.mark.parametrize("prefix_tokens", [16, 32, 48])
+def test_resident_family_hits_objective_on_both_sides_of_split_boundary(prefix_tokens):
+    # Linear synthetic cost: p is prefix work and S is all private suffix work.
+    suffix = 4
+    size = 8
+    prompts = [list(range(prefix_tokens)) + [1000 + i] * suffix for i in range(size)]
+    resident = [{0: prefix_tokens} for _ in prompts]
+    got = pack(prompts, world=2, profile=None, resident=resident)
+    total_suffix = size * suffix
+    spans = [
+        max(total_suffix - moved * suffix,
+            prefix_tokens + moved * suffix if moved else 0)
+        for moved in range(size + 1)
+    ]
+    assert max(got.predicted) == min(spans)
+    assert (len(set(got.ranks)) == 2) == (prefix_tokens < total_suffix)
+
+
+def test_resident_clusters_hit_exhaustive_union_objective():
+    prompts = (
+        [list(range(16)) + [1000 + i] * 4 for i in range(4)]
+        + [list(range(100, 116)) + [2000 + i] * 4 for i in range(4)]
+    )
+    resident = [{i // 4: 16} for i in range(8)]
+    got = pack(prompts, world=2, profile=None, resident=resident)
+
+    def span(assignment):
+        loads = [0, 0]
+        for group in range(2):
+            for family in range(2):
+                count = sum(assignment[i] == group for i in range(family * 4, family * 4 + 4))
+                loads[group] += count * 4 + (16 if count and group != family else 0)
+        return max(loads)
+
+    assert max(got.predicted) == min(map(span, itertools.product(range(2), repeat=8)))
+    assert max(got.predicted) == span(got.ranks)
+
+
+def test_resident_single_prefix_96_members_split_within_derived_bound():
+    size, prefix, suffix = 96, 16, 4
+    prompts = [list(range(prefix)) + [1000 + i] * suffix for i in range(size)]
+    packed = pack(prompts, world=2, profile=None, resident=[{0: prefix}] * size)
+    ideal_offgroup = (size * suffix - prefix) / (2 * suffix)
+    assert abs(packed.ranks.count(1) - ideal_offgroup) <= 1
+    assert max(packed.predicted) <= (size * suffix + prefix) / 2 + suffix
+    assert max(packed.predicted) < size * suffix
+
+
+def test_resident_segment_credit_is_minimum_once_and_trial_does_not_mutate():
+    prompts = [list(range(16)) + [100 + i] * 4 for i in range(3)]
+    tree = build_tree(prompts, B)
+    lengths = [len(p) for p in prompts]
+    resident = [{0: 16}, {0: 16}, {0: 15}]
+    units = [unit_segs(tree, [i], lengths, B, resident) for i in range(3)]
+    info = seg_info(tree, B)
+    expected_pairs = lambda count: count * (20 * 21 - 16 * 17) // 2
+    for order in itertools.permutations(range(3)):
+        state = RankState(info, 0)
+        seen = []
+        for i in order:
+            before = state.features()
+            trial = state.trial(units[i])
+            assert state.features() == before
+            state.add(units[i])
+            assert state.features() == trial
+            seen.append(i)
+            prefix_paid = 16 if 2 in seen else 0
+            assert trial.computed_tokens == len(seen) * 4 + prefix_paid
+            assert trial.attention_pairs == expected_pairs(len(seen)) + (136 if prefix_paid else 0)
+        assert state.features() == _resident_features(prompts, resident, [order])
+
+
+def _resident_features(prompts, resident, groups, rank=0):
+    tree = build_tree(prompts, B)
+    state = RankState(seg_info(tree, B), rank)
+    for members in groups:
+        state.add(unit_segs(tree, members, [len(p) for p in prompts], B, resident))
+    return state.features()
+
+
+def test_resident_credit_keeps_quadratic_pairs_and_chunk_floor_in_profile():
+    profile = _MODULES["executor_cost"].ExecutorCostProfile(
+        model="synthetic", machine="synthetic", compute_capability=(0, 0),
+        memory_gib=(0, 0), group_size=1, world_size=2, fitted_world_size=2,
+        intercept=0, per_1e5_computed_tokens=100_000,
+        per_1e9_attention_pairs=1_000_000_000, per_100_item_rows=100, per_chunk=3,
+    )
+    prompts = [list(range(16)) + [100 + i] * 4 for i in range(8)]
+    resident = [{0: 16} for _ in prompts]
+    packed = pack_wave_ranks(prompts, world_size=2, block_tokens=B, chunk_tokens=8,
+                             profile=profile, resident=resident)
+    for group in range(2):
+        members = [i for i, g in enumerate(packed.ranks) if g == group]
+        feats = _resident_features(prompts, resident, [members], group)
+        if not members:
+            assert packed.predicted[group] == 0
+            continue
+        prefix = 16 if group == 1 else 0
+        pairs = len(members) * (210 - 136) + (136 if prefix else 0)
+        assert feats.computed_tokens == len(members) * 4 + prefix
+        assert feats.attention_pairs == pairs
+        chunks = max(-(-feats.computed_tokens // 8), feats.depth + 1)
+        assert packed.predicted[group] == profile.seconds(
+            feats.computed_tokens, pairs, feats.item_rows, chunks,
+        )
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_empty_residency_is_byte_identical_to_head_golden(shared):
+    prompts = (_few_shot(2, 8, 4) if shared else
+               [_tokens(i, i) + [7] for i in range(1, 7)])
+    golden = (
+        b'{"predicted": [163.0, 147.0, 163.0], "ranks": [0, 2, 1, 0, 2, 1, 0, 2], "round_used": 1}'
+        if shared else
+        b'{"predicted": [114.0, 115.0, 130.0], "ranks": [0, 1, 2, 1, 2, 0], "round_used": 1}'
+    )
+    packed = pack(prompts, world=3, profile=None, fixed=((1, 17),), resident=())
+    assert json.dumps(asdict(packed), sort_keys=True).encode() == golden
+
+
+def test_resident_dict_order_does_not_change_packing():
+    prompts = _few_shot(1, 16, 4)
+    forward = [{0: 64, 1: 16} for _ in prompts]
+    reverse = [dict(reversed(tuple(credit.items()))) for credit in forward]
+    assert pack(prompts, profile=None, resident=forward) == pack(prompts, profile=None, resident=reverse)

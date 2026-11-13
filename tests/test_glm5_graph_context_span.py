@@ -181,11 +181,10 @@ def _capacity_request(
         # A long first batch does not shrink it either.
         (1048576, 65536, 983040, 1048576),
         (202752, 128, 32, 202752),
-        # Per-batch values wider than the deployment bound still widen the
-        # table: unaddressable columns are cheap, a short table is fatal.
-        (131072, 200000, 0, 200000),
-        # The 16384 floor survives a deployment bound below it.
-        (4096, 0, 0, 16384),
+        # Batch hints cannot widen a deployment-sized row.
+        (131072, 200000, 0, 131072),
+        # An explicitly lower deployment bound has no hidden floor.
+        (4096, 0, 0, 4096),
     ],
 )
 def test_token_capacity_comes_from_the_deployment_bound(

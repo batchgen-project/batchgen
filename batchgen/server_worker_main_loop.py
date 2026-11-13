@@ -858,6 +858,17 @@ def _server_worker_main_impl(
 	# Any failure propagates and the worker never signals ready.
 	if runs_startup_before_readiness(args.model_name):
 		worker.prepare_kimi_k3_startup()
+	worker.prepare_deployment()
+	# Every node's scheduler receives its local rank-zero worker's resolved
+	# length, including after restart. Publish before the readiness signal.
+	# The startup decode transient rides the same publication; it is already
+	# reduced over every rank, and is report-only.
+	if args.local_rank == 0:
+		response_queue.put({
+			"type": "deployment_capacity",
+			"max_model_len": worker.model_context_length,
+			"startup_transient": worker.startup_transient,
+		})
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.
@@ -999,11 +1010,9 @@ def _server_worker_main_impl(
 				logging.info(f"Rank {global_rank}: Pool mode init received")
 				try:
 					current_max_output = task_data.get("max_output_len", 4096)
-					max_context_length = task_data.get("max_context_length", None)
 
 					# Initialize worker with pool capacity (no sequences yet)
-					worker.Init(None, current_max_output, 0,
-						max_context_length=max_context_length)
+					worker.Init(None, current_max_output, 0)
 
 					# Set admission and response queues for persistent generate()
 					worker.set_admission_queue(request_queue)

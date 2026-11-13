@@ -21,6 +21,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
+from batchgen.hardware.machine_family import detect_device_facts
 
 from .config import KimiLinearConfig, is_k3_model_type, require_num_routed_experts
 from .dsa_runtime import require_servable_indexer
@@ -152,11 +153,19 @@ class KimiLinearInitializer:
             G = 8
         else:
             G = requested_G
+        from batchgen.attention.mla import paged_decode, sparse_dispatch
+
+        # A captured decode span runs the dense MLA kernel on every layer and,
+        # for K3.1, the sparse one on its DSA layers: both must capture.
+        decode_graph_capturable = paged_decode.graph_capturable() and (
+            not self.is_k31 or sparse_dispatch.graph_capturable()
+        )
         self.planner = KimiLinearPlanner(
             is_k3=self.is_k3,
             attention_group_size=G,
-            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+            device_facts=self.device_facts,
             enable_deepep=getattr(input_arguments, "enable_deepep", False),
+            decode_graph_capturable=decode_graph_capturable,
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
@@ -217,12 +226,18 @@ class KimiLinearInitializer:
 
     def _default_engine_config(self):
         """KV storage layout + module weight shapes for the C++ engine."""
-        props = torch.cuda.get_device_properties(
+        # The planner classifies these facts into a machine family when the
+        # plan is machine-dependent (attention TP8).
+        self.device_facts = detect_device_facts(
             self.engine_config.Basic_Config.device
         )
-        self.gpu_total_memory_bytes = int(props.total_memory)
         logging.info(
-            f"Current device total memory: {self.gpu_total_memory_bytes / (1024**3):.2f} GB"
+            "Current device: compute capability %s, %d SMs, total memory "
+            "%.2f GB, host %s",
+            self.device_facts.compute_capability,
+            self.device_facts.sm_count,
+            self.device_facts.total_memory_bytes / (1024 ** 3),
+            self.device_facts.cpu_arch,
         )
 
         cfg = self.batchgen_config

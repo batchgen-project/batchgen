@@ -28,6 +28,11 @@ class PrefixCacheSequenceState:
     planned_shared_page_ids: Mapping[int, tuple[int, ...]] = field(
         default_factory=dict
     )
+    # The wave plan's restore decision for this row: the trajectory snapshot
+    # boundary its compute start was raised to, or 0 for no restore. Only a
+    # row whose plan materialized its frontier carries a boundary; the KDA
+    # restore applies to exactly those rows.
+    trajectory_restore_boundary: int = 0
 
     @property
     def attachment_handle(self) -> int:

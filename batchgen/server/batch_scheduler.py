@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
+import os
 import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from batchgen.server.agent_sessions import TurnError
 from batchgen.server.io_struct import (
@@ -20,6 +24,7 @@ from batchgen.server.io_struct import (
     FileObject,
     FilePurpose,
     FileStatus,
+    StartupTransientObject,
     ToolCall,
     ToolCallFunction,
 )
@@ -38,18 +43,57 @@ def completion_prompt_to_text(prompt: str | List[str]) -> str:
     return prompt
 
 
+_INT32_MAX = np.iinfo(np.int32).max
+
+# Threads that build a batch's prompt ids off the event loop. Native encode
+# releases the GIL; template rendering does not, so more threads than cores
+# buy nothing.
+_PROMPT_BUILD_THREADS = max(1, min(8, os.cpu_count() or 1))
+# A batch is split into this many contiguous chunks per thread, so a slow
+# chunk does not leave the other threads idle while it finishes.
+_PROMPT_BUILD_CHUNKS_PER_THREAD = 4
+
+
+def prompt_ids_array(token_ids: Any) -> np.ndarray:
+    """One prompt's token ids as the array that crosses the worker seam.
+
+    A contiguous 1-D int32 array: it pickles as raw bytes onto the worker
+    queue and the rank broadcast, and the trajectory book stores int32. A
+    tokenizer that returns anything else for ONE prompt (a string, a nested
+    list, an encoding dict, an id outside int32) is a server defect, so it
+    raises TypeError and fails the batch instead of one request.
+    """
+    if not isinstance(token_ids, (list, tuple, np.ndarray)):
+        raise TypeError(
+            f"prompt token ids must be a flat sequence of ints, got "
+            f"{type(token_ids).__name__}"
+        )
+    array = np.asarray(token_ids)
+    if array.ndim != 1 or (array.size and array.dtype.kind not in "iu"):
+        raise TypeError(
+            f"prompt token ids must be a flat sequence of ints, got an "
+            f"array of shape {array.shape} and dtype {array.dtype}"
+        )
+    if array.size and (array.min() < 0 or array.max() > _INT32_MAX):
+        raise TypeError(
+            f"prompt token ids must lie in [0, {_INT32_MAX}], got "
+            f"[{array.min()}, {array.max()}]"
+        )
+    return np.ascontiguousarray(array, dtype=np.int32)
+
+
 def tokenizer_family_mismatch(
     request_model: str, served_model: str,
 ) -> Optional[str]:
     """Return an error when a request names another tokenizer family.
 
-    The scheduler renders the chat template with the tokenizer resolved from
-    the request's ``model``; the worker encodes the rendered text with the
-    served checkpoint's tokenizer. A request from another tokenizer family
-    would be rendered with that family's template and control markers, then
-    encoded as plain text by the served tokenizer. Family is the tokenizer
-    type the registry resolves, so aliases of the served model still pass.
-    A request name that resolves to no family is left to the tokenizer load.
+    The scheduler builds the prompt token ids with the tokenizer resolved
+    from the request's ``model``; the worker serves those ids with the served
+    checkpoint's vocabulary. A request from another tokenizer family would be
+    encoded with that family's template, control markers and vocabulary.
+    Family is the tokenizer type the registry resolves, so aliases of the
+    served model still pass. A request name that resolves to no family is
+    left to the tokenizer load.
     """
     from batchgen.config.tokenizer_registry import resolve_tokenizer_type
 
@@ -213,6 +257,10 @@ class BatchScheduler:
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
         self._scheduling_pool = SchedulingPool(capacity=0)
         self._trajectory_pool_info: Optional[Dict[str, Any]] = None
+        self.max_model_len: Optional[int] = None
+        # Published with max_model_len by the same worker message; report-only.
+        self.startup_transient: Optional[List[StartupTransientObject]] = None
+        self._deployment_ready = asyncio.Event()
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -226,7 +274,7 @@ class BatchScheduler:
         self._pump_thread: Optional[threading.Thread] = None
         self._pump_stop: Optional[threading.Event] = None
         # Per-request metadata for building output JSONL in pool mode
-        # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
+        # Structure: {batch_id: {request_id: {custom_id, url, model}}}
         # where request_id is f"{custom_id}@{batch_id}"
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # Batches whose leftover intake entries the drain discarded; each is
@@ -268,6 +316,10 @@ class BatchScheduler:
             self._drain_intake_to_worker()
         )
 
+    async def wait_for_deployment(self) -> None:
+        """Wait until the current worker generation publishes its verified L."""
+        await self._deployment_ready.wait()
+
     async def stop(self) -> None:
         if not self._task:
             return
@@ -293,6 +345,10 @@ class BatchScheduler:
         self._task = None
         self._completion_listener_task = None
         self._drain_task = None
+        executor = getattr(self, "_prompt_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._prompt_executor = None
 
     def intake_pool_usage_pct(self) -> float:
         """Return intake pool usage as a fraction (0.0-1.0)."""
@@ -311,9 +367,15 @@ class BatchScheduler:
     def quiesce(self) -> None:
         """Stop dispatching new work while retaining the upstream queues."""
         self._quiesced.set()
+        self._call_on_loop(self._clear_deployment, "retire deployment capacity")
         if self._loop is not None and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
             self._quiesce_ack.wait(timeout=5)
+
+    def _clear_deployment(self) -> None:
+        self.max_model_len = None
+        self.startup_transient = None
+        self._deployment_ready.clear()
 
     def resume(self) -> None:
         self._quiesced.clear()
@@ -525,7 +587,6 @@ class BatchScheduler:
         """Pool capacity for a worker generation's init message."""
         return {
             "max_output_len": getattr(self, "_pool_max_output_len", 4096),
-            "max_context_length": getattr(self, "_pool_max_context_length", None),
         }
 
     async def _run(self) -> None:
@@ -535,6 +596,7 @@ class BatchScheduler:
             except asyncio.CancelledError:
                 break
             try:
+                await self.wait_for_deployment()
                 await self._process_batch(batch_id)
             except Exception:
                 logger.exception("Batch %s failed", batch_id)
@@ -581,7 +643,9 @@ class BatchScheduler:
         # below therefore ends here as FAILED with the error recorded;
         # otherwise the client polls an in_progress batch forever.
         try:
-            prepared = self._prepare_in_progress_batch(batch_id, batch, input_path)
+            prepared = await self._prepare_in_progress_batch(
+                batch_id, batch, input_path
+            )
             if prepared is None:
                 return
             (requests, prompts, per_request_max_tokens, sampling_params,
@@ -602,15 +666,15 @@ class BatchScheduler:
                 f"Batch processing failed: {type(exc).__name__}: {exc}",
             )
 
-    def _prepare_in_progress_batch(
+    async def _prepare_in_progress_batch(
         self, batch_id: str, batch: Any, input_path: Any,
     ) -> Optional[
         Tuple[
-            List[BatchRequestItem], List[Optional[str]], List[Optional[int]],
-            List[Dict[str, Any]], Dict[int, str],
+            List[BatchRequestItem], List[Optional[np.ndarray]],
+            List[Optional[int]], List[Dict[str, Any]], Dict[int, str],
         ]
     ]:
-        """Parse and render a batch already marked IN_PROGRESS.
+        """Parse a batch already marked IN_PROGRESS and build its prompt ids.
 
         Returns (requests, prompts, per_request_max_tokens, sampling_params,
         rejections), or None after an expected rejection has set FAILED with
@@ -619,6 +683,10 @@ class BatchScheduler:
         chat role, a conversation the tokenizer cannot render faithfully, a
         malformed tool call) is in ``rejections`` by index and fails alone;
         the rest of the batch is served.
+
+        Parsing, validation and every status update run on the event loop;
+        only the prompt-id construction runs on worker threads
+        (_build_prompts), so a large batch does not stall the loop.
         """
         with input_path.open("rb") as handle:
             content = handle.read()
@@ -632,34 +700,14 @@ class BatchScheduler:
             )
             return None
 
+        # One model per batch (parse_batch_file): resolve its tokenizer here,
+        # on the loop, so the construction threads never touch the cache.
+        tokenizer = self._get_tokenizer(requests[0].body.model)
+        built = await self._build_prompts(requests, tokenizer)
         prompts, per_request_max_tokens, sampling_params, rejections = (
-            self._convert_requests_to_worker_inputs(requests, batch)
+            self._convert_requests_to_worker_inputs(requests, built, batch)
         )
-        # Apply batch-level max_decoding_length as fallback for requests without explicit value
-        default_max = batch.max_decoding_length
-        if default_max is None:
-            missing_ids = [
-                requests[i].custom_id or f"request-{i}"
-                for i, mt in enumerate(per_request_max_tokens)
-                if mt is None and i not in rejections
-            ]
-            if missing_ids:
-                error_message = (
-                    f"Batch {batch_id}: {len(missing_ids)}/{len(per_request_max_tokens)} requests "
-                    f"have no max_completion_tokens or max_tokens, and no batch-level "
-                    f"max_decoding_length is set. Set one of these to proceed. "
-                    f"First missing: {missing_ids[:5]}"
-                )
-                logger.error(error_message)
-                self.storage.update_batch_status(
-                    batch_id, BatchStatus.FAILED, error=error_message
-                )
-                return None
-        per_request_max_tokens = [
-            mt if mt is not None else default_max
-            for mt in per_request_max_tokens
-        ]
-
+        del built
         # Log batch-level sampling param defaults
         if batch.temperature is not None or batch.top_p is not None or batch.top_k is not None:
             logger.warning(
@@ -673,18 +721,75 @@ class BatchScheduler:
             rejections,
         )
 
+    def _build_prompt(
+        self, request: BatchRequestItem, tokenizer: Any,
+    ) -> Tuple[Optional[np.ndarray], Optional[str]]:
+        """One request's (prompt ids, None), or (None, reason) if it is rejected.
+
+        The one prompt construction of both the batch path and the turn path.
+        A ValueError rejects only this request; anything else propagates and
+        fails the caller's batch or turn. It reads no scheduler state, so the
+        batch path runs it on worker threads.
+        """
+        try:
+            return self._construct_prompt(request, tokenizer), None
+        except ValueError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _prompt_build_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The bounded pool _build_prompts runs on; created on first use."""
+        executor = getattr(self, "_prompt_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_PROMPT_BUILD_THREADS,
+                thread_name_prefix="prompt-build",
+            )
+            self._prompt_executor = executor
+        return executor
+
+    async def _build_prompts(
+        self, requests: List[BatchRequestItem], tokenizer: Any,
+    ) -> List[Tuple[Optional[np.ndarray], Optional[str]]]:
+        """Every request's _build_prompt result, in request order.
+
+        Runs on the bounded prompt-build pool in contiguous chunks, so the
+        event loop keeps serving while a large batch is encoded. The first
+        exception other than a rejection propagates to the caller.
+        """
+        if not requests:
+            return []
+        loop = asyncio.get_running_loop()
+        executor = self._prompt_build_executor()
+        chunks = _PROMPT_BUILD_THREADS * _PROMPT_BUILD_CHUNKS_PER_THREAD
+        size = -(-len(requests) // chunks)
+
+        def build_chunk(chunk: List[BatchRequestItem]):
+            return [self._build_prompt(request, tokenizer) for request in chunk]
+
+        parts = await asyncio.gather(*(
+            loop.run_in_executor(executor, build_chunk, requests[i:i + size])
+            for i in range(0, len(requests), size)
+        ))
+        return [result for part in parts for result in part]
+
     def _convert_requests_to_worker_inputs(
-        self, requests: List[BatchRequestItem], batch=None,
+        self,
+        requests: List[BatchRequestItem],
+        built: List[Tuple[Optional[np.ndarray], Optional[str]]],
+        batch=None,
     ) -> Tuple[
-        List[Optional[str]], List[Optional[int]], List[Dict[str, Any]],
+        List[Optional[np.ndarray]], List[Optional[int]], List[Dict[str, Any]],
         Dict[int, str],
     ]:
         """Convert batch requests to worker inputs with per-request sampling params.
 
+        ``built`` holds each request's _build_prompt result, in request order.
+
         Returns:
             (prompts, per_request_max_tokens, sampling_params, rejections)
-            where per_request_max_tokens is a per-sequence list of max output
-            token limits, sampling_params is a list of dicts with keys:
+            where prompts holds each request's prompt token ids (see
+            prompt_ids_array), per_request_max_tokens is a per-sequence list
+            of max output token limits, sampling_params is a list of dicts with keys:
             temperature, top_p, top_k (per-request values take priority;
             batch-level values serve as defaults), and rejections maps the
             index of each request whose prompt cannot be constructed (a
@@ -692,7 +797,7 @@ class BatchScheduler:
             A rejected request's prompt is None; it fails on its own and
             never reaches a worker.
         """
-        prompts: List[Optional[str]] = []
+        prompts: List[Optional[np.ndarray]] = []
         per_request_max_tokens: List[Optional[int]] = []
         sampling_params: List[Dict[str, Any]] = []
         rejections: Dict[int, str] = {}
@@ -702,16 +807,36 @@ class BatchScheduler:
         batch_top_p = batch.top_p if batch else None
         batch_top_k = batch.top_k if batch else None
 
-        for index, request in enumerate(requests):
+        if len(built) != len(requests):
+            raise RuntimeError(
+                f"{len(built)} built prompts for {len(requests)} requests"
+            )
+        for index, (request, (prompt, reason)) in enumerate(zip(requests, built)):
             body = request.body
             current_max_tokens = getattr(body, "max_completion_tokens", None)
             if current_max_tokens is None:
                 current_max_tokens = getattr(body, "max_tokens", None)
-            try:
-                prompt = self._construct_prompt(request)
-            except ValueError as exc:
+            if current_max_tokens is None and batch is not None:
+                current_max_tokens = batch.max_decoding_length
+            if reason is None:
+                length = self.max_model_len
+                if length is None:
+                    raise RuntimeError("worker has not published deployment max_model_len")
+                prompt_length = len(prompt)
+                if prompt_length >= length:
+                    reason = (
+                        f"prompt has {prompt_length} tokens; deployment max_model_len={length} "
+                        "must leave room for at least one completion token"
+                    )
+                else:
+                    remaining = length - prompt_length
+                    current_max_tokens = (
+                        remaining if current_max_tokens is None
+                        else min(current_max_tokens, remaining)
+                    )
+            if reason is not None:
+                rejections[index] = reason
                 prompt = None
-                rejections[index] = f"{type(exc).__name__}: {exc}"
 
             prompts.append(prompt)
             per_request_max_tokens.append(current_max_tokens)
@@ -734,8 +859,18 @@ class BatchScheduler:
 
         return prompts, per_request_max_tokens, sampling_params, rejections
 
-    def _construct_prompt(self, request: BatchRequestItem) -> str:
-        """The worker prompt for one request; ValueError rejects the request."""
+    def _construct_prompt(
+        self, request: BatchRequestItem, tokenizer: Any,
+    ) -> np.ndarray:
+        """The prompt token ids for one request; ValueError rejects the request.
+
+        Token ids are the only prompt representation sent to the worker. A
+        chat request takes the ids the chat template defines
+        (``apply_chat_template(tokenize=True)``); rendering to text and
+        re-encoding is not the identity for templates defined on token
+        segments. A completion request's text is encoded exactly as the
+        worker encoded prompt text before ids crossed the seam.
+        """
         body = request.body
         if isinstance(body, ChatCompletionRequest):
             model_lower = body.model.lower()
@@ -779,8 +914,8 @@ class BatchScheduler:
             if body.preserve_thinking is not None:
                 template_kwargs["preserve_thinking"] = body.preserve_thinking
             try:
-                prompt = self._format_chat_messages(
-                    messages, body.model, **template_kwargs
+                token_ids = self._chat_prompt_ids(
+                    messages, body.model, tokenizer, **template_kwargs
                 )
             except Exception as exc:
                 # Attach the custom_id: the request fails with this reason,
@@ -790,9 +925,17 @@ class BatchScheduler:
                     f"request {custom_id!r}: the chat template rejected "
                     f"this conversation: {type(exc).__name__}: {exc}"
                 ) from exc
-            return prompt
+            return prompt_ids_array(token_ids)
         if isinstance(body, CompletionRequest):
-            return completion_prompt_to_text(body.prompt)
+            encoded = tokenizer(
+                [completion_prompt_to_text(body.prompt)],
+                return_tensors=None,
+                truncation=False,
+                padding=False,
+                return_attention_mask=False,
+            )
+            (token_ids,) = encoded["input_ids"]
+            return prompt_ids_array(token_ids)
         raise ValueError("Unsupported request body type")
 
     def _inject_reasoning_effort(
@@ -836,14 +979,15 @@ class BatchScheduler:
 
         return modified
 
-    def _format_chat_messages(self, messages: List[dict], model: str, **kwargs) -> str:
-        tokenizer = self._get_tokenizer(model)
+    def _chat_prompt_ids(
+        self, messages: List[dict], model: str, tokenizer: Any, **kwargs,
+    ) -> Any:
         if not hasattr(tokenizer, "apply_chat_template"):
             raise RuntimeError(
                 f"Tokenizer for {model} does not support apply_chat_template"
             )
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **kwargs
+            messages, tokenize=True, add_generation_prompt=True, **kwargs
         )
 
     def _parse_output(
@@ -925,7 +1069,7 @@ class BatchScheduler:
         received_at: float,
         on_routed: Optional[Any] = None,
     ) -> _TurnWaiter:
-        """Render one turn as the batch path does and submit it to the IntakePool.
+        """Build one turn's prompt ids as the batch path does and submit it to the IntakePool.
 
         ``body`` is a validated TurnRequest. The turn becomes a one-entry intake
         batch keyed by ``turn_id``; the returned waiter's future resolves with
@@ -954,6 +1098,8 @@ class BatchScheduler:
                 400, "unsupported_n",
                 f"a turn returns exactly one choice; n={body.n} is not supported",
             )
+        if self.max_model_len is None:
+            raise TurnError(503, "workers_not_ready", "deployment capacity is not ready")
         mismatch = tokenizer_family_mismatch(body.model, self.server_args.model)
         if mismatch is not None:
             raise TurnError(400, "model_mismatch", mismatch)
@@ -964,8 +1110,11 @@ class BatchScheduler:
             body=body,
         )
         try:
+            tokenizer = self._get_tokenizer(body.model)
             prompts, max_tokens, sampling_params, rejections = (
-                self._convert_requests_to_worker_inputs([item])
+                self._convert_requests_to_worker_inputs(
+                    [item], [self._build_prompt(item, tokenizer)]
+                )
             )
         except Exception as exc:
             raise TurnError(
@@ -977,17 +1126,12 @@ class BatchScheduler:
                 400, "invalid_request",
                 f"prompt construction failed: {rejections[0]}",
             )
-        if max_tokens[0] is None:
-            raise TurnError(
-                400, "max_tokens_required",
-                "a turn needs max_completion_tokens or max_tokens",
-            )
         session = body.session
         entry = IntakeEntry(
             request_id=turn_id,
             batch_id=turn_id,
             raw_request={
-                "text": prompts[0],
+                "input_ids": prompts[0],
                 "max_tokens": max_tokens[0],
                 "priority": 0,
                 "sampling_params": sampling_params[0],
@@ -1193,7 +1337,7 @@ class BatchScheduler:
         batch_id: str,
         batch: Any,
         requests: List[BatchRequestItem],
-        prompts: List[Optional[str]],
+        prompts: List[Optional[np.ndarray]],
         per_request_max_tokens: List[Optional[int]],
         sampling_params: List[Dict[str, Any]],
         rejections: Optional[Dict[int, str]] = None,
@@ -1239,7 +1383,7 @@ class BatchScheduler:
                 request_id=request_ids[idx],
                 batch_id=batch_id,
                 raw_request={
-                    "text": prompts[idx],
+                    "input_ids": prompts[idx],
                     "max_tokens": per_request_max_tokens[idx],
                     "priority": 0,  # TODO: support per-batch priority from API
                     "sampling_params": sampling_params[idx] if sampling_params else {},
@@ -1270,8 +1414,6 @@ class BatchScheduler:
             self._pool_max_output_len = max_tokens
         else:
             self._pool_max_output_len = max(self._pool_max_output_len, max_tokens)
-        if not hasattr(self, '_pool_max_context_length'):
-            self._pool_max_context_length = batch.max_context_length
 
         # Store per-request metadata for output JSONL building
         self._pool_request_meta[batch_id] = {}
@@ -1280,7 +1422,6 @@ class BatchScheduler:
                 "custom_id": custom_ids[idx],
                 "url": req.url.value,
                 "model": req.body.model,
-                "prompt_text": prompts[idx],
             }
 
         # Ensure incremental output directory exists
@@ -1295,7 +1436,7 @@ class BatchScheduler:
             self._write_pool_completion(
                 batch_id,
                 request_ids[idx],
-                {"error": {"code": "invalid_prompt", "message": reason}},
+                {"error": {"code": "invalid_prompt", "message": reason, "status_code": 400}},
             )
             self._scheduling_pool.mark_request_completed(
                 request_ids[idx], batch_id
@@ -1309,14 +1450,13 @@ class BatchScheduler:
         # Launch background task to wait for completion and finalize output.
         # Return immediately so the scheduler can process the next batch.
         asyncio.ensure_future(
-            self._wait_and_finalize_batch(batch_id, requests, prompts)
+            self._wait_and_finalize_batch(batch_id, requests)
         )
 
     async def _wait_and_finalize_batch(
         self,
         batch_id: str,
         requests: List[BatchRequestItem],
-        prompts: List[str],
     ) -> None:
         """Background task: wait for a batch to complete, then finalize output.
 
@@ -1345,7 +1485,7 @@ class BatchScheduler:
                 return
             await asyncio.sleep(0.5)
 
-        self._finalize_batch_output(batch_id, requests, prompts)
+        self._finalize_batch_output(batch_id, requests)
 
     def _discard_failed_batch(self, batch_id: str, error: str) -> None:
         """Persist a batch as FAILED and release the scheduler state it holds.
@@ -1404,6 +1544,9 @@ class BatchScheduler:
                 self._quiesce_ack.set()
                 await asyncio.sleep(0.05)
                 continue
+            if not self._deployment_ready.is_set():
+                await asyncio.sleep(0.05)
+                continue
             if self._intake_pool.is_empty():
                 self._intake_wakeup.clear()
                 try:
@@ -1456,8 +1599,8 @@ class BatchScheduler:
                 slot = self._scheduling_pool.allocate_slot(entry.request_id)
                 admit_entries.append({
                     "request_id": entry.request_id,
-                    "text": entry.raw_request.get("text", ""),
-                    "max_tokens": entry.raw_request.get("max_tokens", 4096),
+                    "input_ids": entry.raw_request["input_ids"],
+                    "max_tokens": entry.raw_request["max_tokens"],
                     "batch_id": entry.batch_id,
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
@@ -1691,6 +1834,19 @@ class BatchScheduler:
                         else:
                             logger.info("[POOL] Worker shutdown signal received")
                         continue
+                    elif msg_type == "deployment_capacity":
+                        transients = result["startup_transient"]
+                        if not isinstance(transients, list) or not transients:
+                            raise ValueError("worker published invalid startup_transient")
+                        transients = [
+                            StartupTransientObject.model_validate(item)
+                            for item in transients
+                        ]
+                        self.max_model_len = int(result["max_model_len"])
+                        if self.max_model_len < 2:
+                            raise ValueError("worker published invalid max_model_len")
+                        self.startup_transient = transients
+                        self._deployment_ready.set()
                     elif msg_type == "trajectory_pool_capacity":
                         # ``total_capacity`` is immutable token-pool capacity and
                         # sizes SchedulingPool.  ``free_reservations`` changes on
@@ -1807,6 +1963,7 @@ class BatchScheduler:
                     "error": {
                         "code": error.get("code", "worker_error"),
                         "message": error.get("message", ""),
+                        **({"status_code": error["status_code"]} if "status_code" in error else {}),
                     },
                 },
             )
@@ -1912,7 +2069,6 @@ class BatchScheduler:
         self,
         batch_id: str,
         requests: List[BatchRequestItem],
-        prompts: List[str],
     ) -> None:
         """Finalize batch output after all requests complete.
 

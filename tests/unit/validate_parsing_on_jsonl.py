@@ -29,15 +29,11 @@ from pathlib import Path
 from typing import Optional
 
 
-# ---- Parsers (standalone, no BatchGen imports needed) ----
+# ---- Parsers (standalone except gptoss, which imports the served parser) ----
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _DS_TOOL_RE = re.compile(
     r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁end｜>", re.DOTALL
-)
-_HARMONY_CHANNEL_RE = re.compile(
-    r"<\|channel\|>(.*?)<\|message\|>(.*?)(?=<\|channel\|>|<\|return\|>|$)",
-    re.DOTALL,
 )
 
 
@@ -48,15 +44,6 @@ def parse_thinking_r1(text: str) -> tuple[Optional[str], str]:
     reasoning = m.group(1).strip()
     visible = _THINK_RE.sub("", text, count=1).strip()
     return reasoning, visible
-
-
-def parse_thinking_harmony(text: str) -> tuple[Optional[str], str]:
-    channels = {}
-    for m in _HARMONY_CHANNEL_RE.finditer(text):
-        channels[m.group(1).strip()] = m.group(2).strip()
-    if not channels:
-        return None, text
-    return channels.get("analysis"), channels.get("final", text)
 
 
 def parse_tool_calls_deepseek(text: str) -> tuple[Optional[list], str]:
@@ -76,32 +63,23 @@ def parse_tool_calls_deepseek(text: str) -> tuple[Optional[list], str]:
     return tool_calls, _DS_TOOL_RE.sub("", text).strip()
 
 
+def _gptoss_parser():
+    """The served GPT-OSS harmony parser (needs no staged encoding).
+
+    Harmony is a message grammar, not a regex; a standalone copy here drifted
+    from the served parser once already, so this one imports it.
+    """
+    from batchgen.models.openai.gpt_oss_120b.tokenizer import GPTOssTokenizer
+
+    return GPTOssTokenizer.__new__(GPTOssTokenizer)
+
+
+def parse_thinking_harmony(text: str) -> tuple[Optional[str], str]:
+    return _gptoss_parser().parse_thinking(text)
+
+
 def parse_tool_calls_gptoss(text: str) -> tuple[Optional[list], str]:
-    if "<|call|>" not in text:
-        return None, text
-    parts = text.split("<|call|>")
-    visible = parts[0].strip()
-    tool_calls = []
-    for raw_call in parts[1:]:
-        raw_call = raw_call.strip()
-        for tok in ("<|return|>", "<|end|>"):
-            if raw_call.endswith(tok):
-                raw_call = raw_call[: -len(tok)].strip()
-        try:
-            payload = json.loads(raw_call)
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {
-                    "name": payload.get("name", ""),
-                    "arguments": json.dumps(
-                        payload.get("parameters", payload.get("arguments", {}))
-                    ),
-                },
-            })
-        except json.JSONDecodeError:
-            tool_calls.append({"parse_error": raw_call[:200]})
-    return tool_calls or None, visible
+    return _gptoss_parser().parse_tool_calls(text)
 
 
 def parse_tool_calls_glm5(text: str) -> tuple[Optional[list], str]:

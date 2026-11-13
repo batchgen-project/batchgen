@@ -78,6 +78,17 @@ def fa3_ref(*, q, k_cache, v_cache, qv, page_table, cache_seqlens, softmax_scale
     return out
 
 
+def install_sparse_attention_ref(monkeypatch):
+    """Route the sparse-attention seam (``sparse_dispatch``) to its Hopper
+    backend with ``fa3_ref`` as the kernel: the orchestration under test is
+    the production one, the FA3 launch the CPU reference."""
+    from batchgen.attention.mla import sparse_dispatch
+
+    monkeypatch.setattr(sparse_dispatch, "_BACKEND", "fa3")
+    monkeypatch.setattr(sparse_dispatch, "_fa3_with_kvcache", lambda: fa3_ref)
+    monkeypatch.setattr(sparse_dispatch, "_fa3_num_splits", lambda: 1)
+
+
 def install_flash_attn_varlen(monkeypatch):
     """A CPU ``flash_attn_interface`` for the UNCHANGED dense K3 prefill:
     causal attention inside each packed row, expanded heads."""
