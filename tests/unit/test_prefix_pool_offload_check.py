@@ -44,6 +44,10 @@ KIMI_WRAPPERS = (
     REPO / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "wrappers.py"
 )
 WORKER_TREE = ast.parse(WORKER.read_text())
+# S5b: the pooled prefill forward moved verbatim to PrefillEngine; its
+# model-state statements went behind the worker's PrefillModelStateBinder.
+ENGINE = REPO / "batchgen" / "worker" / "prefill_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
 
 
 # --------------------------------------------------------------------------
@@ -500,6 +504,17 @@ def _worker_method(name):
     )
 
 
+def _engine_method(name):
+    engine = next(
+        node for node in ENGINE_TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine"
+    )
+    return next(
+        node for node in engine.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
 def _worker_probe_keys():
     """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
 
@@ -663,11 +678,15 @@ def test_check_runs_after_the_d2h_retires_and_before_the_wave_is_finished():
 
 
 def test_recorder_install_precedes_the_pool_chunk_loop():
-    pool_prefill = _worker_method("_prefill_prepacked_pool")
-    install = _call_lines(pool_prefill, "_new_pool_offload_check_recorder")
+    pool_prefill = _engine_method("_prefill_prepacked_pool")
+    # The recorder is installed by the binder call that replaced the run.
+    install = _call_lines(pool_prefill, "_bind_prefill_pool_layer_state")
     builds = _call_lines(pool_prefill, "build")
     assert len(install) == 1 and builds
     assert install[0] < builds[0]
+    binder = _worker_method("_bind_prefill_pool_layer_state")
+    assert len(_call_lines(binder, "_new_pool_offload_check_recorder")) == 1
+    assert "AttnWrapperBase.prefill_pool_offload_recorder = " in ast.unparse(binder)
 
 
 def test_offload_issue_site_hashes_only_behind_the_flag():
@@ -757,7 +776,7 @@ def test_a_clean_wave_still_reports_zero_probe_errors():
 def _pool_wave_finally() -> str:
     """The ``finally`` of the pooled prefill wave, as source."""
 
-    method = _worker_method("_prefill_prepacked_pool")
+    method = _engine_method("_prefill_prepacked_pool")
     tries = [node for node in method.body if isinstance(node, ast.Try)]
     assert len(tries) == 1, f"{len(tries)} top-level try blocks"
     return "\n".join(ast.unparse(node) for node in tries[0].finalbody)
@@ -774,14 +793,18 @@ def test_a_wave_that_died_drops_both_probe_recorders():
     final = _pool_wave_finally()
 
     assert "wave.pool.kernel_dump = None" in final
-    assert "AttnWrapperBase.prefill_pool_offload_recorder = None" in final
     # Dropped unless this wave completed and handed the recorder to the
     # post-D2H verification step, which is the only other consumer.
-    assert "if not offload_recorder_handed_off" in final
+    assert (
+        "if not offload_recorder_handed_off:\n"
+        "    self._drop_prefill_pool_offload_recorder()"
+    ) in final
+    drop = ast.unparse(_worker_method("_drop_prefill_pool_offload_recorder"))
+    assert "AttnWrapperBase.prefill_pool_offload_recorder = None" in drop
 
 
 def test_the_handoff_flag_is_only_set_after_the_wave_completed():
-    method_source = ast.unparse(_worker_method("_prefill_prepacked_pool"))
+    method_source = ast.unparse(_engine_method("_prefill_prepacked_pool"))
 
     assert method_source.count("offload_recorder_handed_off = False") == 1
     assert method_source.count("offload_recorder_handed_off = True") == 1

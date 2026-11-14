@@ -807,10 +807,11 @@ def test_streamed_sp8_gathers_only_sequence_final_rows(monkeypatch):
 
 
 def test_worker_uses_model_prefill_last_token_gather_seam():
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
     source = ast.unparse(
         _function(
-            ROOT / "batchgen" / "batchgen_worker.py",
-            "BatchGenWorker",
+            ROOT / "batchgen" / "worker" / "prefill_engine.py",
+            "PrefillEngine",
             "prefill_prepacked",
         )
     )
@@ -3704,8 +3705,9 @@ def test_worker_reads_batch_level_mode_before_configure_prefill():
 
 
 def test_prefill_sync_happens_before_decoder_layers():
-    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
-    function = _function(worker_path, "BatchGenWorker", "prefill_prepacked")
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    engine_path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
+    function = _function(engine_path, "PrefillEngine", "prefill_prepacked")
     sync_lines = [
         node.lineno
         for node in ast.walk(function)
@@ -3728,8 +3730,9 @@ def test_prefill_sync_happens_before_decoder_layers():
 
 
 def test_prefill_schedule_checks_microbatch_count_before_sync_loop():
-    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
-    function = _function(worker_path, "BatchGenWorker", "prefill_prepacked")
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    engine_path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
+    function = _function(engine_path, "PrefillEngine", "prefill_prepacked")
     gather_lines = [
         node.lineno
         for node in ast.walk(function)
@@ -4281,10 +4284,8 @@ def test_worker_runs_missing_weight_passes_outside_the_local_row_guard():
 def test_worker_counts_the_same_prefill_plan_that_execution_uses():
     path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
     count = _function(path, "PrefillEngine", "_prefill_model_pass_count")
-    execute = _function(
-        ROOT / "batchgen" / "batchgen_worker.py", "BatchGenWorker",
-        "prefill_prepacked",
-    )
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    execute = _function(path, "PrefillEngine", "prefill_prepacked")
 
     def calls_plan(function):
         return sum(
