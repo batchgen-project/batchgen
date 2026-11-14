@@ -253,10 +253,15 @@ def test_every_decode_configure_width_derives_from_the_width_helper():
 
 
 def test_every_decode_model_load_lets_the_loader_size_the_width():
-    cls = _worker_class(_worker_tree())
+    # S9 moved one call site (the lifecycle rebuild) into
+    # WorkerLifecycleEngine; the invariant spans both classes.
+    engine_tree = ast.parse(
+        (WORKER_SOURCE.parent / "worker" / "worker_lifecycle_engine.py").read_text()
+    )
     calls = [
         node
-        for node in ast.walk(cls)
+        for tree in (_worker_class(_worker_tree()), engine_tree)
+        for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_load_decode_model"

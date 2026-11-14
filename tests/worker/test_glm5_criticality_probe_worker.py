@@ -42,6 +42,7 @@ from batchgen.models.glm.glm5.criticality_probe import (
 )
 from batchgen.models.glm.glm5.cuda_graph_adapter import Glm5CudaGraphAdapter
 from tests.worker.worker_fakes import make_graph_state
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -70,6 +71,9 @@ def _method_ast(name):
             if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
         )
         return next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "run")
+    # S8/S7/S9: a delegated method resolves to its engine body (worker shape).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(
         node for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name == name

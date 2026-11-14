@@ -25,7 +25,7 @@ import pytest
 from batchgen import eventlog
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
-    rank_sync_method_names,
+    delegated_method_names,
     worker_shaped_method_node,
 )
 
@@ -2087,9 +2087,10 @@ def _decode_engine_run() -> ast.FunctionDef:
 def _worker_method(name: str) -> ast.FunctionDef:
     if name == "decoding_continuous":
         return _decode_engine_run()
-    # S8: the RankSync methods run in RankSyncEngine behind same-name worker
-    # delegators; resolve them to the engine body in the worker's shape.
-    if name in rank_sync_method_names():
+    # S8/S9: the RankSync and WorkerLifecycle methods run in their engines
+    # behind same-name worker delegators; resolve them to the engine body in
+    # the worker's shape.
+    if name in delegated_method_names():
         return worker_shaped_method_node(name)
     return next(
         node for node in _worker_class().body

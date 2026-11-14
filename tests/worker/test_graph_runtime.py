@@ -30,7 +30,11 @@ import pytest
 from batchgen.cuda_graph.adapter import GraphMode, ModelCudaGraphAdapter
 from batchgen.cuda_graph.buckets import generate_bucket_sizes
 from batchgen.worker.graph_runtime import GraphRuntime
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import (
+    delegated_method_names,
+    load_worker_shaped_methods,
+    worker_shaped_method_node,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WORKER_SRC = _ROOT / "batchgen" / "batchgen_worker.py"
@@ -82,6 +86,9 @@ DELETED_PHASE_C_FIELDS = (
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
+    # S9: deep free and the decode release run in WorkerLifecycleEngine.
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     tree = ast.parse(_WORKER_SRC.read_text())
     return next(
         node
@@ -185,7 +192,7 @@ def test_the_capture_counter_increments_per_capture_episode():
 
 
 def _release_decode_graph_state():
-    return load_worker_methods(["_release_decode_graph_state"], {})[
+    return load_worker_shaped_methods(["_release_decode_graph_state"], {})[
         "_release_decode_graph_state"
     ]
 
@@ -231,7 +238,7 @@ def _deep_free_worker(*, held: bool):
     import logging
     import time
 
-    methods = load_worker_methods(
+    methods = load_worker_shaped_methods(
         ["deep_free_model_memory", "_release_decode_graph_state"],
         {
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
