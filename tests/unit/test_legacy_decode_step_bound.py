@@ -18,6 +18,7 @@ from typing import List
 import pytest
 import torch
 
+from batchgen.config.decode_strategy import DecodeStrategy
 from batchgen.sequence import SequenceBatch, SequenceEntry
 from tests.worker_method_source import load_worker_methods
 
@@ -41,6 +42,7 @@ def _methods(step_log, barrier_log):
         ["_legacy_decode_step_bound", "_decoding_legacy_modes"],
         {
             "List": List,
+            "DecodeStrategy": DecodeStrategy,
             "torch": torch,
             "logging": step_log,
             "dist": SimpleNamespace(barrier=lambda: barrier_log.append(1)),
@@ -94,6 +96,7 @@ def _run(worker, decode_uuids):
         list(decode_uuids),
         list(range(len(decode_uuids))),
         1,
+        DecodeStrategy.HYBRID_CPU_GPU,
     )
     return step_log.steps
 
