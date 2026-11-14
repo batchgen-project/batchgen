@@ -20,7 +20,7 @@ import torch
 
 from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import attach_identity, attach_prefix_state, attach_trajectory_state
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
@@ -60,7 +60,7 @@ class _Worker:
     rank = 1
     world_size = 1
     max_input_length = 1 << 20
-    _trajectory_book = None
+    max_decoding_length = 64
     _response_queue = None
 
     _report_completion = _NAMESPACE["_report_completion"]
@@ -71,7 +71,9 @@ class _Worker:
     def __init__(self, *, enable_prefix_cache=True, debug_stats=True):
         self.enable_prefix_cache = enable_prefix_cache
         self.prefix_cache_debug_stats = debug_stats
-        self._prefix_drain_metric_emitted = False
+        attach_trajectory_state(self)
+        attach_prefix_state(self)
+        self._prefix.prefix_drain_metric_emitted = False
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
         attach_identity(self, rank=self.rank, world_size=self.world_size,
@@ -81,8 +83,8 @@ class _Worker:
         # M3 Slice 2: a run that never turned the trajectory flag on has no
         # restorer, so the drain row carries no trajectory fields. Slice 3a
         # adds the session -> owning-group map, which is None on that same run.
-        self._trajectory_restorer = None
-        self._trajectory_session_groups = None
+        self._traj.trajectory_restorer = None
+        self._traj.trajectory_session_groups = None
         self.emitted = []
 
     def _publish_trajectory_pool_capacity(self):
@@ -206,7 +208,8 @@ def test_no_row_without_prefix_cache_or_debug_stats():
         _admit(worker, "a")
         _complete(worker, "a")
         assert worker.emitted == [], kwargs
-        assert worker._prefix_drain_metric_emitted is False
+        # migrated: worker._prefix_drain_metric_emitted -> worker._prefix.prefix_drain_metric_emitted, same owner object.
+        assert worker._prefix.prefix_drain_metric_emitted is False
 
 
 def _calls(node, attr):
@@ -263,7 +266,7 @@ def test_the_drain_row_carries_the_trajectory_attachment_counter():
             }
 
     worker = _Worker()
-    worker._trajectory_restorer = _Restorer()
+    worker._traj.trajectory_restorer = _Restorer()
     _admit(worker, "a")
     _complete(worker, "a")
 
@@ -289,7 +292,7 @@ def test_the_drain_row_splits_session_residency_placement_counts():
         placed_offgroup = 2
 
     worker = _Worker()
-    worker._trajectory_session_groups = _Index()
+    worker._traj.trajectory_session_groups = _Index()
     _admit(worker, "a")
     _complete(worker, "a")
 

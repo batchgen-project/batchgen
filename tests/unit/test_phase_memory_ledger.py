@@ -20,8 +20,23 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
+from tests.worker.worker_fakes import attach_trajectory_state
+
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+# S3.5: the KDA pool read moved to TrajectoryStore.kda_stats (the worker's
+# ledger calls it), so the pins on that block follow the logic to its owner.
+STORE = Path(__file__).resolve().parents[2] / "batchgen" / "worker" / "trajectory_store.py"
+
+
+def _kda_stats_source():
+    tree = ast.parse(STORE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "TrajectoryStore")
+    return ast.unparse(next(
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "kda_stats"
+    ))
 
 
 @functools.lru_cache(maxsize=1)
@@ -115,7 +130,8 @@ def test_the_kda_pools_are_reported_so_the_reuse_stays_observable():
     # The pools are deliberately kept across a rebuild, so their slot count
     # must stay flat; a growing one would mean the reuse decision stopped
     # matching and every cycle allocated a new pool.
-    body = ast.unparse(_method("_log_phase_memory_ledger"))
+    assert "self._traj.kda_stats()" in ast.unparse(_method("_log_phase_memory_ledger"))
+    body = _kda_stats_source()
     assert "num_state_items" in body
     assert "sequence_state_items" in body
 
@@ -172,6 +188,8 @@ def _run_ledger(label="after_configure_decoding"):
         ),
         gpu_paged_kv_cache_manager=SimpleNamespace(pool_is_mapped=True),
     )
+    # A real TrajectoryStore with the production-equivalent KDA loader.
+    attach_trajectory_state(worker)
     MethodType(function, worker)(label)
     assert len(recorder.lines) == 1
     return recorder.lines[0]
@@ -219,6 +237,9 @@ def test_a_half_initialized_manager_cannot_fail_the_phase_switch(
     monkeypatch.setattr(KimiLinearKDAWrapper, "state_manager", manager)
     line = _run_ledger()
     assert wanted in line
+    if isinstance(manager, _WrongTypeManager):
+        # The slot count was read before the failure and is still reported.
+        assert "kda_slots=256" in line
     # The rest of the line — the holders a per-cycle subtraction needs — is
     # still reported; the failure is confined to the KDA fields.
     assert "driver_used=70.00" in line
@@ -250,6 +271,6 @@ def test_no_manager_at_all_reports_the_sentinel(monkeypatch):
 
 
 def test_the_kda_block_is_not_narrowed_to_import_errors():
-    body = ast.unparse(_method("_log_phase_memory_ledger"))
+    body = _kda_stats_source()
     assert "except Exception:" in body
     assert "except ImportError:" not in body
