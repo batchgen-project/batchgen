@@ -217,6 +217,8 @@ class GLM5ParallelStrategyManager:
         # The decode CUDA graph's capture bucket list, for the Triton prewarm's
         # bucket-keyed entries. The worker derives it from its CUDA-graph
         # arguments; None until something hands it over (see triton_prewarm).
+        # Nothing does yet: with the graph on, the prewarm logs that once
+        # (``report_unset_decode_buckets``).
         self.decode_graph_buckets = None
 
     @property
@@ -564,8 +566,16 @@ class GLM5ParallelStrategyManager:
             prewarm_glm5_decode,
             prewarm_glm5_geometry,
             prewarm_glm5_prefill,
+            report_unset_decode_buckets,
         )
 
+        if phase in (PHASE_DECODE, PHASE_GEOMETRY):
+            report_unset_decode_buckets(
+                self.decode_graph_buckets,
+                whole_model_graph=bool(
+                    self.engine_config.Basic_Config.enable_cuda_graphs),
+                rank=self.global_rank,
+            )
         part_index, part_count, barrier = self._triton_prewarm_partition()
         common = dict(part_index=part_index, part_count=part_count,
                       barrier=barrier, rank=self.global_rank)

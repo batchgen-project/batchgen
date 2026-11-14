@@ -33,8 +33,13 @@ Three phases, each once per process:
     DeepEP, the masked SiLU*up cast;
   * geometry (``prewarm_decode_graphs``, right before CUDA-graph capture):
     the kernels whose keys depend on the page-table widths and the graph's
-    score span. It re-runs when that geometry changes. The late-compile
-    guard is armed at its end.
+    score span, and eager decode's transform and dense gather (whose width
+    is a runtime int, so their keys are bounded). It re-runs when that
+    geometry changes. The late-compile guard is armed at its end.
+
+``arm_at_readiness`` marks the worker ready: the Triton guard can no longer
+be disarmed and the DeepGEMM guard snapshots the cache's kernel names, so a
+phase that runs after readiness reports every kernel it compiles as late.
 
 Each phase partitions its entries over the node-local ranks, which share one
 Triton cache directory; after a barrier every rank runs every entry, loading
@@ -90,6 +95,11 @@ MASKED_ROW_STRIDE_WITNESSES = (16, 20)
 # Widths of the ACTIVE page table (``_GPUPageTableManager.gpu_table``), which
 # eager decode hands the paged KV write as a runtime int.
 PAGE_TABLE_COL_WITNESSES = (1, 16, 17)
+
+# Index dtypes eager decode's top-k can reach the transform with: a mixed
+# short/long batch assembles int64 indices, the scorers write int32. The
+# transform accepts both, so both are prewarmed.
+EAGER_TOPK_DTYPES = (torch.int32, torch.int64)
 
 # FP8 blockwise scale block of every GLM-5 activation cast.
 SCALE_BLOCK = 128
@@ -321,6 +331,33 @@ def eager_score_seqlens(index_topk: int) -> Tuple[int, int]:
     return int(index_topk) + 1, int(index_topk) + 16
 
 
+# ``BLOCK_T`` tiers of ``gather_block_t`` as ``(first, last)`` total sizes.
+_GATHER_TIERS = ((1, 4096), (4097, 32768), (32769, None))
+
+
+def dense_gather_spans(index_topk: int) -> Tuple[int, ...]:
+    """Spans of the eager dense indexer gather, one row each, that reach
+    every ``(BLOCK_T, int_class(num_tokens))`` key it can see.
+
+    The gather runs on the same batches as the eager scorer, so its span
+    exceeds ``index_topk`` (never the "1" class). Its width is a runtime
+    int outside the key (kernel revision r2); the row count only sizes the
+    grid and, through ``batch * span``, picks ``BLOCK_T``, which one-row
+    spans in each tier reach.
+    """
+    floor = int(index_topk) + 1
+    spans = set()
+    for first, last in _GATHER_TIERS:
+        start = max(first, floor)
+        if last is not None and start > last:
+            continue
+        for span in (start if start % 16 else start + 1,
+                     -(-start // 16) * 16):
+            if last is None or span <= last:
+                spans.add(span)
+    return tuple(sorted(spans))
+
+
 @dataclass(frozen=True)
 class Glm5DecodeGeometry:
     """Page-table widths and page sizes of the decode graph's KV managers."""
@@ -457,13 +494,14 @@ def describe_section_d(predicates: Dict[str, Any]) -> List[Tuple[int, str]]:
         else:
             lines.append((logging.INFO, "aux cache bf16 AoS: "
                           "_prepare_paged_mqa_inputs_kernel is unreachable"))
-    if predicates.get("eager_width_constexpr"):
+    if predicates.get("eager_width_runtime"):
         lines.append((logging.INFO, "eager decode (over-bucket batches, "
                       "glm5_dsa_mode=eager, graph compare) passes the ACTIVE "
                       "page-table width, which follows the longest sequence, "
-                      "as a constexpr to _transform_selected_positions_kernel "
-                      "and _dense_paged_gather_kernel; those keys are "
-                      "unbounded and NOT prewarmed"))
+                      "to _transform_selected_positions_kernel and "
+                      "_dense_paged_gather_kernel as a runtime int outside "
+                      "the key (kernel revision r2): their eager keys do not "
+                      "depend on it and are prewarmed"))
     return lines
 
 
@@ -761,6 +799,48 @@ def _run_selected_positions(geometry: Glm5DecodeGeometry, topk: int, device,
     )
 
 
+def _run_selected_positions_eager(geometry: Glm5DecodeGeometry, topk: int,
+                                  index_dtype, with_slots: bool, device,
+                                  fn: Optional[Callable] = None) -> None:
+    """``glm5_decode_selector``'s eager transform: no valid count, the slot
+    override (``with_slots``) or a batch-ordered table, and the ACTIVE
+    page-table width, a runtime int outside the key since kernel revision
+    r2, so any width stands for all of them."""
+    if fn is None:
+        from batchgen_kernels.attention.dsa.selected_page_table import (
+            transform_selected_positions_out as fn,
+        )
+    fn(
+        _zeros((1, geometry.primary_width), torch.int32, device),
+        _zeros((1,), torch.int32, device),
+        _zeros((1, topk), index_dtype, device),
+        torch.empty((1, topk), dtype=torch.int32, device=device),
+        torch.empty((1,), dtype=torch.int32, device=device),
+        page_size=geometry.primary_page_size,
+        primary_slot_indices=(_zeros((1,), torch.int32, device)
+                              if with_slots else None),
+    )
+
+
+def _run_dense_gather(shapes: Glm5PrewarmShapes, geometry: Glm5DecodeGeometry,
+                      span: int, aux_dtype, device,
+                      fn: Optional[Callable] = None) -> None:
+    """Eager GLM-5/5.1 indexer gather (``fused_dense_paged_gather``) of one
+    row over a one-page scratch aux cache; the zero table maps every page
+    to page 0, so no read leaves the scratch."""
+    if fn is None:
+        from batchgen_kernels.attention.dsa.fused_paged_gather import (
+            fused_dense_paged_gather as fn,
+        )
+    fn(
+        _zeros((1, geometry.aux_page_size, 1, shapes.index_head_dim),
+               aux_dtype, device),
+        _zeros((1, geometry.aux_width), torch.int32, device),
+        int(span),
+        geometry.aux_page_size,
+    )
+
+
 def _run_paged_mqa_prepare(geometry: Glm5DecodeGeometry, device,
                            fn: Optional[Callable] = None,
                            next_n: Optional[int] = None) -> None:
@@ -982,6 +1062,16 @@ def geometry_entries(shapes: Glm5PrewarmShapes, weights: Glm5DecodeWeights,
         f"selected_positions/graph/w{geometry.primary_width}",
         partial(_run_selected_positions, geometry, shapes.index_topk, device),
     ))
+    entries.extend(
+        PrewarmEntry(
+            f"selected_positions/eager/{str(dtype).rsplit('.', 1)[-1]}/"
+            f"{'slots' if with_slots else 'batch'}",
+            partial(_run_selected_positions_eager, geometry,
+                    shapes.index_topk, dtype, with_slots, device),
+        )
+        for dtype in EAGER_TOPK_DTYPES
+        for with_slots in (True, False)
+    )
     # Eager decode's primary write: no valid count, the active table width.
     entries.append(PrewarmEntry(
         f"kv_write/primary_eager/e{shapes.kv_dim}",
@@ -1020,6 +1110,14 @@ def geometry_entries(shapes: Glm5PrewarmShapes, weights: Glm5DecodeWeights,
                 PAGE_TABLE_COL_WITNESSES, PAGE_TABLE_COL_WITNESSES, False,
                 aux_dtype, device),
     ))
+    entries.extend(
+        PrewarmEntry(
+            f"dense_gather/eager/n{span}",
+            partial(_run_dense_gather, shapes, geometry, span, aux_dtype,
+                    device),
+        )
+        for span in dense_gather_spans(shapes.index_topk)
+    )
     entries.append(PrewarmEntry(
         "eager_score", partial(_run_eager_score, shapes, device),
     ))
@@ -1166,19 +1264,72 @@ def _restore_guard(guard, mode: str) -> None:
         guard.disarm()
 
 
+def _deepgemm_prewarm():
+    """The DeepGEMM half of the prewarm (imported on use, like every GPU
+    dependency of this module)."""
+    from . import deepgemm_prewarm
+
+    return deepgemm_prewarm
+
+
+def arm_at_readiness(rank, strict: bool = False) -> None:
+    """Arm both late-compile guards for good when the worker reports ready:
+    the Triton guard refuses every later ``disarm`` and the DeepGEMM guard
+    snapshots the cache's kernel names. Every later compile, a prewarm
+    phase's included, is reported as late."""
+    get_recorder()  # bind GLM-5's log tag and batch-debug source first
+    _core.arm_at_readiness(strict=strict, rank=rank)
+    _deepgemm_prewarm().record_baseline(rank)
+
+
+_BUCKETS_UNSET_REPORTED = False
+
+
+def report_unset_decode_buckets(buckets, *, whole_model_graph: bool,
+                                rank) -> bool:
+    """Log, once per process, that the whole-model decode graph is on but
+    the bucket list it captures never reached the prewarm. Returns whether
+    it logged."""
+    global _BUCKETS_UNSET_REPORTED
+    if buckets is not None or not whole_model_graph or _BUCKETS_UNSET_REPORTED:
+        return False
+    _BUCKETS_UNSET_REPORTED = True
+    logger.warning(
+        "%s rank=%s decode_graph_buckets is None while the whole-model "
+        "decode CUDA graph is enabled: nothing hands the prewarm the "
+        "worker's capture buckets, so the head-gate and paged-score entries "
+        "fall back to the row-class witnesses and the geometry span ignores "
+        "the bucket statics cap; graph capture can compile kernels the "
+        "prewarm did not reach", LOG_TAG, rank,
+    )
+    return True
+
+
 def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
                barrier, rank, arm_after: bool) -> None:
-    """Partitioned run with the guard disarmed, so the deliberate compiles
-    of a phase are never reported as late."""
-    from .deepgemm_prewarm import cache_kernel_count
+    """Partitioned run of one phase's entries.
 
+    Before readiness the guard is disarmed for the run, so the deliberate
+    compiles of a phase are not reported as late. After readiness
+    (``arm_at_readiness``) nothing compiles deliberately: the guard stays
+    armed, the phase's Triton compiles are logged as late, and the DeepGEMM
+    kernels it compiled are reported by name.
+    """
+    dg = _deepgemm_prewarm()
     recorder = get_recorder()
     active = recorder if recorder.install() else None
-    previous = recorder.guard.armed_mode
-    recorder.guard.disarm()
+    guard = recorder.guard
+    post_ready = guard.ready
+    previous = guard.armed_mode
+    if post_ready:
+        logger.warning("%s rank=%s %s phase runs after readiness: every "
+                       "kernel it compiles is reported as late", LOG_TAG,
+                       rank, phase)
+    else:
+        guard.disarm()
     start = time.perf_counter()
     mark = active.mark() if active is not None else 0
-    deepgemm_before = cache_kernel_count()
+    deepgemm_before = len(dg.cache_kernel_names())
     try:
         with torch.inference_mode():
             _core.run_prewarm(
@@ -1188,10 +1339,11 @@ def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
             )
     finally:
         torch.cuda.empty_cache()
-        if arm_after and active is not None:
-            recorder.guard.arm()
-        else:
-            _restore_guard(recorder.guard, previous)
+        if not post_ready:
+            if arm_after and active is not None:
+                guard.arm()
+            else:
+                _restore_guard(guard, previous)
     if active is not None:
         for kernel, (compiled, loaded) in sorted(
                 active.per_kernel(mark).items()):
@@ -1202,7 +1354,11 @@ def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
     logger.info("%s rank=%s %s entries=%d total wall=%.1fs DeepGEMM cache "
                 "kernels %d -> %d", LOG_TAG, rank, phase, len(entries),
                 time.perf_counter() - start, deepgemm_before,
-                cache_kernel_count())
+                len(dg.cache_kernel_names()))
+    if post_ready:
+        dg.check_late_compiles(rank, f"{phase} phase after readiness",
+                               strict=guard.state() == STRICT)
+        return
     if arm_after and active is not None:
         logger.info(
             "%s rank=%s late-compile guard armed: later compiles log at "
@@ -1233,7 +1389,7 @@ def prewarm_glm5_prefill(config, *, max_rows: int, part_index=0,
     the DeepGEMM GEMMs' row count (``deepgemm_prewarm``)."""
     if PHASE_PREFILL in _DONE_PHASES:
         return False
-    from . import deepgemm_prewarm as dg
+    dg = _deepgemm_prewarm()
 
     dg.check_version(rank)
     shapes = Glm5PrewarmShapes.from_config(config)
@@ -1269,7 +1425,7 @@ def prewarm_glm5_decode(model, config, *, decode_buckets, max_rows: int,
     are initialised. ``max_rows`` bounds the DeepGEMM GEMMs' row count."""
     if PHASE_DECODE in _DONE_PHASES:
         return False
-    from . import deepgemm_prewarm as dg
+    dg = _deepgemm_prewarm()
     from .indexer_wk_backend import glm5_indexer_wk_is_deepgemm
     from .norm_quant_fuse_policy import glm5_norm_quant_fuse_site_enabled
     from .qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
@@ -1305,15 +1461,16 @@ def prewarm_glm5_decode(model, config, *, decode_buckets, max_rows: int,
 def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
                           world_size: int = 1, part_index=0, part_count=1,
                           barrier=None, rank=0) -> bool:
-    """Phase 3: once per page-table geometry. Arms the late-compile guard
-    and records the DeepGEMM cache's kernel count.
+    """Phase 3: once per page-table geometry. Before readiness it arms the
+    late-compile guard and records the DeepGEMM cache's kernel names; after
+    readiness the guards are already armed and its compiles are late.
 
     Every rank must reach the same decision, or the phase barrier hangs;
     the geometry comes from the KV configuration, which all ranks share.
     ``world_size`` is the EP world of the DeepEP MoE's ``expected_m``.
     """
     global _GEOMETRY_KEY
-    from . import deepgemm_prewarm as dg
+    dg = _deepgemm_prewarm()
     from .qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 
     shapes = Glm5PrewarmShapes.from_config(config)
@@ -1342,7 +1499,7 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
         "" if previous is None else f" (changed from {previous})",
     )
     log_section_d({"aux_page_split": geometry.aux_page_split,
-                   "eager_width_constexpr": True}, rank)
+                   "eager_width_runtime": True}, rank)
     # q_b output row widths whose rope half the graph's RMSNorm+RoPE reads:
     # the separate q_b GEMM, and the merged [q_b | wq_b] GEMM of the indexer
     # layers when the merge is on.
@@ -1377,6 +1534,7 @@ def prewarm_glm5_geometry(model, config, gpu_manager, *, decode_buckets,
     _run_phase(PHASE_GEOMETRY, entries, part_index=part_index,
                part_count=part_count, barrier=barrier, rank=rank,
                arm_after=True)
-    dg.record_baseline(rank)
+    if not get_recorder().guard.ready:
+        dg.record_baseline(rank)
     _GEOMETRY_KEY = geometry.key()
     return True
