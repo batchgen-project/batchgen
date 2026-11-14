@@ -26,7 +26,11 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 from batchgen.prefix_reuse.eviction import (
@@ -421,6 +425,8 @@ class FakeWorker:
             rank=rank, world_size=world_size,
             local_world_size=local_world_size, local_rank=local_rank,
         )
+        attach_trajectory_state(self)
+        attach_prefix_state(self)
         self.torch_device = torch.device("cpu")
         self.enable_host_kv_eviction = False
         self.enable_prefix_cache = True
@@ -430,16 +436,16 @@ class FakeWorker:
         self.host_paged_kv_worker_view = pool
         self.core_engine = SimpleNamespace(host_paged_kv_worker_view=pool)
         self.global_batch = FakeBatch(sequences)
-        self._trajectory_frontier_committer = committer
+        self._traj.trajectory_frontier_committer = committer
         self._prefill_admission_state = None
         self._prefill_admission_selection = None
         self._prefill_admission_totals = None
         self._prefill_admission_live = False
         self._prefill_reservation_outcome = None
         self.shared_prefix_admission = True
-        self._shared_prefix_credit_suspended = False
-        self._shared_prefix_credit_applied = False
-        self._prefix_page_digest_cache = {}
+        self._prefix.shared_prefix_credit_suspended = False
+        self._prefix.shared_prefix_credit_applied = False
+        self._prefix.prefix_page_digest_cache = {}
         # Unmeasured prefill-pool budget: the pool declines every wave until
         # one is measured, so the shared-prefix credit declines with it and
         # these fakes admit on the full per-row charge.
@@ -448,7 +454,7 @@ class FakeWorker:
         # is compiled from the real source and reads it.
         self._prefill_pool_wave = None
         # Request-lifecycle surfaces a per-request rejection has to release.
-        self._trajectory_book = trajectory_book
+        self._traj.trajectory_book = trajectory_book
         self.query_book = {}
         self._response_queue = FakeResponseQueue()
         self.published_capacity = 0

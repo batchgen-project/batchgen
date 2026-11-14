@@ -22,7 +22,11 @@ import torch
 
 from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 from tests.worker_method_source import load_worker_functions, load_worker_methods
 
 # What the other rank contributes to the next all_gather_object.
@@ -58,8 +62,7 @@ def _ids(length):
 class _Worker:
     world_size = 2
     max_input_length = 1 << 20
-    _trajectory_book = None
-
+    max_decoding_length = 64
     _admit_sequences_from_message = _METHODS["_admit_sequences_from_message"]
     _report_completion = _METHODS["_report_completion"]
     _gather_completed_tokens = _METHODS["_gather_completed_tokens"]
@@ -76,8 +79,10 @@ class _Worker:
         attach_identity(self, rank=rank, world_size=self.world_size,
                         local_world_size=self.world_size,
                         decode_group_size=attn_tp_size)
+        attach_trajectory_state(self)
+        attach_prefix_state(self)
         self.query_book = {}
-        self._prefix_sequence_states = {}
+        self._prefix.prefix_sequence_states = {}
         self._response_queue = queue.Queue() if rank == 0 else None
 
     def _bind_admitted_prompts(self, uuids, prompt_ids):
@@ -175,7 +180,7 @@ def test_owner_reads_cached_tokens_from_its_prefix_state():
     seq = worker.global_batch.get_sequence("turn_abc")
     worker.seq_table.bind("turn_abc", 0)
     worker.query_book[0] = object()
-    worker._prefix_sequence_states[seq.global_idx] = SimpleNamespace(
+    worker._prefix.prefix_sequence_states[seq.global_idx] = SimpleNamespace(
         compute_cached_tokens=32
     )
     assert worker._gather_completed_tokens(["turn_abc"]) == {"turn_abc": "answer"}
@@ -222,7 +227,7 @@ def _bind_locally(worker, uuid, cached=None):
     worker.seq_table.bind(uuid, 0)
     worker.query_book[0] = object()
     if cached is not None:
-        worker._prefix_sequence_states[seq.global_idx] = SimpleNamespace(
+        worker._prefix.prefix_sequence_states[seq.global_idx] = SimpleNamespace(
             compute_cached_tokens=cached)
     return seq
 

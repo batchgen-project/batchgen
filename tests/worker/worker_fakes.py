@@ -9,9 +9,8 @@ those two rather than loose attributes.
 ``attach_identity`` is the single way tests install them. It is deliberately
 explicit: no ``__getattr__`` magic, no defaults that hide a missing rank.
 Later worker-decouple slices extend this module as more state moves into
-owned components. S3 (``worker/kv_plan.py``) moved no worker fields -- it is
-pure types and functions over plain ints -- so it deliberately adds no
-``attach_*`` helper here.
+owned components. S3.5 installs real ``TrajectoryStore`` and
+``PrefixReuseState`` instances through the two ``attach_*`` helpers below.
 """
 
 from __future__ import annotations
@@ -21,6 +20,8 @@ from typing import Iterable, Mapping, Optional, Union
 from batchgen.worker.graph_runtime import GraphRuntime
 from batchgen.worker.rank_context import RankContext
 from batchgen.worker.sequence_table import SequenceTable
+from batchgen.worker.trajectory_store import TrajectoryStore
+from batchgen.worker.prefix_reuse_state import PrefixReuseState
 
 Bindings = Union[Mapping[str, int], Iterable[str], None]
 
@@ -143,4 +144,40 @@ def attach_graph_state(fake, **overrides):
     relied on.
     """
     fake._graph = make_graph_state(**overrides)
+    return fake
+
+
+def _apply_component_overrides(component, overrides):
+    """Apply only real component fields; typos must fail loudly."""
+    for name, value in overrides.items():
+        if not hasattr(component, name):
+            raise AttributeError(
+                f"{type(component).__name__} has no field {name!r}"
+            )
+        setattr(component, name, value)
+    return component
+
+
+def _load_kda_wrapper():
+    # Mirrors batchgen_worker._load_kda_wrapper, which production injects.
+    from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+    return KimiLinearKDAWrapper
+
+
+def attach_trajectory_state(fake, **overrides):
+    """Attach a real ``TrajectoryStore`` to a worker fake."""
+    loader = overrides.pop("kda_wrapper_loader", _load_kda_wrapper)
+    fake._traj = _apply_component_overrides(
+        TrajectoryStore(kda_wrapper_loader=loader), overrides
+    )
+    return fake
+
+
+def attach_prefix_state(fake, **overrides):
+    """Attach a real ``PrefixReuseState`` to a worker fake."""
+    rank = int(overrides.pop("rank", getattr(fake, "rank", 0)))
+    world_size = int(overrides.pop("world_size", getattr(fake, "world_size", 1)))
+    fake._prefix = _apply_component_overrides(
+        PrefixReuseState(rank=rank, world_size=world_size), overrides
+    )
     return fake
