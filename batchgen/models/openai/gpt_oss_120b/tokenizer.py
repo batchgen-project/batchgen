@@ -35,12 +35,21 @@ Chat prompts are rendered in the harmony format by
 :func:`render_harmony_prompt` (``apply_chat_template``), including request
 ``tools``, assistant ``tool_calls`` history and ``tool`` result messages.
 
-Output parsing (``--parse-thinking`` / ``--parse-tool-call``) reads the
-harmony message grammar. Its markers (``<|start|>``, ``<|channel|>``,
-``<|message|>``, ``<|end|>``, ``<|call|>``, ...) are special tokens, so the
-server must also run with ``--detokenization-include-special-tokens``;
-without it the completion text is ``analysis...assistantfinal...`` with every
-message boundary gone and nothing can be parsed.
+Chat output is always parsed by default, as in OpenAI's harmony serving:
+the ``analysis`` channel becomes ``reasoning_content``, ``final`` and
+recipient-less ``commentary`` become ``content``, and messages addressed to a
+function become ``tool_calls`` (``parse_thinking_default`` and
+``parse_tool_call_default`` are True; ``--no-parse-thinking`` /
+``--no-parse-tool-call`` turn either off).
+
+The parsers read the harmony message grammar, whose markers (``<|start|>``,
+``<|channel|>``, ``<|constrain|>``, ``<|message|>``, ``<|end|>``,
+``<|call|>``, ``<|return|>``) are special tokens in the checkpoint. They are
+the structure of the output, not decoration, so ``decode(skip_special_tokens=
+True)`` keeps them and strips only the non-grammar specials
+(``<|startoftext|>``, ``<|endoftext|>``, the reserved range). Default decode
+therefore yields parseable harmony text, and with parsing turned off the raw
+``content`` still carries every message boundary.
 """
 
 import json
@@ -98,6 +107,26 @@ GPT_OSS_STOP_TOKEN_IDS = frozenset({
     GPT_OSS_SPECIAL_TOKENS["<|endoftext|>"],
     GPT_OSS_SPECIAL_TOKENS["<|call|>"],
 })
+
+#: The harmony output grammar markers. ``decode(skip_special_tokens=True)``
+#: keeps these and strips every other special token: the parsers need the
+#: message boundaries, and ``<|call|>`` / ``<|return|>`` (stop tokens the
+#: worker decodes with the completion) tell a finished message from one cut
+#: off by ``max_tokens``.
+GPT_OSS_GRAMMAR_TOKEN_IDS = frozenset(
+    GPT_OSS_SPECIAL_TOKENS[name]
+    for name in (
+        "<|start|>", "<|channel|>", "<|constrain|>", "<|message|>",
+        "<|end|>", "<|call|>", "<|return|>",
+    )
+)
+
+#: Every id ``decode(skip_special_tokens=True)`` drops: the special tokens
+#: that are not harmony grammar, including the reserved range.
+GPT_OSS_SKIPPED_SPECIAL_IDS = frozenset(
+    (set(GPT_OSS_SPECIAL_TOKENS.values()) | set(range(200013, 201088)))
+    - GPT_OSS_GRAMMAR_TOKEN_IDS
+)
 
 
 # ---- Harmony output grammar ----
@@ -530,7 +559,13 @@ class GPTOssTokenizer(BaseTokenizer):
             <|endoftext|> and at <|call|>, the end of a tool call
         pad_token_id: 199999 (<|endoftext|>)
         vocab_size: 201,088
+        parse_thinking_default / parse_tool_call_default: True -- the
+            harmony channels are always parsed unless the server turns
+            parsing off explicitly.
     """
+
+    parse_thinking_default = True
+    parse_tool_call_default = True
 
     def __init__(self):
         """Initialize the GPT-OSS tokenizer using tiktoken."""
@@ -582,16 +617,15 @@ class GPTOssTokenizer(BaseTokenizer):
 
         Args:
             token_ids: List of token IDs to decode
-            skip_special_tokens: Whether to skip special tokens in output
+            skip_special_tokens: Drop the special tokens that are not harmony
+                grammar (:data:`GPT_OSS_SKIPPED_SPECIAL_IDS`). The grammar
+                markers (:data:`GPT_OSS_GRAMMAR_TOKEN_IDS`) are always kept.
 
         Returns:
             Decoded text string
         """
         if skip_special_tokens:
-            # Filter out special tokens
-            special_ids = set(GPT_OSS_SPECIAL_TOKENS.values())
-            special_ids.update(range(200013, 201088))  # Reserved tokens
-            token_ids = [t for t in token_ids if t not in special_ids]
+            token_ids = [t for t in token_ids if t not in GPT_OSS_SKIPPED_SPECIAL_IDS]
         return self.tokenizer.decode(token_ids)
 
     def __call__(
@@ -800,8 +834,7 @@ class GPTOssTokenizer(BaseTokenizer):
         logger.warning(
             "GPT-OSS parse_thinking: the completion text has no harmony "
             "message markers (<|channel|>...<|message|>), so it is returned "
-            "raw in content. The harmony markers are special tokens: run the "
-            "server with --detokenization-include-special-tokens so the "
-            "decoded text keeps them. Logged once; later occurrences are "
-            "DEBUG."
+            "raw in content. Default decode keeps the markers, so the model "
+            "wrote no harmony message (or the text was decoded by a path that "
+            "strips them). Logged once; later occurrences are DEBUG."
         )

@@ -254,8 +254,11 @@ class ServerArgs:
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
-    parse_thinking: bool = False  # Extract reasoning_content from model output
-    parse_tool_call: bool = False  # Extract tool_calls from model output
+    # Output parsing of chat responses. None = the model's declared default
+    # (BaseTokenizer.parse_thinking_default / parse_tool_call_default);
+    # True / False = forced on / off for every model.
+    parse_thinking: Optional[bool] = None  # Extract reasoning_content from model output
+    parse_tool_call: Optional[bool] = None  # Extract tool_calls from model output
     enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -650,15 +653,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--parse-thinking",
-        action="store_true",
-        default=False,
-        help="Extract thinking/reasoning blocks from model output into reasoning_content field",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Extract thinking/reasoning blocks from chat output into the "
+             "reasoning_content field. Unset: the model's default (on for "
+             "GPT-OSS, whose harmony channels are always parsed; off for "
+             "every other model). --no-parse-thinking returns the raw "
+             "decoded text, delimiters included, in content.",
     )
     parser.add_argument(
         "--parse-tool-call",
-        action="store_true",
-        default=False,
-        help="Extract tool call blocks from model output into tool_calls array",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Extract tool call blocks from chat output into the tool_calls "
+             "array. Unset: the model's default (on for GPT-OSS, off for "
+             "every other model). --no-parse-tool-call leaves calls as raw "
+             "text in content.",
     )
     cuda_graph_group = parser.add_mutually_exclusive_group()
     cuda_graph_group.add_argument(

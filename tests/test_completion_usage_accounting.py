@@ -63,7 +63,9 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
     assert result["decoded_length"] == 128
 
 
-def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
+def test_gather_completed_tokens_decodes_through_the_stop_token(monkeypatch):
+    """The stop token goes to decode with the completion; the tokenizer's
+    skip_special_tokens=True drops it (GLM's <|user|> is special)."""
     seq = SequenceEntry(
         "stopped",
         global_idx=9,
@@ -74,7 +76,7 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
 
     class Tokenizer:
         def decode(self, token_ids, *, skip_special_tokens):
-            assert token_ids == [42]
+            assert token_ids == [42, 154827]
             assert skip_special_tokens is True
             return "answer"
 
@@ -102,7 +104,7 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
     assert worker._gather_completed_tokens([seq.uuid]) == {seq.uuid: "answer"}
 
 
-def test_report_completion_fallback_applies_stop_token_trimming():
+def test_report_completion_fallback_decodes_through_the_stop_token():
     seq = SequenceEntry(
         "local-fallback",
         global_idx=11,
@@ -114,7 +116,7 @@ def test_report_completion_fallback_applies_stop_token_trimming():
 
     class Tokenizer:
         def decode(self, token_ids, *, skip_special_tokens):
-            assert token_ids == [42]
+            assert token_ids == [42, 154827]
             assert skip_special_tokens is True
             return "answer"
 

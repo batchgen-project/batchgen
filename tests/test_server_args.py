@@ -281,3 +281,27 @@ def test_max_model_len_rejects_invalid_values(tmp_path, value):
     )
     with pytest.raises(ValueError, match="max_model_len"):
         validate_server_args(args)
+
+
+@pytest.mark.parametrize("flags, expected", [
+    ([], (None, None)),
+    (["--parse-thinking", "--parse-tool-call"], (True, True)),
+    (["--no-parse-thinking", "--no-parse-tool-call"], (False, False)),
+    (["--no-parse-thinking"], (False, None)),
+    (["--parse-tool-call"], (None, True)),
+])
+def test_output_parsing_flags_are_tri_state(tmp_path, monkeypatch, flags, expected):
+    """Unset = the model's declared default (None); --[no-]parse-* force it."""
+    monkeypatch.chdir(tmp_path)
+    args = server_args_module.prepare_server_args([
+        "--model", "openai/gpt-oss-120b",
+        "--host-kv-cache-size", "1",
+        "--storage-path", str(tmp_path / "storage"),
+        *flags,
+    ])
+    assert (args.parse_thinking, args.parse_tool_call) == expected
+
+
+def test_output_parsing_dataclass_defaults_are_model_default():
+    args = ServerArgs(model="openai/gpt-oss-120b")
+    assert (args.parse_thinking, args.parse_tool_call) == (None, None)

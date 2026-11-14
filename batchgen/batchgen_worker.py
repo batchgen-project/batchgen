@@ -11077,14 +11077,21 @@ class BatchGenWorker:
 			self._log_decode_timing()
 
 	def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
-		"""Decode token IDs to string, stopping at first EOS token.
+		"""Decode token IDs to string, ending at (and including) the first EOS token.
+
+		The stop token is always decoded with the completion; the tokenizer's
+		``decode(skip_special_tokens=True)`` decides whether it shows in the
+		text (see ``BaseTokenizer.decode``). A stop token that terminates the
+		model's output grammar (GPT-OSS ``<|call|>``, ``<|return|>``) stays,
+		so its parser can tell a complete message from a ``max_tokens``
+		truncation; every other stop token is dropped by the decode.
 
 		Args:
 			tokens: Tensor of token IDs, shape [1, seq_len] or [seq_len]
 			min_tokens: Minimum tokens before considering EOS (to avoid empty outputs)
 
 		Returns:
-			Decoded string, truncated at first valid EOS position
+			Decoded string, ending at the first valid EOS position
 		"""
 		# Flatten to 1D if needed
 		if tokens.dim() > 1:
@@ -11096,9 +11103,7 @@ class BatchGenWorker:
 		eos_positions = [i for i, t in enumerate(tokens_list) if t in self.eos_token_ids and i >= min_tokens]
 
 		if eos_positions:
-			end_pos = eos_positions[0]
-			if self.detokenization_include_special_tokens:
-				end_pos += 1  # Include the stop token itself
+			end_pos = eos_positions[0] + 1  # Include the stop token itself
 		else:
 			# No EOS found, use all non-padding tokens
 			non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
