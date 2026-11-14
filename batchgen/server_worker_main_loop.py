@@ -882,6 +882,11 @@ def _server_worker_main_impl(
 	# an idle slot carries no budget, so nothing below is watched by it.
 	phase_reporter.leave()
 
+	# Ready means fully warm: every deliberate compile and capture ran above,
+	# so the late-compile guard arms before the ready signal and reports any
+	# later compile as a defect.
+	worker.arm_late_compile_guard_at_readiness()
+
 	# Each launcher owns a node-local event, so local rank 0 must signal its own
 	# WorkerManager. The global barrier above proves all workers are ready first.
 	_signal_local_worker_manager_ready(

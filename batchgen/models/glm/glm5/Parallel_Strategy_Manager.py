@@ -519,19 +519,37 @@ class GLM5ParallelStrategyManager:
             self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
-    def prewarm_decode_graphs(self, gpu_manager=None):
+    def prewarm_decode_graphs(self, gpu_manager=None, decode_buckets=None):
         """Compile the decode kernels keyed on the KV page-table geometry.
 
         The worker calls this with its GPU KV manager right before CUDA-graph
-        warmup on every decode configure. It runs the geometry phase of the
-        Triton prewarm the first time and again whenever the page-table
-        widths change, then arms the late-compile guard; any other call
-        returns at once.
+        warmup: once at the startup graph capture (before readiness) and on
+        every decode configure. It runs the geometry phase of the Triton
+        prewarm the first time and again whenever the page-table widths
+        change; any other call returns at once.
+
+        ``decode_buckets`` is the graph bucket ladder the worker captures.
+        It bounds the geometry span (the context-proportional statics cap),
+        so the worker hands it down here — nothing else sets it.
         """
         if gpu_manager is None:
             return 0.0
+        if decode_buckets is not None:
+            self.decode_graph_buckets = [int(b) for b in decode_buckets]
         return self._prewarm_triton_kernels(PHASE_GEOMETRY,
                                             gpu_manager=gpu_manager)
+
+    def arm_late_compile_guard(self):
+        """Arm the Triton and DeepGEMM late-compile guards for good.
+
+        The worker calls this as its rank reports ready; every kernel
+        compiled after it is reported as late.
+        """
+        if not torch.cuda.is_available():
+            return
+        from .triton_prewarm import arm_at_readiness
+
+        arm_at_readiness(self.global_rank)
 
     def _triton_prewarm_partition(self):
         """``(part_index, part_count, barrier)`` for one prewarm phase.

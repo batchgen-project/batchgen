@@ -720,15 +720,16 @@ def test_kimi_decode_graph_is_prewarmed_before_continuous_decode():
     """The first measured decode forward must not capture graphs lazily."""
     generate = _function(WORKER, "generate", "BatchGenWorker")
     calls = _calls(generate)
-    # The model's prewarm hook is resolved off the parallel manager (dense
-    # models without one skip it) and bound to a local before the call.
-    assert len(calls["prewarm_kimi_graphs"]) == 1
+    # The worker-owned prewarm seam resolves the model's hook off the
+    # parallel manager (dense models without one skip it inside the seam).
+    assert len(calls["_prewarm_decode_jit"]) == 1
     assert len(calls["decoding_continuous"]) == 1
-    assert calls["prewarm_kimi_graphs"][0] < calls["decoding_continuous"][0]
+    assert calls["_prewarm_decode_jit"][0] < calls["decoding_continuous"][0]
 
-    source = _body_source(generate)
+    seam = _function(WORKER, "_prewarm_decode_jit", "BatchGenWorker")
+    source = _body_source(seam)
     assert "prewarm_decode_graphs" in source
-    assert "prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())" in source
+    assert "self._get_cuda_graph_gpu_manager()" in source
 
 
 # --------------------------------------------------------------------------- #

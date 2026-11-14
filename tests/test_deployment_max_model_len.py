@@ -337,6 +337,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _glm5_whole_model_graph_requested_for_current_batch=lambda: capture,
         _sync_decode_moe_rank_counts=lambda *args, **kwargs: None,
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
+        _prewarm_decode_jit=lambda: events.append("jit_prewarm"),
         _warmup_cuda_graphs=captured_graphs,
         _decode_graph_captures=0, _cuda_graph_manager=None,
     )
@@ -354,7 +355,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
     worker._probe_startup_transient = probe
     build(worker)
     assert events == ["prefill", ("width_check", 8), "decode", "verify_pool", "probe"] + (
-        ["capture"] if capture else []) + ["prefill"]
+        ["jit_prewarm", "capture"] if capture else []) + ["prefill"]
     assert worker._decode_padding_bsz == 8
 
     def refuse():

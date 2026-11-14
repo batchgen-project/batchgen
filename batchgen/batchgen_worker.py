@@ -10935,18 +10935,13 @@ class BatchGenWorker:
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
 
-				# Kimi-K3's segmented attention + resident-MXFP4 MoE graphs
-				# must be captured after the real GPU KV manager/page table and
-				# synchronized decode row counts exist, but before the first
-				# measured decode forward.  The PSM keeps the model-specific
-				# capture logic; this hook only supplies the worker-owned KV
-				# manager.  Other models have no such method and retain their
-				# existing warmup path below.
-				prewarm_kimi_graphs = getattr(
-					self.parallel_manager, "prewarm_decode_graphs", None
-				)
-				if prewarm_kimi_graphs is not None:
-					prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())
+				# Model-owned decode prewarm/capture against the live GPU KV
+				# manager: Kimi-K3's segmented attention + resident-MXFP4 MoE
+				# graphs are captured here, and GLM-5's geometry-keyed JIT
+				# prewarm re-runs here only when the page-table geometry
+				# changed (a retained lifecycle already ran it before
+				# readiness, in _capture_startup_decode_graphs).
+				self._prewarm_decode_jit()
 
 				# The round's criticality probe request. A request that differs
 				# from the probe in the resident decode graph (none is a value)
@@ -12274,14 +12269,17 @@ class BatchGenWorker:
 		capture silently moves back to the first decode configure, after
 		readiness.
 
-		Prewarm seam: a decode JIT prewarm (Triton/DeepGEMM) belongs right
-		before ``_warmup_cuda_graphs`` below, where the KV pool is sized and
-		the decode instance is live.
+		The decode JIT prewarm runs first, right before
+		``_warmup_cuda_graphs``: the KV pool is sized and the decode instance
+		is live here, so the geometry-keyed kernels (Triton/DeepGEMM) compile
+		before readiness and the first decode configure's prewarm finds its
+		geometry already done.
 		"""
 		captures = getattr(self, "_decode_graph_captures", 0)
 		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
 		self._current_decode_max_rank_batch_size = 1
 		self._bind_decode_attention_metadata_for_graph_config([])
+		self._prewarm_decode_jit()
 		self._warmup_cuda_graphs()
 		if (
 			getattr(self, "_decode_graph_captures", 0) != captures + 1
@@ -12295,6 +12293,39 @@ class BatchGenWorker:
 				"are requested and the decode instance is kept, so they must "
 				"be captured before readiness"
 			)
+
+	def _prewarm_decode_jit(self) -> None:
+		"""Run the strategy manager's decode prewarm against the live KV manager.
+
+		The manager owns what "prewarm" means for its model (Kimi captures its
+		planner-chosen decode graphs; GLM-5 compiles the geometry-keyed JIT
+		kernels and dedupes on unchanged geometry). On a whole-model-graph
+		deployment the worker also hands down the bucket ladder it will
+		capture, so the prewarm's geometry span matches the graphs. A manager
+		without the hook has no decode prewarm.
+
+		A prewarm failure propagates: at startup it fails the launch, at a
+		decode configure it fails the batch, in both cases loudly.
+		"""
+		prewarm = getattr(self.parallel_manager, "prewarm_decode_graphs", None)
+		if prewarm is None:
+			return
+		buckets = (
+			self._decode_graph_bucket_sizes()
+			if self._whole_model_decode_graphs_requested()
+			else None
+		)
+		prewarm(self._get_cuda_graph_gpu_manager(), decode_buckets=buckets)
+
+	def arm_late_compile_guard_at_readiness(self) -> None:
+		"""Arm the strategy manager's late-compile guard as this worker's rank
+		reports ready: every kernel compile after this point is a defect the
+		guard reports. A manager without the hook (no prewarm registry yet)
+		is a no-op.
+		"""
+		arm = getattr(self.parallel_manager, "arm_late_compile_guard", None)
+		if arm is not None:
+			arm()
 
 	def _probe_startup_transient(
 		self, *, seam: str, capture: Optional[Callable[[], None]]

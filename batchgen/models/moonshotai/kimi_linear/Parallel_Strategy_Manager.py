@@ -1531,7 +1531,7 @@ class KimiLinearParallelStrategyManager:
             time.perf_counter() - t0)
         return True
 
-    def prewarm_decode_graphs(self, gpu_manager=None):
+    def prewarm_decode_graphs(self, gpu_manager=None, decode_buckets=None):
         """Capture the first K3 decode bucket before measured decode starts.
 
         GPU KV allocation is intentionally worker-owned and happens after this
@@ -1539,6 +1539,10 @@ class KimiLinearParallelStrategyManager:
         the initialized manager here so the graph's MLA capture can bind its
         stable page-table/K-cache addresses without duplicating KV lifecycle
         logic in the PSM.
+
+        ``decode_buckets`` is ignored: this manager's bucket ladder comes
+        from the planner (``Basic_Config.decode_graph_buckets``), and the
+        worker passes None here because no whole-model graph flag is in play.
         """
         if self._decode_graph is None:
             return False
