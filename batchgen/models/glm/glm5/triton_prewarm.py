@@ -1400,8 +1400,23 @@ def prewarm_glm5_prefill(config, *, max_rows: int, part_index=0,
                        "the sparse prefill kv_b dequant is not prewarmed",
                        LOG_TAG, rank)
     entries = prefill_entries(shapes, device, kv_b_dtype=kv_b_dtype)
+    # The grouped contiguous-MoE bound is in packed expert rows: tokens x
+    # topk plus one alignment segment per (worst-case all) routed experts,
+    # the same capacity formula the serving ring sizes with. Overestimating
+    # the expert count only adds a representative row total or two.
+    from batchgen_kernels.deepgemm_sm90_configs import CONTIGUOUS_BLOCK_M
+
+    from .moe_ragged import ragged_row_capacity
+
+    contiguous_max_rows = ragged_row_capacity(
+        int(max_rows),
+        int(getattr(config, "num_experts_per_tok", 1) or 1),
+        shapes.num_routed_experts,
+        row_align=CONTIGUOUS_BLOCK_M,
+    )
     entries += dg.prefill_entries(shapes, device, max_rows=max_rows,
-                                  num_sms=dg.deepgemm_num_sms())
+                                  num_sms=dg.deepgemm_num_sms(),
+                                  contiguous_max_rows=contiguous_max_rows)
     _run_phase(PHASE_PREFILL, entries, part_index=part_index,
                part_count=part_count, barrier=barrier, rank=rank,
                arm_after=False)

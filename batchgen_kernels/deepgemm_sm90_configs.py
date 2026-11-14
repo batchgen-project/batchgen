@@ -62,6 +62,17 @@ _BLOCK_N_CANDIDATES = tuple(range(16, 193, 16))
 _CLUSTERS = ((1, 1), (1, 2), (2, 1))
 _NEVER = np.iinfo(np.int64).max
 
+# ``get_mk_alignment_for_contiguous_layout()``: the m-grouped CONTIGUOUS
+# kernel's only block-M candidate, and the row alignment of every group
+# segment its layout accepts.
+CONTIGUOUS_BLOCK_M = 128
+
+# Block-M candidate selection modes, as ``get_layout_candidates`` branches
+# on the GemmType.
+_MODE_NORMAL = "normal"
+_MODE_MASKED = "masked"
+_MODE_CONTIGUOUS = "contiguous"
+
 
 def installed_version() -> Optional[str]:
     """The installed DeepGEMM distribution's version, or None."""
@@ -127,9 +138,11 @@ def _num_stages(block_m: int, block_n: int, k: int) -> int:
     return min((SMEM_CAPACITY - extra) // per_stage, MAX_STAGES)
 
 
-def _block_ms(m: int, masked: bool) -> List[int]:
-    if masked:
+def _block_ms(m: int, mode: str) -> List[int]:
+    if mode == _MODE_MASKED:
         return [64, 128]
+    if mode == _MODE_CONTIGUOUS:
+        return [CONTIGUOUS_BLOCK_M]
     block_ms = [64, 128]
     if m <= 16:
         block_ms.append(16)
@@ -144,11 +157,19 @@ def _candidates(m: int, n: int, k: int, masked: bool,
     """``(block_m, block_n, cluster_m, cluster_n)`` in DeepGEMM's order."""
     # The list depends on m only through the 16- and 32-row thresholds.
     m_class = 0 if masked else (16 if m <= 16 else 32 if m <= 32 else 48)
-    return _candidates_cached(m_class, n, k, masked, num_sms)
+    mode = _MODE_MASKED if masked else _MODE_NORMAL
+    return _candidates_cached(m_class, n, k, mode, num_sms)
+
+
+def _contiguous_candidates(n: int, k: int,
+                           num_sms: int) -> Tuple[Tuple[int, int, int, int], ...]:
+    """Candidates of the m-grouped contiguous kernel: block M pinned to the
+    layout alignment; the masked multicast-legality cut does not apply."""
+    return _candidates_cached(0, n, k, _MODE_CONTIGUOUS, num_sms)
 
 
 @lru_cache(maxsize=None)
-def _candidates_cached(m: int, n: int, k: int, masked: bool,
+def _candidates_cached(m: int, n: int, k: int, mode: str,
                        num_sms: int) -> Tuple[Tuple[int, int, int, int], ...]:
     if num_sms % 2:
         raise ValueError(f"DeepGEMM requires an even SM count, got {num_sms}")
@@ -156,7 +177,7 @@ def _candidates_cached(m: int, n: int, k: int, masked: bool,
     for cluster_m, cluster_n in _CLUSTERS:
         if num_sms % (cluster_m * cluster_n):
             continue
-        for block_m in _block_ms(m, masked):
+        for block_m in _block_ms(m, mode):
             for block_n in _BLOCK_N_CANDIDATES:
                 # 1D2D unroll requirement.
                 if block_n > BLOCK_K and (
@@ -164,7 +185,8 @@ def _candidates_cached(m: int, n: int, k: int, masked: bool,
                         and BLOCK_K % (block_n - BLOCK_K) != 0):
                     continue
                 # Multicast legality of the masked layout.
-                if masked and _ceil_div(n, block_n) % (cluster_m * cluster_n):
+                if mode == _MODE_MASKED and _ceil_div(n, block_n) % (
+                        cluster_m * cluster_n):
                     continue
                 if block_m > 128 and block_n > 128:
                     continue
@@ -323,3 +345,42 @@ def keys_for_normal_ms(n: int, k: int, ms: Sequence[int],
                        num_sms: int = DEFAULT_NUM_SMS) -> set:
     """The Normal kernel keys a set of row counts selects."""
     return {best_config(m, n, k, num_sms=num_sms).kernel_key() for m in ms}
+
+
+def contiguous_configs(n: int, k: int, m_max: int,
+                       num_sms: int = DEFAULT_NUM_SMS
+                       ) -> Dict[int, Sm90Fp8Config]:
+    """``q -> config`` of the m-grouped CONTIGUOUS kernel
+    (``m_grouped_fp8_gemm_nt_contiguous``) for ``q = 1 .. ceil(m_max / 128)``,
+    where ``q = ceil(m / 128)`` stands for every packed row total ``m`` in
+    ``(128q - 128, 128q]``.
+
+    The host wrapper (``sm90_m_grouped_fp8_gemm_contiguous_1d2d``) models the
+    packed total as the expected M and the group count as 1 (the groups are
+    already packed into ``m``), and block M's only candidate is the
+    contiguous-layout alignment — so the config depends on the call only
+    through ``ceil(m / 128)``, like the Normal kernel's ``ceil(m / 16)``.
+    """
+    n, k, m_max = int(n), int(k), int(m_max)
+    if m_max < 1:
+        raise ValueError(f"m_max must be positive, got {m_max}")
+    q_max = _ceil_div(m_max, CONTIGUOUS_BLOCK_M)
+    candidates = _contiguous_candidates(n, k, num_sms)
+    qs = np.arange(1, q_max + 1, dtype=np.int64)
+    winners = _select(CONTIGUOUS_BLOCK_M * qs, candidates, n, k, 1, num_sms)
+    layouts = {index: _config(candidates[index], k)
+               for index in np.unique(winners).tolist()}
+    return {int(q): layouts[index]
+            for q, index in zip(qs.tolist(), winners.tolist())}
+
+
+def contiguous_representative_ms(n: int, k: int, m_max: int,
+                                 num_sms: int = DEFAULT_NUM_SMS) -> List[int]:
+    """The smallest 128-aligned ``m`` in ``[1, m_max]`` of each distinct
+    contiguous kernel key: one call per returned ``m`` compiles every key the
+    range selects. The witnesses are 128-aligned because serving row totals
+    are (the grouped layout builder refuses any other segment alignment)."""
+    chosen: Dict[tuple, int] = {}
+    for q, config in sorted(contiguous_configs(n, k, m_max, num_sms).items()):
+        chosen.setdefault(config.kernel_key(), CONTIGUOUS_BLOCK_M * q)
+    return sorted(chosen.values())
