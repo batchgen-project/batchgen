@@ -11,14 +11,15 @@ Generates engine configuration for MiniMax-M2.5 inference.
 import logging
 
 from batchgen.config.config import EngineConfig
+from batchgen.config.decode_strategy import apply_normalized_attn_mode
 
 
 class MiniMaxM25Planner:
     def __init__(self):
         pass
 
-    def generate_config(self, engine_config: EngineConfig) -> EngineConfig:
-        """Generate engine configuration for M2.5."""
+    def generate_config(self, engine_config: EngineConfig, model_type: str | None) -> EngineConfig:
+        apply_normalized_attn_mode(engine_config.Basic_Config, model_type)
         # Module batching config
         padding_length = engine_config.Basic_Config.padding_length
         max_decoding_length = engine_config.Basic_Config.max_decoding_length

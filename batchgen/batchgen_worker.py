@@ -216,6 +216,7 @@ from batchgen.query_book import (
 	make_query_book_entry,
 	release_query_book_slot,
 )
+from batchgen.config.decode_strategy import DecodeStrategy, strategy_for
 from batchgen.worker.graph_runtime import GraphRuntime
 from batchgen.worker.trajectory_store import TrajectoryStore
 from batchgen.worker.prefix_reuse_state import PrefixReuseState
@@ -4538,7 +4539,6 @@ class BatchGenWorker:
 		self.host_kv_cache_size = self.args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = self.args.global_host_kv_cache_size_gb
 
-		self.attn_mode = None
 		self.query_book = None
 		self.model_batch_book = {}
 		self.token_k_cache_byte_size = 2048
@@ -19468,16 +19468,9 @@ class BatchGenWorker:
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
-		from batchgen.models.glm.glm5.cuda_graph_policy import (
-			glm5_effective_decode_attn_mode,
-		)
-
-		RUNTIME_ATTN_MODE = glm5_effective_decode_attn_mode(
-			getattr(self.model_config, "model_type", None),
-			self.engine_config.Basic_Config.attn_mode,
-		)
-		if RUNTIME_ATTN_MODE != 3:
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
+		strategy = strategy_for(self.engine_config.Basic_Config.attn_mode)
+		if strategy is not DecodeStrategy.DECOUPLED_GPU:
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1, strategy)
 			return decode_uuids, batch
 		
 		# Setup
@@ -21161,7 +21154,8 @@ class BatchGenWorker:
 		new_tokens: torch.Tensor,
 		decode_uuids: List[str],
 		batch: List[int],
-		start_token_idx: int
+		start_token_idx: int,
+		strategy: DecodeStrategy,
 	) -> None:
 		"""Legacy decoding for modes 0, 1, 2 with continuous batching support."""
 		new_token_idx = start_token_idx
@@ -21207,9 +21201,8 @@ class BatchGenWorker:
 				if not decode_uuids:
 					break
 			
-			RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
 
-			if RUNTIME_ATTN_MODE == 0:
+			if strategy is DecodeStrategy.CPU_ATTN:
 				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
 				with torch.inference_mode():
 					Attn_Wrapper.cur_batch = [batch]
@@ -21279,7 +21272,7 @@ class BatchGenWorker:
 
 				new_token_idx += 1
 
-			elif RUNTIME_ATTN_MODE == 1:
+			elif strategy is DecodeStrategy.LEGACY_MICROBATCH_GPU:
 				"""GPU ATTN MODE - ATTN MICRO BATCH"""
 				micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 				num_micro_batches = math.ceil(len(batch) / micro_batch_size)
@@ -21380,7 +21373,7 @@ class BatchGenWorker:
 
 				new_token_idx += 1
 
-			elif RUNTIME_ATTN_MODE == 2:
+			elif strategy is DecodeStrategy.HYBRID_CPU_GPU:
 				"""CPU-GPU Parallel ATTN - Deprecated"""
 				logging.warning("RUNTIME_ATTN_MODE 2 is deprecated")
 				new_token_idx += 1

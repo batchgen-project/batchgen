@@ -62,7 +62,7 @@ def _plan(
         device_facts=FACTS[family] if facts is None and family else facts,
         decode_graph_capturable=capturable,
     )
-    return planner.generate_config(config)
+    return planner.generate_config(config, "kimi_k3")
 
 
 def test_h20_plan_funds_128_slots_latent_only_with_graphs():

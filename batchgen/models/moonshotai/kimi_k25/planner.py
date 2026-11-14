@@ -49,10 +49,6 @@ class KimiK25Planner(BasePlanner):
         # With 384 experts / 8 ranks = 48 experts per rank.
         expert_per_rank = self.NUM_EXPERTS // self.world_size
 
-        # K2.5 requires attn_mode=3 for the modern decoding path (decoding_continuous),
-        # regardless of offloading. Override base planner's attn_mode=1 default.
-        self.config.Basic_Config.attn_mode = 3
-
         # K2.5 context window: max_position_embeddings=262144 (YaRN: 4096 * factor=64)
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
 
