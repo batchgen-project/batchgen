@@ -24,11 +24,17 @@ import ast
 from pathlib import Path
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
 SOURCE = WORKER.read_text()
 TREE = ast.parse(SOURCE)
 
 
 def _method(name):
+    if name == "decoding_continuous":
+        # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+        tree = ast.parse(ENGINE.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DecoupledGpuDecode")
+        return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
     return next(n for n in ast.walk(TREE)
                 if isinstance(n, ast.FunctionDef) and n.name == name)
 
@@ -66,7 +72,8 @@ def test_host_kv_append_capacity_uses_the_maintained_gid_index():
 def test_decode_step_resolves_host_kv_metadata_from_batch_sequences():
     # batch_sequences is resolved once per step for the forward; re-resolving
     # the same rows for the host-KV append metadata was pure duplication.
-    fn = _method("decoding_continuous")
+    # S4b: the KV metadata producer moved to the worker binder method.
+    fn = _method("_install_decode_kv_append_callbacks")
     assert len(_assign_to(fn, "_kv_seq_ids")) == 1
     loop = next(
         n for n in ast.walk(fn)

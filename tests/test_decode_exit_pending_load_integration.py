@@ -36,6 +36,7 @@ from typing import List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+ENGINE = ROOT / "batchgen" / "worker" / "decode_engine.py"
 
 
 def _isolated_worker_method(function_name, globals_=None):
@@ -130,16 +131,17 @@ def test_integrate_pending_async_load_none_task_still_barriers_and_finalizes():
 
 def _watermark_branch_bodies():
     """Every ``if watermark_triggered:`` body inside decoding_continuous."""
-    tree = ast.parse(WORKER.read_text())
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    tree = ast.parse(ENGINE.read_text())
     worker = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
     )
     loop = next(
         node
         for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == "decoding_continuous"
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
     )
     bodies = []
     for node in ast.walk(loop):

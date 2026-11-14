@@ -46,6 +46,8 @@ from tests.worker.worker_fakes import make_graph_state
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 WORKER_TREE = ast.parse(WORKER.read_text())
+ENGINE = ROOT / "batchgen" / "worker" / "decode_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
 
 _RAW = {
     "sites": ["after_router"],
@@ -61,6 +63,13 @@ def _worker_class():
 
 
 def _method_ast(name):
+    if name == "decoding_continuous":
+        # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+        cls = next(
+            node for node in ENGINE_TREE.body
+            if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
+        )
+        return next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "run")
     return next(
         node for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name == name
