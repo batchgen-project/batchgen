@@ -953,7 +953,7 @@ def test_resident_placement_is_identical_under_shuffled_orders(stub_modules):
         placed = {uuid: seq.decode_dp_group for uuid, seq in seqs.items()}
         assert expected is None or placed == expected
         expected = placed
-        index = worker._trajectory_session_groups
+        index = worker._traj.trajectory_session_groups
         ideal_offgroup = (96 * 4 - len(G0_TOKENS)) / (2 * 4)
         assert abs(index.placed_offgroup - ideal_offgroup) <= 1
         assert index.honored_on_owner + index.placed_offgroup == 96
@@ -972,7 +972,7 @@ def test_evicted_reentry_hard_pin_survives_residency_and_load(stub_modules):
     assert evicted.decode_dp_group == 0
     assert evicted.evicted_from_dp_group is None
     assert {seqs[uuid].decode_dp_group for uuid in tokens} == {1}
-    assert worker._trajectory_session_groups.placed_offgroup == len(tokens)
+    assert worker._traj.trajectory_session_groups.placed_offgroup == len(tokens)
 
 
 def test_no_residency_and_no_packing_keeps_existing_path(stub_modules):
@@ -1009,10 +1009,10 @@ def test_offgroup_continuations_miss_and_pool_full_prefix_once(stub_modules, cap
     lookup = _worker_methods(["_lookup_trajectory_frontiers"])["_lookup_trajectory_frontiers"]
     worker._get_trajectory_restorer = lambda: local_restorer
     worker._owns_host_kv = lambda seq: seq.decode_dp_group == 1
-    worker._trajectory_attachments = {}
+    worker._traj.trajectory_attachments = {}
     with caplog.at_level(logging.INFO):
         lookup(worker, offgroup)
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
     assert local_restorer.counters()["trajectory_hits"] == 0
     assert local_restorer.counters()["trajectory_lookups"] == len(offgroup)
 
