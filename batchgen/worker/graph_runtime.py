@@ -37,14 +37,10 @@ import logging
 class GraphRuntime:
     """The worker's decode-graph state machine, as owned state.
 
-    Two asymmetries of today's lifecycle are reproduced here exactly and
-    are PINNED, NOT ENDORSED -- fixing either would change behavior and
-    belongs in its own slice:
+    One asymmetry of today's lifecycle is reproduced here exactly and is
+    PINNED, NOT ENDORSED -- fixing it would change behavior and belongs in
+    its own slice:
 
-    * ``k25_whole_model_graph`` and ``whole_model_segment_name`` are written
-      only by the K2.5 capture and are reset by NEITHER the release helper nor
-      the worker's deep free. A deep free followed by a capture of a different
-      mode reads a stale True / stale name.
     * the GLM-5 capture-OOM handler nulls the whole manager but adds only the
       failing bucket to ``glm5_whole_model_graph_failed_buckets``, so the
       buckets already captured in that episode are dropped with the manager
