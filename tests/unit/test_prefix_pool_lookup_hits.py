@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+from tests.worker.worker_fakes import attach_prefix_state
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
@@ -39,8 +40,8 @@ def test_hits_are_released_and_prompts_start_at_their_chain_end():
     released = []
     worker = SimpleNamespace(
         prefix_cache_coordinator=SimpleNamespace(release_attachment=released.append),
-        _prefix_sequence_states={},
     )
+    attach_prefix_state(worker)
     seqs = [SimpleNamespace(global_idx=3), SimpleNamespace(global_idx=5)]
     states = {
         3: PrefixCacheSequenceState(
@@ -57,7 +58,8 @@ def test_hits_are_released_and_prompts_start_at_their_chain_end():
     assert states[3].lookup_result is None
     assert states[3].compute_cached_tokens == 0 and states[3].shared_page_ids == ()
     assert states[5].attached_tokens == 64 and states[5].compute_cached_tokens == 64
-    assert worker._prefix_sequence_states == states
+    # migrated: worker._prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states == states
 
 
 def test_declined_waves_keep_their_hits_and_pooled_waves_release_them():

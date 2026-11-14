@@ -31,7 +31,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.worker.worker_fakes import attach_identity
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -248,16 +252,25 @@ def _worker(
         host_paged_kv_worker_view=object(),
         global_batch=SimpleNamespace(get_sequence=sequences.get),
         prefix_cache_coordinator=RecordingCoordinator(),
-        _prefix_sequence_states=dict(states or {}),
         _prefill_pool_base=(0, 0, 0),
         _prefill_pool_page_budget=free_pages,
         _batchgen_debug=None,
         _any_sequence_batchgen_debug=True,
-        _trajectory_attachments=dict(attachments or {}),
-        _trajectory_session_groups=index,
-        _trajectory_restorer=_RecordingRestorer() if restorer is None else restorer,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=max(1, attn_tp_size), local_world_size=8,
+        local_rank=0, decode_group_size=max(1, attn_tp_size),
+        bound=UUIDS,
+    )
+    attach_prefix_state(worker, prefix_sequence_states=dict(states or {}))
+    attach_trajectory_state(
+        worker,
+        trajectory_attachments=dict(attachments or {}),
+        trajectory_session_groups=index,
+        trajectory_restorer=_RecordingRestorer() if restorer is None else restorer,
         # The leader's handle->arena table, read by the mirrored payload.
-        _trajectory_frontier_committer=SimpleNamespace(
+        trajectory_frontier_committer=SimpleNamespace(
             arena_for=lambda handle: SimpleNamespace(
                 shard_count=attn_tp_size,
                 pseudo_sid=-3,
@@ -266,13 +279,7 @@ def _worker(
                 page_ids_by_group={0: (41,)},
             ),
         ),
-        _trajectory_mirrored_restores={},
-        _local_to_uuid_map=dict(enumerate(UUIDS)),
-    )
-    attach_identity(
-        worker,
-        rank=rank, world_size=max(1, attn_tp_size), local_world_size=8,
-        local_rank=0, decode_group_size=max(1, attn_tp_size),
+        trajectory_mirrored_restores={},
     )
     # ``_owns_host_kv`` is the group-leader predicate; a follower answers no.
     worker._owns_host_kv = lambda seq: bool(owns_host_kv)
@@ -296,7 +303,7 @@ def _plan(worker, states=None):
     """Plan with the prefix states the admission lookup produced."""
 
     return worker._plan_prefill_pool_wave(
-        UUIDS, dict(worker._prefix_sequence_states if states is None else states)
+        UUIDS, dict(worker._prefix.prefix_sequence_states if states is None else states)
     )
 
 
@@ -586,7 +593,7 @@ def _materialized_wave(monkeypatch, **kwargs):
         states=_hit_states(),
         **kwargs,
     )
-    states = dict(worker._prefix_sequence_states)
+    states = dict(worker._prefix.prefix_sequence_states)
     wave = worker._plan_prefill_pool_wave(UUIDS, states)
     return worker, seqs, wave, states
 
@@ -609,7 +616,7 @@ def test_the_hits_prefix_state_starts_at_the_frontier_boundary(monkeypatch):
     """The identity the KDA restore refuses to run without."""
 
     worker, _, wave, states = _materialized_wave(monkeypatch)
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.compute_cached_tokens == BOUNDARY
     assert state.attached_tokens == BOUNDARY
     assert states[GLOBAL_IDS[0]].compute_cached_tokens == BOUNDARY
@@ -627,7 +634,7 @@ def test_the_attachment_holding_the_frontier_resident_is_kept_for_the_wave(monke
     assert worker.prefix_cache_coordinator.released == [], (
         "releasing it would let the pages the load reads be evicted mid-wave"
     )
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     # Carried where the one release lane every sequence leaves through
     # frees it exactly once.
     assert state.commit_attachment_handles == (77,)
@@ -645,7 +652,8 @@ def test_a_non_hit_still_releases_its_lookup(monkeypatch):
     )
     worker._plan_prefill_pool_wave(UUIDS, dict(states))
     assert worker.prefix_cache_coordinator.released == [88]
-    assert worker._prefix_sequence_states[GLOBAL_IDS[1]].commit_attachment_handles == ()
+    # migrated: worker._prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states[GLOBAL_IDS[1]].commit_attachment_handles == ()
 
 
 def test_a_loaded_segment_asks_for_no_recurrent_state_slot(monkeypatch):
@@ -662,7 +670,7 @@ def test_a_loaded_segment_asks_for_no_recurrent_state_slot(monkeypatch):
     )
     # Three prompts, one loaded segment and one computed one: four slots.
     wave = worker._plan_prefill_pool_wave(
-        UUIDS, dict(worker._prefix_sequence_states)
+        UUIDS, dict(worker._prefix.prefix_sequence_states)
     )
     assert wave is not None and wave.materialized == frozenset({0})
 
@@ -680,7 +688,7 @@ def test_a_dropped_hit_releases_its_attachment_exactly_once(monkeypatch):
     wave = _plan(worker)
     assert wave is not None and wave.materialized == frozenset()
     assert worker.prefix_cache_coordinator.released == [77]
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.commit_attachment_handles == (), "released, not also retained"
     # The sequence recomputes from token 0 and carries no restore: its
     # trajectory attachment was declined when the wave was planned, so it
@@ -731,7 +739,7 @@ def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplo
     )
     with caplog.at_level("WARNING"):
         wave = worker._plan_prefill_pool_wave(
-            UUIDS, dict(worker._prefix_sequence_states)
+            UUIDS, dict(worker._prefix.prefix_sequence_states)
         )
     assert "declined by the planner" in caplog.text
     assert "pool_materialization_does_not_fit" in caplog.text
