@@ -486,12 +486,8 @@ def test_tp_loading_cap_counts_decode_groups():
 
 def test_worker_passes_decode_padding_cap_to_boundary_request():
     """Wiring guard: the worker is not unit-instantiable, so check the source."""
-    import ast
-    from pathlib import Path
-
-    worker = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
-    fn = next(n for n in ast.walk(ast.parse(worker.read_text()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_make_boundary_decision_request")
+    # S10c: the request builder runs in KVCapacityEngine (worker shape).
+    fn = worker_shaped_method_node("_make_boundary_decision_request")
     assert 'max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0' in ast.unparse(fn).replace("'", '"')
 
 
