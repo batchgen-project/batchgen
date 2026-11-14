@@ -184,13 +184,13 @@ def attach_prefix_state(fake, **overrides):
 
 
 def attach_prefill_state(fake):
-    """Attach the stateless S5a engine seam to a worker fake.
+    """Attach the stateless prefill engine seam to a worker fake.
 
-    The import is function-local on purpose: ``prefill_engine`` imports the
-    real CUDA-backed KV coordinator (exactly as ``batchgen_worker`` does), and
-    lightweight exec-lift pin tests import this fakes module without that
-    dependency being loadable. Only tests that actually attach the engine pull
-    the chain.
+    ``prefill_engine`` imports no native KV-cache module: the
+    ``DualHostKVCoordinator`` isinstance (S5 carve-out #5) and the temporary
+    ``GPUPagedKVCacheManager`` construction (carve-out #6) stay on the worker,
+    so the engine module is CPU-importable. The import stays function-local so
+    only tests that actually attach the engine load it.
     """
     from batchgen.worker.prefill_engine import PrefillEngine
 

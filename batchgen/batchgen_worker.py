@@ -463,28 +463,6 @@ ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
-# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
-# Spelled out here, instead of imported from the four probe modules, so that
-# deciding "is any probe armed on this prefill" is a membership test on a dict
-# the worker already holds: a production prefill must not import a probe module
-# or build a merged debug dict to be told that nothing is armed.
-# ``tests/unit/test_pool_probe_debug_seam.py`` pins these against the modules'
-# own constants, so the duplication cannot drift.
-_EPILOGUE_TRACE_DEBUG_FLAG = "prefix_pool_epilogue_trace"
-_EPILOGUE_TRACE_PROBE_TOKEN_FLAG = "prefix_pool_epilogue_probe_token"
-_POOL_OFFLOAD_CHECK_DEBUG_FLAG = "prefix_pool_offload_check"
-_POOL_KERNEL_DUMP_DEBUG_FLAG = "prefix_pool_dump_kernel_args"
-_POOL_KERNEL_DUMP_DIR_FLAG = "prefix_pool_dump_dir"
-_POOL_PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
-_POOL_PROBE_DEBUG_KEYS = (
-	_EPILOGUE_TRACE_DEBUG_FLAG,
-	_EPILOGUE_TRACE_PROBE_TOKEN_FLAG,
-	_POOL_OFFLOAD_CHECK_DEBUG_FLAG,
-	_POOL_KERNEL_DUMP_DEBUG_FLAG,
-	_POOL_KERNEL_DUMP_DIR_FLAG,
-	_POOL_PAD_POISON_DEBUG_FLAG,
-)
-
 
 def _normalize_aux_kv_entry(entry) -> tuple:
 	"""(layer_idx, k_tensor, v_tensor, scale_tensor) of a deferred aux append.
@@ -13878,6 +13856,7 @@ class BatchGenWorker:
 	def prefill(self, batch: list[int]):
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_prefill_engine", None)
+		# PrefillEngine is stateless; this lazy path (shared by every delegator) only serves test fakes built without __init__ -- deliberate, not a special-case branch.
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()

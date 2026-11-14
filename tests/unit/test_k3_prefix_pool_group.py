@@ -140,22 +140,23 @@ def _worker_methods(names, globals_=None):
 
 
 def _worker_probe_debug_keys():
-    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+    """``_POOL_PROBE_DEBUG_KEYS`` as prefill_engine.py declares it.
 
-    The keys are module-level literals in the worker so that a prefill which
-    armed no probe never imports a probe module to find that out; the compiled
-    seam methods close over them, so the harness has to supply them.
+    The keys are module-level literals in the engine module (their only
+    reader) so that a prefill which armed no probe never imports a probe
+    module to find that out; the compiled seam methods close over them, so the
+    harness has to supply them.
     """
     literals = {
         node.targets[0].id: node.value.value
-        for node in WORKER_TREE.body
+        for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign) and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
     }
     assign = next(
-        node for node in WORKER_TREE.body
+        node for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
