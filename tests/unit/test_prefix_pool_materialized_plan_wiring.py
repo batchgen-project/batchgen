@@ -78,6 +78,7 @@ METHODS = (
     "_owns_host_kv",
     "_check_pool_plan_identical",
     "_prefill_pool_layout",
+    "_prefill_host_view_is_dual",
     "_prefill_pool_psm_layout",
     "_prefill_pool_page_dims",
     "_prefill_pool_group",
