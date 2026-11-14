@@ -33,6 +33,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 HOST_KV_CONFIG = ROOT / "batchgen" / "kv_cache" / "host_kv_mananger_config.py"
@@ -335,6 +337,9 @@ ENGINE_TREE = ast.parse(ENGINE.read_text(), filename=str(ENGINE))
 
 
 def _worker_method_node(name):
+    # S10a: the GPU-KV manager init runs in KVCapacityEngine (worker delegates).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     tree = ENGINE_TREE if name in {
         "_prefill_pool_layout", "_prefill_pool_psm_layout"
     } else WORKER_TREE

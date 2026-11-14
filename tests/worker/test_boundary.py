@@ -14,6 +14,7 @@ phases: completion split, GPU extension/on-hold, loading, scheduler error.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from batchgen.worker.boundary import (
     BoundarySeqMeta,
 )
 from batchgen.worker.decode import reduce_decode_capacity_snapshot
+from tests.worker_method_source import worker_shaped_method_node
 
 _GPN = 8
 
@@ -697,7 +699,7 @@ def test_growth_phase_reclaims_before_the_fresh_preflight():
     allocate = growth.index("worker_view.grow_pages_for_sequences(")
     assert reclaim < preflight < allocate
     # The planner's stats come from the gather that reports reclaimable pages.
-    gather = source[source.index("def _gather_host_kv_stats_by_node"):]
-    gather = gather[: gather.index("\n\tdef ", 1)]
+    # S10a: the gather runs in KVCapacityEngine; located by AST, not by text.
+    gather = ast.unparse(worker_shaped_method_node("_gather_host_kv_stats_by_node"))
     assert "count_releasable_pages(0)" in gather
     assert "'num_reclaimable_pages'" in gather

@@ -33,6 +33,7 @@ import pytest
 from batchgen.worker.kv_manager import GPU_KV_POOL_HEADROOM_GB, KVCacheManager
 from batchgen.worker.kv_plan import provisional_pool_gb
 from tests.worker.worker_fakes import make_graph_state
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 GIB = 1024 ** 3
 
@@ -182,6 +183,9 @@ def _worker_class():
 
 @functools.lru_cache(maxsize=8)
 def _method(name):
+    # S10a: the pool sizing runs in KVCapacityEngine (worker delegates).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(
         node
         for node in _worker_class().body

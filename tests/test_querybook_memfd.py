@@ -24,6 +24,8 @@ from uuid import uuid4
 import pytest
 import torch
 
+from tests.worker_method_source import worker_shaped_method_node
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -147,7 +149,8 @@ def test_allocator_creates_no_name_and_unlinks_nothing():
 
 
 def test_identity_exchange_is_exactly_one_collective():
-    exchange = _method(WORKER, "BatchGenWorker", "_exchange_node_memfd_identity")
+    # S10a: the exchange runs in KVCapacityEngine (worker delegates).
+    exchange = worker_shaped_method_node("_exchange_node_memfd_identity")
 
     assert _calls_to(exchange, "dist") == ["all_gather"]
 
