@@ -24,6 +24,7 @@ from batchgen.continuous_batching import (
     host_kv_owner_reports,
     validate_boundary_payload_alignment,
 )
+from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
 from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
 
 PAGE_TOKENS = 64
@@ -104,14 +105,17 @@ _METHODS = load_worker_methods(
 
 def _worker(rank, *, world_size, attn_tp_size, seqs, held):
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
-        _uuid_to_local_map={uuid: index for index, uuid in enumerate(held)},
-        _trajectory_book=None,
         _sync_trajectory_metadata=lambda seq, state: None,
     )
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=world_size,
+        decode_group_size=attn_tp_size,
+        bound={uuid: index for index, uuid in enumerate(held)},
+    )
+    attach_trajectory_state(worker, trajectory_book=None)
     for name, function in _METHODS.items():
         setattr(worker, name, types.MethodType(function, worker))
     return worker
