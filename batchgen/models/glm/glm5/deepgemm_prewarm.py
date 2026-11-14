@@ -159,6 +159,30 @@ class DenseSite:
 
 
 @dataclass(frozen=True)
+class ContiguousSite:
+    """One ``m_grouped_fp8_gemm_nt_contiguous`` call shape (N and K are
+    compiled in; the group count is packed into the row dimension)."""
+
+    name: str
+    n: int
+    k: int
+
+
+def contiguous_sites(shapes) -> List["ContiguousSite"]:
+    """The grouped prefill S1/S3 GEMMs of the DEFAULT contiguous-MoE backend
+    (``Glm5MoE._forward_prefill_grouped_impl`` via
+    ``grouped_fp8_deepgemm_gemm``): gate and up share one [N, K], down is the
+    transpose. Reached whenever a streamed-prefill window runs the grouped
+    experts with ``prefill_grouped_gemm`` unset or ``deepgemm``."""
+    return [
+        ContiguousSite("contiguous:moe_gate_up",
+                       shapes.expert_intermediate_size, shapes.hidden_size),
+        ContiguousSite("contiguous:moe_down",
+                       shapes.hidden_size, shapes.expert_intermediate_size),
+    ]
+
+
+@dataclass(frozen=True)
 class MaskedSite:
     """One ``fp8_m_grouped_gemm_nt_masked`` call shape."""
 
@@ -299,10 +323,14 @@ INVENTORY_CALLEES = (
     "w8a8_deepgemm", "w8a16_gemm", "_gemm", "gemm",
     "_fp8_linear_from_quantized", "indexer_wk_proj_deepgemm_out",
     "run_deepgemm_masked_moe", "masked_gemm", "deep_gemm_paged_mqa_logits",
-    "paged_mqa_logits_schedule_meta",
+    "paged_mqa_logits_schedule_meta", "grouped_fp8_deepgemm_gemm",
 )
-# ``deep_gemm`` attributes that launch no JIT kernel.
-INVENTORY_NON_KERNELS = ("get_num_sms", "set_pdl", "get_pdl")
+# ``deep_gemm`` attributes that launch no JIT kernel. A ``getattr(deep_gemm,
+# "<name>")`` resolution counts as a call site of ``deep_gemm.<name>`` (the
+# scanner reads it like a direct attribute call: the resolved symbol IS the
+# kernel launcher, wherever the call itself happens).
+INVENTORY_NON_KERNELS = ("get_num_sms", "set_pdl", "get_pdl",
+                         "get_m_alignment_for_contiguous_layout")
 
 _FA3 = "batchgen/attention/mla/fa3_backend.py"
 _FLASHMLA = "batchgen/attention/mla/flashmla_backend.py"
@@ -363,8 +391,18 @@ CALL_SITES: Dict[Tuple[str, str, str], Tuple[int, Any]] = {
     # MoE.
     (_GLM5 + "moe_cuda_graph_segments.py", "Glm5MoEGraphSegment._forward_deepep",
      "run_deepgemm_masked_moe"): (1, ("masked:moe_gate_up", "masked:moe_down")),
+    # Grouped contiguous prefill MoE (the DEFAULT S1/S3 backend since the
+    # m-grouped contiguous adoption): the wrapper resolves the kernel with
+    # getattr, which the scanner reads as this deep_gemm call site.
+    ("batchgen/moe/grouped_fp8_deepgemm_moe.py", "_get_deepgemm",
+     "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): (1, "wrapper"),
+    (_GLM5 + "model.py", "Glm5MoE._forward_prefill_grouped_impl",
+     "grouped_fp8_deepgemm_gemm"): (3, ("contiguous:moe_gate_up",
+                                        "contiguous:moe_down")),
     (_GLM5 + "moe_deepgemm_masked.py", "run_deepgemm_masked_moe",
      "masked_gemm"): (2, "wrapper"),
+    (_GLM5 + "moe_deepgemm_masked.py", "masked_gemm_fn",
+     "deep_gemm.fp8_m_grouped_gemm_nt_masked"): (1, "wrapper"),
     (_GLM5 + "wrappers.py", "GLM5ExpertWrapper._forward_unfused", "w8a16_gemm"):
         (3, _UNFUSED_EXPERT),
     (_GLM5 + "wrappers.py", "GLM5ExpertWrapper._forward_fused_gate_up",
@@ -425,6 +463,7 @@ def table_site_names() -> set:
              for site in dense_sites(shapes, phase)}
     names.update("masked:" + site.name for site in masked_dense_sites(shapes))
     names.update("masked:" + site.name for site in masked_moe_sites(shapes, 1))
+    names.update(site.name for site in contiguous_sites(shapes))
     names.update(("mqa_logits", "paged_mqa"))
     return names
 
@@ -541,6 +580,29 @@ def _run_masked_moe(weight, weight_scale, expected_m: int, device,
     fn((x, x_scale), (weight, weight_scale), out, masked_m, int(expected_m))
 
 
+def _run_contiguous(site: ContiguousSite, rows: int, device,
+                    fn: Optional[Callable] = None) -> None:
+    """One contiguous-kernel call of ``site`` at ``rows`` packed rows (always
+    128-aligned, as serving row totals are), through the serving wrapper:
+    one group, every row mapped to it, a fresh dense ``[1, N, K]`` B stack."""
+    if fn is None:
+        from batchgen.moe.grouped_fp8_deepgemm_moe import (
+            grouped_fp8_deepgemm_gemm,
+        )
+
+        fn = grouped_fp8_deepgemm_gemm
+    rows = int(rows)
+    x_fp8 = torch.zeros((rows, site.k), dtype=torch.float8_e4m3fn,
+                        device=device)
+    x_scale = torch.ones((site.k // SCALE_BLOCK, rows), dtype=torch.float32,
+                         device=device)
+    weight, scale = _weight(site.n, site.k, device)
+    out = torch.empty((rows, site.n), dtype=torch.bfloat16, device=device)
+    layout = torch.zeros((rows,), dtype=torch.int32, device=device)
+    fn(x_fp8, x_scale, weight.unsqueeze(0), scale.unsqueeze(0), output=out,
+       grouped_layout=layout)
+
+
 def _run_paged_mqa(batch: int, num_heads: int, head_dim: int, page_size: int,
                    device, fn: Optional[Callable] = None) -> None:
     """``get_paged_mqa_logits_metadata`` and ``fp8_paged_mqa_logits`` at one
@@ -619,12 +681,46 @@ def _dense_entries(sites: Sequence[DenseSite], max_rows: int, num_sms: int,
     return first + rest
 
 
+def _contiguous_entries(sites: Sequence[ContiguousSite], max_rows: int,
+                        num_sms: int, device) -> List[PrewarmEntry]:
+    """One entry per distinct ``(N, K)`` and representative packed row total.
+    N and K are compiled into the contiguous kernel and the representatives
+    are one-per-key within a shape, so every entry compiles a distinct key."""
+    entries: List[PrewarmEntry] = []
+    seen_shapes = set()
+    for site in sites:
+        shape = (site.n, site.k)
+        if shape in seen_shapes:
+            continue
+        seen_shapes.add(shape)
+        for rows in _contiguous_reps(site.n, site.k, int(max_rows),
+                                     int(num_sms)):
+            entries.append(PrewarmEntry(
+                f"deepgemm/{site.name}/{site.n}x{site.k}/m{rows}",
+                partial(_run_contiguous, site, rows, device),
+            ))
+    return entries
+
+
+@lru_cache(maxsize=None)
+def _contiguous_reps(n: int, k: int, max_rows: int,
+                     num_sms: int) -> Tuple[int, ...]:
+    return tuple(_dg.contiguous_representative_ms(n, k, max_rows, num_sms))
+
+
 def prefill_entries(shapes, device, *, max_rows: int,
-                    num_sms: int) -> List[PrewarmEntry]:
-    """Every prefill Normal site over ``[1, max_rows]`` and, on the packed
-    sparse prefill, the indexer's ``fp8_mqa_logits``."""
+                    num_sms: int,
+                    contiguous_max_rows: int = 0) -> List[PrewarmEntry]:
+    """Every prefill Normal site over ``[1, max_rows]``; the grouped
+    contiguous-MoE sites over ``[1, contiguous_max_rows]`` when that bound is
+    given (it is the packed expert-row capacity, tokens x topk plus segment
+    padding, not the token count); and, on the packed sparse prefill, the
+    indexer's ``fp8_mqa_logits``."""
     entries = _dense_entries(dense_sites(shapes, PHASE_PREFILL), max_rows,
                              num_sms, device)
+    if contiguous_max_rows > 0:
+        entries += _contiguous_entries(contiguous_sites(shapes),
+                                       contiguous_max_rows, num_sms, device)
     if shapes.sparse_prefill:
         entries.append(PrewarmEntry(
             f"deepgemm/mqa_logits/h{shapes.index_n_heads}"

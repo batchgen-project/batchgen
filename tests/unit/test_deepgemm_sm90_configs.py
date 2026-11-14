@@ -201,3 +201,52 @@ def test_imports_without_torch(monkeypatch):
         monkeypatch.setitem(sys.modules, name, None)
     module = _load("_deepgemm_sm90_configs_no_torch")
     assert module.best_config(1, 128, 6144).block_m == 16
+
+
+# --------------------------------------------------------------------------- #
+#  m-grouped contiguous kernel
+# --------------------------------------------------------------------------- #
+def test_contiguous_block_m_is_pinned_to_the_layout_alignment():
+    configs = DG.contiguous_configs(1536, 5120, 8192)
+    assert configs and {c.block_m for c in configs.values()} == {
+        DG.CONTIGUOUS_BLOCK_M}
+
+
+def test_contiguous_config_is_a_function_of_ceil_m_over_128():
+    # Every m in (128q - 128, 128q] selects q's config: the packed total is
+    # the expected M and block M is fixed, so only ceil(m / 128) enters.
+    configs = DG.contiguous_configs(5120, 1536, 4096)
+    assert len(configs) == 4096 // 128
+    shorter = DG.contiguous_configs(5120, 1536, 3 * 128 - 1)
+    assert set(shorter) == {1, 2, 3}
+    assert all(shorter[q] == configs[q] for q in shorter)
+
+
+@pytest.mark.parametrize("n,k", [(1536, 5120), (5120, 1536)])
+def test_contiguous_representatives_reach_every_key(n, k):
+    m_max = 70000
+    reps = DG.contiguous_representative_ms(n, k, m_max)
+    assert reps == sorted(set(reps))
+    assert all(m % DG.CONTIGUOUS_BLOCK_M == 0 and 1 <= m <= m_max
+               for m in reps)
+    configs = DG.contiguous_configs(n, k, m_max)
+    all_keys = {c.kernel_key() for c in configs.values()}
+    rep_keys = {configs[m // DG.CONTIGUOUS_BLOCK_M].kernel_key()
+                for m in reps}
+    assert rep_keys == all_keys
+    assert len(reps) == len(all_keys)
+
+
+def test_contiguous_rejects_a_nonpositive_range():
+    with pytest.raises(ValueError):
+        DG.contiguous_configs(1536, 5120, 0)
+
+
+def test_contiguous_candidates_skip_the_masked_multicast_cut():
+    # n = 24 x 128: ceil(n / block_n) is odd for some block_n, which the
+    # masked layout's multicast legality would cut; the contiguous kernel
+    # keeps those candidates (only the masked/psum types take that cut).
+    n, k = 3072, 5120
+    cont = DG._contiguous_candidates(n, k, DG.DEFAULT_NUM_SMS)
+    assert any(cm * cn > 1 for _, _, cm, cn in cont)
+    assert {bm for bm, _, _, _ in cont} == {DG.CONTIGUOUS_BLOCK_M}
