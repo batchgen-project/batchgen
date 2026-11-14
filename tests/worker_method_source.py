@@ -27,6 +27,13 @@ WORKER_SOURCE = (
     pathlib.Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 )
 WORKER_CLASS = "BatchGenWorker"
+PREFILL_ENGINE_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "prefill_engine.py"
+)
+PREFILL_ENGINE_CLASS = "PrefillEngine"
 
 
 def load_worker_methods(
@@ -108,5 +115,57 @@ def load_worker_functions(
     if missing:
         raise AssertionError(
             f"{WORKER_SOURCE} has no module-level function(s) {sorted(missing)}"
+        )
+    return loaded
+
+
+def load_prefill_engine_methods(
+    names: Iterable[str],
+    namespace: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compile S5a ``PrefillEngine`` methods from their real source.
+
+    The engine methods have the explicit S4b-style seam ``(self, worker, ...)``.
+    This helper adapts them back to the worker-shaped call used by CPU fakes:
+    the engine instance is stateless, so ``None`` is sufficient for its
+    pre-rebinding ``self`` and the fake is passed as ``worker``.
+    """
+    wanted = set(names)
+    tree = ast.parse(
+        PREFILL_ENGINE_SOURCE.read_text(), filename=str(PREFILL_ENGINE_SOURCE)
+    )
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == PREFILL_ENGINE_CLASS
+    ]
+    if len(classes) != 1:
+        raise AssertionError(
+            f"expected exactly one class {PREFILL_ENGINE_CLASS} in "
+            f"{PREFILL_ENGINE_SOURCE}, found {len(classes)}"
+        )
+
+    loaded: Dict[str, Any] = {}
+    for node in classes[0].body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in wanted:
+            continue
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        scope: Dict[str, Any] = dict(namespace)
+        exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
+        engine_method = scope[node.name]
+
+        def worker_method(worker, *args, _engine_method=engine_method, **kwargs):
+            return _engine_method(None, worker, *args, **kwargs)
+
+        loaded[node.name] = worker_method
+
+    missing = wanted - set(loaded)
+    if missing:
+        raise AssertionError(
+            f"{PREFILL_ENGINE_CLASS} has no method(s) {sorted(missing)} in "
+            f"{PREFILL_ENGINE_SOURCE}"
         )
     return loaded

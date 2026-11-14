@@ -406,11 +406,14 @@ def test_emit_appends_the_diagnostics_to_each_row_line():
 
 def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
     source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+    engine_source = _ROOT.joinpath(
+        "batchgen", "worker", "prefill_engine.py"
+    ).read_text()
 
     emit = source.split("epilogue_trace.emit(")[1].split("\n\t\t\t\t\t\t)")[0]
     assert "logits=logits" in emit
     # Both keys are parsed by the shared helper the two paths arm through.
-    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in source
+    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in engine_source
     helper = _ROOT.joinpath("batchgen", "prefix_reuse",
                             "epilogue_trace.py").read_text()
     rule = helper.split("def tracer_from_debug")[1].split("\ndef ")[0]
@@ -497,8 +500,8 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
 
 
 def test_the_pooled_helper_now_shares_the_arming_rule():
-    source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
-    seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
+    source = _ROOT.joinpath("batchgen", "worker", "prefill_engine.py").read_text()
+    seam = source.split("    def _new_pool_epilogue_tracer")[1].split("\n    def ")[0]
 
     assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in seam
     # One cached read per wave, shared with the other three pooled probes,
@@ -514,10 +517,13 @@ def test_the_pooled_helper_now_shares_the_arming_rule():
 # --------------------------------------------------------------------------- #
 def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+    engine_source = _ROOT.joinpath(
+        "batchgen", "worker", "prefill_engine.py"
+    ).read_text()
 
-    assert "def _new_pool_epilogue_tracer(self, wave):" in source
+    assert "def _new_pool_epilogue_tracer(self, worker, wave):" in engine_source
     assert "epilogue_trace = self._new_pool_epilogue_tracer(wave)" in source
-    seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
+    seam = engine_source.split("    def _new_pool_epilogue_tracer")[1].split("\n    def ")[0]
     assert "self._pool_probe_debug(wave)" in seam
     assert "tracer_from_debug" in seam
     assert "return None" in seam

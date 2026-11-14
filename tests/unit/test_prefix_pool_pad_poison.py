@@ -200,13 +200,13 @@ def test_the_worker_reads_the_flag_through_the_batch_debug_seam():
     """The plumbing is batch level, like prefix_pool_offload_check."""
 
     source = Path(__file__).resolve().parents[2].joinpath(
-        "batchgen", "batchgen_worker.py"
+        "batchgen", "worker", "prefill_engine.py"
     ).read_text()
 
-    assert "def _pool_pad_poison_enabled(self, wave) -> bool:" in source
+    assert "def _pool_pad_poison_enabled(self, worker, wave) -> bool:" in source
     assert "pad_poison=self._pool_pad_poison_enabled(wave)," in source
     # Same seam the offload check uses: the wave's own sequences.
-    seam = source.split("def _pool_pad_poison_enabled")[1].split("\n\tdef ")[0]
+    seam = source.split("    def _pool_pad_poison_enabled")[1].split("\n    def ")[0]
     # One cached read per wave, shared with the other pooled probes, and the
     # flag decision precedes the import so the off path imports nothing.
     assert "self._pool_probe_debug(wave)" in seam
