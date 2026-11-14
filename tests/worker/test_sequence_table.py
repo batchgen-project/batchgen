@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from batchgen.worker.rank_context import RankContext
-from batchgen.worker.sequence_table import SequenceTable
+from batchgen.worker.sequence_table import SequenceSlotCollisionError, SequenceTable
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
@@ -66,9 +66,54 @@ def test_an_explicit_slot_is_bound_as_given():
     table = SequenceTable()
     assert table.bind("a", 7) == 7
     assert dict(table.uuid_to_local) == {"a": 7}
-    # An explicit index does not touch the never-used counter: that is what
-    # the raw-container helper did, and the migration path depends on it.
-    assert table.next_local_idx == 0
+    # S6 (declared change): every slot is handed out at most once, so an
+    # explicit slot beyond the never-used counter advances it past the slot
+    # and the skipped indices join the free set. (Before S6 the counter stayed
+    # at 0 and a later bind() handed out slot 7 a second time.)
+    assert table.next_local_idx == 8
+    assert set(table.free_local_indices) == set(range(7))
+
+
+def test_an_explicit_slot_held_by_another_uuid_raises():
+    table = SequenceTable()
+    table.bind("a", 0)
+    with pytest.raises(SequenceSlotCollisionError, match="slot 0 is bound to 'a'"):
+        table.bind("b", 0)
+    # Nothing changed.
+    assert dict(table.local_to_uuid) == {0: "a"}
+    assert dict(table.uuid_to_local) == {"a": 0}
+    assert table.next_local_idx == 1
+
+
+def test_rebinding_the_same_uuid_to_its_own_slot_is_idempotent():
+    table = SequenceTable()
+    table.bind("a", 3)
+    assert table.bind("a", 3) == 3
+    assert dict(table.local_to_uuid) == {3: "a"}
+    assert table.next_local_idx == 4
+
+
+def test_an_explicit_slot_in_the_free_set_leaves_it():
+    table = SequenceTable()
+    table.bind("a")
+    table.bind("b")
+    table.unbind("a")
+    assert set(table.free_local_indices) == {0}
+    assert table.bind("c", 0) == 0
+    assert set(table.free_local_indices) == set()
+    assert table.next_local_idx == 2
+    # The next automatic bind cannot hand slot 0 out again.
+    assert table.bind("d") == 2
+
+
+def test_automatic_binds_never_reuse_an_explicit_slot():
+    """The S6 invariant: explicit and automatic binds never share a slot."""
+    table = SequenceTable()
+    table.bind("x", 3)
+    automatic = [table.bind(f"u{i}") for i in range(6)]
+    assert 3 not in automatic
+    assert sorted(automatic) == [0, 1, 2, 4, 5, 6]
+    assert len(set(table.local_to_uuid)) == len(table) == 7
 
 
 def test_rebinding_a_uuid_to_a_new_slot_leaves_the_old_row_behind():
@@ -83,10 +128,10 @@ def test_rebinding_a_uuid_to_a_new_slot_leaves_the_old_row_behind():
 
 def test_unbind_returns_the_slot_and_frees_it():
     table = SequenceTable()
-    table.bind("a", 4)
-    assert table.unbind("a") == 4
+    table.bind("a", 0)
+    assert table.unbind("a") == 0
     assert dict(table.uuid_to_local) == {} and dict(table.local_to_uuid) == {}
-    assert set(table.free_local_indices) == {4}
+    assert set(table.free_local_indices) == {0}
 
 
 def test_unbind_of_an_unbound_uuid_returns_none_and_frees_nothing():
@@ -97,10 +142,10 @@ def test_unbind_of_an_unbound_uuid_returns_none_and_frees_nothing():
 
 def test_unbind_is_idempotent_after_the_first_call():
     table = SequenceTable()
-    table.bind("a", 4)
-    assert table.unbind("a") == 4
+    table.bind("a", 0)
+    assert table.unbind("a") == 0
     assert table.unbind("a") is None
-    assert set(table.free_local_indices) == {4}
+    assert set(table.free_local_indices) == {0}
 
 
 def test_reset_clears_every_binding_and_restarts_the_counter():
@@ -151,10 +196,10 @@ def test_the_views_stay_live_across_writes_and_reset():
     forward, reverse, free = (
         table.uuid_to_local, table.local_to_uuid, table.free_local_indices,
     )
-    table.bind("a", 2)
-    assert dict(forward) == {"a": 2} and dict(reverse) == {2: "a"}
+    table.bind("a", 0)
+    assert dict(forward) == {"a": 0} and dict(reverse) == {0: "a"}
     table.unbind("a")
-    assert set(free) == {2} and dict(forward) == {}
+    assert set(free) == {0} and dict(forward) == {}
     table.reset()
     assert set(free) == set()
     table.bind("b", 5)
@@ -163,10 +208,10 @@ def test_the_views_stay_live_across_writes_and_reset():
 
 def test_the_free_view_compares_equal_to_a_plain_set_both_ways():
     table = SequenceTable()
-    table.bind("a", 4)
+    table.bind("a", 0)
     table.unbind("a")
-    assert table.free_local_indices == {4}
-    assert {4} == table.free_local_indices
+    assert table.free_local_indices == {0}
+    assert {0} == table.free_local_indices
 
 
 # ------------------------------------------- check_binding_matches_group, G=1
