@@ -21,6 +21,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 
 from tests.worker.worker_fakes import attach_trajectory_state
+from tests.worker_method_source import worker_shaped_method_node
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -48,8 +49,9 @@ def _worker_class():
 
 @functools.lru_cache(maxsize=8)
 def _method(name):
-    return next(node for node in _worker_class().body
-                if isinstance(node, ast.FunctionDef) and node.name == name)
+    # S7: the ledger and its siblings run in StepObservabilityEngine; resolve
+    # them to the engine body in the worker's shape.
+    return worker_shaped_method_node(name)
 
 
 def _ledger_labels(method_name):
