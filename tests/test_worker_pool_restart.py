@@ -23,6 +23,11 @@ from typing import Any, Callable, Dict, List, Optional
 import pytest
 
 from batchgen import eventlog
+from tests.worker_method_source import (
+    RANK_SYNC_SOURCE,
+    rank_sync_method_names,
+    worker_shaped_method_node,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2082,6 +2087,10 @@ def _decode_engine_run() -> ast.FunctionDef:
 def _worker_method(name: str) -> ast.FunctionDef:
     if name == "decoding_continuous":
         return _decode_engine_run()
+    # S8: the RankSync methods run in RankSyncEngine behind same-name worker
+    # delegators; resolve them to the engine body in the worker's shape.
+    if name in rank_sync_method_names():
+        return worker_shaped_method_node(name)
     return next(
         node for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name == name
@@ -2146,7 +2155,7 @@ def _load_worker_shutdown_seam():
         "cohort_shutdown_observed",
     }
     members = [
-        node for node in _worker_class().body
+        _worker_method(node.name) for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     assert {node.name for node in members} == wanted, (
@@ -2971,6 +2980,9 @@ _WORKER_QUIESCE_MEMBERS = (
 _WORKER_DECODE_WAIT_CONSTANTS = (
     "_DECODE_EVENT_SPIN_BUDGET_S",
     "_DECODE_EVENT_POLL_INTERVAL_S",
+)
+# The quiesce bounds moved with the quiesce into rank_sync_engine (S8).
+_RANK_SYNC_DECODE_WAIT_CONSTANTS = (
     "_COHORT_QUIESCE_DEADLINE_S",
     "_COHORT_QUIESCE_POLL_INTERVAL_S",
     "_COHORT_QUIESCE_DEADLINE_REASON",
@@ -3023,11 +3035,13 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
         )
         return found
 
-    constants = _lift(_worker_tree(), _WORKER_DECODE_WAIT_CONSTANTS) + _lift(
-        ast.parse(DECODE_ENGINE_PATH.read_text()), _ENGINE_DECODE_WAIT_CONSTANTS
+    constants = (
+        _lift(_worker_tree(), _WORKER_DECODE_WAIT_CONSTANTS)
+        + _lift(ast.parse(DECODE_ENGINE_PATH.read_text()), _ENGINE_DECODE_WAIT_CONSTANTS)
+        + _lift(ast.parse(RANK_SYNC_SOURCE.read_text()), _RANK_SYNC_DECODE_WAIT_CONSTANTS)
     )
     members = [
-        node for node in _worker_class().body
+        _worker_method(node.name) for node in _worker_class().body
         if isinstance(node, ast.FunctionDef)
         and node.name in _WORKER_DECODE_WAIT_MEMBERS
     ]
