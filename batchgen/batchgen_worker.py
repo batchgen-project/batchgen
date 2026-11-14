@@ -1937,9 +1937,7 @@ class BatchGenWorker:
 		return merged or None
 
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
-		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace")):
-			return True
-		return os.environ.get("BATCHGEN_GLM5_DISPATCH_TRACE", "0") == "1"
+		return isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace"))
 
 	def _flush_glm5_dispatch_trace_summary(self, reason: str) -> None:
 		if not getattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False):
@@ -4581,12 +4579,9 @@ class BatchGenWorker:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
 			"glm" in (getattr(self, "model_name", "") or "").lower()
-			and (
-				glm5_any_cuda_graph_requested(
-					getattr(self, "model_name", None),
-					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
-				)
-				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
+			and glm5_any_cuda_graph_requested(
+				getattr(self, "model_name", None),
+				enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
@@ -15849,8 +15844,6 @@ class BatchGenWorker:
 		return float(value["seconds"]) if value["rank"] == self.rank else 0.0
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_GRAPH_PATH_LOG", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
@@ -15875,28 +15868,68 @@ class BatchGenWorker:
 		)
 
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 
 	def _glm5_whole_model_graph_timing_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_TIMING", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_whole_model_graph_timing")):
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
+
+	def _glm5_whole_model_graph_debug_value(self, key: str):
+		"""The current batch's ``batchgen_debug[key]`` (None when absent)."""
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return None
+		return debug.get(key)
+
+	def _glm5_whole_model_graph_compare_tolerance(self, key: str) -> float:
+		"""``glm5_whole_model_graph_compare_atol`` / ``_rtol``: default 1e-2.
+
+		A number, or a string ``float()`` parses (the grammar of the env vars
+		these keys replace). Anything else is refused by name.
+		"""
+		value = self._glm5_whole_model_graph_debug_value(key)
+		if value is None:
+			return 1e-2
+		if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}")
+		try:
+			return float(value)
+		except ValueError as exc:
+			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}") from exc
+
+	def _glm5_whole_model_graph_probe_layers(self, num_layers: int) -> tuple:
+		"""``glm5_whole_model_graph_probe_layers``: decoder layers to probe.
+
+		``"all"``, a comma-separated index string (the grammar of the env var
+		this key replaces), or a list of ints; absent/empty means no probes.
+		Anything else is refused by name.
+		"""
+		value = self._glm5_whole_model_graph_debug_value("glm5_whole_model_graph_probe_layers")
+		if value is None:
+			return ()
+		if isinstance(value, str):
+			if value.strip().lower() == "all":
+				return tuple(range(num_layers))
+			return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+		if isinstance(value, (list, tuple)) and all(
+			isinstance(item, int) and not isinstance(item, bool) for item in value
+		):
+			return tuple(value)
+		raise ValueError(
+			"batchgen_debug.glm5_whole_model_graph_probe_layers must be \"all\", a "
+			f"comma-separated index string or a list of ints, got {value!r}"
+		)
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
@@ -16801,17 +16834,9 @@ class BatchGenWorker:
 				)
 			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
-			probe_layers_env = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS", "")
-			if probe_layers_env.strip().lower() == "all":
-				compare_probe_layers = tuple(range(len(self.model.model.layers)))
-			elif probe_layers_env.strip():
-				compare_probe_layers = tuple(
-					int(part.strip())
-					for part in probe_layers_env.split(",")
-					if part.strip()
-				)
-			else:
-				compare_probe_layers = ()
+			compare_probe_layers = self._glm5_whole_model_graph_probe_layers(
+				len(self.model.model.layers)
+			)
 			whole_seg = Glm5WholeModelSegment(
 				model=self.model,
 				device=self.torch_device,
@@ -17557,7 +17582,11 @@ class BatchGenWorker:
 		from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 			compare_glm5_whole_model_graph_logits,
 		)
-		return compare_glm5_whole_model_graph_logits(**kwargs)
+		return compare_glm5_whole_model_graph_logits(
+			**kwargs,
+			atol=self._glm5_whole_model_graph_compare_tolerance("glm5_whole_model_graph_compare_atol"),
+			rtol=self._glm5_whole_model_graph_compare_tolerance("glm5_whole_model_graph_compare_rtol"),
+		)
 
 	def _decode_whole_model_segment_name(self):
 		return self._graph.whole_model_segment_name or "glm5_whole_model"

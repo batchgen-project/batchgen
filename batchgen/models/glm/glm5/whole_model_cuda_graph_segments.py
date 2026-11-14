@@ -681,7 +681,7 @@ class Glm5WholeModelSegment:
                     # The probe wants this layer's OUTPUT hidden state, which is
                     # exactly the add the chain defers, so a probed layer pays
                     # for materializing it. Probes are a debug path
-                    # (BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS), off by
+                    # (batchgen_debug.glm5_whole_model_graph_probe_layers), off by
                     # default, so this never costs a production launch.
                     outputs[self._probe_output_name(layer_idx)] = (
                         residual + hidden_states

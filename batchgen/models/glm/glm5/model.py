@@ -103,7 +103,6 @@ def resolve_glm5_3d_mtp(min_rows: int) -> int:
 
 
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
-_GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
 _GLM5_PREFILL_GROUPED_TOKEN_WINDOW = 16_384
 _GLM5_PREFILL_GROUPED_TILEM_AVG = 64
@@ -207,10 +206,7 @@ def _glm5_moe_graph_compare_active() -> bool:
     if _glm5_moe_debug_mode() == "eager":
         return False
     debug = _glm5_moe_debug_dict()
-    return (
-        _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
-        or os.environ.get(_GLM5_MOE_GRAPH_COMPARE_ENV, "0") == "1"
-    )
+    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
 
 
 def _glm5_moe_graph_compare_layer_enabled(layer_idx: int) -> bool:

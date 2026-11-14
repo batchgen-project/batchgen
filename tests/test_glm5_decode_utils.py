@@ -24,7 +24,6 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     glm5_moe_graph_bucket_capacity,
     glm5_moe_cuda_graph_requested_for_model,
     glm5_segmented_cuda_graph_requested_for_model,
-    glm5_whole_model_cuda_graph_compare_requested_for_model,
     glm5_whole_model_cuda_graph_requested_for_model,
 )
 from batchgen.models.glm.glm5.model import (
@@ -85,7 +84,6 @@ def test_glm5_moe_graph_compare_layer_selection(monkeypatch):
         },
         raising=False,
     )
-    monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", raising=False)
 
     assert _glm5_moe_graph_compare_active()
     assert _glm5_moe_graph_compare_layer_enabled(3)
@@ -982,18 +980,21 @@ def test_glm5_whole_model_graph_policy_is_cli_only_and_glm5_fp8_only():
     )
 
 
-def test_glm5_whole_model_compare_policy_requests_warmup():
-    env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
+def test_glm5_graph_routing_is_decided_by_the_cli_flag_alone():
+    """S6c: the server-level graph mode comes only from the CLI. The
+    whole-model compare is a per-batch choice inside that mode
+    (``batchgen_debug.glm5_whole_model_graph_compare``) and no longer feeds
+    the routing predicates; the retired compare env var is not read."""
     model_name = "zai-org/GLM-5-FP8"
 
-    assert glm5_whole_model_cuda_graph_compare_requested_for_model(
-        model_name, environ=env
-    )
-    assert not glm5_whole_model_cuda_graph_compare_requested_for_model(
-        "gpt-oss-120b", environ=env
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(model_name, environ=env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=env)
+    assert not glm5_any_cuda_graph_requested_for_model(model_name)
+    assert glm5_any_cuda_graph_requested_for_model(model_name, enable_cuda_graph=True)
+    assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", enable_cuda_graph=True)
+    import inspect
+
+    assert list(inspect.signature(glm5_any_cuda_graph_requested_for_model).parameters) == [
+        "model_name", "enable_cuda_graph",
+    ]
 
 
 def test_glm5_normalized_decode_attn_mode_uses_continuous_path():
@@ -1098,11 +1099,13 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
     assert "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH" not in os.environ
 
 
-def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
+def test_server_disable_cuda_graphs_sets_no_glm_env(tmp_path, monkeypatch):
+    """S6c: no compare env var exists any more, so --disable-cuda-graphs no
+    longer pins one; the flag alone disables the graph mode."""
     import batchgen.server.server_args as server_args_module
 
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
+    env_before = dict(os.environ)
 
     args = server_args_module.prepare_server_args([
         "--model",
@@ -1118,8 +1121,10 @@ def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypat
 
     assert not args.enable_cuda_graph
     assert args.disable_cuda_graphs
-    # Phase C: mode env vars are no longer read, so only the compare env is pinned off.
-    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"] == "0"
+    assert not hasattr(server_args_module, "_apply_cuda_graph_cli_env_defaults")
+    assert {k: v for k, v in os.environ.items() if k.startswith("BATCHGEN_GLM5_")} == {
+        k: v for k, v in env_before.items() if k.startswith("BATCHGEN_GLM5_")
+    }
 
 
 def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
@@ -1147,7 +1152,6 @@ def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
 def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
-    monkeypatch.delenv("BATCHGEN_GLM5_DISPATCH_TRACE", raising=False)
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1896,7 +1900,7 @@ def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
     worker._graph.glm5_whole_model_graph_failed_buckets = set()
     worker._graph.glm5_whole_model_graph_signature = ("same",)
     worker._graph.glm5_whole_model_graph_unavailable_reason = None
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
+    worker._batchgen_debug = {"glm5_whole_model_graph_compare": True}
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -2279,20 +2283,20 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
         assert not hasattr(worker._graph, name), name
 
 
-def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
+def test_glm5_graph_path_log_flag_uses_batch_debug_only(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
     worker = object.__new__(BatchGenWorker)
     worker._batchgen_debug = {"glm5_graph_path_log": True}
-    monkeypatch.delenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", raising=False)
 
     assert worker._glm5_graph_path_log_requested_for_current_batch()
 
     worker._batchgen_debug = {}
     assert not worker._glm5_graph_path_log_requested_for_current_batch()
 
+    # S6c: the retired env var is not honored.
     monkeypatch.setenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", "1")
-    assert worker._glm5_graph_path_log_requested_for_current_batch()
+    assert not worker._glm5_graph_path_log_requested_for_current_batch()
 
 
 def test_glm5_graph_path_log_default_skips_hot_path_state(monkeypatch):
@@ -2310,7 +2314,6 @@ def test_glm5_graph_path_log_default_skips_hot_path_state(monkeypatch):
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
     worker._batchgen_debug = {}
-    monkeypatch.delenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", raising=False)
     monkeypatch.setattr(
         worker,
         "_glm5_whole_graph_path_state",
