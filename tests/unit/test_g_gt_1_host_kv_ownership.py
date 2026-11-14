@@ -28,6 +28,7 @@ from tests.worker.worker_fakes import (
     attach_prefix_state,
     attach_trajectory_state,
 )
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -42,6 +43,9 @@ def _worker_class():
 
 
 def _worker_method_node(name):
+    # S10c: a delegated method resolves to its engine body (worker shape).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(node for node in _worker_class().body
                 if isinstance(node, ast.FunctionDef) and node.name == name)
 
