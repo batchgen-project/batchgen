@@ -197,9 +197,6 @@ class KimiLinearPlanner(BasePlanner):
 
     def _adjust_config_for_model(self):
         """Kimi-Linear specific config adjustments."""
-        # Modern paged-KV decode path (decoding_continuous), same as K2.5.
-        self.config.Basic_Config.attn_mode = 3
-
         # Machine-dependent knobs come from the K3 profile row of this
         # (machine family, world size) at attention TP8; every other layout
         # plans machine-independent values.
@@ -262,9 +259,8 @@ class KimiLinearPlanner(BasePlanner):
         # (core/utils.cpp) both match on "bfloat16", never "bf16".
         self.config.Basic_Config.kv_dtype = "bfloat16"
 
-        # F6: _compute_batch_configs() ran before this method with the base
-        # default attn_mode=1 (our attn_mode=3 above lands after buffer
-        # sizing), so its expert-residency math is wrong for this model.
+        # F6: _compute_batch_configs() ran before this method with generic
+        # expert-residency math; this model needs its own buffer sizing.
         # Override all three results here — this method runs last, so the
         # values stick:
         # (a) Decode expert staging buffers: normalize to the prefill ring (8).

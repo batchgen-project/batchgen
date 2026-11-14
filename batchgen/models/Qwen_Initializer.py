@@ -391,7 +391,6 @@ class Qwen_Initializer:
         self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
         self.engine_config.Basic_Config.dtype_str = "bfloat16"
         self.engine_config.Basic_Config.device_torch = torch.device("cuda:7")
-        self.engine_config.Basic_Config.attn_mode = 1
         self.engine_config.Basic_Config.module_types = [
             "attn",
             "routed_expert",

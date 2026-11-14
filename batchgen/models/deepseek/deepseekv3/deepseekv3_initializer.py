@@ -163,7 +163,9 @@ class DeepseekV3Initializer:
         self.engine_config = set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
         self.planner = DeepSeekV3Planner()
-        self.engine_config = self.planner.generate_config(self.engine_config)
+        self.engine_config = self.planner.generate_config(
+            self.engine_config, self.model_config.model_type
+        )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")
 

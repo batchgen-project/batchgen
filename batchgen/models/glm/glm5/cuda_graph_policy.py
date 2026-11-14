@@ -125,16 +125,6 @@ def glm5_any_cuda_graph_requested_for_model(
     )
 
 
-def glm5_effective_decode_attn_mode(
-    model_type: str | None,
-    configured_attn_mode: int,
-) -> int:
-    """GLM-5 decode uses the modern continuous path even on single-node runs."""
-    if _is_glm_model(model_type):
-        return 3
-    return configured_attn_mode
-
-
 def glm5_cuda_graph_bucket_for_batch_size(
     batch_size: int,
     bucket_sizes: list[int] | tuple[int, ...] = GLM5_POWER_OF_TWO_BUCKETS_32,
