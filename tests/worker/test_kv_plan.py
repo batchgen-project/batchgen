@@ -778,6 +778,16 @@ def test_kv_plan_imports_stdlib_only():
 
 
 def _compile_worker_method(name, namespace):
+    # S10b: the host-capacity collectives run in KVCapacityEngine; compile
+    # the engine body in the worker's shape.
+    from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
+    if name in delegated_method_names():
+        module = ast.fix_missing_locations(
+            ast.Module(body=[worker_shaped_method_node(name)], type_ignores=[])
+        )
+        exec(compile(module, str(WORKER), "exec"), namespace)
+        return namespace[name]
     tree = ast.parse(WORKER.read_text())
     cls = next(
         n for n in tree.body
