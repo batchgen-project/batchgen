@@ -279,6 +279,22 @@ def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     return copy.deepcopy(worker[name])
 
 
+def delegated_method_source(name: str) -> str:
+    """The raw source text of a delegated method's engine body.
+
+    Text pins that used to slice the worker file keep their assertions
+    byte-identical by reading the engine's own source segment (located by
+    AST, so no indentation or delimiter assumptions). The segment is the
+    engine method as written: its ``worker`` parameter and the ``self =
+    worker`` rebinding are part of it.
+    """
+    for source, class_name in DELEGATED_ENGINES:
+        engine = _class_methods(source, class_name)
+        if name in engine:
+            return ast.get_source_segment(source.read_text(), engine[name])
+    raise KeyError(f"{name} is not a delegated engine method")
+
+
 def delegated_method_names() -> set:
     """Every worker method whose body lives in a delegated engine (S8/S7/S9/S10a)."""
     names: set = set()

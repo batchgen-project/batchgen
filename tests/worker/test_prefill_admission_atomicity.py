@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.worker_method_source import delegated_method_source
+
 
 _WORKER = Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py"
 
@@ -72,11 +74,9 @@ def test_reserve_time_reclaim_runs_once_and_falls_back_to_the_rejection():
 
 
 def test_reserve_time_reclaim_rechecks_capacity_exactly_once():
-    source = _source()
-    retry = source[
-        source.index("def _retry_prefill_host_capacity_after_reclaim") :
-    ]
-    retry = retry[: retry.index("\n\tdef ", 1)]
+    # S10b: the retry and the reclaim helper run in KVCapacityEngine; their
+    # engine source segments are located by AST, not by tab delimiters.
+    retry = delegated_method_source("_retry_prefill_host_capacity_after_reclaim")
     assert retry.count("self._collective_prefill_host_capacity_ok(") == 1
     assert "while " not in retry
     # The wave's attachments are already held here, so the reclaim cannot take
@@ -84,9 +84,6 @@ def test_reserve_time_reclaim_rechecks_capacity_exactly_once():
     # reclaim is the collective helper shared with boundary growth.
     assert retry.count("self._reclaim_host_prefix_pages_collective(") == 1
     assert 'reason="host_reserve"' in retry
-    helper = source[
-        source.index("def _reclaim_host_prefix_pages_collective") :
-    ]
-    helper = helper[: helper.index("\n\tdef ", 1)]
+    helper = delegated_method_source("_reclaim_host_prefix_pages_collective")
     assert helper.count("reclaim_prefix_pages_for_host_admission(") == 1
     assert "while " not in helper
