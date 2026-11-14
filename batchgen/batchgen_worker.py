@@ -4986,50 +4986,29 @@ class BatchGenWorker:
 	def _make_watermark_trigger_request(
 		self, node_stats: List[dict]
 	) -> WatermarkTriggerRequest:
-		"""Snapshot the worker state `plan_watermark_trigger` consumes."""
-		return WatermarkTriggerRequest(
-			node_stats=tuple(node_stats),
-			host_kv_watermark=self.host_kv_watermark,
-			has_queued=self.global_batch.has_queueing(),
-			has_evicted=self.enable_host_kv_eviction and self.global_batch.has_evicted(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_watermark_trigger_request(
+			self,
+			node_stats,
 		)
 
 	def _credit_reclaimable_prefix_pages(
 		self, stats: Dict[str, int]
 	) -> Dict[str, int]:
-		"""Report reclaimable retained prefix pages as free, not as pressure.
-
-		The Host allocator's counters are already PHYSICAL: a prefix several
-		sequences attach is one allocation and is charged to ``used`` exactly
-		once, so this node's utilisation never double-counts a shared page.
-		What it cannot distinguish is a page holding live KV from a page
-		holding a RETAINED prefix that nobody is reading -- a copy the prefix
-		cache keeps for a future hit and that admission reclaims on demand,
-		which is why ``per_node_host_reclaimable`` already counts it as part of
-		the admission budget.
-
-		Left as ``used``, those pages hold free% under the watermark forever,
-		so a pool filled with retained prefixes never preempts decode for
-		prefill -- the one situation the trigger exists for. Crediting them
-		here (and only here, so the legacy/native utilisation parity check
-		keeps comparing the raw counters) makes the trigger see the capacity
-		admission would actually get.
-
-		Read only when work is waiting: the trigger cannot fire otherwise, and
-		the count is an O(max_nodes) scan under the coordinator's lock.
-		"""
-		if not self.enable_prefix_cache:
-			return stats
-		coordinator = getattr(self, "prefix_cache_coordinator", None)
-		if coordinator is None:
-			return stats
-		waiting = self.global_batch.has_queueing() or (
-			self.enable_host_kv_eviction and self.global_batch.has_evicted()
-		)
-		if not waiting:
-			return stats
-		return credit_reclaimable_pages(
-			stats, int(coordinator.count_releasable_pages(0))
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._credit_reclaimable_prefix_pages(
+			self,
+			stats,
 		)
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
@@ -5985,36 +5964,28 @@ class BatchGenWorker:
 		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
-		"""Whether a local decode row needs planning before its next forward."""
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid is None:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None or self._is_sequence_completed(seq):
-				continue
-			if host_capacity_due(
-				int(seq.host_token_capacity), int(seq.current_context_length)
-			):
-				return True
-		return False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_capacity_due_local(
+			self,
+			batch,
+		)
 
 	def _host_capacity_due_all_ranks(self, batch: List[int]) -> bool:
-		"""Collectively detect a re-entry row with no next-token runway.
-
-		Metadata is owner-local during decode, so a local check cannot decide
-		whether all ranks must enter the collective boundary planner.  This check
-		runs only at decode entry and immediately after a boundary, never once per
-		decode token.
-		"""
-		local_due = self._host_capacity_due_local(batch)
-		if self.world_size <= 1:
-			return local_due
-		flag = torch.tensor(
-			[1 if local_due else 0], dtype=torch.int32, device=self.torch_device
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_capacity_due_all_ranks(
+			self,
+			batch,
 		)
-		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-		return bool(int(flag.item()))
 
 	def _prefill_host_reservation_plan(
 		self, prefill_uuids: List[str]
@@ -6071,99 +6042,17 @@ class BatchGenWorker:
 		owner_requests: List[Tuple[str, int]],
 		local_error: bool = False,
 	) -> Tuple[bool, Optional[Dict[int, Tuple[int, int]]]]:
-		"""Check a fresh per-node host-KV snapshot before any mutation.
-
-		Every rank reports its owner demand.  Only the node leader reports the
-		shared allocator's free/total pages; summing demands across ranks and
-		comparing against that one live snapshot prevents one rank from making a
-		decision from stale local state.  The final MIN reduction makes the
-		decision explicit even when a rank's stats call fails.
-
-		Returns ``(ok, rows)``, where ``rows`` maps node id to the gathered
-		``(need, free)`` pair the reserve-time reclaim computes its deficit
-		from. ``rows`` is ``None`` when the snapshot itself is unusable (a
-		rank's stats call failed, a node reported no capacity at all, or two
-		ranks of one node disagreed): a deficit derived from it would be
-		meaningless, so the caller must not retry on it. Both verdicts are
-		reduced, hence rank-uniform -- the retry branch is collective.
-		"""
-		# Members' demands exclude their shared chains, but the pooled
-		# segments themselves allocate one Host copy (mirrored per group, so
-		# one count). Leaving them out over-admits the wave and the
-		# allocation fails right after the preflight passed. Only the wave's
-		# host-KV LEADER allocates segments, so only a rank with owner demand
-		# reports them — at G>1 the followers reporting the same segments
-		# would multiply the node demand by G and falsely reject the wave.
-		local_need = prefill_owner_demand_pages(
-			[int(tokens) for _, tokens in owner_requests],
-			page_size=self.PAGE_SIZE,
-			pool_segment_pages=(
-				self._prefill_pool_segment_host_pages() if owner_requests else 0
-			),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._collective_prefill_host_capacity_ok(
+			self,
+			owner_requests,
+			local_error,
 		)
-		node_id = self.rank_ctx.node_id
-		local_free = -1
-		local_total = -1
-		snapshot_error = 1 if local_error else 0
-		host_view = getattr(self, "host_paged_kv_worker_view", None)
-		if host_view is None:
-			host_view = getattr(
-				getattr(self, "core_engine", None),
-				"host_paged_kv_worker_view",
-				None,
-			)
-		if self.local_rank == 0:
-			try:
-				stats = host_view.get_stats()
-				local_free = int(stats.num_free_pages)
-				local_total = int(stats.num_total_pages)
-			except Exception:
-				snapshot_error = 1
-				logging.exception(
-					"Rank %s: host-KV prefill capacity snapshot failed", self.rank
-				)
-
-		report = torch.tensor(
-			[node_id, local_need, local_free, local_total, snapshot_error],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		if self.world_size == 1:
-			if snapshot_error:
-				return False, None
-			ok = 0 <= local_need <= local_free and local_need <= local_total
-			return ok, {node_id: (local_need, local_free)}
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required for host-KV prefill admission"
-			)
-		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
-		dist.all_gather(gathered, report)
-
-		verdict = verdict_node_capacity(
-			[
-				NodeCapacityReport(
-					node_id=int(item[0].item()),
-					need=int(item[1].item()),
-					free=int(item[2].item()),
-					total=int(item[3].item()),
-					snapshot_error=int(item[4].item()),
-				)
-				for item in gathered
-			],
-			want_rows=True,
-		)
-
-		decision = torch.tensor(
-			[1 if verdict.ok else 0, 1 if verdict.rows_usable else 0],
-			dtype=torch.int32, device=self.torch_device,
-		)
-		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-		if not int(decision[1].item()):
-			return bool(int(decision[0].item())), None
-		# The reduced rows_usable is the MIN over ranks, so it is 1 only when
-		# this rank's local verdict was usable and carries its rows.
-		return bool(int(decision[0].item())), verdict.rows
 
 	def _reclaim_host_prefix_pages_collective(
 		self,
@@ -6171,187 +6060,50 @@ class BatchGenWorker:
 		*,
 		reason: str,
 	) -> int:
-		"""Reclaim retained prefix pages on each node leader; all ranks align.
-
-		The node leader evaluates ``page_target()`` (the Host pages this node is
-		short) and releases up to that many cold retained prefix pages -- only
-		pages with no live attachment and no pending load, so nothing a running
-		row or an attached wave reads is touched. Every other rank of the node
-		then retires the trajectory frontiers standing on the released pages.
-
-		Collective discipline: every rank reaches every collective, a
-		leader-side failure (including in ``page_target``) becomes a MAX-reduced
-		flag, and no rank raises before that flag is reduced. ``reason`` names
-		the caller in logs, the ``prefix_reclaim`` metric and errors. Returns
-		the largest page count any leader reclaimed.
-		"""
-		from batchgen.prefix_reuse.eviction import (
-			EvictedPageRecorder,
-			reclaim_prefix_pages_for_host_admission,
-			retire_node_frontiers,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._reclaim_host_prefix_pages_collective(
+			self,
+			page_target,
+			reason=reason,
 		)
-		node_id = self.rank_ctx.node_id
-		failure = 0
-		local_frontier_hook = self._trajectory_frontier_eviction_hook()
-		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
-		if self.local_rank == 0:
-			try:
-				target = int(page_target())
-				if target:
-					released = reclaim_prefix_pages_for_host_admission(
-						core_engine_module=core_engine,
-						coordinator=self.prefix_cache_coordinator,
-						worker_views_by_group=self._host_views_by_group(),
-						group_id=0,
-						page_target=target,
-						max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
-						frontier_hook=reclaimed_pages,
-					)
-					logging.info(
-						"[PREFIX_CACHE] %s reclaimed %s Host pages on node %s "
-						"(free=%s, target=%s)",
-						reason, released, node_id, self._get_host_kv_free_pages(),
-						target,
-					)
-					if self.prefix_cache_debug_stats:
-						self._emit_prefix_cache_metric(
-							"prefix_reclaim",
-							reason=reason,
-							node=int(node_id),
-							page_target=int(target),
-							released_pages=int(released),
-							**self._prefix_host_resource_fields(),
-						)
-			except Exception:
-				logging.exception("[PREFIX_CACHE] %s eviction failed", reason)
-				failure = 1
-		reclaimed_page_count = reclaimed_pages.page_count
-		if self.world_size > 1:
-			failed = torch.tensor(
-				[failure, reclaimed_page_count],
-				dtype=torch.int64, device=self.torch_device,
-			)
-			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-			failure = int(failed[0].item())
-			reclaimed_page_count = int(failed[1].item())
-		if failure != 0:
-			raise RuntimeError(f"prefix cache {reason} eviction failed on a worker")
-		# The leader already retired its own frontiers inside the release. Any
-		# other rank of the node may own frontier records standing on the
-		# reclaimed pages (G=1, or several serve groups per node), so every rank
-		# runs its own hook on its node's reclaimed map.
-		if self.world_size > 1 and reclaimed_page_count != 0:
-			frontier_failure = 0
-			gathered_reclaims = [None] * self.world_size
-			dist.all_gather_object(
-				gathered_reclaims,
-				(
-					node_id,
-					reclaimed_pages.pages_by_group
-					if self.local_rank == 0 else None,
-				),
-			)
-			if self.local_rank != 0:
-				try:
-					retire_node_frontiers(
-						gathered=gathered_reclaims,
-						node_id=node_id,
-						frontier_hook=local_frontier_hook,
-					)
-				except Exception:
-					logging.exception(
-						"[PREFIX_CACHE] frontier retirement after %s reclaim "
-						"failed", reason,
-					)
-					frontier_failure = 1
-			retired = torch.tensor(
-				[frontier_failure], dtype=torch.int64, device=self.torch_device
-			)
-			dist.all_reduce(retired, op=dist.ReduceOp.MAX)
-			if int(retired.item()) != 0:
-				raise RuntimeError(
-					f"trajectory frontier retirement after {reason} reclaim "
-					"failed on a worker"
-				)
-		return reclaimed_page_count
 
 	def _retry_prefill_host_capacity_after_reclaim(
 		self,
 		owner_requests: List[Tuple[str, int]],
 		capacity_rows: Dict[int, Tuple[int, int]],
 	) -> bool:
-		"""Reclaim this node's host-page deficit once, then re-check capacity.
-
-		Exactly one attempt: a wave sized against free + reclaimable pages can
-		be short only by what is retained, and this releases it. A second
-		shortfall is a real capacity change (a concurrent decode grew, a peer
-		node is the short one and has nothing cold left), which the caller
-		rejects exactly as before.
-
-		Safe by construction: the wave's prefix attachments are already held,
-		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
-		keeps it -- only cold retained pages go, which is precisely the supply
-		the admission budget counted.
-
-		Collective discipline is ``_reclaim_host_prefix_pages_collective``'s:
-		every rank reaches every collective, and the deficit is computed on the
-		leader inside its MAX-reduced failure flag.
-		"""
-		node_id = node_of_rank(self.rank, self.local_world_size)
-		self._reclaim_host_prefix_pages_collective(
-			lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
-			reason="host_reserve",
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._retry_prefill_host_capacity_after_reclaim(
+			self,
+			owner_requests,
+			capacity_rows,
 		)
-		capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
-		return capacity_ok
 
 	def _reclaim_host_prefix_pages_for_growth(
 		self,
 		growth_entries: List[Tuple[str, int, object]],
 		worker_view: Optional[object],
 	) -> int:
-		"""Release the retained prefix pages this boundary's growth plan counted.
-
-		The rank-0 growth plan covers each node's growth debt with free pages,
-		completed/evicted releases and the node's reclaimable retained prefix
-		pages. After every rank has released (the caller's barrier), the node
-		leader reads the physical free count and reclaims exactly the part of
-		this node's growth the free pages do not cover:
-		``max(0, node_growth_pages - free_after_releases)``. A shortfall the
-		reclaim cannot close is left to the fresh collective preflight, which
-		fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
-		list, identical on every rank.
-		"""
-		node_id = node_of_rank(self.rank, self.local_world_size)
-		group_size = self._decode_attn_tp_size()
-
-		def node_growth_deficit() -> int:
-			from batchgen.decode_dp_group import host_kv_owner_rank
-
-			node_growth_pages = 0
-			for uuid, growth_pages, seq in growth_entries:
-				if seq is None:
-					raise RuntimeError(f"growth sequence {uuid} is not in global_batch")
-				if group_size > 1:
-					if seq.decode_dp_group is None:
-						raise RuntimeError(
-							f"growth sequence {uuid} has no decode_dp_group for "
-							f"attn_tp_size={group_size}"
-						)
-					owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
-				else:
-					owner = seq.assigned_rank
-				if node_of_rank(int(owner), self.local_world_size) == node_id:
-					node_growth_pages += int(growth_pages)
-			if node_growth_pages == 0:
-				return 0
-			if worker_view is None:
-				raise RuntimeError("host-KV worker view is unavailable")
-			free_after_releases = int(worker_view.get_stats().num_free_pages)
-			return max(0, node_growth_pages - free_after_releases)
-
-		return self._reclaim_host_prefix_pages_collective(
-			node_growth_deficit, reason="host_growth",
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._reclaim_host_prefix_pages_for_growth(
+			self,
+			growth_entries,
+			worker_view,
 		)
 
 	def _attach_prefix_cache_for_prefill(self, prefill_uuids: List[str]) -> None:
@@ -6689,85 +6441,17 @@ class BatchGenWorker:
 		host_grow_requests: List[Tuple[int, int]],
 		worker_view: Optional[object] = None,
 	) -> bool:
-		"""Preflight one boundary's shared host-KV growth transaction.
-
-		The boundary planner runs from a gathered snapshot taken before completed
-		and evicted rows release their pages.  That snapshot is intentionally
-		pure, but it cannot prove that the shared allocator still has the pages
-		when Phase 4.C executes.  Every rank therefore reports its owner demand;
-		only one rank per node reports the node-shared allocator's fresh free/total
-		counts.  The all-rank MIN makes the decision identical before any view is
-		mutated.
-
-		The second all-rank consensus is performed by the caller after the local
-		allocator call.  A post-preflight allocator failure is fatal: the native
-		worker-view API has no page-level rollback for a successful peer, and
-		continuing would make scalar metadata and shared page tables disagree.
-		"""
-		local_need = sum(int(pages) for _, pages in host_grow_requests)
-		node_id = self.rank_ctx.node_id
-		local_free = -1
-		local_total = -1
-		snapshot_error = 0
-		if worker_view is None:
-			worker_view = getattr(self, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			worker_view = getattr(
-				getattr(self, "core_engine", None),
-				"host_paged_kv_worker_view",
-				None,
-			)
-		# The host region is shared by all ranks on a node.  Use the local
-		# representative for the snapshot, matching _gather_host_kv_stats_by_node
-		# and _collective_prefill_host_capacity_ok.
-		if self.local_rank == 0:
-			try:
-				if worker_view is None:
-					raise RuntimeError("host-KV worker view is unavailable")
-				stats = worker_view.get_stats()
-				local_free = int(stats.num_free_pages)
-				local_total = int(stats.num_total_pages)
-			except Exception:
-				snapshot_error = 1
-				logging.exception(
-					"Rank %s: host-KV boundary growth snapshot failed", self.rank
-				)
-
-		report = torch.tensor(
-			[node_id, local_need, local_free, local_total, snapshot_error],
-			dtype=torch.int64,
-			device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._collective_host_kv_growth_capacity_ok(
+			self,
+			host_grow_requests,
+			worker_view,
 		)
-		if self.world_size == 1:
-			if snapshot_error:
-				return False
-			return 0 <= local_need <= local_free and local_need <= local_total
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required for host-KV growth preflight"
-			)
-		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
-		dist.all_gather(gathered, report)
-
-		verdict = verdict_node_capacity(
-			[
-				NodeCapacityReport(
-					node_id=int(item[0].item()),
-					need=int(item[1].item()),
-					free=int(item[2].item()),
-					total=int(item[3].item()),
-					snapshot_error=int(item[4].item()),
-				)
-				for item in gathered
-			],
-			want_rows=False,
-		)
-
-		decision = torch.tensor(
-			[1 if verdict.ok else 0], dtype=torch.int32, device=self.torch_device
-		)
-		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-		return bool(int(decision.item()))
 
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
