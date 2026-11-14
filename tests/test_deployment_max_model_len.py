@@ -247,7 +247,9 @@ def test_worker_collects_remote_host_regions_before_accepting_length(monkeypatch
             for i in (0, 1)
         },
         _decode_attn_tp_size=lambda: 2,
-        _trajectory_book=SimpleNamespace(page_tokens=64, page_count=100),
+        _traj=SimpleNamespace(
+            trajectory_book=SimpleNamespace(page_tokens=64, page_count=100)
+        ),
     )
     if auto_fit:
         method(worker, 100 * 2048 / (1024 ** 3))

@@ -187,10 +187,13 @@ def test_restore_payload_round_trips_through_arena_from_payload():
 			storage_handle=7,
 			session_key="session",
 			boundary_tokens=64,
+			lcp_tokens=64,
 			owning_group_id=3,
 		)
 	}
-	payload = store.restore_payload(shard_count=2, is_leader=True)
+	payload = store.restore_payload(
+		shard_count=2, is_leader=True, planned_boundary_for=lambda gid: 64
+	)
 	rebuilt = store.arena_from_payload(payload[5])
 	assert rebuilt.pseudo_sid == arena.pseudo_sid
 	assert rebuilt.page_ids_by_group == arena.page_ids_by_group
@@ -241,12 +244,18 @@ def test_adopt_mirrored_arenas_rebuilds_each_payload():
 	assert arena.page_ids_by_group == {0: (1, 2)}
 
 
-# A6 item 7: restore_fields combines restorer counters with session-map pins.
+# A6 item 7: restore_fields combines restorer counters with placement telemetry.
 def test_restore_fields_combines_restorer_and_session_pins():
 	store = TrajectoryStore()
 	store.trajectory_restorer = SimpleNamespace(counters=lambda: {"restores": 4})
-	store.trajectory_session_groups = SimpleNamespace(pins=3)
-	assert store.restore_fields() == {"restores": 4, "trajectory_group_pins": 3}
+	store.trajectory_session_groups = SimpleNamespace(
+		honored_on_owner=3, placed_offgroup=1
+	)
+	assert store.restore_fields() == {
+		"restores": 4,
+		"trajectory_group_honored_on_owner": 3,
+		"trajectory_group_placed_offgroup": 1,
+	}
 
 
 # A6 item 8: commit_requested delegates the strict batch debug flag parser.
