@@ -42,7 +42,6 @@ from batchgen.prefix_reuse.executor import PoolChunkExecutor
 from batchgen.prefix_reuse.pool import PrefillPrefixPool
 from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 from batchgen.prefix_reuse.wave_plan import plan_wave_prefix_sharing
-from batchgen.worker.prefill_engine import DualHostKVCoordinator
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -119,7 +118,7 @@ def _worker_methods(names, globals_=None):
         "List": List, "Optional": Optional, "Sequence": Sequence,
         "hashlib": hashlib, "logging": logging, "math": math,
         "replace": dataclasses.replace,
-        "DualHostKVCoordinator": DualHostKVCoordinator,
+        "DualHostKVCoordinator": type("DualHostKVCoordinator", (), {}),
         **(globals_ or {}),
     }
     loaded = {}
@@ -362,6 +361,7 @@ def _plan_worker(
             "_plan_prefill_pool_wave",
             "_check_pool_plan_identical",
             "_prefill_pool_layout",
+            "_prefill_host_view_is_dual",
             "_prefill_pool_psm_layout",
             "_prefill_pool_page_dims",
             "_prefill_pool_group",
