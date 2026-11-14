@@ -8,13 +8,12 @@ still initialized and reset by the worker's teardown.
 
 It also owns every ``batchgen.cuda_graph`` import the worker used to make:
 the manager/bucketing constructors, the adapter ABC used by the startup type
-backstop, the per-step ``BatchState`` snapshot, the model-agnostic
-eager-vs-graph compare, and bucket-size generation. The one exception is
-main's decode-width ladder (``batchgen.cuda_graph.buckets``:
-``decode_graph_bucket_sizes``, ``check_decode_width_within_buckets``,
-``DecodeWidthExceedsGraphBucketError``), which the worker imports directly
-since the rebase onto main 1c372209; routing it through this class is a
-follow-up, not part of the rebase.
+backstop, the per-step ``BatchState`` snapshot and the model-agnostic
+eager-vs-graph compare. The one exception is the decode bucket ladder
+(``batchgen.cuda_graph.buckets``: ``decode_graph_bucket_sizes``,
+``check_decode_width_within_buckets``, ``DecodeWidthExceedsGraphBucketError``),
+which the worker imports directly since the rebase onto main 1c372209;
+routing it through this class is a follow-up, not part of the rebase.
 
 What this class is NOT, in this slice: a capture/replay engine. The capture,
 eligibility, and replay logic stays in the worker and reads this object's
@@ -119,17 +118,6 @@ class GraphRuntime:
     # ------------------------------------------------------------------ #
     # cuda_graph-layer constructors
     # ------------------------------------------------------------------ #
-
-    def generate_bucket_sizes(self, max_bucket: int, num_buckets: int) -> list:
-        """Exactly ``num_buckets`` bucket sizes from 1 to ``max_bucket``.
-
-        Single owner of the algorithm: ``batchgen.cuda_graph.buckets``, which
-        the model adapters' ``select_buckets`` already call. The worker used
-        to carry a second copy of the same geometric spacing.
-        """
-        from batchgen.cuda_graph.buckets import generate_bucket_sizes
-
-        return generate_bucket_sizes(max_bucket, num_buckets)
 
     def new_bucketing(self, bucket_sizes):
         """``BatchSizeBucketing`` over ``bucket_sizes``."""
