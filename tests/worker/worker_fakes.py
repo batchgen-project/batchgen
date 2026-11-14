@@ -9,7 +9,9 @@ those two rather than loose attributes.
 ``attach_identity`` is the single way tests install them. It is deliberately
 explicit: no ``__getattr__`` magic, no defaults that hide a missing rank.
 Later worker-decouple slices extend this module as more state moves into
-owned components.
+owned components. S3 (``worker/kv_plan.py``) moved no worker fields -- it is
+pure types and functions over plain ints -- so it deliberately adds no
+``attach_*`` helper here.
 """
 
 from __future__ import annotations
