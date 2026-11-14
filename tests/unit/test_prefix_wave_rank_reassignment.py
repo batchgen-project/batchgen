@@ -108,10 +108,10 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
             global_batch=batch,
             prefix_cache_runtime_config=SimpleNamespace(
                 group_specs=[SimpleNamespace(raw_page_tokens=2)]),
-            query_book={4: object()},
+            query_book={0: object()},
         )
         attach_identity(worker_state, rank=rank, world_size=2,
-                        local_world_size=2, bound={old: 4})
+                        local_world_size=2, bound={old: 0})
         # Prompts live in the trajectory book after admission.
         worker_state._trajectory_tokens = (
             lambda seq, length=None, **_: prompts[seq.uuid][:length]
@@ -130,7 +130,7 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         assert worker_state._uuid_to_local_map == {}
         assert worker_state._local_to_uuid_map == {}
         assert worker_state.query_book == {}
-        assert worker_state._free_local_indices == {4}
+        assert worker_state._free_local_indices == {0}
         assert seqs[new].assigned_rank == rank
 
         # Config prefill binds the new owner into the released local slot.
@@ -141,9 +141,9 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
             new, seqs[new], query_book=worker_state.query_book,
             table=worker_state.seq_table,
         )
-        assert idx == 4
+        assert idx == 0
         assert worker_state.seq_table.next_local_idx == counter_before
-        assert worker_state._local_to_uuid_map == {4: new}
+        assert worker_state._local_to_uuid_map == {0: new}
 
 
 def _legacy_must_not_run(*a, **k):
@@ -268,6 +268,7 @@ def test_packing_mode_pins_the_evicted_member_and_repacks_only_queued(monkeypatc
         _install_packer(monkeypatch, (1, 0), recorder)
         moved_away = "q0" if rank == 0 else "q1"
         worker_state = _packing_worker(rank, seqs, {moved_away: 4})
+        free_before = set(worker_state._free_local_indices)
         assign(worker_state, ["e", "q0", "q1"], current_wave=True)
 
         assert recorder["prompts"] == [[4, 5, 6], [7, 8]]
@@ -279,7 +280,7 @@ def test_packing_mode_pins_the_evicted_member_and_repacks_only_queued(monkeypatc
         assert worker_state._uuid_to_local_map == {}
         assert worker_state._local_to_uuid_map == {}
         assert worker_state.query_book == {}
-        assert worker_state._free_local_indices == {4}
+        assert worker_state._free_local_indices == free_before | {4}
 
 
 def test_packing_mode_keeps_the_evicted_members_slot(monkeypatch):
@@ -289,10 +290,12 @@ def test_packing_mode_keeps_the_evicted_members_slot(monkeypatch):
     _install_packer(monkeypatch, (1, 1), recorder)
     seqs = _mixed_wave(1)
     worker_state = _packing_worker(1, seqs, {"e": 6, "q1": 7})
+    free_before = set(worker_state._free_local_indices)
     _assignment_method()(worker_state, ["e", "q0", "q1"], current_wave=True)
     assert seqs["e"].assigned_rank == 1 and seqs["q1"].assigned_rank == 1
     assert worker_state._uuid_to_local_map == {"e": 6, "q1": 7}
-    assert worker_state._free_local_indices == set()
+    # No slot is returned (the set is the fixture's, unchanged).
+    assert worker_state._free_local_indices == free_before
 
 
 def test_packing_mode_raises_when_ranks_disagree(monkeypatch):
