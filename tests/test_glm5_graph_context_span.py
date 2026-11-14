@@ -36,6 +36,11 @@ from batchgen.config.graph_span_policy import (
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
 from tests.worker.worker_fakes import make_graph_state
+from tests.worker_method_source import (
+    STEP_OBSERVABILITY_SOURCE,
+    step_observability_method_names,
+    worker_shaped_method_node,
+)
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -51,6 +56,9 @@ def _worker_class() -> ast.ClassDef:
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
+    # S7: the span warning runs in StepObservabilityEngine (worker delegates).
+    if name in step_observability_method_names():
+        return worker_shaped_method_node(name)
     for stmt in _worker_class().body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name == name:
             return stmt
@@ -83,7 +91,10 @@ BUDGET_BYTES = GRAPH_CONTEXT_STATICS_BUDGET_BYTES
 BYTES_PER_TOKEN_PER_ROW = GRAPH_CONTEXT_STATICS_BYTES_PER_TOKEN_PER_ROW
 SPAN_ALIGN = GRAPH_CONTEXT_SPAN_ALIGN
 SPAN_FLOOR = GRAPH_CONTEXT_SPAN_FLOOR_TOKENS
-WARN_INTERVAL_S = _module_constant("_GRAPH_SPAN_WARN_INTERVAL_S")
+# S7: the rate-limit constant moved with the warning into the engine module.
+WARN_INTERVAL_S = _assigned_value(
+    ast.parse(STEP_OBSERVABILITY_SOURCE.read_text()).body, "_GRAPH_SPAN_WARN_INTERVAL_S"
+)
 EAGER_SERVABLE_REASONS = _class_constant(
     "_WHOLE_GRAPH_EAGER_SERVABLE_REASONS"
 )
