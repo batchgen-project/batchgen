@@ -440,6 +440,9 @@ class WorkerManager:
             and self.args.node_rank == 0
         ):
             status["peers"] = coordinator.peer_acks()
+        daemon = self.distributed_weight_daemon
+        if daemon is not None:
+            status["distributed_weights"] = json.loads(daemon.status())
         return status
 
     def _acquire_runtime_admission(self) -> None:
@@ -1993,7 +1996,15 @@ class WorkerManager:
         # handler declines while a restart owns the pool, and a cohort that
         # dies just before that restart flips to serving must still be caught
         # on the first poll after the flip.  Each reason is logged once.
+        #
+        # The distributed-weight daemon is polled here too, and its failure
+        # fails the pool exactly as a worker exit does.  It is acted on only
+        # once two consecutive polls report it with no worker exit in
+        # either: a worker's death closes its daemon socket before the
+        # process is reapable, so the daemon names it first, and waiting one
+        # poll lets the exit (the root cause, with its traceback) lead.
         reported = None
+        daemon_failure_seen = False
         while not self._monitor_stop_event.is_set():
             if self.worker_process is None:
                 return
@@ -2013,6 +2024,13 @@ class WorkerManager:
                 if self._monitor_stop_event.is_set():
                     return
                 exit_reason = self._collect_worker_exit_reason()
+                if exit_reason:
+                    daemon_failure_seen = False
+                else:
+                    daemon_reason = self._distributed_weight_failure_reason()
+                    if daemon_reason is not None and daemon_failure_seen:
+                        exit_reason = daemon_reason
+                    daemon_failure_seen = daemon_reason is not None
                 if exit_reason:
                     if self._stopping:
                         return
@@ -2319,6 +2337,47 @@ class WorkerManager:
         if self.distributed_weight_daemon is None:
             return 0
         return int(self.distributed_weight_daemon.cohort_epoch())
+
+    def _distributed_weight_failure_reason(self) -> Optional[str]:
+        """Why this node's distributed-weight daemon cannot serve the current
+        cohort, or None while it can.
+
+        The daemon lives in this process and never calls back into Python, so
+        its two latches are read here: the transport (permanent, a cold
+        restart is required) and the current cohort (cleared by the next
+        cohort swap, so a worker restart recovers). Unread, an idle pool kept
+        answering /health 200 and admitting batches until the next streamed
+        prefill reached the latch. A probe that fails leaves the daemon's
+        state unknown, which is a failure too: serving on it is not safe.
+        """
+        daemon = self.distributed_weight_daemon
+        if daemon is None:
+            return None
+        node = self.args.node_rank
+        # Everything read from the report is inside the guard: an exception
+        # escaping here would end the monitor thread, and with it the
+        # detection of worker exits too.
+        try:
+            status = json.loads(daemon.status())
+            if status["failed"]:
+                return (
+                    f"distributed weight daemon on node {node} failed "
+                    f"({status['failure_class']}, cold restart required): "
+                    f"{status['failure']}"
+                )
+            cohort = status["cohort"]
+            if cohort["faulted"]:
+                return (
+                    f"distributed weight daemon on node {node} failed worker "
+                    f"cohort {cohort['epoch']} ({cohort['fault_class']}, "
+                    f"worker restart required): {cohort['fault']}"
+                )
+            return None
+        except Exception as exc:
+            return (
+                f"distributed weight daemon on node {node} could not report "
+                f"its status: {type(exc).__name__}: {exc}"
+            )
 
     def _begin_distributed_weight_swap(self) -> None:
         if self.distributed_weight_daemon is None:

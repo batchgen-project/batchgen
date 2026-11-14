@@ -282,6 +282,8 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
         _install_prefill_weight_copy_pipeline=lambda flag: None,
         _probe_startup_transient=lambda **kwargs: events.append(
             ("probe", kwargs["seam"], kwargs["capture"])),
+        # No retained decode instance / no requested graphs: no startup capture.
+        _startup_decode_graph_capture=lambda key: None,
     )
 
     def size_pool():
@@ -308,10 +310,19 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
     from batchgen.phase_lifecycle import PhaseKey
 
     events = []
-    build = load_worker_methods(["_build_persistent_phase_instances"], {
+    methods = load_worker_methods([
+        "_build_persistent_phase_instances", "_capture_startup_decode_graphs",
+        "_decode_graph_state_present",
+    ], {
         "PhaseKey": PhaseKey, "logging": logging, "_startup_transient": startup_transient,
         "time": SimpleNamespace(perf_counter=lambda: 0),
-    })["_build_persistent_phase_instances"]
+    })
+    build = methods["_build_persistent_phase_instances"]
+
+    def captured_graphs():
+        events.append("capture")
+        worker._decode_graph_captures += 1
+        worker._cuda_graph_manager = object()
     worker = SimpleNamespace(
         rank=0, comm=None, parallel_manager=SimpleNamespace(decode_instance=None),
         _transition_phase=lambda key, **kwargs: (events.append(key.phase) or True, False),
@@ -326,8 +337,13 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _glm5_whole_model_graph_requested_for_current_batch=lambda: capture,
         _sync_decode_moe_rank_counts=lambda *args, **kwargs: None,
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
-        _warmup_cuda_graphs=lambda: events.append("capture"),
+        _warmup_cuda_graphs=captured_graphs,
+        _decode_graph_captures=0, _cuda_graph_manager=None,
     )
+    worker._capture_startup_decode_graphs = (
+        lambda: methods["_capture_startup_decode_graphs"](worker))
+    worker._decode_graph_state_present = (
+        lambda: methods["_decode_graph_state_present"](worker))
 
     def probe(*, seam, capture):
         assert seam == startup_transient.SEAM_PERSISTENT_BUILD

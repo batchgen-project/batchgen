@@ -113,6 +113,30 @@ def uniform_expert_assignment(
     return (row_starts[:, None] + offsets[None, :]) % experts
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+# Every routed-expert tensor a resident decode expert carries, as
+# (checkpoint tensor key, expert attribute). The packed weights and their
+# scales are required; a bias is carried when the checkpoint has one.
+_EXPERT_WEIGHT_ATTRS = (
+    ("gate_proj.weight", "mxfp4_gate_packed"),
+    ("gate_proj.weight_scales", "mxfp4_gate_scales"),
+    ("up_proj.weight", "mxfp4_up_packed"),
+    ("up_proj.weight_scales", "mxfp4_up_scales"),
+    ("down_proj.weight", "mxfp4_down_packed"),
+    ("down_proj.weight_scales", "mxfp4_down_scales"),
+)
+_EXPERT_BIAS_ATTRS = (
+    ("gate_proj.bias", "mxfp4_gate_bias"),
+    ("up_proj.bias", "mxfp4_up_bias"),
+    ("down_proj.bias", "mxfp4_down_bias"),
+)
+# VmmArena.carve aligns every view's start to this many bytes.
+_ARENA_CARVE_ALIGN_BYTES = 256
+
+
 class GptOssParallelStrategyManager:
     """Manage parallel execution strategy for GPT-OSS-120B.
 
@@ -121,7 +145,18 @@ class GptOssParallelStrategyManager:
     - No tensor parallelism
     - MXFP4 dequantization for expert weights
     - BF16 attention weights (not quantized)
+
+    Phase instances follow the worker's reusable-instance lifecycle: when the
+    worker asks for reuse (``reuse_phase_instances``) and this rank keeps
+    every one of its routed experts resident, the decode instance is built
+    once and kept. Its routed experts live in a fixed-address VMM arena whose
+    physical memory is released while prefill runs (SUSPEND) and refilled
+    from the host copy at the same addresses on activation, so the captured
+    decode graphs survive every phase switch. The prefill instance is never
+    kept: it replicates all routed experts on every rank.
     """
+
+    NUM_TOTAL_EXPERTS = 128
 
     def __init__(
         self,
@@ -159,6 +194,265 @@ class GptOssParallelStrategyManager:
 
         # Communication handler for EP (set during configure_decoding)
         self.comm = None
+        self.padding_bsz = None
+
+        # Worker phase-instance reuse protocol (default lifecycle). The worker
+        # sets ``reuse_phase_instances``; ``_instances_are_reused`` decides
+        # whether this rank honours it. A kept decode instance owns no expert
+        # memory of its own: its routed experts are views into the arena,
+        # which with its carved rows and host copy pairs lives for the process.
+        self.reuse_phase_instances = False
+        self.decode_instance = None
+        self._expert_arena = None
+        self._expert_rows = {}
+        self._expert_copy_pairs = []
+
+    # ------------------------------------------------------------------ #
+    #  Phase-instance reuse protocol                                     #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def persistent_phase_instances(self):
+        """Always False: ``--persistent-phase-instances`` is not supported.
+
+        That flag keeps the prefill instance too, and a GPT-OSS prefill
+        instance holds every routed expert resident on every rank. The
+        worker's flag gate admits any manager with ``activate_decoding`` and
+        then writes True here, so the refusal lives in the setter to fail at
+        startup instead of at the first phase switch.
+        """
+        return False
+
+    @persistent_phase_instances.setter
+    def persistent_phase_instances(self, value):
+        if value:
+            raise RuntimeError(
+                "GPT-OSS does not support --persistent-phase-instances; it "
+                "uses the default phase-instance reuse lifecycle"
+            )
+
+    @property
+    def _instances_are_reused(self) -> bool:
+        """True when this rank keeps its decode instance across phase switches.
+
+        The worker's request is honoured only when every local routed expert
+        is resident in the checkpoint's MXFP4 layout: that is what lets the
+        experts live in the arena as fixed-address rows refilled by a plain
+        host-to-device copy. A rank that streams part of its experts, or that
+        pre-dequantizes them to BF16 (resident bytes no longer the host
+        bytes), keeps ``decode_instance`` None, which is how the worker learns
+        to rebuild that phase on every switch exactly as before.
+        """
+        return bool(
+            self.reuse_phase_instances
+            and self._local_routed_experts_fully_resident()
+            and not getattr(self.model_config, "pre_dequantize_weights", False)
+        )
+
+    def _plan_local_expert_split(self) -> Tuple[bool, int, int]:
+        """(EP offloading on, experts resident per layer, experts owned per layer).
+
+        Derived from the world size and the EP configuration only, so it gives
+        the same answer before and after ``configure_decoding`` assigns the
+        ranges: the reuse decision is asked before the first decode configure.
+        A single-GPU deployment decodes with every expert resident.
+        """
+        if self.world_size <= 1:
+            owned = self.model_config.num_local_experts
+            return False, owned, owned
+        owned = self.NUM_TOTAL_EXPERTS // self.world_size
+        if self.world_size > 8:
+            return False, owned, owned
+        if self.engine_config.EP_Config.enable_offloading:
+            offload_ratio = self.engine_config.EP_Config.offloading_ratio
+            return True, int(owned * (1 - offload_ratio)), owned
+        return False, owned, owned
+
+    def _local_routed_experts_fully_resident(self) -> bool:
+        """True when this rank keeps every one of its routed experts on GPU."""
+        _, resident, owned = self._plan_local_expert_split()
+        return resident == owned
+
+    def _local_resident_expert_range(self) -> Tuple[int, int]:
+        """[start, end) global expert indices this rank keeps resident."""
+        _, resident, owned = self._plan_local_expert_split()
+        start = self.global_rank * owned if self.world_size > 1 else 0
+        return start, start + resident
+
+    @property
+    def decode_experts_resident(self) -> bool:
+        """Whether the kept decode instance's routed experts are mapped."""
+        return self._expert_arena is not None and self._expert_arena.is_mapped
+
+    def activate_decoding(self):
+        """Switch the kept decode instance in and refill its routed experts."""
+        if self.decode_instance is None:
+            raise RuntimeError(
+                f"rank {self.rank}: activate_decoding needs a kept decode "
+                "instance; a rank without one rebuilds through configure_decoding"
+            )
+        prep_start = time.perf_counter()
+        # The prefill instance's cached blocks go back to the driver first:
+        # the arena maps physical memory outside the caching allocator.
+        torch.cuda.empty_cache()
+        self.loaded_model_config.phase = "decode"
+        self.model, self.weight_copy_task = self.decode_instance
+        start = time.perf_counter()
+        self._expert_arena.map()
+        mapped = time.perf_counter()
+        self.refill_local_routed_experts()
+        done = time.perf_counter()
+        nbytes = sum(dst.nbytes for dst, _ in self._expert_copy_pairs)
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d prep=%.3fs map=%.3fs refill=%.3fs %.1f GB/s",
+            self.rank,
+            start - prep_start,
+            mapped - start,
+            done - mapped,
+            nbytes / max(done - mapped, 1e-9) / 1e9,
+        )
+        return self.model, self.weight_copy_task
+
+    def release_decode_routed_experts(self):
+        """Return the decode routed experts' HBM; their addresses stay reserved."""
+        torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        start = time.perf_counter()
+        self._expert_arena.unmap()
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d unmap=%.3fs",
+            self.rank,
+            time.perf_counter() - start,
+        )
+
+    @staticmethod
+    def _copy_expert_pairs(pairs):
+        """H2D-copy every (arena row, host source) pair, then await once."""
+        for dst, src in pairs:
+            dst.copy_(src, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+    def refill_local_routed_experts(self):
+        """H2D-copy every local routed expert into its fixed-address arena row."""
+        self._copy_expert_pairs(self._expert_copy_pairs)
+
+    def _make_expert_arena(self, nbytes: int):
+        """Reserve one fixed-address virtual range for the local routed experts.
+
+        Split out so the lifecycle can be exercised without a device: CUDA
+        VMM is the only production implementation.
+        """
+        from batchgen.cuda_graph.vmm_arena import VmmArena
+
+        # 512 MiB chunks keep the round-up waste under 0.5 GiB of HBM.
+        return VmmArena(
+            self.engine_config.Basic_Config.device_torch,
+            nbytes,
+            chunk_bytes=512 << 20,
+        )
+
+    def _carve_local_routed_expert_rows(self, carve):
+        """Carve one fixed-address row per (layer, local expert, tensor).
+
+        ``carve(shape, dtype) -> tensor`` supplies the rows. Returns the rows
+        keyed by ``(layer_idx, expert_idx)`` and the (row, host source) pairs
+        ``refill_local_routed_experts`` copies. The host sources are the
+        address-stable Weights_Storage tensors, so the pairs stay valid for
+        the life of the arena. Every expert must match the first expert's
+        tensor set, shapes and dtypes, which is what the arena was sized for.
+        """
+        start, end = self._local_resident_expert_range()
+        first = self.core_engine.get_tensor(f"routed_expert_0_{start}")
+        attrs = [
+            (key, attr)
+            for key, attr in _EXPERT_WEIGHT_ATTRS + _EXPERT_BIAS_ATTRS
+            if key in first
+        ]
+        missing = [key for key, _ in _EXPERT_WEIGHT_ATTRS if key not in first]
+        if missing:
+            raise RuntimeError(
+                f"routed_expert_0_{start} has no {missing}; the resident decode "
+                "experts need packed MXFP4 weights and scales"
+            )
+        rows = {}
+        pairs = []
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            for expert_idx in range(start, end):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                tensors = self.core_engine.get_tensor(module_key)
+                extra = sorted(
+                    key for key, _ in _EXPERT_BIAS_ATTRS
+                    if (key in tensors) != (key in first)
+                )
+                if extra:
+                    raise RuntimeError(
+                        f"{module_key}: bias set differs from routed_expert_0_"
+                        f"{start} on {extra}"
+                    )
+                expert_rows = {}
+                for key, attr in attrs:
+                    src = tensors[key]
+                    ref = first[key]
+                    if src.shape != ref.shape or src.dtype != ref.dtype:
+                        raise RuntimeError(
+                            f"{module_key}.{key}: host {tuple(src.shape)}/"
+                            f"{src.dtype} does not match the arena row "
+                            f"{tuple(ref.shape)}/{ref.dtype}"
+                        )
+                    row = carve(tuple(src.shape), src.dtype)
+                    expert_rows[attr] = row
+                    pairs.append((row, src))
+                rows[(layer_idx, expert_idx)] = expert_rows
+        return rows, pairs
+
+    def _expert_arena_bytes(self) -> int:
+        """Bytes the local routed experts' rows take, carve alignment included."""
+        start, end = self._local_resident_expert_range()
+        first = self.core_engine.get_tensor(f"routed_expert_0_{start}")
+        per_expert = sum(
+            _round_up(
+                first[key].numel() * first[key].element_size(),
+                _ARENA_CARVE_ALIGN_BYTES,
+            )
+            for key, _ in _EXPERT_WEIGHT_ATTRS + _EXPERT_BIAS_ATTRS
+            if key in first
+        )
+        return per_expert * (end - start) * self.model_config.num_hidden_layers
+
+    def _load_local_routed_experts_into_arena(self):
+        """Load this rank's routed experts into fixed-address arena rows.
+
+        A kept decode instance replays its CUDA graphs across prefill phases,
+        so the expert tensors its MoE pointer tables reference must never
+        move. They live in one VmmArena, created and carved on the first
+        decode build; every later build (after a RETIRE) maps the same range
+        again and binds the same rows, so the addresses never change for the
+        life of the process.
+        """
+        if self._expert_arena is None:
+            self._expert_arena = self._make_expert_arena(self._expert_arena_bytes())
+            self._expert_arena.map()
+            self._expert_rows, self._expert_copy_pairs = (
+                self._carve_local_routed_expert_rows(self._expert_arena.carve)
+            )
+        elif self._expert_arena.is_mapped:
+            raise RuntimeError(
+                f"rank {self.rank}: decode build found the routed-expert arena "
+                "still mapped; a retired decode instance must release it"
+            )
+        else:
+            self._expert_arena.map()
+        self.refill_local_routed_experts()
+        for (layer_idx, expert_idx), expert_rows in self._expert_rows.items():
+            expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+            for attr, row in expert_rows.items():
+                setattr(expert, attr, row)
+        logging.info(
+            "Loaded MXFP4 expert weights for %d local experts into the "
+            "fixed-address arena (rank %d, %.2f GiB)",
+            len(self._expert_rows),
+            self.rank,
+            sum(dst.nbytes for dst, _ in self._expert_copy_pairs) / (1024 ** 3),
+        )
 
     def configure_prefill(self) -> Tuple:
         """Configure model skeleton for prefill phase.
@@ -835,23 +1129,23 @@ class GptOssParallelStrategyManager:
             self.local_routed_experts: List of GPU-resident expert keys
             self.host_routed_experts: List of host-resident expert keys
         """
-        NUM_TOTAL_EXPERTS = 128
-        NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+        # Same planner the reuse decision is made with before the first
+        # configure, so the two can never disagree.
+        (
+            self.enable_ep_offloading,
+            NUM_LOCAL_EXPERT_PER_LAYER,
+            NUM_EXPERT_PER_RANK,
+        ) = self._plan_local_expert_split()
 
         # Determine offloading behavior based on deployment scenario
         if self.world_size > 8:
             # Multi-node: all experts persistent (no offloading across nodes)
-            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
-            self.enable_ep_offloading = False
             logging.info(
                 f"Rank {self.rank}: Multi-node mode (world_size={self.world_size}). "
                 f"All {NUM_EXPERT_PER_RANK} experts per rank are persistent."
             )
-        elif self.engine_config.EP_Config.enable_offloading:
+        elif self.enable_ep_offloading:
             # Single-node with EP offloading
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
-            self.enable_ep_offloading = True
             logging.info(
                 f"Rank {self.rank}: EP with offloading enabled. "
                 f"Experts per rank: {NUM_EXPERT_PER_RANK}, "
@@ -860,8 +1154,6 @@ class GptOssParallelStrategyManager:
             )
         else:
             # Single-node without offloading: all experts persistent
-            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
-            self.enable_ep_offloading = False
             logging.info(
                 f"Rank {self.rank}: EP without offloading. "
                 f"All {NUM_LOCAL_EXPERT_PER_LAYER} experts persistent per rank."
@@ -1006,7 +1298,13 @@ class GptOssParallelStrategyManager:
         # Step 6.6: Load expert MXFP4 weights
         # For EP: only load local experts (GPU-resident)
         # For single GPU: load all experts
-        if ep_enabled:
+        # A kept decode instance takes the same bytes into fixed-address
+        # arena rows instead, so its experts can be released for prefill and
+        # refilled at the same addresses.
+        reuse = self._instances_are_reused
+        if reuse:
+            self._load_local_routed_experts_into_arena()
+        elif ep_enabled:
             self._load_expert_module_ep()
         else:
             self._load_expert_module()
@@ -1050,6 +1348,8 @@ class GptOssParallelStrategyManager:
             f"(EP={ep_enabled}, offloading={self.enable_ep_offloading if ep_enabled else False})"
         )
 
+        if reuse:
+            self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
     @torch.inference_mode()
@@ -1438,8 +1738,8 @@ class GptOssParallelStrategyManager:
     def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
         """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
 
-        This manager keeps no suspended phase instance (experts are resident
-        and every transition rebuilds), so entering a phase always builds it.
+        Decode resumes the kept decode instance when there is one, otherwise
+        builds it. Prefill always builds: its instance is never kept.
         """
         if key.phase == "prefill":
             return self.configure_prefill()
@@ -1452,6 +1752,18 @@ class GptOssParallelStrategyManager:
                 raise ValueError(
                     "decode phase_enter requires PhaseEnterContext.max_num_seq"
                 )
+            if self.decode_instance is not None:
+                # The kept instance's EP buffers and captured graphs were
+                # built for one communicator and one per-rank width.
+                if ctx.comm is not self.comm or ctx.max_num_seq != self.padding_bsz:
+                    raise RuntimeError(
+                        f"rank {self.rank}: decode activation context "
+                        f"(max_num_seq={ctx.max_num_seq}, same comm="
+                        f"{ctx.comm is self.comm}) differs from the kept "
+                        f"instance's (padding_bsz={self.padding_bsz}); the "
+                        "instance must be retired and rebuilt"
+                    )
+                return self.activate_decoding()
             return self.configure_decoding(
                 padding_bsz=ctx.max_num_seq, comm=ctx.comm
             )
@@ -1465,19 +1777,44 @@ class GptOssParallelStrategyManager:
             raise ValueError(f"admit: unsupported phase {key.phase!r}")
 
     def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
-        """Leave ``key.phase``; both modes are manager-side no-ops.
+        """Leave ``key.phase`` in ``mode`` (see ExitMode).
 
-        Nothing resumable is kept between phases (no stored instances, no
-        routed-expert release seam), and the retire mechanics
-        (deep_free_model_memory, GPU KV destroy) are worker-owned.
+        SUSPEND of decode releases the routed experts' physical memory and
+        keeps the instance, its graphs' addresses and the arena reservation.
+        RETIRE drops the instance; the worker's retire mechanics
+        (deep_free_model_memory, GPU KV destroy) free the rest, and the arena
+        is unmapped here because dropping the model's references does not
+        return VMM memory.
         """
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
-        if mode not in (ExitMode.SUSPEND, ExitMode.RETIRE):
+        if mode is ExitMode.RETIRE:
+            if key.phase == "decode":
+                self.decode_instance = None
+                if self.decode_experts_resident:
+                    self.release_decode_routed_experts()
+            self.model = None
+            self.weight_copy_task = {}
+            return
+        if mode is not ExitMode.SUSPEND:
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
+        if key.phase == "prefill":
+            # No prefill instance is kept; nothing manager-owned to suspend.
+            return
+        if self.decode_instance is None or not self.decode_experts_resident:
+            raise RuntimeError(
+                f"rank {self.rank}: decode SUSPEND needs a resident reusable "
+                "decode instance; a rank without one must RETIRE"
+            )
+        self.release_decode_routed_experts()
 
     def holds_instance(self, phase: str) -> bool:
-        """Build-always manager retains no phase instance."""
-        if phase not in ("prefill", "decode"):
-            raise ValueError(f"holds_instance: unsupported phase {phase!r}")
-        return False
+        """Return whether a resumable instance is retained for ``phase``.
+
+        Prefill never is: its instance replicates every routed expert.
+        """
+        if phase == "prefill":
+            return False
+        if phase == "decode":
+            return self.decode_instance is not None
+        raise ValueError(f"holds_instance: unsupported phase {phase!r}")

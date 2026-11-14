@@ -165,6 +165,52 @@ def test_key_change_exits_before_entering():
     )
 
 
+def test_decode_entry_resumes_a_held_decode_instance_after_prefill_retires():
+    # A manager that keeps no prefill instance retires prefill on every
+    # switch; its kept decode instance is still the one phase_enter resumes.
+    events = []
+    manager = _Manager(events, {"prefill": False, "decode": True})
+    worker = _worker(manager, events)
+    worker._live_phase_key = PhaseKey("prefill", "streamed")
+
+    changed, resumed = worker._transition_phase(
+        PhaseKey("decode", "streamed"), comm="comm", max_num_seq=16
+    )
+
+    assert (changed, resumed) == (True, True)
+    assert ("exit", "prefill", ExitMode.RETIRE) in events
+    assert events.index("deep_free") < events.index(("enter", "decode", "comm", 16))
+
+
+def test_decode_entry_is_not_a_resume_when_no_decode_instance_survives_the_exit():
+    events = []
+
+    class _RetiringManager(_Manager):
+        def phase_exit(self, key, mode):
+            super().phase_exit(key, mode)
+            if mode is ExitMode.RETIRE and key.phase == "decode":
+                self.held["decode"] = False
+
+    manager = _RetiringManager(events, {"decode": True})
+    worker = _worker(manager, events)
+    worker._live_phase_key = PhaseKey("decode", "streamed")
+
+    # A key change retires the live decode instance; the entry rebuilds.
+    changed, resumed = worker._transition_phase(
+        PhaseKey("decode", "resident_ep"), comm="comm", max_num_seq=16
+    )
+    assert (changed, resumed) == (True, False)
+    assert ("exit", "decode", ExitMode.RETIRE) in events
+
+    events.clear()
+    manager = _Manager(events, {"prefill": True, "decode": False})
+    worker = _worker(manager, events)
+    worker._live_phase_key = PhaseKey("prefill", "streamed")
+    assert worker._transition_phase(
+        PhaseKey("decode", "streamed"), comm="comm", max_num_seq=16
+    ) == (True, False)
+
+
 def test_unheld_outgoing_instance_uses_retire_mechanics():
     events = []
     manager = _Manager(events, {"decode": False})
