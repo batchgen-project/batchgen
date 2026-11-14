@@ -272,25 +272,17 @@ def test_bucket_sizes_match_the_generator_the_worker_used_to_carry(
     max_bucket, num_buckets, expected
 ):
     """The values the deleted worker copy produced, by its own docstring."""
-    assert GraphRuntime().generate_bucket_sizes(max_bucket, num_buckets) == expected
     assert generate_bucket_sizes(max_bucket, num_buckets) == expected
 
 
-def test_the_runtime_delegates_to_the_single_generator():
-    graph = GraphRuntime()
-    for max_bucket in (1, 7, 16, 100, 128, 256, 1024):
-        for num_buckets in (1, 2, 5, 9, 16, 32):
-            assert graph.generate_bucket_sizes(
-                max_bucket, num_buckets
-            ) == generate_bucket_sizes(max_bucket, num_buckets)
-
-
 def test_the_package_implements_the_generator_exactly_once():
-    """One implementation; the runtime's same-named method only delegates.
+    """One implementation, and no delegating copy.
 
     The worker used to carry a second copy of the geometric spacing (its
     ``_generate_bucket_sizes`` static method) while ``buckets.py``'s docstring
-    already claimed the move had happened.
+    already claimed the move had happened. GraphRuntime's delegating method
+    went dead once the worker took its ladder from ``decode_graph_bucket_sizes``
+    (main 1c372209) and was deleted.
     """
     implementations, delegators = [], []
     for path in sorted((_ROOT / "batchgen").rglob("*.py")):
@@ -320,10 +312,7 @@ def test_the_package_implements_the_generator_exactly_once():
     assert implementations[0].startswith(
         "batchgen/cuda_graph/buckets.py"
     ), implementations
-    assert len(delegators) == 1, delegators
-    assert delegators[0].startswith(
-        "batchgen/worker/graph_runtime.py"
-    ), delegators
+    assert not delegators, delegators
 
     # The algorithm's inner helper exists only inside that one implementation.
     helpers = [
