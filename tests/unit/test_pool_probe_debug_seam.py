@@ -56,10 +56,13 @@ _ENGINE_METHODS = {
     "_new_pool_kernel_dump_recorder", "_pool_pad_poison_enabled",
     "_new_pool_offload_check_recorder",
 }
+# S5b: the two prefill forwards moved verbatim to PrefillEngine; they are only
+# read structurally here, never exec-lifted.
+_ENGINE_FORWARDS = {"_prefill_prepacked_pool", "prefill_prepacked"}
 
 
 def _method(name: str) -> ast.FunctionDef:
-    tree = ENGINE_TREE if name in _ENGINE_METHODS else TREE
+    tree = ENGINE_TREE if name in _ENGINE_METHODS | _ENGINE_FORWARDS else TREE
     return next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == name

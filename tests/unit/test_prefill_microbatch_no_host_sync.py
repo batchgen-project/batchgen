@@ -11,13 +11,15 @@ after the existing completion boundary. This test pins both at source level.
 import ast
 import pathlib
 
-WORKER = (
-    pathlib.Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+# S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+ENGINE = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "batchgen" / "worker" / "prefill_engine.py"
 )
 
 
 def _prefill_prepacked():
-    tree = ast.parse(WORKER.read_text())
+    tree = ast.parse(ENGINE.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "prefill_prepacked":
             return node
