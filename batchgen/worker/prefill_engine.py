@@ -32,6 +32,13 @@ from batchgen.prefill.prepack import (
 )
 
 
+# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
+# Spelled out here, instead of imported from the four probe modules, so that
+# deciding "is any probe armed on this prefill" is a membership test on a dict
+# the engine already holds: a production prefill must not import a probe module
+# or build a merged debug dict to be told that nothing is armed.
+# ``tests/unit/test_pool_probe_debug_seam.py`` pins these against the modules'
+# own constants, so the duplication cannot drift.
 _EPILOGUE_TRACE_DEBUG_FLAG = "prefix_pool_epilogue_trace"
 _EPILOGUE_TRACE_PROBE_TOKEN_FLAG = "prefix_pool_epilogue_probe_token"
 _POOL_OFFLOAD_CHECK_DEBUG_FLAG = "prefix_pool_offload_check"
