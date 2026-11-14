@@ -67,6 +67,10 @@ class _FrozenSetView(AbstractSetABC):
         return f"{type(self).__name__}({set(self._backing)!r})"
 
 
+class SequenceSlotCollisionError(RuntimeError):
+    """An explicit local slot is already bound to a different uuid."""
+
+
 class SequenceTable:
     """Single authority for one rank's local slot binding."""
 
@@ -124,9 +128,14 @@ class SequenceTable:
 
         With ``local_idx=None`` the slot comes from the free set (an arbitrary
         member, ``set.pop``) or, if the set is empty, from the next never-used
-        index. An explicit ``local_idx`` is bound as given: it is neither
-        checked against nor removed from the free set. That matches the
-        behaviour this table replaced.
+        index.
+
+        Invariant: every slot is handed out at most once. An explicit
+        ``local_idx`` therefore leaves both allocation sources: a slot held by
+        another uuid raises ``SequenceSlotCollisionError``; the slot is removed
+        from the free set; and a slot at or beyond the next never-used index
+        advances that index past it, the skipped indices joining the free set.
+        (Rebinding a uuid that is already bound elsewhere is not checked here.)
         """
         if local_idx is None:
             if self._free:
@@ -134,6 +143,17 @@ class SequenceTable:
             else:
                 local_idx = self._next
                 self._next += 1
+        else:
+            holder = self._local_to_uuid.get(local_idx)
+            if holder is not None and holder != uuid:
+                raise SequenceSlotCollisionError(
+                    f"local slot {local_idx} is bound to {holder!r}; "
+                    f"cannot bind it to {uuid!r}"
+                )
+            self._free.discard(local_idx)
+            if local_idx >= self._next:
+                self._free.update(range(self._next, local_idx))
+                self._next = local_idx + 1
         self._local_to_uuid[local_idx] = uuid
         self._uuid_to_local[uuid] = local_idx
         return local_idx
