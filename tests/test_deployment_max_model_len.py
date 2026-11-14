@@ -177,7 +177,8 @@ def test_pool_is_verified_before_allocation_and_recreation_uses_cached_size():
         assert op == "MIN"
         tensor.fill_(6)  # a peer has less space than this rank's 7 GiB
 
-    init = load_worker_methods(["_init_gpu_kv_with_actual_size"], {
+    # S10a: the actual-size init runs in KVCapacityEngine (shaped body).
+    init = load_worker_shaped_methods(["_init_gpu_kv_with_actual_size"], {
         "torch": SimpleNamespace(cuda=cuda, tensor=torch.tensor, float64=torch.float64),
         "dist": SimpleNamespace(all_reduce=reduce_pool, ReduceOp=SimpleNamespace(MIN="MIN")),
         "KVCacheManager": KVCacheManager, "logging": logging, "gc": gc,

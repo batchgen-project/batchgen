@@ -47,7 +47,11 @@ from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 import batchgen.sequence as sequence_module
 from batchgen.worker.rank_context import node_of_rank
 from batchgen.sequence import SequenceStatus
-from tests.worker_method_source import load_prefill_engine_methods
+from tests.worker_method_source import (
+    delegated_method_names,
+    load_prefill_engine_methods,
+    worker_shaped_method_node,
+)
 from batchgen.worker.kv_plan import (
     NodeCapacityReport,
     prefill_owner_demand_pages,
@@ -124,8 +128,12 @@ def _worker_methods(dist):
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
     )
+    # S10a: a delegated method compiles from its engine body (worker shape).
     wanted = [
-        copy.deepcopy(node) for node in worker.body
+        worker_shaped_method_node(node.name)
+        if node.name in delegated_method_names()
+        else copy.deepcopy(node)
+        for node in worker.body
         if isinstance(node, ast.FunctionDef) and node.name in METHODS
     ]
     assert {node.name for node in wanted} == set(METHODS)

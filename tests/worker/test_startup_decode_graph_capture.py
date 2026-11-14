@@ -34,7 +34,10 @@ from typing import Callable, Optional
 import pytest
 
 import batchgen.cuda_graph as cuda_graph_module
-from batchgen.config.cuda_graph_flag_policy import cli_enables_whole_model_graph
+from batchgen.config.cuda_graph_flag_policy import (
+    cli_enables_whole_model_graph,
+    glm5_whole_model_cuda_graph_requested,
+)
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.cuda_graph import BatchSizeBucketing
 from batchgen.cuda_graph.buckets import check_decode_width_within_buckets
@@ -93,6 +96,9 @@ def _load(cuda=None, dist=None):
         "glm5_whole_model_cuda_graph_requested_for_model": (
             glm5_whole_model_cuda_graph_requested_for_model
         ),
+        # rb5: the branch re-homed the predicate behind cuda_graph_flag_policy
+        # (S4b); the body reads this spelling, not the _for_model one.
+        "glm5_whole_model_cuda_graph_requested": glm5_whole_model_cuda_graph_requested,
         "check_decode_width_within_buckets": check_decode_width_within_buckets,
     })
 

@@ -25,7 +25,10 @@ from typing import Optional
 
 import pytest
 
-from batchgen.config.cuda_graph_flag_policy import cli_enables_whole_model_graph
+from batchgen.config.cuda_graph_flag_policy import (
+    cli_enables_whole_model_graph,
+    glm5_whole_model_cuda_graph_requested,
+)
 from batchgen.cuda_graph.buckets import (
     DecodeWidthExceedsGraphBucketError,
     check_decode_width_within_buckets,
@@ -38,14 +41,17 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
 from tests.worker.worker_fakes import attach_graph_state
-from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
+from tests.worker_method_source import (
+    WORKER_SOURCE,
+    load_worker_methods,
+    load_worker_shaped_methods,
+)
 
 GLM5 = "zai-org/GLM-5-FP8"
 GPT_OSS = "openai/gpt-oss-120b"
 
 _METHODS = load_worker_methods(
     [
-        "_max_decode_rank_bsz",
         "_whole_model_decode_graphs_requested",
         "_glm5_whole_model_graph_requested_for_current_batch",
         "_decode_graph_bucket_sizes",
@@ -66,8 +72,22 @@ _METHODS = load_worker_methods(
         "decode_graph_bucket_sizes": decode_graph_bucket_sizes,
         "check_decode_width_within_buckets": check_decode_width_within_buckets,
         "DecodeWidthExceedsGraphBucketError": DecodeWidthExceedsGraphBucketError,
+        # rb5: the branch re-homed the predicate behind cuda_graph_flag_policy
+        # (S4b); the body reads this spelling, not the _for_model one.
+        "glm5_whole_model_cuda_graph_requested": glm5_whole_model_cuda_graph_requested,
     },
 )
+# S10a: _max_decode_rank_bsz runs in KVCapacityEngine; lift the shaped body
+# so the worker delegator's engine import never runs.
+_METHODS.update(load_worker_shaped_methods(
+    ["_max_decode_rank_bsz"],
+    {
+        "os": os,
+        "logging": logging,
+        "_MAX_DECODE_RANK_BSZ": 128,
+        "decode_graph_bucket_sizes": decode_graph_bucket_sizes,
+    },
+))
 _Worker = type("_Worker", (), dict(_METHODS))
 
 
@@ -303,7 +323,10 @@ def test_page_table_slots_cover_the_derived_top_bucket():
 
 
 def test_page_table_request_carries_the_top_bucket_only_for_graph_deployments():
-    source = WORKER_SOURCE.read_text()
+    # S10a: _make_page_table_capacity_request runs in KVCapacityEngine.
+    source = (
+        WORKER_SOURCE.parent / "worker" / "kv_capacity_engine.py"
+    ).read_text()
     assert "decode_graph_top_bucket=decode_graph_top_bucket" in source
     assert _worker(enable_cuda_graph=False)._decode_graph_top_bucket() is None
     assert _worker(disable_cuda_graphs=True)._decode_graph_top_bucket() is None
@@ -396,7 +419,10 @@ def test_decode_step_without_a_live_graph_checks_the_derived_ladder():
 
 
 def test_decode_loop_has_no_over_bucket_eager_exemption():
-    source = WORKER_SOURCE.read_text()
+    # S4b: the decode loop body runs in DecoupledGpuDecode (decode_engine.py);
+    # the worker keeps no copy of the over-bucket exemption either.
+    assert "_glm5_whole_graph_over_bucket" not in WORKER_SOURCE.read_text()
+    source = (WORKER_SOURCE.parent / "worker" / "decode_engine.py").read_text()
     assert "_glm5_whole_graph_over_bucket" not in source
     assert "self._assert_decode_step_within_graph_buckets(_max_bs)" in source
     # The check precedes the graph/eager dispatch decision.
