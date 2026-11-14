@@ -11,7 +11,12 @@ at the source level for both emission sites.
 import pathlib
 import re
 
-WORKER = pathlib.Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+# S5b: both [METRICS] emission sites (prefill_prepacked, _prefill_prepacked_pool)
+# moved verbatim with their bodies to PrefillEngine.
+ENGINE = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "batchgen" / "worker" / "prefill_engine.py"
+)
 
 CONTRACT_KEYS = (
     '"sequences"',
@@ -36,14 +41,14 @@ def _emission_block(source: str, component: str) -> str:
 
 
 def test_prepacked_emission_carries_contract_keys():
-    source = WORKER.read_text()
+    source = ENGINE.read_text()
     block = _emission_block(source, '"component": "prefill_full_attention"')
     for key in CONTRACT_KEYS:
         assert key in block, f"prepacked METRICS block lost {key}"
 
 
 def test_pooled_wave_emission_carries_contract_keys():
-    source = WORKER.read_text()
+    source = ENGINE.read_text()
     block = _emission_block(source, '"component": "prefix_pool"')
     for key in CONTRACT_KEYS:
         assert key in block, f"pooled wave METRICS block lost {key}"

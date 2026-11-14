@@ -19,14 +19,23 @@ from pathlib import Path
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 SOURCE = WORKER.read_text()
 TREE = ast.parse(SOURCE)
+# S5b: prefill_prepacked's body moved verbatim to PrefillEngine; the flag key
+# literal stays in the worker behind _glm5_lmhead_fp32_flag_name (spec F3), so
+# no model-name literal enters batchgen/worker/.
+ENGINE = (
+    Path(__file__).resolve().parents[2] / "batchgen" / "worker" / "prefill_engine.py"
+)
+ENGINE_SOURCE = ENGINE.read_text()
+ENGINE_TREE = ast.parse(ENGINE_SOURCE)
 
 FLAG = "glm5_lmhead_fp32"
 LOCAL = "_lmhead_fp32"
 
 
 def _method(name: str) -> ast.FunctionDef:
+    tree = ENGINE_TREE if name == "prefill_prepacked" else TREE
     return next(
-        node for node in ast.walk(TREE)
+        node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
 
@@ -43,8 +52,11 @@ def test_the_flag_is_read_once_per_prefill_from_the_batch_debug_dict():
     ]
     assert len(body_assigns) == 1, body_assigns
     assert ast.unparse(body_assigns[0].value) == (
-        f"self._debug_flag_enabled(prefill_debug.get('{FLAG}'))"
+        "self._debug_flag_enabled(prefill_debug.get("
+        "self._glm5_lmhead_fp32_flag_name()))"
     )
+    helper = _method("_glm5_lmhead_fp32_flag_name")
+    assert ast.unparse(helper.body[-1]) == f"return '{FLAG}'"
 
     all_assigns = [
         node for node in ast.walk(_method("prefill_prepacked"))
@@ -73,6 +85,7 @@ def test_no_lmhead_env_guard_survives_in_the_worker():
     """§1.3: debug behavior expressible as a batch flag carries no env var."""
 
     assert "BATCHGEN_GLM5_LMHEAD_FP32" not in SOURCE
+    assert "BATCHGEN_GLM5_LMHEAD_FP32" not in ENGINE_SOURCE
 
 
 def test_the_flag_key_is_spelled_once_and_only_in_that_read():
@@ -81,3 +94,7 @@ def test_the_flag_key_is_spelled_once_and_only_in_that_read():
         if isinstance(node, ast.Constant) and node.value == FLAG
     ]
     assert len(reads) == 1, [node.lineno for node in reads]
+    assert not [
+        node for node in ast.walk(ENGINE_TREE)
+        if isinstance(node, ast.Constant) and node.value == FLAG
+    ]
