@@ -23,7 +23,11 @@ them too, with an error that names the knob that does control them.
 from __future__ import annotations
 
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
-from batchgen.models.glm.glm5.cuda_graph_policy import is_glm5_fp8_graph_default_model
+from batchgen.models.glm.glm5.cuda_graph_policy import (
+    glm5_any_cuda_graph_requested_for_model,
+    glm5_whole_model_cuda_graph_requested_for_model,
+    is_glm5_fp8_graph_default_model,
+)
 
 GPT_OSS_GRAPH_FAMILY = "gpt-oss-120b"
 KIMI_K25_GRAPH_FAMILY = "kimi-k2.5"
@@ -86,4 +90,32 @@ def cli_enables_whole_model_graph(
     return bool(enable_cuda_graph) and cuda_graph_flag_family(model_name) in (
         GPT_OSS_GRAPH_FAMILY,
         KIMI_K25_GRAPH_FAMILY,
+    )
+
+
+def glm5_any_cuda_graph_requested(
+    model_name: str | None,
+    *,
+    enable_cuda_graph: bool,
+) -> bool:
+    """Delegate the GLM-5 graph-request predicate from the config layer.
+
+    The model-specific formula remains owned by ``cuda_graph_policy``; this
+    wrapper keeps worker callers on the config boundary.
+    """
+    return glm5_any_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+
+
+def glm5_whole_model_cuda_graph_requested(
+    model_name: str | None,
+    *,
+    enable_cuda_graph: bool,
+) -> bool:
+    """Delegate the GLM-5 whole-model graph predicate from the config layer."""
+    return glm5_whole_model_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=enable_cuda_graph,
     )

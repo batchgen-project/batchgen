@@ -18,21 +18,26 @@ from batchgen.worker.kv_plan import effective_chunk_size
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+ENGINE = ROOT / "batchgen" / "worker" / "decode_engine.py"
 HOST_VIEW = ROOT / "core" / "KV_Storage" / "host_paged_kv_worker_view.h"
 
 
 def _worker_method(name):
-    source = WORKER.read_text()
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    source_path = ENGINE if name == "decoding_continuous" else WORKER
+    source = source_path.read_text()
     tree = ast.parse(source)
     worker = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        if isinstance(node, ast.ClassDef)
+        and node.name == ("DecoupledGpuDecode" if name == "decoding_continuous" else "BatchGenWorker")
     )
     method = next(
         node
         for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+        if isinstance(node, ast.FunctionDef)
+        and node.name == ("run" if name == "decoding_continuous" else name)
     )
     lines = source.splitlines(keepends=True)
     return textwrap.dedent("".join(lines[method.lineno - 1 : method.end_lineno]))

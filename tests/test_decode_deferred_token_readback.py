@@ -45,8 +45,11 @@ from tests.worker.worker_fakes import attach_trajectory_state
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+ENGINE = ROOT / "batchgen" / "worker" / "decode_engine.py"
 SOURCE = WORKER.read_text()
 TREE = ast.parse(SOURCE)
+ENGINE_SOURCE = ENGINE.read_text()
+ENGINE_TREE = ast.parse(ENGINE_SOURCE)
 WORKER_CLASS = next(
     n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "BatchGenWorker"
 )
@@ -68,8 +71,9 @@ def _module_function(name):
 
 
 def _module_constant(name):
+    source_tree = ENGINE_TREE if name == "DECODE_DEFERRED_TOKEN_READBACK" else TREE
     node = next(
-        n for n in TREE.body
+        n for n in source_tree.body
         if isinstance(n, ast.Assign) and [ast.unparse(t) for t in n.targets] == [name]
     )
     return ast.literal_eval(node.value)
@@ -683,7 +687,11 @@ def _bind_metadata(deferred):
 
     fake_cuda = SimpleNamespace(Event=Ev, current_stream=lambda d: "stream")
     fake_torch = SimpleNamespace(cuda=fake_cuda, int64=torch.int64)
-    ns = {"torch": fake_torch, "DECODE_DEFERRED_TOKEN_READBACK": deferred,
+    ns = {"torch": fake_torch,
+          # The worker reads the flag as a module attribute (single
+          # definition on decode_engine, flippable at runtime).
+          "_decode_engine": SimpleNamespace(
+              DECODE_DEFERRED_TOKEN_READBACK=deferred),
           "List": List, "Tuple": tuple, "SequenceEntry": object}
     exec(compile(_source_of(_method_node("_bind_decode_attention_metadata")),
                  str(WORKER), "exec"), ns)
@@ -722,7 +730,11 @@ def test_undeferred_mode_never_touches_a_staging_event():
 # ------------------------------------------- (d) shipping-loop structure
 
 def _loop():
-    fn = _method_node("decoding_continuous")
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    fn = next(
+        n for n in ast.walk(ENGINE_TREE)
+        if isinstance(n, ast.FunctionDef) and n.name == "run"
+    )
     return fn, next(
         n for n in fn.body if isinstance(n, ast.While) and ast.unparse(n.test) == "decode_uuids"
     )

@@ -21,9 +21,19 @@ import pytest
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
+ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
 WORKER_CLASS = next(
     node for node in TREE.body
     if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+)
+ENGINE_CLASS = next(
+    node for node in ENGINE_TREE.body
+    if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
+)
+DECODE_RUN = next(
+    node for node in ENGINE_CLASS.body
+    if isinstance(node, ast.FunctionDef) and node.name == "run"
 )
 
 
@@ -387,6 +397,9 @@ def test_misuse_fails_loud():
 
 
 def _method(name):
+    if name == "decoding_continuous":
+        # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+        return DECODE_RUN
     return next(
         node for node in WORKER_CLASS.body
         if isinstance(node, ast.FunctionDef) and node.name == name
@@ -567,20 +580,22 @@ def test_no_other_model_forward_escapes_the_weight_passes():
         "_decoding_legacy_modes", "_glm5_decode_model_forward",
     }
     found = set()
-    for function in WORKER_CLASS.body:
+    functions = [*WORKER_CLASS.body, DECODE_RUN]
+    for function in functions:
         if not isinstance(function, ast.FunctionDef):
             continue
+        owner = "decoding_continuous" if function is DECODE_RUN else function.name
         for call in _forward_calls(function, _is_model_forward):
-            site = (function.name, ast.unparse(call.func))
+            site = (owner, ast.unparse(call.func))
             if site in UNSTREAMED_FORWARDS:
                 found.add(site)
                 continue
-            assert function.name in wrapped, site
+            assert owner in wrapped, site
     # The list holds no stale entry.
     assert found == set(UNSTREAMED_FORWARDS)
     callers = {
-        function.name
-        for function in WORKER_CLASS.body
+        "decoding_continuous" if function is DECODE_RUN else function.name
+        for function in functions
         if isinstance(function, ast.FunctionDef)
         and _forward_calls(
             function, lambda func: func == "self._glm5_decode_model_forward"
