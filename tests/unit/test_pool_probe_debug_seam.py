@@ -70,10 +70,14 @@ def _method(name: str) -> ast.FunctionDef:
 
 
 def _module_strings() -> dict:
-    """Every module-level ``NAME = "literal"`` of the worker."""
+    """Every module-level ``NAME = "literal"`` of prefill_engine.py.
+
+    The probe keys live with their only reader, PrefillEngine (S5a moved the
+    probe seam there; the worker keeps no copy).
+    """
 
     out = {}
-    for node in TREE.body:
+    for node in ENGINE_TREE.body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
             continue
         target = node.targets[0]
@@ -88,7 +92,7 @@ def _module_key_tuple() -> tuple:
 
     strings = _module_strings()
     assign = next(
-        node for node in TREE.body
+        node for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
