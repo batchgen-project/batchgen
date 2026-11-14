@@ -49,11 +49,19 @@ STEP_OBSERVABILITY_SOURCE = (
     / "step_observability_engine.py"
 )
 STEP_OBSERVABILITY_CLASS = "StepObservabilityEngine"
-# The worker-seam engines (S8, S7) whose methods the worker reaches through
+WORKER_LIFECYCLE_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "worker_lifecycle_engine.py"
+)
+WORKER_LIFECYCLE_CLASS = "WorkerLifecycleEngine"
+# The worker-seam engines (S8, S7, S9) whose methods the worker reaches through
 # same-name canonical delegators.
 DELEGATED_ENGINES = (
     (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
     (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
+    (WORKER_LIFECYCLE_SOURCE, WORKER_LIFECYCLE_CLASS),
 )
 
 
@@ -246,7 +254,8 @@ def step_observability_method_names() -> set:
 def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     """The body a worker method runs, in the worker's own shape.
 
-    For a method S8/S7 moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
+    For a method S8/S7/S9 moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
+    / ``WorkerLifecycleEngine``
     the worker keeps a canonical delegator; the statements that run are the
     engine's, so this returns the engine method converted back by
     :func:`engine_method_as_worker_method`. Every other name resolves to the
@@ -260,3 +269,33 @@ def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     if name not in worker:
         raise AssertionError(f"{WORKER_CLASS} has no method {name}")
     return copy.deepcopy(worker[name])
+
+
+def delegated_method_names() -> set:
+    """Every worker method whose body lives in a delegated engine (S8/S7/S9)."""
+    names: set = set()
+    for source, class_name in DELEGATED_ENGINES:
+        names |= set(_class_methods(source, class_name))
+    return names
+
+
+def load_worker_shaped_methods(
+    names: Iterable[str],
+    namespace: Dict[str, Any],
+) -> Dict[str, Any]:
+    """:func:`load_worker_methods` for the bodies that actually run.
+
+    A delegated method compiles from its engine body in the worker's shape,
+    so the caller's ``namespace`` (stub ``torch``, ``sys``, ...) reaches the
+    moved statements exactly as it reached them on the worker; every other
+    name compiles from the worker class as before.
+    """
+    loaded: Dict[str, Any] = {}
+    for name in names:
+        node = worker_shaped_method_node(name)
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        scope: Dict[str, Any] = dict(namespace)
+        exec(compile(module, str(WORKER_SOURCE), "exec"), scope)  # noqa: S102
+        loaded[name] = scope[name]
+    return loaded

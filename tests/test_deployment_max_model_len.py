@@ -32,7 +32,7 @@ from tests.test_prompt_rejection_fails_one_request import (
 )
 from tests.test_batch_in_progress_failure import bs
 from tests.worker.worker_fakes import make_graph_state
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_methods, load_worker_shaped_methods
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -302,7 +302,10 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
 
     worker._init_gpu_kv_with_actual_size = size_pool
     worker._build_persistent_phase_instances = size_pool
-    prepare = load_worker_methods(["prepare_deployment"], {
+    # S9: prepare_deployment runs in WorkerLifecycleEngine (shaped body).
+    # rb5: main's prepare_deployment reads _startup_transient (the probe seam),
+    # so the lift injects it like the pre-S9 worker lift did.
+    prepare = load_worker_shaped_methods(["prepare_deployment"], {
         "logging": logging, "_startup_transient": startup_transient,
     })["prepare_deployment"]
     prepare(worker)

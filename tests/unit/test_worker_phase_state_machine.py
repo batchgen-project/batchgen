@@ -9,6 +9,7 @@ import pytest
 
 from batchgen.phase_lifecycle import ExitMode, PhaseEnterContext, PhaseKey
 from batchgen.phase_lifecycle import verify_phase_contract
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,8 +30,12 @@ def _isolated_worker_class():
         "_transition_phase",
         "_verify_manager_phase_contract",
     }
+    # S9: _verify_manager_phase_contract runs in WorkerLifecycleEngine; take
+    # its engine body in the worker's shape.
     methods = [
-        copy.deepcopy(node)
+        worker_shaped_method_node(node.name)
+        if node.name in delegated_method_names()
+        else copy.deepcopy(node)
         for node in source_class.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]

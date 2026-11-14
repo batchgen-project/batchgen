@@ -23,6 +23,7 @@ import typing
 import pytest
 
 from batchgen.sequence import SequenceStatus
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -139,8 +140,13 @@ def test_both_segment_constructors_receive_all_short(ctor):
 
 def test_all_short_flag_is_reset_with_the_whole_model_segment():
     tree = _tree(_WORKER_SRC)
+    # S9: the release-state helper runs in WorkerLifecycleEngine; scan the
+    # delegated engine bodies (worker shape) alongside the worker.
+    functions = list(ast.walk(tree)) + [
+        worker_shaped_method_node(name) for name in sorted(delegated_method_names())
+    ]
     resets = 0
-    for fn in ast.walk(tree):
+    for fn in functions:
         if not isinstance(fn, ast.FunctionDef):
             continue
         for body in (
