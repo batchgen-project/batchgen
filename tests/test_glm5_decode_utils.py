@@ -5,6 +5,7 @@ import types
 import torch
 import pytest
 
+from batchgen.config.decode_strategy import normalize_attn_mode
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.cuda_graph import BatchSizeBucketing
 from batchgen.models.glm.glm5.decode_utils import (
@@ -20,7 +21,6 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     glm5_any_cuda_graph_requested_for_model,
     glm5_cuda_graph_bucket_for_batch_size,
     glm5_dsa_cuda_graph_requested_for_model,
-    glm5_effective_decode_attn_mode,
     glm5_moe_graph_bucket_capacity,
     glm5_moe_cuda_graph_requested_for_model,
     glm5_segmented_cuda_graph_requested_for_model,
@@ -1003,10 +1003,17 @@ def test_glm5_whole_model_compare_policy_requests_warmup():
     )
 
 
-def test_glm5_effective_decode_attn_mode_uses_continuous_path():
-    assert glm5_effective_decode_attn_mode("glm_moe_dsa", 1) == 3
-    assert glm5_effective_decode_attn_mode("zai-org/GLM-5-FP8", 0) == 3
-    assert glm5_effective_decode_attn_mode("deepseek_v3", 1) == 1
+def test_glm5_normalized_decode_attn_mode_uses_continuous_path():
+    # The GLM family declares its single decode path at its planner (the
+    # registration seam); the shared owner applies it after validating raw.
+    from batchgen.models.glm.glm5.planner import GLM5Planner
+    from batchgen.planner.base_planner import BasePlanner
+
+    assert GLM5Planner.FORCED_DECODE_MODE == 3
+    assert BasePlanner.FORCED_DECODE_MODE is None
+    assert normalize_attn_mode(1, GLM5Planner.FORCED_DECODE_MODE) == 3
+    assert normalize_attn_mode(0, GLM5Planner.FORCED_DECODE_MODE) == 3
+    assert normalize_attn_mode(1, BasePlanner.FORCED_DECODE_MODE) == 1
 
 
 def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():

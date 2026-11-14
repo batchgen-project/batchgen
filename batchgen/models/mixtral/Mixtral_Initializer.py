@@ -295,10 +295,6 @@ class Mixtral_Initializer:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
-            # Get mode from env var
-            mode = os.getenv("ATTN_MODE", "1")
-            mode = int(mode)
-            self.engine_config.Basic_Config.attn_mode = mode
             self.engine_config.Basic_Config.module_types = [
                 "attn",
                 "routed_expert",
@@ -412,9 +408,6 @@ class Mixtral_Initializer:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
-            mode = os.getenv("ATTN_MODE", "1")
-            mode = int(mode)
-            self.engine_config.Basic_Config.attn_mode = mode
             self.engine_config.Basic_Config.module_types = [
                 "attn",
                 "routed_expert",

@@ -23,6 +23,7 @@ import torch
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.engine_config_parser import parse_config_from_json
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
+from batchgen.config.decode_strategy import apply_normalized_attn_mode
 
 from .set_basic_config import set_basic_config
 
@@ -127,6 +128,7 @@ class DeepSeekV4FlashInitializer:
         )
 
     def _set_batching_and_buffer_config(self):
+        apply_normalized_attn_mode(self.engine_config.Basic_Config, self.model_config.model_type)
         reserved_length = self.engine_config.KV_Storage_Config.reserved_length
         world_size = max(1, int(self.world_size))
         experts_per_rank = self.model_config.num_local_experts // world_size

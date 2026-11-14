@@ -81,11 +81,6 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
     engine_config.Basic_Config.device = device
     engine_config.Basic_Config.device_torch = torch.device(f"cuda:{device}")
 
-    attn_mode = _get_arg(input_arguments, "attn_mode", 3)
-    if attn_mode not in [1, 2, 3]:
-        raise ValueError("Currently attn_mode must be 1, 2, or 3")
-    engine_config.Basic_Config.attn_mode = attn_mode
-
     engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
     engine_config.Basic_Config.num_threads = 0
 
