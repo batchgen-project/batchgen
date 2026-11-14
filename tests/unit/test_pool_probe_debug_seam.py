@@ -49,11 +49,19 @@ from batchgen.prefix_reuse.wave_runtime import PoolWave
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
+ENGINE = WORKER.parents[0] / "worker" / "prefill_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
+_ENGINE_METHODS = {
+    "_pool_probe_debug", "_new_pool_epilogue_tracer",
+    "_new_pool_kernel_dump_recorder", "_pool_pad_poison_enabled",
+    "_new_pool_offload_check_recorder",
+}
 
 
 def _method(name: str) -> ast.FunctionDef:
+    tree = ENGINE_TREE if name in _ENGINE_METHODS else TREE
     return next(
-        node for node in ast.walk(TREE)
+        node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
 
@@ -103,6 +111,14 @@ exec(compile(ast.fix_missing_locations(ast.Module(
     body=[copy.deepcopy(_method(name)) for name in _SEAM],
     type_ignores=[],
 )), "<worker-probe-seam>", "exec"), _NAMESPACE)
+
+for _name in _ENGINE_METHODS:
+    _engine_method = _NAMESPACE[_name]
+
+    def _worker_method(worker, *args, _engine_method=_engine_method, **kwargs):
+        return _engine_method(None, worker, *args, **kwargs)
+
+    _NAMESPACE[_name] = _worker_method
 
 
 # --------------------------------------------------------------------------- #

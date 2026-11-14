@@ -181,3 +181,18 @@ def attach_prefix_state(fake, **overrides):
         PrefixReuseState(rank=rank, world_size=world_size), overrides
     )
     return fake
+
+
+def attach_prefill_state(fake):
+    """Attach the stateless S5a engine seam to a worker fake.
+
+    The import is function-local on purpose: ``prefill_engine`` imports the
+    real CUDA-backed KV coordinator (exactly as ``batchgen_worker`` does), and
+    lightweight exec-lift pin tests import this fakes module without that
+    dependency being loadable. Only tests that actually attach the engine pull
+    the chain.
+    """
+    from batchgen.worker.prefill_engine import PrefillEngine
+
+    fake._prefill_engine = PrefillEngine()
+    return fake

@@ -42,6 +42,7 @@ from batchgen.prefix_reuse.executor import PoolChunkExecutor
 from batchgen.prefix_reuse.pool import PrefillPrefixPool
 from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 from batchgen.prefix_reuse.wave_plan import plan_wave_prefix_sharing
+from batchgen.worker.prefill_engine import DualHostKVCoordinator
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -70,6 +71,29 @@ TOKEN_CAP = 64
 
 
 WORKER_TREE = ast.parse(WORKER.read_text())
+ENGINE = WORKER.parents[0] / "worker" / "prefill_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
+
+_MOVED = {
+    "_plan_prefill_micro_batches", "_prefill_model_pass_count",
+    "_prefill_prefix_pool_enabled", "_pool_prefill_group_safe",
+    "_prefill_pool_group", "_prefill_pool_free_state_slots",
+    "_next_pool_segment_sid", "_prefix_rank_packing_mode",
+    "_prefix_rank_cost_profile_disabled", "_cached_prefix_rank_cost_profile",
+    "_materialized_prefix_hits", "_unmaterializable_frontier",
+    "_plan_prefill_pool_wave", "_prefill_pool_psm_layout",
+    "_prefill_pool_page_dims", "_prefill_pool_page_bytes",
+    "_measure_prefill_prefix_kv_budget", "_construct_prefill_pool",
+    "_check_pool_plan_identical", "_prefill_pool_layout",
+    "_replace_prefix_lookup_hits", "_settle_trajectory_restore_plan",
+    "_prefill_pool_segment_host_pages", "_allocate_prefill_pool_host_pages",
+    "_materialized_segment_loader", "_prefix_pool_index_key_carrier",
+    "_materialized_pool_index_key_layers", "_load_materialized_segments",
+    "_pool_probe_debug", "_new_pool_epilogue_tracer",
+    "_record_unsharded_epilogue_gather", "_new_pool_kernel_dump_recorder",
+    "_pool_pad_poison_enabled", "_new_pool_offload_check_recorder",
+    "_finish_prefill_pool_wave", "_release_pool_segment_refs",
+}
 
 
 def _worker_class():
@@ -82,18 +106,38 @@ def _worker_method_node(name):
                 if isinstance(node, ast.FunctionDef) and node.name == name)
 
 
+def _engine_method_node(name):
+    klass = next(node for node in ENGINE_TREE.body
+                 if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine")
+    return next(node for node in klass.body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
 def _worker_methods(names, globals_=None):
     """Compile the named worker methods onto one shared namespace of fakes."""
-    wanted = [copy.deepcopy(_worker_method_node(name)) for name in names]
-    module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List, "Optional": Optional, "Sequence": Sequence,
         "hashlib": hashlib, "logging": logging, "math": math,
         "replace": dataclasses.replace,
+        "DualHostKVCoordinator": DualHostKVCoordinator,
         **(globals_ or {}),
     }
-    exec(compile(module, str(WORKER), "exec"), namespace)
-    return {name: namespace[name] for name in names}
+    loaded = {}
+    for name in names:
+        source = ENGINE if name in _MOVED else WORKER
+        node = copy.deepcopy(
+            _engine_method_node(name) if name in _MOVED else _worker_method_node(name)
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        scope = dict(namespace)
+        exec(compile(module, str(source), "exec"), scope)
+        function = scope[name]
+        if name in _MOVED:
+            def worker_method(worker, *args, _function=function, **kwargs):
+                return _function(None, worker, *args, **kwargs)
+            function = worker_method
+        loaded[name] = function
+    return loaded
 
 
 def _worker_probe_debug_keys():
@@ -1057,7 +1101,7 @@ def test_pool_collectives_are_not_rank_conditional():
         ("_plan_prefill_pool_wave", "all_reduce"),
         ("_check_pool_plan_identical", "all_gather"),
     ):
-        method = _worker_method_node(name)
+        method = _engine_method_node(name)
         parents = _parents(method)
         calls = [
             node for node in ast.walk(method)

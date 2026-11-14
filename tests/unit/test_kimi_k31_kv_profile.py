@@ -330,13 +330,18 @@ def test_the_k31_patterns_precede_the_broad_kimi_k3_pattern():
 # --------------------------------------------------------------------------- #
 
 WORKER_TREE = ast.parse(WORKER.read_text(), filename=str(WORKER))
+ENGINE = WORKER.parents[0] / "worker" / "prefill_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text(), filename=str(ENGINE))
 
 
 def _worker_method_node(name):
-    for node in ast.walk(WORKER_TREE):
+    tree = ENGINE_TREE if name in {
+        "_prefill_pool_layout", "_prefill_pool_psm_layout"
+    } else WORKER_TREE
+    for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
-    raise AssertionError(f"{name} not found in {WORKER}")
+    raise AssertionError(f"{name} not found")
 
 
 class _FakeDualHostKVCoordinator:
@@ -351,7 +356,7 @@ def _layout_worker(*, dual, engine_layers, indexer_layers, indexer_dim,
     wanted = [copy.deepcopy(_worker_method_node(name)) for name in names]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {"DualHostKVCoordinator": _FakeDualHostKVCoordinator}
-    exec(compile(module, str(WORKER), "exec"), namespace)
+    exec(compile(module, str(ENGINE), "exec"), namespace)
 
     layers = []
     for layer_idx in range(engine_layers):
@@ -372,7 +377,16 @@ def _layout_worker(*, dual, engine_layers, indexer_layers, indexer_dim,
     if cached is not None:
         worker._prefill_pool_layout_cache = cached
     for name in names:
-        setattr(worker, name, types.MethodType(namespace[name], worker))
+        engine_method = namespace[name]
+        setattr(
+            worker,
+            name,
+            types.MethodType(
+                lambda self, *args, _fn=engine_method, **kwargs:
+                _fn(None, self, *args, **kwargs),
+                worker,
+            ),
+        )
     geometry = SimpleNamespace(
         num_layers=kv_num_layers, logical_to_physical_layer=kv_layer_map)
     return worker, geometry

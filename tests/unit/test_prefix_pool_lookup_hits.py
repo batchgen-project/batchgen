@@ -7,17 +7,22 @@ the merged attach-and-suffix path materializes hits natively.
 """
 
 import ast
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
 from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 from tests.worker.worker_fakes import attach_prefix_state
+from tests.worker_method_source import load_prefill_engine_methods
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+ENGINE = Path(__file__).resolve().parents[2] / "batchgen" / "worker" / "prefill_engine.py"
 
 
 def _method(name):
-    tree = ast.parse(WORKER.read_text())
+    source = ENGINE if name in {"_replace_prefix_lookup_hits", "_plan_prefill_pool_wave"} else WORKER
+    tree = ast.parse(source.read_text())
+    class_name = "PrefillEngine" if source == ENGINE else "BatchGenWorker"
     return next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == name
@@ -34,9 +39,9 @@ def _calls(node, name):
 
 
 def test_hits_are_released_and_prompts_start_at_their_chain_end():
-    namespace = {}
-    module = ast.Module(body=[_method("_replace_prefix_lookup_hits")], type_ignores=[])
-    exec(compile(module, str(WORKER), "exec"), namespace)
+    replace_hits = load_prefill_engine_methods(
+        ["_replace_prefix_lookup_hits"], {"replace": dataclasses.replace}
+    )["_replace_prefix_lookup_hits"]
     released = []
     worker = SimpleNamespace(
         prefix_cache_coordinator=SimpleNamespace(release_attachment=released.append),
@@ -53,7 +58,7 @@ def test_hits_are_released_and_prompts_start_at_their_chain_end():
             lookup_result=None, attached_tokens=0, compute_cached_tokens=0
         ),
     }
-    namespace["_replace_prefix_lookup_hits"](worker, seqs, states, [0, 64])
+    replace_hits(worker, seqs, states, [0, 64])
     assert released == [7]
     assert states[3].lookup_result is None
     assert states[3].compute_cached_tokens == 0 and states[3].shared_page_ids == ()
