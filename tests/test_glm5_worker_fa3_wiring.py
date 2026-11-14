@@ -27,6 +27,9 @@ from batchgen.sequence import SequenceStatus
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKER_SRC = _REPO_ROOT / "batchgen/batchgen_worker.py"
+# The decode loop (and its inline whole-graph replay gate) lives in the
+# decode engine since the S4b extraction.
+_DECODE_ENGINE_SRC = _REPO_ROOT / "batchgen/worker/decode_engine.py"
 _GLM5_DIR = _REPO_ROOT / "batchgen/models/glm/glm5"
 _SEGMENTS_SRC = _GLM5_DIR / "cuda_graph_segments.py"
 
@@ -326,7 +329,7 @@ def test_inline_replay_gate_blocks_an_exceeded_all_short_graph():
     """The decode loop's inline gate (not just the advisory path-state) must
     refuse to replay an all_short capture once the longest context passes
     index_topk; under a required graph that surfaces as reason=all_short_exceeded."""
-    source = _WORKER_SRC.read_text()
+    source = _DECODE_ENGINE_SRC.read_text()
     gate = source[source.index("_glm5_whole_graph_active = bool("):]
     gate = gate[: gate.index("_use_graph = (")]
     assert "_glm5_all_short_exceeded" in gate
@@ -351,7 +354,8 @@ def test_guards_read_the_stored_index_topk():
     assert source.count("glm5_whole_model_index_topk", 0) >= 5
     # No guard reads index_topk off model_config any more (the step-state
     # hint helper at module level is a separate, pre-existing consumer).
-    gate = source[source.index("_glm5_whole_graph_active = bool("):]
+    engine_source = _DECODE_ENGINE_SRC.read_text()
+    gate = engine_source[engine_source.index("_glm5_whole_graph_active = bool("):]
     gate = gate[: gate.index("_use_graph = (")]
     assert "glm5_whole_model_index_topk" in gate
     admission = source[source.index("DecodeScheduler.select_decode_batch"):][:2500]

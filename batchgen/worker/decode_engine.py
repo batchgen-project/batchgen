@@ -27,11 +27,21 @@ from batchgen.worker.step_timing import (
     new_decode_step_split,
 )
 
+# ``_wait_decode_tokens``' two outcomes (single owner; the worker imports
+# them).  COMPLETED is exactly what ``synchronize()`` guarantees: the step's
+# device work is done and its readback buffers hold this step's tokens.
+# ABANDONED means the cohort is being torn down and the event may never fire,
+# so none of the step's outputs may be read.
 _DECODE_WAIT_COMPLETED = "completed"
 _DECODE_WAIT_ABANDONED = "abandoned"
 DECODE_DEFERRED_TOKEN_READBACK = True
+# Env-evaluated debug flags, evaluated once here (single owner; the worker
+# imports them).
+# Debug logging level for continuous batching page boundary.
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
+# Optional decode-time invariant check: assert cache_seqlens <= gpu_pages_allocated * PAGE_SIZE.
 BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
+# Multi-batch diagnostic logging for investigating metadata corruption.
 BATCHGEN_MULTI_BATCH_DIAG = os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
 
 
@@ -50,18 +60,11 @@ class DecodeModelStateBinder(Protocol):
         self, global_decode_sequences, batch, probe_adapter, probe_round_request, probe_mismatch_logged
     ) -> bool: ...
 
-    def _read_decode_max_seqlen_for_all_short(self): ...
-    def _read_decode_max_seqlen_for_graph_span(self): ...
-    def _read_decode_max_seqlen_for_warning(self): ...
-    def _read_decode_max_seqlen_for_adapter(self): ...
+    def _read_decode_max_seqlen(self): ...
     def _read_decode_cur_batch(self): ...
-    def _read_decode_cache_seqlens_for_adapter(self): ...
-    def _read_decode_cache_seqlens_for_replay(self): ...
-    def _read_decode_position_ids_for_adapter(self): ...
-    def _read_decode_position_ids_for_probe(self): ...
-    def _read_decode_position_ids_for_model(self): ...
-    def _read_decode_attention_mask_for_probe(self): ...
-    def _read_decode_attention_mask_for_model(self): ...
+    def _read_decode_cache_seqlens(self): ...
+    def _read_decode_position_ids(self): ...
+    def _read_decode_attention_mask(self): ...
     def _read_decode_kv_append_callbacks(self): ...
     def _teardown_decode_model_state(self) -> None: ...
 
@@ -211,7 +214,7 @@ class DecoupledGpuDecode:
         # Device-side time of the forward+sample segment from reusable timing
         # events, so the heartbeat reports real GPU forward time next to the
         # CPU split. The ring never makes the host wait (see
-        # batchgen.self.step_timing). Its record points sit in this loop
+        # batchgen.worker.step_timing). Its record points sit in this loop
         # body, outside any graph capture: every capture site is a scoped
         # ``torch.cuda.graph`` context that ends before its callee returns
         # here, and this loop only replays graphs (a missing whole-model
@@ -428,7 +431,7 @@ class DecoupledGpuDecode:
                     
                     # Get page stats if available
                     page_info = ""
-                    if hasattr(worker, '_host_kv_page_stats') and self._host_kv_page_stats:
+                    if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
                         ps = self._host_kv_page_stats
                         page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
 
@@ -684,14 +687,14 @@ class DecoupledGpuDecode:
                     _glm5_all_short_exceeded = bool(
                         self._graph.glm5_whole_model_all_short
                         and int(self._graph.glm5_whole_model_index_topk or 0)
-                        and binder._read_decode_max_seqlen_for_all_short()
+                        and binder._read_decode_max_seqlen()
                         > int(self._graph.glm5_whole_model_index_topk)
                     )
                     _glm5_whole_graph_active = (
                         not _glm5_all_short_exceeded
                         and _glm5_whole_bucket not in self._graph.glm5_whole_model_graph_failed_buckets
                         and self._graph.cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
-                        and binder._read_decode_max_seqlen_for_graph_span() <= int(getattr(self._graph.whole_model_segment, "max_seqlen", 0))
+                        and binder._read_decode_max_seqlen() <= int(getattr(self._graph.whole_model_segment, "max_seqlen", 0))
                         and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == self._graph.glm5_whole_model_graph_signature
                     )
                 if (
@@ -706,7 +709,7 @@ class DecoupledGpuDecode:
                         # span, so all ranks take this branch together and the
                         # graph's baked NCCL ops stay matched.
                         self._warn_decode_graph_span_exceeded(
-                            binder._read_decode_max_seqlen_for_warning(),
+                            binder._read_decode_max_seqlen(),
                             int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0),
                         )
                     else:
@@ -741,9 +744,8 @@ class DecoupledGpuDecode:
                     # otherwise mismatched NCCL ops cause deadlock.
                     batch_size = len(batch)
                     bucket = self._graph.whole_model_bucketing.get_padded_size(_max_bs)
-                    # Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
-                    # and an adapter is present, route replay through it. Legacy path
-                    # (default) preserves today's behavior exactly.
+                    # An adapter, when present, routes the GLM-5 whole-model replay
+                    # (the Phase-B dual gate is retired: it was always on).
                     # K2.5 always routes whole-model replay through the adapter
                     # (no legacy non-adapter K2.5 whole-model path exists).
                     _k25_whole_active = self._graph.k25_whole_model_graph
@@ -751,10 +753,7 @@ class DecoupledGpuDecode:
                         self._graph.cuda_graph_adapter is not None
                         and (
                             _k25_whole_active
-                            or (
-                                self._graph.cuda_graph_adapter_dual
-                                and self._graph.glm5_whole_model_graph
-                            )
+                            or self._graph.glm5_whole_model_graph
                         )
                     )
                     _wm_seg_name = self._decode_whole_model_segment_name()
@@ -765,9 +764,9 @@ class DecoupledGpuDecode:
                             local_bsz=batch_size,
                             max_rank_bsz=_max_bs,
                             rank_token_counts=_all_rank_counts,
-                            cache_seqlens=binder._read_decode_cache_seqlens_for_adapter(),
-                            position_ids=binder._read_decode_position_ids_for_adapter(),
-                            max_seqlen=binder._read_decode_max_seqlen_for_adapter(),
+                            cache_seqlens=binder._read_decode_cache_seqlens(),
+                            position_ids=binder._read_decode_position_ids(),
+                            max_seqlen=binder._read_decode_max_seqlen(),
                             cur_batch_sequence_ids=binder._read_decode_cur_batch(),
                             gpu_kv_manager=gpu_manager,
                             decode_iter=0,
@@ -898,7 +897,7 @@ class DecoupledGpuDecode:
                         graph_out = self._graph.cuda_graph_manager.replay(
                             "whole_model", bucket,
                             input_ids=new_tokens,
-                            cache_seqlens=binder._read_decode_cache_seqlens_for_replay()[:batch_size],
+                            cache_seqlens=binder._read_decode_cache_seqlens()[:batch_size],
                             page_table=pt_slice,
                             slot_indices=slot_slice,
                         )
@@ -921,8 +920,8 @@ class DecoupledGpuDecode:
                             if getattr(self._graph.whole_model_segment, "compare_probe_layers", ()):
                                 eager_probe_outputs = self._graph.whole_model_segment.run_model_with_probes(
                                     input_ids=new_tokens,
-                                    attention_mask=binder._read_decode_attention_mask_for_probe(),
-                                    position_ids=binder._read_decode_position_ids_for_probe(),
+                                    attention_mask=binder._read_decode_attention_mask(),
+                                    position_ids=binder._read_decode_position_ids(),
                                     use_layer_segments=False,
                                 )
                                 eager_hidden_states = eager_probe_outputs["hidden_states"]
@@ -935,8 +934,8 @@ class DecoupledGpuDecode:
                             else:
                                 eager_model_outputs = self.model.model(
                                     input_ids=new_tokens,
-                                    attention_mask=binder._read_decode_attention_mask_for_model(),
-                                    position_ids=binder._read_decode_position_ids_for_model(),
+                                    attention_mask=binder._read_decode_attention_mask(),
+                                    position_ids=binder._read_decode_position_ids(),
                                     use_cache=False,
                                 )
                                 eager_hidden_states = eager_model_outputs[0][:, -1, :]
@@ -1174,7 +1173,7 @@ class DecoupledGpuDecode:
             # unbounded and ends in a device sync, i.e. the same unwakeable
             # state one level down.  The D1 invariant it exists for is kept
             # instead by _quiesce_decode_for_cohort_shutdown, which runs the
-            # same local drain under a deadline and worker-exits rather than
+            # same local drain under a deadline and self-exits rather than
             # unwind with those unlocked page-table readers still live.
             #
             # As with the two flag checks, the exit RETURNS (a break would run
