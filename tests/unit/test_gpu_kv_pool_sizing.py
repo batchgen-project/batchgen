@@ -352,7 +352,11 @@ def test_the_provisional_measurement_still_bounds_itself_with_the_fraction():
     # kv_plan.provisional_pool_gb; this site must still feed it the fraction
     # and keep its fail-loud policy (no floor).
     body = ast.unparse(_method("_init_gpu_kv_with_actual_size"))
-    assert "KVCacheManager.provisional_pool_gb(total_mem_gb, used_mem_gb, self.gpu_memory_frac)" in body
+    assert (
+        "provisional_pool_gb(total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None)"
+        in body
+    )
+    assert "KVCacheManager.provisional_pool_gb" not in body
 
 
 def _cached_path_worker(cached_gb):

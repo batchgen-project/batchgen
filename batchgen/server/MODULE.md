@@ -19,8 +19,8 @@ available pages/bytes, and estimated feasible length. Each resource permits
 `floor(available_pages / G) * P` tokens. Auto-fit chooses the smallest of these
 resource bounds and the model context. A capacity below 2 tokens still fails.
 
-The GPU budget input is `KVCacheManager.provisional_pool_gb(total_gb, used_gb,
-gpu_memory_frac) = total_gb * gpu_memory_frac - used_gb`, measured with decode
+The GPU budget input is `kv_plan.provisional_pool_gb(total_gb, gpu_memory_frac,
+used_gb, floor_gb=None) = total_gb * gpu_memory_frac - used_gb`, measured with decode
 weights resident. The tightest rank sets the common pool size. Startup freezes
 this budget in every mode, before any graph capture. The late post-capture
 resizing hook is therefore inactive for these deployments. The provisional

@@ -522,13 +522,10 @@ class KVCacheManager:
     # GPU-KV-manager allocation planning (Phase 5.4a)
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # Measure-once-cache pool sizing (pure helpers; the worker applies them)
+    # Measure-once-cache pool sizing (pure helpers; the worker applies them).
+    # The provisional formula ``total * frac - used`` has one owner,
+    # ``batchgen.worker.kv_plan.provisional_pool_gb``.
     # ------------------------------------------------------------------
-    @staticmethod
-    def provisional_pool_gb(total_gb: float, used_gb: float, gpu_memory_frac: float) -> float:
-        """Pool budget after decode residency, before graph/transient allocations."""
-        return total_gb * gpu_memory_frac - used_gb
-
     @staticmethod
     def compute_final_pool_gb(
         total_gb: float,
