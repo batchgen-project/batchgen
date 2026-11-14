@@ -6,19 +6,18 @@ the only supported mode. Mode env vars (``BATCHGEN_GLM5_*_CUDA_GRAPH``,
 ``BATCHGEN_SEGMENTED_GRAPH``) are no longer read here; the predicates for
 the retired modes return ``False`` unconditionally.
 
-The compare-only debug env var ``BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE``
-remains in this file for the developer-facing compare facility (renaming
-to the ``BATCHGEN_DECODE_GRAPH_COMPARE`` namespace lands in a follow-up).
+The server-level graph mode is decided only by the CLI at startup. The
+eager-vs-graph compare is a per-batch choice inside that mode
+(``batchgen_debug.glm5_whole_model_graph_compare``, read by the worker); it
+no longer feeds these routing predicates.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 
 from batchgen.models.glm.glm5 import releases as glm5_releases
 
-GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
 GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
 
 # Every GLM-5 release's FP8 checkpoint name, in each spelling users pass.
@@ -32,10 +31,6 @@ def _is_glm_model(model_name: str | None) -> bool:
 def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     normalized = (model_name or "").strip().lower()
     return any(pattern in normalized for pattern in _GLM5_FP8_GRAPH_DEFAULT_PATTERNS)
-
-
-def _env_flag_enabled(env: Mapping[str, str], name: str) -> bool:
-    return env.get(name, "0") == "1"
 
 
 def is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
@@ -85,15 +80,6 @@ def glm5_whole_model_cuda_graph_requested_for_model(
     return bool(enable_cuda_graph) and _is_glm5_fp8_graph_default_model(model_name)
 
 
-def glm5_whole_model_cuda_graph_compare_requested_for_model(
-    model_name: str | None,
-    *,
-    environ: Mapping[str, str] | None = None,
-) -> bool:
-    env = os.environ if environ is None else environ
-    return _env_flag_enabled(env, GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV) and _is_glm_model(model_name)
-
-
 def glm5_segmented_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
@@ -108,20 +94,12 @@ def glm5_any_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
     enable_cuda_graph: bool = False,
-    environ: Mapping[str, str] | None = None,
 ) -> bool:
-    # Phase C: only the whole-model graph remains. Compare debug also
-    # activates the warmup path so users running compare without
-    # `--enable-cuda-graph` still get the captured graph to compare against.
-    return (
-        glm5_whole_model_cuda_graph_requested_for_model(
-            model_name,
-            enable_cuda_graph=enable_cuda_graph,
-            environ=environ,
-        )
-        or glm5_whole_model_cuda_graph_compare_requested_for_model(
-            model_name, environ=environ,
-        )
+    # Phase C: only the whole-model graph remains, and only the CLI decides
+    # it (the per-batch compare selects behavior within that mode).
+    return glm5_whole_model_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=enable_cuda_graph,
     )
 
 
