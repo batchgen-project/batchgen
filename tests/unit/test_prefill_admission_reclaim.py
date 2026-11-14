@@ -45,6 +45,7 @@ from batchgen.prefix_reuse.trajectory_commit import (
 )
 from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 import batchgen.sequence as sequence_module
+from batchgen.worker.rank_context import node_of_rank
 from batchgen.sequence import SequenceStatus
 from tests.worker_method_source import load_prefill_engine_methods
 from batchgen.worker.kv_plan import (
@@ -148,6 +149,7 @@ def _worker_methods(dist):
         "_sequence_module": sequence_module,
         "NodeCapacityReport": NodeCapacityReport,
         "prefill_owner_demand_pages": prefill_owner_demand_pages,
+        "node_of_rank": node_of_rank,
         "verdict_node_capacity": verdict_node_capacity,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)

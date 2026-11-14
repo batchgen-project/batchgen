@@ -70,8 +70,16 @@ def _module_function(name):
     return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
+# Constants whose single owner is decode_engine (the worker imports them).
+_ENGINE_OWNED_CONSTANTS = frozenset({
+    "DECODE_DEFERRED_TOKEN_READBACK",
+    "_DECODE_WAIT_COMPLETED",
+    "_DECODE_WAIT_ABANDONED",
+})
+
+
 def _module_constant(name):
-    source_tree = ENGINE_TREE if name == "DECODE_DEFERRED_TOKEN_READBACK" else TREE
+    source_tree = ENGINE_TREE if name in _ENGINE_OWNED_CONSTANTS else TREE
     node = next(
         n for n in source_tree.body
         if isinstance(n, ast.Assign) and [ast.unparse(t) for t in n.targets] == [name]
