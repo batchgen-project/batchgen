@@ -185,7 +185,9 @@ def dg_cache(monkeypatch, tmp_path):
 
 def test_unarmed_guard_is_loud_and_returns_none(dg_cache, caplog):
     (dg_cache / "kernel.sm90_fp8_gemm_1d2d.a").mkdir()
-    with caplog.at_level(logging.WARNING, logger=DGP.logger.name):
+    # INFO, not WARNING: the guard arms at readiness, so an unarmed check
+    # during the startup sequence is the expected state.
+    with caplog.at_level(logging.INFO, logger=DGP.logger.name):
         assert DGP.check_late_compiles(1, "configure_prefill") is None
         assert DGP.check_late_compiles(1, "configure_prefill") is None
         assert DGP.check_late_compiles(1, "admit") is None
