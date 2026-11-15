@@ -81,6 +81,31 @@ def test_eos_respects_min_tokens():
     print("  PASS: test_eos_respects_min_tokens")
 
 
+def test_first_token_stop_is_honored_when_nothing_follows():
+    """The min-token floor defers only to a LATER EOS: a sequence that is
+    one EOS plus padding genuinely ended, and the slice must end at that
+    EOS instead of resurrecting it through the non-pad fallback."""
+    worker = MockWorker(eos_token_ids={2}, pad_token_id=0)
+    tokens = torch.tensor([[2, 0, 0, 0]], dtype=torch.int64)
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    # Slice is [EOS]; the EOS is special and dropped by the decode.
+    assert result == "", f"Expected '', got '{result}'"
+    worker = MockWorker(
+        eos_token_ids={2}, pad_token_id=0, detokenization_include_special_tokens=True
+    )
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    assert result == "t2", f"Expected 't2', got '{result}'"
+
+
+def test_early_eos_with_content_after_keeps_the_fallback():
+    """An early EOS followed by real tokens and NO later EOS keeps the
+    old whole-slice fallback (the floor suppressed that EOS)."""
+    worker = MockWorker(eos_token_ids={2}, pad_token_id=0)
+    tokens = torch.tensor([[2, 10, 20, 0]], dtype=torch.int64)
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    assert result == "t10 t20", f"Expected 't10 t20', got '{result}'"
+
+
 def test_stop_token_is_decoded_with_the_completion():
     """The slice ends after the stop token; decode decides if it shows."""
     tokens = torch.tensor([[10, 20, 2, 30, 0]], dtype=torch.int64)
