@@ -3307,17 +3307,18 @@ class KimiLinearParallelStrategyManager:
                 self.prefill_instance = None
             else:
                 self.decode_instance = None
-                # A retired decode instance owns nothing. The resident EP
-                # shard and the decode graph are
-                # manager-owned and stay mapped through any reference drop:
-                # the captured graph keeps the model alive. Release them here
-                # even when the worker's end-of-interval deep free already
-                # dropped self.model; the release walks the manager's own
-                # record of resident blocks. Every profile with a positive
-                # resident_ep_prefill_token_cap declines instance reuse and
-                # exits decode here; leaving them mapped OOMs the next prefill
-                # build wherever the shard and that build do not both fit.
-                self.release_decode_routed_experts()
+            # A retired instance owns nothing. The resident EP shard is
+            # manager-owned and is built by whichever phase uses it: decode,
+            # and prefill too under the resident-EP prefill handoff. It stays
+            # mapped through any reference drop (the manager's record of
+            # resident blocks holds it, and a captured decode graph keeps the
+            # model alive), so release it here for either phase, even when the
+            # worker's end-of-interval deep free already dropped self.model.
+            # The release is a no-op when no shard is attached. Every profile
+            # with a positive resident_ep_prefill_token_cap declines instance
+            # reuse and exits here; a shard left mapped makes the next build
+            # fail its unreleased-shard check.
+            self.release_decode_routed_experts()
             self.model = None
             self.weight_copy_task = {}
             return
