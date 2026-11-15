@@ -798,14 +798,16 @@ def check_late_compiles(rank, where: str,
     The cache is node-wide, so the names include every rank of the node.
 
     None when the guard is not armed: nothing is known about the compiles
-    at ``where``, and that is logged at WARNING (once per call site) rather
-    than passed off as "no late compile".
+    at ``where``, and that is logged at INFO (once per call site) rather
+    than passed off as "no late compile". The guard arms at readiness, so
+    a startup-sequence check before the baseline exists is the expected
+    state, not a warning condition.
     """
     global _BASELINE
     if _BASELINE is None:
         if where not in _UNARMED_REPORTED:
             _UNARMED_REPORTED.add(where)
-            logger.warning(
+            logger.info(
                 "%s rank=%s DeepGEMM late-compile guard not armed at %s: no "
                 "kernel-name baseline is recorded yet, so kernels DeepGEMM "
                 "compiles here are NOT checked", LOG_TAG, rank, where,
