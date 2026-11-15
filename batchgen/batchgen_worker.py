@@ -11100,9 +11100,24 @@ class BatchGenWorker:
 		if eos_positions:
 			end_pos = eos_positions[0] + 1  # Include the stop token itself
 		else:
-			# No EOS found, use all non-padding tokens
-			non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
-			end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
+			# The min-token floor only defers to a LATER EOS. When the
+			# sequence genuinely ended below the floor (e.g. a first-token
+			# stop: nothing but padding follows the early EOS), honor that
+			# stop; the old fallback decoded the whole non-pad slice and
+			# resurrected the stop token as text.
+			early_eos = [
+				i for i, t in enumerate(tokens_list[:min_tokens])
+				if t in self.eos_token_ids
+			]
+			if early_eos and all(
+				t == self.pad_token_id
+				for t in tokens_list[early_eos[0] + 1:]
+			):
+				end_pos = early_eos[0] + 1  # Include the stop token itself
+			else:
+				# No EOS found, use all non-padding tokens
+				non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
+				end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
 		# Decode tokens up to end position
 		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=(not self.detokenization_include_special_tokens))
