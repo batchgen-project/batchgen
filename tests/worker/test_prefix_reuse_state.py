@@ -1,5 +1,6 @@
 import hashlib
 import random
+import sys
 from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
@@ -248,7 +249,10 @@ def test_digest_walk_matches_frozen_fixture_at_boundary_lengths():
 # D-E: the sid seed is eager and every generated sid is monotonic and unique.
 def test_sid_counter_monotonicity_and_collision_guard_seed(monkeypatch):
 	seed_ns = 1234567890123
-	monkeypatch.setattr("batchgen.worker.prefix_reuse_state.time.time_ns", lambda: seed_ns)
+	# Patch through the module object the class was defined in: a dotted string
+	# re-resolves ``batchgen`` and breaks when another test left a mock there.
+	owner_module = sys.modules[PrefixReuseState.__module__]
+	monkeypatch.setattr(owner_module.time, "time_ns", lambda: seed_ns)
 	store = PrefixReuseState(rank=2, world_size=8)
 	assert store.pool_sid_counter == seed_ns // 1000
 	first, second, third = (
