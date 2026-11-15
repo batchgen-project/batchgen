@@ -1666,7 +1666,7 @@ class BatchScheduler:
                     waiter = self._turn_waiters.get(entry.batch_id)
                     if waiter is not None:
                         waiter.timing["admit_sent_at"] = sent_at
-            logger.warning(
+            logger.info(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
                 f"(intake remaining: {self._intake_pool.size()}, "
                 f"scheduling active: {self._scheduling_pool.num_active_slots()}, "

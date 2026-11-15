@@ -618,6 +618,15 @@ def test_section_d_predicates_from_the_model():
     assert drift["moe_3d_ready"] is False
     assert TP.decode_section_d_predicates(
         _fake_model(None, []), config)["moe_3d_ready"] is None
+    # Tri-state readiness: at prewarm time the blockwise stacking has not run
+    # yet, so a pending (None) flag is NOT drift; only use_3d_moe off or an
+    # explicit False (the disable path) is.
+    pending = TP.decode_section_d_predicates(
+        _fake_model("bf16", [(True, None), (True, True)]), config)
+    assert pending["moe_3d_ready"] is True
+    off = TP.decode_section_d_predicates(
+        _fake_model("bf16", [(False, None), (True, True)]), config)
+    assert off["moe_3d_ready"] is False
 
 
 def test_section_d_logging(caplog):

@@ -520,9 +520,14 @@ def _absorb_container_name(model) -> Optional[str]:
 
 
 def _moe_3d_ready(model) -> Optional[bool]:
+    # _fp8_blockwise_ready is tri-state: None until the blockwise weight
+    # stacking runs (which happens after this prewarm-time report), True once
+    # stacked, and explicit False only when the 3d path was disabled. Pending
+    # stacking is therefore NOT drift; only use_3d_moe off or an explicit
+    # disable is.
     flags = [
         bool(getattr(mlp, "use_3d_moe", False))
-        and bool(getattr(mlp, "_fp8_blockwise_ready", False))
+        and getattr(mlp, "_fp8_blockwise_ready", None) is not False
         for mlp in (getattr(layer, "mlp", None) for layer in _layers(model))
         if mlp is not None and hasattr(mlp, "use_3d_moe")
     ]
