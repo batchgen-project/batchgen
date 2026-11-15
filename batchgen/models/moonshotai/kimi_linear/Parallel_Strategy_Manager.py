@@ -3292,6 +3292,16 @@ class KimiLinearParallelStrategyManager:
                 self.prefill_instance = None
             else:
                 self.decode_instance = None
+                # A retired decode instance owns nothing. The resident EP
+                # shard is a manager-owned buffer, not a tensor of the model
+                # being dropped, so dropping the references below never frees
+                # its ~84 GiB/rank (world16 K3): release it here, while
+                # self.model is still alive for the per-layer walk. SUSPEND
+                # already releases it; RETIRE leaving it mapped OOMs the
+                # following prefill build on 2x8 H200 (the only deployment
+                # whose profile declines instance reuse).
+                if self.model is not None:
+                    self.release_decode_routed_experts()
             self.model = None
             self.weight_copy_task = {}
             return
