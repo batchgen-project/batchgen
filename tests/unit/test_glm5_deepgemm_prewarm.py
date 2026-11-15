@@ -214,6 +214,17 @@ def _scan_calls(root=_ROOT):
                     and func.value.id == "deep_gemm"
                     and func.attr not in DGP.INVENTORY_NON_KERNELS):
                 callee = "deep_gemm." + func.attr
+            elif (isinstance(func, ast.Name) and func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "deep_gemm"
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    and node.args[1].value not in DGP.INVENTORY_NON_KERNELS):
+                # A dynamic resolution launches the kernel wherever the bound
+                # name is later called; the resolution is the one static
+                # anchor, so it is the inventoried call site.
+                callee = "deep_gemm." + node.args[1].value
             elif isinstance(func, ast.Name) and func.id in callees:
                 callee = func.id
             if callee is not None:
@@ -246,6 +257,28 @@ def test_inventory_scan_reaches_a_deepgemm_call_under_batchgen_moe(tmp_path):
     assert dict(_scan_calls(tmp_path)) == {
         ("batchgen/moe/planted_contiguous.py", "grouped",
          "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): 1,
+    }
+
+
+def test_inventory_scan_reaches_a_getattr_resolved_kernel(tmp_path):
+    """``getattr(deep_gemm, "<kernel>")`` is a call site: the resolution is
+    the only static anchor of a dynamically dispatched kernel, so a planted
+    one must be named by the site table. Non-kernel attributes stay out."""
+    call = (
+        "import deep_gemm\n"
+        "def resolve():\n"
+        "    fn = getattr(deep_gemm, 'm_grouped_fp8_gemm_nt_contiguous', None)\n"
+        "    align = getattr(deep_gemm, 'get_m_alignment_for_contiguous_layout', None)\n"
+        "    return fn, align\n"
+    )
+    rel = "batchgen/moe/planted_getattr.py"
+    (tmp_path / rel).parent.mkdir(parents=True)
+    (tmp_path / rel).write_text(call)
+    for other in DGP.INVENTORY_PATHS:
+        if not (tmp_path / other).exists():
+            (tmp_path / other).mkdir(parents=True)
+    assert dict(_scan_calls(tmp_path)) == {
+        (rel, "resolve", "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): 1,
     }
 
 
@@ -599,3 +632,65 @@ def test_imports_without_deepgemm_or_triton(monkeypatch):
     module = _load(_GLM5_DIR / "deepgemm_prewarm.py",
                    "_glm5_deepgemm_prewarm_no_gpu_deps")
     assert callable(module.geometry_entries)
+
+
+# --------------------------------------------------------------------------- #
+#  Grouped contiguous prefill MoE entries
+# --------------------------------------------------------------------------- #
+def test_contiguous_sites_are_the_grouped_prefill_gemm_shapes():
+    shapes = _shapes()
+    sites = {s.name: (s.n, s.k, s.groups) for s in DGP.contiguous_sites(shapes)}
+    # The group count is compiled into the kernel, so the sites carry the
+    # serving stack size (every routed expert).
+    assert sites == {
+        "contiguous:moe_gate_up": (2048, 6144, 256),
+        "contiguous:moe_down": (6144, 2048, 256),
+    }
+
+
+def test_prefill_entries_without_a_contiguous_bound_add_no_contiguous_entry():
+    shapes = _shapes()
+    entries = DGP.prefill_entries(shapes, "cpu", max_rows=MAX_ROWS,
+                                  num_sms=NUM_SMS)
+    assert not [e for e in entries if "contiguous" in e.name]
+
+
+def test_prefill_entries_cover_every_contiguous_key_of_the_row_range():
+    shapes = _shapes()
+    bound = 70_000
+    entries = DGP.prefill_entries(shapes, "cpu", max_rows=MAX_ROWS,
+                                  num_sms=NUM_SMS,
+                                  contiguous_max_rows=bound)
+    rows_by_shape = collections.defaultdict(list)
+    for e in entries:
+        if "contiguous" not in e.name:
+            continue
+        _, name, nk, m = e.name.split("/")
+        n, k = (int(v) for v in nk.split("x"))
+        assert int(m[1:]) % DG.CONTIGUOUS_BLOCK_M == 0
+        rows_by_shape[(name, n, k)].append(int(m[1:]))
+    assert set(rows_by_shape) == {
+        ("contiguous:moe_gate_up", 2048, 6144),
+        ("contiguous:moe_down", 6144, 2048),
+    }
+    for (name, n, k), rows in rows_by_shape.items():
+        assert rows == DG.contiguous_representative_ms(n, k, bound,
+                                                       num_sms=NUM_SMS)
+
+
+def test_run_contiguous_builds_the_serving_call(monkeypatch):
+    site = DGP.ContiguousSite("contiguous:moe_gate_up", 256, 512, groups=3)
+    fn = _Recorder()
+    DGP._run_contiguous(site, 128, "cpu", fn=fn)
+    (args, kwargs), = fn.calls
+    x_fp8, x_scale, b, sfb = args
+    assert x_fp8.shape == (128, 512) and x_fp8.dtype == torch.float8_e4m3fn
+    assert x_scale.shape == (512 // 128, 128)
+    # The B stack carries the site's compiled-in group count.
+    assert b.shape == (3, 256, 512) and b.stride(0) == 256 * 512
+    assert sfb.shape == (3, 2, 4)
+    assert kwargs["output"].shape == (128, 256)
+    assert kwargs["output"].dtype == torch.bfloat16
+    layout = kwargs["grouped_layout"]
+    assert layout.shape == (128,) and layout.dtype == torch.int32
+    assert bool((layout == 0).all())
