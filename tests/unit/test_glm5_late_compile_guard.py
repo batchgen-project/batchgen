@@ -264,18 +264,25 @@ def test_buckets_report_is_silent_otherwise(monkeypatch, caplog, buckets,
     assert caplog.records == []
 
 
-def test_psm_reports_unset_buckets_on_the_decode_phase_only():
+def test_psm_reports_unset_buckets_at_the_ladder_handoff():
+    # prewarm_decode_graphs is the only channel the worker hands the capture
+    # ladder through, so the missing-ladder report lives there (after the
+    # adoption), not in the per-phase prewarm, whose earlier phases run
+    # before the ladder exists.
     tree = ast.parse((_GLM5_DIR / "Parallel_Strategy_Manager.py").read_text())
-    method, = [node for node in ast.walk(tree)
-               if isinstance(node, ast.FunctionDef)
-               and node.name == "_prewarm_triton_kernels"]
-    calls = [node for node in ast.walk(method)
+    handoff, = [node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "prewarm_decode_graphs"]
+    calls = [node for node in ast.walk(handoff)
              if isinstance(node, ast.Call)
              and ast.unparse(node.func) == "report_unset_decode_buckets"]
     assert len(calls) == 1
     text = ast.unparse(calls[0])
     assert "self.decode_graph_buckets" in text
     assert "enable_cuda_graphs" in text
-    guard, = [node for node in ast.walk(method)
-              if isinstance(node, ast.If) and calls[0] in ast.walk(node)]
-    assert ast.unparse(guard.test) == "phase == PHASE_DECODE"
+    phases, = [node for node in ast.walk(tree)
+               if isinstance(node, ast.FunctionDef)
+               and node.name == "_prewarm_triton_kernels"]
+    assert not [node for node in ast.walk(phases)
+                if isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "report_unset_decode_buckets"]
