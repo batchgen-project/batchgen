@@ -67,7 +67,7 @@ def _capture_worker(methods, events, manager):
     worker = SimpleNamespace(
         rank=0,
         parallel_manager=manager,
-        _decode_graph_captures=0,
+        _graph=SimpleNamespace(decode_graph_captures=0),
         _sync_decode_moe_rank_counts=lambda *a, **k: events.append("sync"),
         _bind_decode_attention_metadata_for_graph_config=(
             lambda _: events.append("bind")),
@@ -79,7 +79,7 @@ def _capture_worker(methods, events, manager):
 
     def warmed():
         events.append("capture")
-        worker._decode_graph_captures += 1
+        worker._graph.decode_graph_captures += 1
 
     worker._warmup_cuda_graphs = warmed
     worker._prewarm_decode_jit = (
