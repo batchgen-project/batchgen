@@ -34,10 +34,6 @@ KEPT_STOP_TOKENS = {
     "gpt_oss": {"<|return|>", "<|call|>"},
 }
 
-#: Declared tokenizer types with no tokenizer module in the tree. The worker
-#: cannot load them (load_tokenizer raises), so they have no decode to check.
-UNIMPLEMENTED_TYPES = {"deepseek_v2", "mixtral"}
-
 BODIES = (
     "Hello there, 42 is the answer.",
     "Mixed text: 中文, émoji 🙂, and code `x = 1`.",
@@ -83,10 +79,21 @@ def _worker(tok):
     return worker
 
 
-def test_every_declared_tokenizer_type_is_registered_or_absent():
+@pytest.mark.parametrize("retired", ["DeepSeek-V2-Lite", "DeepSeek-V2",
+                                     "Mixtral-8x22B", "Mixtral-8x7B"])
+def test_retired_tokenizer_patterns_no_longer_resolve(retired):
+    # Their modules never existed: resolution must fail loud at
+    # load_tokenizer's clear no-tokenizer-registered message, and the
+    # registry warm-up must not retry (and ERROR-log) a dead import.
+    assert registry.resolve_tokenizer_type(retired) is None
+
+
+def test_every_declared_tokenizer_type_is_registered():
+    # Every declared module must exist and register its type: a declared
+    # module that cannot import puts an ERROR line into every server start.
     declared = set(registry._TOKENIZER_MODULES)
     registered = set(registry.TOKENIZER_REGISTRY)
-    assert declared - registered == UNIMPLEMENTED_TYPES
+    assert declared - registered == set()
     assert set(KEPT_STOP_TOKENS) <= registered
 
 
