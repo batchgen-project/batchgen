@@ -198,6 +198,9 @@ def test_glm5_prewarm_adopts_the_handed_down_bucket_ladder():
     methods = _glm5_methods(cuda_available=True, arm_calls=[])
     psm = SimpleNamespace(
         decode_graph_buckets=None,
+        engine_config=SimpleNamespace(
+            Basic_Config=SimpleNamespace(enable_cuda_graphs=True)),
+        global_rank=0,
         _prewarm_triton_kernels=lambda phase, gpu_manager=None: runs.append(
             (phase, gpu_manager)) or 0.0,
     )

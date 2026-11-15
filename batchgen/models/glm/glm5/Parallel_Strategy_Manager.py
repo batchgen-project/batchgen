@@ -536,6 +536,19 @@ class GLM5ParallelStrategyManager:
             return 0.0
         if decode_buckets is not None:
             self.decode_graph_buckets = [int(b) for b in decode_buckets]
+        # This call is the only channel that hands the worker's capture
+        # ladder down, so HERE a missing ladder with the whole-model decode
+        # graph enabled is a real wiring fault — earlier prewarm phases run
+        # before the ladder exists and must not report it missing.
+        from batchgen.models.glm.glm5.triton_prewarm import (
+            report_unset_decode_buckets,
+        )
+        report_unset_decode_buckets(
+            self.decode_graph_buckets,
+            whole_model_graph=bool(
+                self.engine_config.Basic_Config.enable_cuda_graphs),
+            rank=self.global_rank,
+        )
         return self._prewarm_triton_kernels(PHASE_GEOMETRY,
                                             gpu_manager=gpu_manager)
 
@@ -584,19 +597,8 @@ class GLM5ParallelStrategyManager:
             prewarm_glm5_decode,
             prewarm_glm5_geometry,
             prewarm_glm5_prefill,
-            report_unset_decode_buckets,
         )
 
-        # Only the decode phase: the worker hands the bucket ladder at the
-        # startup decode capture, so the earlier geometry phase legitimately
-        # runs before the buckets exist and must not report them missing.
-        if phase == PHASE_DECODE:
-            report_unset_decode_buckets(
-                self.decode_graph_buckets,
-                whole_model_graph=bool(
-                    self.engine_config.Basic_Config.enable_cuda_graphs),
-                rank=self.global_rank,
-            )
         part_index, part_count, barrier = self._triton_prewarm_partition()
         common = dict(part_index=part_index, part_count=part_count,
                       barrier=barrier, rank=self.global_rank)
