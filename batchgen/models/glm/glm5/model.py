@@ -1693,7 +1693,9 @@ class Glm5MoE(nn.Module):
         self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
-        self._fp8_blockwise_ready = False
+        # Tri-state: None until the FP8 blockwise weight stacking runs (it
+        # sets True), explicit False only when the 3d path is disabled.
+        self._fp8_blockwise_ready = None
         self._moe_cuda_graph_manager = None
         self._moe_cuda_graph_segment_name = None
         self._moe_cuda_graph_segment = None
@@ -2604,7 +2606,7 @@ class Glm5MoE(nn.Module):
         buf.resize_if_needed(num_global)
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
-            logging.warning(
+            logging.info(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_ragged + reduce_weighted_scatter "
                 "(compact ragged MoE)")
             Glm5MoE._warned_k25_path = True
@@ -2709,7 +2711,7 @@ class Glm5MoE(nn.Module):
         `_triton_compute` wholesale when they are unavailable.
         """
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
-            logging.warning(
+            logging.info(
                 "[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d (compact ragged, "
                 f"capacity={buf.capacity} rows)")
             Glm5MoE._warned_gemm_3d = True

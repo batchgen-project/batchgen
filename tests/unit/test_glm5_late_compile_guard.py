@@ -264,7 +264,7 @@ def test_buckets_report_is_silent_otherwise(monkeypatch, caplog, buckets,
     assert caplog.records == []
 
 
-def test_psm_reports_unset_buckets_on_the_decode_and_geometry_phases():
+def test_psm_reports_unset_buckets_on_the_decode_phase_only():
     tree = ast.parse((_GLM5_DIR / "Parallel_Strategy_Manager.py").read_text())
     method, = [node for node in ast.walk(tree)
                if isinstance(node, ast.FunctionDef)
@@ -278,4 +278,4 @@ def test_psm_reports_unset_buckets_on_the_decode_and_geometry_phases():
     assert "enable_cuda_graphs" in text
     guard, = [node for node in ast.walk(method)
               if isinstance(node, ast.If) and calls[0] in ast.walk(node)]
-    assert ast.unparse(guard.test) == "phase in (PHASE_DECODE, PHASE_GEOMETRY)"
+    assert ast.unparse(guard.test) == "phase == PHASE_DECODE"

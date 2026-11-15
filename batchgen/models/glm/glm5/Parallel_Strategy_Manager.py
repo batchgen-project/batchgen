@@ -587,7 +587,10 @@ class GLM5ParallelStrategyManager:
             report_unset_decode_buckets,
         )
 
-        if phase in (PHASE_DECODE, PHASE_GEOMETRY):
+        # Only the decode phase: the worker hands the bucket ladder at the
+        # startup decode capture, so the earlier geometry phase legitimately
+        # runs before the buckets exist and must not report them missing.
+        if phase == PHASE_DECODE:
             report_unset_decode_buckets(
                 self.decode_graph_buckets,
                 whole_model_graph=bool(
@@ -2166,7 +2169,7 @@ class GLM5ParallelStrategyManager:
                 bucket = entry.split(":", 1)[0]
                 seen_types.setdefault(bucket, []).append(entry)
             for bucket, entries in seen_types.items():
-                logging.warning(
+                logging.info(
                     f"[SKELETON q_a/kv_a trace] {bucket}: {len(entries)} entries; "
                     f"examples: {entries[:3]}"
                 )
@@ -2176,7 +2179,7 @@ class GLM5ParallelStrategyManager:
             # Bucket summary — a zero count for attn_norm or gate_bias means
             # those keys never matched the checkpoint and silently remain at
             # init (ones for norms, zeros for bias).
-            logging.warning(
+            logging.info(
                 f"[SKELETON-BUCKETS loaded] {dict(loaded_bucket)}"
             )
             if missing_bucket:
