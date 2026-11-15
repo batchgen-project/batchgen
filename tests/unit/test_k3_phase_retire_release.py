@@ -113,13 +113,18 @@ def test_decode_retire_after_worker_dropped_model_still_releases():
     assert psm.model is None
 
 
-def test_prefill_retire_never_touches_decode_shard():
+def test_prefill_retire_releases_a_resident_prefill_shard():
+    # Under the resident-EP prefill handoff the prefill instance builds the
+    # shard itself; retiring it must hand the shard back before the decode
+    # build, which otherwise finds it still recorded.
     model = object()
     psm = _exit_psm(model)
     psm.prefill_instance = (model, {})
     psm.phase_exit(PREFILL, ExitMode.RETIRE)
-    assert psm._release_calls == []
+    assert psm._release_calls == ["release"]
     assert psm.prefill_instance is None
+    assert psm.model is None
+    # A prefill retire leaves the decode instance tuple to its own exit.
     assert psm.decode_instance == (model, {})
 
 
@@ -213,6 +218,15 @@ def test_rebuild_with_unreleased_shard_fails_loud(owner_psm):
     psm, _ = owner_psm
     with pytest.raises(RuntimeError, match="still attached to 2 MoE blocks"):
         psm._reset_model_attached_state()
+
+
+def test_handoff_prefill_shard_release_lets_the_decode_build_proceed(owner_psm):
+    # resident prefill built the shard -> prefill RETIRE releases it -> the
+    # decode configure's rebuild finds an empty record.
+    psm, _ = owner_psm
+    psm._release_resident_ep_decode()
+    psm._reset_model_attached_state()
+    assert psm._resident_ep_moes == []
 
 
 def test_rebuild_after_release_resets_bookkeeping(owner_psm):
