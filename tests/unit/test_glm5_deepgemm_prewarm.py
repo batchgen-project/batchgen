@@ -639,10 +639,12 @@ def test_imports_without_deepgemm_or_triton(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_contiguous_sites_are_the_grouped_prefill_gemm_shapes():
     shapes = _shapes()
-    sites = {s.name: (s.n, s.k) for s in DGP.contiguous_sites(shapes)}
+    sites = {s.name: (s.n, s.k, s.groups) for s in DGP.contiguous_sites(shapes)}
+    # The group count is compiled into the kernel, so the sites carry the
+    # serving stack size (every routed expert).
     assert sites == {
-        "contiguous:moe_gate_up": (2048, 6144),
-        "contiguous:moe_down": (6144, 2048),
+        "contiguous:moe_gate_up": (2048, 6144, 256),
+        "contiguous:moe_down": (6144, 2048, 256),
     }
 
 
@@ -677,15 +679,16 @@ def test_prefill_entries_cover_every_contiguous_key_of_the_row_range():
 
 
 def test_run_contiguous_builds_the_serving_call(monkeypatch):
-    site = DGP.ContiguousSite("contiguous:moe_gate_up", 256, 512)
+    site = DGP.ContiguousSite("contiguous:moe_gate_up", 256, 512, groups=3)
     fn = _Recorder()
     DGP._run_contiguous(site, 128, "cpu", fn=fn)
     (args, kwargs), = fn.calls
     x_fp8, x_scale, b, sfb = args
     assert x_fp8.shape == (128, 512) and x_fp8.dtype == torch.float8_e4m3fn
     assert x_scale.shape == (512 // 128, 128)
-    assert b.shape == (1, 256, 512) and b.stride(0) == 256 * 512
-    assert sfb.shape == (1, 2, 4)
+    # The B stack carries the site's compiled-in group count.
+    assert b.shape == (3, 256, 512) and b.stride(0) == 256 * 512
+    assert sfb.shape == (3, 2, 4)
     assert kwargs["output"].shape == (128, 256)
     assert kwargs["output"].dtype == torch.bfloat16
     layout = kwargs["grouped_layout"]
