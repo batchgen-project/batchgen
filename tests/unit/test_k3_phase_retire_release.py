@@ -7,8 +7,9 @@ before the next ``phase_exit(decode, RETIRE)``, while the captured decode
 graph still keeps that model, and the shard on it, alive. The release must
 therefore walk the manager's own record of resident MoE blocks, and a model
 rebuild that finds the record non-empty must fail loudly instead of
-allocating beside an unreachable shard (2x8 H200, the only deployment whose
-machine-profile row declines instance reuse).
+allocating beside an unreachable shard. Every machine-profile row with a
+positive ``resident_ep_prefill_token_cap`` declines instance reuse and takes
+this RETIRE path.
 
 The REAL methods are AST-extracted from the production manager and exercised
 against stub state, matching the other phase-hook suites.

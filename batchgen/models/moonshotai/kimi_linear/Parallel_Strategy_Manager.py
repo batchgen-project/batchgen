@@ -3313,9 +3313,10 @@ class KimiLinearParallelStrategyManager:
                 # the captured graph keeps the model alive. Release them here
                 # even when the worker's end-of-interval deep free already
                 # dropped self.model; the release walks the manager's own
-                # record of resident blocks. Leaving them mapped OOMs the next
-                # prefill build on 2x8 H200, the only deployment whose profile
-                # declines instance reuse.
+                # record of resident blocks. Every profile with a positive
+                # resident_ep_prefill_token_cap declines instance reuse and
+                # exits decode here; leaving them mapped OOMs the next prefill
+                # build wherever the shard and that build do not both fit.
                 self.release_decode_routed_experts()
             self.model = None
             self.weight_copy_task = {}
