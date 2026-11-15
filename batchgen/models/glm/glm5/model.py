@@ -155,16 +155,22 @@ def _glm5_prefill_grouped_gemm_backend() -> str:
     rather than read as a default, because a silently ignored arm switch
     would make the two arms the same run.
     """
+    from batchgen_kernels.jit_site_registry import (
+        check_slot_backend,
+        default_backend,
+    )
+
+    from . import jit_coverage  # noqa: F401 - registers the family's slots
+
     value = _glm5_moe_debug_dict().get("prefill_grouped_gemm")
     if value is None:
-        return "deepgemm"
+        return default_backend("glm5", "prefill_grouped_gemm")
     if not isinstance(value, str):
         raise ValueError("prefill_grouped_gemm must be a string")
     mode = value.strip().lower()
-    if mode not in {"deepgemm", "cute_ptrs"}:
-        raise ValueError(
-            f"prefill_grouped_gemm must be 'deepgemm' or 'cute_ptrs', got {value!r}"
-        )
+    # The registry is the only allowlist: an unvalidated or uncovered backend
+    # is refused with a named error, never read as a default.
+    check_slot_backend("glm5", "prefill_grouped_gemm", mode)
     return mode
 
 
