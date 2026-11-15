@@ -23,7 +23,6 @@ Loaded by file path (no ``import batchgen``); no CUDA, Triton or DeepGEMM.
 Run: python -m pytest tests/unit/test_glm5_deepgemm_prewarm.py -q
 """
 
-import ast
 import collections
 import importlib.util
 import logging
@@ -185,113 +184,16 @@ def test_page_split_scale_bytes_match_the_cache_format():
 
 
 # --------------------------------------------------------------------------- #
-#  Inventory pin
+#  Inventory pin — the repo-wide scanner lives in test_jit_site_registry.py;
+#  this file keeps the GLM-5-owned check that every reachable table name is a
+#  prewarm site.
 # --------------------------------------------------------------------------- #
-def _scan_calls(root=_ROOT):
-    """``(path, enclosing function, callee) -> count`` over the inventory."""
-    files = set()
-    for rel in DGP.INVENTORY_PATHS:
-        path = root / rel
-        files.update([path] if path.is_file() else path.rglob("*.py"))
-    callees = set(DGP.INVENTORY_CALLEES)
-    found = collections.Counter()
-
-    class Visitor(ast.NodeVisitor):
-        def __init__(self, rel):
-            self.rel, self.stack = rel, []
-
-        def _scope(self, node):
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        visit_ClassDef = visit_FunctionDef = visit_AsyncFunctionDef = _scope
-
-        def visit_Call(self, node):
-            func, callee = node.func, None
-            if (isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "deep_gemm"
-                    and func.attr not in DGP.INVENTORY_NON_KERNELS):
-                callee = "deep_gemm." + func.attr
-            elif (isinstance(func, ast.Name) and func.id == "getattr"
-                    and len(node.args) >= 2
-                    and isinstance(node.args[0], ast.Name)
-                    and node.args[0].id == "deep_gemm"
-                    and isinstance(node.args[1], ast.Constant)
-                    and isinstance(node.args[1].value, str)
-                    and node.args[1].value not in DGP.INVENTORY_NON_KERNELS):
-                # A dynamic resolution launches the kernel wherever the bound
-                # name is later called; the resolution is the one static
-                # anchor, so it is the inventoried call site.
-                callee = "deep_gemm." + node.args[1].value
-            elif isinstance(func, ast.Name) and func.id in callees:
-                callee = func.id
-            if callee is not None:
-                scope = ".".join(self.stack) or "<module>"
-                found[(self.rel, scope, callee)] += 1
-            self.generic_visit(node)
-
-    for path in sorted(files):
-        if path.name in ("triton_prewarm.py", "deepgemm_prewarm.py"):
-            continue
-        rel = path.relative_to(root).as_posix()
-        Visitor(rel).visit(ast.parse(path.read_text()))
-    return found
 
 
-def test_inventory_scan_reaches_a_deepgemm_call_under_batchgen_moe(tmp_path):
-    """The shared MoE layer is scanned: a DeepGEMM kernel call added there
-    must be named by the site table (or it fails the pin above)."""
-    call = ("import deep_gemm\n"
-            "def grouped(a, b, out, layout):\n"
-            "    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, layout)\n")
-    for rel in ("batchgen/moe/planted_contiguous.py",
-                "batchgen/elsewhere/planted.py"):
-        (tmp_path / rel).parent.mkdir(parents=True)
-        (tmp_path / rel).write_text(call)
-    for rel in DGP.INVENTORY_PATHS:
-        if not (tmp_path / rel).exists():
-            (tmp_path / rel).mkdir(parents=True)
-    assert "batchgen/moe" in DGP.INVENTORY_PATHS
-    assert dict(_scan_calls(tmp_path)) == {
-        ("batchgen/moe/planted_contiguous.py", "grouped",
-         "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): 1,
-    }
 
 
-def test_inventory_scan_reaches_a_getattr_resolved_kernel(tmp_path):
-    """``getattr(deep_gemm, "<kernel>")`` is a call site: the resolution is
-    the only static anchor of a dynamically dispatched kernel, so a planted
-    one must be named by the site table. Non-kernel attributes stay out."""
-    call = (
-        "import deep_gemm\n"
-        "def resolve():\n"
-        "    fn = getattr(deep_gemm, 'm_grouped_fp8_gemm_nt_contiguous', None)\n"
-        "    align = getattr(deep_gemm, 'get_m_alignment_for_contiguous_layout', None)\n"
-        "    return fn, align\n"
-    )
-    rel = "batchgen/moe/planted_getattr.py"
-    (tmp_path / rel).parent.mkdir(parents=True)
-    (tmp_path / rel).write_text(call)
-    for other in DGP.INVENTORY_PATHS:
-        if not (tmp_path / other).exists():
-            (tmp_path / other).mkdir(parents=True)
-    assert dict(_scan_calls(tmp_path)) == {
-        (rel, "resolve", "deep_gemm.m_grouped_fp8_gemm_nt_contiguous"): 1,
-    }
 
 
-def test_inventory_names_every_deepgemm_call():
-    found = _scan_calls()
-    pinned = {key: count for key, (count, _) in DGP.CALL_SITES.items()}
-    missing = {k: v for k, v in found.items() if k not in pinned}
-    stale = {k: v for k, v in pinned.items() if k not in found}
-    changed = {k: (pinned[k], found[k]) for k in pinned.keys() & found.keys()
-               if pinned[k] != found[k]}
-    assert missing == {}, "DeepGEMM calls the site table does not name"
-    assert stale == {}, "site-table calls that no longer exist"
-    assert changed == {}, "call counts changed (pinned, found)"
 
 
 def test_inventory_sites_are_table_sites():
