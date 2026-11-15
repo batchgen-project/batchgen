@@ -25,13 +25,19 @@ from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
+
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 from batchgen.prefix_reuse.eviction import (
     EvictedPageRecorder,
     retire_node_frontiers,
 )
-from batchgen.query_book import release_local_query_slot
+from batchgen.query_book import release_query_book_slot
 from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotArena,
     SnapshotLayout,
@@ -40,6 +46,11 @@ from batchgen.prefix_reuse.trajectory_commit import (
 from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 import batchgen.sequence as sequence_module
 from batchgen.sequence import SequenceStatus
+from batchgen.worker.kv_plan import (
+    NodeCapacityReport,
+    prefill_owner_demand_pages,
+    verdict_node_capacity,
+)
 from batchgen.worker.prefill import (
     PREFILL_NO_PROGRESS_LIMIT,
     PREFILL_RECLAIM_TARGET_CANDIDATES,
@@ -129,9 +140,12 @@ def _worker_methods(dist):
         "describe_prefill_blockers": describe_prefill_blockers,
         "prefill_reclaim_target_pages": prefill_reclaim_target_pages,
         "prefill_host_reserve_page_deficit": prefill_host_reserve_page_deficit,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
         "SequenceStatus": SequenceStatus,
         "_sequence_module": sequence_module,
+        "NodeCapacityReport": NodeCapacityReport,
+        "prefill_owner_demand_pages": prefill_owner_demand_pages,
+        "verdict_node_capacity": verdict_node_capacity,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in METHODS}
@@ -406,10 +420,13 @@ class FakeWorker:
         committer=None, rank=0, local_rank=0, world_size=1, local_world_size=1,
         dist=None, trajectory_book=None,
     ):
-        self.rank = rank
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.local_world_size = local_world_size
+        attach_identity(
+            self,
+            rank=rank, world_size=world_size,
+            local_world_size=local_world_size, local_rank=local_rank,
+        )
+        attach_trajectory_state(self)
+        attach_prefix_state(self)
         self.torch_device = torch.device("cpu")
         self.enable_host_kv_eviction = False
         self.enable_prefix_cache = True
@@ -419,16 +436,16 @@ class FakeWorker:
         self.host_paged_kv_worker_view = pool
         self.core_engine = SimpleNamespace(host_paged_kv_worker_view=pool)
         self.global_batch = FakeBatch(sequences)
-        self._trajectory_frontier_committer = committer
+        self._traj.trajectory_frontier_committer = committer
         self._prefill_admission_state = None
         self._prefill_admission_selection = None
         self._prefill_admission_totals = None
         self._prefill_admission_live = False
         self._prefill_reservation_outcome = None
         self.shared_prefix_admission = True
-        self._shared_prefix_credit_suspended = False
-        self._shared_prefix_credit_applied = False
-        self._prefix_page_digest_cache = {}
+        self._prefix.shared_prefix_credit_suspended = False
+        self._prefix.shared_prefix_credit_applied = False
+        self._prefix.prefix_page_digest_cache = {}
         # Unmeasured prefill-pool budget: the pool declines every wave until
         # one is measured, so the shared-prefix credit declines with it and
         # these fakes admit on the full per-row charge.
@@ -437,11 +454,8 @@ class FakeWorker:
         # is compiled from the real source and reads it.
         self._prefill_pool_wave = None
         # Request-lifecycle surfaces a per-request rejection has to release.
-        self._trajectory_book = trajectory_book
-        self._uuid_to_local_map = {}
-        self._local_to_uuid_map = {}
+        self._traj.trajectory_book = trajectory_book
         self.query_book = {}
-        self._free_local_indices = set()
         self._response_queue = FakeResponseQueue()
         self.published_capacity = 0
         self._pool_mode = pool_mode

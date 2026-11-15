@@ -27,6 +27,10 @@ class GLM5Planner(BasePlanner):
     DEFAULT_MEM_FRAC = 0.85
     NUM_EXPERTS = 256
 
+    # GLM-5 decode supports only the decoupled GPU path; this declaration
+    # replaces the unconditional attn_mode force-write this class carried.
+    FORCED_DECODE_MODE = 3
+
     # GLM-5 specific constants
     NUM_LAYERS = 78
     COMPRESSED_KV_DIM = 576  # kv_lora_rank(512) + qk_rope_head_dim(64)
@@ -94,10 +98,6 @@ class GLM5Planner(BasePlanner):
 
         expert_per_rank = self.NUM_EXPERTS // self.world_size
         assert expert_per_rank > 0, "EXPERT_PER_RANK must be greater than 0"
-
-        # GLM-5 decode must always use the continuous attention path; legacy
-        # attn modes do not support the DSA architecture.
-        self.config.Basic_Config.attn_mode = 3
 
         attn_decoding_micro_batch_size = self.MAGIC_NUM // self.max_prompt_length
         attn_decoding_micro_batch_size = 2 ** (attn_decoding_micro_batch_size.bit_length() - 1)

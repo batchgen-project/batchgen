@@ -23,7 +23,10 @@ import torch
 
 import batchgen.sequence as _sequence_module
 from batchgen.continuous_batching import AdaptiveChunkSizer
-from batchgen.query_book import release_local_query_slot
+from batchgen.query_book import release_query_book_slot
+from batchgen.worker.kv_plan import effective_chunk_size
+from batchgen.worker.rank_context import RankContext
+from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from batchgen.sequence import SequenceBatch, SequenceEntry
 from batchgen.worker.prefill import compute_prefill_host_reservation
 from tests.worker_method_source import load_worker_functions, load_worker_methods
@@ -46,7 +49,9 @@ _METHODS = load_worker_methods(
         "_admitted_prompt_ids": _admitted_prompt_ids,
         "compute_prefill_host_reservation": compute_prefill_host_reservation,
         "_sequence_module": _sequence_module,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
+        "RankContext": RankContext,
+        "effective_chunk_size": effective_chunk_size,
         "_release_tokenizer_arenas": lambda **_: None,
         "logging": logging,
         "math": math,
@@ -65,9 +70,10 @@ class _Worker:
     DECISION_INTERVAL = _sequence_module.DECISION_FREQUENCY_PAGES * PAGE
     world_size = 1
     rank = 0
+    local_rank = 0
+    local_world_size = 1
     device = "cpu"
     enable_prefix_cache = False
-    _trajectory_book = None
 
     Init = _METHODS["Init"]
     _get_effective_chunk_size = _METHODS["_get_effective_chunk_size"]
@@ -93,7 +99,8 @@ class _Worker:
             else None
         )
         self.global_batch = SequenceBatch()
-        self._prefix_sequence_states = {}
+        attach_trajectory_state(self, trajectory_book=None)
+        attach_prefix_state(self)
         self._group_uuids = set()
         self.max_input_length = 0
 

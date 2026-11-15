@@ -31,6 +31,8 @@ from types import SimpleNamespace
 import pytest
 
 from batchgen.worker.kv_manager import GPU_KV_POOL_HEADROOM_GB, KVCacheManager
+from batchgen.worker.kv_plan import provisional_pool_gb
+from tests.worker.worker_fakes import make_graph_state
 
 GIB = 1024 ** 3
 
@@ -229,6 +231,7 @@ def _callable(name, free_gb, total_gb):
         "logging": recorder,
         "KVCacheManager": KVCacheManager,
         "GPU_KV_POOL_HEADROOM_GB": GPU_KV_POOL_HEADROOM_GB,
+        "provisional_pool_gb": provisional_pool_gb,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return namespace[name], recorder
@@ -253,7 +256,14 @@ def _finalize_worker(provisional_gb=PROVISIONAL_GB, max_bucket=128):
         _gpu_kv_sizing_provisional=True,
         _gpu_kv_cached_pool_gb=None,
         gpu_paged_kv_cache_manager=_manager(pages),
-        _whole_model_bucketing=SimpleNamespace(bucket_sizes=[1, 16, 64, max_bucket]),
+        # S2: the capture-time bucketing moved onto the worker's GraphRuntime.
+        # Same value, read through `self._graph` -- the floor still comes from
+        # max(bucket_sizes).
+        _graph=make_graph_state(
+            whole_model_bucketing=SimpleNamespace(
+                bucket_sizes=[1, 16, 64, max_bucket]
+            ),
+        ),
     )
 
 
@@ -338,6 +348,9 @@ def test_finalize_does_not_pass_the_memory_fraction_to_the_sizing_helper():
 def test_the_provisional_measurement_still_bounds_itself_with_the_fraction():
     # Before the capture the graph footprint is unallocated, so (1 - frac) is
     # the only thing covering it; that is the one load-bearing use of frac.
+    # The formula ``total * frac - used`` has one definition,
+    # kv_plan.provisional_pool_gb; this site must still feed it the fraction
+    # and keep its fail-loud policy (no floor).
     body = ast.unparse(_method("_init_gpu_kv_with_actual_size"))
     assert "KVCacheManager.provisional_pool_gb(total_mem_gb, used_mem_gb, self.gpu_memory_frac)" in body
 

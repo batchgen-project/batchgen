@@ -1,3 +1,4 @@
+import ast
 import sys
 import types
 import importlib.util
@@ -19,15 +20,27 @@ EngineConfig = _config_module.EngineConfig
 from batchgen.models.glm.glm5.planner import GLM5Planner
 
 
+def test_glm5_planner_consumes_mode_without_writing_it():
+    source_path = _config_path.parents[1] / "models" / "glm" / "glm5" / "planner.py"
+    tree = ast.parse(source_path.read_text())
+    assert not [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.Attribute, ast.Name))
+        and isinstance(node.ctx, ast.Store)
+        and (node.attr if isinstance(node, ast.Attribute) else node.id) == "attn_mode"
+    ]
+
+
 def _plan(world_size: int, available_gpu_gib: float = 96 * 0.85) -> EngineConfig:
     config = EngineConfig()
+    config.Basic_Config.attn_mode = 1
     config.Basic_Config.kv_dtype = "bfloat16"
     config.Basic_Config.set_max_prompt_length(8192)
     config.Basic_Config.max_decoding_length = 16
     config.Basic_Config.world_size = world_size
     planner = GLM5Planner("zai-org/GLM-5-FP8")
     planner._available_gpu_memory_gb = lambda: available_gpu_gib
-    return planner.generate_config(config)
+    return planner.generate_config(config, "glm_moe_dsa")
 
 
 def test_glm5_planner_rejects_single_node_with_h20_memory_budget():

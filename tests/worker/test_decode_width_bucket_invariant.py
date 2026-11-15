@@ -37,6 +37,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     glm5_whole_model_cuda_graph_requested_for_model,
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
+from tests.worker.worker_fakes import attach_graph_state
 from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
 
 GLM5 = "zai-org/GLM-5-FP8"
@@ -82,6 +83,7 @@ def _worker(
     reuse=True,
 ):
     worker = _Worker()
+    attach_graph_state(worker)
     worker.rank = 1
     worker.model_name = model_name
     worker.args = SimpleNamespace(
@@ -313,7 +315,8 @@ def test_capture_logs_and_checks_the_derived_ladder():
     assert "check_decode_width_within_buckets(decode_width, bucket_sizes)" in body
     # No second ladder is generated from the raw flag.
     assert "generate_bucket_sizes(" not in body
-    assert body.count("BatchSizeBucketing(") == 1
+    # S2: the one ladder construction goes through GraphRuntime.
+    assert body.count("self._graph.new_bucketing(") == 1
 
 
 # ---- configure-time invariant ----------------------------------------------
@@ -357,9 +360,9 @@ def test_eager_deployments_are_untouched(kwargs):
 
 
 def _captured(worker, buckets):
-    worker._whole_model_graph = True
-    worker._cuda_graph_manager = object()
-    worker._whole_model_bucketing = BatchSizeBucketing(buckets)
+    worker._graph.whole_model_graph = True
+    worker._graph.cuda_graph_manager = object()
+    worker._graph.whole_model_bucketing = BatchSizeBucketing(buckets)
     worker._decode_padding_bsz = 128
 
 
@@ -378,9 +381,9 @@ def test_decode_step_above_the_captured_top_bucket_raises(model_name):
 
 def test_decode_step_without_a_live_graph_checks_the_derived_ladder():
     worker = _worker()
-    worker._whole_model_graph = False
-    worker._cuda_graph_manager = None
-    worker._whole_model_bucketing = None
+    worker._graph.whole_model_graph = False
+    worker._graph.cuda_graph_manager = None
+    worker._graph.whole_model_bucketing = None
     worker._decode_padding_bsz = 128
     worker._assert_decode_step_within_graph_buckets(128)
     with pytest.raises(DecodeWidthExceedsGraphBucketError):

@@ -125,10 +125,12 @@ def test_deep_free_keeps_graph_state_of_a_held_decode_instance():
     assert deep_free.index(guard) < deep_free.index(
         "self._release_decode_graph_state()"
     )
+    # S2 made GraphRuntime (self._graph) the owner of decode-graph state;
+    # the pinned spellings follow the owned fields.
     release = ast.unparse(_function(source, "_release_decode_graph_state"))
-    assert "self._cuda_graph_manager = None" in release
-    assert "self._cuda_graph_adapter.release_context()" in release
-    assert "self._decode_graph_captures = 0" in release
+    assert "self._graph.cuda_graph_manager = None" in release
+    assert "self._graph.cuda_graph_adapter.release_context()" in release
+    assert "self._graph.decode_graph_captures = 0" in release
 
 
 def test_persistent_builder_tells_the_manager_its_prefill_mode():

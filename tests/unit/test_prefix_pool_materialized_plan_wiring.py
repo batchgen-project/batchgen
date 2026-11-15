@@ -30,6 +30,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -232,10 +238,6 @@ def _worker(
     )
     sequences = _seqs() if seqs is None else seqs
     worker = SimpleNamespace(
-        rank=rank,
-        local_rank=0,
-        world_size=max(1, attn_tp_size),
-        local_world_size=8,
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,
@@ -250,16 +252,25 @@ def _worker(
         host_paged_kv_worker_view=object(),
         global_batch=SimpleNamespace(get_sequence=sequences.get),
         prefix_cache_coordinator=RecordingCoordinator(),
-        _prefix_sequence_states=dict(states or {}),
         _prefill_pool_base=(0, 0, 0),
         _prefill_pool_page_budget=free_pages,
         _batchgen_debug=None,
         _any_sequence_batchgen_debug=True,
-        _trajectory_attachments=dict(attachments or {}),
-        _trajectory_session_groups=index,
-        _trajectory_restorer=_RecordingRestorer() if restorer is None else restorer,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=max(1, attn_tp_size), local_world_size=8,
+        local_rank=0, decode_group_size=max(1, attn_tp_size),
+        bound=UUIDS,
+    )
+    attach_prefix_state(worker, prefix_sequence_states=dict(states or {}))
+    attach_trajectory_state(
+        worker,
+        trajectory_attachments=dict(attachments or {}),
+        trajectory_session_groups=index,
+        trajectory_restorer=_RecordingRestorer() if restorer is None else restorer,
         # The leader's handle->arena table, read by the mirrored payload.
-        _trajectory_frontier_committer=SimpleNamespace(
+        trajectory_frontier_committer=SimpleNamespace(
             arena_for=lambda handle: SimpleNamespace(
                 shard_count=attn_tp_size,
                 pseudo_sid=-3,
@@ -268,9 +279,12 @@ def _worker(
                 page_ids_by_group={0: (41,)},
             ),
         ),
-        _trajectory_mirrored_restores={},
-        _local_to_uuid_map=dict(enumerate(UUIDS)),
+        trajectory_mirrored_restores={},
     )
+    # Bound-method references build_restorer takes (never called when the
+    # store already holds a restorer, as these fakes always do).
+    worker._host_views_by_group = lambda: {}
+    worker._next_pool_segment_sid = lambda: -1
     # ``_owns_host_kv`` is the group-leader predicate; a follower answers no.
     worker._owns_host_kv = lambda seq: bool(owns_host_kv)
     # The prompt reader the worker shares with the trajectory book.
@@ -293,7 +307,7 @@ def _plan(worker, states=None):
     """Plan with the prefix states the admission lookup produced."""
 
     return worker._plan_prefill_pool_wave(
-        UUIDS, dict(worker._prefix_sequence_states if states is None else states)
+        UUIDS, dict(worker._prefix.prefix_sequence_states if states is None else states)
     )
 
 
@@ -465,12 +479,12 @@ def test_the_vote_rides_the_budget_reduce_and_the_group_min_decides(monkeypatch)
     assert wave.materialized == frozenset(), "the peer's no takes it back"
     assert wave.plan.materialized_tokens == 0
     # And this rank's live attachment is declined by name at plan time.
-    assert worker._trajectory_restorer.declines == [(
+    assert worker._traj.trajectory_restorer.declines == [(
         GLOBAL_IDS[0], "not_planned",
         "at plan time: the serve group could not confirm the mirrored "
         "frontier set",
     )]
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
 
 
 def test_the_leaders_no_reaches_the_reduce(monkeypatch):
@@ -583,7 +597,7 @@ def _materialized_wave(monkeypatch, **kwargs):
         states=_hit_states(),
         **kwargs,
     )
-    states = dict(worker._prefix_sequence_states)
+    states = dict(worker._prefix.prefix_sequence_states)
     wave = worker._plan_prefill_pool_wave(UUIDS, states)
     return worker, seqs, wave, states
 
@@ -606,17 +620,17 @@ def test_the_hits_prefix_state_starts_at_the_frontier_boundary(monkeypatch):
     """The identity the KDA restore refuses to run without."""
 
     worker, _, wave, states = _materialized_wave(monkeypatch)
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.compute_cached_tokens == BOUNDARY
     assert state.attached_tokens == BOUNDARY
     assert states[GLOBAL_IDS[0]].compute_cached_tokens == BOUNDARY
     assert wave.chain_tokens(0) == BOUNDARY
     # The plan's restore decision: this row, at exactly its boundary.
     assert state.trajectory_restore_boundary == BOUNDARY
-    assert worker._prefix_sequence_states[GLOBAL_IDS[1]].trajectory_restore_boundary == 0
+    assert worker._prefix.prefix_sequence_states[GLOBAL_IDS[1]].trajectory_restore_boundary == 0
     # A planned attachment is NOT declined; it stays for the restore seam.
-    assert worker._trajectory_restorer.declines == []
-    assert set(worker._trajectory_attachments) == {GLOBAL_IDS[0]}
+    assert worker._traj.trajectory_restorer.declines == []
+    assert set(worker._traj.trajectory_attachments) == {GLOBAL_IDS[0]}
 
 
 def test_the_attachment_holding_the_frontier_resident_is_kept_for_the_wave(monkeypatch):
@@ -624,7 +638,7 @@ def test_the_attachment_holding_the_frontier_resident_is_kept_for_the_wave(monke
     assert worker.prefix_cache_coordinator.released == [], (
         "releasing it would let the pages the load reads be evicted mid-wave"
     )
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     # Carried where the one release lane every sequence leaves through
     # frees it exactly once.
     assert state.commit_attachment_handles == (77,)
@@ -642,7 +656,8 @@ def test_a_non_hit_still_releases_its_lookup(monkeypatch):
     )
     worker._plan_prefill_pool_wave(UUIDS, dict(states))
     assert worker.prefix_cache_coordinator.released == [88]
-    assert worker._prefix_sequence_states[GLOBAL_IDS[1]].commit_attachment_handles == ()
+    # migrated: worker._prefix.prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states[GLOBAL_IDS[1]].commit_attachment_handles == ()
 
 
 def test_a_loaded_segment_asks_for_no_recurrent_state_slot(monkeypatch):
@@ -659,7 +674,7 @@ def test_a_loaded_segment_asks_for_no_recurrent_state_slot(monkeypatch):
     )
     # Three prompts, one loaded segment and one computed one: four slots.
     wave = worker._plan_prefill_pool_wave(
-        UUIDS, dict(worker._prefix_sequence_states)
+        UUIDS, dict(worker._prefix.prefix_sequence_states)
     )
     assert wave is not None and wave.materialized == frozenset({0})
 
@@ -677,17 +692,17 @@ def test_a_dropped_hit_releases_its_attachment_exactly_once(monkeypatch):
     wave = _plan(worker)
     assert wave is not None and wave.materialized == frozenset()
     assert worker.prefix_cache_coordinator.released == [77]
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.commit_attachment_handles == (), "released, not also retained"
     # The sequence recomputes from token 0 and carries no restore: its
     # trajectory attachment was declined when the wave was planned, so it
     # never reaches the restore seam.
     assert state.compute_cached_tokens == 0
     assert state.trajectory_restore_boundary == 0
-    assert [reason for _, reason, _ in worker._trajectory_restorer.declines] == [
+    assert [reason for _, reason, _ in worker._traj.trajectory_restorer.declines] == [
         "not_planned"
     ]
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
 
 
 def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplog):
@@ -728,17 +743,17 @@ def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplo
     )
     with caplog.at_level("WARNING"):
         wave = worker._plan_prefill_pool_wave(
-            UUIDS, dict(worker._prefix_sequence_states)
+            UUIDS, dict(worker._prefix.prefix_sequence_states)
         )
     assert "declined by the planner" in caplog.text
     assert "pool_materialization_does_not_fit" in caplog.text
     # The row's restore is declined by name at plan time, once.
-    assert worker._trajectory_restorer.declines == [(
+    assert worker._traj.trajectory_restorer.declines == [(
         GLOBAL_IDS[0], "not_planned",
         "at plan time: the wave planner declined it "
         "(pool_materialization_does_not_fit)",
     )]
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
     if wave is not None:
         assert wave.materialized == frozenset()
         # The sequence still completes: it is computed in full.
@@ -814,10 +829,10 @@ DROP_CASES = {
 @pytest.mark.parametrize("name", sorted(DROP_CASES))
 def test_every_drop_path_ends_in_one_named_plan_time_decline(monkeypatch, name):
     worker = _drop_case(name, monkeypatch)
-    attachment = worker._trajectory_attachments[GLOBAL_IDS[0]]
-    worker._plan_prefill_pool_wave(UUIDS, dict(worker._prefix_sequence_states))
+    attachment = worker._traj.trajectory_attachments[GLOBAL_IDS[0]]
+    worker._plan_prefill_pool_wave(UUIDS, dict(worker._prefix.prefix_sequence_states))
 
-    restorer = worker._trajectory_restorer
+    restorer = worker._traj.trajectory_restorer
     assert len(restorer.declines) == 1, restorer.declines
     sequence_id, reason, detail = restorer.declines[0]
     assert (sequence_id, reason) == (GLOBAL_IDS[0], "not_planned")
@@ -825,7 +840,7 @@ def test_every_drop_path_ends_in_one_named_plan_time_decline(monkeypatch, name):
     # Released exactly once (the recording restorer refuses a second
     # consumption) and gone from the live map ...
     assert attachment.consumed is True
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
     # ... so the restore seam has nothing to apply for the row.
     worker._restore_trajectory_frontiers([0, 1, 2])
     assert restorer.restores == []
@@ -835,10 +850,10 @@ def test_the_planned_row_is_restored_at_exactly_its_boundary(monkeypatch):
     worker, _, wave, _ = _materialized_wave(monkeypatch)
     assert wave is not None and wave.materialized == frozenset({0})
     worker._restore_trajectory_frontiers([0, 1, 2])
-    restorer = worker._trajectory_restorer
+    restorer = worker._traj.trajectory_restorer
     assert restorer.restores == [(GLOBAL_IDS[0], BOUNDARY)]
     assert restorer.declines == []
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
 
 
 def test_an_unplanned_attachment_at_the_restore_seam_is_a_broken_invariant(monkeypatch):
@@ -849,10 +864,10 @@ def test_an_unplanned_attachment_at_the_restore_seam_is_a_broken_invariant(monke
         attachments={GLOBAL_IDS[0]: _Attachment()},
         states=_hit_states(),  # a lookup state, never planned
     )
-    attachment = worker._trajectory_attachments[GLOBAL_IDS[0]]
+    attachment = worker._traj.trajectory_attachments[GLOBAL_IDS[0]]
     with pytest.raises(RuntimeError, match="never planned"):
         worker._restore_trajectory_frontiers([0])
-    restorer = worker._trajectory_restorer
+    restorer = worker._traj.trajectory_restorer
     assert restorer.restores == []
     assert [reason for _, reason, _ in restorer.declines] == ["not_planned"]
     assert attachment.consumed is True
@@ -863,7 +878,7 @@ def test_the_mirrored_payload_carries_planned_rows_only(monkeypatch):
     assert wave is not None
     # A second live attachment the plan never took (a row outside this
     # wave's materialization, e.g. one left from an earlier pass).
-    worker._trajectory_attachments[GLOBAL_IDS[1]] = _Attachment(
+    worker._traj.trajectory_attachments[GLOBAL_IDS[1]] = _Attachment(
         sequence_id=GLOBAL_IDS[1]
     )
     payload = worker._trajectory_restore_payload()
@@ -886,9 +901,9 @@ def test_the_plan_keeps_the_hit_whose_frontier_covers_its_pool_chain(monkeypatch
     wave = _plan(worker)
     assert wave is not None and wave.materialized == frozenset({0})
     assert wave.chain_tokens(0) == BOUNDARY
-    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    state = worker._prefix.prefix_sequence_states[GLOBAL_IDS[0]]
     assert state.trajectory_restore_boundary == BOUNDARY
-    assert worker._trajectory_restorer.declines == []
+    assert worker._traj.trajectory_restorer.declines == []
 
 
 # --------------------------------------------------------------------------- #
@@ -910,7 +925,7 @@ def test_a_planned_rows_restore_failure_propagates_out_of_the_seam(monkeypatch):
 
     worker, _, wave, _ = _materialized_wave(monkeypatch)
     assert wave is not None and wave.materialized == frozenset({0})
-    restorer = worker._trajectory_restorer
+    restorer = worker._traj.trajectory_restorer
 
     def _exhausted(attachment, *, serving_group_id, compute_cached_tokens):
         restorer._consume(attachment)
@@ -928,7 +943,7 @@ def test_a_planned_rows_restore_failure_propagates_out_of_the_seam(monkeypatch):
         worker._restore_trajectory_frontiers([0, 1, 2])
     assert excinfo.value.reason == DECLINE_SLOTS_EXHAUSTED
     assert excinfo.value.sequence_id == GLOBAL_IDS[0]
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
 
 
 def test_a_planned_row_whose_attachment_is_gone_is_raised_by_name(monkeypatch):
@@ -939,13 +954,13 @@ def test_a_planned_row_whose_attachment_is_gone_is_raised_by_name(monkeypatch):
 
     worker, _, wave, _ = _materialized_wave(monkeypatch)
     assert wave is not None and wave.materialized == frozenset({0})
-    worker._trajectory_attachments.pop(GLOBAL_IDS[0])
+    worker._traj.trajectory_attachments.pop(GLOBAL_IDS[0])
     with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
         worker._restore_trajectory_frontiers([0, 1, 2])
     assert excinfo.value.reason == FAIL_NO_RESTORE_SOURCE
     assert excinfo.value.sequence_id == GLOBAL_IDS[0]
     assert excinfo.value.boundary_tokens == BOUNDARY
-    assert worker._trajectory_restorer.restores == []
+    assert worker._traj.trajectory_restorer.restores == []
 
 
 def test_a_follower_planned_row_without_a_mirrored_decision_is_raised(monkeypatch):
@@ -971,8 +986,8 @@ def test_a_follower_planned_row_without_a_mirrored_decision_is_raised(monkeypatc
             ),
         },
     )
-    assert worker._trajectory_attachments == {}
-    assert worker._trajectory_mirrored_restores == {}
+    assert worker._traj.trajectory_attachments == {}
+    assert worker._traj.trajectory_mirrored_restores == {}
     with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
         worker._restore_trajectory_frontiers([0, 1, 2])
     assert excinfo.value.reason == FAIL_NO_RESTORE_SOURCE
@@ -986,5 +1001,5 @@ def test_unplanned_rows_with_no_source_pass_the_seam(monkeypatch):
     _stub_heavy_modules(monkeypatch, free_state_slots=32)
     worker, _ = _worker(states=_hit_states())
     worker._restore_trajectory_frontiers([0, 1, 2])
-    assert worker._trajectory_restorer.restores == []
-    assert worker._trajectory_restorer.declines == []
+    assert worker._traj.trajectory_restorer.restores == []
+    assert worker._traj.trajectory_restorer.declines == []

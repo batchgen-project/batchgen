@@ -34,6 +34,7 @@ from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import (
     GptOssParallelStrategyManager,
 )
 from batchgen.phase_lifecycle import ExitMode, PhaseEnterContext, PhaseKey
+from tests.worker.worker_fakes import attach_graph_state
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -436,9 +437,9 @@ def _worker(manager, events):
     worker._log_phase_memory_ledger = lambda label: None
     worker._unregister_fp8_weights = lambda: events.append("unregister")
     worker.init_nvshmem = lambda: None
-    worker._cuda_graph_adapter = None
-    worker._cuda_graph_manager = None
-    worker._decode_graph_captures = 0
+    # S2: the decode-graph state is GraphRuntime's (adapter/manager None,
+    # capture counter 0 by default).
+    attach_graph_state(worker)
     worker.model = None
     worker.weight_copy_task = {}
     return worker
@@ -448,8 +449,8 @@ def _capture(worker, events):
     """The `_setup_cuda_graphs` contract: guard, capture, count."""
     worker._assert_decode_graph_capture_allowed()
     events.append("capture")
-    worker._cuda_graph_manager = object()
-    worker._whole_model_segment = object()
+    worker._graph.cuda_graph_manager = object()
+    worker._graph.whole_model_segment = object()
     worker._record_decode_graph_capture()
 
 
@@ -459,7 +460,7 @@ def _decode_interval(worker, events):
         DECODE, comm=worker.comm, max_num_seq=WIDTH
     )
     if should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=worker._cuda_graph_manager is not None,
+        graph_manager_is_initialized=worker._graph.cuda_graph_manager is not None,
         global_batch_has_queueing=False,
         model_name="gpt-oss-120b",
     ):
@@ -483,8 +484,8 @@ def test_two_decode_intervals_capture_exactly_once(monkeypatch):
     # entry still resumes the kept decode instance.
     assert second == (True, True)
     assert events.count("capture") == 1
-    assert worker._decode_graph_captures == 1
-    assert worker._cuda_graph_manager is not None
+    assert worker._graph.decode_graph_captures == 1
+    assert worker._graph.cuda_graph_manager is not None
     assert m.arenas[0].maps == 2 and m.arenas[0].unmaps == 2
     assert len(m.pointer_tables) == 1
     assert "unregister" not in events  # decode interval keeps the instance
@@ -495,7 +496,7 @@ def test_capture_requested_again_for_a_kept_instance_fails_loud(monkeypatch):
     events = []
     worker = _worker(m, events)
     _decode_interval(worker, events)
-    worker._cuda_graph_manager = None  # graph state lost under a kept instance
+    worker._graph.cuda_graph_manager = None  # graph state lost under a kept instance
     with pytest.raises(RuntimeError, match="captured once per"):
         _decode_interval(worker, events)
     worker._criticality_probe_recapture = True
@@ -512,4 +513,4 @@ def test_build_always_rank_recaptures_every_interval(monkeypatch):
     _decode_interval(worker, events)
     _decode_interval(worker, events)
     assert events.count("capture") == 2
-    assert worker._decode_graph_captures == 0  # released with the instance
+    assert worker._graph.decode_graph_captures == 0  # released with the instance

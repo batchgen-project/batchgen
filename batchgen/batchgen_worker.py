@@ -10,7 +10,17 @@ import os
 import socket
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
+from typing import (
+	AbstractSet,
+	Callable,
+	Dict,
+	List,
+	Mapping,
+	Optional,
+	Sequence,
+	Set,
+	Tuple,
+)
 
 import torch
 import torch.multiprocessing as mp
@@ -202,10 +212,24 @@ from batchgen.batch_order import (
 from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBook,
-	bind_local_sequence_to_query_book,
+	bind_query_book_slot,
 	make_query_book_entry,
-	release_local_query_slot,
+	release_query_book_slot,
 )
+from batchgen.config.decode_strategy import DecodeStrategy, strategy_for
+from batchgen.worker.graph_runtime import GraphRuntime
+from batchgen.worker.trajectory_store import TrajectoryStore
+from batchgen.worker.prefix_reuse_state import PrefixReuseState
+
+
+def _load_kda_wrapper():
+	# The only model-package import behind TrajectoryStore: batchgen/worker/
+	# must not depend on batchgen.models, so the store receives this loader.
+	# ImportError propagates so each store call site keeps its old handling.
+	from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+	return KimiLinearKDAWrapper
+from batchgen.worker.rank_context import RankContext, node_of_rank
+from batchgen.worker.sequence_table import SequenceTable
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import (
 	is_kimi_k25_backend_model,
@@ -284,6 +308,15 @@ from batchgen.worker.kv_manager import (
 	MigrationPlanRequest,
 	PageTableCapacityRequest,
 	WatermarkTriggerRequest,
+)
+from batchgen.worker.kv_plan import (
+	NodeCapacityReport,
+	credit_reclaimable_pages,
+	effective_chunk_size,
+	host_capacity_due,
+	prefill_owner_demand_pages,
+	provisional_pool_gb,
+	verdict_node_capacity,
 )
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
@@ -1209,6 +1242,10 @@ class BatchGenWorker:
 		self.rank = args.global_rank # Alias for compatibility
 		self.world_size = args.world_size
 		self.local_world_size = args.local_world_size
+		# S3.5 state owners.  They are created eagerly so flag-off paths are
+		# plain field reads and the pool pseudo-sid seed is unconditional.
+		self._traj = TrajectoryStore(kda_wrapper_loader=_load_kda_wrapper)
+		self._prefix = PrefixReuseState(rank=self.rank, world_size=self.world_size)
 		self.pynccl_port_base = args.pynccl_port_base
 		self.pynccl_port_span = args.pynccl_port_span
 		self._nccl_port = self.pynccl_port_base
@@ -1226,16 +1263,10 @@ class BatchGenWorker:
 		# silently mis-order the temperature vector after a page boundary.
 		self._decode_row_epoch = 0
 
-		# CUDA graph state
-		self._cuda_graph_manager = None
-		# Phase C: cuda-graph adapter (cached from initializer.get_cuda_graph_adapter())
-		# becomes the default and only decode-graph path. When an adapter is
-		# present it owns eligibility / replay-inputs / KV staging; the legacy
-		# `_glm5_*` whole-model code path is unreachable for models that ship
-		# an adapter. Phase B's BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL env gate is
-		# retired — adapters are now the production path, not a migration toggle.
-		self._cuda_graph_adapter = None
-		self._cuda_graph_adapter_dual = True
+		# CUDA graph state: every field of the decode-graph state machine is
+		# owned by `batchgen.worker.graph_runtime.GraphRuntime`, which also
+		# owns the cuda-graph-layer imports this module used to make.
+		self._graph = GraphRuntime()
 		# SyncCoordinator instantiated lazily on first use so we don't
 		# touch torch.distributed before it's initialized.
 		self._sync_coordinator: Optional[SyncCoordinator] = None
@@ -1246,23 +1277,6 @@ class BatchGenWorker:
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
-		self._glm5_moe_cuda_graph_manager = None
-		self._glm5_layer_cuda_graph_manager = None
-		self._glm5_layer_graph_failed_buckets = set()
-		self._glm5_layer_graph_capture_attempted_for_batch = False
-		self._glm5_layer_graph_signature = None
-		self._glm5_layer_graph_max_seqlen = None
-		self._glm5_moe_graph_failed_buckets = set()
-		self._glm5_dsa_graph_capture_attempted_for_batch = False
-		self._glm5_moe_graph_capture_attempted_for_batch = False
-		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
-		self._whole_model_graph = False
-		self._glm5_whole_model_graph = False
-		self._glm5_whole_model_graph_failed_buckets = set()
-		self._glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._glm5_whole_model_graph_signature = None
-		self._glm5_whole_model_graph_unavailable_reason = None
 		# Decode criticality probe. The model's graph adapter parses the request
 		# from batchgen_debug and builds the probe; the worker only holds the
 		# round's request (set at decode configure), the probe installed in the
@@ -1271,8 +1285,6 @@ class BatchGenWorker:
 		self._criticality_probe = None
 		self._criticality_probe_request = None
 		self._criticality_probe_recapture = False
-		# Monotonic timestamp of the last "step exceeds the captured span" WARN.
-		self._decode_graph_span_warn_monotonic = None
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
@@ -1396,9 +1408,9 @@ class BatchGenWorker:
 		self.prefix_cache_coordinator = None
 		# Edge trigger for the prefix_drain metric: set when the row is
 		# emitted, cleared when admission adds new sequences.
-		self._prefix_drain_metric_emitted = False
-		self._prefix_sequence_states = {}
-		self._active_prefix_materializations = []
+		self._prefix.prefix_drain_metric_emitted = False
+		self._prefix.prefix_sequence_states = {}
+		self._prefix.active_prefix_materializations = []
 		self._prefill_pool_wave = None
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
@@ -1410,9 +1422,7 @@ class BatchGenWorker:
 		self._prefill_pool_base = (0, 0, 0)
 		# Pseudo Host ids must not collide with entries a previous worker of
 		# this node left in the shared Host KV region (hot reload).
-		self._pool_sid_counter = time.time_ns() // 1000
-		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
-		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
+		# ``PrefixReuseState`` seeded and initialized these fields eagerly.
 		# Scheduler-loop hard guard against identical empty prefill waves with
 		# nothing live; _prepare_prefill_batch publishes the rank-identical
 		# admission state (and its selection snapshot) the guard compares.
@@ -1438,21 +1448,21 @@ class BatchGenWorker:
 		# the retry falls back to the full charge, makes progress, and the
 		# latch clears on the next committed reservation. Rank-uniform: both
 		# the rejection and the commit are decided by a collective.
-		self._shared_prefix_credit_suspended = False
-		self._shared_prefix_credit_applied = False
+		self._prefix.shared_prefix_credit_suspended = False
+		self._prefix.shared_prefix_credit_applied = False
 		# global_idx -> cumulative per-page prompt digests, one entry per
 		# SHAREABLE page (a prompt's last page is private by construction, so
 		# every row keeps a tail). Cached because a digest is a property of the
 		# prompt, not of the round: recomputing it on every scheduler iteration
 		# would re-hash the whole candidate set each time.
-		self._prefix_page_digest_cache = {}
+		self._prefix.prefix_page_digest_cache = {}
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
-		self._trajectory_frontier_committer = None
+		self._traj.trajectory_frontier_committer = None
 		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
 		# None otherwise. global_idx -> the live TrajectoryAttachment a hit
 		# took; empty whenever the flag is off, so the restore seam is free.
-		self._trajectory_restorer = None
-		self._trajectory_attachments = {}
+		self._traj.trajectory_restorer = None
+		self._traj.trajectory_attachments = {}
 		# M3 Slice 1c, G>1 only. Both are per-PASS and both are published by
 		# the serve-group leader on the host-KV mirror that already runs in
 		# prefill config, so no new collective exists:
@@ -1462,13 +1472,13 @@ class BatchGenWorker:
 		#   _trajectory_mirrored_restores: global_id -> the leader's frontier
 		#     HIT for this pass, so the group restores on one decision instead
 		#     of G independent ones.
-		self._trajectory_arena_payload = {}
-		self._trajectory_mirrored_restores = {}
+		self._traj.trajectory_arena_payload = {}
+		self._traj.trajectory_mirrored_restores = {}
 		# M3 Slice 3a: the WORLD's session -> owning-group map, folded from
 		# every leader's summary on that same mirror. Built on the first fold,
 		# None whenever the trajectory flag never turned on, so the group
 		# assignment of a flag-off run reads one attribute and moves on.
-		self._trajectory_session_groups = None
+		self._traj.trajectory_session_groups = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -1560,12 +1570,6 @@ class BatchGenWorker:
 		# Compatibility key for the currently entered manager phase.
 		self._phase = None
 		self._live_phase_key = None
-		# Whole-model decode graph capture episodes of the current decode
-		# instance; reset when that instance's graph state is released
-		# (_release_decode_graph_state). On the reuse lifecycle it stays at 1:
-		# the switch invariants and the capture-once guard in
-		# _setup_cuda_graphs read it.
-		self._decode_graph_captures = 0
 		# Prefill MoE mode of the most recent prefill entry; see
 		# _desired_phase_key("decode").
 		self._prefill_moe_mode_in_effect = None
@@ -1585,10 +1589,13 @@ class BatchGenWorker:
 		self.global_batch: Optional[SequenceBatch] = None
 		self.query_book: Optional[Dict] = None
 		self.model_batch_book: Dict = {}
-		self._local_to_uuid_map: Dict[int, str] = {}
-		self._uuid_to_local_map: Dict[str, int] = {}
-		self._free_local_indices: Set[int] = set()  # Track freed indices for O(1) allocation
-		self._next_local_idx: int = 0  # Next index if free list is empty
+		# Local slot binding (both maps) and its free-slot allocator live in
+		# ONE owner; `_local_to_uuid_map` / `_uuid_to_local_map` below are
+		# read-only views of it. Every write goes through `self.seq_table`.
+		self.seq_table = SequenceTable()
+		# Frozen rank identity. Built in `Init` once the parallel strategy
+		# manager exists, because the decode attention TP size G comes from it.
+		self.rank_ctx: Optional[RankContext] = None
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
@@ -1645,8 +1652,8 @@ class BatchGenWorker:
 		# Legacy pool fields remain only for checkpoint/object compatibility; the
 		# production path uses the fixed trajectory book initialized with the model.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
-		self._trajectory_book = None
-		self._trajectory_memfd: Optional[NodeSharedMemfd] = None
+		self._traj.trajectory_book = None
+		self._traj.trajectory_memfd: Optional[NodeSharedMemfd] = None
 		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
@@ -1655,6 +1662,28 @@ class BatchGenWorker:
 		self._retired_buffer_pools: List[QueryBookBufferPool] = []
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
+
+	# ============ Local slot binding (owned by SequenceTable) ============
+	#
+	# Read-only views. `SequenceTable` is the single writer: bind / unbind /
+	# reset. Mutating one of these raises, which is the point — a stray
+	# `pop`/`[...]=` here used to be how the two maps drifted apart.
+
+	@property
+	def _local_to_uuid_map(self) -> Mapping[int, str]:
+		return self.seq_table.local_to_uuid
+
+	@property
+	def _uuid_to_local_map(self) -> Mapping[str, int]:
+		return self.seq_table.uuid_to_local
+
+	@property
+	def _free_local_indices(self) -> AbstractSet[int]:
+		return self.seq_table.free_local_indices
+
+	@property
+	def _next_local_idx(self) -> int:
+		return self.seq_table.next_local_idx
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
 		"""
@@ -1696,7 +1725,20 @@ class BatchGenWorker:
 		else:
 			# Just update the num_queries and batch-related config
 			self._update_batch_config(num_queries)
-		
+
+		# Freeze this rank's identity. G (`_decode_attn_tp_size`) reads the
+		# parallel strategy manager, which `_initialize_core_components`
+		# constructs, so this is the earliest point it is knowable. Every
+		# field is stable for the process lifetime, so a re-Init rebuilds an
+		# equal object.
+		self.rank_ctx = RankContext(
+			rank=self.rank,
+			world_size=self.world_size,
+			local_rank=self.local_rank,
+			local_world_size=self.local_world_size,
+			decode_group_size=self._decode_attn_tp_size(),
+		)
+
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
@@ -1732,18 +1774,23 @@ class BatchGenWorker:
 			total_mem_gb = total_mem_bytes / (1024 ** 3)
 			used_mem_gb = total_mem_gb - free_mem_gb
 
-			# Formula: gpu_kv_cache = total * frac - used
+			# Formula: gpu_kv_cache = total * frac - used (single definition:
+			# kv_plan.provisional_pool_gb).
 			# This reserves (1-frac) of GPU memory for activations and overhead
-			gpu_kv_cache_gb = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-
-			# Ensure positive value
-			if gpu_kv_cache_gb <= 0:
+			calculated_gb = provisional_pool_gb(
+				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
+			)
+			# Ensure positive value: a non-positive remainder warns here and is
+			# replaced by the 1 GB floor kv_plan substitutes.
+			gpu_kv_cache_gb = provisional_pool_gb(
+				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=1.0
+			)
+			if calculated_gb <= 0:
 				logging.warning(
-					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
+					f"[GPU-KV] Calculated size is non-positive ({calculated_gb:.2f} GB). "
 					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
 					f"Using minimum 1 GB."
 				)
-				gpu_kv_cache_gb = 1.0
 
 			logging.info(
 				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
@@ -2108,7 +2155,7 @@ class BatchGenWorker:
 				"admitted sequence must carry its own decode budget"
 			)
 		# New live work: the next drain is a new edge for the prefix_drain row.
-		self._prefix_drain_metric_emitted = False
+		self._prefix.prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2242,7 +2289,7 @@ class BatchGenWorker:
 		# copy the prompt into the same store that will receive decode tokens.
 		# Every rank executes this deterministically so local metadata and the
 		# node-shared storage have identical slot assignments.
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		valid = [
 			(seq, prompt_ids[i])
@@ -2251,11 +2298,11 @@ class BatchGenWorker:
 		]
 		sequence_ids = [seq.uuid for seq, _ in valid]
 		reserved_tokens = [self.model_context_length] * len(valid)
-		reserved_slots = self._trajectory_book.bind_batch(sequence_ids, reserved_tokens)
+		reserved_slots = self._traj.trajectory_book.bind_batch(sequence_ids, reserved_tokens)
 		try:
 			for (seq, token_ids), slot in zip(valid, reserved_slots):
 				actual_prompt_len = int(token_ids.numel())
-				self._trajectory_book.write_prompt(slot, token_ids)
+				self._traj.trajectory_book.write_prompt(slot, token_ids)
 				seq._buffer_slot = slot
 				# Token storage is now accessed through QueryBook; these fields are
 				# intentionally empty so no stale dense view can escape the book.
@@ -2270,8 +2317,8 @@ class BatchGenWorker:
 				seq.clamp_decode_to_context(actual_prompt_len, self.model_context_length)
 		except Exception:
 			for slot in reserved_slots:
-				if slot in self._trajectory_book._records:
-					self._trajectory_book.release(slot)
+				if slot in self._traj.trajectory_book._records:
+					self._traj.trajectory_book.release(slot)
 			raise
 		self._publish_trajectory_pool_capacity()
 
@@ -2358,43 +2405,18 @@ class BatchGenWorker:
 		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
 
 	def _owns_local_sequence(self, seq) -> bool:
-		"""Which ranks bind a sequence into the LOCAL maps (query_book +
-		_uuid_to_local_map) and drive it through prefill/decode.
+		"""Delegate: which ranks bind a sequence into the LOCAL table.
 
-		Pure DP (G==1, the validated path): the single ``assigned_rank`` owns it.
-		Option 1 unified resident TP (G>1): ALL G ranks of the sequence's
-		``decode_dp_group`` hold it — the group runs prefill+decode in TP-G
-		lockstep on identical sequences (replicated attention, head-sharded KDA
-		state), so the o_proj all_reduce couples matching tokens and no
-		prefill->decode reshard is ever needed. Requires ``decode_dp_group`` to
-		be stamped (done at admission / prefill config before binding)."""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return seq.assigned_rank == self.rank
-		from batchgen.decode_dp_group import rank_in_decode_group
-		return rank_in_decode_group(seq.decode_dp_group, self.rank, G)
+		Rule and rationale live on `RankContext.owns_sequence`.
+		"""
+		return self.rank_ctx.owns_sequence(seq)
 
 	def _owns_host_kv(self, seq) -> bool:
-		"""Which SINGLE rank drives the per-node SHARED host-KV region for a seq.
+		"""Delegate: which SINGLE rank drives the shared host-KV region.
 
-		The host paged KV cache is ONE run-namespaced shm region per node,
-		keyed by ``global_idx``, so register /
-		allocate / grow / release must fire EXACTLY once per sequence. This is
-		NARROWER than ``_owns_local_sequence``: G>1 replicates a seq onto all G
-		ranks of its group (they each hold GPU KV + head-sharded KDA state), but
-		only the group LEADER ``decode_dp_group*G`` may touch the shared host
-		region — otherwise the G ranks double-register (G x host reservation) and
-		double-release (2nd releaser hits ``IndexError: Sequence ID ... not found
-		during release``). G==1 is the validated single-owner path: the
-		``assigned_rank`` owner, identical to ``uuid in _uuid_to_local_map``."""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return seq.assigned_rank == self.rank
-		from batchgen.decode_dp_group import host_kv_owner_rank
-		return (
-			seq.decode_dp_group is not None
-			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
-		)
+		Rule and rationale live on `RankContext.owns_host_kv`.
+		"""
+		return self.rank_ctx.owns_host_kv(seq)
 
 	def _mirror_group_host_kv(
 		self,
@@ -2408,7 +2430,7 @@ class BatchGenWorker:
 		G>1 replicates a sequence onto all G ranks of its group, but only the
 		leader (``_owns_host_kv``) registers / allocates it in the per-node
 		SHARED host region, so the other G-1 ranks come out of prefill config
-		with an empty worker-view page table and no ``_prefix_sequence_states``
+		with an empty worker-view page table and no prefix state entry
 		entry for sequences they must still read. Both are rank-local views of
 		page ids the leader has already committed, so one object all-gather
 		reproduces them exactly: every follower installs ITS OWN leader's entry.
@@ -2584,7 +2606,7 @@ class BatchGenWorker:
 				trajectory_restore_boundary=int(restore),
 			)
 			prefix_states[global_id] = state
-			self._prefix_sequence_states[global_id] = state
+			self._prefix.prefix_sequence_states[global_id] = state
 		if trajectory:
 			# M3 Slice 1c, follower side. Both halves come from the leader: the
 			# arena this rank writes its own shard into, and the hit it must
@@ -2592,23 +2614,23 @@ class BatchGenWorker:
 			# prefill in lockstep -- G independent lookups could disagree, and
 			# a rank that declined while its peers restored would run the same
 			# suffix against a zeroed head shard.
-			self._trajectory_arena_payload = dict(
+			self._traj.trajectory_arena_payload = dict(
 				entry.get("frontier_arenas") or {}
 			)
-			self._trajectory_mirrored_restores = dict(
+			self._traj.trajectory_mirrored_restores = dict(
 				entry.get("frontier_restores") or {}
 			)
 			self._adopt_mirrored_trajectory_arenas(
-				self._trajectory_arena_payload
+				self._traj.trajectory_arena_payload
 			)
-			if self._trajectory_arena_payload or self._trajectory_mirrored_restores:
+			if self._traj.trajectory_arena_payload or self._traj.trajectory_mirrored_restores:
 				logging.info(
 					"[TRAJECTORY_FRONTIER] Rank %s shard=%s adopted %s arena(s) "
 					"and %s mirrored restore(s) from serve-group leader %s",
 					self.rank,
 					self._trajectory_group_geometry()[1],
-					len(self._trajectory_arena_payload),
-					len(self._trajectory_mirrored_restores),
+					len(self._traj.trajectory_arena_payload),
+					len(self._traj.trajectory_mirrored_restores),
 					leader,
 				)
 
@@ -2697,7 +2719,7 @@ class BatchGenWorker:
 			owner, boundary = residency[uuid]
 			seq = self.global_batch.get_sequence(uuid)
 			honored = seq.decode_dp_group == owner
-			self._trajectory_session_groups.record_pin(placed_on_owner=honored)
+			self._traj.trajectory_session_groups.record_pin(placed_on_owner=honored)
 			logging.info(
 				"[TRAJECTORY_FRONTIER] Rank %s sequence %s owner_group=%s "
 				"placed_group=%s boundary=%s honored_on_owner=%s placed_offgroup=%s",
@@ -2877,41 +2899,16 @@ class BatchGenWorker:
 	def _check_local_binding_matches_group(
 		self, uuids: List[str], where: str
 	) -> None:
-		"""A local row exists iff this rank's group owns the sequence (G>1).
+		"""Delegate: a local row exists iff this rank's group owns the sequence.
 
-		``_get_local_indices_for_uuids`` resolves a wave from
-		``_uuid_to_local_map`` alone and silently skips what it does not find,
-		so a binding that disagrees with the serve-group map is not refused
-		anywhere: the rank prefills or decodes a row its group does not own, or
-		misses one it does. The second form is what raises ``KeyError:
-		Sequence <global_idx> has no KDA state item`` from
-		``prepare_decode_step`` — by then the stamping seam is long gone.
-
-		The invariant is an equivalence, so both directions are checked, and
-		both are local reads: no collective, O(len(uuids)) per call.
+		Rule and rationale live on `SequenceTable.check_binding_matches_group`.
 		"""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return
-		offenders = []
-		for uuid in uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			bound = uuid in self._uuid_to_local_map
-			owns = self._owns_local_sequence(seq)
-			if bound != owns:
-				offenders.append(
-					f"global_idx={seq.global_idx} group={seq.decode_dp_group} "
-					f"bound={int(bound)} owns={int(owns)}"
-				)
-		if offenders:
-			raise RuntimeError(
-				f"Rank {self.rank}: [SCHED_INVARIANT] {where}: "
-				f"{len(offenders)} sequences whose local row disagrees with the "
-				f"serve-group map (G={G}, rank//G={self.rank // G}): "
-				+ "; ".join(offenders[:10])
-			)
+		self.seq_table.check_binding_matches_group(
+			uuids,
+			where,
+			rank_ctx=self.rank_ctx,
+			get_sequence=self.global_batch.get_sequence,
+		)
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -2922,17 +2919,13 @@ class BatchGenWorker:
 		seq = self.global_batch.get_sequence(uuid)
 		if self.query_book is None:
 			self.query_book = {}
-		local_idx, self._next_local_idx = bind_local_sequence_to_query_book(
+		return bind_query_book_slot(
 			uuid,
 			seq,
 			query_book=self.query_book,
-			local_to_uuid_map=self._local_to_uuid_map,
-			uuid_to_local_map=self._uuid_to_local_map,
-			free_local_indices=self._free_local_indices,
-			next_local_idx=self._next_local_idx,
+			table=self.seq_table,
 			local_idx=local_idx,
 		)
-		return local_idx
 
 	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
 		"""Build local query book entries for newly admitted sequences on this rank.
@@ -2948,13 +2941,13 @@ class BatchGenWorker:
 			self._bind_local_sequence_to_query_book(uuid)
 
 	def _trajectory_slot(self, seq: SequenceEntry) -> int:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
 		try:
 			# Slot numbers are local to a node's allocator, so the same UUID holds
 			# different slots on different nodes; never trust the process-global
 			# ``_buffer_slot`` field (last set on another node) as the lookup key.
-			return self._trajectory_book.slot_for(seq.uuid)
+			return self._traj.slot_for(seq.uuid)
 		except KeyError as exc:
 			raise RuntimeError(
 				f"sequence {seq.uuid} has no active trajectory reservation"
@@ -2969,27 +2962,27 @@ class BatchGenWorker:
 		dtype: torch.dtype = torch.int32,
 	) -> torch.Tensor:
 		"""Materialize a trajectory span; no persistent storage view escapes."""
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if dtype not in (torch.int32, torch.int64):
 			raise ValueError(f"unsupported trajectory dtype: {dtype}")
-		valid = self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+		valid = self._traj.metadata(self._trajectory_slot(seq)).token_length
 		if length is None:
 			length = valid - start
 		out = torch.empty(int(length), dtype=torch.int32)
-		self._trajectory_book.copy_span_to(
+		self._traj.copy_span_to(
 			self._trajectory_slot(seq), out, start=int(start), length=int(length)
 		)
 		return out if dtype == torch.int32 else out.to(dtype=torch.int64)
 
 	def _trajectory_decoded_tokens(self, seq: SequenceEntry) -> torch.Tensor:
 		"""Materialize generated tokens for output and repetition checks."""
-		return self._trajectory_book.generated_tokens(self._trajectory_slot(seq))
+		return self._traj.generated_tokens(self._trajectory_slot(seq))
 
 	def _append_trajectory_token(self, seq: SequenceEntry, token_id: int) -> int:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
-		return self._trajectory_book.append_token(self._trajectory_slot(seq), int(token_id))
+		return self._traj.append_token(self._trajectory_slot(seq), int(token_id))
 
 	def _append_trajectory_tokens(
 		self, sequences: Sequence[SequenceEntry], token_ids: Sequence[int]
@@ -3000,7 +2993,7 @@ class BatchGenWorker:
 		decode loop drops retired rows first (see [COMPLETED_ROW_SKIP]), so
 		this helper never decides which rows are live.
 		"""
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if len(sequences) != len(token_ids):
 			raise ValueError(
@@ -3009,12 +3002,12 @@ class BatchGenWorker:
 		if not sequences:
 			return
 		slots = [self._trajectory_slot(seq) for seq in sequences]
-		self._trajectory_book.append_tokens(slots, token_ids)
+		self._traj.append_tokens(slots, token_ids)
 
 	def _append_trajectory_batch(
 		self, batch: Sequence[int], token_ids: torch.Tensor
 	) -> None:
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		if token_ids.numel() != len(batch):
 			raise ValueError(
@@ -3034,19 +3027,13 @@ class BatchGenWorker:
 	def _sync_trajectory_metadata(
 		self, seq: SequenceEntry, state: Dict[str, object]
 	) -> None:
-		"""Refresh a local QueryBook mirror from the owning rank's lengths.
-
-		The node-shared token pages are written by the sequence owner, while each
-		process keeps its QueryBook allocator metadata locally.  Boundary state
-		contains the owner's logical lengths so non-owning ranks can participate in
-		re-entry bookkeeping without copying the trajectory.
-		"""
-		if self._trajectory_book is None or not self._trajectory_book.has_sequence(seq.uuid):
+		"""Refresh a local QueryBook mirror from the owning rank's lengths."""
+		if not self._traj.has_sequence(seq.uuid):
 			return
 		token_length = state.get("trajectory_token_length")
 		if token_length is None:
 			return
-		self._trajectory_book.synchronize_metadata(
+		self._traj.synchronize_metadata(
 			self._trajectory_slot(seq),
 			prompt_length=int(state["prompt_length"]),
 			token_length=int(token_length),
@@ -3071,8 +3058,8 @@ class BatchGenWorker:
 			return
 		fallback_text = ""
 		trajectory_slot = None
-		if self._trajectory_book is not None and self._trajectory_book.has_sequence(uuid):
-			trajectory_slot = self._trajectory_book.slot_for(uuid)
+		if self._traj.trajectory_book is not None and self._traj.trajectory_book.has_sequence(uuid):
+			trajectory_slot = self._traj.trajectory_book.slot_for(uuid)
 		if (
 			self.rank == 0
 			and gathered_text is None
@@ -3089,19 +3076,17 @@ class BatchGenWorker:
 		# Free the complete trajectory reservation on every rank. This is the
 		# only token-storage release point; multi-turn re-entry keeps the slot.
 		if trajectory_slot is not None:
-			self._trajectory_book.release(trajectory_slot)
+			self._traj.trajectory_book.release(trajectory_slot)
 		self._publish_trajectory_pool_capacity()
 		seq._buffer_slot = -1
 
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
 		# stray pops with downstream "Missing UUID" errors.
-		local_idx = release_local_query_slot(
+		local_idx = release_query_book_slot(
 			uuid,
-			uuid_to_local_map=self._uuid_to_local_map,
-			local_to_uuid_map=self._local_to_uuid_map,
 			query_book=self.query_book,
-			free_local_indices=self._free_local_indices,
+			table=self.seq_table,
 		)
 		if local_idx is not None:
 			if seq.assigned_rank == self.rank:
@@ -3182,7 +3167,7 @@ class BatchGenWorker:
 						text = ""
 					cached = None
 					if self._owns_host_kv(seq):
-						state = self._prefix_sequence_states.get(seq.global_idx)
+						state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 						cached = 0 if state is None else int(state.compute_cached_tokens)
 					my_tokens[uuid] = (text, cached)
 
@@ -4407,8 +4392,10 @@ class BatchGenWorker:
 					f"status={seq.status.name}"
 				)
 			if required_tokens > int(seq.host_token_capacity):
-				growth_pages = math.ceil(
-					(required_tokens - int(seq.host_token_capacity)) / seq.PAGE_SIZE
+				# The guards above bound required_tokens to the token budget,
+				# so the owner's budget cap never engages here.
+				growth_pages = seq.get_host_growth_pages(
+					required_tokens - int(seq.host_token_capacity)
 				)
 				grow_requests.append((int(global_idx), growth_pages))
 
@@ -4552,7 +4539,6 @@ class BatchGenWorker:
 		self.host_kv_cache_size = self.args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = self.args.global_host_kv_cache_size_gb
 
-		self.attn_mode = None
 		self.query_book = None
 		self.model_batch_book = {}
 		self.token_k_cache_byte_size = 2048
@@ -4597,34 +4583,12 @@ class BatchGenWorker:
 		self.engine_config.Basic_Config.max_model_len = self.model_context_length
 		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
 		# Pull the cuda-graph adapter from the initializer (None if the model
-		# does not implement one).
-		self._cuda_graph_adapter = getattr(
-			self.initializer, "get_cuda_graph_adapter", lambda: None
-		)()
-		if self._cuda_graph_adapter is not None:
-			# Every model's graph behavior must come through the
-			# ModelCudaGraphAdapter ABC. An object that merely happens to carry
-			# the right method names would pass every call site here and then
-			# fail mid-decode on the first hook it does not implement, so the
-			# type is asserted once, at startup, on the fetch itself.
-			from batchgen.cuda_graph.adapter import ModelCudaGraphAdapter
-
-			if not isinstance(self._cuda_graph_adapter, ModelCudaGraphAdapter):
-				adapter_type = type(self._cuda_graph_adapter)
-				raise RuntimeError(
-					"get_cuda_graph_adapter() for model "
-					f"{getattr(self, 'model_name', None)!r} returned "
-					f"{adapter_type.__module__}.{adapter_type.__qualname__}, "
-					"which is not a ModelCudaGraphAdapter. Every model's "
-					"graph behavior must come through this ABC: subclass "
-					"batchgen.cuda_graph.adapter.ModelCudaGraphAdapter "
-					"instead of duck-typing it."
-				)
-			logging.info(
-				"Cuda-graph adapter discovered: %s (advertises %s)",
-				type(self._cuda_graph_adapter).__name__,
-				[m.value for m in self._cuda_graph_adapter.advertised_modes()],
-			)
+		# does not implement one). GraphRuntime owns the handle, the one
+		# startup type backstop against the ModelCudaGraphAdapter ABC, and the
+		# import of that ABC.
+		self._graph.adopt_adapter(
+			self.initializer, model_name=getattr(self, 'model_name', None)
+		)
 
 		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view.primary
@@ -4701,7 +4665,7 @@ class BatchGenWorker:
 
 	def _initialize_trajectory_book(self) -> None:
 		"""Create or attach the node-shared fixed input-id trajectory pool."""
-		if self._trajectory_book is not None:
+		if self._traj.trajectory_book is not None:
 			return
 		if self.model_context_length is None:
 			raise RuntimeError("model context must be known before creating QueryBook")
@@ -4715,7 +4679,7 @@ class BatchGenWorker:
 				f"{page_tokens}-token page"
 			)
 		storage, memfd = allocate_node_shared_tensor(
-			label=f"{self._query_book_shm_prefix}trajectory_n{self.rank // self.local_world_size}",
+			label=f"{self._query_book_shm_prefix}trajectory_n{node_of_rank(self.rank, self.local_world_size)}",
 			rows=page_count,
 			width=page_tokens,
 			dtype=torch.int32,
@@ -4723,8 +4687,8 @@ class BatchGenWorker:
 			exchange=self._exchange_node_memfd_identity,
 			barrier=dist.barrier,
 		)
-		self._trajectory_memfd = memfd
-		self._trajectory_book = QueryBook(
+		self._traj.trajectory_memfd = memfd
+		self._traj.trajectory_book = QueryBook(
 			capacity_bytes=page_count * page_bytes,
 			page_tokens=page_tokens,
 			storage=storage,
@@ -4733,27 +4697,27 @@ class BatchGenWorker:
 			"Rank %s: unified trajectory pool ready: budget=%.3f GiB "
 			"pages=%s page_tokens=%s max_context=%s sequence_capacity=%s",
 			self.rank,
-			self._trajectory_book.memory_bytes / (1024 ** 3),
-			self._trajectory_book.page_count,
+			self._traj.trajectory_book.memory_bytes / (1024 ** 3),
+			self._traj.trajectory_book.page_count,
 			page_tokens,
 			self.model_context_length,
-			self._trajectory_book.reservation_total_capacity(self.model_context_length),
+			self._traj.trajectory_book.reservation_total_capacity(self.model_context_length),
 		)
 
 	def _publish_trajectory_pool_capacity(self) -> None:
 		"""Publish derived scheduling capacity once rank zero has a response queue."""
-		if self.rank != 0 or self._response_queue is None or self._trajectory_book is None:
+		if self.rank != 0 or self._response_queue is None or self._traj.trajectory_book is None:
 			return
 		signature = (
-			self._trajectory_book.reservation_total_capacity(self.model_context_length),
-			self._trajectory_book.reservation_free_count(self.model_context_length),
-			self._trajectory_book.free_page_count,
-			self._trajectory_book.active_count,
-			self._trajectory_book.largest_free_extent_pages,
+			self._traj.trajectory_book.reservation_total_capacity(self.model_context_length),
+			self._traj.trajectory_book.reservation_free_count(self.model_context_length),
+			self._traj.trajectory_book.free_page_count,
+			self._traj.trajectory_book.active_count,
+			self._traj.trajectory_book.largest_free_extent_pages,
 		)
-		if getattr(self, "_trajectory_pool_capacity_signature", None) == signature:
+		if self._traj.trajectory_pool_capacity_signature == signature:
 			return
-		self._trajectory_pool_capacity_signature = signature
+		self._traj.trajectory_pool_capacity_signature = signature
 		self._response_queue.put({
 			"type": "trajectory_pool_capacity",
 			# Reject pre-protocol snapshots: the legacy ``capacity`` field
@@ -4768,10 +4732,10 @@ class BatchGenWorker:
 			"free_pages": signature[2],
 			"active_count": signature[3],
 			"largest_free_extent_pages": signature[4],
-			"page_tokens": self._trajectory_book.page_tokens,
+			"page_tokens": self._traj.trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
 			"max_model_len": self.model_context_length,
-			"capacity_bytes": self._trajectory_book.memory_bytes,
+			"capacity_bytes": self._traj.trajectory_book.memory_bytes,
 		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
@@ -5295,14 +5259,7 @@ class BatchGenWorker:
 
 	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
 		"""Release Kimi-Linear KDA state independently of paged GPU KV."""
-		if not global_sequence_ids:
-			return
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-			if KimiLinearKDAWrapper.slot_manager is not None:
-				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
-		except ImportError:
-			pass
+		self._traj.free_kda_sequences(global_sequence_ids)
 
 	def _destroy_gpu_paged_kv_cache(
 		self, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
@@ -5472,7 +5429,7 @@ class BatchGenWorker:
 
 		# Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
 		# Host KV is shared across all GPUs on a node
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		node_rank_start = node_id * self.local_world_size
 		node_rank_end = min(node_rank_start + self.local_world_size, self.world_size)
 
@@ -5505,7 +5462,7 @@ class BatchGenWorker:
 
 		return {
 			'rank': self.rank,
-			'node_id': self.rank // self.local_world_size,
+			'node_id': self.rank_ctx.node_id,
 			'num_free_pages': free_pages,
 			'num_total_pages': stats.num_total_pages,
 			'num_used_pages': used_pages,
@@ -5536,7 +5493,7 @@ class BatchGenWorker:
 			)
 		else:
 			regions = (("host", view),)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		for name, region_view in regions:
 			logging.info(
 				f"[HOST_KV] node={node_id} "
@@ -5556,8 +5513,7 @@ class BatchGenWorker:
 		growth phase releases them on demand before the fresh capacity
 		preflight. Zero when the prefix cache is off.
 		"""
-		gpus_per_node = self.local_world_size
-		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
+		num_nodes = self.rank_ctx.num_nodes
 		report_free = 0
 		report_total = 0
 		report_reclaimable = -1
@@ -5565,7 +5521,7 @@ class BatchGenWorker:
 		if worker_view is not None and self.local_rank == 0:
 			try:
 				stats = worker_view.get_stats()
-				report_node = self.rank // gpus_per_node
+				report_node = self.rank_ctx.node_of(self.rank)
 				report_free = int(stats.num_free_pages)
 				report_total = int(stats.num_total_pages)
 				report_reclaimable = (
@@ -5664,25 +5620,9 @@ class BatchGenWorker:
 		)
 		if not waiting:
 			return stats
-		releasable = max(0, int(coordinator.count_releasable_pages(0)))
-		if releasable == 0:
-			return stats
-		total = int(stats["num_total_pages"])
-		used = int(stats["num_used_pages"])
-		# A retained page is charged to `used`, so crediting it moves the same
-		# count. Clamped so a stale read can never make `used` negative or
-		# free% exceed 100 -- a watermark fed an impossible snapshot would
-		# preempt decode on every step.
-		credited = min(releasable, used)
-		free = int(stats["num_free_pages"]) + credited
-		updated = dict(stats)
-		updated["num_used_pages"] = used - credited
-		updated["num_free_pages"] = free
-		updated["num_reclaimable_prefix_pages"] = credited
-		updated["free_percent"] = (
-			int((free / total) * 100) if total > 0 else 100
+		return credit_reclaimable_pages(
+			stats, int(coordinator.count_releasable_pages(0))
 		)
-		return updated
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
@@ -5975,13 +5915,13 @@ class BatchGenWorker:
 			# Snapshot the trajectory before releasing any source-side resources.
 			# The destination must acknowledge restoring this exact payload before
 			# the source allocator gives its pages back.
-			if self._trajectory_book is None or not self._trajectory_book.has_sequence(uuid):
+			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: migration source has no trajectory slot for {uuid[:8]}"
 				)
 			trajectory = self._trajectory_tokens(seq, dtype=torch.int32).contiguous()
 			trajectory_slot = self._trajectory_slot(seq)
-			turn_payload = self._trajectory_book.turns_payload(trajectory_slot).contiguous()
+			turn_payload = self._traj.trajectory_book.turns_payload(trajectory_slot).contiguous()
 			header = torch.tensor(
 				[1, trajectory.numel(), seq.prompt_length, seq.decoded_length, turn_payload.shape[0]],
 				dtype=torch.int64,
@@ -6072,17 +6012,17 @@ class BatchGenWorker:
 			turn_payload = torch.empty((turn_count, 6), dtype=torch.int64)
 			dist.recv(tensor=turn_payload, src=from_rank, group=gloo_group)
 			turns = QueryBook.turns_from_payload(turn_payload)
-			if self._trajectory_book is None:
+			if self._traj.trajectory_book is None:
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: trajectory book is unavailable during migration"
 				)
-			if not self._trajectory_book.has_sequence(uuid):
+			if not self._traj.trajectory_book.has_sequence(uuid):
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: migration destination has no admission "
 					f"reservation for {uuid[:8]}"
 				)
-			destination_slot = self._trajectory_book.slot_for(uuid)
-			self._trajectory_book.restore(
+			destination_slot = self._traj.trajectory_book.slot_for(uuid)
+			self._traj.trajectory_book.restore(
 				destination_slot,
 				trajectory_recv,
 				prompt_length=prompt_length,
@@ -6230,9 +6170,10 @@ class BatchGenWorker:
 
 			# Update local mappings on source rank (remove)
 			if self.rank == old_rank:
-				local_idx = self._uuid_to_local_map.pop(uuid, None)
+				# unbind drops both directions and returns the slot to the
+				# free list for O(1) reuse.
+				local_idx = self.seq_table.unbind(uuid)
 				if local_idx is not None:
-					self._local_to_uuid_map.pop(local_idx, None)
 					# A remap can leave `batch` byte-identical while changing
 					# which sequence a row resolves to, so row-keyed state must
 					# be invalidated here and not only where `batch` is rebound.
@@ -6240,8 +6181,6 @@ class BatchGenWorker:
 					self._sequences_with_gpu_kv.discard(uuid)
 					# Remove query_book entry
 					self.query_book.pop(local_idx, None)
-					# Add freed index to free list for O(1) reuse
-					self._free_local_indices.add(local_idx)
 					logging.debug(
 						f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
 						f"{uuid[:8]} (local_idx={local_idx}, from_rank={old_rank}, "
@@ -6250,15 +6189,9 @@ class BatchGenWorker:
 
 			# Update local mappings on dest rank (add)
 			if self.rank == new_rank:
-				# O(1) allocation: prefer reusing freed indices, otherwise use next available
-				if self._free_local_indices:
-					new_local_idx = self._free_local_indices.pop()
-				else:
-					new_local_idx = self._next_local_idx
-					self._next_local_idx += 1
-
-				self._uuid_to_local_map[uuid] = new_local_idx
-				self._local_to_uuid_map[new_local_idx] = uuid
+				# O(1) allocation: prefer reusing freed indices, otherwise use
+				# next available.
+				new_local_idx = self.seq_table.bind(uuid)
 				self._bump_decode_row_epoch()
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
@@ -6267,23 +6200,23 @@ class BatchGenWorker:
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
 					seq = self.global_batch.get_sequence(uuid)
-					if self._trajectory_book is None:
+					if self._traj.trajectory_book is None:
 						raise QueryBookPoolCapacityError(
 							f"Rank {self.rank}: trajectory book unavailable for migration receive {uuid[:8]}"
 						)
-					if not self._trajectory_book.has_sequence(uuid):
+					if not self._traj.trajectory_book.has_sequence(uuid):
 						raise QueryBookPoolCapacityError(
 							f"Rank {self.rank}: migration destination has no admission "
 							f"reservation for {uuid[:8]}"
 						)
-					destination_slot = self._trajectory_book.slot_for(uuid)
+					destination_slot = self._traj.trajectory_book.slot_for(uuid)
 					logging.info(
 						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
 						f"restoring slot={destination_slot}, "
 						f"tokens={pending['trajectory'].numel()}"
 					)
 					if not pending.get('restored', False):
-						self._trajectory_book.restore(
+						self._traj.trajectory_book.restore(
 							destination_slot,
 							pending['trajectory'],
 							prompt_length=pending['prompt_length'],
@@ -6442,15 +6375,15 @@ class BatchGenWorker:
 					# pages are node-shared.  Publish the owner's lengths so
 					# non-owning ranks can repair their mirror before re-entry.
 					'trajectory_token_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					'trajectory_decoded_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					# total_decoded_before_eviction: needed so non-owning ranks
@@ -6660,7 +6593,10 @@ class BatchGenWorker:
 			)
 			gathered = [torch.zeros_like(identity) for _ in range(self.world_size)]
 			dist.all_gather(gathered, identity)
-			creator_rank = (self.rank // self.local_world_size) * self.local_world_size
+			# Pre-`rank_ctx`: this collective runs inside core initialization.
+			creator_rank = (
+				node_of_rank(self.rank, self.local_world_size) * self.local_world_size
+			)
 			creator = gathered[creator_rank]
 			return int(creator[0].item()), int(creator[1].item())
 
@@ -6702,14 +6638,21 @@ class BatchGenWorker:
 	# ============ KV-Driven Batch Preparation ============
 
 	def _get_node_for_rank(self, rank: int) -> int:
-		"""Get physical host-KV node ID for a rank."""
-		if self.world_size <= self.local_world_size:
-			return 0
-		return rank // self.local_world_size
+		"""Delegate: physical host-KV node id of a rank.
+
+		The single definition is `RankContext.node_of`. The old
+		`world_size <= local_world_size -> 0` special case is subsumed by it:
+		every valid rank is < local_world_size in that configuration, so the
+		floor division already yields 0.
+		"""
+		return self.rank_ctx.node_of(rank)
 
 	def _get_num_nodes(self) -> int:
-		"""Get total number of physical host-KV nodes."""
-		return max(1, math.ceil(self.world_size / self.local_world_size))
+		"""Delegate: total number of physical host-KV nodes.
+
+		The single definition is `RankContext.num_nodes`.
+		"""
+		return self.rank_ctx.num_nodes
 
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
@@ -6726,14 +6669,12 @@ class BatchGenWorker:
 			chunk = self.adaptive_chunk_sizer.get_chunk_size()
 		else:
 			chunk = self.host_kv_chunk_size
-		# A boundary is the only place where host pages may be allocated.  Keep
-		# one complete decision interval of runway so the next boundary is
-		# reached while the metadata invariant still holds.  This removes the
-		# unsafe post-sample emergency growth path.
-		chunk = max(chunk, self.DECISION_INTERVAL)
-		# Round up to page boundary
-		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
-		return chunk
+		# Clamp + page rounding: single definition in kv_plan.
+		return effective_chunk_size(
+			chunk,
+			decision_interval=self.DECISION_INTERVAL,
+			page_size=SequenceEntry.PAGE_SIZE,
+		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
 		"""Whether a local decode row needs planning before its next forward."""
@@ -6744,7 +6685,9 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or self._is_sequence_completed(seq):
 				continue
-			if int(seq.host_token_capacity) <= int(seq.current_context_length):
+			if host_capacity_due(
+				int(seq.host_token_capacity), int(seq.current_context_length)
+			):
 				return True
 		return False
 
@@ -6795,7 +6738,7 @@ class BatchGenWorker:
 			if self._owns_host_kv(seq):
 				private_tokens = tokens
 				state = (
-					self._prefix_sequence_states.get(seq.global_idx)
+					self._prefix.prefix_sequence_states.get(seq.global_idx)
 					if self.enable_prefix_cache
 					else None
 				)
@@ -6836,10 +6779,6 @@ class BatchGenWorker:
 		meaningless, so the caller must not retry on it. Both verdicts are
 		reduced, hence rank-uniform -- the retry branch is collective.
 		"""
-		local_need = sum(
-			math.ceil(int(tokens) / self.PAGE_SIZE)
-			for _, tokens in owner_requests
-		)
 		# Members' demands exclude their shared chains, but the pooled
 		# segments themselves allocate one Host copy (mirrored per group, so
 		# one count). Leaving them out over-admits the wave and the
@@ -6847,9 +6786,14 @@ class BatchGenWorker:
 		# host-KV LEADER allocates segments, so only a rank with owner demand
 		# reports them — at G>1 the followers reporting the same segments
 		# would multiply the node demand by G and falsely reject the wave.
-		if owner_requests:
-			local_need += self._prefill_pool_segment_host_pages()
-		node_id = self.rank // self.local_world_size
+		local_need = prefill_owner_demand_pages(
+			[int(tokens) for _, tokens in owner_requests],
+			page_size=self.PAGE_SIZE,
+			pool_segment_pages=(
+				self._prefill_pool_segment_host_pages() if owner_requests else 0
+			),
+		)
+		node_id = self.rank_ctx.node_id
 		local_free = -1
 		local_total = -1
 		snapshot_error = 1 if local_error else 0
@@ -6888,48 +6832,30 @@ class BatchGenWorker:
 		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
 		dist.all_gather(gathered, report)
 
-		node_needs: Dict[int, int] = {}
-		node_capacity: Dict[int, Tuple[int, int]] = {}
-		ok = True
-		# A rejection that is merely "short of pages" is retryable by reclaim; a
-		# broken snapshot is not, and the two must not be confused.
-		rows_usable = True
-		for item in gathered:
-			reported_node = int(item[0].item())
-			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
-				item[1].item()
-			)
-			if int(item[4].item()) != 0:
-				ok = False
-				rows_usable = False
-			if int(item[2].item()) >= 0:
-				capacity = (int(item[2].item()), int(item[3].item()))
-				previous = node_capacity.get(reported_node)
-				if previous is not None and previous != capacity:
-					ok = False
-					rows_usable = False
-				node_capacity[reported_node] = capacity
-		for node, needed in node_needs.items():
-			free_total = node_capacity.get(node)
-			if free_total is None:
-				ok = False
-				rows_usable = False
-				continue
-			free_pages, total_pages = free_total
-			if needed < 0 or needed > free_pages or needed > total_pages:
-				ok = False
+		verdict = verdict_node_capacity(
+			[
+				NodeCapacityReport(
+					node_id=int(item[0].item()),
+					need=int(item[1].item()),
+					free=int(item[2].item()),
+					total=int(item[3].item()),
+					snapshot_error=int(item[4].item()),
+				)
+				for item in gathered
+			],
+			want_rows=True,
+		)
 
 		decision = torch.tensor(
-			[1 if ok else 0, 1 if rows_usable else 0],
+			[1 if verdict.ok else 0, 1 if verdict.rows_usable else 0],
 			dtype=torch.int32, device=self.torch_device,
 		)
 		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
 		if not int(decision[1].item()):
 			return bool(int(decision[0].item())), None
-		return bool(int(decision[0].item())), {
-			node: (needed, node_capacity[node][0])
-			for node, needed in node_needs.items()
-		}
+		# The reduced rows_usable is the MIN over ranks, so it is 1 only when
+		# this rank's local verdict was usable and carries its rows.
+		return bool(int(decision[0].item())), verdict.rows
 
 	def _reclaim_host_prefix_pages_collective(
 		self,
@@ -6956,7 +6882,7 @@ class BatchGenWorker:
 			reclaim_prefix_pages_for_host_admission,
 			retire_node_frontiers,
 		)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		failure = 0
 		local_frontier_hook = self._trajectory_frontier_eviction_hook()
 		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
@@ -7175,7 +7101,7 @@ class BatchGenWorker:
 					attached_tokens=int(attached),
 					compute_cached_tokens=int(compute_cached),
 				)
-				self._prefix_sequence_states[seq.global_idx] = state
+				self._prefix.prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
 		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
@@ -7335,12 +7261,12 @@ class BatchGenWorker:
 						self._host_views_by_group(),
 						{
 							self.global_batch.get_sequence(uuid).global_idx:
-							self._prefix_sequence_states[
+							self._prefix.prefix_sequence_states[
 								self.global_batch.get_sequence(uuid).global_idx
 							]
 							for uuid, _ in owner_requests
 							if self.global_batch.get_sequence(uuid).global_idx
-							in self._prefix_sequence_states
+							in self._prefix.prefix_sequence_states
 						},
 					)
 				if self.enable_prefix_cache:
@@ -7350,7 +7276,7 @@ class BatchGenWorker:
 					host_views = self._host_views_by_group()
 					for uuid, _ in owner_requests:
 						seq = self.global_batch.get_sequence(uuid)
-						state = self._prefix_sequence_states.get(seq.global_idx)
+						state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 						if state is None:
 							continue
 						for group_id, view in sorted(host_views.items()):
@@ -7401,9 +7327,9 @@ class BatchGenWorker:
 				# pages), then each pseudo-sid frees and unregisters. Pop only
 				# THIS wave's entries: earlier waves' members still hold refs.
 				for gid in wave.global_ids:
-					self._pool_member_sids.pop(gid, None)
+					self._prefix.pool_member_sids.pop(gid, None)
 				for sid in set(wave.segment_sids.values()):
-					self._pool_sid_members.pop(sid, None)
+					self._prefix.pool_sid_members.pop(sid, None)
 					try:
 						host_view.release_sequence_pages([sid])
 					except Exception:
@@ -7431,7 +7357,7 @@ class BatchGenWorker:
 			# followers included) takes the owner's value at the post-prefill
 			# _sync_sequence_metadata.
 			state = (
-				self._prefix_sequence_states.get(seq.global_idx)
+				self._prefix.prefix_sequence_states.get(seq.global_idx)
 				if self.enable_prefix_cache
 				else None
 			)
@@ -7447,7 +7373,7 @@ class BatchGenWorker:
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
 		# allocator consumed, so the next round may credit again.
-		self._shared_prefix_credit_suspended = False
+		self._prefix.shared_prefix_credit_suspended = False
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -7471,7 +7397,7 @@ class BatchGenWorker:
 		continuing would make scalar metadata and shared page tables disagree.
 		"""
 		local_need = sum(int(pages) for _, pages in host_grow_requests)
-		node_id = self.rank // self.local_world_size
+		node_id = self.rank_ctx.node_id
 		local_free = -1
 		local_total = -1
 		snapshot_error = 0
@@ -7515,33 +7441,22 @@ class BatchGenWorker:
 		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
 		dist.all_gather(gathered, report)
 
-		node_needs: Dict[int, int] = {}
-		node_capacity: Dict[int, Tuple[int, int]] = {}
-		ok = True
-		for item in gathered:
-			reported_node = int(item[0].item())
-			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
-				item[1].item()
-			)
-			if int(item[4].item()) != 0:
-				ok = False
-			if int(item[2].item()) >= 0:
-				capacity = (int(item[2].item()), int(item[3].item()))
-				previous = node_capacity.get(reported_node)
-				if previous is not None and previous != capacity:
-					ok = False
-				node_capacity[reported_node] = capacity
-		for node, needed in node_needs.items():
-			capacity = node_capacity.get(node)
-			if capacity is None:
-				ok = False
-				continue
-			free_pages, total_pages = capacity
-			if needed < 0 or needed > free_pages or needed > total_pages:
-				ok = False
+		verdict = verdict_node_capacity(
+			[
+				NodeCapacityReport(
+					node_id=int(item[0].item()),
+					need=int(item[1].item()),
+					free=int(item[2].item()),
+					total=int(item[3].item()),
+					snapshot_error=int(item[4].item()),
+				)
+				for item in gathered
+			],
+			want_rows=False,
+		)
 
 		decision = torch.tensor(
-			[1 if ok else 0], dtype=torch.int32, device=self.torch_device
+			[1 if verdict.ok else 0], dtype=torch.int32, device=self.torch_device
 		)
 		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
 		return bool(int(decision.item()))
@@ -7588,7 +7503,6 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 
-		gpus_per_node = self.local_world_size
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
 		sequence_limits = self._prefill_sequence_limits()
@@ -7670,7 +7584,7 @@ class BatchGenWorker:
 		# state is per GPU; every rank reports its free count and the scheduler
 		# uses the node minimum. This keeps every rank's selection identical
 		# even if a prior lifecycle bug left one TP group asymmetric.
-		report_node = self.rank // gpus_per_node
+		report_node = self.rank_ctx.node_of(self.rank)
 		report_host_free = local_host_free if self.local_rank == 0 else -1
 		report_host_total = (
 			self._get_host_kv_total_pages() if self.local_rank == 0 else -1
@@ -8271,17 +8185,15 @@ class BatchGenWorker:
 					uuid[:8], needed, total,
 				)
 			if (
-				self._trajectory_book is not None
-				and self._trajectory_book.has_sequence(uuid)
+				self._traj.trajectory_book is not None
+				and self._traj.trajectory_book.has_sequence(uuid)
 			):
-				self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
+				self._traj.trajectory_book.release(self._traj.trajectory_book.slot_for(uuid))
 				seq._buffer_slot = -1
-			release_local_query_slot(
+			release_query_book_slot(
 				uuid,
-				uuid_to_local_map=self._uuid_to_local_map,
-				local_to_uuid_map=self._local_to_uuid_map,
 				query_book=self.query_book,
-				free_local_indices=self._free_local_indices,
+				table=self.seq_table,
 			)
 			if self.rank == 0 and self._response_queue is not None:
 				self._response_queue.put({
@@ -8419,7 +8331,7 @@ class BatchGenWorker:
 		compute_cached_tokens = []
 		for local_idx in batch:
 			seq = self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-			prefix_state = self._prefix_sequence_states.get(seq.global_idx)
+			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 			full_seq_lengths.append(seq.prompt_length)
 			compute_cached_tokens.append(
 				prefix_state.compute_cached_tokens
@@ -8470,165 +8382,60 @@ class BatchGenWorker:
 		return local_passes, global_passes
 
 	def _suspend_shared_prefix_credit(self, reason: str) -> None:
-		"""Fall back to the full per-row charge for the next admission round.
-
-		Called when a wave admitted with the shared-prefix credit is rejected
-		by the reservation transaction. The credit predicts that the wave
-		planner will pool each shared prefix into ONE Host copy; the planner
-		can still decline (an unmeasured or too-small pool budget, the
-		threshold ladder), and then every member really does allocate its own
-		prefix and the wave genuinely does not fit.
-
-		Re-admitting the same credited wave would repeat the same rejection on
-		every iteration, so the retry charges in full, admits the smaller wave
-		that does fit, and makes progress; the latch clears on the next
-		committed reservation. The suspension is logged by name -- it is a
-		measurable prediction miss, not a silent fallback.
-		"""
-		if not self._shared_prefix_credit_applied:
-			return
-		self._shared_prefix_credit_applied = False
-		if self._shared_prefix_credit_suspended:
-			return
-		self._shared_prefix_credit_suspended = True
-		if self.rank == 0:
-			logging.warning(
-				"[PREFILL] shared-prefix admission credit suspended for the "
-				"next round: a credited wave was %s, so the next wave is "
-				"charged per row",
-				reason,
-			)
+		"""Delegate the credit latch while retaining worker logging context."""
+		self._prefix.suspend_shared_prefix_credit(reason, rank=self.rank)
 
 	def _shared_prefix_credit_enabled(self) -> bool:
-		"""Whether this round may charge an in-wave shared prefix once.
-
-		Every condition is a reason the prediction would otherwise be wrong:
-
-		- the credit describes prefix-cache sharing, so it needs the cache on;
-		- only the in-wave prefix POOL gives the wave one Host copy per shared
-		  segment with members attaching it, which is what the credit counts;
-		- the pool declines every wave until its page budget has been measured
-		  (the first wave after startup seeds it), and a declined wave
-		  allocates a full private copy per member;
-		- a previous credited wave that the reservation rejected suspends the
-		  credit for one round so admission makes progress.
-		"""
-		if not self.shared_prefix_admission:
+		"""Whether this round may charge an in-wave shared prefix once."""
+		# Keep the old short-circuit order: with the feature flag off the pool
+		# configuration is intentionally allowed to be absent.
+		if not self.shared_prefix_admission or not self.enable_prefix_cache:
 			return False
-		if not self.enable_prefix_cache:
-			return False
-		if self._shared_prefix_credit_suspended:
+		if self._prefix.shared_prefix_credit_suspended:
 			return False
 		if not self._prefill_prefix_pool_enabled():
 			return False
-		return self._prefill_pool_page_budget is not None
+		return self._prefix.shared_prefix_credit_enabled(
+			shared_prefix_admission=self.shared_prefix_admission,
+			enable_prefix_cache=self.enable_prefix_cache,
+			pool_enabled=True,
+			prefill_pool_page_budget=self._prefill_pool_page_budget,
+		)
 
 	def _prefix_page_digests(self, seq) -> Tuple[int, ...]:
-		"""Cumulative page digests of this sequence's prompt, shareable pages.
-
-		Digest ``k`` identifies the first ``k+1`` pages of the prompt: two
-		sequences hold the same digest at ``k`` exactly when those pages carry
-		the same tokens, hence the same KV, hence one physical copy in the
-		pool. Using the digest itself as the ledger key therefore makes "same
-		key" mean "same physical pages", which is what the charge requires.
-
-		Deterministic across ranks: the digest is a function of the prompt
-		tokens, which every rank reads from the node-shared trajectory store.
-		"""
-		cached = self._prefix_page_digest_cache.get(seq.global_idx)
-		if cached is not None:
-			return cached
-		page_size = int(seq.PAGE_SIZE)
-		# The final page is never shareable, so a fully shared prompt still
-		# pays for the page holding the token it produces logits for.
-		shareable = (int(seq.prompt_length) - 1) // page_size
-		if shareable <= 0:
-			self._prefix_page_digest_cache[seq.global_idx] = ()
-			return ()
-		tokens = self._trajectory_tokens(seq, length=seq.prompt_length)
-		token_array = np.ascontiguousarray(
-			np.asarray(tokens, dtype=np.int64)
+		"""Worker identity wrapper around the shared digest walk."""
+		return self._prefix.prefix_page_digests(
+			global_id=int(seq.global_idx),
+			prompt_length=int(seq.prompt_length),
+			page_size=int(seq.PAGE_SIZE),
+			tokens_for=lambda: self._trajectory_tokens(
+				seq, length=seq.prompt_length
+			).tolist(),
 		)
-		digests = []
-		running = b"\x00" * 16
-		for page in range(shareable):
-			block = token_array[page * page_size:(page + 1) * page_size]
-			running = hashlib.blake2b(
-				running + block.tobytes(), digest_size=16
-			).digest()
-			digests.append(
-				int.from_bytes(running[:8], "big", signed=False)
-			)
-		chain = tuple(digests)
-		self._prefix_page_digest_cache[seq.global_idx] = chain
-		return chain
 
 	def _prune_prefix_page_digest_cache(self) -> None:
-		"""Drop digests of sequences the batch no longer holds."""
-		if not self._prefix_page_digest_cache:
+		"""Pass the live global ids; identity resolution stays on the worker."""
+		if not self._prefix.prefix_page_digest_cache:
 			return
-		live = {
-			seq.global_idx
-			for seq in self.global_batch.sequences.values()
-		}
-		for global_idx in list(self._prefix_page_digest_cache):
-			if global_idx not in live:
-				del self._prefix_page_digest_cache[global_idx]
+		self._prefix.prune_prefix_page_digest_cache(
+			[int(seq.global_idx) for seq in self.global_batch.sequences.values()]
+		)
 
 	def _admission_shared_prefix_segments(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Per candidate, the shared run it reads with an ADJACENT candidate.
-
-		``_stamp_prefix_prefill_order`` sorts the admission by prompt token
-		ids, which on a prefix tree is a depth-first walk: candidates sharing
-		a prefix are contiguous. A candidate's shared run is therefore the
-		longer of its page-granular common prefix with its two neighbours in
-		admission order, and its key is the cumulative digest at the end of
-		that run -- equal for exactly the candidates that share it.
-
-		Conservative by construction: crediting only the deepest adjacent run
-		under-counts a wave whose families themselves share an outer prefix
-		(the outer run is charged once per family rather than once per wave),
-		and under-counting can only admit fewer rows, never over-admit.
-		"""
-		if not self._shared_prefix_credit_enabled():
-			return {}
-		self._prune_prefix_page_digest_cache()
-		ordered = sorted(
+		"""Resolve candidates on the worker, then run the pure store walk."""
+		credit_enabled = self._shared_prefix_credit_enabled()
+		if credit_enabled:
+			self._prune_prefix_page_digest_cache()
+		return self._prefix.admission_shared_prefix_segments(
 			all_candidates,
-			key=lambda uuid: (
-				self._admission_order_key(
-					self.global_batch.get_sequence(uuid)
-				),
-				self.global_batch.get_sequence(uuid).global_idx,
-			),
+			sequence_for=self.global_batch.get_sequence,
+			tokens_for=lambda seq: self._trajectory_tokens(
+				seq, length=seq.prompt_length
+			).tolist(),
+			credit_enabled=credit_enabled,
 		)
-		digests = [
-			self._prefix_page_digests(self.global_batch.get_sequence(uuid))
-			for uuid in ordered
-		]
-
-		def shared_pages(left: int, right: int) -> int:
-			if left < 0 or right >= len(digests):
-				return 0
-			first, second = digests[left], digests[right]
-			limit = min(len(first), len(second))
-			index = 0
-			while index < limit and first[index] == second[index]:
-				index += 1
-			return index
-
-		segments: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for position, uuid in enumerate(ordered):
-			run = max(
-				shared_pages(position - 1, position),
-				shared_pages(position, position + 1),
-			)
-			if run <= 0:
-				continue
-			segments[uuid] = ((digests[position][run - 1], run),)
-		return segments
 
 	def _admission_order_key(self, seq) -> int:
 		"""The order ``select_prefill_batch`` walks QUEUEING candidates in."""
@@ -8643,11 +8450,11 @@ class BatchGenWorker:
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		shared_segments = self._admission_shared_prefix_segments(all_candidates)
-		self._shared_prefix_credit_applied = bool(shared_segments)
+		self._prefix.shared_prefix_credit_applied = bool(shared_segments)
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
-			seq_node = seq.assigned_rank // self.local_world_size
+			seq_node = self.rank_ctx.node_of(seq.assigned_rank)
 			G = self._decode_attn_tp_size()
 			if G > 1:
 				if seq.decode_dp_group is None:
@@ -8656,9 +8463,8 @@ class BatchGenWorker:
 						"TP prefill selection"
 					)
 				from batchgen.decode_dp_group import host_kv_owner_rank
-				seq_node = (
+				seq_node = self.rank_ctx.node_of(
 					host_kv_owner_rank(seq.decode_dp_group, G)
-					// self.local_world_size
 				)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
@@ -8836,8 +8642,8 @@ class BatchGenWorker:
 		# decode batch of such a lifetime. Admission is deterministic across
 		# ranks, so this raises on every rank together (a clean failure)
 		# instead of one rank leaving the graph mid-collective.
-		if decode_batch and getattr(self, "_glm5_whole_model_all_short", False):
-			index_topk = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+		if decode_batch and self._graph.glm5_whole_model_all_short:
+			index_topk = int(self._graph.glm5_whole_model_index_topk or 0)
 			if index_topk:
 				over_budget = [
 					uuid for uuid in decode_batch
@@ -9362,14 +9168,11 @@ class BatchGenWorker:
 		self._buffer_pool = None
 		logging.info(
 			f"Rank {self.rank}: unified trajectory pool active "
-			f"(capacity={self._trajectory_book.reservation_total_capacity(self.model_context_length)})"
+			f"(capacity={self._traj.trajectory_book.reservation_total_capacity(self.model_context_length)})"
 		)
 
 		# Initialize index maps
-		self._local_to_uuid_map = {}
-		self._uuid_to_local_map = {}
-		self._free_local_indices = set()
-		self._next_local_idx = 0
+		self.seq_table.reset()
 		self._bump_decode_row_epoch()
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -9704,7 +9507,7 @@ class BatchGenWorker:
 					copies=self._decode_attn_tp_size(),
 				))
 		if self.local_rank == 0:
-			book = self._trajectory_book
+			book = self._traj.trajectory_book
 			capacities.append(SequenceLengthCapacity(
 				"input IDs", "trajectory", node, self.rank,
 				book.page_tokens, book.page_tokens * QueryBook.TOKEN_BYTES, book.page_count,
@@ -10873,12 +10676,12 @@ class BatchGenWorker:
 			leftovers = [
 				name
 				for name in (
-					"_cuda_graph_manager",
-					"_glm5_moe_cuda_graph_manager",
-					"_glm5_layer_cuda_graph_manager",
-					"_whole_model_segment",
+					"cuda_graph_manager",
+					"glm5_moe_cuda_graph_manager",
+					"glm5_layer_cuda_graph_manager",
+					"whole_model_segment",
 				)
-				if getattr(self, name, None) is not None
+				if getattr(self._graph, name, None) is not None
 			]
 			if leftovers:
 				raise RuntimeError(
@@ -11251,12 +11054,12 @@ class BatchGenWorker:
 			prev_decoded = seq.total_decoded_before_eviction
 			seq.log_event(SeqEvent.REENTRY_START, self.rank,
 				f"new_prompt_len={seq.prompt_length}, prev_decoded={prev_decoded}")
-			if self._trajectory_book is None or not self._trajectory_book.has_sequence(uuid):
+			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
 				raise QueryBookPoolCapacityError(
 					f"Rank {self.rank}: re-entry of {uuid[:8]} has no trajectory slot"
 				)
 			trajectory_slot = self._trajectory_slot(seq)
-			trajectory_length = self._trajectory_book.metadata(trajectory_slot).token_length
+			trajectory_length = self._traj.trajectory_book.metadata(trajectory_slot).token_length
 			if trajectory_length < seq.prompt_length:
 				raise RuntimeError(
 					f"Rank {self.rank}: trajectory for {uuid[:8]} is shorter than "
@@ -11265,7 +11068,7 @@ class BatchGenWorker:
 			# Record the replayed prompt boundary and make the local QueryBook
 			# metadata agree with the scalar effective prompt length. No token bytes
 			# are copied: the trajectory already contains this prefix.
-			self._trajectory_book.begin_reentry_turn(
+			self._traj.trajectory_book.begin_reentry_turn(
 				trajectory_slot, prompt_length=seq.prompt_length
 			)
 			# Clear the legacy owner-only tensor marker. No token copy occurs.
@@ -11330,8 +11133,8 @@ class BatchGenWorker:
 		# is introduced. The predicate is broadcast-identical (the flag is on
 		# the batch's own sequences and the batch is replicated), so every rank
 		# reaches the gather with the same expectation.
-		self._trajectory_arena_payload = {}
-		self._trajectory_mirrored_restores = {}
+		self._traj.trajectory_arena_payload = {}
+		self._traj.trajectory_mirrored_restores = {}
 		mirror_trajectory = (
 			self._decode_attn_tp_size() > 1
 			and self.enable_prefix_cache
@@ -11344,7 +11147,7 @@ class BatchGenWorker:
 		)
 		self._mirror_group_host_kv(
 			my_prefill_uuids,
-			self._prefix_sequence_states,
+			self._prefix.prefix_sequence_states,
 			trajectory=mirror_trajectory,
 		)
 
@@ -11498,10 +11301,10 @@ class BatchGenWorker:
 		Admission is bounded by the decode width the ladder covers, so a wider
 		step is a regression; every rank sees the same width and raises
 		together. Eager deployments return without a check."""
-		bucketing = getattr(self, "_whole_model_bucketing", None)
+		bucketing = self._graph.whole_model_bucketing
 		if (
-			getattr(self, "_whole_model_graph", False)
-			and getattr(self, "_cuda_graph_manager", None) is not None
+			self._graph.whole_model_graph
+			and self._graph.cuda_graph_manager is not None
 			and bucketing is not None
 		):
 			top = int(max(bucketing.bucket_sizes))
@@ -11711,12 +11514,12 @@ class BatchGenWorker:
 	def _decode_graph_state_present(self) -> bool:
 		"""Whether any captured decode graph state is currently held."""
 		return any(
-			getattr(self, name, None) is not None
+			getattr(self._graph, name, None) is not None
 			for name in (
-				"_cuda_graph_manager",
-				"_glm5_moe_cuda_graph_manager",
-				"_glm5_layer_cuda_graph_manager",
-				"_whole_model_segment",
+				"cuda_graph_manager",
+				"glm5_moe_cuda_graph_manager",
+				"glm5_layer_cuda_graph_manager",
+				"whole_model_segment",
 			)
 		)
 
@@ -11739,7 +11542,7 @@ class BatchGenWorker:
 
 	def _assert_decode_graph_state_kept(self, context: str) -> None:
 		"""A reused instance's captured graphs outlive every phase switch."""
-		if getattr(self, "_decode_graph_captures", 0) > 0 and not (
+		if self._graph.decode_graph_captures > 0 and not (
 			self._decode_graph_state_present()
 		):
 			raise RuntimeError(
@@ -11759,7 +11562,7 @@ class BatchGenWorker:
 		exception: it releases only the graph state, never the model state.
 		"""
 		if (
-			getattr(self, "_decode_graph_captures", 0) > 0
+			self._graph.decode_graph_captures > 0
 			and self.parallel_manager.holds_instance("decode")
 			and not getattr(self, "_criticality_probe_recapture", False)
 		):
@@ -11771,7 +11574,7 @@ class BatchGenWorker:
 
 	def _record_decode_graph_capture(self) -> None:
 		"""Count one completed decode graph capture for the live decode owner."""
-		self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
+		self._graph.decode_graph_captures = self._graph.decode_graph_captures + 1
 
 	def _assert_decode_attention_weights_registered(self) -> None:
 		"""A reused decode instance keeps its resident attention weights.
@@ -11804,7 +11607,7 @@ class BatchGenWorker:
 		"""True when --persistent-phase-instances keeps both phase instances."""
 		if not getattr(self.args, "persistent_phase_instances", False):
 			return False
-		if self._trajectory_book is None:
+		if self._traj.trajectory_book is None:
 			raise RuntimeError(
 				"--persistent-phase-instances requires the unified trajectory pool"
 			)
@@ -11919,20 +11722,20 @@ class BatchGenWorker:
 		before readiness and the first decode configure's prewarm finds its
 		geometry already done.
 		"""
-		captures = getattr(self, "_decode_graph_captures", 0)
+		captures = self._graph.decode_graph_captures
 		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
 		self._current_decode_max_rank_batch_size = 1
 		self._bind_decode_attention_metadata_for_graph_config([])
 		self._prewarm_decode_jit()
 		self._warmup_cuda_graphs()
 		if (
-			getattr(self, "_decode_graph_captures", 0) != captures + 1
+			self._graph.decode_graph_captures != captures + 1
 			or not self._decode_graph_state_present()
 		):
 			raise RuntimeError(
 				f"Rank {self.rank}: startup decode graph capture produced no "
 				f"decode graphs (captures {captures} -> "
-				f"{getattr(self, '_decode_graph_captures', 0)}, graph state "
+				f"{self._graph.decode_graph_captures}, graph state "
 				f"present={self._decode_graph_state_present()}); the graphs "
 				"are requested and the decode instance is kept, so they must "
 				"be captured before readiness"
@@ -12098,24 +11901,7 @@ class BatchGenWorker:
 		free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
 		gib = 1024 ** 3
 		pm = getattr(self, "parallel_manager", None)
-		kda_slots = kda_live = -1
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import (
-				KimiLinearKDAWrapper,
-			)
-
-			manager = KimiLinearKDAWrapper.state_manager
-			if manager is not None:
-				# The pools are deliberately kept across a rebuild, so their
-				# slot count must stay FLAT; a growing one would mean the
-				# reuse decision stopped matching.
-				kda_slots = int(manager.config.num_state_items)
-				kda_live = len(manager.sequence_state_items)
-		except Exception:
-			# Observability must not take down the switch it observes: a
-			# half-initialized manager raises AttributeError/TypeError here,
-			# and the -1 sentinel is a readable "unknown" in the line.
-			pass
+		kda_slots, kda_live = self._traj.kda_stats()
 		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
 		logging.info(
 			"[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
@@ -12594,11 +12380,11 @@ class BatchGenWorker:
 		"""
 		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
 			return
-		if self._prefix_drain_metric_emitted:
+		if self._prefix.prefix_drain_metric_emitted:
 			return
 		if not self.global_batch.all_completed():
 			return
-		self._prefix_drain_metric_emitted = True
+		self._prefix.prefix_drain_metric_emitted = True
 		self._emit_prefix_cache_metric(
 			"prefix_drain",
 			**self._prefix_host_resource_fields(),
@@ -12628,7 +12414,7 @@ class BatchGenWorker:
 		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
 
 		_AWB.prefill_prefix_materialization = None
-		if not self._active_prefix_materializations:
+		if not self._prefix.active_prefix_materializations:
 			return
 		try:
 			_AWB.retire_pending_prefill_offloads(
@@ -12640,8 +12426,8 @@ class BatchGenWorker:
 				"Rank %s failed to retire prefix prefill offloads",
 				self.rank,
 			)
-		while self._active_prefix_materializations:
-			materialization = self._active_prefix_materializations.pop()
+		while self._prefix.active_prefix_materializations:
+			materialization = self._prefix.active_prefix_materializations.pop()
 			try:
 				self._close_prefix_materialization(
 					materialization,
@@ -12718,19 +12504,14 @@ class BatchGenWorker:
 		A pooled segment runs as a row of its own under a pseudo sequence id, so
 		it holds one slot for the whole wave on top of the wave's sequences.
 		"""
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-		except ImportError:
-			return -1
-		manager = KimiLinearKDAWrapper.state_manager
-		if KimiLinearKDAWrapper.slot_manager is None or manager is None:
+		manager = self._traj.kda_state_manager()
+		if manager is None:
 			return -1
 		return int(manager.get_stats().num_free_state_items)
 
 	def _next_pool_segment_sid(self) -> int:
 		"""Negative Host sequence ids, rank-strided so no two ranks collide."""
-		self._pool_sid_counter += 1
-		return -(self.rank + 1 + self.world_size * self._pool_sid_counter)
+		return self._prefix.next_pool_segment_sid()
 
 	def _prefix_rank_packing_mode(self, seqs) -> bool:
 		"""True when this batch asked for the predicted-time wave packer."""
@@ -13018,12 +12799,10 @@ class BatchGenWorker:
 			)
 		for seq, rank in zip(seqs, ranks):
 			if current_wave and seq.assigned_rank == self.rank and rank != self.rank:
-				local_idx = release_local_query_slot(
+				local_idx = release_query_book_slot(
 					seq.uuid,
-					uuid_to_local_map=self._uuid_to_local_map,
-					local_to_uuid_map=self._local_to_uuid_map,
 					query_book=self.query_book,
-					free_local_indices=self._free_local_indices,
+					table=self.seq_table,
 				)
 				if local_idx is None:
 					raise RuntimeError(
@@ -13087,7 +12866,7 @@ class BatchGenWorker:
 		if not self._trajectory_commit_requested(seqs):
 			return [], True, {}, {}
 		digest = self.prefix_cache_runtime_config.namespace_digest
-		index = self._trajectory_session_groups
+		index = self._traj.trajectory_session_groups
 		hits: List[MaterializedPrefix] = []
 		pages: Dict[int, Dict[int, List[int]]] = {}
 		drops: Dict[int, str] = {}
@@ -13096,7 +12875,7 @@ class BatchGenWorker:
 		for position, seq in enumerate(seqs):
 			if seq is None:
 				continue
-			attachment = self._trajectory_attachments.get(int(seq.global_idx))
+			attachment = self._traj.trajectory_attachments.get(int(seq.global_idx))
 			if group is None:
 				# Own group: no peer to agree with, so the live record is the
 				# only truth there is.
@@ -13161,7 +12940,7 @@ class BatchGenWorker:
 				)
 				confirmed = False
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			attached = 0 if state is None else int(state.attached_tokens)
 			if attached < boundary:
 				# The resident pages the load reads are kept resident by this
@@ -13802,7 +13581,7 @@ class BatchGenWorker:
 				trajectory_restore_boundary=restore,
 			)
 			prefix_states[seq.global_idx] = state
-			self._prefix_sequence_states[seq.global_idx] = state
+			self._prefix.prefix_sequence_states[seq.global_idx] = state
 
 	def _settle_trajectory_restore_plan(self, seqs, drops, default_reason) -> None:
 		"""Decline, at plan time, every live attachment the plan does not restore.
@@ -13816,19 +13595,19 @@ class BatchGenWorker:
 		released exactly once. Only the rank holding attachments (the
 		host-KV leader) has anything to do; a follower's map is empty.
 		"""
-		if not self._trajectory_attachments:
+		if not self._traj.trajectory_attachments:
 			return
 		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
 
-		restorer = self._trajectory_restorer
+		restorer = self._traj.trajectory_restorer
 		for index, seq in enumerate(seqs):
 			if seq is None:
 				continue
 			global_id = int(seq.global_idx)
-			attachment = self._trajectory_attachments.get(global_id)
+			attachment = self._traj.trajectory_attachments.get(global_id)
 			if attachment is None:
 				continue
-			state = self._prefix_sequence_states.get(global_id)
+			state = self._prefix.prefix_sequence_states.get(global_id)
 			planned = 0 if state is None else int(state.trajectory_restore_boundary)
 			if planned:
 				if planned != int(attachment.boundary_tokens):
@@ -13843,7 +13622,7 @@ class BatchGenWorker:
 					f"Rank {self.rank}: sequence {global_id} holds a live "
 					"trajectory attachment but this rank has no restorer"
 				)
-			del self._trajectory_attachments[global_id]
+			del self._traj.trajectory_attachments[global_id]
 			restorer.decline(
 				attachment,
 				reason=DECLINE_NOT_PLANNED,
@@ -13887,7 +13666,7 @@ class BatchGenWorker:
 				},
 			)
 			prefix_states[global_id] = state
-			self._prefix_sequence_states[global_id] = state
+			self._prefix.prefix_sequence_states[global_id] = state
 			# A segment's Host pages live until its last member releases. A
 			# materialized segment has no pseudo sequence to refcount: its
 			# pages are the prefix cache's, kept by this sequence's own
@@ -13897,9 +13676,7 @@ class BatchGenWorker:
 				for seg in wave.chains[index]
 				if seg not in wave.materialized
 			)
-			self._pool_member_sids[global_id] = sids
-			for sid in sids:
-				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
+			self._prefix.add_pool_member_refs(global_id, sids)
 
 	def _materialized_pool_layers(self):
 		"""The attention layers that materialize, in Host physical order.
@@ -14807,8 +14584,8 @@ class BatchGenWorker:
 					self.prefix_cache_coordinator.release_attachment(handle)
 			for index, handle in member_handles.items():
 				global_id = wave.global_ids[index]
-				state = self._prefix_sequence_states[global_id]
-				self._prefix_sequence_states[global_id] = replace(
+				state = self._prefix.prefix_sequence_states[global_id]
+				self._prefix.prefix_sequence_states[global_id] = replace(
 					state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
 				)
 		finally:
@@ -14819,22 +14596,10 @@ class BatchGenWorker:
 			self._prefill_pool_wave = None
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
-		"""A pool segment's Host pages outlive its last member, never longer.
-
-		Leader-only by construction: only ``_allocate_prefill_pool_host_pages``
-		fills these maps and only the serve group's host-KV owner runs it, so a
-		follower — which released its mirrored records at the end of the wave —
-		finds nothing here and must not free the leader's pages.
-		"""
-		for sid in self._pool_member_sids.pop(global_id, ()):
-			left = self._pool_sid_members[sid] - 1
-			if left:
-				self._pool_sid_members[sid] = left
-			else:
-				del self._pool_sid_members[sid]
-				for view in self._host_views_by_group().values():
-					view.release_sequence_pages([sid])
-					view.unregister_sequences([sid])
+		"""Release pool pseudo-sids through the PrefixReuseState owner."""
+		self._prefix.release_pool_segment_refs(
+			int(global_id), host_views_provider=self._host_views_by_group
+		)
 
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
@@ -14856,7 +14621,7 @@ class BatchGenWorker:
 		)
 		for sequence_id in global_sequence_ids:
 			self._release_pool_segment_refs(int(sequence_id))
-			state = self._prefix_sequence_states.pop(int(sequence_id), None)
+			state = self._prefix.pop_state(int(sequence_id))
 			if state is None:
 				continue
 			for handle in (*state.commit_attachment_handles, state.attachment_handle):
@@ -14872,11 +14637,7 @@ class BatchGenWorker:
 		rather than read as off -- a mistyped flag would look like a clean run
 		with no frontier committed.
 		"""
-		from batchgen.prefix_reuse.trajectory_commit import (
-			trajectory_commit_enabled,
-		)
-
-		return trajectory_commit_enabled(
+		return self._traj.commit_requested(
 			self._active_batchgen_debug_for_sequences(batch_sequences)
 		)
 
@@ -14890,9 +14651,9 @@ class BatchGenWorker:
 		shard index is simply ``rank % G`` -- the same arithmetic, read from the
 		other end, so there is no second notion of group membership.
 		"""
-		G = self._decode_attn_tp_size()
-		shard_index = int(self.rank % G) if G > 1 else 0
-		return int(G), shard_index, shard_index == 0
+		return self._traj.group_geometry(
+			decode_attn_tp_size=self._decode_attn_tp_size(), rank=self.rank
+		)
 
 	def _get_trajectory_frontier_committer(self):
 		"""One trajectory-frontier committer per rank, built on first use.
@@ -14903,54 +14664,14 @@ class BatchGenWorker:
 		prefix-cache runtime config -- the same ``host_page_bytes_all_layers``
 		the frontier charge is expressed in.
 		"""
-		if self._trajectory_frontier_committer is not None:
-			return self._trajectory_frontier_committer
-		from batchgen.models.moonshotai.kimi_linear.wrappers import (
-			KimiLinearKDAWrapper,
-		)
-		from batchgen.prefix_reuse.trajectory_commit import (
-			HostKVSnapshotArenaAllocator,
-			KDAStateSnapshotReader,
-			TrajectoryFrontierCommitter,
-			TrajectoryStateUnavailable,
-			profile_from_kda_state_config,
-		)
-
-		manager = KimiLinearKDAWrapper.state_manager
-		if manager is None:
-			raise TrajectoryStateUnavailable(
-				"prefix_trajectory_commit needs a live KDA state pool; this "
-				"deployment has none"
-			)
 		runtime = self.prefix_cache_runtime_config
-		page_tokens = int(runtime.group_specs[0].raw_page_tokens)
-		page_bytes = int(runtime.host_page_bytes_all_layers)
-		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
-		self._trajectory_frontier_committer = TrajectoryFrontierCommitter(
+		return self._traj.build_committer(
 			rank=self.rank,
-			page_tokens=page_tokens,
-			host_page_bytes_all_layers=page_bytes,
-			# M3 Slice 1c: at G>1 every rank of the serve group snapshots its
-			# OWN head shard into the leader's one G-wide arena, and the leader
-			# alone keeps the registry -- a follower record would outlive the
-			# arena the leader can evict under it.
-			shard_count=shard_count,
-			shard_index=shard_index,
-			owns_registry=is_leader,
-			arena_allocator=HostKVSnapshotArenaAllocator(
-				host_views_provider=self._host_views_by_group,
-				page_tokens=page_tokens,
-				host_page_bytes_all_layers=page_bytes,
-				next_pseudo_sid=self._next_pool_segment_sid,
-			),
-			snapshot_reader=KDAStateSnapshotReader(
-				state_manager_provider=(
-					lambda: KimiLinearKDAWrapper.state_manager
-				),
-				profile=profile_from_kda_state_config(manager.config),
-			),
+			runtime=runtime,
+			group_geometry=self._trajectory_group_geometry(),
+			host_views_provider=self._host_views_by_group,
+			next_pseudo_sid=self._next_pool_segment_sid,
 		)
-		return self._trajectory_frontier_committer
 
 	def _trajectory_frontier_eviction_hook(self):
 		"""The frontier eviction seam, or None when no frontier is committed.
@@ -14959,7 +14680,7 @@ class BatchGenWorker:
 		prefix eviction path keeps its exact previous behavior on every run
 		that never turned the flag on.
 		"""
-		committer = self._trajectory_frontier_committer
+		committer = self._traj.trajectory_frontier_committer
 		if committer is None:
 			return None
 		return committer.on_prefix_pages_released
@@ -14975,39 +14696,11 @@ class BatchGenWorker:
 		(``_next_pool_segment_sid``), so its read row cannot collide with a
 		pool segment or with an arena being written.
 		"""
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return None
-		if self._trajectory_restorer is not None:
-			return self._trajectory_restorer
-		from batchgen.models.moonshotai.kimi_linear.wrappers import (
-			KimiLinearKDAWrapper,
-		)
-		from batchgen.prefix_reuse.trajectory_restore import (
-			HostKVSnapshotArenaReader,
-			KDAStateSnapshotWriter,
-			TrajectoryRestorer,
-		)
-
-		self._trajectory_restorer = TrajectoryRestorer(
+		return self._traj.build_restorer(
 			rank=self.rank,
-			committer=committer,
-			arena_reader=HostKVSnapshotArenaReader(
-				host_views_provider=self._host_views_by_group,
-				next_pseudo_sid=self._next_pool_segment_sid,
-			),
-			state_writer=KDAStateSnapshotWriter(
-				state_manager_provider=(
-					lambda: KimiLinearKDAWrapper.state_manager
-				),
-				profile=committer.layout.profile,
-			),
-			attention_group_size=committer.shard_count,
-			# WHICH head shard this rank restores: the same index its commit
-			# wrote, read from the committer so the two cannot disagree.
-			shard_index=committer.shard_index,
+			host_views_provider=self._host_views_by_group,
+			next_pseudo_sid=self._next_pool_segment_sid,
 		)
-		return self._trajectory_restorer
 
 	def _trajectory_commit_tokens(self, seq) -> int:
 		"""Page-aligned boundary this sequence would commit at, or 0.
@@ -15019,15 +14712,7 @@ class BatchGenWorker:
 		of the boundary it would claim, so such a sequence gets no arena at all
 		and no rank writes a shard for it.
 		"""
-		runtime = self.prefix_cache_runtime_config
-		if runtime is None:
-			return 0
-		boundary = int(runtime.publish_boundary_tokens)
-		prompt_length = int(getattr(seq, "prompt_length", 0) or 0)
-		commit_tokens = (prompt_length // boundary) * boundary
-		if commit_tokens == 0 or commit_tokens != prompt_length:
-			return 0
-		return commit_tokens
+		return self._traj.commit_tokens(self.prefix_cache_runtime_config, seq)
 
 	def _reserve_trajectory_arenas(self, uuids) -> dict:
 		"""Pre-allocate each committing sequence's G-wide snapshot arena.
@@ -15112,35 +14797,15 @@ class BatchGenWorker:
 		token-identity check.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or not is_leader or not self._trajectory_attachments:
-			return {}
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return {}
-		payload = {}
-		for global_id, attachment in sorted(self._trajectory_attachments.items()):
-			state = self._prefix_sequence_states.get(int(global_id))
-			planned = 0 if state is None else int(state.trajectory_restore_boundary)
-			if planned != int(attachment.boundary_tokens):
-				continue
-			arena = committer.arena_for(attachment.storage_handle)
-			if arena is None:
-				continue
-			payload[int(global_id)] = {
-				"session_key": str(attachment.session_key),
-				"boundary_tokens": int(attachment.boundary_tokens),
-				"lcp_tokens": int(attachment.lcp_tokens),
-				"owning_group_id": int(attachment.owning_group_id),
-				"shard_count": int(arena.shard_count),
-				"pseudo_sid": int(arena.pseudo_sid),
-				"pages_per_group": int(arena.pages_per_group),
-				"capacity_bytes": int(arena.capacity_bytes),
-				"pages": {
-					int(group_id): [int(page) for page in pages]
-					for group_id, pages in arena.page_ids_by_group.items()
-				},
-			}
-		return payload
+		def _planned_boundary(global_id: int) -> int:
+			state = self._prefix.prefix_sequence_states.get(int(global_id))
+			return 0 if state is None else int(state.trajectory_restore_boundary)
+
+		return self._traj.restore_payload(
+			shard_count=shard_count,
+			is_leader=is_leader,
+			planned_boundary_for=_planned_boundary,
+		)
 
 	def _trajectory_session_summary(self) -> dict:
 		"""This serve group's committed sessions, for the world map.
@@ -15159,65 +14824,13 @@ class BatchGenWorker:
 		record does not exist until finalize.
 		"""
 		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or not is_leader:
-			return {}
-		committer = self._trajectory_frontier_committer
-		if committer is None or not committer.owns_registry:
-			return {}
-		sessions = committer.registry.session_group_summary()
-		return {
-			# The group this leader speaks for. An empty ``sessions`` is
-			# meaningful: it says this group now holds no committed session,
-			# so the fold drops the entries it used to publish.
-			"group_id": int(self.rank // shard_count),
-			"sessions": {
-				str(session_key): [
-					int(owning_group_id),
-					int(boundary_tokens),
-					str(index_key),
-				]
-				for session_key, (
-					owning_group_id,
-					boundary_tokens,
-					index_key,
-				) in sessions.items()
-			},
-		}
-
-	def _fold_trajectory_session_groups(self, gathered) -> None:
-		"""Fold every leader's session summary into this rank's map.
-
-		Runs on EVERY rank, in gathered rank order, over the same list on
-		every rank -- that identity is what lets the pin below be part of a
-		replicated assignment. Nothing is built when no leader published a
-		summary, so a flag-on pass before the first commit allocates nothing.
-		"""
-		summaries = [
-			entry.get("frontier_sessions")
-			for entry in gathered
-			if isinstance(entry, dict) and entry.get("frontier_sessions")
-		]
-		if not summaries and self._trajectory_session_groups is None:
-			return
-		from batchgen.prefix_reuse.trajectory_frontier import (
-			TrajectorySessionGroupIndex,
+		return self._traj.session_summary(
+			shard_count=shard_count, is_leader=is_leader, rank=self.rank
 		)
 
-		index = self._trajectory_session_groups
-		if index is None:
-			index = TrajectorySessionGroupIndex()
-			self._trajectory_session_groups = index
-		changed = index.fold(summaries)
-		if changed:
-			logging.info(
-				"[TRAJECTORY_FRONTIER] Rank %s folded %s session-group "
-				"change(s) from %s leader summary/summaries: %s session(s) "
-				"now pinnable",
-				self.rank,
-				changed,
-				len(summaries),
-				len(index),
-			)
+	def _fold_trajectory_session_groups(self, gathered) -> None:
+		"""Delegate the rank-identical fold to the trajectory owner."""
+		self._traj.fold_session_groups(gathered, rank=self.rank)
 
 	def _trajectory_session_residency(self, uuids, *, num_groups: int) -> dict:
 		"""``{uuid: (owning group, boundary tokens)}`` for continuations.
@@ -15231,13 +14844,13 @@ class BatchGenWorker:
 		nothing here re-implements the hashing or the boundary search. A miss
 		returns nothing for that sequence and default assignment is unchanged.
 		"""
-		index = self._trajectory_session_groups
+		index = self._traj.trajectory_session_groups
 		if not index:
 			return {}
 		if not self.enable_prefix_cache:
 			return {}
 		runtime = self.prefix_cache_runtime_config
-		if runtime is None or self._trajectory_book is None:
+		if runtime is None or self._traj.trajectory_book is None:
 			return {}
 		sequences = [self.global_batch.get_sequence(uuid) for uuid in sorted(uuids)]
 		if not self._trajectory_commit_requested(
@@ -15251,7 +14864,7 @@ class BatchGenWorker:
 				continue
 			if seq.evicted_from_dp_group is not None:
 				continue
-			if not self._trajectory_book.has_sequence(seq.uuid):
+			if not self._traj.trajectory_book.has_sequence(seq.uuid):
 				# No trajectory reservation: the prompt is not readable yet, so
 				# this sequence cannot supply a residency credit yet.
 				continue
@@ -15272,37 +14885,16 @@ class BatchGenWorker:
 			residency[seq.uuid] = (int(entry.owning_group_id), int(entry.boundary_tokens))
 		return residency
 
-	@staticmethod
-	def _trajectory_arena_from_payload(entry: dict):
+	def _trajectory_arena_from_payload(self, entry: dict):
 		"""Rebuild the leader's arena object from its mirrored page ids."""
-		from batchgen.prefix_reuse.trajectory_commit import SnapshotArena
-
-		return SnapshotArena(
-			# The handle is the leader's record-side identity; a follower never
-			# looks an arena up by handle, so a stable placeholder is honest
-			# here and a fake positive handle would not be.
-			storage_handle=0,
-			pseudo_sid=int(entry["pseudo_sid"]),
-			page_ids_by_group={
-				int(group_id): tuple(int(page) for page in pages)
-				for group_id, pages in entry["pages"].items()
-			},
-			pages_per_group=int(entry["pages_per_group"]),
-			capacity_bytes=int(entry["capacity_bytes"]),
-			payload_bytes=0,
-			shard_count=int(entry["shard_count"]),
-		)
+		return self._traj.arena_from_payload(entry)
 
 	def _adopt_mirrored_trajectory_arenas(self, arenas: dict) -> None:
 		"""Follower side: take the leader's arenas for this pass."""
 		if not arenas:
 			return
 		committer = self._get_trajectory_frontier_committer()
-		for global_id, entry in arenas.items():
-			committer.adopt_arena(
-				sequence_id=int(global_id),
-				arena=self._trajectory_arena_from_payload(entry),
-			)
+		self._traj.adopt_mirrored_arenas(arenas, committer=committer)
 
 	def _lookup_trajectory_frontiers(self, uuids) -> None:
 		"""M3 Slice 2 admission lookup, beside the prefix-cache lookup.
@@ -15329,7 +14921,7 @@ class BatchGenWorker:
 			if seq is None or not self._owns_host_kv(seq):
 				continue
 			global_id = int(seq.global_idx)
-			if global_id in self._trajectory_attachments:
+			if global_id in self._traj.trajectory_attachments:
 				# Back-to-back prefill of the same row: the earlier attachment
 				# is still live, so do not take a second reference for it.
 				continue
@@ -15341,7 +14933,7 @@ class BatchGenWorker:
 				sequence_id=global_id,
 			)
 			if attachment is not None:
-				self._trajectory_attachments[global_id] = attachment
+				self._traj.trajectory_attachments[global_id] = attachment
 
 	def _restore_trajectory_frontiers(self, local_indices) -> None:
 		"""Restore every pinned snapshot into its KDA slot before prefill.
@@ -15384,12 +14976,12 @@ class BatchGenWorker:
 			if seq is None:
 				continue
 			global_id = int(seq.global_idx)
-			state = self._prefix_sequence_states.get(global_id)
+			state = self._prefix.prefix_sequence_states.get(global_id)
 			planned = 0 if state is None else int(state.trajectory_restore_boundary)
 			if (
 				planned
-				and global_id not in self._trajectory_attachments
-				and global_id not in self._trajectory_mirrored_restores
+				and global_id not in self._traj.trajectory_attachments
+				and global_id not in self._traj.trajectory_mirrored_restores
 			):
 				raise TrajectoryPlannedRestoreFailed(
 					reason=FAIL_NO_RESTORE_SOURCE,
@@ -15403,14 +14995,14 @@ class BatchGenWorker:
 					session_key="unknown",
 					boundary_tokens=planned,
 				)
-		if self._trajectory_mirrored_restores:
+		if self._traj.trajectory_mirrored_restores:
 			self._restore_mirrored_trajectory_shards(local_indices)
-		if not self._trajectory_attachments:
+		if not self._traj.trajectory_attachments:
 			return
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
 			raise RuntimeError(
-				f"Rank {self.rank}: {len(self._trajectory_attachments)} live "
+				f"Rank {self.rank}: {len(self._traj.trajectory_attachments)} live "
 				"trajectory attachment(s) reached the restore seam but this "
 				"rank has no restorer; their planned rows would run without "
 				"their restored state"
@@ -15425,12 +15017,12 @@ class BatchGenWorker:
 			)
 			if seq is None:
 				continue
-			attachment = self._trajectory_attachments.pop(
+			attachment = self._traj.trajectory_attachments.pop(
 				int(seq.global_idx), None
 			)
 			if attachment is None:
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			if state is None or not int(state.trajectory_restore_boundary):
 				restorer.decline(
 					attachment,
@@ -15459,7 +15051,7 @@ class BatchGenWorker:
 		leader mirrored for this pass, which is why the whole group restores or
 		recomputes together.
 		"""
-		mirrored = self._trajectory_mirrored_restores
+		mirrored = self._traj.trajectory_mirrored_restores
 		if not mirrored:
 			return
 		# Build the committer FIRST. It is this rank's only source of the
@@ -15489,7 +15081,7 @@ class BatchGenWorker:
 			entry = mirrored.pop(int(seq.global_idx), None)
 			if entry is None:
 				continue
-			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
 			restorer.restore_mirrored_shard(
 				sequence_id=int(seq.global_idx),
 				arena=self._trajectory_arena_from_payload(entry),
@@ -15511,55 +15103,15 @@ class BatchGenWorker:
 		back allocation and a completed sequence all return the live count to
 		zero through the same call.
 		"""
-		if not self._trajectory_attachments:
-			return
-		restorer = self._trajectory_restorer
-		for sequence_id in global_sequence_ids:
-			attachment = self._trajectory_attachments.pop(
-				int(sequence_id), None
-			)
-			if attachment is None or restorer is None:
-				continue
-			try:
-				restorer.release(attachment)
-			except Exception:
-				logging.exception(
-					"Rank %s: releasing the trajectory attachment of sequence "
-					"%s failed; its frontier stays pinned",
-					self.rank,
-					int(sequence_id),
-				)
+		self._traj.release_attachments(global_sequence_ids, rank=self.rank)
 
 	def _rollback_trajectory_reservations(self, global_sequence_ids) -> None:
 		"""Give back any snapshot arena these rows reserved and never used."""
-		committer = self._trajectory_frontier_committer
-		if committer is None:
-			return
-		for sequence_id in global_sequence_ids:
-			self._trajectory_arena_payload.pop(int(sequence_id), None)
-			self._trajectory_mirrored_restores.pop(int(sequence_id), None)
-			try:
-				committer.rollback_reservation(sequence_id=int(sequence_id))
-			except Exception:
-				logging.exception(
-					"[TRAJECTORY_FRONTIER] Rank %s: could not give back the "
-					"reserved snapshot arena of sequence %s",
-					self.rank,
-					int(sequence_id),
-				)
+		self._traj.rollback_reservations(global_sequence_ids, rank=self.rank)
 
 	def _trajectory_restore_fields(self) -> dict:
 		"""Drain-counter fields, or empty when the path never ran."""
-		fields = {}
-		restorer = self._trajectory_restorer
-		if restorer is not None:
-			fields.update(restorer.counters())
-		# Placement telemetry is replicated even on ranks without a restorer.
-		index = self._trajectory_session_groups
-		if index is not None:
-			fields["trajectory_group_honored_on_owner"] = int(index.honored_on_owner)
-			fields["trajectory_group_placed_offgroup"] = int(index.placed_offgroup)
-		return fields
+		return self._traj.restore_fields()
 
 	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
 		"""Resident Host pages backing a committed prefix, per KV group.
@@ -15602,7 +15154,7 @@ class BatchGenWorker:
 		about which frontiers exist.
 		"""
 		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or is_leader or not self._trajectory_arena_payload:
+		if shard_count <= 1 or is_leader or not self._traj.trajectory_arena_payload:
 			return
 		committer = self._get_trajectory_frontier_committer()
 		for local_idx in local_sequence_ids:
@@ -15615,7 +15167,7 @@ class BatchGenWorker:
 			if seq is None:
 				continue
 			global_id = int(seq.global_idx)
-			if global_id not in self._trajectory_arena_payload:
+			if global_id not in self._traj.trajectory_arena_payload:
 				continue
 			commit_tokens = self._trajectory_commit_tokens(seq)
 			if commit_tokens == 0:
@@ -15659,7 +15211,7 @@ class BatchGenWorker:
 		No-op at G==1, where the commit step installs its own record: one rank
 		owns the whole arena and there is nothing to wait for.
 		"""
-		committer = self._trajectory_frontier_committer
+		committer = self._traj.trajectory_frontier_committer
 		if committer is None:
 			return
 		shard_count, _shard_index, _is_leader = self._trajectory_group_geometry()
@@ -15674,7 +15226,7 @@ class BatchGenWorker:
 				self.rank,
 			)
 			return
-		self._trajectory_arena_payload = {}
+		self._traj.trajectory_arena_payload = {}
 		if outcome.installed or outcome.rolled_back_sequence_ids or outcome.failed_sequence_ids:
 			logging.info(
 				"[TRAJECTORY_FRONTIER] Rank %s finalize: installed=%s "
@@ -15696,10 +15248,6 @@ class BatchGenWorker:
 		``host_owned_pages`` is not touched here and nothing is credited back
 		to it when the snapshot is freed.
 		"""
-		from batchgen.prefix_reuse.trajectory_commit import (
-			PREFIX as _FRONTIER_PREFIX,
-		)
-
 		pages = self._resident_frontier_page_ids(
 			token_ids=token_ids, commit_tokens=commit_tokens
 		)
@@ -15708,7 +15256,7 @@ class BatchGenWorker:
 				"[%s] rank=%s seq=%s SKIPPED frontier commit: the coordinator "
 				"does not hold all %s committed tokens as resident pages in "
 				"every KV group",
-				_FRONTIER_PREFIX,
+				self._traj.FRONTIER_PREFIX,
 				self.rank,
 				seq.global_idx,
 				int(commit_tokens),
@@ -15811,13 +15359,13 @@ class BatchGenWorker:
 			if commit_handle:
 				# Keep the new resident pages pinned until this sequence releases
 				# its Host page table, including during back-to-back prefill.
-				state = self._prefix_sequence_states.get(seq.global_idx)
+				state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 				if state is None:
 					self.prefix_cache_coordinator.release_attachment(commit_handle)
 					raise RuntimeError(
 						"prefix commit has no active sequence state"
 					)
-				self._prefix_sequence_states[seq.global_idx] = replace(
+				self._prefix.prefix_sequence_states[seq.global_idx] = replace(
 					state,
 					commit_attachment_handles=(
 						*state.commit_attachment_handles, commit_handle
@@ -16078,7 +15626,7 @@ class BatchGenWorker:
 			# model to "continue" mid-sentence instead of answering. Bind
 			# everything to seq.prompt_length directly.
 			L = seq.prompt_length
-			prefix_state = self._prefix_sequence_states.get(seq.global_idx)
+			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
 			compute_cached = (
 				prefix_state.compute_cached_tokens
 				if prefix_state is not None
@@ -16371,7 +15919,7 @@ class BatchGenWorker:
 							.host_page_bytes_all_layers
 						),
 					)
-					self._active_prefix_materializations.append(
+					self._prefix.active_prefix_materializations.append(
 						prefix_materialization
 					)
 
@@ -16621,7 +16169,7 @@ class BatchGenWorker:
 						prefix_materialization,
 						empty_cuda_cache=True,
 					)
-					self._active_prefix_materializations.remove(
+					self._prefix.active_prefix_materializations.remove(
 						prefix_materialization
 					)
 					AttnWrapperBase.prefill_prefix_materialization = None
@@ -17068,15 +16616,15 @@ class BatchGenWorker:
 					# pages are node-shared. Publish the owner's lengths so
 					# non-owning ranks can repair their mirror before re-entry.
 					'trajectory_token_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					'trajectory_decoded_length': (
-						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
-						if self._trajectory_book is not None
-						and self._trajectory_book.has_sequence(uuid)
+						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._traj.trajectory_book is not None
+						and self._traj.trajectory_book.has_sequence(uuid)
 						else None
 					),
 					# total_decoded_before_eviction: propagated here so the
@@ -17442,7 +16990,7 @@ class BatchGenWorker:
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
 							f"decoded={seq.decoded_length} "
 							f"host_pages={seq.host_pages_allocated} "
-							f"trajectory_tokens={self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length}"
+							f"trajectory_tokens={self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length}"
 						)
 				# Host KV is ONE per-node SHARED shm region keyed by global_idx, so
 				# release/unregister must fire EXACTLY once per sequence. Under G>1
@@ -17499,12 +17047,12 @@ class BatchGenWorker:
 				seq.total_decoded_before_eviction = seq.decoded_length
 				seq.prompt_length = new_reentry_len
 				seq.current_context_length = new_reentry_len
-				if self._trajectory_book is not None and self._trajectory_book.has_sequence(uuid):
-					slot = self._trajectory_book.slot_for(uuid)
+				if self._traj.trajectory_book is not None and self._traj.trajectory_book.has_sequence(uuid):
+					slot = self._traj.trajectory_book.slot_for(uuid)
 					# Record the replayed prompt boundary at eviction time. Re-entry
 					# calls this idempotently, so migration while ON_HOLD carries a
 					# ledger consistent with the scalar prompt length.
-					self._trajectory_book.begin_reentry_turn(
+					self._traj.trajectory_book.begin_reentry_turn(
 						slot, prompt_length=new_reentry_len
 					)
 				saved = new_reentry_len
@@ -18684,7 +18232,7 @@ class BatchGenWorker:
 		takes the same decision; the recapture runs behind the capture path's
 		rank barriers.
 		"""
-		adapter = getattr(self, "_cuda_graph_adapter", None)
+		adapter = self._graph.cuda_graph_adapter
 		requested = None
 		if adapter is not None:
 			args = getattr(self, "args", None)
@@ -18727,14 +18275,14 @@ class BatchGenWorker:
 			and "glm" in (getattr(self, "model_name", "") or "").lower()
 		)
 		generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
-			graph_manager_is_initialized=self._cuda_graph_manager is not None,
+			graph_manager_is_initialized=self._graph.cuda_graph_manager is not None,
 			global_batch_has_queueing=has_queueing,
 			model_name=getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 		)
 		return bool(
 			generic_cuda_graph_warmup_needed
-			or (glm5_whole_graph_requested and self._cuda_graph_manager is None)
+			or (glm5_whole_graph_requested and self._graph.cuda_graph_manager is None)
 			or self._glm5_whole_model_graph_current_bucket_missing()
 			or self._criticality_probe_recapture
 		)
@@ -18746,28 +18294,28 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
-		if getattr(self, "_glm5_whole_model_graph_unavailable_reason", None):
+		if self._graph.glm5_whole_model_graph_unavailable_reason:
 			return False
 		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 		if max_bsz <= 0:
 			return False
 		capture_attempted = bool(
-			getattr(self, "_glm5_whole_model_graph_capture_attempted_for_batch", False)
+			self._graph.glm5_whole_model_graph_capture_attempted_for_batch
 		)
-		if self._cuda_graph_manager is None or not getattr(self, "_glm5_whole_model_graph", False):
+		if self._graph.cuda_graph_manager is None or not self._graph.glm5_whole_model_graph:
 			return not capture_attempted
 		try:
-			bucket = self._cuda_graph_manager.bucketing.get_padded_size(max_bsz)
+			bucket = self._graph.cuda_graph_manager.bucketing.get_padded_size(max_bsz)
 		except ValueError:
 			return False
-		if bucket in getattr(self, "_glm5_whole_model_graph_failed_buckets", set()):
+		if bucket in self._graph.glm5_whole_model_graph_failed_buckets:
 			return False
-		if not self._cuda_graph_manager.has_bucket_for_all_segments(max_bsz):
+		if not self._graph.cuda_graph_manager.has_bucket_for_all_segments(max_bsz):
 			if capture_attempted:
 				return False
 			return True
 		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-		captured_max_seqlen = int(getattr(getattr(self, "_whole_model_segment", None), "max_seqlen", 0) or 0)
+		captured_max_seqlen = int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0)
 		if (
 			current_max_seqlen > 0
 			and captured_max_seqlen > 0
@@ -18775,32 +18323,32 @@ class BatchGenWorker:
 		):
 			if (
 				capture_attempted
-				and not getattr(self, "_glm5_whole_model_graph_state_change_after_capture_logged", False)
+				and not self._graph.glm5_whole_model_graph_state_change_after_capture_logged
 			):
 				logging.info(
 					f"Rank {self.rank}: GLM-5 whole-model CUDA graph max_seqlen "
 					f"{captured_max_seqlen} is below current decode max_seqlen "
 					f"{current_max_seqlen}; using eager decode instead of recapturing"
 				)
-				self._glm5_whole_model_graph_state_change_after_capture_logged = True
+				self._graph.glm5_whole_model_graph_state_change_after_capture_logged = True
 			return not capture_attempted
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
-		if signature != getattr(self, "_glm5_whole_model_graph_signature", None):
+		if signature != self._graph.glm5_whole_model_graph_signature:
 			if (
 				capture_attempted
-				and not getattr(self, "_glm5_whole_model_graph_state_change_after_capture_logged", False)
+				and not self._graph.glm5_whole_model_graph_state_change_after_capture_logged
 			):
 				logging.info(
 					f"Rank {self.rank}: GLM-5 whole-model CUDA graph page-table storage "
 					"changed after configured capture; using eager decode instead of recapturing"
 				)
-				self._glm5_whole_model_graph_state_change_after_capture_logged = True
+				self._graph.glm5_whole_model_graph_state_change_after_capture_logged = True
 			return not capture_attempted
 		return False
 
 	def _release_glm5_whole_model_graph_state(self, *, empty_cuda_cache: bool = False) -> None:
-		manager = getattr(self, "_cuda_graph_manager", None)
-		segment = getattr(self, "_whole_model_segment", None)
+		manager = self._graph.cuda_graph_manager
+		segment = self._graph.whole_model_segment
 		device = getattr(self, "torch_device", None)
 		if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
 			torch.cuda.synchronize(device)
@@ -18812,25 +18360,25 @@ class BatchGenWorker:
 		elif segment is not None:
 			release = getattr(segment, "release_static_buffers", None)
 			if release is not None:
-				bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [])
+				bucket_sizes = list(getattr(self._graph.whole_model_bucketing, "bucket_sizes", []) or [])
 				for bucket in bucket_sizes:
 					release(int(bucket))
-		self._cuda_graph_manager = None
-		self._whole_model_segment = None
-		self._glm5_whole_model_all_short = False
-		self._glm5_whole_model_index_topk = 0
-		self._whole_model_bucketing = None
-		self._whole_model_graph = False
-		self._glm5_whole_model_graph = False
-		self._glm5_whole_model_graph_signature = None
+		self._graph.cuda_graph_manager = None
+		self._graph.whole_model_segment = None
+		self._graph.glm5_whole_model_all_short = False
+		self._graph.glm5_whole_model_index_topk = 0
+		self._graph.whole_model_bucketing = None
+		self._graph.whole_model_graph = False
+		self._graph.glm5_whole_model_graph = False
+		self._graph.glm5_whole_model_graph_signature = None
 		# The probe belongs to the released graph (its spin nodes bake the
 		# probe's delay table), so it goes with it.
 		self._criticality_probe = None
 		# Phase B: also drop the adapter's reference to the captured segment so
 		# the next worker generation starts from a clean adapter context.
-		if self._cuda_graph_adapter is not None:
+		if self._graph.cuda_graph_adapter is not None:
 			try:
-				self._cuda_graph_adapter.release_all(manager=None)
+				self._graph.cuda_graph_adapter.release_all(manager=None)
 			except Exception as _exc:
 				logging.warning(
 					"Phase B: failed to release adapter state: %s", _exc,
@@ -18851,10 +18399,10 @@ class BatchGenWorker:
 	def _warn_decode_graph_span_exceeded(self, step_max_seqlen: int, span: int) -> None:
 		"""Rate-limited WARN naming this step's max_seqlen and the captured span."""
 		now = time.monotonic()
-		last = getattr(self, "_decode_graph_span_warn_monotonic", None)
+		last = self._graph.decode_graph_span_warn_monotonic
 		if last is not None and now - last < _GRAPH_SPAN_WARN_INTERVAL_S:
 			return
-		self._decode_graph_span_warn_monotonic = now
+		self._graph.decode_graph_span_warn_monotonic = now
 		logging.warning(
 			"Rank %s: the whole-model decode graph covers %d context tokens but "
 			"this step's max_seqlen is %d; running the step in eager decode. The "
@@ -18875,21 +18423,21 @@ class BatchGenWorker:
 			return "disabled", None, "not_requested"
 		if max_rank_bsz <= 0:
 			return "eager", None, "empty_global_batch"
-		if getattr(self, "_glm5_whole_model_graph_unavailable_reason", None):
+		if self._graph.glm5_whole_model_graph_unavailable_reason:
 			return "eager", None, "unavailable"
-		manager = getattr(self, "_cuda_graph_manager", None)
-		if manager is None or not getattr(self, "_glm5_whole_model_graph", False):
+		manager = self._graph.cuda_graph_manager
+		if manager is None or not self._graph.glm5_whole_model_graph:
 			return "eager", None, "no_manager"
 		try:
 			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
 		except ValueError:
 			return "eager", None, "over_bucket"
-		if bucket in getattr(self, "_glm5_whole_model_graph_failed_buckets", set()):
+		if bucket in self._graph.glm5_whole_model_graph_failed_buckets:
 			return "eager", bucket, "failed_bucket"
 		if not manager.has_bucket_for_all_segments(max_rank_bsz):
 			return "eager", bucket, "bucket_not_captured"
 		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-		captured_max_seqlen = int(getattr(getattr(self, "_whole_model_segment", None), "max_seqlen", 0) or 0)
+		captured_max_seqlen = int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0)
 		if (
 			current_max_seqlen > 0
 			and captured_max_seqlen > 0
@@ -18899,15 +18447,15 @@ class BatchGenWorker:
 		# An all_short capture never runs indexer scoring, so rows past
 		# index_topk must leave the graph; the eager path still selects
 		# top-k correctly for them.
-		index_topk_cfg = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+		index_topk_cfg = int(self._graph.glm5_whole_model_index_topk or 0)
 		if (
-			getattr(self, "_glm5_whole_model_all_short", False)
+			self._graph.glm5_whole_model_all_short
 			and index_topk_cfg > 0
 			and current_max_seqlen > index_topk_cfg
 		):
 			return "eager", bucket, "all_short_exceeded"
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
-		if signature != getattr(self, "_glm5_whole_model_graph_signature", None):
+		if signature != self._graph.glm5_whole_model_graph_signature:
 			return "eager", bucket, "page_table_storage_changed"
 		return "graph", bucket, "captured"
 
@@ -19072,7 +18620,7 @@ class BatchGenWorker:
 			provisional_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
 		)
 		final_pages = KVCacheManager.pool_pages_for_gb(final_gb, bytes_per_page)
-		bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [1])
+		bucket_sizes = list(getattr(self._graph.whole_model_bucketing, "bucket_sizes", []) or [1])
 		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
 		if final_gb <= 0 or final_pages < floor_pages:
 			raise RuntimeError(
@@ -19103,7 +18651,9 @@ class BatchGenWorker:
 				"measurement (the frac-based final size would have been %.2f GB)",
 				GPU_KV_POOL_HEADROOM_GB,
 				self.gpu_memory_frac,
-				total_mem_gb * self.gpu_memory_frac - steady_used_gb,
+				provisional_pool_gb(
+					total_mem_gb, self.gpu_memory_frac, steady_used_gb, floor_gb=None
+				),
 			)
 
 	def _setup_cuda_graphs(self, gpu_manager):
@@ -19116,7 +18666,6 @@ class BatchGenWorker:
 		Dynamic metadata (cache_seqlens) is passed as a static-address input buffer.
 		KV cache, page table, and cos/sin tables are at fixed GPU addresses.
 		"""
-		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
 			FullAttnSegment, MoESegment, MoEComputeSegment, SharedMoEBufferPool,
 			WholeModelSegment,
@@ -19143,8 +18692,8 @@ class BatchGenWorker:
 				int(self.args.cuda_graph_num_buckets),
 			)
 			self._decode_graph_ladder_logged = True
-		bucketing = BatchSizeBucketing(bucket_sizes)
-		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		bucketing = self._graph.new_bucketing(bucket_sizes)
+		manager = self._graph.new_manager(bucketing, device=self.torch_device)
 
 		# Use model's max_position_embeddings (not the deployment max_model_len) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
@@ -19167,21 +18716,21 @@ class BatchGenWorker:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 			capture_attempted = bool(
-				getattr(self, "_glm5_whole_model_graph_capture_attempted_for_batch", False)
+				self._graph.glm5_whole_model_graph_capture_attempted_for_batch
 			)
 			if max_bsz <= 0:
 				logging.info(
 					f"Rank {self.rank}: no global GLM-5 decode rows; skipping whole-model graph capture"
 				)
 				return
-			failed_buckets = getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
+			failed_buckets = self._graph.glm5_whole_model_graph_failed_buckets
 			capture_buckets = [
 				int(bucket)
 				for bucket in bucketing.bucket_sizes
 				if int(bucket) not in failed_buckets
 			]
 			if not capture_buckets:
-				self._glm5_whole_model_graph_capture_attempted_for_batch = True
+				self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
 				if whole_graph_required:
 					raise RuntimeError("GLM-5 whole-model CUDA graph required but all configured buckets failed")
 				return
@@ -19192,18 +18741,18 @@ class BatchGenWorker:
 					"decode wrapper state is bound"
 				)
 				return
-			existing_manager = getattr(self, "_cuda_graph_manager", None)
+			existing_manager = self._graph.cuda_graph_manager
 			existing_signature = self._glm5_whole_model_graph_capture_signature()
-			if existing_manager is not None and getattr(self, "_glm5_whole_model_graph", False):
+			if existing_manager is not None and self._graph.glm5_whole_model_graph:
 				missing_configured = any(
 					not existing_manager.has_bucket_for_all_segments(bucket)
 					for bucket in capture_buckets
 				)
 				if (
 					not missing_configured
-					and existing_signature == getattr(self, "_glm5_whole_model_graph_signature", None)
+					and existing_signature == self._graph.glm5_whole_model_graph_signature
 				):
-					self._glm5_whole_model_graph_capture_attempted_for_batch = True
+					self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
 					return
 				# A recapture armed by a changed criticality probe request is
 				# the one deliberate exception: it falls through to the stale
@@ -19305,8 +18854,8 @@ class BatchGenWorker:
 			# graph_max_seqlen above), at the cost of always scoring the indexer.
 			# The all_short capture code itself is left in place and never selected.
 			all_short = False
-			self._glm5_whole_model_all_short = all_short
-			self._glm5_whole_model_index_topk = index_topk_cfg
+			self._graph.glm5_whole_model_all_short = all_short
+			self._graph.glm5_whole_model_index_topk = index_topk_cfg
 			if self.rank == 0:
 				logging.info(
 					"Rank %s: GLM-5 whole-model graph attention span "
@@ -19375,20 +18924,20 @@ class BatchGenWorker:
 					"Single-node partial-persistent expert configs can run eager/mixed "
 					"decode, but cannot validate the real whole-model graph."
 				)
-				self._glm5_whole_model_graph_unavailable_reason = reason
+				self._graph.glm5_whole_model_graph_unavailable_reason = reason
 				if whole_graph_required:
 					raise RuntimeError(reason)
 				logging.warning("%s Using eager decode without whole-model graph compare.", reason)
 				return
 
-			if getattr(self, "_glm5_whole_model_graph", False) or getattr(self, "_whole_model_segment", None) is not None:
+			if self._graph.glm5_whole_model_graph or self._graph.whole_model_segment is not None:
 				logging.info(
 					f"Rank {self.rank}: releasing stale GLM-5 whole-model CUDA graph "
 					"before configure-time capture"
 				)
 				self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
 
-			manager = CUDAGraphManager(bucketing, device=self.torch_device)
+			manager = self._graph.new_manager(bucketing, device=self.torch_device)
 			moe_layers = [
 				layer.mlp for layer in self.model.model.layers
 				if isinstance(getattr(layer, "mlp", None), Glm5MoE)
@@ -19552,19 +19101,19 @@ class BatchGenWorker:
 			self._criticality_probe = None
 			probe_request = getattr(self, "_criticality_probe_request", None)
 			if probe_request is not None:
-				self._criticality_probe = self._cuda_graph_adapter.install_criticality_probe(
+				self._criticality_probe = self._graph.cuda_graph_adapter.install_criticality_probe(
 					probe_request,
 					whole_model_segment=whole_seg,
 					device=self.torch_device,
 				)
 			torch.cuda.synchronize(self.torch_device)
 			dist.barrier()
-			self._cuda_graph_manager = manager
-			self._whole_model_graph = True
-			self._glm5_whole_model_graph = True
-			self._whole_model_bucketing = bucketing
-			self._whole_model_segment = whole_seg
-			self._glm5_whole_model_graph_capture_attempted_for_batch = True
+			self._graph.cuda_graph_manager = manager
+			self._graph.whole_model_graph = True
+			self._graph.glm5_whole_model_graph = True
+			self._graph.whole_model_bucketing = bucketing
+			self._graph.whole_model_segment = whole_seg
+			self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
 				# Largest-first: the big bucket primes the shared graph pool and
 				# smaller buckets reuse its blocks instead of growing the pool.
@@ -19582,15 +19131,15 @@ class BatchGenWorker:
 					dist.barrier()
 			except torch.OutOfMemoryError as exc:
 				manager.drop_bucket(capture_bucket)
-				self._glm5_whole_model_graph_failed_buckets.add(capture_bucket)
-				self._cuda_graph_manager = None
-				self._whole_model_segment = None
-				self._glm5_whole_model_all_short = False
-				self._glm5_whole_model_index_topk = 0
-				self._whole_model_bucketing = None
-				self._glm5_whole_model_capture_input_ids = None
-				self._whole_model_graph = False
-				self._glm5_whole_model_graph = False
+				self._graph.glm5_whole_model_graph_failed_buckets.add(capture_bucket)
+				self._graph.cuda_graph_manager = None
+				self._graph.whole_model_segment = None
+				self._graph.glm5_whole_model_all_short = False
+				self._graph.glm5_whole_model_index_topk = 0
+				self._graph.whole_model_bucketing = None
+				self._graph.glm5_whole_model_capture_input_ids = None
+				self._graph.whole_model_graph = False
+				self._graph.glm5_whole_model_graph = False
 				self._criticality_probe = None
 				self._criticality_probe_recapture = False
 				torch.cuda.empty_cache()
@@ -19601,7 +19150,7 @@ class BatchGenWorker:
 					f"capture for bucket BS={capture_bucket} ran out of memory; using eager decode: {exc}"
 				)
 				return
-			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
+			self._graph.glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
 			self._record_decode_graph_capture()
 			self._criticality_probe_recapture = False
 			# Phase B: hand the just-captured segment to the adapter so its
@@ -19610,11 +19159,11 @@ class BatchGenWorker:
 			# Without this attach, adapter._ctx stays None and eligibility()
 			# returns EAGER/adapter_not_built every step (the worker silently
 			# falls back to the legacy path).
-			if self._cuda_graph_adapter is not None:
+			if self._graph.cuda_graph_adapter is not None:
 				try:
 					_adapter_max_seqlen = int(getattr(whole_seg, "max_seqlen", 0) or 0)
 					_adapter_gpu_mgr = gpu_manager
-					_attach = getattr(self._cuda_graph_adapter, "attach_existing_segment", None)
+					_attach = getattr(self._graph.cuda_graph_adapter, "attach_existing_segment", None)
 					if _attach is not None:
 						_attach(
 							model=self.model,
@@ -19625,12 +19174,12 @@ class BatchGenWorker:
 							max_seqlen_cap=_adapter_max_seqlen,
 						)
 					for _bucket in capture_buckets:
-						_sig = self._cuda_graph_adapter.capture_signature(
+						_sig = self._graph.cuda_graph_adapter.capture_signature(
 							bucket=int(_bucket),
 							gpu_kv_manager=_adapter_gpu_mgr,
 							max_seqlen=_adapter_max_seqlen,
 						)
-						self._cuda_graph_adapter.record_capture(
+						self._graph.cuda_graph_adapter.record_capture(
 							segment_name=segment_name,
 							bucket=int(_bucket),
 							signature=_sig,
@@ -19753,11 +19302,11 @@ class BatchGenWorker:
 		# the eager-MoE launch overhead. Self-contained; leaves the GLM-5 /
 		# GPT-OSS whole-model paths byte-for-byte untouched. Falls back to the
 		# legacy per-layer K2.5 path below if no adapter is present.
-		if _is_k25 and self._cuda_graph_adapter is not None:
+		if _is_k25 and self._graph.cuda_graph_adapter is not None:
 			from batchgen.models.moonshotai.kimi_k25.cuda_graph_adapter import (
 				SEGMENT_NAME_WHOLE_MODEL as _K25_WM_NAME,
 			)
-			bundle = self._cuda_graph_adapter.build_segments(
+			bundle = self._graph.cuda_graph_adapter.build_segments(
 				model=self.model,
 				bucketing=bucketing,
 				gpu_kv_manager=gpu_manager,
@@ -19779,18 +19328,18 @@ class BatchGenWorker:
 			dist.barrier()
 			manager.warmup_and_capture_all()
 			for _bucket in bucketing.bucket_sizes:
-				_sig = self._cuda_graph_adapter.capture_signature(
+				_sig = self._graph.cuda_graph_adapter.capture_signature(
 					bucket=_bucket, gpu_kv_manager=gpu_manager, max_seqlen=max_rope_len,
 				)
-				self._cuda_graph_adapter.record_capture(
+				self._graph.cuda_graph_adapter.record_capture(
 					segment_name=_K25_WM_NAME, bucket=_bucket, signature=_sig,
 				)
-			self._cuda_graph_manager = manager
-			self._whole_model_graph = True
-			self._k25_whole_model_graph = True
-			self._whole_model_segment_name = _K25_WM_NAME
-			self._whole_model_bucketing = bucketing
-			self._whole_model_segment = whole_seg
+			self._graph.cuda_graph_manager = manager
+			self._graph.whole_model_graph = True
+			self._graph.k25_whole_model_graph = True
+			self._graph.whole_model_segment_name = _K25_WM_NAME
+			self._graph.whole_model_bucketing = bucketing
+			self._graph.whole_model_segment = whole_seg
 			self._record_decode_graph_capture()
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
@@ -19809,7 +19358,7 @@ class BatchGenWorker:
 		if use_whole_model:
 			# Whole-model mode: single graph for entire decode pass.
 			# Discard per-layer segments, register one WholeModelSegment instead.
-			manager = CUDAGraphManager(bucketing, device=self.torch_device)
+			manager = self._graph.new_manager(bucketing, device=self.torch_device)
 
 			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
@@ -19870,10 +19419,10 @@ class BatchGenWorker:
 			for layer in self.model.model.layers:
 				layer._graph_capture_mode = False
 
-			self._cuda_graph_manager = manager
-			self._whole_model_graph = True
-			self._whole_model_bucketing = bucketing
-			self._whole_model_segment = whole_seg
+			self._graph.cuda_graph_manager = manager
+			self._graph.whole_model_graph = True
+			self._graph.whole_model_bucketing = bucketing
+			self._graph.whole_model_segment = whole_seg
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
 				logging.info(
@@ -19881,7 +19430,7 @@ class BatchGenWorker:
 				)
 		else:
 			# Per-layer mode: capture attention graph per layer, MoE stays eager.
-			self._whole_model_graph = False
+			self._graph.whole_model_graph = False
 
 			if _is_k25:
 				# K2.5: Register K25AttnSegment per layer (MLA attention only, no MoE graph).
@@ -19941,7 +19490,7 @@ class BatchGenWorker:
 						moe_name=moe_name,
 					)
 
-			self._cuda_graph_manager = manager
+			self._graph.cuda_graph_manager = manager
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
 				logging.info(
@@ -19970,16 +19519,9 @@ class BatchGenWorker:
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
-		from batchgen.models.glm.glm5.cuda_graph_policy import (
-			glm5_effective_decode_attn_mode,
-		)
-
-		RUNTIME_ATTN_MODE = glm5_effective_decode_attn_mode(
-			getattr(self.model_config, "model_type", None),
-			self.engine_config.Basic_Config.attn_mode,
-		)
-		if RUNTIME_ATTN_MODE != 3:
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
+		strategy = strategy_for(self.engine_config.Basic_Config.attn_mode)
+		if strategy is not DecodeStrategy.DECOUPLED_GPU:
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1, strategy)
 			return decode_uuids, batch
 		
 		# Setup
@@ -20154,7 +19696,7 @@ class BatchGenWorker:
 		# reported once and ignored: the graph is fixed until the next
 		# configure.
 		_probe = getattr(self, "_criticality_probe", None)
-		_probe_adapter = getattr(self, "_cuda_graph_adapter", None)
+		_probe_adapter = self._graph.cuda_graph_adapter
 		_probe_round_request = getattr(self, "_criticality_probe_request", None)
 		_probe_mismatch_logged = False
 		if _probe is not None:
@@ -20610,7 +20152,7 @@ class BatchGenWorker:
 				# Phase C: layer-graph mode retired; only whole-model needs the
 				# globally-synced rank-count reuse.
 				if (
-					getattr(self, '_whole_model_graph', False)
+					self._graph.whole_model_graph
 					or self._glm5_whole_model_graph_requested_for_current_batch()
 				):
 					# Whole-model graph needs globally synced counts for NCCL bucket
@@ -20724,7 +20266,7 @@ class BatchGenWorker:
 						"during decode configuration; using eager decode instead of "
 						"capturing in the decode loop"
 					)
-					self._glm5_whole_model_graph_capture_attempted_for_batch = True
+					self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
 
 				self._log_glm5_graph_path_for_forward(
 					local_bsz=len(batch),
@@ -20754,11 +20296,11 @@ class BatchGenWorker:
 				# fails loud here instead of running eager.
 				self._assert_decode_step_within_graph_buckets(_max_bs)
 				_glm5_whole_graph_active = bool(
-					getattr(self, "_glm5_whole_model_graph", False)
-					and self._cuda_graph_manager is not None
+					self._graph.glm5_whole_model_graph
+					and self._graph.cuda_graph_manager is not None
 				)
 				if _glm5_whole_graph_active:
-					_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+					_glm5_whole_bucket = self._graph.whole_model_bucketing.get_padded_size(_max_bs)
 					# An all_short capture never runs indexer scoring, so a
 					# step whose longest context exceeds index_topk must NOT
 					# replay it: top-k selection would be silently skipped.
@@ -20766,17 +20308,17 @@ class BatchGenWorker:
 					# (correct top-k) or, under a required graph, raises
 					# below with reason=all_short_exceeded.
 					_glm5_all_short_exceeded = bool(
-						getattr(self, "_glm5_whole_model_all_short", False)
-						and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+						self._graph.glm5_whole_model_all_short
+						and int(self._graph.glm5_whole_model_index_topk or 0)
 						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-						> int(self._glm5_whole_model_index_topk)
+						> int(self._graph.glm5_whole_model_index_topk)
 					)
 					_glm5_whole_graph_active = (
 						not _glm5_all_short_exceeded
-						and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
-						and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
-						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
-						and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
+						and _glm5_whole_bucket not in self._graph.glm5_whole_model_graph_failed_buckets
+						and self._graph.cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
+						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._graph.whole_model_segment, "max_seqlen", 0))
+						and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == self._graph.glm5_whole_model_graph_signature
 					)
 				if (
 					self._glm5_whole_model_graph_requested_for_current_batch()
@@ -20791,7 +20333,7 @@ class BatchGenWorker:
 						# graph's baked NCCL ops stay matched.
 						self._warn_decode_graph_span_exceeded(
 							int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
-							int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
+							int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0),
 						)
 					else:
 						raise RuntimeError(
@@ -20800,20 +20342,20 @@ class BatchGenWorker:
 							f"(bucket={_required_bucket}, reason={_required_reason})"
 						)
 				_use_graph = (
-					getattr(self, '_whole_model_graph', False)
-					and self._cuda_graph_manager is not None
+					self._graph.whole_model_graph
+					and self._graph.cuda_graph_manager is not None
 					and (
-						not getattr(self, "_glm5_whole_model_graph", False)
+						not self._graph.glm5_whole_model_graph
 						or _glm5_whole_graph_active
 					)
 				)
 				if _use_graph:
 					_glm5_whole_compare = bool(
-						getattr(self, "_glm5_whole_model_graph", False)
+						self._graph.glm5_whole_model_graph
 						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
 					)
 					_glm5_whole_timing = bool(
-						getattr(self, "_glm5_whole_model_graph", False)
+						self._graph.glm5_whole_model_graph
 						and self._glm5_whole_model_graph_timing_requested_for_current_batch()
 					)
 					_glm5_whole_timing_items = {}
@@ -20824,31 +20366,30 @@ class BatchGenWorker:
 					# baked inside — all ranks MUST replay the same bucket's graph,
 					# otherwise mismatched NCCL ops cause deadlock.
 					batch_size = len(batch)
-					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+					bucket = self._graph.whole_model_bucketing.get_padded_size(_max_bs)
 					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
 					# and an adapter is present, route replay through it. Legacy path
 					# (default) preserves today's behavior exactly.
 					# K2.5 always routes whole-model replay through the adapter
 					# (no legacy non-adapter K2.5 whole-model path exists).
-					_k25_whole_active = getattr(self, "_k25_whole_model_graph", False)
+					_k25_whole_active = self._graph.k25_whole_model_graph
 					_adapter_dual_active = (
-						self._cuda_graph_adapter is not None
+						self._graph.cuda_graph_adapter is not None
 						and (
 							_k25_whole_active
 							or (
-								self._cuda_graph_adapter_dual
-								and getattr(self, "_glm5_whole_model_graph", False)
+								self._graph.cuda_graph_adapter_dual
+								and self._graph.glm5_whole_model_graph
 							)
 						)
 					)
-					_wm_seg_name = getattr(
-						self, "_whole_model_segment_name", "glm5_whole_model"
+					_wm_seg_name = (
+						self._graph.whole_model_segment_name or "glm5_whole_model"
 					)
 					_adapter_decision = None
 					_adapter_batch_state = None
 					if _adapter_dual_active:
-						from batchgen.cuda_graph.adapter import BatchState as _BatchState
-						_adapter_batch_state = _BatchState(
+						_adapter_batch_state = self._graph.make_batch_state(
 							local_bsz=batch_size,
 							max_rank_bsz=_max_bs,
 							rank_token_counts=_all_rank_counts,
@@ -20861,7 +20402,7 @@ class BatchGenWorker:
 							input_ids=new_tokens,
 							device=self.torch_device,
 						)
-						_adapter_decision = self._cuda_graph_adapter.eligibility(_adapter_batch_state)
+						_adapter_decision = self._graph.cuda_graph_adapter.eligibility(_adapter_batch_state)
 						if _adapter_decision.mode.value != "whole_model":
 							logging.info(
 								"Phase B: adapter eligibility=%s/%s; using legacy path for parity",
@@ -20870,7 +20411,7 @@ class BatchGenWorker:
 							_adapter_dual_active = False
 					if _adapter_dual_active:
 						# ADAPTER PATH (Phase B dual gate)
-						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
+						replay_inputs = self._graph.cuda_graph_adapter.prepare_replay_inputs(
 							decision=_adapter_decision,
 							batch_state=_adapter_batch_state,
 							segment_name=_wm_seg_name,
@@ -20882,7 +20423,7 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
+						graph_out = self._graph.cuda_graph_manager.replay(
 							_wm_seg_name, _max_bs, **replay_inputs,
 						)
 						if _glm5_whole_timing:
@@ -20895,9 +20436,8 @@ class BatchGenWorker:
 						# token selection). GLM-5 keeps its own bespoke compare block
 						# below; this path serves any adapter that has no such block.
 						if _k25_whole_active:
-							_dbg = self._cuda_graph_adapter.debug_options(_adapter_batch_state)
+							_dbg = self._graph.cuda_graph_adapter.debug_options(_adapter_batch_state)
 							if _dbg.compare_against_eager:
-								from batchgen.cuda_graph.compare import compare_decode_outputs
 								# graph_out has padded bucket rows; the eager reference
 								# produces local_bsz (=batch_size) rows. Slice to align.
 								# Graph probe keys are `probe_layer_<NNN>_hidden`; the
@@ -20911,8 +20451,8 @@ class BatchGenWorker:
 										_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
 									else:
 										_graph_cmp[_k] = _vs
-								_report = compare_decode_outputs(
-									adapter=self._cuda_graph_adapter,
+								_report = self._graph.compare_decode_outputs(
+									adapter=self._graph.cuda_graph_adapter,
 									decision=_adapter_decision,
 									batch_state=_adapter_batch_state,
 									segment_name=_wm_seg_name,
@@ -20933,7 +20473,7 @@ class BatchGenWorker:
 									_report.max_abs, _report.max_rel,
 									_report.mismatched_keys, _report.probe_results,
 								)
-					elif getattr(self, "_glm5_whole_model_graph", False):
+					elif self._graph.glm5_whole_model_graph:
 						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
 						aux_manager = getattr(
 							gpu_manager,
@@ -20946,7 +20486,7 @@ class BatchGenWorker:
 							local_bsz=batch_size,
 							bucket=bucket,
 							gpu_manager=gpu_manager,
-							graph_max_seqlen_override=int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
+							graph_max_seqlen_override=int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0),
 						)
 						# Delay-table update for this step's level: an async copy
 						# on this stream, ahead of the replay that reads it.
@@ -20955,7 +20495,7 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
+						graph_out = self._graph.cuda_graph_manager.replay(
 							"glm5_whole_model", _max_bs,
 							input_ids=new_tokens[:batch_size],
 							cache_seqlens=graph_inputs["cache_seqlens"],
@@ -20983,10 +20523,10 @@ class BatchGenWorker:
 							active_page_table=_pt_mgr.gpu_table,
 							slot_index_tensor=_pt_mgr._slot_index_tensor,
 							batch_size=batch_size,
-							max_pages_per_seq=self._whole_model_segment.max_pages_per_seq,
+							max_pages_per_seq=self._graph.whole_model_segment.max_pages_per_seq,
 							device=self.torch_device,
 						)
-						graph_out = self._cuda_graph_manager.replay(
+						graph_out = self._graph.cuda_graph_manager.replay(
 							"whole_model", bucket,
 							input_ids=new_tokens,
 							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
@@ -21009,8 +20549,8 @@ class BatchGenWorker:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_eager_start = time.perf_counter()
 						with self._glm5_force_segmented_graph_eager():
-							if getattr(self._whole_model_segment, "compare_probe_layers", ()):
-								eager_probe_outputs = self._whole_model_segment.run_model_with_probes(
+							if getattr(self._graph.whole_model_segment, "compare_probe_layers", ()):
+								eager_probe_outputs = self._graph.whole_model_segment.run_model_with_probes(
 									input_ids=new_tokens,
 									attention_mask=Attn_Wrapper.attention_mask,
 									position_ids=Attn_Wrapper.position_ids,
@@ -21092,7 +20632,7 @@ class BatchGenWorker:
 						# contiguous-only clone path; no per-layer fallback branch).
 						if _glm5_whole_timing:
 							_glm5_offload_start = time.perf_counter()
-						self._cuda_graph_adapter.stage_post_graph_kv(
+						self._graph.cuda_graph_adapter.stage_post_graph_kv(
 							decision=_adapter_decision,
 							batch_state=_adapter_batch_state,
 							graph_outputs=graph_out,
@@ -21110,7 +20650,7 @@ class BatchGenWorker:
 						# D2H; cloning per layer adds 156 small GPU copies per decode
 						# token on GLM-5 and dominates the whole-graph replay overhead.
 						kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
-						wm_seg = getattr(self, '_whole_model_segment', None)
+						wm_seg = self._graph.whole_model_segment
 						if (
 							batch_size > 0
 							and kv_cb is not None
@@ -21621,11 +21161,11 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
-			if self._trajectory_book is None:
+			if self._traj.trajectory_book is None:
 				continue
 			# Use the turn ledger: later user prompts make the latest generated
 			# token non-contiguous with the original prompt boundary.
-			token = self._trajectory_book.last_generated_token(
+			token = self._traj.trajectory_book.last_generated_token(
 				self._trajectory_slot(seq)
 			).to(dtype=torch.int64).view(1, 1)
 			tokens.append(token)
@@ -21665,7 +21205,8 @@ class BatchGenWorker:
 		new_tokens: torch.Tensor,
 		decode_uuids: List[str],
 		batch: List[int],
-		start_token_idx: int
+		start_token_idx: int,
+		strategy: DecodeStrategy,
 	) -> None:
 		"""Legacy decoding for modes 0, 1, 2 with continuous batching support."""
 		new_token_idx = start_token_idx
@@ -21711,9 +21252,8 @@ class BatchGenWorker:
 				if not decode_uuids:
 					break
 			
-			RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
 
-			if RUNTIME_ATTN_MODE == 0:
+			if strategy is DecodeStrategy.CPU_ATTN:
 				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
 				with torch.inference_mode():
 					Attn_Wrapper.cur_batch = [batch]
@@ -21783,7 +21323,7 @@ class BatchGenWorker:
 
 				new_token_idx += 1
 
-			elif RUNTIME_ATTN_MODE == 1:
+			elif strategy is DecodeStrategy.LEGACY_MICROBATCH_GPU:
 				"""GPU ATTN MODE - ATTN MICRO BATCH"""
 				micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 				num_micro_batches = math.ceil(len(batch) / micro_batch_size)
@@ -21884,7 +21424,7 @@ class BatchGenWorker:
 
 				new_token_idx += 1
 
-			elif RUNTIME_ATTN_MODE == 2:
+			elif strategy is DecodeStrategy.HYBRID_CPU_GPU:
 				"""CPU-GPU Parallel ATTN - Deprecated"""
 				logging.warning("RUNTIME_ATTN_MODE 2 is deprecated")
 				new_token_idx += 1
@@ -22186,38 +21726,38 @@ class BatchGenWorker:
 
 	def _release_decode_graph_state(self) -> None:
 		"""Drop the decode instance's captured graphs and their bookkeeping."""
-		self._cuda_graph_manager = None
-		self._glm5_moe_cuda_graph_manager = None
-		self._glm5_layer_cuda_graph_manager = None
-		self._glm5_layer_graph_failed_buckets = set()
-		self._glm5_layer_graph_capture_attempted_for_batch = False
-		self._glm5_layer_graph_signature = None
-		self._glm5_layer_graph_max_seqlen = None
-		self._glm5_dsa_graph_capture_attempted_for_batch = False
-		self._glm5_moe_graph_capture_attempted_for_batch = False
-		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
-		self._whole_model_segment = None
-		self._glm5_whole_model_all_short = False
-		self._glm5_whole_model_index_topk = 0
-		self._whole_model_bucketing = None
-		self._glm5_whole_model_capture_input_ids = None
-		self._glm5_moe_graph_failed_buckets = set()
-		self._whole_model_graph = False
-		self._glm5_whole_model_graph = False
-		self._glm5_whole_model_graph_failed_buckets = set()
-		self._glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._glm5_whole_model_graph_signature = None
-		self._glm5_whole_model_graph_unavailable_reason = None
+		self._graph.cuda_graph_manager = None
+		self._graph.glm5_moe_cuda_graph_manager = None
+		self._graph.glm5_layer_cuda_graph_manager = None
+		self._graph.glm5_layer_graph_failed_buckets = set()
+		self._graph.glm5_layer_graph_capture_attempted_for_batch = False
+		self._graph.glm5_layer_graph_signature = None
+		self._graph.glm5_layer_graph_max_seqlen = None
+		self._graph.glm5_dsa_graph_capture_attempted_for_batch = False
+		self._graph.glm5_moe_graph_capture_attempted_for_batch = False
+		self._graph.glm5_dsa_graph_page_table_change_after_capture_logged = False
+		self._graph.whole_model_segment = None
+		self._graph.glm5_whole_model_all_short = False
+		self._graph.glm5_whole_model_index_topk = 0
+		self._graph.whole_model_bucketing = None
+		self._graph.glm5_whole_model_capture_input_ids = None
+		self._graph.glm5_moe_graph_failed_buckets = set()
+		self._graph.whole_model_graph = False
+		self._graph.glm5_whole_model_graph = False
+		self._graph.glm5_whole_model_graph_failed_buckets = set()
+		self._graph.glm5_whole_model_graph_capture_attempted_for_batch = False
+		self._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
+		self._graph.glm5_whole_model_graph_signature = None
+		self._graph.glm5_whole_model_graph_unavailable_reason = None
 		# The probe's spin nodes live in the graphs dropped above.
 		self._criticality_probe = None
 		# Adapter holds Python refs to model/segment/KV manager via _ctx;
 		# without release_context() the captured segment's static KV buffers
 		# survive empty_cache() and prefill OOMs on the next batch.
-		if getattr(self, '_cuda_graph_adapter', None) is not None:
-			self._cuda_graph_adapter.release_context()
+		if self._graph.cuda_graph_adapter is not None:
+			self._graph.cuda_graph_adapter.release_context()
 		# A later decode instance is a new owner and captures its own graphs.
-		self._decode_graph_captures = 0
+		self._graph.decode_graph_captures = 0
 
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.

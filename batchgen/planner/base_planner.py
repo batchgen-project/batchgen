@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 import logging
 
 from batchgen.config.config import EngineConfig
+from batchgen.config.decode_strategy import apply_normalized_attn_mode
 
 
 class BasePlanner(ABC):
@@ -40,20 +41,17 @@ class BasePlanner(ABC):
     DEFAULT_MEM_FRAC: float = NotImplemented
     NUM_EXPERTS: int = NotImplemented
 
+    # A model family that supports only one decode path declares it here;
+    # apply_normalized_attn_mode applies it after validating the raw code.
+    FORCED_DECODE_MODE: int | None = None
+
     def __init__(self):
         """Initialize planner. Config parameters set via generate_config()."""
         pass
 
-    def generate_config(self, config: EngineConfig) -> EngineConfig:
-        """Generate complete config for the model.
-
-        Args:
-            config: EngineConfig with Basic_Config already populated
-                   (device, dtypes, padding_length, etc. from set_basic_config)
-
-        Returns:
-            EngineConfig with all sections populated
-        """
+    # Generate all sections from the basic config populated by the initializer.
+    def generate_config(self, config: EngineConfig, model_type: str | None) -> EngineConfig:
+        apply_normalized_attn_mode(config.Basic_Config, model_type, self.FORCED_DECODE_MODE)
         self.config = config
         self.max_prompt_length = config.Basic_Config.padding_length
         self.max_response_length = config.Basic_Config.max_decoding_length
@@ -110,18 +108,6 @@ class BasePlanner(ABC):
 
         expert_per_rank = self.NUM_EXPERTS // self.world_size
         assert expert_per_rank > 0, "EXPERT_PER_RANK must be greater than 0"
-
-        # Set attention mode based on world size and EP offloading
-        # attn_mode = 3 uses decoding_continuous() which properly handles dynamic weight loading
-        # attn_mode = 1 uses legacy modes that don't support EP with offloading
-        if self.world_size > 8:
-            self.config.Basic_Config.attn_mode = 3  # DUAL-NODE
-        elif self.config.EP_Config.enable_offloading:
-            # EP with offloading on single-node requires attn_mode = 3 for decoding_continuous()
-            self.config.Basic_Config.attn_mode = 3
-            logging.info("EP offloading enabled on single-node: setting attn_mode=3 for decoding_continuous()")
-        else:
-            self.config.Basic_Config.attn_mode = 1  # SINGLE-NODE (legacy)
 
         # Compute decoding micro batch size using model-specific MAGIC_NUM
         attn_decoding_micro_batch_size = self.MAGIC_NUM // self.max_prompt_length
