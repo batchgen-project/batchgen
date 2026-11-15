@@ -160,25 +160,38 @@ class DenseSite:
 
 @dataclass(frozen=True)
 class ContiguousSite:
-    """One ``m_grouped_fp8_gemm_nt_contiguous`` call shape (N and K are
-    compiled in; the group count is packed into the row dimension)."""
+    """One ``m_grouped_fp8_gemm_nt_contiguous`` call shape.
+
+    N, K AND the group count are compiled into the kernel (the generated
+    source instantiates ``num_groups`` as a template argument), so a witness
+    must run at the serving group count — a G=1 witness compiles a different
+    kernel, which the wza-8-3 r1 leg proved: serving at G=256 late-compiled
+    the exact block configs the G=1 witnesses had already built. The block
+    CONFIG selection itself models the group count as 1 (the host wrapper
+    passes num_groups=1 to the selector), which that run confirmed.
+    """
 
     name: str
     n: int
     k: int
+    groups: int
 
 
 def contiguous_sites(shapes) -> List["ContiguousSite"]:
     """The grouped prefill S1/S3 GEMMs of the DEFAULT contiguous-MoE backend
     (``Glm5MoE._forward_prefill_grouped_impl`` via
     ``grouped_fp8_deepgemm_gemm``): gate and up share one [N, K], down is the
-    transpose. Reached whenever a streamed-prefill window runs the grouped
-    experts with ``prefill_grouped_gemm`` unset or ``deepgemm``."""
+    transpose. The serving dense stack spans every routed expert of the
+    frame; the resident deployments stack all of them, so that is the
+    compiled-in group count."""
+    groups = int(shapes.num_routed_experts)
     return [
         ContiguousSite("contiguous:moe_gate_up",
-                       shapes.expert_intermediate_size, shapes.hidden_size),
+                       shapes.expert_intermediate_size, shapes.hidden_size,
+                       groups),
         ContiguousSite("contiguous:moe_down",
-                       shapes.hidden_size, shapes.expert_intermediate_size),
+                       shapes.hidden_size, shapes.expert_intermediate_size,
+                       groups),
     ]
 
 
@@ -452,8 +465,13 @@ def _run_masked_moe(weight, weight_scale, expected_m: int, device,
 def _run_contiguous(site: ContiguousSite, rows: int, device,
                     fn: Optional[Callable] = None) -> None:
     """One contiguous-kernel call of ``site`` at ``rows`` packed rows (always
-    128-aligned, as serving row totals are), through the serving wrapper:
-    one group, every row mapped to it, a fresh dense ``[1, N, K]`` B stack."""
+    128-aligned, as serving row totals are), through the serving wrapper.
+
+    The B stack has the SITE's group count (compiled into the kernel); every
+    row maps to group 0, which compiles and runs the kernel without touching
+    the other groups' weights. The stack is transient (fp8 G x N x K, a few
+    GB for the full expert count) and freed when the call returns.
+    """
     if fn is None:
         from batchgen.moe.grouped_fp8_deepgemm_moe import (
             grouped_fp8_deepgemm_gemm,
@@ -461,15 +479,19 @@ def _run_contiguous(site: ContiguousSite, rows: int, device,
 
         fn = grouped_fp8_deepgemm_gemm
     rows = int(rows)
+    groups = max(1, int(site.groups))
     x_fp8 = torch.zeros((rows, site.k), dtype=torch.float8_e4m3fn,
                         device=device)
     x_scale = torch.ones((site.k // SCALE_BLOCK, rows), dtype=torch.float32,
                          device=device)
-    weight, scale = _weight(site.n, site.k, device)
+    weight = torch.zeros((groups, site.n, site.k),
+                         dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.ones((groups, -(-site.n // SCALE_BLOCK),
+                        -(-site.k // SCALE_BLOCK)), dtype=torch.float32,
+                       device=device)
     out = torch.empty((rows, site.n), dtype=torch.bfloat16, device=device)
     layout = torch.zeros((rows,), dtype=torch.int32, device=device)
-    fn(x_fp8, x_scale, weight.unsqueeze(0), scale.unsqueeze(0), output=out,
-       grouped_layout=layout)
+    fn(x_fp8, x_scale, weight, scale, output=out, grouped_layout=layout)
 
 
 def _run_paged_mqa(batch: int, num_heads: int, head_dim: int, page_size: int,
@@ -558,7 +580,7 @@ def _contiguous_entries(sites: Sequence[ContiguousSite], max_rows: int,
     entries: List[PrewarmEntry] = []
     seen_shapes = set()
     for site in sites:
-        shape = (site.n, site.k)
+        shape = (site.n, site.k, site.groups)
         if shape in seen_shapes:
             continue
         seen_shapes.add(shape)
