@@ -30,6 +30,9 @@
 #include <variant>
 #include <vector>
 
+#include <unistd.h>
+
+#include "../Parameter_Server/posix_shm.h"
 #include "../utils.h"
 #include "host_kv_page_table.h"
 #include "host_paged_kv_backend.h"
@@ -1825,8 +1828,51 @@ class HostPagedKVWorkerView : private LayerMapper {
         if (base == nullptr || bytes == 0) {
             return;
         }
-        worker_detail::RegisterPinnedRange(static_cast<void*>(base), bytes,
-                                           device_index_, logger_);
+        // One cudaHostRegister above the driver's per-call ceiling fails
+        // with out-of-memory. Register in segments planned
+        // by the same planner the weight store uses; every page copy stays
+        // inside one layer, so per-layer extents keep each copy inside one
+        // registration.
+        std::vector<std::pair<int64_t, int64_t>> extents;
+        extents.reserve(config_.num_layers);
+        for (std::size_t layer = 0; layer < config_.num_layers; ++layer) {
+            const int64_t begin = static_cast<int64_t>(
+                layout_.KPageAddress(base, layer, 0) - base);
+            const int64_t end =
+                layer + 1 < config_.num_layers
+                    ? static_cast<int64_t>(
+                          layout_.KPageAddress(base, layer + 1, 0) - base)
+                    : static_cast<int64_t>(bytes);
+            extents.emplace_back(begin, end);
+        }
+        const auto segments = ::plan_host_registration_segments(
+            std::move(extents), static_cast<int64_t>(bytes),
+            ::kMaxHostRegistrationBytes,
+            static_cast<int64_t>(sysconf(_SC_PAGESIZE)));
+        pinned_segments_.clear();
+        pinned_segments_.reserve(segments.size());
+        try {
+            for (const auto& [seg_begin, seg_end] : segments) {
+                void* seg_base = static_cast<void*>(base + seg_begin);
+                worker_detail::RegisterPinnedRange(
+                    seg_base, static_cast<std::size_t>(seg_end - seg_begin),
+                    device_index_, logger_);
+                pinned_segments_.push_back(seg_base);
+            }
+        } catch (...) {
+            for (auto it = pinned_segments_.rbegin();
+                 it != pinned_segments_.rend(); ++it) {
+                worker_detail::UnregisterPinnedRange(*it, device_index_,
+                                                     logger_);
+            }
+            pinned_segments_.clear();
+            throw;
+        }
+        logger_->info(
+            "Host KV registered {:.3f} GiB with CUDA in {} segment(s) of at "
+            "most {} GiB",
+            static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+            segments.size(), ::kMaxHostRegistrationBytes >> 30);
         pinned_registered_ = true;
         pinned_base_ = static_cast<void*>(base);
         pinned_bytes_ = bytes;
@@ -1836,8 +1882,11 @@ class HostPagedKVWorkerView : private LayerMapper {
         if (!pinned_registered_) {
             return;
         }
-        worker_detail::UnregisterPinnedRange(pinned_base_, device_index_,
-                                             logger_);
+        for (auto it = pinned_segments_.rbegin(); it != pinned_segments_.rend();
+             ++it) {
+            worker_detail::UnregisterPinnedRange(*it, device_index_, logger_);
+        }
+        pinned_segments_.clear();
         pinned_registered_ = false;
         pinned_base_ = nullptr;
         pinned_bytes_ = 0;
@@ -3060,6 +3109,7 @@ class HostPagedKVWorkerView : private LayerMapper {
     bool pinned_registered_ = false;
     void* pinned_base_ = nullptr;
     std::size_t pinned_bytes_ = 0;
+    std::vector<void*> pinned_segments_;
     int device_index_ = -1;
     bool copy_streams_ready_ = false;
     std::optional<at::cuda::CUDAStream> h2d_stream_;

@@ -189,3 +189,54 @@ def test_k3_scale_layout_plans_without_cutting_a_tensor():
     _assert_valid_plan(segments, extents, cursor, core.MAX_HOST_REGISTRATION_BYTES)
     assert core.MAX_HOST_REGISTRATION_BYTES == 256 * GIB
     assert len(segments) >= -(-cursor // core.MAX_HOST_REGISTRATION_BYTES)
+
+
+# --------------------------------------------------------------------------
+# Host KV registers in segments too (batchgen-host-pin-registration-size-ceiling)
+# --------------------------------------------------------------------------
+
+HOST_KV_VIEW = ROOT / "core" / "KV_Storage" / "host_paged_kv_worker_view.h"
+
+
+def test_host_kv_view_registers_planned_segments_and_unregisters_each():
+    source = HOST_KV_VIEW.read_text()
+    register = _section(source, "void RegisterPinnedMemory() {", "void UnregisterPinnedMemory() {")
+    # One planner call over per-layer extents, then one register per segment.
+    assert "::plan_host_registration_segments(" in register
+    assert "::kMaxHostRegistrationBytes" in register
+    assert "layout_.KPageAddress(base, layer, 0)" in register
+    assert register.index("::plan_host_registration_segments(") < register.index(
+        "worker_detail::RegisterPinnedRange("
+    )
+    assert "pinned_segments_.push_back(seg_base);" in register
+    # The single whole-region registration is gone.
+    assert "RegisterPinnedRange(static_cast<void*>(base), bytes," not in register
+    # A failed segment releases the earlier ones before rethrowing.
+    rollback = _section(register, "} catch (...) {", "throw;")
+    assert "UnregisterPinnedRange(*it" in rollback
+    unregister = _section(source, "void UnregisterPinnedMemory() {", "enum class CopyDirection")
+    assert "for (auto it = pinned_segments_.rbegin()" in unregister
+    assert "pinned_segments_.clear();" in unregister
+
+
+def test_host_kv_layer_extents_plan_cuts_on_layer_boundaries():
+    core = _core_engine()
+    # K3 MLA host KV near a 1 TiB host budget: 24 layers, one K page of
+    # 64 tokens x 576 B x bf16 per layer, ~980 GiB total -> > 256 GiB, so
+    # several segments, and every cut must sit on a layer boundary because
+    # each page copy lives inside one layer.
+    layers = 24
+    page_bytes = 64 * 576 * 2
+    layer_bytes = -(-(980 * GIB // layers) // (2 << 20)) * (2 << 20)  # 2 MiB aligned stride
+    layer_bytes = layer_bytes // page_bytes * page_bytes
+    layer_bytes = -(-layer_bytes // (2 << 20)) * (2 << 20)
+    total = layers * layer_bytes
+    extents = [(i * layer_bytes, (i + 1) * layer_bytes) for i in range(layers)]
+    segments = core.plan_host_registration_segments(
+        extents, total, core.MAX_HOST_REGISTRATION_BYTES, PAGE
+    )
+    _assert_valid_plan(segments, extents, total, core.MAX_HOST_REGISTRATION_BYTES)
+    assert len(segments) >= 4
+    boundaries = {i * layer_bytes for i in range(layers + 1)}
+    for begin, end in segments:
+        assert begin in boundaries and end in boundaries
