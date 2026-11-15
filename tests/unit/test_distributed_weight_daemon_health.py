@@ -365,3 +365,27 @@ def test_native_status_reports_both_latches_and_releases_the_gil():
     start = binding.index('.def("status", &DistributedWeightDaemon::Status')
     definition = binding[start:binding.index(".def(", start + 1)]
     assert "py::call_guard<py::gil_scoped_release>()" in definition
+
+
+def test_stop_never_throws_past_a_dead_peer():
+    """Teardown must complete locally when a peer is gone (dwd6, 2026-11-13):
+    the graceful flush close parked on "UCP request: Endpoint timeout" and
+    the raised error aborted Stop() half way, so the fail-fast path logged
+    a teardown failure right after a clean worker stop."""
+    source = DAEMON_CPP.read_text()
+
+    # The teardown close force-closes (no flush against a dead peer) and
+    # reports instead of throwing.
+    start = source.index("void close_endpoint_for_stop(")
+    body = source[start:source.index("\n}\n", start)]
+    assert "UCP_EP_CLOSE_FLAG_FORCE" in body
+    assert "check_ucs" not in body and "fail(" not in body
+    assert "fprintf" in body
+
+    # Stop() owns every endpoint's end of life and uses only that close;
+    # the throwing graceful close is gone.
+    stop_start = source.index("    void Stop() {")
+    stop_body = source[stop_start:source.index("\n    }\n", stop_start)]
+    assert "close_endpoint_for_stop(" in stop_body
+    assert "void close_endpoint(" not in source
+    assert source.count("close_endpoint_for_stop(") == 3  # def + 2 call sites
