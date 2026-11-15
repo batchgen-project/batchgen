@@ -32,6 +32,10 @@ def _section(source, begin, end):
 
 def _core_engine():
     try:
+        # core_engine links against torch's shared libraries (libc10 and
+        # friends), which are only on the loader path once torch is imported.
+        import torch  # noqa: F401
+
         from batchgen.native_loader import core_engine
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"compiled extension unavailable: {exc}")
