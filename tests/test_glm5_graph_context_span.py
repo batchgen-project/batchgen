@@ -36,6 +36,11 @@ from batchgen.config.graph_span_policy import (
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
 from tests.worker.worker_fakes import make_graph_state
+from tests.worker_method_source import (
+    STEP_OBSERVABILITY_SOURCE,
+    delegated_method_names,
+    worker_shaped_method_node,
+)
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -51,6 +56,10 @@ def _worker_class() -> ast.ClassDef:
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
+    # S7/S10a: the span warning (StepObservabilityEngine) and the KV pool
+    # sizing (KVCapacityEngine) run in their engines (worker delegates).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     for stmt in _worker_class().body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name == name:
             return stmt
@@ -83,7 +92,10 @@ BUDGET_BYTES = GRAPH_CONTEXT_STATICS_BUDGET_BYTES
 BYTES_PER_TOKEN_PER_ROW = GRAPH_CONTEXT_STATICS_BYTES_PER_TOKEN_PER_ROW
 SPAN_ALIGN = GRAPH_CONTEXT_SPAN_ALIGN
 SPAN_FLOOR = GRAPH_CONTEXT_SPAN_FLOOR_TOKENS
-WARN_INTERVAL_S = _module_constant("_GRAPH_SPAN_WARN_INTERVAL_S")
+# S7: the rate-limit constant moved with the warning into the engine module.
+WARN_INTERVAL_S = _assigned_value(
+    ast.parse(STEP_OBSERVABILITY_SOURCE.read_text()).body, "_GRAPH_SPAN_WARN_INTERVAL_S"
+)
 EAGER_SERVABLE_REASONS = _class_constant(
     "_WHOLE_GRAPH_EAGER_SERVABLE_REASONS"
 )
@@ -458,16 +470,22 @@ def test_decode_step_only_raises_for_a_non_eager_servable_reason():
     no replayable graph existed, including for a step merely longer than the
     capture.
     """
+    # S4b: the decode loop body (and this raise) runs in DecoupledGpuDecode.
+    engine_tree = ast.parse(
+        (_WORKER_SRC.parent / "worker" / "decode_engine.py").read_text()
+    )
     raises = [
         node
-        for node in ast.walk(_worker_class())
+        for scope in (_worker_class(), engine_tree)
+        for node in ast.walk(scope)
         if isinstance(node, ast.Raise)
         and "no replayable" in ast.unparse(node)
     ]
     assert len(raises) == 1, [ast.unparse(r) for r in raises]
     guards = [
         node
-        for node in ast.walk(_worker_class())
+        for scope in (_worker_class(), engine_tree)
+        for node in ast.walk(scope)
         if isinstance(node, ast.If)
         and "_WHOLE_GRAPH_EAGER_SERVABLE_REASONS" in ast.unparse(node.test)
     ]

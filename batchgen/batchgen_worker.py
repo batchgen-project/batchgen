@@ -75,12 +75,8 @@ REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
 # and no sleep, no probe read at all.
 _DECODE_EVENT_SPIN_BUDGET_S = 0.002
 _DECODE_EVENT_POLL_INTERVAL_S = 1e-4
-# ``_wait_decode_tokens``' two outcomes.  COMPLETED is exactly what
-# ``synchronize()`` guarantees: the step's device work is done and its readback
-# buffers hold this step's tokens.  ABANDONED means the cohort is being torn
-# down and the event may never fire, so none of the step's outputs may be read.
-_DECODE_WAIT_COMPLETED = "completed"
-_DECODE_WAIT_ABANDONED = "abandoned"
+# ``_wait_decode_tokens``' two outcomes (_DECODE_WAIT_COMPLETED /
+# _DECODE_WAIT_ABANDONED) have one owner, decode_engine, imported below.
 # Returned by _finish_deferred_decode_step when the cohort teardown flag was
 # seen after the step's host-KV drain (the deferred twin of the post-drain
 # flag check in the undeferred step).
@@ -99,33 +95,6 @@ _DECODE_STEP_SHUTDOWN = "shutdown"
 # the completed-row mask), so emitted tokens are unchanged.
 # False: the undeferred step exactly as before (byte-identical behavior).
 # Read at call time, so it can be flipped on the module.
-DECODE_DEFERRED_TOKEN_READBACK = True
-# Total budget for the LOCAL quiesce on a decode teardown exit.  An abandoned
-# step leaves its host-KV appends and its async KV load parked behind device
-# work the dead collective will never let finish, so the quiesce bounds them
-# itself (see _quiesce_decode_for_cohort_shutdown) and self-exits rather than
-# unwind while they still hold page-table pointers.
-#
-# The bound is established by NON-BLOCKING probes only -- never by running a
-# blocking wait under a timeout, on this thread or any other.  MEASURED: the
-# append task's wait is bound as `.def("wait", &kv::KVAsyncTask::wait)`
-# (core/batchgen_Binding.cpp:968) with no `py::call_guard<gil_scoped_release>`,
-# so a task parked behind the dead collective blocks in
-# `std::shared_future::get` HOLDING THE GIL.  No other Python can then run --
-# not the deadline, not the abort watchdog, not the supervisor's self-exit net
-# -- so the rank burns the whole grace window.  `KVAsyncTask::done()`
-# (core/KV_Storage/host_paged_kv_worker_view.h:93-99) is a `wait_for(0s)` status
-# test, and a CUDA event query is the same class of probe for device work; both
-# are safe to call under the GIL because neither can wait.
-_COHORT_QUIESCE_DEADLINE_S = 5.0
-_COHORT_QUIESCE_POLL_INTERVAL_S = 1e-3
-_COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
-
-# Seconds between two "step exceeds the captured span" warnings. The condition
-# holds for every step of a long sequence, so it is logged at a rate a human
-# reads rather than once per step.
-_GRAPH_SPAN_WARN_INTERVAL_S = 60.0
-
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
@@ -217,9 +186,23 @@ from batchgen.query_book import (
 	release_query_book_slot,
 )
 from batchgen.config.decode_strategy import DecodeStrategy, strategy_for
+from batchgen.config.legacy_kv_accounting import legacy_past_kv_byte_size
 from batchgen.worker.graph_runtime import GraphRuntime
 from batchgen.worker.trajectory_store import TrajectoryStore
 from batchgen.worker.prefix_reuse_state import PrefixReuseState
+from batchgen.worker import decode_engine as _decode_engine
+from batchgen.worker.decode_engine import (
+	BATCHGEN_CB_DEBUG,
+	BATCHGEN_DECODE_ASSERT,
+	BATCHGEN_MULTI_BATCH_DIAG,
+	_DECODE_WAIT_ABANDONED,
+	_DECODE_WAIT_COMPLETED,
+	DecoupledGpuDecode,
+)
+from batchgen.worker.prefill_engine import PrefillEngine
+from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+from batchgen.worker.step_observability_engine import StepObservabilityEngine
+from batchgen.worker.rank_sync_engine import RankSyncEngine
 
 
 def _load_kda_wrapper():
@@ -239,15 +222,9 @@ from batchgen.config.model_name_utils import (
 )
 from batchgen.config.cuda_graph_flag_policy import (
 	cli_enables_whole_model_graph,
+	glm5_any_cuda_graph_requested,
+	glm5_whole_model_cuda_graph_requested,
 	require_cuda_graph_flag_supported,
-)
-from batchgen.models.glm.glm5.cuda_graph_policy import (
-	glm5_any_cuda_graph_requested_for_model,
-	glm5_dsa_cuda_graph_requested_for_model,
-	glm5_dsa_full_cuda_graph_requested,
-	glm5_moe_cuda_graph_requested_for_model,
-	glm5_segmented_cuda_graph_requested_for_model,
-	glm5_whole_model_cuda_graph_requested_for_model,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.native_loader import core_engine
@@ -358,6 +335,7 @@ from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, conf
 # import them by value (that binds the import-time defaults).
 import batchgen.sequence as _sequence_module
 from batchgen.kv_cache.host_kv_health import format_host_kv_health
+from batchgen.worker.kv_capacity_engine import KVCapacityEngine, _DualKVLoadPointers
 from batchgen.prefill.prepack import (
 	prepack_sequences,
 	unpack_last_token_logits,
@@ -380,42 +358,11 @@ from batchgen.sampling import sample_tokens
 # Migration data structures for KV cache migration between nodes
 from batchgen.migration import MigrationOp
 
-BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
-if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
-	try:
-		from pplx_kernels import nvshmem_init
-	except ImportError as exc:
-		logging.warning("Failed to import pplx_kernels.nvshmem_init: %s", exc)
-		nvshmem_init = None
-else:
-	nvshmem_init = None
-
-# Debug logging level for continuous batching page boundary
-BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
-
-# Optional decode-time invariant check: assert cache_seqlens <= gpu_pages_allocated * PAGE_SIZE
-BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
-
-# Multi-batch diagnostic logging for investigating metadata corruption
-BATCHGEN_MULTI_BATCH_DIAG = os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
+# BATCHGEN_CB_DEBUG / BATCHGEN_DECODE_ASSERT / BATCHGEN_MULTI_BATCH_DIAG are
+# evaluated once, by their single owner decode_engine (imported above).
 
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
-
-# Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
-# Default: enabled (recommended always on). Use --no-prepack to disable.
-BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
-
-# Optional runtime checks for NaN/Inf in KV tensors (disabled by default)
-BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == '1'
-
-# Optional gate for expensive/critical diagnostics (default off in production)
-BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
-
-# Max per-rank in-decode batch. Bounds the K2.5 MoE padded buffer (mtp = round_up(world_size *
-# this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
-# the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
-_MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
 
 def _reentry_history_length(
 	prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
@@ -437,75 +384,12 @@ def _reentry_history_length(
 # message, which re-enters Init() before any sequence is admitted.
 _K3_STARTUP_MAX_DECODING_LENGTH = 4096
 
-# Optional Nsight Systems capture window for decode-forward profiling.
-# Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
-BATCHGEN_NSYS_DECODE_PROFILE = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE", "0") == "1"
-BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT = int(
-	os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT", "3")
-)
-if BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT <= 0:
-	raise ValueError("BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT must be positive")
-BATCHGEN_NSYS_DECODE_PROFILE_EXIT = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_EXIT", "1") == "1"
-
-def _parse_nsys_controller_ranks() -> Set[int]:
-	raw = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS", "0")
-	return {int(part.strip()) for part in raw.split(",") if part.strip()}
-
-BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS = _parse_nsys_controller_ranks()
-if BATCHGEN_NSYS_DECODE_PROFILE and not BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS:
-	raise ValueError("BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS must not be empty")
-
 # Decode preemption configuration (DEPRECATED: use CLI args instead)
 # --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
 # --enable-decode-preemption / --no-decode-preemption: Default enabled
 ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '1') == '1'  # Default ON
 
-# GPU KV cache size override (DEPRECATED: use --gpu-memory-frac CLI arg instead)
-# If set, overrides the automatic calculation. Otherwise, size is computed as:
-# gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
-_GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
-
-# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
-# Spelled out here, instead of imported from the four probe modules, so that
-# deciding "is any probe armed on this prefill" is a membership test on a dict
-# the worker already holds: a production prefill must not import a probe module
-# or build a merged debug dict to be told that nothing is armed.
-# ``tests/unit/test_pool_probe_debug_seam.py`` pins these against the modules'
-# own constants, so the duplication cannot drift.
-_EPILOGUE_TRACE_DEBUG_FLAG = "prefix_pool_epilogue_trace"
-_EPILOGUE_TRACE_PROBE_TOKEN_FLAG = "prefix_pool_epilogue_probe_token"
-_POOL_OFFLOAD_CHECK_DEBUG_FLAG = "prefix_pool_offload_check"
-_POOL_KERNEL_DUMP_DEBUG_FLAG = "prefix_pool_dump_kernel_args"
-_POOL_KERNEL_DUMP_DIR_FLAG = "prefix_pool_dump_dir"
-_POOL_PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
-_POOL_PROBE_DEBUG_KEYS = (
-	_EPILOGUE_TRACE_DEBUG_FLAG,
-	_EPILOGUE_TRACE_PROBE_TOKEN_FLAG,
-	_POOL_OFFLOAD_CHECK_DEBUG_FLAG,
-	_POOL_KERNEL_DUMP_DEBUG_FLAG,
-	_POOL_KERNEL_DUMP_DIR_FLAG,
-	_POOL_PAD_POISON_DEBUG_FLAG,
-)
-
-
-def _normalize_aux_kv_entry(entry) -> tuple:
-	"""(layer_idx, k_tensor, v_tensor, scale_tensor) of a deferred aux append.
-
-	A page-split FP8 aux region needs the fp32 per-token scales alongside the
-	quantized keys, so a producer may append a 4-tuple; a bf16 AoS producer
-	keeps appending a 3-tuple and gets ``scale_tensor=None``.
-	"""
-
-	if len(entry) == 4:
-		return tuple(entry)
-	if len(entry) == 3:
-		layer_idx, k_tensor, v_tensor = entry
-		return layer_idx, k_tensor, v_tensor, None
-	raise RuntimeError(
-		"deferred aux KV entry must be (layer_idx, k_tensor, v_tensor) or "
-		f"(layer_idx, k_tensor, v_tensor, scale_tensor); got {len(entry)} fields"
-	)
 
 
 class _DualAsyncLoadTask:
@@ -698,17 +582,6 @@ class _WeightPasses:
 				int(report["pass"]),
 				self._describe(report),
 			)
-
-
-@dataclass
-class _DualKVLoadPointers:
-	sequence_tensor: torch.Tensor
-	primary_k_ptrs: torch.Tensor
-	primary_v_ptrs: Optional[torch.Tensor]
-	primary_page_counts: torch.Tensor
-	aux_k_ptrs: torch.Tensor
-	aux_v_ptrs: Optional[torch.Tensor]
-	aux_page_counts: torch.Tensor
 
 
 class QueryBookPoolCapacityError(RuntimeError):
@@ -985,37 +858,6 @@ class InputArguments:
 				raise AttributeError(f"InputArguments has no attribute '{key}'")
 
 
-def _is_port_available(host: str, port: int) -> bool:
-	"""Check if a port is available for binding on the given host."""
-	try:
-		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-			s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-			s.bind((host, port))
-			return True
-	except (OSError, socket.error):
-		return False
-
-
-def _find_available_port(host: str, start_port: int, max_attempts: int = 100) -> int:
-	"""Find an available port starting from start_port.
-
-	Args:
-		host: Host address to bind to
-		start_port: Starting port number to check
-		max_attempts: Maximum number of ports to try
-
-	Returns:
-		An available port number
-
-	Raises:
-		RuntimeError: If no available port is found within max_attempts
-	"""
-	for offset in range(max_attempts):
-		port = start_port + offset
-		if _is_port_available(host, port):
-			return port
-	raise RuntimeError(f"No available port found in range [{start_port}, {start_port + max_attempts})")
-
 
 @dataclass
 class BatchGenWorkerArgs:
@@ -1267,6 +1109,11 @@ class BatchGenWorker:
 		# owned by `batchgen.worker.graph_runtime.GraphRuntime`, which also
 		# owns the cuda-graph-layer imports this module used to make.
 		self._graph = GraphRuntime()
+		self._prefill_engine = PrefillEngine()
+		self._kv_capacity_engine = KVCapacityEngine()
+		self._worker_lifecycle_engine = WorkerLifecycleEngine()
+		self._step_observability_engine = StepObservabilityEngine()
+		self._rank_sync_engine = RankSyncEngine()
 		# SyncCoordinator instantiated lazily on first use so we don't
 		# touch torch.distributed before it's initialized.
 		self._sync_coordinator: Optional[SyncCoordinator] = None
@@ -1686,265 +1533,51 @@ class BatchGenWorker:
 		return self.seq_table.next_local_idx
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
-		"""
-		Initialize/reconfigure before the persistent generate() loop starts.
-		- First call: performs full initialization of core_engine, parallel_manager, etc.
-		- Subsequent calls: only updates batch parameters.
-
-		Every caller runs before generate_persistent(), i.e. while global_batch
-		is still None; the per-batch state reset the legacy path needed between
-		two global batches went away with that path.
-
-		Args:
-			max_input_length: Maximum input length hint. If None, will be determined dynamically
-			                  during tokenization as the longest prompt in the batch.
-			                  For first initialization, a default of 8192 is used if None.
-			max_decoding_length: Decode-budget hint for init-time sizing. In
-			                     pool mode it is the budget of the first batch the
-			                     server saw, so nothing may cap a sequence with it:
-			                     each admission entry carries that sequence's own
-			                     budget (``kv_token_budget``).
-			num_queries: Number of queries in the global batch.
-		"""
-		# Update batch-specific parameters
-		# max_input_length can be None - will be set during tokenization
-		# For first initialization, use a reasonable default if None (needed for scheduler)
-		if max_input_length is None or max_input_length <= 0:
-			# Default hint for scheduler; actual value determined during tokenization
-			self.max_input_length = 8192 if not self._core_initialized else 0
-		else:
-			self.max_input_length = max_input_length
-		self.max_decoding_length = max_decoding_length
-
-		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
-		
-		# One-time initialization (only on first call)
-		if not self._core_initialized:
-			self._initialize_core_components(num_queries)
-			self._core_initialized = True
-		else:
-			# Just update the num_queries and batch-related config
-			self._update_batch_config(num_queries)
-
-		# Freeze this rank's identity. G (`_decode_attn_tp_size`) reads the
-		# parallel strategy manager, which `_initialize_core_components`
-		# constructs, so this is the earliest point it is knowable. Every
-		# field is stable for the process lifetime, so a re-Init rebuilds an
-		# equal object.
-		self.rank_ctx = RankContext(
-			rank=self.rank,
-			world_size=self.world_size,
-			local_rank=self.local_rank,
-			local_world_size=self.local_world_size,
-			decode_group_size=self._decode_attn_tp_size(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.Init(
+			self,
+			max_input_length,
+			max_decoding_length,
+			num_queries,
 		)
-
-		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
-		"""
-		Calculate GPU KV cache size based on actual GPU memory usage.
-
-		Uses torch.cuda.mem_get_info() to get real memory usage after model is loaded.
-		Formula: gpu_kv_cache = total_gpu_mem * gpu_memory_frac - used_mem
-
-		This reserves (1-gpu_memory_frac) of total GPU memory for activations and overhead.
-
-		IMPORTANT: Must be called in _initialize_core_components() right after model loading,
-		BEFORE any inference (prefill/decode). If called during/after prefill, activation
-		memory will be included in 'used_mem', resulting in incorrect (possibly negative) size.
-
-		Rank 0 calculates and broadcasts to all ranks to ensure consistency.
-		"""
-		# Check for environment variable override first
-		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
-			gpu_kv_cache_gb = float(_GPU_KV_CACHE_SIZE_OVERRIDE)
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Size from env override: {gpu_kv_cache_gb:.2f} GB "
-					f"(BATCHGEN_GPU_KV_CACHE_SIZE_GB)"
-				)
-			return gpu_kv_cache_gb
-
-		# Rank 0 calculates, then broadcasts to all ranks
-		if self.rank == 0:
-			# Get actual GPU memory usage (after model is loaded)
-			free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
-			free_mem_gb = free_mem_bytes / (1024 ** 3)
-			total_mem_gb = total_mem_bytes / (1024 ** 3)
-			used_mem_gb = total_mem_gb - free_mem_gb
-
-			# Formula: gpu_kv_cache = total * frac - used (single definition:
-			# kv_plan.provisional_pool_gb).
-			# This reserves (1-frac) of GPU memory for activations and overhead
-			calculated_gb = provisional_pool_gb(
-				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
-			)
-			# Ensure positive value: a non-positive remainder warns here and is
-			# replaced by the 1 GB floor kv_plan substitutes.
-			gpu_kv_cache_gb = provisional_pool_gb(
-				total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=1.0
-			)
-			if calculated_gb <= 0:
-				logging.warning(
-					f"[GPU-KV] Calculated size is non-positive ({calculated_gb:.2f} GB). "
-					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
-					f"Using minimum 1 GB."
-				)
-
-			logging.info(
-				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
-			)
-		else:
-			gpu_kv_cache_gb = 0.0
-
-		# Broadcast from rank 0 to all ranks
-		size_tensor = torch.tensor([gpu_kv_cache_gb], dtype=torch.float32, device=self.torch_device)
-		dist.broadcast(size_tensor, src=0)
-		gpu_kv_cache_gb = float(size_tensor.item())
-
-		return gpu_kv_cache_gb
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._calculate_gpu_kv_cache_size(
+			self,
+		)
 
 	def _kv_fixed_address_pool_available(self) -> bool:
-		"""Whether the KV pools can be carved from a reserved virtual range.
-
-		CUDA VMM is the only implementation, and it needs an indexed device.
-		Every serving path has one; CPU-only unit tests that build a manager
-		directly keep the allocator-backed default.
-		"""
-		return bool(torch.cuda.is_available() and isinstance(self.local_rank, int))
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._kv_fixed_address_pool_available(
+			self,
+		)
 
 	def _initialize_gpu_kv_manager_fixed_size(self) -> GPUPagedKVCacheManager:
-		"""
-		Initialize GPU KV manager with pre-determined fixed size.
-		Called once at the start of decoding.
-
-		For DSA models, splits the memory budget between primary (MLA) and
-		auxiliary (indexer) caches, wrapping both in a DualKVCacheCoordinator.
-
-		The pools are carved from one reserved virtual range per pool
-		(``fixed_address_pool``), so the phase-switch lifecycle can hand their
-		physical pages back to the driver for the prefill phase and map them
-		again afterwards WITHOUT the pool base, the page-pointer tables or the
-		page-table storage moving. A captured decode graph bakes those
-		pointers, so releasing an allocator-backed pool under it would make the
-		next replay read freed memory.
-		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			build_gpu_kv_config_fixed_size,
-			is_dsa_model,
-			_resolve_indexer_profile,
-			_torch_dtype_from_string,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._initialize_gpu_kv_manager_fixed_size(
+			self,
 		)
-		from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
-
-		# Calculate GPU KV cache size if not already done
-		if self.gpu_kv_cache_size_gb is None:
-			self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
-
-		if is_dsa_model(self.huggingface_ckpt_name):
-			# Split memory budget between primary MLA cache and auxiliary indexer cache.
-			# Compute the ratio of bytes-per-page for primary vs auxiliary so both
-			# get the same number of pages (they share the same page table).
-			from batchgen.kv_cache.host_kv_mananger_config import _resolve_profile
-			primary_profile = _resolve_profile(self.huggingface_ckpt_name)
-			aux_profile = _resolve_indexer_profile(self.huggingface_ckpt_name)
-
-			primary_bytes_per_page = primary_profile.bytes_per_page() * primary_profile.num_layers
-			aux_bytes_per_page = aux_profile.bytes_per_page() * aux_profile.num_layers
-			combined_bytes_per_page = primary_bytes_per_page + aux_bytes_per_page
-
-			total_bytes = int(self.gpu_kv_cache_size_gb * (1024 ** 3))
-			num_pages = total_bytes // combined_bytes_per_page
-
-			primary_config = GPUPagedKVConfig(
-				num_layers=primary_profile.num_layers,
-				num_pages=num_pages,
-				page_size_tokens=primary_profile.page_size,
-				num_k_heads=primary_profile.num_k_heads,
-				k_head_dim=primary_profile.k_head_dim,
-				num_v_heads=primary_profile.num_v_heads,
-				v_head_dim=primary_profile.v_head_dim,
-				kv_dtype=_torch_dtype_from_string(primary_profile.kv_dtype),
-				# Engine-layer -> cache-slot map, exactly as the dense builder
-				# passes it. A fully-DSA model (GLM) has None here (engine ==
-				# physical); an interleaved model (Kimi-K3.1: 24 MLA rows among
-				# 93 engine layers) addresses BOTH regions by engine layer id,
-				# and without the map the primary pool bounds-checks engine ids
-				# against its 24 physical slots and refuses layer 27 at the
-				# first decode-graph capture.
-				logical_to_physical_layer=(
-					list(primary_profile.logical_to_physical_layer)
-					if getattr(primary_profile, "logical_to_physical_layer", None)
-					is not None
-					else None
-				),
-			)
-			primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
-			aux_config = GPUPagedKVConfig(
-				num_layers=aux_profile.num_layers,
-				num_pages=num_pages,
-				page_size_tokens=aux_profile.page_size,
-				num_k_heads=aux_profile.num_k_heads,
-				k_head_dim=aux_profile.k_head_dim,
-				num_v_heads=aux_profile.num_v_heads,
-				v_head_dim=aux_profile.v_head_dim,
-				kv_dtype=_torch_dtype_from_string(aux_profile.kv_dtype),
-				logical_to_physical_layer=(
-					list(aux_profile.logical_to_physical_layer)
-					if getattr(aux_profile, "logical_to_physical_layer", None) is not None
-					else None
-				),
-			)
-			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
-
-			fixed_addresses = self._kv_fixed_address_pool_available()
-			primary = GPUPagedKVCacheManager(
-				config=primary_config,
-				device=self.local_rank,
-				fixed_address_pool=fixed_addresses,
-			)
-			primary.initialize()
-			auxiliary = GPUPagedKVCacheManager(
-				config=aux_config,
-				device=self.local_rank,
-				fixed_address_pool=fixed_addresses,
-			)
-			auxiliary.initialize()
-			manager = DualKVCacheCoordinator(primary, auxiliary)
-			self._bind_gpu_paged_kv_manager(manager)
-
-			if self.rank == 0:
-				primary_gb = (primary_bytes_per_page * num_pages) / (1024 ** 3)
-				aux_gb = (aux_bytes_per_page * num_pages) / (1024 ** 3)
-				logging.info(
-					f"[GPU-KV] DualKVCacheCoordinator initialized: "
-					f"{num_pages} pages, primary={primary_gb:.2f} GB (dim={primary_profile.k_head_dim}), "
-					f"auxiliary={aux_gb:.2f} GB (dim={aux_profile.k_head_dim})"
-				)
-			return manager
-		else:
-			config = build_gpu_kv_config_fixed_size(
-				model_name=self.huggingface_ckpt_name,
-				gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
-			)
-			config = self._with_cuda_graph_page_table_capacity(config)
-
-			manager = GPUPagedKVCacheManager(
-				config=config,
-				device=self.local_rank,
-				fixed_address_pool=self._kv_fixed_address_pool_available(),
-			)
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
-				)
-
-			return manager
 		
 	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
 		if self._batchgen_debug:
@@ -1964,9 +1597,7 @@ class BatchGenWorker:
 		return merged or None
 
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
-		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace")):
-			return True
-		return os.environ.get("BATCHGEN_GLM5_DISPATCH_TRACE", "0") == "1"
+		return isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace"))
 
 	def _flush_glm5_dispatch_trace_summary(self, reason: str) -> None:
 		if not getattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False):
@@ -3416,23 +3047,28 @@ class BatchGenWorker:
 			pass  # Not GPT-OSS or module not available
 
 	def set_watchdog(self, watchdog) -> None:
-		"""
-		Set the watchdog for stuck detection during inference.
-
-		The watchdog will be fed periodically during generation to prevent
-		false timeout detection on long-running inference.
-
-		Args:
-			watchdog: Watchdog instance with a feed() method, or None to disable
-		"""
-		self._watchdog = watchdog
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_watchdog(
+			self,
+			watchdog,
+		)
 
 	def set_decode_watchdog(self, watchdog) -> None:
-		"""Set a per-decode-step watchdog. Starts disabled; enabled only during decode."""
-		self._decode_watchdog = watchdog
-		# Start disabled — only enable around actual decode iterations
-		if hasattr(watchdog, '_active'):
-			watchdog._active = False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_decode_watchdog(
+			self,
+			watchdog,
+		)
 
 	# This worker's slot in the server's shared startup-phase record, installed
 	# by the supervisor.  The null default keeps every phase-reporting step
@@ -3441,43 +3077,51 @@ class BatchGenWorker:
 	_startup_phase_reporter = NULL_STARTUP_PHASE_REPORTER
 
 	def set_startup_phase_reporter(self, reporter) -> None:
-		"""Install the handle this worker reports its startup phases through.
-
-		Like the cohort-shutdown probe below, the shape behind it -- a
-		lock-free shared record the server polls -- stays in the supervisor;
-		this class only ever says which phase it has entered.
-		"""
-		self._startup_phase_reporter = reporter
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.set_startup_phase_reporter(
+			self,
+			reporter,
+		)
 
 	def _startup_phase(self, name: str):
-		"""Report one named startup phase for the duration of the body.
-
-		``name`` must be one of ``batchgen.worker.startup_phases.STARTUP_PHASES``;
-		the reporter refuses anything else.
-		"""
-		return self._startup_phase_reporter.phase(name)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._startup_phase(
+			self,
+			name,
+		)
 
 	def set_cohort_shutdown_probe(self, probe) -> None:
-		"""Install the zero-argument cohort-teardown probe.
-
-		``probe()`` answers one question -- has this cohort's teardown begun --
-		and the supervisor owns what backs it (a plain load from a lock-free
-		shared byte the manager stores to).  Keeping it a callable is what keeps
-		the flag's shape, and the no-handshake contract that goes with it, out
-		of this class.
-		"""
-		self._cohort_shutdown_probe = probe
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine.set_cohort_shutdown_probe(
+			self,
+			probe,
+		)
 
 	def _cohort_shutdown_requested(self) -> bool:
-		"""Has this cohort's teardown begun?
-
-		Called once per decode step on the hot path, so it stays a single
-		attribute load and, when armed, one shared-byte load behind the probe:
-		no lock, no allocation, no logging.  Unarmed (no supervisor, or a code
-		path that never serves a pool) it is a ``None`` test and nothing else.
-		"""
-		probe = self._cohort_shutdown_probe
-		return probe is not None and probe()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._cohort_shutdown_requested(
+			self,
+		)
 
 	def _wait_decode_tokens(self, event) -> str:
 		"""Wait for a decode step's sampled-token readback, pollably.
@@ -3699,220 +3343,74 @@ class BatchGenWorker:
 		return _DECODE_WAIT_COMPLETED
 
 	def _warn_sampling_bad_rows(self, residency) -> None:
-		"""Drain the device-side sampling fallback counter and warn on it.
-
-		Reads a device counter, so callers must be where the device has caught
-		up with the sampling that wrote it (see drain_bad_rows).
-		"""
-		_bad_rows = residency.drain_bad_rows()
-		if _bad_rows:
-			logging.warning(
-				f"[DECODE] invalid probabilities after filtering for "
-				f"{_bad_rows} row(s) since the last heartbeat; those rows "
-				"fell back to greedy"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._warn_sampling_bad_rows(
+			self,
+			residency,
+		)
 
 	def _poll_until(self, ready, deadline) -> bool:
-		"""Poll one NON-BLOCKING readiness probe until the shared deadline.
-
-		``ready()`` must answer "is this work finished?" without waiting:
-		``KVAsyncTask.done()`` (a ``wait_for(0s)`` status test) and
-		``cudaEventQuery`` behind ``torch.cuda.Event.query()`` are the two
-		shapes used here.  That is the whole point of this helper.  The waits
-		themselves may NOT be bounded this way, nor on a helper thread: the
-		append task's ``wait`` holds the GIL while it blocks, so one such call
-		anywhere in the process freezes the deadline that is supposed to bound
-		it, the abort watchdog and the supervisor's self-exit net along with it.
-
-		The probe is read once before the clock, so work that is already
-		finished proves itself even if the budget is gone -- readiness is
-		readiness, and self-exiting a rank whose readers have all returned would
-		throw away a perfectly ordered unwind.
-
-		Returns True only if the probe answered True.  Anything else, including
-		a probe that raises (a task type with no non-blocking ``done()``), is
-		reported as not-quiesced: this runs during teardown, and the caller's
-		safe answer to "I cannot prove the local readers are done" is to end the
-		process rather than unwind.  It never raises, for the same reason the
-		quiesce itself never raises.
-		"""
-		try:
-			while True:
-				if ready():
-					return True
-				if time.perf_counter() >= deadline:
-					return False
-				time.sleep(_COHORT_QUIESCE_POLL_INTERVAL_S)
-		except BaseException:
-			logging.warning(
-				"Rank %s: probing a decode teardown quiesce wait failed; "
-				"treating it as not quiesced",
-				self.rank,
-				exc_info=True,
-			)
-			return False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._poll_until(
+			self,
+			ready,
+			deadline,
+		)
 
 	def _pending_kv_appends_done(self) -> bool:
-		"""Has every pending host-KV append task finished?  Never waits.
-
-		``done()`` is ``future_.wait_for(0s) == ready`` in the native task
-		(``core/KV_Storage/host_paged_kv_worker_view.h:93-99``, bound at
-		``core/batchgen_Binding.cpp:969``), so this is a status read per task and
-		nothing else.  ``None`` entries are skipped exactly as the real drain
-		skips them, and a worker that never created the list (the drain's own
-		``hasattr`` guard admits that case) has nothing in flight.
-		"""
-		for task in getattr(self, "_pending_kv_append_tasks", ()):
-			if task is not None and not task.done():
-				return False
-		return True
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._pending_kv_appends_done(
+			self,
+		)
 
 	def _record_quiesce_device_event(self):
-		"""A non-blocking probe for the device work this rank already queued.
-
-		This replaces the ``torch.cuda.synchronize(self.torch_device)`` the load
-		drain used to end in: on an abandoned step that sync is unbounded, and
-		it is the last thing standing between the teardown and the unwakeable
-		state one level down.  An event recorded on the worker's current stream
-		(the stream the decode step records its token event on) is ready exactly
-		once the work queued ahead of it has run, and ``query()`` reads that
-		with ``cudaEventQuery`` -- no wait, no GIL hazard.
-
-		Returns the event, or ``None`` if it could not even be recorded, which
-		the caller treats as "the device state cannot be proven" and self-exits.
-		"""
-		try:
-			event = torch.cuda.Event()
-			event.record(torch.cuda.current_stream(self.torch_device))
-			return event
-		except BaseException:
-			logging.warning(
-				"Rank %s: recording the decode teardown quiesce device probe "
-				"failed; treating it as not quiesced",
-				self.rank,
-				exc_info=True,
-			)
-			return None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._record_quiesce_device_event(
+			self,
+		)
 
 	def _self_exit_on_quiesce_deadline(self) -> None:
-		"""End this process instead of unwinding past a quiesce that did not land.
-
-		The ordered teardown releases the very mappings the parked waits hold
-		raw pointers into -- the host-KV appends are std::async threads reading
-		the worker view's page table unlocked -- so an unwind that cannot prove
-		they finished is a use-after-free during teardown.  That is the one
-		hazard this whole exit path exists to avoid, so when the bound expires
-		the rank takes the supervisor's own bounded outcome directly.
-
-		The marker keeps the ``path=self-exit`` grep key the supervisor's safety
-		net emits, so marker accounting still sums, and adds a reason so the two
-		causes stay distinguishable in the logs.  ``os._exit`` runs no atexit
-		hook and no stream flush, so the marker is flushed first or it is lost.
-
-		The import is local because ``server_worker_main_loop`` imports this
-		module; by the time any rank can reach here that module is loaded, since
-		it is what arms the probe this path depends on.
-		"""
-		from batchgen.eventlog.process import record_exit
-		from batchgen.server_worker_main_loop import (
-			_EXIT_PATH_SELF_EXIT,
-			_WORKER_SELF_EXIT_CODE,
-			_flush_worker_logs,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._self_exit_on_quiesce_deadline(
+			self,
 		)
-
-		logging.error(
-			"[shutdown] worker exit path=%s rank=%s pid=%s reason=%s",
-			_EXIT_PATH_SELF_EXIT,
-			self.rank,
-			os.getpid(),
-			_COHORT_QUIESCE_DEADLINE_REASON,
-		)
-		_flush_worker_logs()
-		record_exit(_WORKER_SELF_EXIT_CODE, _COHORT_QUIESCE_DEADLINE_REASON)
-		os._exit(_WORKER_SELF_EXIT_CODE)
 
 	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
-		"""Let LOCAL in-flight decode work finish before the ordered teardown.
-
-		Called on the decode loop's teardown exits.  Everything waited on here
-		is work this rank already launched and that holds raw pointers into
-		mappings the ordered teardown is about to release -- the host-KV append
-		tasks (std::async threads reading the worker view's page table with no
-		lock) and an async host->GPU KV load.  Returning out of decode with
-		either still in flight is a use-after-free during teardown, which is
-		why the exit quiesces instead of just leaving.
-
-		Every wait here is deliberately LOCAL.  ``defer_errors=True`` keeps the
-		append drain off the cross-rank error sync, which is the one thing this
-		exit must never do: the peer whose death started this teardown will
-		never join a collective again, so a guarded one would hang exactly
-		where the unfixed code hung.
-
-		Nothing raises out of here.  This runs on a teardown path whose whole
-		purpose is to unwind normally -- an exception would escape as an error
-		and lose the ordered exit -- so a failed quiesce is logged and the
-		teardown continues; the process is about to drop these mappings anyway.
-
-		The quiesce is BOUNDED, by one shared ``_COHORT_QUIESCE_DEADLINE_S``
-		budget, and the bound is established by NON-BLOCKING PROBES ONLY.  On
-		the exit taken when the step's token event was ABANDONED the step's
-		device work is parked behind the dead collective, so every wait here is
-		parked with it -- and MEASURED, the append task's ``wait`` blocks while
-		HOLDING THE GIL (no ``gil_scoped_release`` in its binding), which
-		freezes the deadline meant to bound it, the abort watchdog and the
-		supervisor's self-exit net.  A blocking wait therefore may not be
-		called, on this thread or any other, until something non-blocking has
-		proven it cannot block:
-
-		  1. every pending host-KV append task reports ``done()``;
-		  2. the async KV load task reports ``done()`` (the dual coordinator's
-		     composite task answers for both of its halves);
-		  3. the device-work probe recorded at entry reports ``query()``, which
-		     is what the load drain's unbounded device sync became.
-
-		All three inside the budget: the real drains then run with every future
-		ready and the ordered unwind proceeds exactly as before.  Any of them
-		expiring is the one case that may not unwind at all (the readers are
-		still live, holding page-table pointers), so it self-exits with the
-		reason recorded, inside ~5 s instead of the supervisor's grace window.
-		On the healthy clean-restart exits all three probes answer immediately.
-		"""
-		deadline = time.perf_counter() + _COHORT_QUIESCE_DEADLINE_S
-		device_event = self._record_quiesce_device_event()
-
-		quiesced = self._poll_until(self._pending_kv_appends_done, deadline)
-		if quiesced and pending_async_task is not None:
-			quiesced = self._poll_until(lambda: pending_async_task.done(), deadline)
-		if quiesced:
-			quiesced = device_event is not None and self._poll_until(
-				device_event.query, deadline
-			)
-
-		if quiesced:
-			try:
-				if self._pending_kv_append_tasks:
-					self._wait_pending_kv_append_tasks(defer_errors=True)
-			except BaseException:
-				logging.warning(
-					"Rank %s: draining host-KV appends at the decode teardown "
-					"boundary failed; continuing the ordered teardown",
-					self.rank,
-					exc_info=True,
-				)
-			try:
-				if pending_async_task is not None:
-					pending_async_task.wait()
-			except BaseException:
-				logging.warning(
-					"Rank %s: draining the pending async KV load at the decode "
-					"teardown boundary failed; continuing the ordered teardown",
-					self.rank,
-					exc_info=True,
-				)
-
-		self.disable_decode_watchdog()
-		if not quiesced:
-			self._self_exit_on_quiesce_deadline()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._quiesce_decode_for_cohort_shutdown(
+			self,
+			pending_async_task,
+		)
 
 	@property
 	def cohort_shutdown_observed(self) -> bool:
@@ -3926,25 +3424,48 @@ class BatchGenWorker:
 		return self._cohort_shutdown_observed
 
 	def feed_watchdog(self) -> None:
-		"""Feed the watchdog to prevent timeout during long operations."""
-		if self._watchdog is not None:
-			self._watchdog.feed()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.feed_watchdog(
+			self,
+		)
 
 	def feed_decode_watchdog(self) -> None:
-		"""Feed the decode watchdog at the start of each decode step."""
-		if self._decode_watchdog is not None:
-			self._decode_watchdog.feed()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.feed_decode_watchdog(
+			self,
+		)
 
 	def enable_decode_watchdog(self) -> None:
-		"""Enable decode watchdog monitoring (call before decode loop)."""
-		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
-			self._decode_watchdog._active = True
-			self._decode_watchdog.feed()  # Reset timer
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.enable_decode_watchdog(
+			self,
+		)
 
 	def disable_decode_watchdog(self) -> None:
-		"""Disable decode watchdog monitoring (call after decode loop)."""
-		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
-			self._decode_watchdog._active = False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.disable_decode_watchdog(
+			self,
+		)
 
 	@contextmanager
 	def disable_watchdog(self):
@@ -3988,19 +3509,17 @@ class BatchGenWorker:
 	def _collective_gpu_kv_allocation_preflight(
 		self, required_pages: int, free_pages: int
 	) -> bool:
-		"""Require every rank to approve a GPU-KV allocation before mutation."""
-		local_can_allocate = int(required_pages >= 0 and required_pages <= free_pages)
-		if self.world_size == 1:
-			return bool(local_can_allocate)
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required for GPU-KV allocation preflight"
-			)
-		can_allocate = torch.tensor(
-			[local_can_allocate], dtype=torch.int32, device=self.torch_device
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._collective_gpu_kv_allocation_preflight(
+			self,
+			required_pages,
+			free_pages,
 		)
-		dist.all_reduce(can_allocate, op=dist.ReduceOp.MIN)
-		return bool(int(can_allocate.item()))
 
 	def _allocate_gpu_kv_two_page_buffer(
 		self, 
@@ -4008,434 +3527,69 @@ class BatchGenWorker:
 		load_from_host: bool = True,
 		collective_preflight: bool = False,
 	) -> bool:
-		"""
-		Allocate GPU KV pages using two-page buffer strategy.
-		
-		Returns:
-			True if allocation succeeded, False otherwise.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			if collective_preflight:
-				return self._collective_gpu_kv_allocation_preflight(0, 0)
-			return False
-		if not manager.is_initialized:
-			if collective_preflight:
-				return self._collective_gpu_kv_allocation_preflight(0, 0)
-			return False
-		if not local_sequence_ids:
-			if collective_preflight:
-				return self._collective_gpu_kv_allocation_preflight(
-					0, manager.get_stats().num_free_pages
-				)
-			return True
-		
-		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		
-		pages_per_seq = []
-		total_pages = 0
-		
-		# DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
-		alloc_details = []
-		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			pages = seq.get_gpu_pages_for_two_page_buffer()
-			pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
-			total_pages += pages
-			
-			# Track details for resuming sequences (decoded_length > 0)
-			if seq.decoded_length > 0:
-				alloc_details.append({
-					'uuid': uuid[:8],
-					'global_idx': seq.global_idx,
-					'decoded_length': seq.decoded_length,
-					'current_context_length': seq.current_context_length,
-					'pages_allocating': pages,
-					'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
-				})
-		
-		if alloc_details and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
-			logging.debug(
-				f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
-			)
-
-		free_pages = manager.get_stats().num_free_pages
-		# With prefix sharing the physical demand is lower than the logical
-		# page sum: a Host page already mapped (or repeated in this batch)
-		# costs nothing. The preview runs the allocator's own validation, so
-		# a demand it accepts cannot fail validation at allocation time.
-		try:
-			page_keys = self._host_identity_page_keys(
-				manager, global_ids, pages_per_seq
-			)
-			demand_pages = (
-				total_pages
-				if page_keys is None
-				else manager.count_new_shared_pages(
-					global_ids, pages_per_seq, page_keys
-				)
-			)
-		except Exception:
-			if collective_preflight:
-				# The failed rank still joins the collective so peers cannot
-				# advance into allocation while this rank raises.
-				self._collective_gpu_kv_allocation_preflight(1, 0)
-			raise
-		if collective_preflight:
-			if not self._collective_gpu_kv_allocation_preflight(
-				demand_pages, free_pages
-			):
-				logging.warning(
-					f"Rank {self.rank}: collective GPU KV allocation preflight failed "
-					f"(need {demand_pages} of {total_pages} logical, "
-					f"local free {free_pages})"
-				)
-				return False
-		elif demand_pages > free_pages:
-			logging.error(
-				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
-				f"only {free_pages} free"
-			)
-			# Don't set gpu_pages_allocated since we're failing
-			return False
-		
-		try:
-			self._allocate_gpu_pages_with_host_identity(
-				manager, global_ids, pages_per_seq
-			)
-		except RuntimeError as exc:
-			if "Insufficient free pages" not in str(exc):
-				raise
-			logging.error(
-				"Rank %s cannot allocate shared GPU KV pages: %s",
-				self.rank,
-				exc,
-			)
-			return False
-
-		# Now safe to update tracking.
-		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			pages = seq.get_gpu_pages_for_two_page_buffer()
-			seq.gpu_pages_allocated = pages
-			# Mark that this sequence has received its initial GPU reservation
-			seq.mark_initial_gpu_reservation_done()
-		
-		manager.rebuild_page_table(global_ids)
-
-		if load_from_host:
-			self._load_host_kv_to_gpu(manager, global_ids)
-		
-		# Track in set
-		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
-			self._sequences_with_gpu_kv.add(uuid)
-		
-		# Rebuild page table with ALL active sequences
-		all_active_global_ids = []
-		for uuid in self._sequences_with_gpu_kv:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				all_active_global_ids.append(seq.global_idx)
-		all_active_global_ids.sort()
-		
-		if all_active_global_ids:
-			manager.rebuild_page_table(all_active_global_ids)
-
-		# DIAGNOSTIC: Log page table order after allocation for debugging order mismatch (debug-only / opt-in)
-		if manager and manager._gpu_page_table_manager and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
-			final_slot_order = list(manager._gpu_page_table_manager.slot_to_seq_id) if manager._gpu_page_table_manager.slot_to_seq_id else []
-			logging.debug(
-				f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer finished. "
-				f"input_global_ids={global_ids[:5]}{'...' if len(global_ids) > 5 else ''} (len={len(global_ids)}), "
-				f"all_active_sorted={all_active_global_ids[:5]}{'...' if len(all_active_global_ids) > 5 else ''} (len={len(all_active_global_ids)}), "
-				f"final_slot_to_seq_id={final_slot_order[:5]}{'...' if len(final_slot_order) > 5 else ''} (len={len(final_slot_order)})"
-			)
-
-		logging.debug(
-			f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._allocate_gpu_kv_two_page_buffer(
+			self,
+			local_sequence_ids,
+			load_from_host,
+			collective_preflight,
 		)
-		return True
 
 	def _extend_gpu_kv_allocation(self, uuids: List[str]) -> bool:
-		"""
-		Extend GPU KV allocation for sequences that need more pages.
-		
-		Returns:
-			True if all extensions succeeded, False if insufficient pages
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			return False
-		
-		free_pages = manager.get_stats().num_free_pages
-		
-		extensions_needed = []
-		total_additional = 0
-		
-		for uuid in uuids:
-			if uuid not in self._uuid_to_local_map:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			additional = seq.get_additional_gpu_pages_needed()
-			if additional > 0:
-				extensions_needed.append((uuid, additional))
-				total_additional += additional
-		
-		if total_additional > free_pages:
-			logging.warning(
-				f"Rank {self.rank}: Insufficient GPU pages for extension: "
-				f"need {total_additional}, have {free_pages}"
-			)
-			return False
-		
-		# Perform extensions
-		for uuid, additional in extensions_needed:
-			seq = self.global_batch.get_sequence(uuid)
-			local_idx = self._uuid_to_local_map[uuid]
-			global_id = seq.global_idx
-			
-			# Extend allocation
-			new_total_pages = seq.gpu_pages_allocated + additional
-			new_total_tokens = new_total_pages * self.PAGE_SIZE
-			
-			manager.extend_pages_for_sequence(global_id, new_total_tokens)
-			seq.gpu_pages_allocated = new_total_pages
-		
-		return True
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._extend_gpu_kv_allocation(
+			self,
+			uuids,
+		)
 
 	def _flush_deferred_kv_to_host(self) -> None:
-		"""Flush all deferred KV host offload entries accumulated during forward.
-
-		Batch-launch D2H copies for all layers (primary MLA KV + the DSA
-		auxiliary indexer KV if present). The C++ async append APIs order their
-		dedicated D2H stream after the producer stream with a CUDA event, so this
-		function must not synchronize the CPU with the producer stream first.
-		"""
-		entries = getattr(self, '_deferred_kv_entries', [])
-		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
-		if not entries and not entries_aux:
-			return
-
-		worker_view = getattr(self, '_deferred_kv_worker_view', None)
-		batch_info = getattr(self, '_deferred_kv_batch', None)
-		aux_view = getattr(self, '_deferred_kv_worker_view_aux', None)
-		if entries_aux and aux_view is None:
-			raise RuntimeError(
-				"DSA auxiliary host KV worker view is required for deferred aux KV offload"
-			)
-		if (worker_view is None or batch_info is None) and not aux_view:
-			self._deferred_kv_entries = []
-			self._deferred_kv_entries_aux = []
-			return
-
-		sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
-		if sequence_ids is not None and sequence_lengths is not None:
-			self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
-
-		def _assert_deferred_kv_rows(cache_name: str, layer_idx: int, tensor: torch.Tensor) -> None:
-			if sequence_ids is None:
-				return
-			if tensor.shape[0] != len(sequence_ids):
-				raise RuntimeError(
-					f"{cache_name} deferred KV row mismatch at layer {layer_idx}: "
-					f"tensor_rows={tensor.shape[0]}, sequence_ids={len(sequence_ids)}, "
-					f"gids={sequence_ids[:8] if sequence_ids is not None else []}, "
-					f"write_pos={sequence_lengths[:8] if sequence_lengths is not None else []}"
-				)
-
-		# Fire all D2H copies
-		if not hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors = []
-
-		_use_uva_kernel = os.environ.get(
-			"BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1") == "1"
-
-		if _use_uva_kernel and hasattr(worker_view, "async_append_decode_kv_to_host_batched_kernel"):
-			if entries and worker_view is not None and sequence_ids is not None:
-				_prepared_entries = []
-				for layer_idx, k_tensor, v_tensor in entries:
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					if v_tensor is not None and v_tensor.dim() == 3:
-						v_tensor = v_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("primary", layer_idx, k_tensor)
-					if v_tensor is not None:
-						_assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
-					_prepared_entries.append((layer_idx, k_tensor, v_tensor))
-					self._pending_kv_append_tensors.append(k_tensor)
-					if v_tensor is not None:
-						self._pending_kv_append_tensors.append(v_tensor)
-				task = worker_view.async_append_decode_kv_to_host_batched_kernel(
-					entries=_prepared_entries,
-					sequence_ids=sequence_ids,
-					sequence_lengths=sequence_lengths,
-				)
-				if task is not None:
-					self._pending_kv_append_tasks.append(task)
-
-			if entries_aux and aux_view is not None and sequence_ids is not None:
-				_prepared_aux = []
-				for layer_idx, k_tensor, v_tensor, scale_tensor in (
-					_normalize_aux_kv_entry(entry) for entry in entries_aux
-				):
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
-					_prepared_aux.append((layer_idx, k_tensor, None, scale_tensor))
-					self._pending_kv_append_tensors.append(k_tensor)
-					if scale_tensor is not None:
-						self._pending_kv_append_tensors.append(scale_tensor)
-				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
-					entries=_prepared_aux,
-					sequence_ids=sequence_ids,
-					sequence_lengths=sequence_lengths,
-				)
-				if task is not None:
-					self._pending_kv_append_tasks.append(task)
-		else:
-			if entries and worker_view is not None and sequence_ids is not None:
-				for layer_idx, k_tensor, v_tensor in entries:
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					if v_tensor is not None and v_tensor.dim() == 3:
-						v_tensor = v_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("primary", layer_idx, k_tensor)
-					if v_tensor is not None:
-						_assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
-
-					task = worker_view.async_append_decode_kv_to_host(
-						layer_idx=layer_idx,
-						sequence_ids=sequence_ids,
-						k_tensor=k_tensor,
-						v_tensor=v_tensor,
-						sequence_lengths=sequence_lengths,
-					)
-
-					self._pending_kv_append_tensors.append(k_tensor)
-					if v_tensor is not None:
-						self._pending_kv_append_tensors.append(v_tensor)
-					if task is not None:
-						self._pending_kv_append_tasks.append(task)
-
-			if entries_aux and aux_view is not None and sequence_ids is not None:
-				for layer_idx, k_tensor, v_tensor, scale_tensor in (
-					_normalize_aux_kv_entry(entry) for entry in entries_aux
-				):
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
-
-					task = aux_view.async_append_decode_kv_to_host(
-						layer_idx=layer_idx,
-						sequence_ids=sequence_ids,
-						k_tensor=k_tensor,
-						v_tensor=None,
-						sequence_lengths=sequence_lengths,
-						scale_tensor=scale_tensor,
-					)
-
-					self._pending_kv_append_tensors.append(k_tensor)
-					if scale_tensor is not None:
-						self._pending_kv_append_tensors.append(scale_tensor)
-					if task is not None:
-						self._pending_kv_append_tasks.append(task)
-
-		# This function only LAUNCHES the D2H append tasks. The decode loop
-		# drains them every step right after the sampled-token readback, in
-		# a step-split slot of its own; see [KV_APPEND_DRAIN] in
-		# ``decoding_continuous`` for why that drain must stay per step.
-		self._deferred_kv_entries = []
-		self._deferred_kv_entries_aux = []
-		self._deferred_kv_batch = None
-		self._deferred_kv_worker_view = None
-		self._deferred_kv_worker_view_aux = None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._flush_deferred_kv_to_host(
+			self,
+		)
 
 	def _ensure_host_kv_append_capacity(
 		self,
 		sequence_ids: List[int],
 		sequence_lengths: List[int],
 	) -> None:
-		if len(sequence_ids) != len(sequence_lengths):
-			raise RuntimeError(
-				f"host KV append metadata mismatch: ids={len(sequence_ids)} lengths={len(sequence_lengths)}"
-			)
-		if self.global_batch is None:
-			return
-		# Resolve through SequenceBatch's maintained gid index. This runs on
-		# every decode step, so rebuilding a gid -> entry dict here cost one
-		# dict comprehension over the whole batch per step.
-		grow_requests = []
-		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
-			seq = self.global_batch.get_sequence_by_global_idx(int(global_idx))
-			if seq is None:
-				raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
-			if int(write_pos) < 0:
-				raise RuntimeError(
-					f"host KV append negative write position for gid={global_idx}: {write_pos}"
-				)
-			required_tokens = int(write_pos) + 1
-			if int(seq.host_token_capacity) <= 0:
-				raise RuntimeError(
-					f"host KV append for unallocated gid={global_idx}: "
-					f"write_pos={write_pos}, host_token_capacity={seq.host_token_capacity}, "
-					f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
-					f"status={seq.status.name}"
-				)
-			if required_tokens > int(seq.kv_token_budget):
-				raise RuntimeError(
-					f"host KV append would exceed token budget for gid={global_idx}: "
-					f"required_tokens={required_tokens}, kv_token_budget={seq.kv_token_budget}, "
-					f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
-					f"status={seq.status.name}"
-				)
-			if required_tokens > int(seq.host_token_capacity):
-				# The guards above bound required_tokens to the token budget,
-				# so the owner's budget cap never engages here.
-				growth_pages = seq.get_host_growth_pages(
-					required_tokens - int(seq.host_token_capacity)
-				)
-				grow_requests.append((int(global_idx), growth_pages))
-
-		if not grow_requests:
-			return
-
-		# Host pages are allocated only by the rank-0 boundary planner.  A
-		# deferred append is already inside a decode interval whose reservation
-		# was validated before forward; reaching this branch means the scheduler
-		# violated that invariant.  Growing here would bypass completion release,
-		# eviction, mirrored DSA allocation, and G>1 host ownership.
-		raise RuntimeError(
-			"host KV append reached without a boundary reservation: "
-			f"requests={grow_requests[:8]}; decode must enter the page-boundary "
-			"planner before issuing the forward"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._ensure_host_kv_append_capacity(
+			self,
+			sequence_ids,
+			sequence_lengths,
 		)
 
 	def _aux_layers_with_slots(self):
-		"""Logical layer ids that have a slot in the aux (indexer) KV pools.
-
-		None = no layer mapping (every engine layer has an aux slot). GLM-5.2
-		maps only its 21 indexer layers; skip layers' index-K is never read,
-		so decode appends for them are dropped at the queueing choke points —
-		the mapped host view hard-fails on unmapped layers by design.
-		"""
-		cached = getattr(self, "_aux_layers_with_slots_cache", False)
-		if cached is not False:
-			return cached
-		coord = getattr(self, "gpu_paged_kv_cache_manager", None)
-		aux_mgr = getattr(coord, "auxiliary", None)
-		if aux_mgr is None:
-			return None  # aux not initialized yet; do not cache
-		aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
-		result = None
-		if aux_map is not None:
-			result = frozenset(
-				l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
-			)
-		self._aux_layers_with_slots_cache = result
-		return result
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._aux_layers_with_slots(
+			self,
+		)
 
 	def _append_decode_kv_to_host_aux_async(
 		self,
@@ -4445,58 +3599,20 @@ class BatchGenWorker:
 		v_tensor: torch.Tensor = None,
 		scale_tensor: torch.Tensor = None,
 	) -> None:
-		"""Fire-and-forget auxiliary (indexer) KV append to host.
-
-		Uses the auxiliary host worker view and the shared pending task list,
-		so one flush drains primary and auxiliary appends together.
-
-		``scale_tensor`` carries the fp32 per-token scales that a page-split
-		FP8 aux region requires alongside the quantized keys; an AoS region
-		rejects it. The host view validates the pairing, so a producer that
-		forgets the scales fails loud instead of leaving a page's scale region
-		at its previous contents.
-		"""
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-		if aux_view is None or not batch:
-			return
-		valid_layers = self._aux_layers_with_slots()
-		if valid_layers is not None and layer_idx not in valid_layers:
-			return
-
-		sequence_ids = []
-		sequence_lengths = []
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			sequence_ids.append(seq.global_idx)
-			write_pos = seq.current_context_length - 1
-			sequence_lengths.append(write_pos)
-
-		if k_tensor.dim() == 3:
-			k_tensor = k_tensor.unsqueeze(2)
-
-		# Launch async D2H — no CPU-side sync needed (same as primary path).
-		task = aux_view.async_append_decode_kv_to_host(
-			layer_idx=layer_idx,
-			sequence_ids=sequence_ids,
-			k_tensor=k_tensor,
-			v_tensor=None,
-			sequence_lengths=sequence_lengths,
-			scale_tensor=scale_tensor,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._append_decode_kv_to_host_aux_async(
+			self,
+			layer_idx,
+			batch,
+			k_tensor,
+			v_tensor,
+			scale_tensor,
 		)
-
-		if not hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors = []
-		self._pending_kv_append_tensors.append(k_tensor)
-		if scale_tensor is not None:
-			self._pending_kv_append_tensors.append(scale_tensor)
-
-		if task is not None:
-			self._pending_kv_append_tasks.append(task)
-
-		MAX_PENDING_KV_TASKS = 256
-		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
@@ -4608,12 +3724,9 @@ class BatchGenWorker:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
 			"glm" in (getattr(self, "model_name", "") or "").lower()
-			and (
-				glm5_any_cuda_graph_requested_for_model(
-					getattr(self, "model_name", None),
-					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
-				)
-				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
+			and glm5_any_cuda_graph_requested(
+				getattr(self, "model_name", None),
+				enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
@@ -4739,29 +3852,16 @@ class BatchGenWorker:
 		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
-		"""
-		Update configuration for a new batch without reinitializing heavy components.
-		Called on subsequent Init() calls after the first.
-		"""
-		logging.info(f"Rank {self.rank}: Updating batch config for new batch")
-		
-		# Update engine config with new batch parameters
-		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
-		self.engine_config.Basic_Config.set_max_prompt_length(self.max_input_length)
-		self.engine_config.Basic_Config.num_queries = num_queries
-		
-		# Update input_arguments for any components that might reference them
-		if hasattr(self, 'input_arguments'):
-			self.input_arguments.max_prompt_length = self.max_input_length
-			self.input_arguments.padding_length = self.max_input_length
-			self.input_arguments.max_decoding_length = self.max_decoding_length
-			self.input_arguments.num_queries = num_queries
-		
-		# Reset per-batch state
-		self.query_book = None
-		self.model_batch_book = {}
-		
-		logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._update_batch_config(
+			self,
+			num_queries,
+		)
 
 	def _update_config_after_tokenization(self) -> None:
 		"""
@@ -4787,43 +3887,16 @@ class BatchGenWorker:
 	# ============ KV Cache Helper Methods ============
 
 	def _shared_page_identity_sources(self, manager):
-		"""The pools whose GPU pages can be deduplicated by Host page id.
-
-		Returns one ``(pool name, GPU manager, Host worker view)`` triple per
-		pool, or ``None`` when shared-page identity does not apply at all.
-		``None`` is the single condition behind BOTH the allocator and the
-		decode admission credit: plain allocation gives every row its own
-		physical copy, so a credit there would charge for a copy that was
-		really made.
-
-		A DSA model (GLM-5.x, DeepSeek-V3.2) runs TWO pools -- primary MLA
-		latent KV and auxiliary indexer KV -- backed by two separate Host KV
-		regions. Each pool therefore gets its own Host worker view, which is
-		its own key space; group 0 is the MLA region and group 1 the indexer
-		region (``DualHostKVCoordinator.views_by_group``), matching
-		primary/auxiliary on the GPU side.
-		"""
-		if manager is None or not self.enable_prefix_cache:
-			return None
-		if isinstance(manager, DualKVCacheCoordinator):
-			host_view = getattr(self, "host_paged_kv_worker_view", None)
-			if not isinstance(host_view, DualHostKVCoordinator):
-				return None
-			views = host_view.views_by_group()
-			primary_view = views.get(0)
-			auxiliary_view = views.get(1)
-			if primary_view is None or auxiliary_view is None:
-				return None
-			return (
-				("primary", manager.primary, primary_view),
-				("auxiliary", manager.auxiliary, auxiliary_view),
-			)
-		worker_view = getattr(
-			self.core_engine, "host_paged_kv_worker_view", None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._shared_page_identity_sources(
+			self,
+			manager,
 		)
-		if worker_view is None:
-			return None
-		return (("primary", manager, worker_view),)
 
 	def _host_identity_page_keys(
 		self,
@@ -4831,38 +3904,18 @@ class BatchGenWorker:
 		global_sequence_ids: Sequence[int],
 		sequence_tokens: Sequence[int],
 	):
-		"""The page-key argument for ``manager``'s keyed allocation, or ``None``.
-
-		One manager: a list of Host page id rows, one row per sequence, in
-		logical page order -- equal ids mean one physical GPU page.
-
-		A DSA dual coordinator: ``DualPoolPageKeys``, which carries that same
-		row list ONCE PER POOL. The two pools are separate Host KV regions, so
-		a Host page id identifies content only inside its own region and the
-		two key spaces must never be crossed; each pool deduplicates on its
-		own ids.
-
-		``None`` means shared-page identity does not apply (prefix cache off,
-		or the Host views that define the identity are not bound) and plain
-		allocation is used.
-		"""
-		sources = self._shared_page_identity_sources(manager)
-		if sources is None:
-			return None
-		rows_by_pool: Dict[str, List[List[int]]] = {}
-		for pool_name, pool_manager, worker_view in sources:
-			rows_by_pool[pool_name] = self._pool_host_identity_page_keys(
-				pool_name,
-				pool_manager,
-				worker_view,
-				global_sequence_ids,
-				sequence_tokens,
-			)
-		if isinstance(manager, DualKVCacheCoordinator):
-			return DualPoolPageKeys.from_rows(
-				rows_by_pool["primary"], rows_by_pool["auxiliary"]
-			)
-		return rows_by_pool["primary"]
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_identity_page_keys(
+			self,
+			manager,
+			global_sequence_ids,
+			sequence_tokens,
+		)
 
 	def _pool_host_identity_page_keys(
 		self,
@@ -4872,25 +3925,20 @@ class BatchGenWorker:
 		global_sequence_ids: Sequence[int],
 		sequence_tokens: Sequence[int],
 	) -> List[List[int]]:
-		"""One pool's Host page ids behind each sequence's GPU reservation."""
-		host_tables = worker_view.build_page_table(global_sequence_ids)
-		page_size = int(pool_manager.config.page_size_tokens)
-		page_keys: List[List[int]] = []
-		for sequence_id, tokens, host_pages in zip(
-			global_sequence_ids, sequence_tokens, host_tables
-		):
-			required = math.ceil(int(tokens) / page_size)
-			if len(host_pages) < required:
-				raise RuntimeError(
-					f"Host page table ({pool_name} pool) is shorter than GPU "
-					f"reservation: sequence={sequence_id}, "
-					f"host_pages={len(host_pages)}, required={required}"
-				)
-			page_keys.append([int(page) for page in host_pages[:required]])
-		self._assert_private_writable_page_keys(
-			pool_name, pool_manager, global_sequence_ids, page_keys, page_size
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._pool_host_identity_page_keys(
+			self,
+			pool_name,
+			pool_manager,
+			worker_view,
+			global_sequence_ids,
+			sequence_tokens,
 		)
-		return page_keys
 
 	def _assert_private_writable_page_keys(
 		self,
@@ -4900,51 +3948,20 @@ class BatchGenWorker:
 		page_keys: Sequence[Sequence[int]],
 		page_size: int,
 	) -> None:
-		"""Fail loud if a page the row will WRITE carries a shared key.
-
-		Sharing a physical page is safe only for a committed prefix, which is
-		immutable and page aligned. Everything from the row's write head on is
-		its private tail: decode writes the new token at position
-		``current_context_length`` (``update_layer_decode_new_token``), i.e.
-		into logical page ``current_context_length // page_size``, and every
-		later page of the reservation is future tail. Those pages come from
-		the row's OWN Host reservation, so their Host page ids -- the keys --
-		are private by construction; this states that invariant as a check
-		instead of trusting it, because a shared key here would let two rows
-		write one physical page.
-		"""
-		write_heads: List[int] = []
-		for sequence_id in global_sequence_ids:
-			sequence = self.global_batch.get_sequence_by_global_idx(
-				int(sequence_id)
-			)
-			if sequence is None:
-				raise RuntimeError(
-					"shared GPU page identity needs the row's context length: "
-					f"global sequence {sequence_id} is not in the batch"
-				)
-			write_heads.append(
-				int(sequence.current_context_length) // int(page_size)
-			)
-		rows_per_key: Dict[int, int] = {}
-		for row in page_keys:
-			for key in row:
-				rows_per_key[int(key)] = rows_per_key.get(int(key), 0) + 1
-		for sequence_id, row, write_head in zip(
-			global_sequence_ids, page_keys, write_heads
-		):
-			for index in range(max(0, write_head), len(row)):
-				key = int(row[index])
-				if (
-					rows_per_key[key] > 1
-					or pool_manager.is_shared_page_key_mapped(key)
-				):
-					raise RuntimeError(
-						f"{pool_name} GPU pool: sequence {sequence_id} would "
-						f"share writable logical page {index} (write head "
-						f"{write_head}); only a committed prefix page may be "
-						"shared"
-					)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._assert_private_writable_page_keys(
+			self,
+			pool_name,
+			pool_manager,
+			global_sequence_ids,
+			page_keys,
+			page_size,
+		)
 
 	def _allocate_gpu_pages_with_host_identity(
 		self,
@@ -4952,73 +3969,41 @@ class BatchGenWorker:
 		global_sequence_ids: Sequence[int],
 		sequence_tokens: Sequence[int],
 	):
-		"""Share GPU pages when sequences reference the same Host page ids."""
-
-		page_keys = self._host_identity_page_keys(
-			manager, global_sequence_ids, sequence_tokens
-		)
-		if page_keys is None:
-			return manager.allocate_pages_for_sequences(
-				global_sequence_ids, sequence_tokens
-			)
-		allocations = manager.allocate_pages_for_sequences_with_page_keys(
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._allocate_gpu_pages_with_host_identity(
+			self,
+			manager,
 			global_sequence_ids,
 			sequence_tokens,
-			page_keys,
 		)
-		if self.prefix_cache_debug_stats:
-			sharing = manager.get_prefix_gpu_share_stats()
-			new_physical_pages = {
-				int(page)
-				for row in allocations.values()
-				for page in row
-			}
-			# Both pools request the same logical page count per row, so the
-			# primary rows describe the request for either shape.
-			primary_rows = (
-				page_keys.primary
-				if isinstance(page_keys, DualPoolPageKeys)
-				else page_keys
-			)
-			self._emit_prefix_cache_metric(
-				"prefix_gpu_share",
-				sequences=len(global_sequence_ids),
-				requested_logical_pages=sum(len(row) for row in primary_rows),
-				new_physical_pages=len(new_physical_pages),
-				logical_page_references=sharing.logical_page_references,
-				physical_pages=sharing.physical_pages,
-				keyed_physical_pages=sharing.keyed_physical_pages,
-				multi_referenced_pages=sharing.multi_referenced_pages,
-				reused_logical_references=sharing.reused_logical_references,
-			)
-		return allocations
 
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
-		"""Bind GPU KV manager to both worker and core_engine.
-
-		If manager is a DualKVCacheCoordinator, the primary manager is bound
-		to existing gpu_paged_kv_manager slots and the auxiliary (indexer) is
-		bound to gpu_paged_kv_manager_aux slots.
-		"""
-		self.gpu_paged_kv_cache_manager = manager
-		self._gpu_kv_pool_created = True
-		if isinstance(manager, DualKVCacheCoordinator):
-			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-				self.core_engine.gpu_paged_kv_manager = manager.primary
-			if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
-				self.core_engine.gpu_paged_kv_manager_aux = manager.auxiliary
-		else:
-			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-				self.core_engine.gpu_paged_kv_manager = manager
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._bind_gpu_paged_kv_manager(
+			self,
+			manager,
+		)
 
 	def _get_cuda_graph_gpu_manager(self):
-		"""Return the GPU KV manager object to use for CUDA graph setup."""
-		manager = self.gpu_paged_kv_cache_manager
-		if isinstance(manager, DualKVCacheCoordinator):
-			return manager
-		if manager is not None:
-			return manager
-		return getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._get_cuda_graph_gpu_manager(
+			self,
+		)
 
 	# Page-table capacity helpers — thin delegations to `KVCacheManager`.
 	# `_make_page_table_capacity_request` normalizes the worker's optional
@@ -5026,71 +4011,37 @@ class BatchGenWorker:
 	# `PageTableCapacityRequest` frozen snapshot.
 
 	def _deployment_context_bound_tokens(self) -> int:
-		"""Longest context any sequence can reach for the life of this server.
-
-		Admission clamps every sequence to `model_context_length`
-		(`clamp_decode_to_context`, and the `ctx_lens >= model_context_length`
-		completion test), so no decode step's `max_seqlen` can ever exceed it.
-		That makes it the one DEPLOYMENT bound available to capture-time
-		sizing: `max_input_length` / `max_decoding_length` are per-batch — set
-		by `Init` and grown at admission — so sizing from them describes
-		whichever batch happens to arrive first, not the deployment.
-
-		`_initialize_core_components` sets it from the model config (131072
-		default) before any KV pool or graph exists, so it is always available
-		to the pool and capture paths. Returns 0 only before core init; the
-		caller decides whether that is an error.
-		"""
-		return int(getattr(self, "model_context_length", 0) or 0)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._deployment_context_bound_tokens(
+			self,
+		)
 
 	def _make_page_table_capacity_request(self) -> PageTableCapacityRequest:
-		engine_config = getattr(self, "engine_config", None)
-		engine_module_global_batch_size: Optional[int] = None
-		engine_module_attn_decoding_micro_batch_size: Optional[int] = None
-		engine_basic_num_queries: Optional[int] = None
-		engine_basic_decode_graph_max_bucket: Optional[int] = None
-		if engine_config is not None:
-			basic = engine_config.Basic_Config
-			module_batching = engine_config.Module_Batching_Config
-			engine_module_global_batch_size = module_batching.global_batch_size
-			engine_module_attn_decoding_micro_batch_size = module_batching.attn_decoding_micro_batch_size
-			engine_basic_num_queries = basic.num_queries
-			# A whole-model decode graph addresses one page-table row per
-			# sequence of its bucket; the planner's top bucket (K3 H200: the
-			# KDA slot count, 160 > the 128 arg default) must fit.
-			graph_buckets = getattr(basic, "decode_graph_buckets", None) or ()
-			engine_basic_decode_graph_max_bucket = max(graph_buckets) if graph_buckets else None
-		model_config = getattr(self, "model_config", None)
-		# Deployment bound first, model config second. `model_context_length`
-		# is what admission clamps to, and it exists even when the config class
-		# does not declare `max_position_embeddings` — a config that lacks the
-		# field used to drop the bound from the candidate set entirely, leaving
-		# the page table's token span at the first batch's
-		# `max_input_length + max_decoding_length`. A graph captured against
-		# that span then rejected every later, longer decode step.
-		model_max_position_embeddings = self._deployment_context_bound_tokens() or getattr(
-			model_config, "max_position_embeddings", None
-		)
-		args = getattr(self, "args", None)
-		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
-		# The derived ladder can top out above the flag (at the per-rank
-		# decode width); the page table must address every row of that bucket.
-		decode_graph_top_bucket = (
-			self._decode_graph_top_bucket() if engine_config is not None else None
-		)
-		return PageTableCapacityRequest(
-			engine_module_global_batch_size=engine_module_global_batch_size,
-			engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
-			engine_basic_num_queries=engine_basic_num_queries,
-			model_max_position_embeddings=model_max_position_embeddings,
-			args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
-			engine_basic_decode_graph_max_bucket=engine_basic_decode_graph_max_bucket,
-			decode_graph_top_bucket=decode_graph_top_bucket,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_page_table_capacity_request(
+			self,
 		)
 
 	def _with_cuda_graph_page_table_capacity(self, config):
-		return KVCacheManager.apply_page_table_capacity(
-			self._make_page_table_capacity_request(), config
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._with_cuda_graph_page_table_capacity(
+			self,
+			config,
 		)
 
 	def _prepare_dual_kv_load_pointers(
@@ -5099,61 +4050,29 @@ class BatchGenWorker:
 		new_global_ids: List[int],
 		existing_global_ids: Optional[List[int]] = None,
 	) -> _DualKVLoadPointers:
-		if not isinstance(gpu_manager, DualKVCacheCoordinator):
-			raise RuntimeError("DSA dual KV load requires DualKVCacheCoordinator")
-		if not new_global_ids:
-			raise ValueError("_prepare_dual_kv_load_pointers requires non-empty sequence ids")
-
-		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
-		try:
-			gpu_manager.rebuild_page_table(new_global_ids)
-
-			primary_order = list(gpu_manager.primary._gpu_page_table_manager.slot_to_seq_id)
-			aux_order = list(gpu_manager.auxiliary._gpu_page_table_manager.slot_to_seq_id)
-			if primary_order != new_global_ids or aux_order != new_global_ids:
-				raise RuntimeError(
-					f"DSA dual load page-table order mismatch: requested={new_global_ids[:10]} "
-					f"primary={primary_order[:10]} aux={aux_order[:10]}"
-				)
-
-			primary_k, primary_v = gpu_manager.primary.get_padded_3d_page_pointers()
-			primary_counts = gpu_manager.primary.export_active_sequence_page_counts()
-			aux_k, aux_v = gpu_manager.auxiliary.get_padded_3d_page_pointers()
-			aux_counts = gpu_manager.auxiliary.export_active_sequence_page_counts()
-			if primary_counts.tolist() != aux_counts.tolist():
-				raise RuntimeError(
-					f"DSA dual load page-count mismatch: "
-					f"primary={primary_counts.tolist()} aux={aux_counts.tolist()}"
-				)
-
-			return _DualKVLoadPointers(
-				sequence_tensor=sequence_tensor,
-				primary_k_ptrs=primary_k,
-				primary_v_ptrs=primary_v,
-				primary_page_counts=primary_counts,
-				aux_k_ptrs=aux_k,
-				aux_v_ptrs=aux_v,
-				aux_page_counts=aux_counts,
-			)
-		finally:
-			if existing_global_ids:
-				gpu_manager.rebuild_page_table(existing_global_ids)
-			else:
-				gpu_manager.clear_page_table()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._prepare_dual_kv_load_pointers(
+			self,
+			gpu_manager,
+			new_global_ids,
+			existing_global_ids,
+		)
 
 	def _launch_dual_host_kv_load(self, pointers: _DualKVLoadPointers) -> DualAsyncKVTask:
-		host_view = self.host_paged_kv_worker_view
-		if not isinstance(host_view, DualHostKVCoordinator):
-			raise RuntimeError("DSA dual KV load requires DualHostKVCoordinator")
-		return host_view.async_load_layer_paged_kv_to_device_dual(
-			sequence_ids=pointers.sequence_tensor,
-			primary_active_page_counts=pointers.primary_page_counts,
-			primary_k_device_ptrs=pointers.primary_k_ptrs,
-			primary_v_device_ptrs=pointers.primary_v_ptrs,
-			aux_active_page_counts=pointers.aux_page_counts,
-			aux_k_device_ptrs=pointers.aux_k_ptrs,
-			aux_v_device_ptrs=pointers.aux_v_ptrs,
-			tensors=pointers,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._launch_dual_host_kv_load(
+			self,
+			pointers,
 		)
 
 	def _load_host_kv_to_gpu(
@@ -5161,61 +4080,16 @@ class BatchGenWorker:
 		manager: GPUPagedKVCacheManager,
 		global_sequence_ids: List[int],
 	) -> None:
-		"""Copy prefetched host KV pages into the GPU cache."""
-		if not global_sequence_ids:
-			return
-		copy_start = time.perf_counter()
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
-		
-		# DIAGNOSTIC: Check if these are resuming sequences (have decoded tokens)
-		resuming_seq_info = []
-		for global_idx in global_sequence_ids:
-			# Find the sequence by global_idx
-			for uuid, local_idx in self._uuid_to_local_map.items():
-				seq = self.global_batch.get_sequence(uuid)
-				if seq and seq.global_idx == global_idx and seq.decoded_length > 0:
-					resuming_seq_info.append({
-						'global_idx': global_idx,
-						'decoded_length': seq.decoded_length,
-						'current_context_length': seq.current_context_length,
-					})
-					break
-		
-		if resuming_seq_info and BATCHGEN_CB_DEBUG:
-			logging.debug(
-				f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
-			)
-		
-		logging.debug(
-			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
-			f"{len(global_sequence_ids)} sequences..."
-		)
-
-		if isinstance(manager, DualKVCacheCoordinator):
-			pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)
-			load_task = self._launch_dual_host_kv_load(pointers)
-		else:
-			sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-			active_sequence_page_counts = manager.export_active_sequence_page_counts()
-			load_task = worker_view.async_load_layer_paged_kv_to_device(
-				sequence_ids=sequence_tensor,
-				active_page_counts=active_sequence_page_counts,
-				k_device_ptrs=k_ptrs,
-				v_device_ptrs=v_ptrs,
-			)
-		
-		# Wait for load to complete (this is synchronous load path used during prefill)
-		load_task.wait()
-		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
-		torch.cuda.synchronize(self.torch_device)
-
-		load_duration = time.perf_counter() - copy_start
-		logging.debug(
-			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
-			self.rank, len(global_sequence_ids), load_duration,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._load_host_kv_to_gpu(
+			self,
+			manager,
+			global_sequence_ids,
 		)
 
 		# Option 1 (unified resident TP): NO prefill->decode KDA reshard. Under
@@ -5226,40 +4100,28 @@ class BatchGenWorker:
 		# which is REPLICATED across the group — nothing to reshard.
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
-		"""Return GPU KV pages associated with the provided local sequence ids."""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None or not local_sequence_ids:
-			return
-		
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		
-		if not global_sequence_ids:
-			return
-		
-		# All call sites now intersect `my_completed` with `_sequences_with_gpu_kv`
-		# before reaching here, so a KeyError from the manager indicates a real
-		# bookkeeping bug (the source-of-truth set drifted from the manager's
-		# state). Surface it loudly instead of swallowing.
-		manager.free_pages_for_sequences(global_sequence_ids)
-		# NOTE: No sync needed - page deallocation is synchronous to the allocator
-		logging.debug(
-			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_gpu_kv_pages(
+			self,
+			local_sequence_ids,
 		)
 
-		self._release_kda_state_slots(global_sequence_ids)
-
-		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
-		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid:
-				self._sequences_with_gpu_kv.discard(uuid)
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None:
-					seq.gpu_pages_allocated = 0
-
 	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
-		"""Release Kimi-Linear KDA state independently of paged GPU KV."""
-		self._traj.free_kda_sequences(global_sequence_ids)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_kda_state_slots(
+			self,
+			global_sequence_ids,
+		)
 
 	def _destroy_gpu_paged_kv_cache(
 		self, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
@@ -5330,84 +4192,70 @@ class BatchGenWorker:
 	# parity validation.
 
 	def _make_kv_cache_manager(self) -> KVCacheManager:
-		"""Lazy-construct: KV managers may not be bound at __init__ time."""
-		if self._kv_cache_manager is None:
-			worker = self
-			class _TorchKVStatsBackend:
-				def get_host_stats(self) -> KVStats:
-					s = worker.host_paged_kv_worker_view.get_stats()
-					return KVStats(
-						num_free_pages=s.num_free_pages,
-						num_used_pages=s.num_used_pages,
-						num_total_pages=s.num_total_pages,
-					)
-				def get_gpu_stats(self) -> "Optional[KVStats]":
-					m = worker.gpu_paged_kv_cache_manager
-					if m is None:
-						return None
-					s = m.get_stats()
-					return KVStats(
-						num_free_pages=s.num_free_pages,
-						num_used_pages=s.num_used_pages,
-						num_total_pages=s.num_total_pages,
-					)
-			self._kv_cache_manager = KVCacheManager(backend=_TorchKVStatsBackend())
-		return self._kv_cache_manager
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_kv_cache_manager(
+			self,
+		)
 
 	def _make_kv_utilization_request(self) -> KVUtilizationRequest:
-		return KVUtilizationRequest(
-			rank=self.rank,
-			world_size=self.world_size,
-			local_rank=self.local_rank,
-			num_gpus_per_node=self.local_world_size,
-			global_batch=self.global_batch,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_kv_utilization_request(
+			self,
 		)
 
 	def _get_host_kv_free_pages(self) -> int:
-		if self._kv_stats_compare:
-			legacy = self._legacy_get_host_kv_free_pages()
-			native = self._make_kv_cache_manager().get_host_free_pages()
-			assert legacy == native, f"kv_stats compare mismatch: get_host_kv_free_pages legacy={legacy} native={native}"
-			return native if self._kv_stats_native else legacy
-		if self._kv_stats_native:
-			return self._make_kv_cache_manager().get_host_free_pages()
-		return self._legacy_get_host_kv_free_pages()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._get_host_kv_free_pages(
+			self,
+		)
 
 	def _legacy_get_host_kv_free_pages(self) -> int:
-		"""Get current free pages from host KV cache."""
-		stats = self.host_paged_kv_worker_view.get_stats()
-		return stats.num_free_pages
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._legacy_get_host_kv_free_pages(
+			self,
+		)
 
 	def _get_or_create_gloo_group(self):
-		"""Get or create a Gloo process group for CPU tensor migrations.
-
-		Gloo backend supports CPU tensors and can use RDMA if available.
-		This is more memory efficient than NCCL (which requires GPU staging).
-
-		Returns:
-			The Gloo process group for CPU tensor operations.
-		"""
-		if not hasattr(self, '_gloo_migration_group') or self._gloo_migration_group is None:
-			logging.debug(f"Rank {self.rank}: Creating Gloo process group for CPU migrations")
-			# Create a new group with Gloo backend including all ranks
-			self._gloo_migration_group = dist.new_group(
-				ranks=list(range(self.world_size)),
-				backend="gloo"
-			)
-			logging.debug(f"Rank {self.rank}: Gloo process group created")
-		return self._gloo_migration_group
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._get_or_create_gloo_group(
+			self,
+		)
 
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
-		if self._kv_stats_compare:
-			legacy = self._legacy_get_host_kv_utilization()
-			native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
-			native = _dataclasses.asdict(native_obj)
-			assert legacy == native, f"kv_stats compare mismatch: get_host_kv_utilization legacy={legacy} native={native}"
-			return native if self._kv_stats_native else legacy
-		if self._kv_stats_native:
-			native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
-			return _dataclasses.asdict(native_obj)
-		return self._legacy_get_host_kv_utilization()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._get_host_kv_utilization(
+			self,
+		)
 
 	def _legacy_get_host_kv_utilization(self) -> Dict[str, int]:
 		"""Get host KV stats counting sequences with KV in host memory.
@@ -5475,153 +4323,54 @@ class BatchGenWorker:
 		}
 
 	def _log_host_kv_health(self) -> None:
-		"""Log the audited health of this node's host-KV region(s).
-
-		One line per region: the used-page identity, the sequence-table
-		occupancy, and the region's lifetime counters (see
-		``batchgen.kv_cache.host_kv_health``). ``get_audited_stats()`` is
-		O(table + pages) under both region locks; call this only from the
-		periodic heartbeat.
-		"""
-		view = getattr(self, "host_paged_kv_worker_view", None)
-		if view is None:
-			return
-		if isinstance(view, DualHostKVCoordinator):
-			regions = (
-				("primary", view.primary),
-				("aux", view.require_auxiliary("host-KV health")),
-			)
-		else:
-			regions = (("host", view),)
-		node_id = self.rank_ctx.node_id
-		for name, region_view in regions:
-			logging.info(
-				f"[HOST_KV] node={node_id} "
-				f"{format_host_kv_health(name, region_view.get_audited_stats())}"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._log_host_kv_health(
+			self,
+		)
 
 	def _gather_host_kv_stats_by_node(self, worker_view: Optional[object]) -> List[Dict[str, int]]:
-		"""Gather one host-KV pool stat record per node.
-
-		Host KV is shared by ranks on the same node, not globally. Rank 0 uses
-		these per-node stats to plan dynamic host growth against the same pool
-		that each owner rank will later allocate from.
-
-		Each record also carries the retained prefix pages the node can reclaim
-		right now (resident, no live attachment, no pending load): growth may
-		consume them exactly as prefill admission does, and the boundary's
-		growth phase releases them on demand before the fresh capacity
-		preflight. Zero when the prefix cache is off.
-		"""
-		num_nodes = self.rank_ctx.num_nodes
-		report_free = 0
-		report_total = 0
-		report_reclaimable = -1
-		report_node = -1
-		if worker_view is not None and self.local_rank == 0:
-			try:
-				stats = worker_view.get_stats()
-				report_node = self.rank_ctx.node_of(self.rank)
-				report_free = int(stats.num_free_pages)
-				report_total = int(stats.num_total_pages)
-				report_reclaimable = (
-					max(0, int(self.prefix_cache_coordinator.count_releasable_pages(0)))
-					if (
-						self.enable_prefix_cache
-						and self.prefix_cache_coordinator is not None
-					)
-					else 0
-				)
-			except Exception:
-				# Carry a rank-local stats failure through the collective so
-				# peers do not block while this rank raises before all-gather.
-				logging.exception("Rank %s: host-KV stats snapshot failed", self.rank)
-				report_node = -2
-				report_free = -1
-				report_total = -1
-				report_reclaimable = -1
-
-		stats_tensor = torch.tensor(
-			[report_node, report_free, report_total, report_reclaimable],
-			dtype=torch.int64,
-			device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._gather_host_kv_stats_by_node(
+			self,
+			worker_view,
 		)
-		gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, stats_tensor)
-		if any(int(item[0].item()) == -2 for item in gathered):
-			raise RuntimeError(
-				"[SCHED_INVARIANT] host-KV stats snapshot failed on one or more ranks"
-			)
-
-		per_node_stats = []
-		reports_by_node = {}
-		for item in gathered:
-			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = {
-					'node_id': node_id,
-					'num_free_pages': int(item[1].item()),
-					'num_total_pages': int(item[2].item()),
-					'num_reclaimable_pages': int(item[3].item()),
-				}
-
-		for node in range(num_nodes):
-			per_node_stats.append(reports_by_node.get(node, {
-				'node_id': node,
-				'num_free_pages': 0,
-				'num_total_pages': 0,
-				'num_reclaimable_pages': 0,
-			}))
-
-		return per_node_stats
 
 	def _make_watermark_trigger_request(
 		self, node_stats: List[dict]
 	) -> WatermarkTriggerRequest:
-		"""Snapshot the worker state `plan_watermark_trigger` consumes."""
-		return WatermarkTriggerRequest(
-			node_stats=tuple(node_stats),
-			host_kv_watermark=self.host_kv_watermark,
-			has_queued=self.global_batch.has_queueing(),
-			has_evicted=self.enable_host_kv_eviction and self.global_batch.has_evicted(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_watermark_trigger_request(
+			self,
+			node_stats,
 		)
 
 	def _credit_reclaimable_prefix_pages(
 		self, stats: Dict[str, int]
 	) -> Dict[str, int]:
-		"""Report reclaimable retained prefix pages as free, not as pressure.
-
-		The Host allocator's counters are already PHYSICAL: a prefix several
-		sequences attach is one allocation and is charged to ``used`` exactly
-		once, so this node's utilisation never double-counts a shared page.
-		What it cannot distinguish is a page holding live KV from a page
-		holding a RETAINED prefix that nobody is reading -- a copy the prefix
-		cache keeps for a future hit and that admission reclaims on demand,
-		which is why ``per_node_host_reclaimable`` already counts it as part of
-		the admission budget.
-
-		Left as ``used``, those pages hold free% under the watermark forever,
-		so a pool filled with retained prefixes never preempts decode for
-		prefill -- the one situation the trigger exists for. Crediting them
-		here (and only here, so the legacy/native utilisation parity check
-		keeps comparing the raw counters) makes the trigger see the capacity
-		admission would actually get.
-
-		Read only when work is waiting: the trigger cannot fire otherwise, and
-		the count is an O(max_nodes) scan under the coordinator's lock.
-		"""
-		if not self.enable_prefix_cache:
-			return stats
-		coordinator = getattr(self, "prefix_cache_coordinator", None)
-		if coordinator is None:
-			return stats
-		waiting = self.global_batch.has_queueing() or (
-			self.enable_host_kv_eviction and self.global_batch.has_evicted()
-		)
-		if not waiting:
-			return stats
-		return credit_reclaimable_pages(
-			stats, int(coordinator.count_releasable_pages(0))
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._credit_reclaimable_prefix_pages(
+			self,
+			stats,
 		)
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
@@ -6258,23 +5007,6 @@ class BatchGenWorker:
 					f"({100-final_stats['free_percent']}% utilized)"
 				)
 
-	def _get_gpu_kv_free_pages(self) -> int:
-		if self._kv_stats_compare:
-			legacy = self._legacy_get_gpu_kv_free_pages()
-			native = self._make_kv_cache_manager().get_gpu_free_pages()
-			assert legacy == native, f"kv_stats compare mismatch: get_gpu_kv_free_pages legacy={legacy} native={native}"
-			return native if self._kv_stats_native else legacy
-		if self._kv_stats_native:
-			return self._make_kv_cache_manager().get_gpu_free_pages()
-		return self._legacy_get_gpu_kv_free_pages()
-
-	def _legacy_get_gpu_kv_free_pages(self) -> int:
-		"""Get current free pages from GPU KV cache."""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			return 0
-		return manager.get_stats().num_free_pages
-
 	# ============ UUID/Index Conversion Helpers ============
 	#
 	# Thin delegations to `batchgen.worker.indexing.IndexManager`. The worker
@@ -6486,154 +5218,71 @@ class BatchGenWorker:
 	# process group is initialized.
 
 	def _make_sync_coordinator(self) -> SyncCoordinator:
-		if self._sync_coordinator is None:
-			self._sync_coordinator = SyncCoordinator(backend=TorchDistCollectiveBackend())
-		return self._sync_coordinator
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._make_sync_coordinator(
+			self,
+		)
 
 	def _make_sync_context(self) -> SyncContext:
-		return SyncContext(
-			rank=self.rank,
-			uuid_to_local=self._uuid_to_local_map,
-			global_batch=self.global_batch,
-			torch_device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._make_sync_context(
+			self,
 		)
 
 	def _sync_completion_status_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> Tuple[Set[str], List[str]]:
-		return self._make_sync_coordinator().sync_completion_status_tensor(
-			self._make_sync_context(), decode_uuids
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._sync_completion_status_tensor(
+			self,
+			decode_uuids,
 		)
 
 	def _sync_decode_uuids_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> List[str]:
-		return self._make_sync_coordinator().sync_decode_uuids_tensor(
-			self._make_sync_context(), decode_uuids
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._sync_decode_uuids_tensor(
+			self,
+			decode_uuids,
 		)
 
 	# ============ QueryBook Buffer Pool ============
 
-	def _ensure_buffer_pool(
-		self,
-		required_rows: int,
-		required_input_width: int,
-		required_decode_width: int,
-		reason: str,
-	) -> None:
-		"""Retired compatibility hook; the trajectory pool is fixed at init.
-
-		COLLECTIVE: every rank must call this with identical arguments. They do,
-		because both call sites derive the requirement from the tokenized batch,
-		which is all-gathered to every rank before this runs.
-
-		The old dense ``input_ids``/``decoded_tokens`` pool and its dynamic-growth
-		path are intentionally unreachable. Production admissions use the fixed
-		int32 ``QueryBook`` reservation made during worker initialization.
-		"""
-		raise RuntimeError("dynamic QueryBookBufferPool growth is retired")
-		# Kept below only for source compatibility with old checkpoints.
-		old = self._buffer_pool
-		# Kept as explicit symbols for compatibility with the collective pool
-		# contract and its structural regression tests; prompt storage itself is
-		# now handled by the trajectory book.
-		_exchange = self._exchange_node_memfd_identity
-		_barrier = dist.barrier
-		if old is not None and required_rows <= old.num_sequences and required_decode_width <= old.max_decoding_length:
-			return
-
-		rows = max(required_rows, old.num_sequences if old is not None else 0)
-		in_w = 0
-		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
-
-		new_pool = QueryBookBufferPool(
-			num_sequences=rows,
-			input_ids_width=in_w,
-			max_decoding_length=dec_w,
-			pad_token_id=self.pad_token_id,
-			input_ids_buffer=None,
-			input_ids_memfd=None,
-		)
-		private_gib = rows * dec_w * 8 / 2**30
-		if old is None:
-			logging.info(
-				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
-				f"input_ids_width={in_w}, decoded_width={dec_w} -> prompt tokens in the trajectory book, decoded_tokens "
-				f"{private_gib:.3f} GiB per rank"
-			)
-		else:
-			logging.warning(
-				f"Rank {self.rank}: QueryBook pool GROWN ({reason}): rows "
-				f"{old.num_sequences}->{rows}, decoded_width "
-				f"{old.max_decoding_length}->{dec_w}"
-			)
-			new_pool.adopt(old)
-		self._buffer_pool = new_pool
-		if old is not None:
-			self._rebind_buffer_pool_views()
-			self._retire_buffer_pool(old)
-
 	def _exchange_node_memfd_identity(self, pid: int, fd: int) -> Tuple[int, int]:
-		"""Publish this rank's ``input_ids`` memfd identity, take its node's.
-
-		COLLECTIVE, one per pool generation, issued identically by every rank on
-		every path. It REPLACES the post-create barrier ``allocate_node_shared_int64``
-		used to run: an all_gather cannot deliver on any rank before every rank
-		has entered, so the creator's memfd is guaranteed to exist — and to be
-		sized — by the time an attacher reads its pid and fd. Non-creators
-		contribute ``fd=-1``, which is never selected.
-		"""
-		# Pool allocation can run inside InferenceMode (see the buffer creation
-		# in allocate_node_shared_int64); the collective writes into `gathered`.
-		with torch.inference_mode(False):
-			identity = torch.tensor(
-				[pid, fd], dtype=torch.int64, device=self.torch_device
-			)
-			gathered = [torch.zeros_like(identity) for _ in range(self.world_size)]
-			dist.all_gather(gathered, identity)
-			# Pre-`rank_ctx`: this collective runs inside core initialization.
-			creator_rank = (
-				node_of_rank(self.rank, self.local_world_size) * self.local_world_size
-			)
-			creator = gathered[creator_rank]
-			return int(creator[0].item()), int(creator[1].item())
-
-	def _retire_buffer_pool(self, old: QueryBookBufferPool) -> None:
-		"""Drop a superseded generation's descriptor but keep its mapping alive.
-
-		Views handed out before the grow may still be referenced somewhere this
-		rebind does not reach; unmapping under them would segfault. Closing the
-		fd keeps /proc/<pid>/fd from accumulating one entry per grow — the
-		kernel frees the pages once the last mapping goes, i.e. at process exit,
-		however that exit happens.
-		"""
-		self._retired_buffer_pools.append(old)
-		if old.input_ids_memfd is not None:
-			old.input_ids_memfd.release_fd()
-
-	def _rebind_buffer_pool_views(self) -> None:
-		"""Repoint every live sequence and query-book entry at the current pool."""
-		pool = self._buffer_pool
-		rebound = 0
-		for seq in self.global_batch:
-			slot = getattr(seq, '_buffer_slot', -1)
-			if slot < 0:
-				continue
-			input_ids_view = self._prompt_tensors.get(seq.uuid)
-			if input_ids_view is None:
-				continue
-			decoded_view = pool.get_decoded_tokens_view(slot)
-			seq.input_ids = input_ids_view
-			seq.decoded_tokens = decoded_view
-			local_idx = self._uuid_to_local_map.get(seq.uuid)
-			if local_idx is not None and self.query_book and local_idx in self.query_book:
-				entry = self.query_book[local_idx]
-				entry.encoded["input_ids"] = input_ids_view
-				entry.decoded_tokens = decoded_view
-			rebound += 1
-		logging.warning(f"Rank {self.rank}: rebound {rebound} sequences onto the grown QueryBook pool")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._exchange_node_memfd_identity(
+			self,
+			pid,
+			fd,
+		)
 
 	# ============ KV-Driven Batch Preparation ============
 
@@ -6677,36 +5326,28 @@ class BatchGenWorker:
 		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
-		"""Whether a local decode row needs planning before its next forward."""
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid is None:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None or self._is_sequence_completed(seq):
-				continue
-			if host_capacity_due(
-				int(seq.host_token_capacity), int(seq.current_context_length)
-			):
-				return True
-		return False
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_capacity_due_local(
+			self,
+			batch,
+		)
 
 	def _host_capacity_due_all_ranks(self, batch: List[int]) -> bool:
-		"""Collectively detect a re-entry row with no next-token runway.
-
-		Metadata is owner-local during decode, so a local check cannot decide
-		whether all ranks must enter the collective boundary planner.  This check
-		runs only at decode entry and immediately after a boundary, never once per
-		decode token.
-		"""
-		local_due = self._host_capacity_due_local(batch)
-		if self.world_size <= 1:
-			return local_due
-		flag = torch.tensor(
-			[1 if local_due else 0], dtype=torch.int32, device=self.torch_device
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_capacity_due_all_ranks(
+			self,
+			batch,
 		)
-		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-		return bool(int(flag.item()))
 
 	def _prefill_host_reservation_plan(
 		self, prefill_uuids: List[str]
@@ -6763,99 +5404,17 @@ class BatchGenWorker:
 		owner_requests: List[Tuple[str, int]],
 		local_error: bool = False,
 	) -> Tuple[bool, Optional[Dict[int, Tuple[int, int]]]]:
-		"""Check a fresh per-node host-KV snapshot before any mutation.
-
-		Every rank reports its owner demand.  Only the node leader reports the
-		shared allocator's free/total pages; summing demands across ranks and
-		comparing against that one live snapshot prevents one rank from making a
-		decision from stale local state.  The final MIN reduction makes the
-		decision explicit even when a rank's stats call fails.
-
-		Returns ``(ok, rows)``, where ``rows`` maps node id to the gathered
-		``(need, free)`` pair the reserve-time reclaim computes its deficit
-		from. ``rows`` is ``None`` when the snapshot itself is unusable (a
-		rank's stats call failed, a node reported no capacity at all, or two
-		ranks of one node disagreed): a deficit derived from it would be
-		meaningless, so the caller must not retry on it. Both verdicts are
-		reduced, hence rank-uniform -- the retry branch is collective.
-		"""
-		# Members' demands exclude their shared chains, but the pooled
-		# segments themselves allocate one Host copy (mirrored per group, so
-		# one count). Leaving them out over-admits the wave and the
-		# allocation fails right after the preflight passed. Only the wave's
-		# host-KV LEADER allocates segments, so only a rank with owner demand
-		# reports them — at G>1 the followers reporting the same segments
-		# would multiply the node demand by G and falsely reject the wave.
-		local_need = prefill_owner_demand_pages(
-			[int(tokens) for _, tokens in owner_requests],
-			page_size=self.PAGE_SIZE,
-			pool_segment_pages=(
-				self._prefill_pool_segment_host_pages() if owner_requests else 0
-			),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._collective_prefill_host_capacity_ok(
+			self,
+			owner_requests,
+			local_error,
 		)
-		node_id = self.rank_ctx.node_id
-		local_free = -1
-		local_total = -1
-		snapshot_error = 1 if local_error else 0
-		host_view = getattr(self, "host_paged_kv_worker_view", None)
-		if host_view is None:
-			host_view = getattr(
-				getattr(self, "core_engine", None),
-				"host_paged_kv_worker_view",
-				None,
-			)
-		if self.local_rank == 0:
-			try:
-				stats = host_view.get_stats()
-				local_free = int(stats.num_free_pages)
-				local_total = int(stats.num_total_pages)
-			except Exception:
-				snapshot_error = 1
-				logging.exception(
-					"Rank %s: host-KV prefill capacity snapshot failed", self.rank
-				)
-
-		report = torch.tensor(
-			[node_id, local_need, local_free, local_total, snapshot_error],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		if self.world_size == 1:
-			if snapshot_error:
-				return False, None
-			ok = 0 <= local_need <= local_free and local_need <= local_total
-			return ok, {node_id: (local_need, local_free)}
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required for host-KV prefill admission"
-			)
-		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
-		dist.all_gather(gathered, report)
-
-		verdict = verdict_node_capacity(
-			[
-				NodeCapacityReport(
-					node_id=int(item[0].item()),
-					need=int(item[1].item()),
-					free=int(item[2].item()),
-					total=int(item[3].item()),
-					snapshot_error=int(item[4].item()),
-				)
-				for item in gathered
-			],
-			want_rows=True,
-		)
-
-		decision = torch.tensor(
-			[1 if verdict.ok else 0, 1 if verdict.rows_usable else 0],
-			dtype=torch.int32, device=self.torch_device,
-		)
-		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-		if not int(decision[1].item()):
-			return bool(int(decision[0].item())), None
-		# The reduced rows_usable is the MIN over ranks, so it is 1 only when
-		# this rank's local verdict was usable and carries its rows.
-		return bool(int(decision[0].item())), verdict.rows
 
 	def _reclaim_host_prefix_pages_collective(
 		self,
@@ -6863,187 +5422,50 @@ class BatchGenWorker:
 		*,
 		reason: str,
 	) -> int:
-		"""Reclaim retained prefix pages on each node leader; all ranks align.
-
-		The node leader evaluates ``page_target()`` (the Host pages this node is
-		short) and releases up to that many cold retained prefix pages -- only
-		pages with no live attachment and no pending load, so nothing a running
-		row or an attached wave reads is touched. Every other rank of the node
-		then retires the trajectory frontiers standing on the released pages.
-
-		Collective discipline: every rank reaches every collective, a
-		leader-side failure (including in ``page_target``) becomes a MAX-reduced
-		flag, and no rank raises before that flag is reduced. ``reason`` names
-		the caller in logs, the ``prefix_reclaim`` metric and errors. Returns
-		the largest page count any leader reclaimed.
-		"""
-		from batchgen.prefix_reuse.eviction import (
-			EvictedPageRecorder,
-			reclaim_prefix_pages_for_host_admission,
-			retire_node_frontiers,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._reclaim_host_prefix_pages_collective(
+			self,
+			page_target,
+			reason=reason,
 		)
-		node_id = self.rank_ctx.node_id
-		failure = 0
-		local_frontier_hook = self._trajectory_frontier_eviction_hook()
-		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
-		if self.local_rank == 0:
-			try:
-				target = int(page_target())
-				if target:
-					released = reclaim_prefix_pages_for_host_admission(
-						core_engine_module=core_engine,
-						coordinator=self.prefix_cache_coordinator,
-						worker_views_by_group=self._host_views_by_group(),
-						group_id=0,
-						page_target=target,
-						max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
-						frontier_hook=reclaimed_pages,
-					)
-					logging.info(
-						"[PREFIX_CACHE] %s reclaimed %s Host pages on node %s "
-						"(free=%s, target=%s)",
-						reason, released, node_id, self._get_host_kv_free_pages(),
-						target,
-					)
-					if self.prefix_cache_debug_stats:
-						self._emit_prefix_cache_metric(
-							"prefix_reclaim",
-							reason=reason,
-							node=int(node_id),
-							page_target=int(target),
-							released_pages=int(released),
-							**self._prefix_host_resource_fields(),
-						)
-			except Exception:
-				logging.exception("[PREFIX_CACHE] %s eviction failed", reason)
-				failure = 1
-		reclaimed_page_count = reclaimed_pages.page_count
-		if self.world_size > 1:
-			failed = torch.tensor(
-				[failure, reclaimed_page_count],
-				dtype=torch.int64, device=self.torch_device,
-			)
-			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-			failure = int(failed[0].item())
-			reclaimed_page_count = int(failed[1].item())
-		if failure != 0:
-			raise RuntimeError(f"prefix cache {reason} eviction failed on a worker")
-		# The leader already retired its own frontiers inside the release. Any
-		# other rank of the node may own frontier records standing on the
-		# reclaimed pages (G=1, or several serve groups per node), so every rank
-		# runs its own hook on its node's reclaimed map.
-		if self.world_size > 1 and reclaimed_page_count != 0:
-			frontier_failure = 0
-			gathered_reclaims = [None] * self.world_size
-			dist.all_gather_object(
-				gathered_reclaims,
-				(
-					node_id,
-					reclaimed_pages.pages_by_group
-					if self.local_rank == 0 else None,
-				),
-			)
-			if self.local_rank != 0:
-				try:
-					retire_node_frontiers(
-						gathered=gathered_reclaims,
-						node_id=node_id,
-						frontier_hook=local_frontier_hook,
-					)
-				except Exception:
-					logging.exception(
-						"[PREFIX_CACHE] frontier retirement after %s reclaim "
-						"failed", reason,
-					)
-					frontier_failure = 1
-			retired = torch.tensor(
-				[frontier_failure], dtype=torch.int64, device=self.torch_device
-			)
-			dist.all_reduce(retired, op=dist.ReduceOp.MAX)
-			if int(retired.item()) != 0:
-				raise RuntimeError(
-					f"trajectory frontier retirement after {reason} reclaim "
-					"failed on a worker"
-				)
-		return reclaimed_page_count
 
 	def _retry_prefill_host_capacity_after_reclaim(
 		self,
 		owner_requests: List[Tuple[str, int]],
 		capacity_rows: Dict[int, Tuple[int, int]],
 	) -> bool:
-		"""Reclaim this node's host-page deficit once, then re-check capacity.
-
-		Exactly one attempt: a wave sized against free + reclaimable pages can
-		be short only by what is retained, and this releases it. A second
-		shortfall is a real capacity change (a concurrent decode grew, a peer
-		node is the short one and has nothing cold left), which the caller
-		rejects exactly as before.
-
-		Safe by construction: the wave's prefix attachments are already held,
-		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
-		keeps it -- only cold retained pages go, which is precisely the supply
-		the admission budget counted.
-
-		Collective discipline is ``_reclaim_host_prefix_pages_collective``'s:
-		every rank reaches every collective, and the deficit is computed on the
-		leader inside its MAX-reduced failure flag.
-		"""
-		node_id = self.rank // self.local_world_size
-		self._reclaim_host_prefix_pages_collective(
-			lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
-			reason="host_reserve",
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._retry_prefill_host_capacity_after_reclaim(
+			self,
+			owner_requests,
+			capacity_rows,
 		)
-		capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
-		return capacity_ok
 
 	def _reclaim_host_prefix_pages_for_growth(
 		self,
 		growth_entries: List[Tuple[str, int, object]],
 		worker_view: Optional[object],
 	) -> int:
-		"""Release the retained prefix pages this boundary's growth plan counted.
-
-		The rank-0 growth plan covers each node's growth debt with free pages,
-		completed/evicted releases and the node's reclaimable retained prefix
-		pages. After every rank has released (the caller's barrier), the node
-		leader reads the physical free count and reclaims exactly the part of
-		this node's growth the free pages do not cover:
-		``max(0, node_growth_pages - free_after_releases)``. A shortfall the
-		reclaim cannot close is left to the fresh collective preflight, which
-		fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
-		list, identical on every rank.
-		"""
-		node_id = self.rank // self.local_world_size
-		group_size = self._decode_attn_tp_size()
-
-		def node_growth_deficit() -> int:
-			from batchgen.decode_dp_group import host_kv_owner_rank
-
-			node_growth_pages = 0
-			for uuid, growth_pages, seq in growth_entries:
-				if seq is None:
-					raise RuntimeError(f"growth sequence {uuid} is not in global_batch")
-				if group_size > 1:
-					if seq.decode_dp_group is None:
-						raise RuntimeError(
-							f"growth sequence {uuid} has no decode_dp_group for "
-							f"attn_tp_size={group_size}"
-						)
-					owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
-				else:
-					owner = seq.assigned_rank
-				if int(owner) // self.local_world_size == node_id:
-					node_growth_pages += int(growth_pages)
-			if node_growth_pages == 0:
-				return 0
-			if worker_view is None:
-				raise RuntimeError("host-KV worker view is unavailable")
-			free_after_releases = int(worker_view.get_stats().num_free_pages)
-			return max(0, node_growth_pages - free_after_releases)
-
-		return self._reclaim_host_prefix_pages_collective(
-			node_growth_deficit, reason="host_growth",
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._reclaim_host_prefix_pages_for_growth(
+			self,
+			growth_entries,
+			worker_view,
 		)
 
 	def _attach_prefix_cache_for_prefill(self, prefill_uuids: List[str]) -> None:
@@ -7381,85 +5803,17 @@ class BatchGenWorker:
 		host_grow_requests: List[Tuple[int, int]],
 		worker_view: Optional[object] = None,
 	) -> bool:
-		"""Preflight one boundary's shared host-KV growth transaction.
-
-		The boundary planner runs from a gathered snapshot taken before completed
-		and evicted rows release their pages.  That snapshot is intentionally
-		pure, but it cannot prove that the shared allocator still has the pages
-		when Phase 4.C executes.  Every rank therefore reports its owner demand;
-		only one rank per node reports the node-shared allocator's fresh free/total
-		counts.  The all-rank MIN makes the decision identical before any view is
-		mutated.
-
-		The second all-rank consensus is performed by the caller after the local
-		allocator call.  A post-preflight allocator failure is fatal: the native
-		worker-view API has no page-level rollback for a successful peer, and
-		continuing would make scalar metadata and shared page tables disagree.
-		"""
-		local_need = sum(int(pages) for _, pages in host_grow_requests)
-		node_id = self.rank_ctx.node_id
-		local_free = -1
-		local_total = -1
-		snapshot_error = 0
-		if worker_view is None:
-			worker_view = getattr(self, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			worker_view = getattr(
-				getattr(self, "core_engine", None),
-				"host_paged_kv_worker_view",
-				None,
-			)
-		# The host region is shared by all ranks on a node.  Use the local
-		# representative for the snapshot, matching _gather_host_kv_stats_by_node
-		# and _collective_prefill_host_capacity_ok.
-		if self.local_rank == 0:
-			try:
-				if worker_view is None:
-					raise RuntimeError("host-KV worker view is unavailable")
-				stats = worker_view.get_stats()
-				local_free = int(stats.num_free_pages)
-				local_total = int(stats.num_total_pages)
-			except Exception:
-				snapshot_error = 1
-				logging.exception(
-					"Rank %s: host-KV boundary growth snapshot failed", self.rank
-				)
-
-		report = torch.tensor(
-			[node_id, local_need, local_free, local_total, snapshot_error],
-			dtype=torch.int64,
-			device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._collective_host_kv_growth_capacity_ok(
+			self,
+			host_grow_requests,
+			worker_view,
 		)
-		if self.world_size == 1:
-			if snapshot_error:
-				return False
-			return 0 <= local_need <= local_free and local_need <= local_total
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required for host-KV growth preflight"
-			)
-		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
-		dist.all_gather(gathered, report)
-
-		verdict = verdict_node_capacity(
-			[
-				NodeCapacityReport(
-					node_id=int(item[0].item()),
-					need=int(item[1].item()),
-					free=int(item[2].item()),
-					total=int(item[3].item()),
-					snapshot_error=int(item[4].item()),
-				)
-				for item in gathered
-			],
-			want_rows=False,
-		)
-
-		decision = torch.tensor(
-			[1 if verdict.ok else 0], dtype=torch.int32, device=self.torch_device
-		)
-		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-		return bool(int(decision.item()))
 
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
@@ -8071,8 +6425,15 @@ class BatchGenWorker:
 		return describe_prefill_blockers(selection, total_pages_by_node=totals)
 
 	def _get_host_kv_total_pages(self) -> int:
-		"""This node's shared Host-KV pool size in pages."""
-		return int(self.host_paged_kv_worker_view.get_stats().num_total_pages)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._get_host_kv_total_pages(
+			self,
+		)
 
 	def _prefill_candidate_digest(self, candidate_uuids: List[str]) -> int:
 		"""Digest the inputs the prefill candidate snapshot is derived from.
@@ -8234,69 +6595,19 @@ class BatchGenWorker:
 			)
 		return limits
 
-	def _plan_prefill_micro_batches(
-		self,
-		seq_lengths: List[int],
-		full_seq_lengths: List[int],
-		compute_cached_tokens: List[int],
-	) -> Tuple[List[Tuple[int, int]], int, bool]:
-		"""Build the one authoritative prepacked-forward plan for local rows.
-
-		``seq_lengths`` are the computed (suffix) lengths the forward packs;
-		``full_seq_lengths`` the prompt lengths. A micro-batch holding a
-		prefix hit materializes temporary GPU KV for every member's full
-		length, so its pages are capped by the prefill-phase prefix KV budget
-		(``_measure_prefill_prefix_kv_budget``) and the micro-batch splits
-		until the transient fits.
-		"""
-		token_cap = (
-			self.engine_config.Module_Batching_Config
-			.prefill_micro_batch_token_cap
-		)
-		use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-		single_sequence_only = (
-			token_cap > 0
-			and max(seq_lengths) > token_cap
-			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
-			and self.parallel_manager.prefill_uses_streamed_sp8()
-		)
-		prefix_hits = [int(tokens) > 0 for tokens in compute_cached_tokens]
-		kv_pages = [0] * len(prefix_hits)
-		kv_page_cap = 0
-		if any(prefix_hits):
-			from batchgen.prefix_reuse.materialization import (
-				gpu_kv_page_bytes,
-				temporary_kv_pages,
-			)
-
-			budget = self._prefill_prefix_kv_budget_bytes
-			if budget is None:
-				raise RuntimeError(
-					"prefix-hit prefill has no prefill-phase prefix KV budget: "
-					"the model planner sets no prefill_prefix_pool_workspace_bytes"
-					", so the temporary full-length KV cannot be bounded"
-				)
-			if self._decode_attn_tp_size() != 1:
-				raise RuntimeError(
-					"prefix-hit prefill splits micro-batches by a rank-local "
-					"budget, which a serve group of attn_tp_size>1 cannot share"
-				)
-			page_config = self._prefix_materialization_kv_config([1])
-			kv_pages = [
-				temporary_kv_pages(length, page_config.page_size_tokens)
-				for length in full_seq_lengths
-			]
-			kv_page_cap = budget // gpu_kv_page_bytes(page_config)
-		micro_batches, l2_cap = build_prefill_micro_batches(
+	def _plan_prefill_micro_batches(self, seq_lengths: List[int], full_seq_lengths: List[int], compute_cached_tokens: List[int]) -> Tuple[List[Tuple[int, int]], int, bool]:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._plan_prefill_micro_batches(
+			self,
 			seq_lengths,
-			token_cap,
-			l2_balance=use_l2,
-			single_sequence_only=single_sequence_only,
-			prefix_hits=prefix_hits,
-			kv_pages=kv_pages,
-			kv_page_cap=kv_page_cap,
+			full_seq_lengths,
+			compute_cached_tokens,
 		)
-		return micro_batches, l2_cap, single_sequence_only
 
 	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
 		"""The temporary GPU KV config of one prefix-hit micro-batch."""
@@ -8309,44 +6620,16 @@ class BatchGenWorker:
 		)
 
 	def _prefill_model_pass_count(self, batch: List[int]) -> int:
-		"""Return the number of complete model forwards local prefill will run."""
-		if not batch:
-			return 0
-		if self._prefill_pool_wave is not None:
-			# A pool wave runs one forward per planned chunk, not one per
-			# micro-batch of whole prompts: a chunk packs pooled segments and
-			# tails. The plan is identical on every rank of the serve group, so
-			# the pass counts the transport padding aligns against agree.
-			return len(self._prefill_pool_wave.plan.chunks)
-		if not self.enable_prepack:
-			micro_batch_size = (
-				self.engine_config.Module_Batching_Config
-				.MoE_prefill_micro_batch_size
-			)
-			return math.ceil(len(batch) / micro_batch_size)
-
-		# The same inputs prefill_prepacked plans with: computed (suffix)
-		# lengths, prompt lengths and the attached prefix of each row.
-		full_seq_lengths = []
-		compute_cached_tokens = []
-		for local_idx in batch:
-			seq = self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
-			full_seq_lengths.append(seq.prompt_length)
-			compute_cached_tokens.append(
-				prefix_state.compute_cached_tokens
-				if prefix_state is not None
-				else 0
-			)
-		micro_batches, _, _ = self._plan_prefill_micro_batches(
-			[
-				full - cached
-				for full, cached in zip(full_seq_lengths, compute_cached_tokens)
-			],
-			full_seq_lengths,
-			compute_cached_tokens,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_model_pass_count(
+			self,
+			batch,
 		)
-		return len(micro_batches)
 
 	def _streamed_sp8_prefill_pass_alignment(
 		self, local_prefill_indices: List[int]
@@ -8562,45 +6845,14 @@ class BatchGenWorker:
 		dist.barrier()
 
 	def _snapshot_decode_capacity(self) -> DecodeCapacitySnapshot:
-		"""Collect the live GPU-KV capacity before decode admission.
-
-		Total pages are immutable after initialization and must match on every
-		rank.  Free pages are dynamic; the pure reducer takes the tightest rank
-		in each replicated attention group so the admission plan is safe for all
-		ranks that will allocate the selected sequence.
-
-		The whole read — local stats and the cross-rank all_gather — runs inside
-		the manager's ``capacity_snapshot()`` section (#424), so the phase
-		switch cannot release the pool underneath a decision that is already
-		being taken against it: a release attempted here fails loud instead of
-		producing a plan for pages that no longer exist.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None or not manager.is_initialized:
-			raise RuntimeError(
-				"GPU KV manager must be initialized before taking a decode capacity snapshot"
-			)
-		with manager.capacity_snapshot():
-			stats = manager.get_stats()
-			local = torch.tensor(
-				[int(stats.num_total_pages), int(stats.num_free_pages)],
-				dtype=torch.int64,
-				device=self.torch_device,
-			)
-			if self.world_size == 1:
-				rank_stats = [local]
-			else:
-				if not dist.is_initialized():
-					raise RuntimeError(
-						"distributed process group is required for a multi-rank decode capacity snapshot"
-					)
-				rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
-				dist.all_gather(rank_stats, local)
-		return reduce_decode_capacity_snapshot(
-			tuple(int(item[0].item()) for item in rank_stats),
-			tuple(int(item[1].item()) for item in rank_stats),
-			world_size=self.world_size,
-			attn_tp_size=self._decode_attn_tp_size(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._snapshot_decode_capacity(
+			self,
 		)
 
 	def _prepare_decode_batch(self) -> List[str]:
@@ -9083,64 +7335,14 @@ class BatchGenWorker:
 	# ============ Batch Statistics ============
 
 	def _log_batch_statistics(self) -> None:
-		"""
-		Log statistics about the completed batch including:
-		- Global batch size
-		- Prompt lengths: min, max, mean, median, P95, P99
-		- Decoded token lengths: min, max, mean, median, P95, P99
-
-		Only called from rank 0.
-		"""
-		if self.global_batch is None:
-			return
-
-		# Gather all sequences
-		prompt_lengths = []
-		decoded_lengths = []
-		for seq in self.global_batch:
-			prompt_lengths.append(seq.prompt_length)
-			decoded_lengths.append(seq.decoded_length)
-
-		if not prompt_lengths:
-			logging.info("[BATCH STATS] No sequences in batch.")
-			return
-
-		# Convert to numpy for statistics
-		prompt_arr = np.array(prompt_lengths)
-		decoded_arr = np.array(decoded_lengths)
-
-		# Compute statistics
-		def compute_stats(arr: np.ndarray) -> dict:
-			return {
-				'min': int(np.min(arr)),
-				'max': int(np.max(arr)),
-				'mean': float(np.mean(arr)),
-				'median': float(np.median(arr)),
-				'p95': float(np.percentile(arr, 95)),
-				'p99': float(np.percentile(arr, 99)),
-			}
-
-		prompt_stats = compute_stats(prompt_arr)
-		decoded_stats = compute_stats(decoded_arr)
-		batch_size = len(prompt_lengths)
-
-		# Log formatted output
-		logging.info(
-			f"\n{'='*60}\n"
-			f"BATCH STATISTICS\n"
-			f"{'='*60}\n"
-			f"  Global Batch Size: {batch_size}\n"
-			f"\n"
-			f"  Prompt Lengths:\n"
-			f"    Min: {prompt_stats['min']:,}  Max: {prompt_stats['max']:,}\n"
-			f"    Mean: {prompt_stats['mean']:,.1f}  Median: {prompt_stats['median']:,.1f}\n"
-			f"    P95: {prompt_stats['p95']:,.1f}  P99: {prompt_stats['p99']:,.1f}\n"
-			f"\n"
-			f"  Decoded Token Lengths:\n"
-			f"    Min: {decoded_stats['min']:,}  Max: {decoded_stats['max']:,}\n"
-			f"    Mean: {decoded_stats['mean']:,.1f}  Median: {decoded_stats['median']:,.1f}\n"
-			f"    P95: {decoded_stats['p95']:,.1f}  P99: {decoded_stats['p99']:,.1f}\n"
-			f"{'='*60}"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._log_batch_statistics(
+			self,
 		)
 
 	# ============ Main Generation Loop ============
@@ -9197,42 +7399,29 @@ class BatchGenWorker:
 		local_bsz: int,
 		global_bsz: int,
 	) -> bool:
-		"""Start a batch-debug-gated nsys prefill capture window."""
-		debug = self._batchgen_debug or {}
-		if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
-			return False
-
-		torch.cuda.synchronize(self.torch_device)
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
-		if self.rank == 0:
-			logging.info(
-				"[NSYS_PREFILL_PROFILE] starting cuda profiler capture "
-				"global_bsz=%s",
-				global_bsz,
-			)
-			torch.cuda.cudart().cudaProfilerStart()
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
-		torch.cuda.nvtx.range_push(
-			f"BatchGen_prefill_rank_{self.rank}_local_bsz_{local_bsz}"
-			f"_global_bsz_{global_bsz}"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._nsys_prefill_profile_begin(
+			self,
+			local_bsz=local_bsz,
+			global_bsz=global_bsz,
 		)
-		return True
 
 	def _nsys_prefill_profile_end(self, active: bool) -> None:
-		"""Finish one batch-debug-gated nsys prefill capture window."""
-		if not active:
-			return
-		torch.cuda.nvtx.range_pop()
-		torch.cuda.synchronize(self.torch_device)
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
-		if self.rank == 0:
-			logging.info("[NSYS_PREFILL_PROFILE] stopping cuda profiler capture")
-			torch.cuda.cudart().cudaProfilerStop()
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._nsys_prefill_profile_end(
+			self,
+			active,
+		)
 
 	def _nsys_decode_profile_begin_forward(
 		self,
@@ -9241,36 +7430,18 @@ class BatchGenWorker:
 		local_bsz: int,
 		max_rank_bsz: int,
 	) -> Optional[int]:
-		"""Start an env-gated nsys decode-forward capture window."""
-		if not BATCHGEN_NSYS_DECODE_PROFILE:
-			return None
-		self._nsys_decode_profile_forward_count += 1
-		forward_idx = self._nsys_decode_profile_forward_count
-		if forward_idx > BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT:
-			return None
-
-		if (
-			self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
-			and not self._nsys_decode_profile_started
-		):
-			torch.cuda.synchronize(self.torch_device)
-			logging.info(
-				"[NSYS_DECODE_PROFILE] rank=%s starting cuda profiler capture "
-				"limit=%s controller_ranks=%s",
-				self.rank,
-				BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT,
-				sorted(BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS),
-			)
-			torch.cuda.cudart().cudaProfilerStart()
-			self._nsys_decode_profile_started = True
-
-		range_name = (
-			f"BatchGen_decode_forward_{forward_idx}"
-			f"_rank_{self.rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
-			f"_iter_{local_iteration}"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._nsys_decode_profile_begin_forward(
+			self,
+			local_iteration=local_iteration,
+			local_bsz=local_bsz,
+			max_rank_bsz=max_rank_bsz,
 		)
-		torch.cuda.nvtx.range_push(range_name)
-		return forward_idx
 
 	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
 		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: after 3
@@ -9329,154 +7500,40 @@ class BatchGenWorker:
 					logging.warning("[K3_DECODE_PROFILE] trace export failed: %s", exc)
 
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
-		"""End one env-gated nsys decode-forward range and optionally exit."""
-		if forward_idx is None:
-			return
-		torch.cuda.nvtx.range_pop()
-		if forward_idx < BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT:
-			return
-
-		torch.cuda.synchronize(self.torch_device)
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
-		if (
-			self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
-			and not self._nsys_decode_profile_stopped
-		):
-			logging.info(
-				"[NSYS_DECODE_PROFILE] rank=%s stopping cuda profiler capture "
-				"after %s decode forwards",
-				self.rank,
-				forward_idx,
-			)
-			torch.cuda.cudart().cudaProfilerStop()
-			self._nsys_decode_profile_stopped = True
-		if dist.is_available() and dist.is_initialized():
-			dist.barrier()
-
-		if BATCHGEN_NSYS_DECODE_PROFILE_EXIT:
-			# Local: only this diagnostic exit needs it.
-			from batchgen.eventlog.process import exit_process
-
-			logging.info(
-				"[NSYS_DECODE_PROFILE] rank=%s exiting after %s profiled decode forwards",
-				self.rank,
-				forward_idx,
-			)
-			exit_process(0, "nsys profile exit")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._nsys_decode_profile_end_forward(
+			self,
+			forward_idx,
+		)
 
 	def _ensure_pynccl_communicator(self) -> None:
-		"""Create the PyNccl communicator unless every rank already holds one.
-
-		Collective and idempotent: the need-init vote, the port broadcast and
-		the pre-TCPStore barrier are all torch.distributed collectives, so every
-		rank must call this together. Once all ranks have a communicator the
-		vote fails and nothing is created.
-		"""
-		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") != "0":
-			return
-
-		# Verify rank consistency
-		if dist.is_initialized():
-			assert self.rank == dist.get_rank(), \
-				f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
-
-		# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
-		if self.world_size == 1:
-			logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
-			return
-
-		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-
-		# Coordinate PyNccl initialization across all ranks
-		# Use all_reduce to check if ANY rank needs to (re)init the communicator
-		need_init = 1 if self.comm is None else 0
-		need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
-		dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
-		any_rank_needs_init = need_init_tensor.item() > 0
-
-		if not any_rank_needs_init:
-			return
-
-		# All ranks must participate in init - destroy any existing comm first
-		if self.comm is not None:
-			logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
-			try:
-				self.comm.destroy()
-			except Exception:
-				pass
-			self.comm = None
-			if hasattr(self, '_nccl_group') and self._nccl_group is not None:
-				del self._nccl_group
-				self._nccl_group = None
-
-		device = torch.device("cuda", self.local_rank)
-
-		if comm_master_addr is None:
-			logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-		elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-			# Rank 0 finds an available port, then broadcasts to all ranks
-			selected_port = self._nccl_port
-			if self.rank == 0:
-				try:
-					selected_port = self._find_available_pynccl_port(
-						comm_master_addr,
-						self._nccl_port,
-					)
-					logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl")
-				except RuntimeError as e:
-					logging.error(f"Rank 0: Failed to find available port: {e}")
-					selected_port = -1
-
-			# Broadcast the chosen port from rank 0 to all ranks
-			port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
-			dist.broadcast(port_tensor, src=0)
-			self._nccl_port = port_tensor.item()
-			if self._nccl_port < 0:
-				raise RuntimeError(
-					"No available port remains in this runtime's PyNccl range"
-				)
-
-			# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-			# is ready before other ranks try to connect. Different ranks may reach
-			# this point at very different times due to tokenization workload.
-			logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
-			dist.barrier()
-
-			try:
-				logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
-
-				# Store group separately so we can properly destroy it on reinit
-				self._nccl_group = StatelessProcessGroup.create(
-					host=comm_master_addr,
-					port=self._nccl_port,
-					rank=self.rank,
-					world_size=self.world_size,
-					data_expiration_seconds=36000,  # 10 hours
-				)
-				self.comm = PyNcclCommunicator(
-					group=self._nccl_group,
-					device=device
-				)
-				# Only rank 0 logs at INFO level to reduce verbosity
-				if self.rank == 0:
-					logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
-				else:
-					logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
-			except Exception as e:
-				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._ensure_pynccl_communicator(
+			self,
+		)
 
 	def _find_available_pynccl_port(self, host: str, start_port: int) -> int:
-		end_port = self.pynccl_port_base + self.pynccl_port_span
-		start_port = max(start_port, self.pynccl_port_base)
-		remaining = end_port - start_port
-		if remaining <= 0:
-			raise RuntimeError(
-				"PyNccl port range exhausted: "
-				f"[{self.pynccl_port_base}, {end_port})"
-			)
-		return _find_available_port(host, start_port, remaining)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._find_available_pynccl_port(
+			self,
+			host,
+			start_port,
+		)
 
 	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
 		"""Collect every region before allocating GPU pages or publishing L."""
@@ -9491,7 +7548,7 @@ class BatchGenWorker:
 		# This is the same split used by _initialize_gpu_kv_manager_fixed_size:
 		# all regions have equal page counts, each page spans its physical layers.
 		gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
-		node = self.rank // self.local_world_size
+		node = node_of_rank(self.rank, self.local_world_size)
 		capacities = []
 		host_views = self._host_views_by_group()
 		for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
@@ -9527,42 +7584,15 @@ class BatchGenWorker:
 		self._deployment_length_verified = True
 
 	def prepare_deployment(self) -> None:
-		"""Resolve and verify L against decode residency before worker readiness.
-
-		The measured provisional budget is retained for every model and mode;
-		it reserves the configured fraction's slack for later allocations.
-		Both lifecycles probe the startup decode transient at the per-rank cap
-		right after the pool is sized (``_probe_startup_transient``); it is
-		published, not yet reserved.
-
-		On the default lifecycle a decode instance the strategy manager keeps
-		across the switch to prefill has its decode graphs captured here,
-		inside that probe and before readiness
-		(``_startup_decode_graph_capture``); every later activation replays
-		them. An instance the manager rebuilds per phase captures at its
-		decode configure.
-		"""
-		with self._startup_phase("model-build"):
-			if not self._core_initialized:
-				self.Init(None, 1, 0)
-		with self._startup_phase("communicator-init"):
-			self._ensure_pynccl_communicator()
-		with self._startup_phase("decode-shard-build"):
-			if self._persistent_phase_enabled():
-				self._build_persistent_phase_instances()
-			else:
-				prefill_key = self._desired_phase_key("prefill")
-				self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
-				self._load_decode_model(comm=self.comm)
-				self._init_gpu_kv_with_actual_size()
-				self._probe_startup_transient(
-					seam=_startup_transient.SEAM_DEPLOYMENT_PREPARE,
-					capture=self._startup_decode_graph_capture(prefill_key),
-				)
-				self._transition_phase(prefill_key)
-				self.set_phase("prefill")
-				self._install_prefill_weight_copy_pipeline(False)
-		logging.info("Deployment max_model_len verified: %s", self.model_context_length)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.prepare_deployment(
+			self,
+		)
 
 	def prepare_kimi_k3_startup(self) -> None:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
@@ -10677,8 +8707,6 @@ class BatchGenWorker:
 				name
 				for name in (
 					"cuda_graph_manager",
-					"glm5_moe_cuda_graph_manager",
-					"glm5_layer_cuda_graph_manager",
 					"whole_model_segment",
 				)
 				if getattr(self._graph, name, None) is not None
@@ -10760,14 +8788,15 @@ class BatchGenWorker:
 		)
 
 	def _verify_manager_phase_contract(self) -> None:
-		"""Refuse service when the active manager misses a required hook."""
-		errors = verify_phase_contract(self.parallel_manager)
-		if errors:
-			raise RuntimeError(
-				f"phase lifecycle contract failed for "
-				f"{type(self.parallel_manager).__name__}: "
-				+ "; ".join(errors)
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._verify_manager_phase_contract(
+			self,
+		)
 
 	def _phase_exit_mode(self, live: PhaseKey, desired: PhaseKey) -> ExitMode:
 		"""Select suspend only when the outgoing instance can resume safely."""
@@ -10792,28 +8821,15 @@ class BatchGenWorker:
 				self.core_engine.reset_decoding_buffer()
 
 	def _release_suspended_decode_kv_pool(self) -> None:
-		"""Return the suspended decode KV pool's physical pages, keep its addresses.
-
-		The decode graphs baked the pool bases, page-pointer tables and
-		page-table storage, so a resumable decode instance must find them at
-		the same virtual addresses; only the physical memory goes back to the
-		driver for the prefill phase, and ``_remap_reused_kv_pool`` maps it
-		again on resume.
-		"""
-		self._assert_kv_pool_addresses_are_fixed("decode->prefill")
-		manager = self.gpu_paged_kv_cache_manager
-		pages = manager.get_stats().num_total_pages if manager is not None else 0
-		start = time.perf_counter()
-		self._destroy_gpu_paged_kv_cache()
-		if manager is not None:
-			logging.info(
-				"[GPU-KV] rank=%d released the reserved KV pool's physical "
-				"pages in %.3fs (%d pages, %.2f GB)",
-				self.rank,
-				time.perf_counter() - start,
-				pages,
-				self.gpu_kv_cache_size_gb,
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_suspended_decode_kv_pool(
+			self,
+		)
 
 	def _transition_phase(
 		self, desired: PhaseKey, *, comm=None, max_num_seq: int | None = None
@@ -10860,14 +8876,15 @@ class BatchGenWorker:
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:
-		if not torch.cuda.is_available():
-			return
-		free_mem, _ = torch.cuda.mem_get_info(self.local_rank)
-		allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
-		reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
-		logging.info(
-			f"[HBM] Rank {self.rank} {when} configure_prefill: "
-			f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._log_prefill_entry_hbm(
+			self,
+			when,
 		)
 
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
@@ -11222,41 +9239,15 @@ class BatchGenWorker:
 			self.core_engine.start_h2d_worker()
 
 	def _max_decode_rank_bsz(self) -> int:
-		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
-		per-node cap when a TP-group model (every rank holds the same rows)
-		plans more slots than the guard — e.g. K3 H200 with sharded latent
-		projections plans 160 rows per node.
-
-		The legacy BATCHGEN_MAX_RANK_BSZ env name sizes the deepseek PSM
-		padding separately; silently diverging values corrupt the padded
-		buffer contract, so both names must agree when both are set."""
-		explicit = os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ")
-		legacy = os.environ.get("BATCHGEN_MAX_RANK_BSZ")
-		if explicit is not None and legacy is not None and explicit != legacy:
-			raise RuntimeError(
-				"BATCHGEN_MAX_DECODE_RANK_BSZ and BATCHGEN_MAX_RANK_BSZ "
-				"must match when both are set"
-			)
-		planned = int(getattr(
-			self.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
-		) or 0)
-		if self._decode_attn_tp_size() > 1 and planned > _MAX_DECODE_RANK_BSZ:
-			return planned
-		if explicit is None and legacy is None:
-			# On a whole-model-graph deployment the bucket flag is the width
-			# knob: raising --cuda-graph-max-bucket-size widens decode with it,
-			# so capture above the admission width cannot exist (the bucket
-			# set and this width share one source). An explicit env cap or a
-			# TP-planner value still wins above.
-			flag_bucket = int(getattr(
-				getattr(self, "args", None), "cuda_graph_max_bucket_size", 0,
-			) or 0)
-			if (
-				flag_bucket > _MAX_DECODE_RANK_BSZ
-				and self._whole_model_decode_graphs_requested()
-			):
-				return flag_bucket
-		return _MAX_DECODE_RANK_BSZ
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._max_decode_rank_bsz(
+			self,
+		)
 
 	def _whole_model_decode_graphs_requested(self) -> bool:
 		"""Whether this deployment requests whole-model decode graphs: GLM-5
@@ -11338,154 +9329,62 @@ class BatchGenWorker:
 		)
 
 	def _log_decode_parameter_residency(self) -> None:
-		"""One-line HBM breakdown of the decode model's resident parameters and
-		buffers by top-level module kind (rank 0, once per decode config), so
-		the non-expert residency — what competes with KV pool and KDA slots
-		for concurrency — is visible next to the resident expert shard line."""
-		model = getattr(self, "model", None)
-		if model is None or not hasattr(model, "named_parameters"):
-			return
-		try:
-			by_kind = {}
-			seen = set()
-			for name, t in list(model.named_parameters()) + list(model.named_buffers()):
-				if not t.is_cuda or t.data_ptr() in seen:
-					continue
-				seen.add(t.data_ptr())
-				parts = name.split(".")
-				kind = parts[0]
-				for i, part in enumerate(parts):
-					if part == "layers" and i + 2 < len(parts):
-						kind = parts[i + 2]
-						break
-					if part in ("embed_tokens", "lm_head", "norm"):
-						kind = part
-						break
-				by_kind[kind] = by_kind.get(kind, 0) + t.numel() * t.element_size()
-			total = sum(by_kind.values())
-			items = sorted(by_kind.items(), key=lambda kv: -kv[1])
-			logging.info(
-				"[HBM] decode parameters/buffers resident on rank %s: %.2f GiB total | %s",
-				self.rank, total / (1024 ** 3),
-				", ".join(f"{k}={v / (1024 ** 3):.2f}" for k, v in items[:12]),
-			)
-		except Exception as e:  # informational only
-			logging.debug("parameter residency breakdown failed: %r", e)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._log_decode_parameter_residency(
+			self,
+		)
 
 	def _remap_reused_kv_pool(self) -> None:
-		"""P->D on the default lifecycle: map the KV pool back where it was.
-
-		``initialize()`` on a reserved-range pool maps fresh physical memory
-		under the SAME virtual addresses, zeroes it the way a freshly built
-		pool hands out zeroed pages, and refreshes the page-pointer tables in
-		place. Nothing is allocated, nothing is sized: the page count is the
-		one the first decode configure measured.
-
-		Called from inside the activation so the pool is live before the
-		capacity snapshot, before decode admission allocates a page and before
-		a captured graph dereferences a pool pointer.
-
-		A decode instance can be built before readiness (Kimi-K3's startup
-		pass), so its first activation precedes the first pool sizing. With no
-		pool ever created in this process there is nothing to remap, and
-		``_init_gpu_kv_with_actual_size()``, which the caller runs next from
-		the decode phase, sizes it. A pool that existed and is gone is a
-		lifecycle bug and still fails here.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			if not self._gpu_kv_pool_created:
-				return
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill->decode activated a reused decode "
-				"instance with no GPU KV manager although this process already "
-				"created a GPU KV pool; the reserved pool must survive every "
-				"phase switch"
-			)
-		self._assert_kv_pool_addresses_are_fixed("prefill->decode")
-		if manager.pool_is_mapped:
-			# decode -> decode returns before the activation, so this is only
-			# reached if a future caller activates an already-active instance.
-			return
-		start = time.perf_counter()
-		manager.initialize()
-		stats = manager.get_stats()
-		logging.info(
-			"[GPU-KV] rank=%d remapped the reserved KV pool in %.3fs (%d pages)",
-			self.rank,
-			time.perf_counter() - start,
-			stats.num_total_pages,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._remap_reused_kv_pool(
+			self,
 		)
 
 	def _assert_kv_pool_addresses_are_fixed(self, context: str) -> None:
-		"""A reused decode instance requires an address-stable KV pool.
-
-		Its captured graphs dereference the pool bases and page-pointer tables
-		recorded at capture time. Releasing an allocator-backed pool under them
-		would hand those addresses to the next allocation and the following
-		replay would read someone else's memory, so an unsupported pool fails
-		the switch instead of silently taking the old destroy/recreate path.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			return
-		if not getattr(manager, "uses_fixed_address_pool", False):
-			raise RuntimeError(
-				f"Rank {self.rank}: {context} switch would release a GPU KV "
-				"pool that is not held at fixed addresses while the decode "
-				"instance is reused; its captured graphs bake the pool "
-				"pointers, so the pool must be a reserved-range pool"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._assert_kv_pool_addresses_are_fixed(
+			self,
+			context,
+		)
 
 	def _assert_kv_region_mapped(self, context: str) -> None:
-		"""Before decode configure and replay the KV pool is mapped.
-
-		Decode admission reads live all-rank capacity through it (#424) and the
-		decode graphs bake its pointers, so the activation maps the pool back
-		before either can run.
-
-		The one exception is a process that has never created a pool: a decode
-		instance built before readiness is activated before the first sizing,
-		which ``_init_gpu_kv_with_actual_size()`` performs right after this
-		check, before admission or capture can read it.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None and not self._gpu_kv_pool_created:
-			return
-		if manager is None or not manager.is_initialized:
-			raise RuntimeError(
-				f"Rank {self.rank}: {context} switch left the GPU KV region "
-				"unmapped while phase instances are reused; decode admission "
-				"reads live capacity through it and the decode graphs bake its "
-				"pointers"
-			)
-		if not manager.pool_is_mapped:
-			raise RuntimeError(
-				f"Rank {self.rank}: {context} switch left the GPU KV pool's "
-				"physical pages unmapped at their reserved addresses; a decode "
-				"replay or capacity read would touch unmapped device memory"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._assert_kv_region_mapped(
+			self,
+			context,
+		)
 
 	def _assert_kv_region_released(self, context: str) -> None:
-		"""After decode->prefill the KV pool's physical pages are back.
-
-		The addresses stay reserved — that is what lets the activation map the
-		same range again — but the pages themselves belong to the prefill phase
-		until then. A pool still mapped here is the cleanup bug this lifecycle
-		exists to avoid: the prefill phase would run with the whole decode KV
-		pool charged against it.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			# Never created: a lifetime whose decode phase has not sized a pool
-			# yet has nothing to release.
-			return
-		if manager.pool_is_mapped:
-			raise RuntimeError(
-				f"Rank {self.rank}: {context} switch left the GPU KV pool "
-				"mapped; prefill needs its physical pages back, and the "
-				"reserved addresses are what make the remap free"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._assert_kv_region_released(
+			self,
+			context,
+		)
 
 	def _request_phase_instance_reuse(self) -> bool:
 		"""Ask the strategy manager to keep this process's phase instances.
@@ -11517,8 +9416,6 @@ class BatchGenWorker:
 			getattr(self._graph, name, None) is not None
 			for name in (
 				"cuda_graph_manager",
-				"glm5_moe_cuda_graph_manager",
-				"glm5_layer_cuda_graph_manager",
 				"whole_model_segment",
 			)
 		)
@@ -11865,193 +9762,73 @@ class BatchGenWorker:
 		self.startup_transient = [item.as_dict() for item in deployment]
 
 	def _mark_phase_end(self, phase: str) -> None:
-		# [phase, running since (None while idle), busy seconds so far]
-		self._phase_end = [phase, time.perf_counter(), 0.0]
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._mark_phase_end(
+			self,
+			phase,
+		)
 
 	def _pause_phase_switch_clock(self) -> None:
-		"""Stop counting while the pool is idle and waits for new admissions."""
-		end = getattr(self, "_phase_end", None)
-		if end is not None and end[1] is not None:
-			end[2] += time.perf_counter() - end[1]
-			end[1] = None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._pause_phase_switch_clock(
+			self,
+		)
 
 	def _resume_phase_switch_clock(self) -> None:
-		end = getattr(self, "_phase_end", None)
-		if end is not None and end[1] is None:
-			end[1] = time.perf_counter()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._resume_phase_switch_clock(
+			self,
+		)
 
 	def _log_phase_memory_ledger(self, label: str) -> None:
-		"""One line per phase-switch stage: who holds device memory right now.
-
-		The rebuild path tears a phase instance down and stages the next one, so
-		"every cycle gives back what it took" is an invariant with no owner: a
-		slice retained per switch only shows up as an OOM several cycles later,
-		at whichever allocation happens to be the largest (the KV pool remap's
-		``cuMemCreate``). Torch's own counters cannot see that slice — the KV
-		pool is CUDA-VMM, the captured graphs own private pools, and the weight
-		buffers are C++ — so the driver's free/total is reported beside them,
-		and the holders that survive a model are named explicitly.
-
-		Cheap: four driver queries and attribute reads, once per switch stage,
-		on rank 0 only. No synchronize (the callers that need one do it) and no
-		``.item()``.
-		"""
-		if self.rank != 0 or not torch.cuda.is_available():
-			return
-		free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
-		gib = 1024 ** 3
-		pm = getattr(self, "parallel_manager", None)
-		kda_slots, kda_live = self._traj.kda_stats()
-		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
-		logging.info(
-			"[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
-			"driver_total=%.2f torch_alloc=%.2f torch_reserved=%.2f "
-			"model=%d pm_model=%d resident_ep=%d sp8_buffer=%d decode_graph=%d "
-			"kv_pool_mapped=%s kda_slots=%d kda_live=%d",
-			self.rank,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._log_phase_memory_ledger(
+			self,
 			label,
-			getattr(self, "_phase_mem_switch_index", 0),
-			(total_bytes - free_bytes) / gib,
-			total_bytes / gib,
-			torch.cuda.memory_allocated(self.local_rank) / gib,
-			torch.cuda.memory_reserved(self.local_rank) / gib,
-			int(getattr(self, "model", None) is not None),
-			int(getattr(pm, "model", None) is not None),
-			int(bool(getattr(pm, "_resident_ep_built", False))),
-			int(getattr(pm, "_streamed_sp8_buffer", None) is not None),
-			int(getattr(pm, "_decode_graph", None) is not None),
-			getattr(gpu_kv, "pool_is_mapped", "na"),
-			kda_slots,
-			kda_live,
 		)
 
 	def _log_phase_switch(self, phase: str) -> None:
-		"""Per-rank busy time from the previous phase's compute end to this phase's start."""
-		previous = getattr(self, "_phase_end", None)
-		self._phase_end = None
-		if previous is None or previous[0] == phase:
-			return
-		seconds = previous[2]
-		if previous[1] is not None:
-			seconds += time.perf_counter() - previous[1]
-		logging.info(
-			"[PHASE_SWITCH] rank=%d direction=%s_to_%s seconds=%.3f persistent=%s",
-			self.rank,
-			previous[0],
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._log_phase_switch(
+			self,
 			phase,
-			seconds,
-			self._persistent_phase_enabled(),
 		)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
-		"""
-		Calculate actual GPU KV size AFTER model loading and initialize the manager.
-		This replaces the theoretical estimation - must be called after _load_decode_model().
-
-		Only runs the full calculation and initialization on the first call;
-		subsequent calls skip if the manager is already initialized.
-		"""
-		# Skip if GPU KV manager is already initialized (subsequent decode iterations)
-		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
-			return
-
-		# The pool is sized from what is free once the decode model is in
-		# place, so sizing it while the prefill phase is still resident
-		# permanently charges that phase's bytes against decode capacity. On
-		# the reuse lifecycle the size is then kept for the whole process,
-		# which is exactly how an earlier startup-time sizing attempt ended up
-		# with roughly half the pages the per-batch path got. Sizing therefore
-		# only happens from the decode phase, after the prefill ring and the
-		# prefill model have been released.
-		if getattr(self, "_phase", None) != "decode":
-			raise RuntimeError(
-				f"Rank {self.rank}: GPU KV pool sizing attempted in phase "
-				f"{self._phase!r}; it must run from the decode phase so the "
-				"measurement cannot charge prefill-only residency against the "
-				"pool it then keeps"
-			)
-
-		# A reserved-range pool is never re-created: its virtual range is still
-		# held and its page count was fixed by the sizing below on the first
-		# decode configure, so a later decode phase maps the same pages back
-		# instead of sizing a second, different pool. The reuse lifecycle has
-		# already remapped inside its activation; this covers a rank that
-		# rebuilds its decode instance, and keeps every rank's num_total_pages
-		# identical, which the cross-rank capacity snapshot requires.
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is not None and getattr(manager, "uses_fixed_address_pool", False):
-			self._remap_reused_kv_pool()
-			return
-
-		# Measure-once-cache: once startup decode residency has been
-		# measured, every later pool (re)creation reuses the cached size —
-		# never a fresh measurement (contract invariant 1: the pool is
-		# identical across decode rounds of the same server).
-		if self._gpu_kv_cached_pool_gb is not None:
-			self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
-			# The previous pool's segments already returned to CUDA at destroy
-			# (dedicated MemPool, whole-segment free). This flushes the
-			# GENERAL cache's all-free segments (prefill transients) too, so
-			# the full-size cudaMalloc below sees the maximum free memory. The
-			# collection first drops tensors still held only by cycles, so
-			# empty_cache can return their segments.
-			torch.cuda.synchronize(self.torch_device)
-			gc.collect()
-			torch.cuda.empty_cache()
-			# Later residency may consume the fraction's reserved slack, but
-			# the verified pool itself must still fit. Name any shortfall
-			# instead of silently shrinking the deployment's capacity.
-			free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
-			KVCacheManager.check_cached_pool_fits(
-				self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
-			)
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
-					f"(startup budget; {free_mem_gb:.2f} GB free)"
-				)
-			self._initialize_gpu_kv_manager_fixed_size()
-			if self.rank == 0:
-				stats = self.gpu_paged_kv_cache_manager.get_stats()
-				logging.info(
-					f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, "
-					f"{stats.num_total_pages} pages"
-				)
-			return
-
-		# First startup decode entry: measure after weights are resident. The
-		# remaining fraction is reserved for graph and eager allocations; it
-		# is not counted as KV capacity. Every later entry uses the cache.
-		torch.cuda.synchronize(self.torch_device)
-		torch.cuda.empty_cache()
-
-		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
-		free_mem_gb = free_mem_bytes / (1024 ** 3)
-		total_mem_gb = total_mem_bytes / (1024 ** 3)
-		used_mem_gb = total_mem_gb - free_mem_gb
-
-		local_pool_gb = KVCacheManager.provisional_pool_gb(
-			total_mem_gb, used_mem_gb, self.gpu_memory_frac
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._init_gpu_kv_with_actual_size(
+			self,
 		)
-		self._verify_deployment_max_model_len(local_pool_gb)
-		# Identical page counts are required by decode admission. The tightest
-		# rank supplies the common pool, rather than rank zero's residency.
-		size_tensor = torch.tensor([local_pool_gb], dtype=torch.float64, device=self.torch_device)
-		dist.all_reduce(size_tensor, op=dist.ReduceOp.MIN)
-		self.gpu_kv_cache_size_gb = float(size_tensor.item())
-		# Freeze the measured startup pool for every mode before capture. A
-		# lazy capture must not change it after L has been published. The
-		# fraction's slack covers graph/eager allocations until startup can
-		# measure those allocations at the per-rank cap.
-		self._gpu_kv_sizing_provisional = False
-
-		# Initialize GPU KV manager with actual size
-		self._initialize_gpu_kv_manager_fixed_size()
-		self._gpu_kv_cached_pool_gb = self.gpu_kv_cache_size_gb
-
-		if self.rank == 0:
-			stats = self.gpu_paged_kv_cache_manager.get_stats()
-			logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
 
 	def _config_decoding_for_batch(
 		self,
@@ -12327,71 +10104,49 @@ class BatchGenWorker:
 					manager.rebuild_page_table(remaining_global_ids)
 
 	def _emit_prefix_cache_metric(self, phase: str, **fields) -> None:
-		if not self.prefix_cache_debug_stats:
-			return
-		from batchgen.prefix_reuse.metrics import emit_prefix_cache_metric
-
-		emit_prefix_cache_metric(
-			phase=phase,
-			rank=self.rank,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._emit_prefix_cache_metric(
+			self,
+			phase,
 			**fields,
 		)
 
 	def _host_views_by_group(self) -> dict:
-		"""One Host-KV worker view per prefix-cache KV group.
-
-		A DSA model keeps group 0 (MLA latent) in the primary region and group 1
-		(indexer keys) in the auxiliary one, so every prefix-cache Host page
-		operation has to run on both. Every other model has one region.
-		"""
-		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
-			views = self.host_paged_kv_worker_view.views_by_group()
-		else:
-			view = getattr(self, "host_paged_kv_worker_view", None)
-			if view is None:
-				view = self.core_engine.host_paged_kv_worker_view
-			views = {0: view}
-		runtime = self.prefix_cache_runtime_config
-		if runtime is not None and len(runtime.group_specs) != len(views):
-			raise RuntimeError(
-				"prefix cache groups do not match the Host KV regions: "
-				f"groups={len(runtime.group_specs)}, views={len(views)}"
-			)
-		return views
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._host_views_by_group(
+			self,
+		)
 
 	def _prefix_host_resource_fields(self) -> dict[str, int]:
-		from batchgen.prefix_reuse.metrics import host_resource_fields
-
-		return host_resource_fields(
-			coordinator=self.prefix_cache_coordinator,
-			worker_view=self.core_engine.host_paged_kv_worker_view,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._prefix_host_resource_fields(
+			self,
 		)
 
 	def _maybe_emit_prefix_drain_metric(self) -> None:
-		"""Emit one prefix_drain row when the live sequence set drains to empty.
-
-		Called from _report_completion, which every completion path runs after
-		the sequence reached COMPLETED and its Host pages and prefix
-		attachments were released, so the row records active_attachments at the
-		drain moment. Live means any status other than COMPLETED: a QUEUEING,
-		IN_PREFILL, PREFILLED, IN_DECODE, ON_HOLD or EVICTED sequence can still
-		hold or regain an attachment. Edge-triggered: one row per drain,
-		re-armed by _admit_sequences_from_message.
-		"""
-		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
-			return
-		if self._prefix.prefix_drain_metric_emitted:
-			return
-		if not self.global_batch.all_completed():
-			return
-		self._prefix.prefix_drain_metric_emitted = True
-		self._emit_prefix_cache_metric(
-			"prefix_drain",
-			**self._prefix_host_resource_fields(),
-			# M3 Slice 2: live attachments must be zero at the drain, beside
-			# the coordinator's own active_attachments. Absent on a run that
-			# never turned the trajectory flag on.
-			**self._trajectory_restore_fields(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._maybe_emit_prefix_drain_metric(
+			self,
 		)
 
 	def _close_prefix_materialization(
@@ -12442,168 +10197,95 @@ class BatchGenWorker:
 	# ============ IN-WAVE PREFIX POOL (batchgen/prefix_reuse) ============
 
 	def _prefill_prefix_pool_enabled(self) -> bool:
-		"""In-wave prefix pool: prefix caching on, planner workspace set, pure DP prefill."""
-		workspace = self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
-		if not self.enable_prefix_cache:
-			return False
-		from batchgen.prefix_reuse.config import PrefixKVGroupSemantic
-		if any(
-			spec.semantic is not PrefixKVGroupSemantic.FULL_KV
-			for spec in self.prefix_cache_runtime_config.group_specs
-		) and (workspace <= 0 or getattr(self, "_prefix_integrity", False)):
-			# Only the pool path serves MLA-latent prefix reuse (GLM DSA, Kimi-K3);
-			# the cross-wave materialization path handles one full-K/V group.
-			raise RuntimeError(
-				"MLA-latent prefix reuse needs the prefill prefix pool, but this "
-				"model's planner sets no pool workspace or the integrity check is on"
-			)
-		if workspace <= 0 or getattr(self, "_prefix_integrity", False):
-			return False
-		if (
-			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-			and self.parallel_manager.prefill_uses_resident_ep()
-		) or (
-			self._decode_attn_tp_size() != 1
-			and not self._pool_prefill_group_safe()
-		):
-			raise RuntimeError(
-				"the prefill prefix pool runs per DP rank; this model's prefill "
-				"joins cross-rank collectives"
-			)
-		return True
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_prefix_pool_enabled(
+			self,
+		)
 
 	def _pool_prefill_group_safe(self) -> bool:
-		"""Whether the PSM plans ONE identical pool wave per serve group (G>1).
-
-		At G>1 a sequence is replicated onto all G ranks of its serve group and
-		every one of them prefills it, so the pool is safe only when the whole
-		group runs the same chunks in the same order — the per-layer collectives
-		then still pair up. The PSM declares that; the resident-EP refusal above
-		stands either way, since those passes join EP-world collectives.
-		"""
-		declares = getattr(
-			self.parallel_manager, "supports_group_pool_prefill", None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._pool_prefill_group_safe(
+			self,
 		)
-		return declares is not None and bool(declares())
 
 	def _prefill_pool_group(self):
-		"""The process group a pool wave must be identical over; None at G==1."""
-		if self._decode_attn_tp_size() <= 1:
-			return None
-		group = getattr(self.parallel_manager, "attn_tp_group", None)
-		if group is None:
-			raise RuntimeError(
-				"the prefill prefix pool at attn_tp_size>1 needs the attention "
-				"TP process group to plan one wave per serve group"
-			)
-		return group
-
-	def _prefill_pool_free_state_slots(self) -> int:
-		"""Free recurrent-state slots, or -1 when the model keeps no such state.
-
-		A pooled segment runs as a row of its own under a pseudo sequence id, so
-		it holds one slot for the whole wave on top of the wave's sequences.
-		"""
-		manager = self._traj.kda_state_manager()
-		if manager is None:
-			return -1
-		return int(manager.get_stats().num_free_state_items)
-
-	def _next_pool_segment_sid(self) -> int:
-		"""Negative Host sequence ids, rank-strided so no two ranks collide."""
-		return self._prefix.next_pool_segment_sid()
-
-	def _prefix_rank_packing_mode(self, seqs) -> bool:
-		"""True when this batch asked for the predicted-time wave packer."""
-		active_debug = getattr(self, "_active_batchgen_debug_for_sequences", None)
-		debug = (active_debug(seqs) if active_debug is not None else None) or {}
-		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
-
-	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
-		"""``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
-
-		Scoring the packer's targets by predicted seconds and balancing their
-		computed tokens are the two arms of the packing comparison, and the
-		difference between them is a wall time: measuring it across two servers
-		would confound it with cold-start, allocator and JIT state, so the arm
-		has to be switchable inside one process. Batch level and nothing else:
-		the key rides the same admitted-batch broadcast as
-		``prefix_rank_assignment_mode``, so every rank of every group resolves
-		the same value and the packing stays replicated. Set it on EVERY
-		request of a corpus — ``_active_batchgen_debug_for_sequences`` merges
-		per-sequence dicts first-non-None-wins, exactly as the mode key does.
-
-		Only the two spellings are accepted; a mistyped value is refused rather
-		than read as "on", because a silently ignored arm switch would make the
-		two arms the same run.
-		"""
-		active = getattr(self, "_active_batchgen_debug_for_sequences", None)
-		debug = (active(seqs) if active is not None else None) or {}
-		value = debug.get("prefix_rank_cost_profile")
-		if value is None:
-			return False
-		if isinstance(value, str):
-			text = value.strip().lower()
-			if text == "off":
-				return True
-			if text == "on":
-				return False
-		raise ValueError(
-			"batchgen_debug.prefix_rank_cost_profile must be 'on' or 'off', "
-			f"got {value!r}"
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_group(
+			self,
 		)
 
-	def _cached_prefix_rank_cost_profile(self, disabled: bool = False):
-		"""This deployment's prefill executor cost profile, looked up once.
+	def _prefill_pool_free_state_slots(self) -> int:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_free_state_slots(
+			self,
+		)
 
-		Model, device properties and parallel layout are deployment constants,
-		so every packer call site shares one lookup. ``None`` is a valid result:
-		no profile matches, and the packer then balances computed tokens. A
-		profile scores one serve group, so it is keyed by the group size too.
+	def _next_pool_segment_sid(self) -> int:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._next_pool_segment_sid(
+			self,
+		)
 
-		Every rank must resolve the same profile, or ranks pack differently.
-		Device 0 stands for the node, not this rank's own device, and
-		cross-node GPU homogeneity is a deployment precondition that the launch
-		identity gate verifies; no collective is run here. Each rank logs what
-		it resolved, so a divergence is visible in the logs.
+	def _prefix_rank_packing_mode(self, seqs) -> bool:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefix_rank_packing_mode(
+			self,
+			seqs,
+		)
 
-		The cache is keyed by ``disabled``, not a single attribute: the A/B
-		switch is batch level, so one process serves both arms, and a lookup
-		cached under whichever arm arrived first would pin every later batch to
-		it. ``disabled`` resolves to ``None`` — the same value as "no profile
-		matches", which is exactly the fallback arm the packer already has.
-		"""
-		if not hasattr(self, "_prefix_rank_cost_profiles"):
-			self._prefix_rank_cost_profiles = {}
-		key = bool(disabled)
-		if key not in self._prefix_rank_cost_profiles:
-			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
+	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefix_rank_cost_profile_disabled(
+			self,
+			seqs,
+		)
 
-			G = self._decode_attn_tp_size()
-			group_size = G if G > 1 else 1
-			if key:
-				profile = None
-			else:
-				props = torch.cuda.get_device_properties(0)
-				profile = find_executor_cost_profile(
-					self.model_name or "",
-					(props.major, props.minor),
-					props.total_memory,
-					self.world_size,
-					group_size,
-				)
-			self._prefix_rank_cost_profiles[key] = profile
-			logging.info(
-				"[PREFIX_PACK] rank %d executor cost profile: model=%s "
-				"group_size=%d disabled=%d -> %s",
-				self.rank,
-				(self.model_name or "").lower().rsplit("/", 1)[-1],
-				group_size,
-				int(key),
-				"none" if profile is None
-				else f"{profile.model}/{profile.machine}/g{profile.group_size}",
-			)
-		return self._prefix_rank_cost_profiles[key]
+	def _cached_prefix_rank_cost_profile(self, disabled: bool=False):
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._cached_prefix_rank_cost_profile(
+			self,
+			disabled,
+		)
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
@@ -12828,855 +10510,190 @@ class BatchGenWorker:
 				)
 
 	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
-		"""``(hits, confirmed, pages, drops)`` for this wave's trajectory re-entries.
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._materialized_prefix_hits(
+			self,
+			seqs,
+			page_tokens=page_tokens,
+			group=group,
+		)
 
-		M3 Slice 3, the plan input. EVERY rank of a serve group must derive
-		the SAME hit set BEFORE planning, or two ranks pack different chunks
-		of the per-layer collectives that pair them up. So the set is read
-		from the MIRRORED session index -- replicated read-only data every
-		rank folded from the same gather -- and never from the frontier
-		registry, which only the group's host-KV leader holds. At G==1 a rank
-		is its own group, and its own live attachments are that same data.
-
-		``confirmed`` is this rank's vote on whether the mirrored set is still
-		true. The index distributes on the prefill-config mirror, so it lags a
-		commit by one flag-on pass (Slice 3a addendum): a session that has
-		advanced or been evicted since would otherwise be materialized from
-		pages nobody holds any more. The leader compares the mirrored boundary
-		against the record it is holding a reference on; a rank with no
-		opinion votes yes and the group reduces with MIN, so one leader's
-		"no" takes the whole group back to recomputing.
-
-		``pages`` maps a hit's wave index to the frontier's resident Host
-		pages per KV group -- known only to the leader, which mirrors them to
-		the group inside this same pass.
-
-		``drops`` maps the wave index of every row this pass found a reason
-		NOT to plan to that reason, so the plan can decline the row's restore
-		by name. Only a rank holding the row's live attachment acts on it.
-
-		The ``attached_tokens < boundary`` veto stays: the frontier record's
-		reference pins only its snapshot and registry entry, while the MLA
-		pages ``[0, boundary)`` the load reads are kept resident by the row's
-		own prefix-cache attachment alone (an eviction under a referenced
-		record releases the pages first and only then refuses the record).
-		"""
-		from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
-
-		if not self._trajectory_commit_requested(seqs):
-			return [], True, {}, {}
-		digest = self.prefix_cache_runtime_config.namespace_digest
-		index = self._traj.trajectory_session_groups
-		hits: List[MaterializedPrefix] = []
-		pages: Dict[int, Dict[int, List[int]]] = {}
-		drops: Dict[int, str] = {}
-		confirmed = True
-		unknown = 0
-		for position, seq in enumerate(seqs):
-			if seq is None:
-				continue
-			attachment = self._traj.trajectory_attachments.get(int(seq.global_idx))
-			if group is None:
-				# Own group: no peer to agree with, so the live record is the
-				# only truth there is.
-				if attachment is None:
-					unknown += 1
-					continue
-				boundary = int(attachment.boundary_tokens)
-				entry_group = int(attachment.owning_group_id)
-			else:
-				entry = None if index is None else index.resolve(
-					namespace_digest=digest,
-					prompt_token_ids=self._trajectory_tokens(
-						seq, length=seq.prompt_length
-					).tolist(),
-				)
-				if entry is None:
-					unknown += 1
-					drops[position] = (
-						"the mirrored session index does not place this session"
-					)
-					continue
-				boundary = int(entry.boundary_tokens)
-				entry_group = int(entry.owning_group_id)
-			reason = self._unmaterializable_frontier(
-				seq, boundary=boundary, owning_group_id=entry_group,
-				page_tokens=page_tokens,
-			)
-			if reason is not None:
-				logging.info(
-					"[PREFIX_POOL] Rank %s sequence %s continues a frontier at "
-					"%s token(s) the pool cannot materialize (%s); it is "
-					"prefilled in full",
-					self.rank, int(seq.global_idx), boundary, reason,
-				)
-				drops[position] = f"the pool cannot materialize it ({reason})"
-				continue
-			hits.append(MaterializedPrefix(index=position, tokens=boundary))
-			if attachment is None:
-				if self._owns_host_kv(seq):
-					# This rank holds the registry the index came from and has
-					# no live record for it: the mirror is stale.
-					logging.warning(
-						"[PREFIX_POOL] Rank %s holds no live frontier for "
-						"sequence %s, which the mirrored session index places "
-						"at boundary %s; the group recomputes this wave",
-						self.rank, int(seq.global_idx), boundary,
-					)
-					confirmed = False
-				continue
-			if int(attachment.boundary_tokens) != boundary:
-				logging.warning(
-					"[PREFIX_POOL] Rank %s holds sequence %s's frontier at "
-					"boundary %s but the mirrored index says %s; the group "
-					"recomputes this wave",
-					self.rank, int(seq.global_idx),
-					int(attachment.boundary_tokens), boundary,
-				)
-				drops[position] = (
-					f"the live frontier is at boundary "
-					f"{int(attachment.boundary_tokens)} but the mirrored index "
-					f"says {boundary}"
-				)
-				confirmed = False
-				continue
-			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
-			attached = 0 if state is None else int(state.attached_tokens)
-			if attached < boundary:
-				# The resident pages the load reads are kept resident by this
-				# sequence's own prefix-cache attachment, so that attachment
-				# must already cover the frontier. It normally covers more (the
-				# lookup attaches the longest resident prefix); less means the
-				# cache does not in fact hold what the index advertised.
-				logging.warning(
-					"[PREFIX_POOL] Rank %s: sequence %s holds %s attached "
-					"prefix token(s), fewer than the %s-token frontier the "
-					"index advertised; the group recomputes",
-					self.rank, int(seq.global_idx), attached, boundary,
-				)
-				drops[position] = (
-					f"its prefix-cache attachment covers {attached} token(s), "
-					f"short of the {boundary}-token frontier it must keep "
-					"resident"
-				)
-				confirmed = False
-				continue
-			record_pages = {
-				int(group_id): [int(page) for page in page_ids]
-				for group_id, page_ids in
-				attachment.record.page_ids_by_group.items()
-			}
-			if not record_pages:
-				logging.warning(
-					"[PREFIX_POOL] Rank %s: sequence %s's frontier record "
-					"names no resident Host page; the group recomputes",
-					self.rank, int(seq.global_idx),
-				)
-				drops[position] = "its frontier record names no resident Host page"
-				confirmed = False
-				continue
-			pages[position] = record_pages
-		if unknown:
-			# A fresh (turn-1) prompt legitimately continues nothing, so this
-			# is one aggregate line, not a per-sequence warning. It exists so
-			# a wave whose EVERY continuation misses -- the mirrored index
-			# lagging its leader's registry -- is visible in the log instead
-			# of silently planning an unpooled wave.
-			logging.info(
-				"[PREFIX_POOL] Rank %s: %s of %s flag-on sequence(s) continue "
-				"no session known to %s; they are prefilled in full",
-				self.rank, unknown, len(seqs),
-				"this rank's live attachments" if group is None
-				else "the mirrored session index",
-			)
-		return hits, confirmed, pages, drops
-
-	def _unmaterializable_frontier(
-		self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
-	) -> Optional[str]:
-		"""Why this frontier cannot become a pool segment, or None.
-
-		Each reason is a property of the wave, identical on every rank that
-		derived the same hit, so skipping on it keeps the plans identical.
-		"""
-
-		if boundary <= 0 or boundary % int(page_tokens):
-			return "boundary_off_the_page_grid"
-		if boundary > int(seq.prompt_length) - 1:
-			# The last prompt token must stay private: it produces the logit.
-			return "no_private_token_left"
-		if int(seq.decode_dp_group or 0) != int(owning_group_id):
-			# The snapshot is head-sharded for the owning group, so a
-			# sequence serving elsewhere could not restore its state.
-			return "serving_group_is_not_the_owning_group"
-		return None
+	def _unmaterializable_frontier(self, seq, *, boundary: int, owning_group_id: int, page_tokens: int) -> Optional[str]:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._unmaterializable_frontier(
+			self,
+			seq,
+			boundary=boundary,
+			owning_group_id=owning_group_id,
+			page_tokens=page_tokens,
+		)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
-		"""Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
-		the prefill phase (`_construct_prefill_pool`), after configure_prefill
-		settles the device layout.
-
-		A prompt re-entering after eviction is planned like any other: its
-		reconstructed tokens are its prompt. A pooled member's cross-wave
-		lookup hit is released and its chain recomputed in-wave; when this
-		returns None the wave keeps its lookup hits (the caller releases them
-		for a model whose reuse only the pool can serve).
-
-		The page budget is the prefill-phase free memory measured after the
-		previous configure_prefill — a deployment constant, so the first wave
-		after startup runs unpooled and seeds the measurement.
-
-		At G>1 every rank of the serve group runs this over the same sequences
-		and must come out with the same plan: the page and state-slot budgets
-		are reduced to the group MIN and the plan digest is compared inside the
-		group, so every early return and every chunk is group-identical.
-
-		The plan is also the trajectory RESTORE decision: a row whose frontier
-		it materializes carries ``trajectory_restore_boundary`` and starts its
-		compute exactly there; every other live trajectory attachment of the
-		wave is declined here, at plan time, with the reason it was dropped
-		(``_settle_trajectory_restore_plan``) -- on every return path.
-		"""
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
-		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
-		from batchgen.prefix_reuse.pool import scratch_pages_bound
-		from batchgen.prefix_reuse.wave_plan import (
-			plan_wave_prefix_sharing,
-			validate_wave_prefix_plan,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._plan_prefill_pool_wave(
+			self,
+			uuids,
+			prefix_states,
 		)
-		from batchgen.prefix_reuse.wave_runtime import PoolWave
-
-		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
-		total_pages = self._prefill_pool_page_budget
-		if total_pages is None:
-			# Budget seeding is part of configure_prefill, which every rank of
-			# a wave runs in the same step, so an unmeasured budget is
-			# group-uniform. Declining before the group lookup also keeps the
-			# first wave off attn_tp_group, which the PSM publishes only once
-			# prefill has configured.
-			logging.info(
-				"[PREFIX_POOL] Rank %s first wave keeps the existing path: "
-				"prefill-phase pool budget not yet measured",
-				self.rank,
-			)
-			self._settle_trajectory_restore_plan(
-				seqs, {}, "the prefill-phase pool budget is not yet measured"
-			)
-			return None
-		group = self._prefill_pool_group()
-		prompts = [
-			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
-			for seq in seqs
-		]
-		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
-		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-		batching = self.engine_config.Module_Batching_Config
-		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
-		state_slots = self._prefill_pool_free_state_slots()
-		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
-		# replicated data so every rank of the group has the same set, plus
-		# this rank's vote on whether that set is still live.
-		hits, hits_confirmed, hit_pages, drops = self._materialized_prefix_hits(
-			seqs, page_tokens=page_tokens, group=group
-		)
-		if group is not None:
-			# Reached by every rank of the group (uuids is the group's sequence
-			# set): the tightest rank's budget is the group's, so the identical
-			# prompts then give every rank the identical plan. The
-			# materialization vote rides the SAME reduce -- it decides the
-			# plan, so it has to be settled before the plan is built, and a
-			# second collective here would be a second place to diverge.
-			budget = torch.tensor(
-				[total_pages, state_slots, 1 if hits_confirmed else 0],
-				dtype=torch.int64,
-				device=self.torch_device,
-			)
-			dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)
-			total_pages = int(budget[0].item())
-			state_slots = int(budget[1].item())
-			hits_confirmed = bool(int(budget[2].item()))
-		if hits and not hits_confirmed:
-			logging.warning(
-				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): the "
-				"serve group could not confirm the mirrored frontier set; the "
-				"wave recomputes them",
-				self.rank, len(hits),
-			)
-			for hit in hits:
-				drops.setdefault(
-					int(hit.index),
-					"the serve group could not confirm the mirrored frontier set",
-				)
-			hits = []
-		if self._prefill_pool_psm_layout() is not None:
-			# The pool holds EVERY token of a chunk, tails as well as segments,
-			# so a chunk wider than the pool can never be planned; leave half the
-			# pages for the pooled segments those tails read.
-			pool_chunk_tokens = (
-				max(0, (total_pages - len(prompts)) // 2) * page_tokens
-			)
-			if pool_chunk_tokens < chunk_tokens:
-				logging.info(
-					"[PREFIX_POOL] Rank %s caps the pool chunk at %d tokens "
-					"(cap %d): %d pool pages hold every chunk token",
-					self.rank, pool_chunk_tokens, chunk_tokens, total_pages,
-				)
-				chunk_tokens = pool_chunk_tokens
-		scratch = scratch_pages_bound(
-			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts), page_tokens
-		)
-		if total_pages <= scratch:
-			logging.info(
-				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
-				self.rank, total_pages, scratch,
-			)
-			self._settle_trajectory_restore_plan(
-				seqs, drops,
-				f"the wave is not pooled: pool {total_pages} pages <= scratch "
-				f"{scratch}",
-			)
-			return None
-		# A model that declares group-safe pool prefill (K3) writes a chunk's KV
-		# before attending over it AND runs its recurrent layers level by level,
-		# so a whole prefix tree finishes in one forward. Read from the PSM like
-		# the pool layout above; GPT-OSS and GLM declare neither.
-		declares = getattr(self.parallel_manager, "supports_group_pool_prefill", None)
-		level_wise = declares is not None and bool(declares())
-		plan_kwargs = dict(
-			block_tokens=page_tokens,
-			pool_pages=total_pages - scratch,
-			chunk_tokens=chunk_tokens,
-			# Every GLM prefill forward streams all experts, so a chunk is
-			# expensive; its attention writes the chunk's KV before reading it.
-			same_chunk_ancestors=level_wise or not with_v,
-			# DSA pool attention gathers every row's prefix indexer keys (bf16
-			# plus an FP8 copy, ~384 B each); keep that inside the workspace.
-			chunk_keys=None if with_v else 8 * 1024 * 1024,
-		)
-		if hits and not plan_kwargs["same_chunk_ancestors"]:
-			# A model whose rows cannot read a segment resident in their own
-			# chunk cannot run a load either; named here rather than refused
-			# inside the planner on every wave.
-			logging.info(
-				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): this "
-				"model's pool does not read a segment resident in its own "
-				"chunk",
-				self.rank, len(hits),
-			)
-			for hit in hits:
-				drops.setdefault(
-					int(hit.index),
-					"this model's pool does not read a segment resident in its "
-					"own chunk",
-				)
-			hits = []
-		# Every computed segment holds a recurrent-state slot for the wave on
-		# top of the wave's own sequences, so the planner pools only as many
-		# (the highest-saving ones) as the group-MIN slot budget leaves spare,
-		# instead of declining the whole wave when the full tree does not fit.
-		if state_slots >= 0:
-			plan_kwargs["max_computed_segments"] = max(0, state_slots - len(prompts))
-		# The planner decides per row which hits it materializes (arbitration
-		# against the in-wave pool, then partial fit) and names every one it
-		# declines. Deterministic in the group's own inputs (the same prompts,
-		# the same hit set, the same group-MIN budget), so every rank of the
-		# group keeps and declines the same rows.
-		plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
-		if plan.declined_materialized:
-			logging.warning(
-				"[PREFIX_POOL] Rank %s plans %d of %d materialized prefix(es); "
-				"declined by the planner: %s",
-				self.rank, len(hits) - len(plan.declined_materialized),
-				len(hits),
-				", ".join(
-					f"sequence {int(seqs[index].global_idx)} ({reason})"
-					for index, reason in plan.declined_materialized
-				),
-			)
-			for index, reason in plan.declined_materialized:
-				drops.setdefault(int(index), f"the wave planner declined it ({reason})")
-		if level_wise:
-			# Rows grouped by level, so a recurrent layer runs one packed call
-			# per level, each after the level that left its parents' state.
-			plan = order_chunk_items_by_level(plan)
-		validate_wave_prefix_plan(plan, prompts)
-		self._check_pool_plan_identical(plan, group)
-		# Nothing shared, or no room for the state: a pooled segment is a prefill
-		# row of its own, so on a model with per-sequence recurrent state it
-		# holds a slot of its own until the wave ends. The slot budget is the
-		# group MIN, so this decline is group-uniform like every other.
-		# A materialized segment is no row, so it holds no recurrent state
-		# slot; only the segments a row computes do.
-		state_slots_needed = (
-			len(plan.segments) - len(plan.materialized_segments) + len(prompts)
-		)
-		if not plan.segments or 0 <= state_slots < state_slots_needed:
-			logging.info(
-				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
-				"shared, %d state slots needed, %d free",
-				self.rank, len(plan.segments), state_slots_needed, state_slots,
-			)
-			self._settle_trajectory_restore_plan(
-				seqs, drops,
-				f"the wave is not pooled: {len(plan.segments)} segment(s), "
-				f"{state_slots_needed} state slot(s) needed, {state_slots} free",
-			)
-			return None
-		wave = PoolWave(
-			plan=plan,
-			prompts=prompts,
-			uuids=list(uuids),
-			global_ids=[seq.global_idx for seq in seqs],
-			page_tokens=page_tokens,
-			total_pages=total_pages,
-			scratch_pages=scratch,
-		)
-		for segment_id in sorted(wave.materialized):
-			members = plan.segments[segment_id].members
-			source = next(
-				(hit_pages[index] for index in members if index in hit_pages),
-				None,
-			)
-			if source is None:
-				# A follower holds no record: the leader mirrors these pages
-				# inside this same pass, before the forward reads them.
-				continue
-			wave.bind_materialized_host_pages(segment_id, source)
-		# A materialized member's chain IS its frontier, so its compute start
-		# is the snapshot boundary: that row, and only that row, restores.
-		restore_boundaries = {
-			index: wave.chain_tokens(index)
-			for segment_id in wave.materialized
-			for index in plan.segments[segment_id].members
-		}
-		self._replace_prefix_lookup_hits(
-			seqs, prefix_states,
-			[wave.chain_tokens(index) for index in range(len(seqs))],
-			retain=frozenset(restore_boundaries),
-			restore_boundaries=restore_boundaries,
-		)
-		self._settle_trajectory_restore_plan(
-			seqs, drops, "the wave plan does not materialize its frontier"
-		)
-		logging.info(
-			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
-			"threshold %s, compute %d of %d prompt tokens, %d pool pages "
-			"(%d for segments, %d scratch)",
-			self.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
-			plan.computed_tokens, plan.prompt_tokens, total_pages,
-			total_pages - scratch, scratch,
-		)
-		return wave
 
 	def _prefill_pool_psm_layout(self):
-		"""The PSM's pool-geometry override, or None to use the Host geometry.
-
-		A model whose pool holds the EXPANDED heads (K3: 192-wide K and
-		128-wide V per LOCAL head against one 576-wide latent) takes its pool
-		geometry from the PSM; the Host geometry is the pool's only while
-		prefill attention reads exactly what the Host stores.
-		"""
-		layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
-		return layout() if layout is not None else None
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_psm_layout(
+			self,
+		)
 
 	def _prefill_pool_page_dims(self, geometry) -> tuple:
-		"""(layers, heads, k_head_dim, v_head_dim) of one pool page row."""
-		layout = self._prefill_pool_psm_layout()
-		if layout:
-			return (
-				int(layout["num_layers"]),
-				int(layout["num_kv_heads"]),
-				int(layout["k_head_dim"]),
-				int(layout["v_head_dim"]),
-			)
-		return (
-			geometry.num_layers,
-			geometry.num_k_heads,
-			geometry.k_head_dim,
-			geometry.k_head_dim,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_page_dims(
+			self,
+			geometry,
 		)
 
 	def _prefill_pool_page_bytes(self) -> int:
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
-
-		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
-		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
-		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-		layers, heads, k_head_dim, v_head_dim = self._prefill_pool_page_dims(geometry)
-		return (
-			layers * page_tokens * heads
-			* (k_head_dim + (v_head_dim if with_v else 0))
-			+ len(indexer_layers) * page_tokens * indexer_dim
-		) * element
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_page_bytes(
+			self,
+		)
 
 	def _measure_prefill_prefix_kv_budget(self) -> None:
-		"""Measure the prefill-phase prefix KV budget. Runs after every
-		configure_prefill while prefix caching is on; the device layout at
-		that point is a deployment constant, so the measurement is stable.
-
-		The planner's ``prefill_prefix_pool_workspace_bytes`` is the forward
-		workspace of one prefill micro-batch; the free memory beside it is the
-		prefix KV a prefill forward may hold, either the in-wave pool's pages
-		or the temporary full-length KV of a cross-wave prefix hit. A model
-		whose planner sets no workspace has no such budget (None)."""
-		from batchgen.prefix_reuse.pool import pool_pages_from_budget
-
-		pool_enabled = self._prefill_prefix_pool_enabled()
-		torch.cuda.synchronize(self.torch_device)
-		torch.cuda.empty_cache()
-		free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
-		batching = self.engine_config.Module_Batching_Config
-		workspace = int(batching.prefill_prefix_pool_workspace_bytes)
-		kv_budget = max(0, free_bytes - workspace) if workspace > 0 else None
-		if kv_budget != self._prefill_prefix_kv_budget_bytes:
-			logging.info(
-				"[PREFIX_KV] Rank %s prefill-phase prefix KV budget: %s B "
-				"(%d B free, %d B workspace, was %s)",
-				self.rank, kv_budget, free_bytes, workspace,
-				self._prefill_prefix_kv_budget_bytes,
-			)
-		self._prefill_prefix_kv_budget_bytes = kv_budget
-		if not pool_enabled:
-			return
-		budget = pool_pages_from_budget(
-			free_bytes, workspace, self._prefill_pool_page_bytes(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._measure_prefill_prefix_kv_budget(
+			self,
 		)
-		previous = self._prefill_pool_page_budget
-		self._prefill_pool_page_budget = budget
-		if previous is None or previous != budget:
-			logging.info(
-				"[PREFIX_POOL] Rank %s prefill-phase pool budget: %d pages "
-				"(%d B free, %d B workspace, was %s)",
-				self.rank, budget, free_bytes,
-				int(batching.prefill_prefix_pool_workspace_bytes), previous,
-			)
 
 	def _construct_prefill_pool(self, wave) -> None:
-		"""Build the planned wave's GPU pool and executor in the prefill phase."""
-		from batchgen.prefix_reuse.executor import PoolChunkExecutor
-		from batchgen.prefix_reuse.pool import PrefillPrefixPool
-
-		num_pages = wave.total_pages
-		budget = self._prefill_pool_page_budget
-		group = self._prefill_pool_group()
-		if group is not None:
-			# One pool size per serve group: a rank-local jitter shrink (or a
-			# rank-local failure) would leave the group's ranks in different
-			# chunk shapes mid-collective. The tightest rank decides.
-			reduced = torch.tensor(
-				[-1 if budget is None else int(budget)],
-				dtype=torch.int64,
-				device=self.torch_device,
-			)
-			dist.all_reduce(reduced, op=dist.ReduceOp.MIN, group=group)
-			budget = None if int(reduced.item()) < 0 else int(reduced.item())
-		if budget is not None and budget < num_pages:
-			# Free-memory jitter of a few pages between measurements is not
-			# layout drift. The pool only ever needs the planned segment peak
-			# plus the executor's exact transient bound; shrink to the fresh
-			# budget when that still fits, fail loud when it cannot.
-			required = wave.plan.peak_pool_pages + wave.scratch_pages
-			if budget < required:
-				raise RuntimeError(
-					f"Rank {self.rank}: prefill pool budget shrank to {budget} "
-					f"pages below the required {required} (peak "
-					f"{wave.plan.peak_pool_pages} + scratch {wave.scratch_pages})"
-				)
-			logging.info(
-				"[PREFIX_POOL] Rank %s pool shrinks to the fresh budget: "
-				"%d pages (planned %d, required %d)",
-				self.rank, budget, num_pages, required,
-			)
-			num_pages = budget
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
-
-		geometry_page_bytes = self._prefill_pool_page_bytes()
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
-		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-		pool_layers, pool_heads, k_head_dim, v_head_dim = (
-			self._prefill_pool_page_dims(geometry)
-		)
-		pool = PrefillPrefixPool(
-			num_layers=pool_layers,
-			num_pages=num_pages,
-			page_tokens=wave.page_tokens,
-			num_kv_heads=pool_heads,
-			head_dim=k_head_dim,
-			dtype=geometry.kv_dtype,
-			device=self.torch_device,
-			with_v=with_v,
-			v_head_dim=v_head_dim,
-			indexer_layers=indexer_layers,
-			indexer_dim=indexer_dim,
-		)
-		if pool.page_bytes != geometry_page_bytes:
-			raise RuntimeError(
-				f"prefix pool page is {pool.page_bytes} B, budget assumed "
-				f"{geometry_page_bytes} B"
-			)
-		wave.pool = pool
-		pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
-		wave.executor = PoolChunkExecutor(
-			wave.plan, wave.prompts, pool,
-			pad_poison=self._pool_pad_poison_enabled(wave),
-		)
-		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
-		reserved = torch.cuda.memory_reserved(self.local_rank)
-		self._prefill_pool_base = (
-			torch.cuda.memory_allocated(self.local_rank),
-			reserved,
-			device_total - free_after - reserved,
-		)
-		torch.cuda.reset_peak_memory_stats(self.local_rank)
-		logging.info(
-			"[PREFIX_POOL] Rank %s pool up: %d pages (%d B each, %d segments)",
-			self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._construct_prefill_pool(
+			self,
+			wave,
 		)
 
 	def _check_pool_plan_identical(self, plan, group) -> None:
-		"""Raise unless every rank of the serve group planned the same wave.
-
-		Deterministic planning over replicated prompts and a group-MIN budget
-		gives one plan per group. A divergence would send two ranks through
-		different chunks of the per-layer collectives that pair them up, so it
-		is named here instead of deadlocking or corrupting a row later. No-op at
-		G==1, where the rank's plan is its own.
-		"""
-		if group is None:
-			return
-		hasher = hashlib.blake2b(digest_size=7)
-		for chunk in plan.chunks:
-			for item in chunk.items:
-				hasher.update(
-					f"{item.kind}:{item.ref}:{item.token_start}:"
-					f"{item.token_end}:{item.prefix_segments};".encode()
-				)
-			hasher.update(f"|{chunk.release_after}|".encode())
-		digest = torch.tensor(
-			[int.from_bytes(hasher.digest(), "little")],
-			dtype=torch.int64,
-			device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._check_pool_plan_identical(
+			self,
+			plan,
+			group,
 		)
-		gathered = [
-			torch.zeros_like(digest) for _ in range(self._decode_attn_tp_size())
-		]
-		dist.all_gather(gathered, digest, group=group)
-		if len({int(item.item()) for item in gathered}) != 1:
-			raise RuntimeError(
-				f"Rank {self.rank}: the prefill prefix pool plan diverged inside "
-				f"the serve group ({len(plan.chunks)} chunks, "
-				f"{len(plan.segments)} segments, digest {int(digest.item())})"
-			)
 
 	def _prefill_pool_layout(self, geometry) -> tuple:
-		"""(with_v, indexer_layers, indexer_dim) of this model's prefill pool.
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_layout(
+			self,
+			geometry,
+		)
 
-		A DSA model (dual Host KV) pools the indexer keys of its full (top-k
-		computing) layers next to its attention rows; a non-DSA model pools
-		K/V and no index keys.
-
-		Whether the pool carries V is a property of the POOL ROW, not of DSA:
-		the row's owner is the PSM's ``prefill_pool_layout`` when it declares
-		one (a model whose pool holds the expanded per-head K AND V, as
-		``_prefill_pool_page_dims`` already reads for the widths), otherwise
-		the Host geometry, whose DSA form is a single latent with no V side.
-		Deciding it from "is the coordinator dual" instead would drop the V
-		rows of any DSA model that pools expanded heads while
-		``_prefill_pool_page_dims`` kept declaring ``v_head_dim``, and the
-		two would disagree silently -- ``PrefillPrefixPool`` simply leaves
-		``self.v`` as None.
-		"""
-		if not isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
-			return True, (), 0
-		psm_layout = self._prefill_pool_psm_layout()
-		with_v = bool(psm_layout and int(psm_layout["v_head_dim"]) > 0)
-		if self.model is None:
-			# Wave planning runs at reservation time (decode phase), where the
-			# model object is not resident. The layout is a model constant and
-			# the budget gate guarantees a prefill measured it before any wave
-			# plans, so the cached copy is always available here.
-			cached = getattr(self, "_prefill_pool_layout_cache", None)
-			if cached is None:
-				raise RuntimeError(
-					"DSA prefill pool: layout requested before the first "
-					"prefill measured it"
-				)
-			return cached
-		# The layers' own indexers decide what prefill scores and offloads: a
-		# shared layer has none and reuses the previous full layer's top-k.
-		indexers = {}
-		for layer_idx, layer in enumerate(self.model.model.layers):
-			attn = getattr(layer.self_attn, "module", layer.self_attn)
-			if getattr(attn, "indexer", None) is not None:
-				indexers[layer_idx] = attn.indexer
-		# Compare against the primary cache's LOGICAL depth, not its row count:
-		# a profile that stores its attention layers densely carries a
-		# logical->physical map (Kimi-K3's 93 engine layers -> 24 MLA rows), and
-		# `num_layers` is then the physical row count, which no model's layer
-		# stack is ever equal to. The check is "does this cache describe this
-		# model's depth", so it must read whichever of the two the profile
-		# declares -- a table lookup, not a per-model branch.
-		logical_map = getattr(geometry, "logical_to_physical_layer", None)
-		kv_depth = len(logical_map) if logical_map else geometry.num_layers
-		if not indexers or len(self.model.model.layers) != kv_depth:
-			raise RuntimeError(
-				"DSA prefill pool: indexer layers do not match the KV geometry "
-				f"({len(indexers)} indexer layers, {len(self.model.model.layers)} "
-				f"engine layers, KV logical depth {kv_depth})"
-			)
-		dims = {int(indexer.index_head_dim) for indexer in indexers.values()}
-		if len(dims) != 1:
-			raise RuntimeError(f"DSA prefill pool: mixed indexer head dims {sorted(dims)}")
-		layout = (with_v, tuple(indexers), dims.pop())
-		self._prefill_pool_layout_cache = layout
-		return layout
-
-	def _replace_prefix_lookup_hits(
-		self, seqs, prefix_states, chain_tokens, retain=frozenset(),
-		restore_boundaries=None,
-	) -> None:
-		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
-
-		A serve-group follower plans the same wave as its leader but holds no
-		lookup of its own — the leader owns every coordinator attachment and
-		mirrors the state afterwards — so a missing entry is its normal case and
-		leaves nothing to release.
-
-		``retain`` names the wave indices whose attachment must SURVIVE this
-		call (M3 Slice 3: a materialized prefix is read out of the prefix
-		cache's own resident pages for the whole wave, and that attachment is
-		what keeps them resident; a computed segment needs no such protection
-		because the wave publishes it afresh). The handle moves into the
-		sequence's retained-handle tuple, so the one release lane every
-		sequence leaves through frees it exactly once.
-
-		``restore_boundaries`` maps the wave indices whose trajectory frontier
-		the plan materialized to that boundary: the row's restore decision,
-		carried on its state as ``trajectory_restore_boundary``. Every other
-		row gets 0, i.e. no restore.
-		"""
-		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
-
-		restores = restore_boundaries or {}
-		for index, (seq, end) in enumerate(zip(seqs, chain_tokens)):
-			old = prefix_states.get(seq.global_idx)
-			handle = 0 if old is None else int(old.attachment_handle)
-			if handle and index not in retain:
-				self.prefix_cache_coordinator.release_attachment(handle)
-				handle = 0
-			restore = int(restores.get(index, 0))
-			if restore and restore != int(end):
-				raise RuntimeError(
-					f"Rank {self.rank}: sequence {int(seq.global_idx)} is "
-					f"planned to restore at token {restore} but its compute "
-					f"starts at {int(end)}"
-				)
-			state = PrefixCacheSequenceState(
-				lookup_result=None,
-				attached_tokens=end,
-				compute_cached_tokens=end,
-				commit_attachment_handles=(handle,) if handle else (),
-				trajectory_restore_boundary=restore,
-			)
-			prefix_states[seq.global_idx] = state
-			self._prefix.prefix_sequence_states[seq.global_idx] = state
+	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens, retain=frozenset(), restore_boundaries=None) -> None:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._replace_prefix_lookup_hits(
+			self,
+			seqs,
+			prefix_states,
+			chain_tokens,
+			retain,
+			restore_boundaries,
+		)
 
 	def _settle_trajectory_restore_plan(self, seqs, drops, default_reason) -> None:
-		"""Decline, at plan time, every live attachment the plan does not restore.
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._settle_trajectory_restore_plan(
+			self,
+			seqs,
+			drops,
+			default_reason,
+		)
 
-		Runs once at the end of every wave plan, on every return path, over
-		the wave's sequences in wave order. An attachment whose row carries a
-		``trajectory_restore_boundary`` is the plan's to restore and stays; any
-		other is consumed HERE with ``not_planned`` and the reason the plan
-		dropped it (``drops``: wave index -> reason; ``default_reason``
-		otherwise), so it never reaches the restore seam and its reference is
-		released exactly once. Only the rank holding attachments (the
-		host-KV leader) has anything to do; a follower's map is empty.
-		"""
-		if not self._traj.trajectory_attachments:
-			return
-		from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
-
-		restorer = self._traj.trajectory_restorer
-		for index, seq in enumerate(seqs):
-			if seq is None:
-				continue
-			global_id = int(seq.global_idx)
-			attachment = self._traj.trajectory_attachments.get(global_id)
-			if attachment is None:
-				continue
-			state = self._prefix.prefix_sequence_states.get(global_id)
-			planned = 0 if state is None else int(state.trajectory_restore_boundary)
-			if planned:
-				if planned != int(attachment.boundary_tokens):
-					raise RuntimeError(
-						f"Rank {self.rank}: sequence {global_id} is planned to "
-						f"restore at token {planned} but its live frontier is "
-						f"at {int(attachment.boundary_tokens)}"
-					)
-				continue
-			if restorer is None:
-				raise RuntimeError(
-					f"Rank {self.rank}: sequence {global_id} holds a live "
-					"trajectory attachment but this rank has no restorer"
-				)
-			del self._traj.trajectory_attachments[global_id]
-			restorer.decline(
-				attachment,
-				reason=DECLINE_NOT_PLANNED,
-				detail=f"at plan time: {drops.get(index, default_reason)}",
-			)
+	def _prefill_host_view_is_dual(self) -> bool:
+		# S5a rewrite carve-out #5 (spec §S5b F3 block): the engine module must
+		# stay importable without the CUDA/native kv_cache chain, so the
+		# DualHostKVCoordinator isinstance stays on the worker (this file
+		# already imports the class) and the moved body reads this predicate
+		# through the rebound self.
+		return isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator)
 
 	def _prefill_pool_segment_host_pages(self) -> int:
-		"""Host pages this wave allocates for its segments.
-
-		A materialized segment is excluded: its pages are the frontier's,
-		already allocated and retained by the wave that computed it.
-		"""
-		wave = self._prefill_pool_wave
-		if wave is None:
-			return 0
-		return sum(
-			seg.tokens for seg in wave.computed_segments()
-		) // wave.page_tokens
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_pool_segment_host_pages(
+			self,
+		)
 
 	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
-		"""One Host copy per pooled segment; members attach their chain of them."""
-		from batchgen.prefix_reuse.wave_runtime import allocate_segment_host_pages
-
-		wave = self._prefill_pool_wave
-		allocated = allocate_segment_host_pages(
-			wave, host_views, self._next_pool_segment_sid
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._allocate_prefill_pool_host_pages(
+			self,
+			host_views,
+			prefix_states,
 		)
-		if allocated != self._prefill_pool_segment_host_pages():
-			raise RuntimeError(
-				f"pool segments got {allocated} Host pages, planned "
-				f"{self._prefill_pool_segment_host_pages()}"
-			)
-		for index, global_id in enumerate(wave.global_ids):
-			if not wave.chains[index]:
-				continue
-			state = replace(
-				prefix_states[global_id],
-				planned_shared_page_ids={
-					group_id: tuple(pages)
-					for group_id, pages in wave.chain_host_pages(index).items()
-				},
-			)
-			prefix_states[global_id] = state
-			self._prefix.prefix_sequence_states[global_id] = state
-			# A segment's Host pages live until its last member releases. A
-			# materialized segment has no pseudo sequence to refcount: its
-			# pages are the prefix cache's, kept by this sequence's own
-			# attachment and released with it.
-			sids = tuple(
-				wave.segment_sids[seg]
-				for seg in wave.chains[index]
-				if seg not in wave.materialized
-			)
-			self._prefix.add_pool_member_refs(global_id, sids)
 
 	def _materialized_pool_layers(self):
 		"""The attention layers that materialize, in Host physical order.
@@ -13713,796 +10730,139 @@ class BatchGenWorker:
 		return layers
 
 	def _materialized_segment_loader(self, wave):
-		"""Staging for this wave's loads, or None when it materializes none.
-
-		One loader per prefix-cache KV group, keyed by group id. Group 0 is the
-		primary region's MLA latent, which the model expands. A dual-region
-		(DSA) model adds group 1, the page-split FP8 indexer keys: those pages
-		ARE the index keys, so they are read back and dequantized rather than
-		reconstructed, and they are cut at the same page boundaries as the
-		latent so the two slab streams pair up one for one.
-		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			build_gpu_kv_config,
-			build_gpu_kv_config_aux,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._materialized_segment_loader(
+			self,
+			wave,
 		)
-		from batchgen.prefix_reuse.pool_materialize import (
-			DEFAULT_SLAB_BYTES,
-			MaterializedSegmentLoader,
-			PageSplitIndexKeyLoader,
-		)
-
-		if not wave.materialized:
-			return None
-		views = self._host_views_by_group()
-		if sorted(views) not in ([0], [0, 1]):
-			raise RuntimeError(
-				"materializing a prefix needs the primary Host KV region "
-				"(group 0) alone or beside the DSA indexer region (group 1), "
-				f"this model has groups {sorted(views)}"
-			)
-		geometry = build_gpu_kv_config(
-			self.huggingface_ckpt_name, [int(wave.page_tokens)]
-		)
-		primary = MaterializedSegmentLoader(
-			worker_view=views[0],
-			num_layers=int(geometry.num_layers),
-			page_tokens=int(wave.page_tokens),
-			latent_dim=int(geometry.num_k_heads) * int(geometry.k_head_dim),
-			dtype=geometry.kv_dtype,
-			device=self.torch_device,
-			max_slab_bytes=DEFAULT_SLAB_BYTES,
-		)
-		loaders = {0: primary}
-		if 1 in views:
-			aux_geometry = build_gpu_kv_config_aux(
-				self.huggingface_ckpt_name, [int(wave.page_tokens)]
-			)
-			if aux_geometry is None:
-				raise RuntimeError(
-					"this model has a second Host KV region but no DSA "
-					"indexer profile, so the auxiliary pages cannot be read "
-					"back as index keys"
-				)
-			if int(aux_geometry.num_layers) != int(geometry.num_layers):
-				raise RuntimeError(
-					"the DSA indexer region keeps "
-					f"{int(aux_geometry.num_layers)} row(s) against the "
-					f"latent region's {int(geometry.num_layers)}; a prefix "
-					"load addresses both by the same row"
-				)
-			loaders[1] = PageSplitIndexKeyLoader(
-				worker_view=views[1],
-				num_layers=int(aux_geometry.num_layers),
-				page_tokens=int(wave.page_tokens),
-				carrier_bytes=self._prefix_pool_index_key_carrier(aux_geometry),
-				slab_pages=primary.slab_pages,
-				dtype=geometry.kv_dtype,
-				device=self.torch_device,
-			)
-		logging.info(
-			"[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
-			"%d B of device staging (%d Host page(s) per slab, groups %s)",
-			self.rank, len(wave.materialized),
-			sum(loader.staging_bytes for loader in loaders.values()),
-			primary.slab_pages, sorted(loaders),
-		)
-		return loaders
 
 	def _prefix_pool_index_key_carrier(self, aux_geometry) -> int:
-		"""Bytes per token in the auxiliary region, scale bytes included.
-
-		A page-split FP8 region declares ``k_head_dim`` in BYTES per token (the
-		e4m3 data bytes plus one fp32 scale); the loader turns that into the
-		key width through the layout's own statement. An AoS indexer region
-		declares ELEMENTS and carries no scale, so reading it as page-split
-		bytes would silently reinterpret every key: refused here.
-		"""
-		if aux_geometry.kv_dtype is not torch.float8_e4m3fn:
-			raise RuntimeError(
-				"loading a cached prefix's index keys needs the page-split "
-				f"FP8 indexer region, got {aux_geometry.kv_dtype}"
-			)
-		return int(aux_geometry.k_head_dim)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefix_pool_index_key_carrier(
+			self,
+			aux_geometry,
+		)
 
 	def _materialized_pool_index_key_layers(self, pool):
-		"""The attention layers that materialize INDEX KEYS, in pool-row order.
-
-		The same assertion the latent walk makes, against the pool's indexer
-		rows: the n-th index-key-materializing layer must be indexer row n,
-		because the auxiliary Host region keeps one dense row per DSA layer in
-		engine order and the load addresses it by that one index. A model whose
-		two orders disagree would load every layer's prefix keys into the wrong
-		row and the suffix would select plausible keys from the wrong depth.
-		"""
-		rows = getattr(pool, "indexer_row", None) if pool is not None else None
-		if not rows:
-			raise RuntimeError(
-				"a materialized DSA prefix needs the pool's indexer rows"
-			)
-		layers = []
-		for engine_layer, decoder_layer in enumerate(self.model.model.layers):
-			attn = decoder_layer.self_attn
-			if not hasattr(attn, "materialize_pool_segment_index_keys"):
-				continue
-			row = rows.get(engine_layer)
-			if row is None:
-				raise RuntimeError(
-					f"engine layer {engine_layer} materializes index keys but "
-					"has no prefix-pool indexer row"
-				)
-			if row != len(layers):
-				raise RuntimeError(
-					f"engine layer {engine_layer} is pool indexer row {row} "
-					f"but the {len(layers)}th index-key materializing layer; "
-					"the pool and Host orders must agree for a prefix load"
-				)
-			layers.append(attn)
-		if len(layers) != len(rows):
-			raise RuntimeError(
-				f"{len(layers)} layer(s) materialize index keys against "
-				f"{len(rows)} pool indexer row(s)"
-			)
-		return layers
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._materialized_pool_index_key_layers(
+			self,
+			pool,
+		)
 
 	def _load_materialized_segments(self, wave, rows, loaders) -> int:
-		"""Fill this chunk's loaded segments BEFORE its forward reads them.
-
-		Per slab: one H2D per KV group of the committed prefix across every
-		layer, waited on, then each layer writes its own slab into the pool
-		slots that layer's row would have written. The primary region holds the
-		MLA latent, which the model expands through its own projection; a DSA
-		model's auxiliary region holds the index keys themselves, which are
-		dequantized from their page-split FP8 bytes and written as keys. Both
-		regions carry the SAME segment pages in the same order, so the slabs
-		pair up and one window of pool slots receives both. Returns the number
-		of tokens loaded, for the wave's metrics.
-		"""
-		if not rows.materialized:
-			return 0
-		if not loaders:
-			raise RuntimeError(
-				f"Rank {self.rank}: this chunk loads "
-				f"{len(rows.materialized)} materialized segment(s) with no "
-				"staging; the wave was built without a loader"
-			)
-		layers = self._materialized_pool_layers()
-		key_layers = (
-			self._materialized_pool_index_key_layers(wave.pool)
-			if 1 in loaders else ()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._load_materialized_segments(
+			self,
+			wave,
+			rows,
+			loaders,
 		)
-		loaded = 0
-		for stage in rows.materialized:
-			pages_by_group = wave.segment_host_pages.get(stage.segment_id)
-			if not pages_by_group:
-				raise RuntimeError(
-					f"Rank {self.rank}: materialized segment "
-					f"{stage.segment_id} names no Host page to load from"
-				)
-			if sorted(pages_by_group) != sorted(loaders):
-				raise RuntimeError(
-					f"Rank {self.rank}: materialized segment "
-					f"{stage.segment_id} names Host pages in groups "
-					f"{sorted(pages_by_group)}, this model loads groups "
-					f"{sorted(loaders)}"
-				)
-			pages = pages_by_group[0]
-			streams = [
-				loaders[group].slabs(
-					host_page_ids=pages_by_group[group],
-					tokens=int(stage.tokens),
-				)
-				for group in sorted(loaders)
-			]
-			for slabs in zip(*streams):
-				latent_slab = slabs[0]
-				window = stage.slots[
-					latent_slab.token_start:
-					latent_slab.token_start + latent_slab.tokens
-				]
-				for physical, attn in enumerate(layers):
-					attn.materialize_pool_segment(
-						latent=latent_slab.latent[physical], slots=window
-					)
-				for key_slab in slabs[1:]:
-					if (
-						key_slab.token_start != latent_slab.token_start
-						or key_slab.tokens != latent_slab.tokens
-					):
-						raise RuntimeError(
-							f"Rank {self.rank}: materialized segment "
-							f"{stage.segment_id} loaded index keys for "
-							f"[{key_slab.token_start}, {key_slab.tokens}) "
-							f"against a latent slab of "
-							f"[{latent_slab.token_start}, "
-							f"{latent_slab.tokens})"
-						)
-					for physical, attn in enumerate(key_layers):
-						attn.materialize_pool_segment_index_keys(
-							index_keys=key_slab.keys[physical], slots=window
-						)
-				loaded += int(latent_slab.tokens)
-			logging.info(
-				"[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
-				"token(s) over %d Host page(s) per region into %d pool "
-				"page(s), groups %s",
-				self.rank, stage.segment_id, int(stage.tokens), len(pages),
-				len(stage.pages), sorted(loaders),
-			)
-		return loaded
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
-		"""Prefill a planned wave: each pooled segment once, then every tail."""
-		from batchgen.models.wrappers.attention import AttnWrapperBase
-		from batchgen.prefix_reuse.wave_plan import prefill_plan_work
-
-		wave = self._prefill_pool_wave
-		if wave.pool is None:
-			self._construct_prefill_pool(wave)
-		index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
-		order = [index_of[self._local_to_uuid_map[local_idx]] for local_idx in batch]
-		if sorted(order) != list(range(len(wave.uuids))):
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill batch does not match the planned wave"
-			)
-		workspace = int(
-			self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_prepacked_pool(
+			self,
+			batch,
 		)
-		lm_weight = self.model.lm_head.weight
-		lm_bias = getattr(self.model.lm_head, "bias", None)
-		# The three model seams prefill_prepacked also goes through, duck-typed
-		# so they collapse to the plain path: K3 carries a per-layer block
-		# residual and ends on a depth mix, streamed-SP8 keeps only a row shard
-		# of the final hidden state, and its lm_head is vocab-parallel.
-		use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-		gather_last_token_hidden = getattr(
-			self.parallel_manager, "gather_prefill_last_token_hidden", None
-		)
-		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
-		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
-		epilogue_trace = self._new_pool_epilogue_tracer(wave)
-		if epilogue_trace is not None:
-			# The wave boundary is the earliest point this seam can stamp: the
-			# plan and the Host attachment happen in the reservation
-			# transaction, before this method is entered.
-			epilogue_trace.phase(
-				"wave_begin",
-				# Rows, so loaded segments do not count: they run none.
-				rows=len(wave.computed_segments()) + len(wave.global_ids),
-				tokens=wave.plan.computed_tokens,
-				chunks=len(wave.plan.chunks),
-			)
-		tokens_by_index = {}
-		executed = 0
-		workspace_peak = 0
-		reserved_peak = 0
-		base_alloc, base_reserved, base_other = self._prefill_pool_base
-		# As in prefill_prepacked: layers offload through these views, and a DSA
-		# model writes its indexer keys through the aux one.
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-		AttnWrapperBase.prefill_pool = wave.pool
-		# A recurrent layer forks a row's state from its parent segment's state
-		# slot, which is keyed by that segment's pseudo sequence id.
-		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
-		# A LOADED segment ran no row, so it left no recurrent state to fork:
-		# its reader resumes from the slot the trajectory restore bound before
-		# this wave, which the level cut verifies.
-		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
-			sorted(wave.materialized)
-		)
-		# The pool row of an engine layer comes from the model's own pool
-		# layout, never from a KV cache's layer mapping: a cache that keeps
-		# every layer resolves to itself and would index past the pool.
-		pool_layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
-		AttnWrapperBase.prefill_pool_layer_map = (
-			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
-		)
-		# Always reassigned, never left over: a wave that died before its
-		# verification point cannot leak its records into the next one.
-		AttnWrapperBase.prefill_pool_offload_recorder = (
-			self._new_pool_offload_check_recorder(wave)
-		)
-		# Staging for the wave's loads; None unless it materializes something.
-		materialized_loader = self._materialized_segment_loader(wave)
-		materialized_tokens = 0
-		offload_recorder_handed_off = False
-		try:
-			start = time.perf_counter()
-			for chunk_index, chunk in enumerate(
-				tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0))
-			):
-				self.feed_watchdog()
-				self._weight_passes.begin(
-					carry=chunk_index + 1 < len(wave.plan.chunks)
-				)
-				rows = wave.executor.build(chunk)
-				if epilogue_trace is not None:
-					epilogue_trace.chunk_begin(
-						epilogue_trace.chunk + 1,
-						rows=len(rows.items),
-						tokens=int(rows.input_ids.numel()),
-					)
-				host_ids, host_starts = wave.row_host_targets(rows)
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
-				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
-				AttnWrapperBase.prepack_num_sequences = len(rows.items)
-				AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
-				AttnWrapperBase.position_ids = rows.position_ids
-				AttnWrapperBase.cur_batch = host_ids
-				AttnWrapperBase.prefill_pool_batch = rows
-				AttnWrapperBase.prefill_pool_row_starts = host_starts
-				# Before the forward, never during it: every layer's pool row
-				# holds the committed prefix by the time any row attends over
-				# it, and a failure here has not yet touched the forward.
-				materialized_tokens += self._load_materialized_segments(
-					wave, rows, materialized_loader
-				)
-				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
-				block_residual = (
-					self.model.model._new_block_residual(hidden_states)
-					if use_attn_res else None
-				)
-				for decoder_layer in self.model.model.layers:
-					if use_attn_res:
-						hidden_states, block_residual = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-							block_residual=block_residual,
-						)
-					else:
-						hidden_states = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-						)[0]
-				if rows.tail_wave_indices:
-					if use_attn_res:
-						# Mix-then-norm over every row: the depth mix needs each
-						# row's own residual (kimi_linear/model.py:904-913).
-						hidden_dim = hidden_states.shape[2]
-						batch_sz, seq_sz = hidden_states.shape[:2]
-						hidden_states = self.model.model._apply_output_attn_res(
-							hidden_states.view(-1, hidden_dim), block_residual
-						).view(batch_sz, seq_sz, hidden_dim)
-					if gather_last_token_hidden is None:
-						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
-						if epilogue_trace is not None:
-							# No gather exists on this manager, so the rank
-							# holds every row. record_unsharded_gather asserts
-							# that against the manager instead of trusting
-							# this branch: a hand-written single-rank record on
-							# a sharded path would report a broken multi-rank
-							# gather as healthy.
-							self._record_unsharded_epilogue_gather(
-								epilogue_trace,
-								last_hidden,
-								num_global_rows=int(rows.input_ids.numel()),
-							)
-					else:
-						# Streamed-SP8 holds only this rank's row shard, so the
-						# tail rows are reassembled over the group.
-						last_hidden = gather_last_token_hidden(
-							self.model.model.norm(hidden_states),
-							rows.tail_rows,
-							int(rows.input_ids.numel()),
-							**(
-								{"trace": epilogue_trace}
-								if epilogue_trace is not None
-								else {}
-							),
-						)
-					logits = (
-						self.model.lm_head.forward(last_hidden).float()
-						if vocab_parallel_head
-						else torch.nn.functional.linear(
-							last_hidden, lm_weight, lm_bias
-						).float()
-					)
-					selected = self._select_tokens(
-						logits,
-						[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
-					)
-					for row, index in enumerate(rows.tail_wave_indices):
-						tokens_by_index[index] = selected[row]
-					if epilogue_trace is not None:
-						# The pairing side of the trace: the row -> wave index
-						# -> uuid -> global id chain, beside the gather-side
-						# facts the recorder already holds.
-						epilogue_trace.emit(
-							table_rows=[
-								row for row, item in enumerate(rows.items)
-								if item.kind == "tail"
-							],
-							tail_rows=rows.tail_rows.tolist(),
-							wave_indices=list(rows.tail_wave_indices),
-							global_ids=list(wave.global_ids),
-							uuids=list(wave.uuids),
-							tokens=[int(token) for token in selected],
-							# The SAME tensor _select_tokens consumed: full
-							# vocabulary in both branches (the vocab-parallel
-							# head all-gathers before returning).
-							logits=logits,
-						)
-				del hidden_states
-				# Dropped before the next chunk seeds its own buffer, so the two
-				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
-				block_residual = None
-				self._weight_passes.end()
-				executed += int(rows.input_ids.numel())
-				wave.executor.finish(chunk)
-				if epilogue_trace is not None:
-					epilogue_trace.chunk_end(
-						rows=len(rows.items),
-						tokens=int(rows.input_ids.numel()),
-					)
-				# Allocated bytes are what a chunk needs. The allocator's reserve
-				# grows into whatever the pool left free and drops cached blocks
-				# only when a cudaMalloc fails, so it is reported, not checked.
-				free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
-				reserved_now = torch.cuda.memory_reserved(self.local_rank)
-				reserved_peak = max(
-					reserved_peak,
-					torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
-					+ (device_total - free_now - reserved_now) - base_other,
-				)
-				peak = torch.cuda.max_memory_allocated(self.local_rank) - base_alloc
-				workspace_peak = max(workspace_peak, peak)
-				if peak > workspace:
-					raise RuntimeError(
-						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
-						f"{workspace} B kept beside the prefix pool"
-					)
-			prefill_s = time.perf_counter() - start
-			if epilogue_trace is not None:
-				# The last stamp a rank emits before it leaves the pooled
-				# prefill: comparing wave_end across the two nodes is what
-				# shows whether one group entered decode while the other was
-				# still inside a pooled chunk.
-				epilogue_trace.phase(
-					"wave_end",
-					elapsed_ms=prefill_s * 1e3,
-					tokens=executed,
-					chunks=len(wave.plan.chunks),
-				)
-			if executed != wave.plan.computed_tokens:
-				raise RuntimeError(
-					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
-					f"{wave.plan.computed_tokens}"
-				)
-			wave.executor.close()
-			# The wave reached its end, so the offload recorder is handed to
-			# _verify_prefill_pool_offload_bytes - which runs after the D2H has
-			# retired, outside this method - and only it may clear the recorder.
-			offload_recorder_handed_off = True
-		finally:
-			if wave.pool.free_pages != wave.pool.num_pages:
-				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
-			# A segment's recurrent state is keyed by its pseudo sequence id and
-			# has to live across the chunks that continue it, so it is released
-			# here — the wave is over and no later batch carries those ids.
-			self._release_kda_state_slots(list(wave.segment_sids.values()))
-			if materialized_loader is not None:
-				for group_loader in materialized_loader.values():
-					group_loader.release()
-			# Probe recorder teardown, unconditional: a wave that died anywhere
-			# above must not leave its records attached to a class attribute or
-			# to a pool the next wave inherits. The dump recorder is finished
-			# either way - it writes per chunk, nothing consumes it later - and
-			# the offload recorder is dropped UNLESS this wave completed and
-			# handed it to the post-D2H verification step.
-			wave.pool.kernel_dump = None
-			if not offload_recorder_handed_off:
-				AttnWrapperBase.prefill_pool_offload_recorder = None
-			wave.pool.k = wave.pool.v = wave.pool.indexer = None
-			AttnWrapperBase.prefill_pool = None
-			AttnWrapperBase.prefill_pool_batch = None
-			AttnWrapperBase.prefill_pool_row_starts = None
-			AttnWrapperBase.prefill_pool_segment_sids = None
-			AttnWrapperBase.prefill_pool_materialized_segments = ()
-			AttnWrapperBase.prefill_pool_layer_map = None
-			AttnWrapperBase.prepack_mode = False
-			AttnWrapperBase.prepack_cu_seqlens = None
-			AttnWrapperBase.prepack_max_seqlen = None
-			AttnWrapperBase.prepack_num_sequences = None
-			AttnWrapperBase.prepack_seq_lengths = None
-			torch.cuda.empty_cache()
-		work = prefill_plan_work(wave.plan)
-		new_tokens = torch.stack([tokens_by_index[index] for index in order])
-		# Ledger-contract fields the prepacked path already carries
-		# (prefill_metrics_proposal.md): without seq_len_* a single-S run
-		# cannot bind its FLOPs model, and without the sampled ids a pooled
-		# wave has no determinism witness, so pooled waves were falling out
-		# of prefill_report entirely. The wave is complete and the barrier
-		# above has drained the compute stream, so the tolist() is a
-		# wave-boundary scalar transfer, same as the prepacked emission.
-		wave_seq_lens = [
-			int(self.global_batch.get_sequence(uuid).prompt_length)
-			for uuid in wave.uuids
-		]
-		logging.info("[METRICS] " + json.dumps({
-			"component": "prefix_pool",
-			"phase": "prefill",
-			"rank": self.rank,
-			"sequences": len(order),
-			"prompt_tokens": wave.plan.prompt_tokens,
-			"computed_tokens": executed,
-			"full_attention_pairs": work.full_attention_pairs,
-			"item_rows": work.item_rows,
-			"saved_tokens": wave.plan.prompt_tokens - executed,
-			"materialized_tokens": materialized_tokens,
-			"materialized_segments": len(wave.materialized),
-			"segments": len(wave.plan.segments),
-			"chunks": len(wave.plan.chunks),
-			"threshold": wave.plan.threshold,
-			"pool_pages": wave.pool.num_pages,
-			"peak_pool_pages": wave.plan.peak_pool_pages,
-			"workspace_peak_bytes": workspace_peak,
-			"reserved_peak_bytes": reserved_peak,
-			"prefill_s": prefill_s,
-			"seq_len_min": min(wave_seq_lens) if wave_seq_lens else 0,
-			"seq_len_max": max(wave_seq_lens) if wave_seq_lens else 0,
-			"world_size": self.world_size,
-			"first_sampled_token_ids": (
-				new_tokens.reshape(-1).tolist()[:16]
-			),
-		}, separators=(",", ":")))
-		return self._write_prefill_tokens(batch, new_tokens)
 
 	def _pool_probe_debug(self, wave):
-		"""The probe keys this wave armed, or None. Read ONCE per wave.
-
-		The four pooled probes (epilogue trace, offload byte check, kernel dump,
-		pad poison) are armed through the same batch-level seam as
-		``prefix_rank_assignment_mode``: the flag rides on the wave's own
-		sequences, so a batch arms a probe against a server that is already up.
-
-		Off is the production path and has to cost nothing measurable, so this
-		is the ONLY place that walks the wave's sequences, the answer is cached
-		on the wave, and the walk itself allocates nothing: a member whose
-		``batchgen_debug`` is absent costs one attribute read, and the result
-		dict is not created until a probe key is actually found. Each probe's
-		own setup then imports its module only after this returned non-None.
-		"""
-
-		if wave.probe_debug_read:
-			return wave.probe_debug
-		armed = None
-		server_debug = self._batchgen_debug
-		if server_debug:
-			# Server-level ``--batchgen-debug`` wins outright, exactly as
-			# _active_batchgen_debug_for_sequences has it.
-			for key in _POOL_PROBE_DEBUG_KEYS:
-				value = server_debug.get(key)
-				if value is not None:
-					if armed is None:
-						armed = {}
-					armed[key] = value
-		else:
-			for uuid in wave.uuids:
-				seq_debug = getattr(
-					self.global_batch.get_sequence(uuid), "batchgen_debug", None
-				)
-				if not isinstance(seq_debug, dict):
-					continue
-				for key in _POOL_PROBE_DEBUG_KEYS:
-					value = seq_debug.get(key)
-					# First member that names a key wins, as the merge in
-					# _active_batchgen_debug_for_sequences does.
-					if value is None or (armed is not None and key in armed):
-						continue
-					if armed is None:
-						armed = {}
-					armed[key] = value
-		wave.probe_debug = armed
-		wave.probe_debug_read = True
-		return armed
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._pool_probe_debug(
+			self,
+			wave,
+		)
 
 	def _new_pool_epilogue_tracer(self, wave):
-		"""Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
-
-		Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
-		flag rides on the wave's own sequences. Traces the only stretch of the
-		pooled path the local oracles and the GPU replays never reached - the
-		tail-row gather, the streamed-SP8 shard reassembly and the row ->
-		wave index -> uuid -> sequence pairing that carries a hidden state to
-		sampling. Returns None when the batch did not ask.
-
-		The flag check comes BEFORE the import: on a production wave
-		``_pool_probe_debug`` has already answered None and this method touches
-		nothing else. A malformed flag value is a diagnostics failure, not a
-		serving failure, so it leaves a ``probe_error`` line and no tracer.
-		"""
-		debug = self._pool_probe_debug(wave)
-		if debug is None:
-			return None
-		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
-		from batchgen.prefix_reuse.probe_guard import run_probe
-
-		tracer = run_probe(
-			"epilogue_trace.setup",
-			lambda: tracer_from_debug(debug, rank=self.rank, path="pool"),
-			rank=self.rank,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._new_pool_epilogue_tracer(
+			self,
+			wave,
 		)
-		if tracer is None:
-			return None
-		logging.info(
-			"[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
-			"chunks=%s probe_token=%s",
-			self.rank,
-			len(wave.uuids),
-			len(wave.plan.segments),
-			len(wave.plan.chunks),
-			tracer.probe_token,
-		)
-		return tracer
 
-	def _record_unsharded_epilogue_gather(
-		self, tracer, selected, *, num_global_rows
-	) -> None:
-		"""Hand-write the gather record for a path with NO sharded gather.
-
-		Both prefill paths have a branch where the parallel manager exposes no
-		``gather_prefill_last_token_hidden`` at all, so this rank holds every
-		row and the gather-side facts are trivially ``tp=0/1, owned=all``. That
-		is the ONLY record a caller may write itself, and
-		``record_unsharded_gather`` asserts the premise against the manager
-		rather than taking the branch's word for it - the alternative is a
-		trace that reports a broken multi-rank gather as healthy, which is the
-		one failure an acceptance probe must never have.
-
-		Where a gather DOES exist the tracer goes into it (``trace=``) and the
-		record is written from inside, with the real shard and owned mask.
-		"""
-
-		from batchgen.prefix_reuse.epilogue_trace import record_unsharded_gather
-		from batchgen.prefix_reuse.probe_guard import run_probe
-
-		run_probe(
-			"epilogue_trace.gather_unsharded",
-			lambda: record_unsharded_gather(
-				tracer,
-				selected,
-				num_global_rows=num_global_rows,
-				manager=self.parallel_manager,
-			),
-			rank=self.rank,
+	def _record_unsharded_epilogue_gather(self, tracer, selected, *, num_global_rows) -> None:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._record_unsharded_epilogue_gather(
+			self,
+			tracer,
+			selected,
+			num_global_rows=num_global_rows,
 		)
 
 	def _new_pool_kernel_dump_recorder(self, wave):
-		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
-
-		Same seam as ``prefix_pool_offload_check``: the flag rides on the
-		wave's own sequences. The value is the mode, ``"sync"`` or
-		``"nosync"`` - with ``sync`` the probe synchronizes before reading the
-		pool back, so a corruption that only survives ``nosync`` is a
-		write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
-		directory (default /dev/shm). Returns None when the batch did not ask.
-
-		The flag check comes BEFORE the import, and the whole setup - mode
-		parse, directory resolution, the recorder's own ``makedirs`` - is
-		guarded: an undumpable directory must cost the dump, not the wave.
-		"""
-		debug = self._pool_probe_debug(wave)
-		if debug is None:
-			return None
-		from batchgen.prefix_reuse.kernel_dump import (
-			DEBUG_FLAG as _POOL_DUMP_FLAG,
-			DUMP_DIR_FLAG as _POOL_DUMP_DIR_FLAG,
-			PoolKernelDumpRecorder,
-			dump_directory,
-			parse_dump_mode,
-		)
-		from batchgen.prefix_reuse.probe_guard import run_probe
-
-		mode = run_probe(
-			"kernel_dump.setup",
-			lambda: parse_dump_mode(debug.get(_POOL_DUMP_FLAG)),
-			rank=self.rank,
-		)
-		if mode is None:
-			return None
-		directory = run_probe(
-			"kernel_dump.setup",
-			lambda: dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank),
-			rank=self.rank,
-		)
-		if directory is None:
-			return None
-		logging.info(
-			"[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
-			"segments=%s page_tokens=%s",
-			self.rank,
-			mode,
-			directory,
-			len(wave.uuids),
-			len(wave.plan.segments),
-			wave.page_tokens,
-		)
-		return run_probe(
-			"kernel_dump.setup",
-			lambda: PoolKernelDumpRecorder(
-				rank=self.rank,
-				mode=mode,
-				directory=directory,
-				page_tokens=wave.page_tokens,
-				global_ids=list(wave.global_ids),
-			),
-			rank=self.rank,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._new_pool_kernel_dump_recorder(
+			self,
+			wave,
 		)
 
 	def _pool_pad_poison_enabled(self, wave) -> bool:
-		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
-
-		Read through the same seam as ``prefix_pool_offload_check``: the flag
-		rides on the wave's own sequences, so a batch arms the probe against a
-		server that is already up. False when the batch did not ask, which
-		leaves the packed page table byte-identical to the default.
-
-		The flag check comes BEFORE the import: on a production wave
-		``_pool_probe_debug`` has already answered None.
-		"""
-		debug = self._pool_probe_debug(wave)
-		if debug is None:
-			return False
-		from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
-
-		if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
-			return False
-		logging.info(
-			"[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
-			"with its own last page: members=%s segments=%s",
-			self.rank,
-			len(wave.uuids),
-			len(wave.plan.segments),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._pool_pad_poison_enabled(
+			self,
+			wave,
 		)
-		return True
 
 	def _new_pool_offload_check_recorder(self, wave):
-		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
-
-		Read through the same seam as ``prefix_rank_assignment_mode``: the flag
-		rides on the wave's own sequences, so a batch arms the check against a
-		server that is already up and no env var exists for it. Returns None
-		when the batch did not ask, which is what keeps the check free.
-
-		The flag check comes BEFORE the import: on a production wave
-		``_pool_probe_debug`` has already answered None.
-		"""
-		debug = self._pool_probe_debug(wave)
-		if debug is None:
-			return None
-		from batchgen.prefix_reuse.offload_check import (
-			DEBUG_FLAG as _POOL_OFFLOAD_CHECK_FLAG,
-			PoolOffloadCheckRecorder,
-		)
-
-		if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
-			return None
-		logging.info(
-			"[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
-			"members=%s segments=%s page_tokens=%s",
-			self.rank,
-			len(wave.uuids),
-			len(wave.plan.segments),
-			wave.page_tokens,
-		)
-		from batchgen.prefix_reuse.probe_guard import run_probe
-
-		return run_probe(
-			"offload_check.setup",
-			lambda: PoolOffloadCheckRecorder(
-				rank=self.rank, page_tokens=wave.page_tokens
-			),
-			rank=self.rank,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._new_pool_offload_check_recorder(
+			self,
+			wave,
 		)
 
 	def _verify_prefill_pool_offload_bytes(self) -> None:
@@ -14539,66 +10899,26 @@ class BatchGenWorker:
 		)
 
 	def _finish_prefill_pool_wave(self) -> None:
-		"""After every D2H retired: publish the segments, pin members to them.
-
-		The Host pages and the prefix-cache nodes are the serve group's leader's,
-		so only the leader commits and attaches. A follower computed rows into
-		the leader's pages and has nothing to publish: it drops the page-table
-		record it mirrored for the pseudo sequences and keeps the mirrored prefix
-		state. The leader's member refcount is what keeps those pages alive.
-		"""
-		wave = self._prefill_pool_wave
-		if wave is None:
-			return
-		self._prefill_pool_wave = None
-		if not all(
-			self._owns_host_kv(self.global_batch.get_sequence(uuid))
-			for uuid in wave.uuids
-		):
-			for view in self._host_views_by_group().values():
-				view.unregister_sequences(list(wave.segment_sids.values()))
-			return
-		from batchgen.prefix_reuse.wave_runtime import (
-			attach_pool_members,
-			commit_pool_segments,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._finish_prefill_pool_wave(
+			self,
 		)
 
-		runtime = self.prefix_cache_runtime_config
-		try:
-			segment_handles = commit_pool_segments(
-				wave,
-				coordinator=self.prefix_cache_coordinator,
-				worker_views_by_group=self._host_views_by_group(),
-				namespace_digest=runtime.namespace_digest,
-				publish_boundary_tokens=runtime.publish_boundary_tokens,
-				max_scan_nodes=runtime.max_nodes,
-			)
-			try:
-				member_handles = attach_pool_members(
-					wave,
-					coordinator=self.prefix_cache_coordinator,
-					namespace_digest=runtime.namespace_digest,
-				)
-			finally:
-				for handle in segment_handles:
-					self.prefix_cache_coordinator.release_attachment(handle)
-			for index, handle in member_handles.items():
-				global_id = wave.global_ids[index]
-				state = self._prefix.prefix_sequence_states[global_id]
-				self._prefix.prefix_sequence_states[global_id] = replace(
-					state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
-				)
-		finally:
-			# Success or failure, the wave object is done. Segment Host pages
-			# stay tracked in _pool_sid_members/_pool_member_sids, so after a
-			# failed commit/attach the per-member release lane still frees and
-			# unregisters every pseudo-sid.
-			self._prefill_pool_wave = None
-
 	def _release_pool_segment_refs(self, global_id: int) -> None:
-		"""Release pool pseudo-sids through the PrefixReuseState owner."""
-		self._prefix.release_pool_segment_refs(
-			int(global_id), host_views_provider=self._host_views_by_group
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._release_pool_segment_refs(
+			self,
+			global_id,
 		)
 
 	def _release_prefix_cache_attachments(
@@ -15442,871 +11762,186 @@ class BatchGenWorker:
 	# ============ Prefill and Decode ============
 
 	def prefill(self, batch: list[int]):
-		"""
-		Handle the prefill for a batch.
-		batch: list of local indices
-		"""
-		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
-		# loop. Without this binding, GLM-5's prefill indexer-K offload at
-		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
-		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
-		# populated for prompt tokens and any later decode past 2048 tokens
-		# reads unwritten aux pages.
-		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
-		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
-		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
-		# the host aux cache instead of early-returning on a None view.
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = False
-
-		# Dynamic padding: find max length within THIS batch, not global max
-		# This is critical for long-tailed distributions
-		batch_seq_lengths = []
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			batch_seq_lengths.append(int(seq.prompt_length))
-		batch_max_len = max(batch_seq_lengths)
-
-		# Pad each sequence to batch_max_len and construct attention masks on-the-fly
-		padded_input_ids = []
-		padded_attention_masks = []
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			prompt_len = seq.prompt_length
-			seq_input_ids = self._trajectory_tokens(
-				seq, length=prompt_len, dtype=torch.int64
-			).view(1, -1)
-			seq_len = seq_input_ids.shape[1]
-
-			# Construct attention mask from prompt_length (1s for valid tokens, 0s for padding)
-			seq_attention_mask = torch.zeros((1, seq_len), dtype=torch.int64)
-			seq_attention_mask[0, :prompt_len] = 1
-
-			if seq_len < batch_max_len:
-				# Pad with zeros (left-aligned tokens, right-padded)
-				pad_len = batch_max_len - seq_len
-				seq_input_ids = torch.cat([
-					seq_input_ids,
-					torch.zeros((1, pad_len), dtype=seq_input_ids.dtype)
-				], dim=1)
-				seq_attention_mask = torch.cat([
-					seq_attention_mask,
-					torch.zeros((1, pad_len), dtype=seq_attention_mask.dtype)
-				], dim=1)
-
-			padded_input_ids.append(seq_input_ids)
-			padded_attention_masks.append(seq_attention_mask)
-
-		input_ids = torch.cat(padded_input_ids, dim=0)
-		attention_masks = torch.cat(padded_attention_masks, dim=0)
-
-		num_prefill_micro_batches = math.ceil(
-			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		# PrefillEngine is stateless; this lazy path (shared by every delegator) only serves test fakes built without __init__ -- deliberate, not a special-case branch.
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine.prefill(
+			self,
+			batch,
 		)
-		prefill_micro_batch_input_ids = torch.split(
-			input_ids,
-			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
-		)
-		prefill_micro_batch_attention_masks = torch.split(
-			attention_masks,
-			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
-		)
-		if self.rank == 0:
-			logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
-
-		cur_batch_start = 0
-		output_tokens = []
-
-		with self._weight_passes.scope("prefill"):
-			for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
-				# Feed watchdog during long prefill operations
-				self.feed_watchdog()
-				self._weight_passes.begin(
-					carry=micro_batch_idx + 1 < num_prefill_micro_batches
-				)
-
-				with torch.inference_mode():
-					Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
-					Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
-						prefill_micro_batch_attention_masks[micro_batch_idx]
-					)
-
-					cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
-					cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
-
-					# Pass local indices - the C++ layer handles rank offset internally
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
-
-					cur_batch_start += cur_batch_size
-					assert len(cur_batch_local) == cur_batch_size
-
-					outputs = self.model(
-						prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
-						attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
-						use_cache=False,
-					)
-					cur_batch_sequences = [
-						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-						for local_idx in cur_batch_local
-					]
-					new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
-					self._weight_passes.end()
-					output_tokens.append(new_tokens)
-
-		new_tokens = torch.cat(output_tokens, dim=0)
-
-		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
-		new_tokens_cpu = new_tokens.cpu()
-		self._append_trajectory_batch(batch, new_tokens_cpu)
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			seq.decoded_length += 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
-
-			# MODIFIED: Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
-				seq.eos_reached = True
-
-		return new_tokens
 
 	def prefill_prepacked(self, batch: list[int]):
-		"""
-		Handle prefill for a batch using prepack optimization.
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine.prefill_prepacked(
+			self,
+			batch,
+		)
 
-		Prepack combines multiple shorter sequences into rows to minimize padding waste,
-		which is especially beneficial for MLP/MoE layers.
+	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._write_prefill_tokens(
+			self,
+			batch,
+			new_tokens,
+		)
 
-		Args:
-			batch: list of local indices
-		"""
-		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
-		# loop. Without this binding, GLM-5's prefill indexer-K offload at
-		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
-		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
-		# populated for prompt tokens and any later decode past 2048 tokens
-		# reads unwritten aux pages.
-		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
-		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
-		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
-		# the host aux cache instead of early-returning on a None view.
+	# ============ PREFILL MODEL-STATE BINDER (S5b) ============
+	# The worker implements PrefillModelStateBinder (batchgen/worker/prefill_engine.py):
+	# every model-wrapper class-state statement the moved prefill bodies made
+	# stays here, one method per contiguous run of the original body, moved
+	# verbatim; PrefillEngine calls each at its run's former position, so the
+	# engine module never names a model wrapper.
+
+	def _bind_prefill_host_views(self) -> None:
+		"""Bind the host KV worker views the prefill forward offloads through."""
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
-		if self._prefill_pool_wave is not None:
-			with self._weight_passes.scope("prefill"):
-				return self._prefill_prepacked_pool(batch)
-
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = False
-
-		# Collect input_ids and attention_masks as lists for prepacking
-		input_ids_list = []
-		attention_mask_list = []
-		seq_lengths = []
-		full_seq_lengths = []
-		compute_cached_tokens = []
-		attached_tokens = []
-		prefix_lookup_results = []
-
-		for query_idx in batch:
-			uuid = self._local_to_uuid_map[query_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			# NO truncation: every prompt is tokenized to its OWN length.
-			# An earlier `[:, :self.max_input_length]` slice silently dropped
-			# the tail of long LongBench prompts when max_input_length was
-			# carried over from a smaller earlier admit batch, causing the
-			# model to "continue" mid-sentence instead of answering. Bind
-			# everything to seq.prompt_length directly.
-			L = seq.prompt_length
-			prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
-			compute_cached = (
-				prefix_state.compute_cached_tokens
-				if prefix_state is not None
-				else 0
-			)
-			attached = (
-				prefix_state.attached_tokens
-				if prefix_state is not None
-				else 0
-			)
-			query_len = L - compute_cached
-			if query_len <= 0:
-				raise RuntimeError(
-					"prefix prefill must compute at least one prompt token"
-				)
-			# Suffix-only prefill: materialize just the uncached span of the
-			# trajectory; the cached prefix is attached as resident paged KV.
-			input_ids = self._trajectory_tokens(
-				seq, start=compute_cached, length=query_len, dtype=torch.int64
-			).view(1, -1)
-			seq_lengths.append(query_len)
-			full_seq_lengths.append(L)
-			compute_cached_tokens.append(compute_cached)
-			attached_tokens.append(attached)
-			prefix_lookup_results.append(
-				prefix_state.lookup_result if prefix_state is not None else None
-			)
-
-			# Per-seq mask marks the L valid positions for the prepacker.
-			# Causal attention is enforced by FA varlen + cu_seqlens.
-			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
-			attention_mask[0, :query_len] = 1
-
-			input_ids_list.append(input_ids)
-			attention_mask_list.append(attention_mask)
-
-		# Prepack sequences
-		# Row capacity is set by planner in config (None = no limit, use max sequence length)
-		row_capacity = self.engine_config.Module_Batching_Config.prepack_row_capacity
-		prepack_meta = prepack_sequences(
-			input_ids_list,
-			attention_mask_list,
-			row_capacity=row_capacity,
-			device=self.torch_device,
+	def _bind_prefill_pool_segments(self, wave) -> None:
+		"""Bind one pool wave's views, pool, segment sids and loaded segments."""
+		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		AttnWrapperBase.prefill_pool = wave.pool
+		# A recurrent layer forks a row's state from its parent segment's state
+		# slot, which is keyed by that segment's pseudo sequence id.
+		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
+		# A LOADED segment ran no row, so it left no recurrent state to fork:
+		# its reader resumes from the slot the trajectory restore bound before
+		# this wave, which the level cut verifies.
+		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
+			sorted(wave.materialized)
 		)
 
-		# Log prepack statistics
-		if self.rank == 0:
-			stats = get_prepack_stats(prepack_meta)
-			logging.info(
-				f"Prepack stats: {stats['num_sequences']} seqs -> {stats['num_packed_rows']} rows, "
-				f"padding saved: {stats['padding_saved']} tokens, "
-				f"efficiency: {stats['packing_efficiency']:.2%}"
-			)
-
-		# Create flattened tensors for prepacked forward
-		# Flatten packed_input_ids to [total_tokens]
-		total_tokens = sum(prepack_meta.original_seq_lengths)
-
-		# Extract only valid tokens (non-padding) in order
-		packed_input_ids_flat = []
-		packed_position_ids_flat = []
-
-		for seq_idx in range(prepack_meta.num_original_sequences):
-			row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
-			seq_len = prepack_meta.original_seq_lengths[seq_idx]
-
-			# Extract tokens for this sequence
-			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
-			packed_input_ids_flat.append(seq_input_ids)
-
-			# Prefix-hit suffixes retain their original absolute positions.
-			position_start = compute_cached_tokens[seq_idx]
-			packed_position_ids_flat.append(torch.arange(
-				position_start,
-				position_start + seq_len,
-				device=self.torch_device,
-			))
-
-		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
-		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
-
-		# Split sequences into micro-batches based on TOKEN count (not sequence count)
-		# This prevents OOM when sequences have varying lengths
-		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
-		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-		num_sequences = prepack_meta.num_original_sequences
-		seq_lengths_list = prepack_meta.original_seq_lengths
-
-		# Create micro-batches bounded by token count, optionally also by sum(L^2)
-		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
-		# on one micro-batch when a single very long sequence is present.
-		# The planner's token cap is a bound between sequence boundaries.  A
-		# single K3 prompt may itself be much larger than that cap, so the
-		# ordinary greedy planner cannot split it and would still co-reside two
-		# 262K-token sequences in one decoder pass.  That pass allocates the
-		# block-attention-residual scratch for *all* rows and exceeded H20 HBM
-		# before the first streamed-SP8 expert layer.  K3's KDA/MLA state is
-		# persistent per sequence, so keeping each long sequence in its own
-		# prepack pass preserves the state contract; it is not a token-axis
-		# split pretending to be a resumable model forward.
-		micro_batches, l2_cap, _use_single_sequence_mb = (
-			self._plan_prefill_micro_batches(
-				seq_lengths_list, full_seq_lengths, compute_cached_tokens
-			)
+	def _bind_prefill_pool_layer_state(self, wave, pool_layout) -> None:
+		"""Bind the wave's pool layer map and its fresh offload recorder."""
+		AttnWrapperBase.prefill_pool_layer_map = (
+			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
-		total_tokens_all = sum(seq_lengths_list)
-		if (
-			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-			and self.parallel_manager.prefill_uses_resident_ep()
-		):
-			# Pass counts were aligned across ALL ranks before this call (a
-			# rank with no local rows never enters here, so no collective may
-			# live in this function); ranks short of the global count pad with
-			# collective-only passes afterwards.
-			global_passes = getattr(self, "_prefill_global_passes", None)
-			if global_passes is not None and len(micro_batches) > global_passes:
-				raise RuntimeError(
-					"resident-EP prefill planned more micro-batches than the "
-					f"aligned global count: {len(micro_batches)} > {global_passes}"
-				)
-
-		if self.rank == 0:
-			logging.info(
-				f"Prepacked prefill: {len(micro_batches)} micro batches, "
-				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
-				+ (", single-sequence long-prompt guard" if _use_single_sequence_mb else "")
-				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
-			)
-
-		output_tokens = []
-		prefill_sequences = [
-			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-			for local_idx in batch
-		]
-		prefill_debug = (
-			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
 		)
-		_k3_profile_enabled = self._debug_flag_enabled(
-			prefill_debug.get("k3_prefill_profile")
+
+	def _install_prefill_pool_rows(self, rows, host_ids, host_starts) -> None:
+		"""Install one pool chunk's packed-row metadata on the attention wrappers."""
+		AttnWrapperBase.prepack_mode = True
+		AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
+		AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
+		AttnWrapperBase.prepack_num_sequences = len(rows.items)
+		AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
+		AttnWrapperBase.position_ids = rows.position_ids
+		AttnWrapperBase.cur_batch = host_ids
+		AttnWrapperBase.prefill_pool_batch = rows
+		AttnWrapperBase.prefill_pool_row_starts = host_starts
+
+	def _drop_prefill_pool_offload_recorder(self) -> None:
+		"""Drop the wave's offload recorder (not handed to verification)."""
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+
+	def _unbind_prefill_pool_segments(self) -> None:
+		"""Clear every pool-wave binding the wrappers carried for the wave."""
+		AttnWrapperBase.prefill_pool = None
+		AttnWrapperBase.prefill_pool_batch = None
+		AttnWrapperBase.prefill_pool_row_starts = None
+		AttnWrapperBase.prefill_pool_segment_sids = None
+		AttnWrapperBase.prefill_pool_materialized_segments = ()
+		AttnWrapperBase.prefill_pool_layer_map = None
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
+
+	def _bind_prefill_step_metadata(self, attention_mask) -> None:
+		"""Bind one padded prefill micro-batch's mask and derived positions."""
+		Attn_Wrapper.attention_mask = attention_mask
+		Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
+			attention_mask
 		)
-		_k3_profile_logits = []
-		# Batch-level ``batchgen_debug.glm5_lmhead_fp32``: read once here,
-		# like ``k3_prefill_profile`` above, so the per-micro-batch lm_head
-		# epilogue below costs one local bool test.
-		_lmhead_fp32 = self._debug_flag_enabled(
-			prefill_debug.get("glm5_lmhead_fp32")
+
+	def _bind_prefill_step_batch(self, cur_batch_local) -> None:
+		"""Bind the global sequence ids of one padded prefill micro-batch."""
+		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+
+	def _install_prefill_prepack_metadata(
+		self,
+		batch_cu_seqlens,
+		batch_max_seqlen,
+		batch_num_seqs,
+		batch_seq_lengths,
+		batch_position_ids_flat,
+		batch_spans,
+		prefix_materialization,
+		batch_full_seq_lengths,
+		batch_compute_cached,
+		batch_attached_tokens,
+	) -> None:
+		"""Install one prepacked micro-batch's metadata on the wrappers."""
+		Attn_Wrapper.prepack_mode = True
+		Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
+		Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
+		Attn_Wrapper.prepack_num_sequences = batch_num_seqs
+		Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
+		Attn_Wrapper.position_ids = batch_position_ids_flat
+		Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
+
+		# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
+		# which does NOT offload KV to host, causing decode to read garbage.
+		AttnWrapperBase.prepack_mode = True
+		AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+		AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
+		AttnWrapperBase.prepack_num_sequences = batch_num_seqs
+		AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+		AttnWrapperBase.prepack_full_seq_lengths = (
+			batch_full_seq_lengths
+			if prefix_materialization is not None
+			else None
 		)
-		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
-		# same keys as the pooled wave, so one armed batch traces whichever
-		# prefill runs (the first batch on a fresh server, or reuse OFF).
-		# None in production: ``prefill_debug`` is read once above for
-		# ``k3_prefill_profile``, and this one membership test on it is the
-		# whole cost of the trace being off - no tracer, no import.
-		unpooled_trace = None
-		if _EPILOGUE_TRACE_DEBUG_FLAG in prefill_debug:
-			from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
-			from batchgen.prefix_reuse.probe_guard import run_probe
-
-			unpooled_trace = run_probe(
-				"epilogue_trace.setup",
-				lambda: tracer_from_debug(
-					prefill_debug, rank=self.rank, path="unpooled"
-				),
-				rank=self.rank,
-			)
-		if unpooled_trace is not None:
-			logging.info(
-				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
-				"micro_batches=%s probe_token=%s",
-				self.rank, len(prefill_sequences), len(micro_batches),
-				unpooled_trace.probe_token,
-			)
-
-		# Pure forward wall time: started here so configure_prefill (already
-		# reported separately as `Config completed`) is NEVER folded in.
-		_prefill_forward_t0 = time.perf_counter()
-		with torch.inference_mode(), self._weight_passes.scope("prefill"):
-			for batch_idx, (seq_start, seq_end) in tqdm(
-				enumerate(micro_batches),
-				total=len(micro_batches),
-				desc="Prepacked Prefill",
-				disable=(self.rank != 0)  # Only show progress on rank 0
-			):
-				# Feed watchdog during long prefill operations
-				self.feed_watchdog()
-				self._weight_passes.begin(carry=batch_idx + 1 < len(micro_batches))
-
-				# Get sequences for this micro-batch
-				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
-				batch_full_seq_lengths = full_seq_lengths[seq_start:seq_end]
-				batch_compute_cached = compute_cached_tokens[seq_start:seq_end]
-				batch_attached_tokens = attached_tokens[seq_start:seq_end]
-				batch_lookup_results = prefix_lookup_results[seq_start:seq_end]
-				batch_num_seqs = seq_end - seq_start
-
-				# Extract tokens for this micro-batch
-				batch_input_ids = []
-				batch_position_ids = []
-				token_offset = sum(seq_lengths_list[:seq_start])  # Offset into flat tensors
-
-				for seq_idx in range(seq_start, seq_end):
-					seq_len = seq_lengths_list[seq_idx]
-					# Calculate where this sequence's tokens are in the flat tensor
-					seq_token_start = sum(seq_lengths_list[:seq_idx])
-					seq_token_end = seq_token_start + seq_len
-
-					batch_input_ids.append(packed_input_ids_flat[seq_token_start:seq_token_end])
-					batch_position_ids.append(packed_position_ids_flat[seq_token_start:seq_token_end])
-
-				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
-				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
-				if (
-					hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-					and self.parallel_manager.prefill_uses_resident_ep()
-				):
-					self._sync_prefill_moe_rank_counts(
-						int(batch_input_ids_flat.numel()),
-						reason=f"prefill_microbatch_{batch_idx}",
-					)
-
-				batch_local_indices = batch[seq_start:seq_end]
-				local_to_global_seq_id_map = {}
-				for local_idx in batch_local_indices:
-					uuid = self._local_to_uuid_map.get(local_idx)
-					if uuid is None:
-						raise RuntimeError(
-							f"Rank {self.rank}: missing UUID for prefill local_idx={local_idx}"
-						)
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is None:
-						raise RuntimeError(
-							f"Rank {self.rank}: missing SequenceEntry for prefill uuid={uuid[:8]}"
-						)
-					local_to_global_seq_id_map[local_idx] = seq.global_idx
-
-				batch_spans = build_prefill_sequence_spans(
-					batch_local_indices,
-					batch_seq_lengths,
-					self._local_to_uuid_map,
-					local_to_global_seq_id_map,
-				)
-				# Pinned source + non_blocking: a pageable H2D here blocks the
-				# host until the copy lands, i.e. once per micro-batch.
-				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
-					dtype=torch.int32,
-				).pin_memory().to(self.torch_device, non_blocking=True)
-				batch_max_seqlen = max(batch_seq_lengths)
-				prefix_materialization = None
-				if any(tokens > 0 for tokens in batch_compute_cached):
-					if any(result is None for result in batch_lookup_results):
-						raise RuntimeError(
-							"prefix-hit microbatch is missing lookup results"
-						)
-					from batchgen.prefix_reuse.materialization import (
-						materialize_gpt_oss_prefixes,
-					)
-
-					host_page_tokens = int(
-						self.prefix_cache_runtime_config.group_specs[0]
-						.raw_page_tokens
-					)
-					# Sized by the same function the micro-batch planner
-					# capped against the prefill-phase prefix KV budget.
-					gpu_config = self._prefix_materialization_kv_config(
-						batch_full_seq_lengths
-					)
-					temporary_manager = GPUPagedKVCacheManager(
-						config=gpu_config,
-						device=self.local_rank,
-					)
-					temporary_manager.initialize()
-					prefix_materialization = materialize_gpt_oss_prefixes(
-						gpu_manager=temporary_manager,
-						host_worker_view=(
-							self.core_engine.host_paged_kv_worker_view
-						),
-						coordinator=self.prefix_cache_coordinator,
-						lookup_results=batch_lookup_results,
-						sequence_ids=(
-							prefill_sequence_spans_to_global_seq_ids(batch_spans)
-						),
-						prompt_lengths=batch_full_seq_lengths,
-						compute_cached_tokens=batch_compute_cached,
-						raw_page_tokens=host_page_tokens,
-						collect_metrics=self.prefix_cache_debug_stats,
-						host_page_bytes_all_layers=(
-							self.prefix_cache_runtime_config
-							.host_page_bytes_all_layers
-						),
-					)
-					self._prefix.active_prefix_materializations.append(
-						prefix_materialization
-					)
-
-				# Set up Attn_Wrapper for this micro-batch.
-				# These class attrs are the per-step worker->model contract read
-				# by attention wrappers; see semantics in
-				#   batchgen-context/architecture/PSM_WORKER_CONTRACT.md (§2)
-				Attn_Wrapper.prepack_mode = True
-				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
-				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
-				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
-				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
-				Attn_Wrapper.position_ids = batch_position_ids_flat
-				Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
-
-				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
-				# which does NOT offload KV to host, causing decode to read garbage.
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
-				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
-				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
-				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
-				AttnWrapperBase.prepack_full_seq_lengths = (
-					batch_full_seq_lengths
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prepack_compute_cached_tokens = (
-					batch_compute_cached
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prepack_attached_tokens = (
-					batch_attached_tokens
-					if prefix_materialization is not None
-					else None
-				)
-				AttnWrapperBase.prefill_prefix_materialization = (
-					prefix_materialization
-				)
-				AttnWrapperBase.position_ids = batch_position_ids_flat
-				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(
-					batch_input_ids_flat.to(self.torch_device, dtype=torch.int64)
-				)
-
-				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-				hidden_states = inputs_embeds.unsqueeze(0)
-				# unsqueeze is a VIEW, so `hidden_states` already keeps the
-				# embedding storage alive for exactly as long as layer 0 needs
-				# it. Keeping `inputs_embeds` bound as well pins that storage
-				# for the WHOLE stack instead -- 1.75 GiB dead across layers
-				# 1-92 at S=131,072 / H=7168 / bf16
-				# (batchgen_design/model_support/kimi_k3/
-				#  PREFILL_MEMORY_AUDIT.md section 7, fix 4).
-				del inputs_embeds
-
-				# Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
-				# classic residual body, so the per-layer state has to be carried
-				# here. Without it every layer sees a zero-width residual and the
-				# model runs happily while computing something that is not K3 --
-				# wrong text, no error. Mirrors KimiLinearModel.forward
-				# (kimi_linear/model.py:880-910), which is the eager reference.
-				use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-				block_residual = None
-				if use_attn_res:
-					# Zero-column view of a buffer preallocated for ALL the
-					# stack's block boundaries, so the per-boundary `cat` never
-					# holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
-					# GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
-					# `block_residual = None` above is load-bearing: it drops
-					# the previous micro-batch's view before the next buffer is
-					# allocated.
-					block_residual = self.model.model._new_block_residual(hidden_states)
-
-				# DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
-				# bookkeeping is CPU-side, no sync) and independent of the
-				# allocator-history trace, so it still localises the peak layer
-				# if the trace ring buffer wraps.
-				_memprof_layers = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
-				# The allocator-history ring buffer only holds the LAST max_entries
-				# events, and one K3 prefill emits ~2e7 of them (896-expert
-				# moe_infer loop x 92 layers), so a whole-forward trace only ever
-				# retains the tail. The HBM peak is set in the FIRST layer, so
-				# BATCHGEN_MEM_PROFILE_STOP_LAYER=N dumps and stops recording right
-				# after layer N: a short, wrap-free trace of the window that
-				# actually contains the peak.
-				_memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
-
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					if use_attn_res:
-						hidden_states, block_residual = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-							block_residual=block_residual,
-						)
-					else:
-						layer_outputs = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-						)
-						hidden_states = layer_outputs[0]
-					if _memprof_layers:
-						logging.info(
-							f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
-							f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
-							f"alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
-							f"cum_peak={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
-							f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
-							f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
-						)
-						if layer_idx == _memprof_stop_layer:
-							_p = os.path.join(
-								os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
-								f"memprof_rank{self.rank}_thru_layer{layer_idx}_{int(time.time())}.pickle",
-							)
-							torch.cuda.memory._dump_snapshot(_p)
-							torch.cuda.memory._record_memory_history(enabled=None)
-							logging.info(
-								f"[MEMPROF] Rank {self.rank}: stop-layer snapshot -> {_p} "
-								f"(peak_alloc so far={torch.cuda.max_memory_allocated()/2**30:.3f}GiB)"
-							)
-
-				# Output depth-mix, then norm -- that ORDER is load-bearing
-				# (kimi_linear/model.py:904-913).
-				if use_attn_res:
-					hidden_dim = hidden_states.shape[2]
-					batch_sz, seq_sz = hidden_states.shape[:2]
-					hidden_states = self.model.model._apply_output_attn_res(
-						hidden_states.view(-1, hidden_dim), block_residual
-					).view(batch_sz, seq_sz, hidden_dim)
-
-				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
-
-				# Extract last token hidden states for each sequence
-				last_token_indices = batch_cu_seqlens[1:] - 1
-				gather_last_token_hidden = getattr(
-					self.parallel_manager,
-					"gather_prefill_last_token_hidden",
-					None,
-				)
-				if gather_last_token_hidden is None:
-					last_token_hidden = hidden_states[
-						0, last_token_indices, :
-					]
-					if unpooled_trace is not None:
-						# Genuinely single-rank: this manager has no gather, so
-						# the rank holds every row. Asserted inside, not
-						# assumed - see _record_unsharded_epilogue_gather.
-						unpooled_trace.begin_chunk(batch_idx)
-						self._record_unsharded_epilogue_gather(
-							unpooled_trace,
-							last_token_hidden,
-							num_global_rows=int(hidden_states.shape[1]),
-						)
-				else:
-					# The tracer goes INTO the real gather, exactly as on the
-					# pooled path: under streamed-SP8 this rank holds only a
-					# row shard, and the shard bounds, the owned mask and the
-					# norms either side of the all-reduce are visible only in
-					# there. Writing a tp=0/1 record out here instead would
-					# report a broken multi-rank gather as healthy.
-					if unpooled_trace is not None:
-						unpooled_trace.begin_chunk(batch_idx)
-					last_token_hidden = gather_last_token_hidden(
-						hidden_states,
-						last_token_indices,
-						batch_input_ids_flat.numel(),
-						**(
-							{"trace": unpooled_trace}
-							if unpooled_trace is not None
-							else {}
-						),
-					)
-
-				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-				# Opt into FP32-cast via batchgen_debug.glm5_lmhead_fp32 for
-				# debugging (batch-level only; no env guard).
-				if getattr(self.model.lm_head, "tp_size", 1) > 1:
-					# vocab-parallel head (K3 TP8): the module all_gathers the
-					# full logits; the raw shard weight must not be used here.
-					# .forward skips the decode-only pre-hook (``[:, -1, :]``
-					# expects [bsz, seq, H]; this input is the gathered [n, H]).
-					logits = self.model.lm_head.forward(last_token_hidden).float()
-				elif _lmhead_fp32:
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
-				if _k3_profile_enabled:
-					_k3_profile_logits.append(logits.detach())
-
-				batch_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in batch_local_indices
-				]
-				batch_new_tokens = self._select_tokens(logits, batch_sequences)
-				if batch_new_tokens.shape[0] != batch_num_seqs:
-					raise RuntimeError(
-						f"Rank {self.rank}: prefill token selection shape mismatch, "
-						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
-					)
-				if unpooled_trace is not None:
-					# One line per sequence, from the SAME logits the token
-					# choice consumed. The gather-side facts were recorded by
-					# the gather itself (or, where no gather exists, by the
-					# asserted single-rank helper), so nothing is hand-written
-					# here: the chunk was opened before the gather so those
-					# records survive to this line.
-					unpooled_trace.emit(
-						table_rows=list(range(batch_num_seqs)),
-						tail_rows=last_token_indices.tolist(),
-						wave_indices=list(range(batch_num_seqs)),
-						global_ids=[int(seq.global_idx) for seq in batch_sequences],
-						uuids=[str(seq.uuid) for seq in batch_sequences],
-						tokens=[int(token) for token in batch_new_tokens],
-						logits=logits,
-					)
-				output_tokens.append(batch_new_tokens)
-				self._weight_passes.end()
-
-				if prefix_materialization is not None:
-					AttnWrapperBase.retire_pending_prefill_offloads(
-						device=self.torch_device,
-						reason="before releasing prefix materialization",
-					)
-					self._close_prefix_materialization(
-						prefix_materialization,
-						empty_cuda_cache=True,
-					)
-					self._prefix.active_prefix_materializations.remove(
-						prefix_materialization
-					)
-					AttnWrapperBase.prefill_prefix_materialization = None
-
-
-		# Keep the historical host-enqueue boundary for backwards-compatible
-		# diagnostics, then establish two stronger completion boundaries. A host
-		# perf-counter sample alone does not prove that a non-default CUDA stream
-		# has finished, and the last layer's KV D2H task is intentionally not on
-		# the compute stream.
-		_prefill_forward_host_s = time.perf_counter() - _prefill_forward_t0
-		torch.cuda.current_stream(self.torch_device).synchronize()
-		_prefill_forward_gpu_complete_s = time.perf_counter() - _prefill_forward_t0
-		# The FIRST generated tokens, straight out of prefill: a cross-check
-		# of the response path (max_tokens=1 requests complete right after
-		# prefill). Read once per wave after the completion boundary above,
-		# never per micro-batch, so it adds no host-device sync. Rank 0 only;
-		# ids only (the worker has no tokenizer -- decode them client-side).
-		if self.rank == 0 and output_tokens:
-			_ids = torch.cat([t.reshape(-1) for t in output_tokens]).tolist()
-			logging.info(
-				"[PREFILL] first sampled token ids: %s ... last: %s (n=%d)",
-				_ids[:16], _ids[-8:], len(_ids))
-		_num_final_kv_tasks = AttnWrapperBase.retire_pending_prefill_offloads(
-			device=self.torch_device,
-			reason="prefill metrics KV-ready boundary",
+		AttnWrapperBase.prepack_compute_cached_tokens = (
+			batch_compute_cached
+			if prefix_materialization is not None
+			else None
 		)
-		_prefill_kv_ready_s = time.perf_counter() - _prefill_forward_t0
-		if _k3_profile_enabled:
-			_k3_profile_topk = []
-			for profile_logits in _k3_profile_logits:
-				top_values, top_indices = torch.topk(
-					profile_logits,
-					k=min(8, profile_logits.shape[-1]),
-					dim=-1,
-				)
-				_k3_profile_topk.append({
-					"ids": top_indices.cpu().tolist(),
-					"values": top_values.cpu().tolist(),
-				})
-			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
-				KimiK3MXFP4ExpertWrapper,
-			)
-			from batchgen.moe.streamed_sp8_mxfp4 import (
-				StreamedSP8MXFP4MoELayer,
-			)
-			free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
-			# The top-k ``.cpu()`` transfers above have drained the compute stream.
-			# Pending ingress events precede the ready events that stream waited on,
-			# so every timing pair is complete before ``elapsed_time`` is queried.
-			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
-				"rank": self.rank,
-				"hbm": {
-					"current_allocated_bytes": torch.cuda.memory_allocated(
-						self.local_rank
-					),
-					"current_reserved_bytes": torch.cuda.memory_reserved(
-						self.local_rank
-					),
-					"peak_allocated_bytes": torch.cuda.max_memory_allocated(
-						self.local_rank
-					),
-					"peak_reserved_bytes": torch.cuda.max_memory_reserved(
-						self.local_rank
-					),
-					"free_bytes": free_hbm,
-					"total_bytes": total_hbm,
-				},
-				"weight_stream": self.core_engine.get_weight_stream_profile(),
-				# The exact module counts of the profiled forward's passes.
-				"weight_passes": self._weight_passes.totals,
-				"expert_consumer": (
-					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
-				),
-				"streamed_sp8": (
-					StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
-				),
-				"logit_topk": _k3_profile_topk,
-			}, separators=(",", ":")))
-
-		# Structured prefill record, one JSON line per rank that actually ran a
-		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
-		# report tool prefers this over scraping the tqdm bar, which is
-		# presentation, not an API.
-		#
-		# Deliberately NOT gated on rank 0, departing from the proposal's
-		# "rank 0 only". prefill_prepacked runs only under
-		# `if local_prefill_indices:`, and the tqdm bar above is
-		# disable=(self.rank != 0) -- so when rank 0 owns none of the batch
-		# there is neither a bar nor a rank-0 line anywhere in the log, and the
-		# run reports `Prefill: 0.0s` with nothing to scrape. That is exactly
-		# what the 131,069-token run produced when rank 2 owned the sequence.
-		# Every participating rank emits its own tagged line; the wall time for
-		# the batch is the MAX of each timing field over the emitting ranks.
-		# `prefill_s` retains its historical host-forward meaning; schema-aware
-		# reporters use `prefill_kv_ready_s` as the canonical capability boundary.
-		# The legacy/full-attention path does not build a WavePrefixPlan, but it
-		# still has the same workload geometry. Keep the stress metric contract
-		# comparable: every prompt is recomputed, one item row is emitted per
-		# sequence, and each FA3 micro-batch is one chunk. Causal pairs are the
-		# exact full-attention work count for each prompt.
-		legacy_full_attention_pairs = sum(
-			(int(seq_len) * (int(seq_len) + 1)) // 2
-			for seq_len in seq_lengths_list
+		AttnWrapperBase.prepack_attached_tokens = (
+			batch_attached_tokens
+			if prefix_materialization is not None
+			else None
 		)
-		logging.info("[METRICS] %s", json.dumps({
-			"component": "prefill_full_attention",
-			"phase": "prefill",
-			"prefill_metrics_contract": "forward-host+gpu-complete+kv-ready-v1",
-			"prefill_s": _prefill_forward_host_s,
-			"prefill_forward_host_s": _prefill_forward_host_s,
-			"prefill_forward_gpu_complete_s": _prefill_forward_gpu_complete_s,
-			"prefill_kv_ready_s": _prefill_kv_ready_s,
-			"final_kv_offload_tasks_retired": _num_final_kv_tasks,
-			"sequences": num_sequences,
-			"prompt_tokens": total_tokens_all,
-			"computed_tokens": total_tokens_all,
-			"full_attention_pairs": legacy_full_attention_pairs,
-			"item_rows": num_sequences,
-			"chunks": len(micro_batches),
-			"saved_tokens": 0,
-			"recomputed_tokens": total_tokens_all,
-			"tokens_total": total_tokens_all,
-			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
-			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,
-			"micro_batches": len(micro_batches),
-			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
-			"world_size": self.world_size,
-			"rank": self.rank,
-			# Guarded: the proposal's unguarded output_tokens[0] is an IndexError
-			# on a rank that ran zero micro-batches.
-			"first_sampled_token_ids": (
-				output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
-			),
-		}, separators=(",", ":")))
+		AttnWrapperBase.prefill_prefix_materialization = (
+			prefix_materialization
+		)
+		AttnWrapperBase.position_ids = batch_position_ids_flat
+		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-		# Reset prepack mode
+	def _retire_prefill_pending_offloads(self, device, reason):
+		"""Retire pending prefill KV offloads; returns the retired task count."""
+		return AttnWrapperBase.retire_pending_prefill_offloads(
+			device=device,
+			reason=reason,
+		)
+
+	def _clear_prefill_prefix_materialization(self) -> None:
+		"""Detach the released prefix materialization from the wrappers."""
+		AttnWrapperBase.prefill_prefix_materialization = None
+
+	def _reset_prefill_prepack_metadata(self) -> None:
+		"""Reset the prepack metadata after the prepacked forward loop."""
 		Attn_Wrapper.prepack_mode = False
 		Attn_Wrapper.prepack_cu_seqlens = None
 		Attn_Wrapper.prepack_max_seqlen = None
@@ -16324,37 +11959,69 @@ class BatchGenWorker:
 		AttnWrapperBase.prepack_attached_tokens = None
 		AttnWrapperBase.prefill_prefix_materialization = None
 
-		# Log timing summary for GPT-OSS if timing was enabled
-		self._log_prefill_timing()
+	# S5b model-name routing (spec F3): the moved prefill bodies read these
+	# model-family constants through the worker so no model-name literal enters
+	# batchgen/worker/. Each returns exactly the original string constant.
 
-		new_tokens = torch.cat(output_tokens, dim=0)
-		return self._write_prefill_tokens(batch, new_tokens)
+	def _prefill_deepseek_family_name(self) -> str:
+		return "deepseek"
 
-	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
-		"""Store each sequence's first generated token (batch order)."""
-		if new_tokens.shape[0] != len(batch):
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill writeback shape mismatch, "
-				f"got {new_tokens.shape[0]} rows for {len(batch)} local sequences"
-			)
+	def _k3_prefill_profile_flag_name(self) -> str:
+		return "k3_prefill_profile"
 
-		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		new_tokens_cpu = new_tokens.cpu()
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
-			# The unified book owns the append position. Keep the scalar
-			# completion counter in lockstep for fresh prefill and KV re-entry.
-			seq.decoded_length += 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+	def _glm5_lmhead_fp32_flag_name(self) -> str:
+		return "glm5_lmhead_fp32"
 
-			# Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
-				seq.eos_reached = True
+	def _new_prefill_temporary_gpu_kv_manager(self, gpu_config) -> GPUPagedKVCacheManager:
+		# S5b carve-out #6 (spec §S5b): the engine module must stay importable
+		# without the native kv_cache chain, so the temporary prefix-hit GPU KV
+		# manager is constructed here, where the class is already imported.
+		return GPUPagedKVCacheManager(
+			config=gpu_config,
+			device=self.local_rank,
+		)
 
-		return new_tokens
+	def _emit_k3_prefill_profile_log(self, k3_profile_topk) -> None:
+		"""Log the per-rank K3 prefill profile record (one JSON line)."""
+		from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+			KimiK3MXFP4ExpertWrapper,
+		)
+		from batchgen.moe.streamed_sp8_mxfp4 import (
+			StreamedSP8MXFP4MoELayer,
+		)
+		free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
+		# The top-k ``.cpu()`` transfers above have drained the compute stream.
+		# Pending ingress events precede the ready events that stream waited on,
+		# so every timing pair is complete before ``elapsed_time`` is queried.
+		logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
+			"rank": self.rank,
+			"hbm": {
+				"current_allocated_bytes": torch.cuda.memory_allocated(
+					self.local_rank
+				),
+				"current_reserved_bytes": torch.cuda.memory_reserved(
+					self.local_rank
+				),
+				"peak_allocated_bytes": torch.cuda.max_memory_allocated(
+					self.local_rank
+				),
+				"peak_reserved_bytes": torch.cuda.max_memory_reserved(
+					self.local_rank
+				),
+				"free_bytes": free_hbm,
+				"total_bytes": total_hbm,
+			},
+			"weight_stream": self.core_engine.get_weight_stream_profile(),
+			# The exact module counts of the profiled forward's passes.
+			"weight_passes": self._weight_passes.totals,
+			"expert_consumer": (
+				KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
+			),
+			"streamed_sp8": (
+				StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
+			),
+			"logit_topk": k3_profile_topk,
+		}, separators=(",", ":")))
 
 	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 
@@ -16368,41 +12035,21 @@ class BatchGenWorker:
 		chunk_size: int,
 		per_node_host_stats: Optional[List[Dict[str, int]]],
 	) -> BoundaryDecisionRequest:
-		"""Snapshot the boundary-decision inputs (rank 0 only).
-
-		``seq_meta`` is sourced from ``global_batch`` (rank 0 holds every
-		sequence) for the union of decode + loadable-candidate uuids,
-		replacing the handler's direct ``global_batch`` reads. Entries are
-		omitted for uuids with no sequence — the handler treats a missing
-		entry as ``global_idx = inf`` / ``priority = 0``, matching the
-		legacy ``if seq is not None else ...`` fallbacks.
-		"""
-		seq_meta: Dict[str, BoundarySeqMeta] = {}
-		for uuid in set(decode_uuids) | set(global_candidate_info.keys()):
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			seq_meta[uuid] = BoundarySeqMeta(
-				global_idx=seq.global_idx,
-				priority=getattr(seq, 'priority', 0),
-				current_context_length=getattr(seq, 'current_context_length', 0),
-				host_token_capacity=getattr(seq, 'host_token_capacity', 0),
-				host_pages_allocated=getattr(seq, 'host_pages_allocated', 0),
-			)
-		return BoundaryDecisionRequest(
-			decode_uuids=tuple(decode_uuids),
-			global_seq_state=global_seq_state,
-			global_candidate_info=global_candidate_info,
-			per_rank_free=tuple(per_rank_free),
-			per_rank_total=tuple(per_rank_total),
-			chunk_size=chunk_size,
-			per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
-			seq_meta=seq_meta,
-			world_size=self.world_size,
-			num_gpus_per_node=self.local_world_size,
-			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
-			enable_host_kv_eviction=self.enable_host_kv_eviction,
-			attn_tp_size=self._decode_attn_tp_size(),
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_boundary_decision_request(
+			self,
+			decode_uuids,
+			global_seq_state,
+			global_candidate_info,
+			per_rank_free,
+			per_rank_total,
+			chunk_size,
+			per_node_host_stats,
 		)
 
 	def _compute_boundary_decisions(
@@ -17677,27 +13324,14 @@ class BatchGenWorker:
 		batch: List[int],
 		gpu_manager,
 	) -> Tuple[List[str], List[int]]:
-		"""Complete an in-flight boundary GPU-KV load and fold its rows in.
-
-		A launched boundary load has already allocated GPU pages -- and
-		registered their shared-page keys -- for rows that are NOT yet in
-		``decode_uuids``; only the finalize step moves them in. Every decode
-		exit that drops its pending-load state must therefore run this first:
-		an exit that forgets the pending rows strands their GPU pages (no
-		later path frees pages for a row outside ``decode_uuids``), and the
-		next load of such a row finds its own stale keyed pages still mapped
-		and fails the writable-page sharing guard, which the collective
-		converts into a cohort-fatal SCHED_INVARIANT.
-
-		All ranks hold identical ``pending_load_uuids`` and reach this from
-		broadcast boundary decisions, so the wait/barrier/finalize protocol
-		stays rank-aligned.
-		"""
-		if pending_async_task is not None:
-			pending_async_task.wait()
-			torch.cuda.synchronize(self.torch_device)
-		dist.barrier()
-		return self._finalize_async_load_minimal(
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._integrate_pending_async_load(
+			self,
 			pending_async_task,
 			pending_load_uuids,
 			pending_load_local_indices,
@@ -17767,7 +13401,10 @@ class BatchGenWorker:
 			position_view.add_(1)
 		else:
 			staging = self._decode_cache_seqlens_cpu_staging
-			_deferred = DECODE_DEFERRED_TOKEN_READBACK
+			# Module-attribute read: the flag's single definition lives on
+			# decode_engine and is documented as flippable on that module at
+			# runtime; a from-import here would freeze a copy.
+			_deferred = _decode_engine.DECODE_DEFERRED_TOKEN_READBACK
 			if _deferred:
 				# With the readback deferred the host runs one step ahead of
 				# the stream, so the previous step's copy out of this pinned
@@ -17853,90 +13490,32 @@ class BatchGenWorker:
 					manager.rebuild_page_table(cur_batch)
 
 	def _sync_decode_moe_rank_counts(self, batch: List[int], *, reason: str) -> int:
-		"""Synchronize per-rank decode row counts for 3D MoE padding masks."""
-		local_count = int(len(batch))
-		if self._decode_local_count_tensor is None:
-			self._decode_local_count_tensor = torch.empty(
-				(1,), dtype=torch.int64, device=self.torch_device
-			)
-		if (
-			self._decode_all_rank_counts is None
-			or self._decode_all_rank_counts.shape[0] != self.world_size
-		):
-			self._decode_all_rank_counts = torch.empty(
-				(self.world_size,), dtype=torch.int64, device=self.torch_device
-			)
-		local_count_tensor = self._decode_local_count_tensor
-		all_rank_counts = self._decode_all_rank_counts
-		local_count_tensor.fill_(local_count)
-		dist.all_gather_into_tensor(all_rank_counts, local_count_tensor)
-		max_batch_size = int(all_rank_counts.max().item())
-
-		self._current_decode_local_batch_size = local_count
-		self._current_decode_max_rank_batch_size = max_batch_size
-		self._current_decode_rank_token_counts = all_rank_counts
-
-		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-			# M2b: under DP-(world/G) x TP-G decode the 32-way max above is the
-			# per-GROUP batch B_grp (the G ranks of a group hold identical
-			# sequences). Decode scatters those rows across the group's G ranks
-			# before the DP-32 resident MoE, so the padded all_gather/all_reduce
-			# layout is sized by the POST-scatter share ceil(B_grp/G), not B_grp.
-			# G==1 -> ceil(max/1)==max, byte-identical to the pure-DP path.
-			from batchgen.decode_dp_group import moe_ntp_from_group_max
-			_G = getattr(self.parallel_manager, "attn_tp_size", 1)
-			moe_ntp = moe_ntp_from_group_max(max_batch_size, _G)
-			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-				self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
-			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-				self.parallel_manager.set_rank_token_counts(all_rank_counts)
-
-		if BATCHGEN_MULTI_BATCH_DIAG:
-			try:
-				counts_list = all_rank_counts.detach().cpu().tolist()
-			except RuntimeError:
-				counts_list = ["<unavailable>"]
-			logging.info(
-				f"[GLM5_MOE_COUNTS] Rank {self.rank}: reason={reason} "
-				f"local={local_count} max={max_batch_size} counts={counts_list}"
-			)
-		return max_batch_size
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._sync_decode_moe_rank_counts(
+			self,
+			batch,
+			reason=reason,
+		)
 
 	def _sync_prefill_moe_rank_counts(
 		self, local_token_count: int, *, reason: str
 	) -> int:
-		"""Size resident-EP prefill collectives after TP-group row scattering."""
-		local = torch.tensor(
-			[int(local_token_count)],
-			dtype=torch.int64,
-			device=self.torch_device,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._sync_prefill_moe_rank_counts(
+			self,
+			local_token_count,
+			reason=reason,
 		)
-		counts = torch.empty(
-			(self.world_size,), dtype=torch.int64, device=self.torch_device
-		)
-		dist.all_gather_into_tensor(counts, local)
-		G = self._decode_attn_tp_size()
-		counts_list = [int(value) for value in counts.cpu().tolist()]
-		for start in range(0, self.world_size, G):
-			group = counts_list[start:start + G]
-			if len(set(group)) != 1:
-				raise RuntimeError(
-					"resident-EP prefill requires identical token rows within "
-					f"each TP group; ranks {start}:{start + G} reported {group}"
-				)
-		max_group_tokens = max(counts_list)
-		from batchgen.decode_dp_group import moe_ntp_from_group_max
-		moe_ntp = moe_ntp_from_group_max(max_group_tokens, G)
-		self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
-		if self.rank == 0:
-			logging.info(
-				"[K3_PREFILL_MOE] reason=%s group_token_counts=%s "
-				"post_scatter_ntp=%s",
-				reason,
-				[counts_list[start] for start in range(0, self.world_size, G)],
-				moe_ntp,
-			)
-		return moe_ntp
 
 	def _warmup_cuda_graphs(self):
 		"""One-time CUDA graph warmup phase with model guard.
@@ -17953,7 +13532,6 @@ class BatchGenWorker:
 		model_name_l = model_name.lower()
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
-			and "glm" in model_name_l
 		)
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
 			if glm5_whole_graph_enabled:
@@ -18095,8 +13673,6 @@ class BatchGenWorker:
 		return float(value["seconds"]) if value["rank"] == self.rank else 0.0
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_GRAPH_PATH_LOG", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
@@ -18111,7 +13687,7 @@ class BatchGenWorker:
 		# is the supported way to enable the compare facility.
 		if getattr(getattr(self, "args", None), "disable_cuda_graphs", False):
 			return False
-		return glm5_whole_model_cuda_graph_requested_for_model(
+		return glm5_whole_model_cuda_graph_requested(
 			getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(
 				getattr(self, "args", None),
@@ -18121,28 +13697,68 @@ class BatchGenWorker:
 		)
 
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 
 	def _glm5_whole_model_graph_timing_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_TIMING", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_whole_model_graph_timing")):
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
-			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
+
+	def _glm5_whole_model_graph_debug_value(self, key: str):
+		"""The current batch's ``batchgen_debug[key]`` (None when absent)."""
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return None
+		return debug.get(key)
+
+	def _glm5_whole_model_graph_compare_tolerance(self, key: str) -> float:
+		"""``glm5_whole_model_graph_compare_atol`` / ``_rtol``: default 1e-2.
+
+		A number, or a string ``float()`` parses (the grammar of the env vars
+		these keys replace). Anything else is refused by name.
+		"""
+		value = self._glm5_whole_model_graph_debug_value(key)
+		if value is None:
+			return 1e-2
+		if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}")
+		try:
+			return float(value)
+		except ValueError as exc:
+			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}") from exc
+
+	def _glm5_whole_model_graph_probe_layers(self, num_layers: int) -> tuple:
+		"""``glm5_whole_model_graph_probe_layers``: decoder layers to probe.
+
+		``"all"``, a comma-separated index string (the grammar of the env var
+		this key replaces), or a list of ints; absent/empty means no probes.
+		Anything else is refused by name.
+		"""
+		value = self._glm5_whole_model_graph_debug_value("glm5_whole_model_graph_probe_layers")
+		if value is None:
+			return ()
+		if isinstance(value, str):
+			if value.strip().lower() == "all":
+				return tuple(range(num_layers))
+			return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+		if isinstance(value, (list, tuple)) and all(
+			isinstance(item, int) and not isinstance(item, bool) for item in value
+		):
+			return tuple(value)
+		raise ValueError(
+			"batchgen_debug.glm5_whole_model_graph_probe_layers must be \"all\", a "
+			f"comma-separated index string or a list of ints, got {value!r}"
+		)
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
@@ -18171,8 +13787,7 @@ class BatchGenWorker:
 		# legacy `_glm5_force_segmented_graph_eager` wrap stays for the
 		# compare-mode eager re-run path (used in the legacy whole-model
 		# compare branch that still wraps `self.model.model(...)`).
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" in model_name_l and self._glm5_whole_model_graph_requested_for_current_batch():
+		if self._glm5_whole_model_graph_requested_for_current_batch():
 			with self._glm5_force_segmented_graph_eager():
 				return _forward()
 		return _forward()
@@ -18272,7 +13887,6 @@ class BatchGenWorker:
 
 		glm5_whole_graph_requested = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
-			and "glm" in (getattr(self, "model_name", "") or "").lower()
 		)
 		generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
 			graph_manager_is_initialized=self._graph.cuda_graph_manager is not None,
@@ -18397,21 +14011,16 @@ class BatchGenWorker:
 	_WHOLE_GRAPH_EAGER_SERVABLE_REASONS = frozenset({"max_seqlen_exceeds_capture"})
 
 	def _warn_decode_graph_span_exceeded(self, step_max_seqlen: int, span: int) -> None:
-		"""Rate-limited WARN naming this step's max_seqlen and the captured span."""
-		now = time.monotonic()
-		last = self._graph.decode_graph_span_warn_monotonic
-		if last is not None and now - last < _GRAPH_SPAN_WARN_INTERVAL_S:
-			return
-		self._graph.decode_graph_span_warn_monotonic = now
-		logging.warning(
-			"Rank %s: the whole-model decode graph covers %d context tokens but "
-			"this step's max_seqlen is %d; running the step in eager decode. The "
-			"span is the deployment context bound trimmed by the graph's "
-			"context-proportional statics budget (%d bytes).",
-			self.rank,
-			int(span),
-			int(step_max_seqlen),
-			GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_step_observability_engine", None)
+		if engine is None:
+			from batchgen.worker.step_observability_engine import StepObservabilityEngine
+			engine = StepObservabilityEngine()
+			self._step_observability_engine = engine
+		return engine._warn_decode_graph_span_exceeded(
+			self,
+			step_max_seqlen,
+			span,
 		)
 
 	def _glm5_whole_graph_path_state(self, max_rank_bsz: int):
@@ -18559,102 +14168,16 @@ class BatchGenWorker:
 		}
 
 	def _finalize_gpu_kv_pool_after_capture(self, gpu_manager) -> None:
-		"""Measure-once-cache finalization (semantic contract, POIS 2026-10-05).
-
-		Called once, right after the full graph warmup/capture, while the
-		PROVISIONAL pool is still allocated. The capture pass has materialized
-		every persistent allocation (graph pools, static buffers, NCCL
-		per-collective resources, JIT caches), so the steady residency is
-		``used - provisional_pool`` and the final pool is everything the memory
-		fraction allows above it. The result is CACHED; every later pool
-		(re)creation reuses it, making the pool identical across decode rounds
-		(invariant 1) and retiring the fresh-server round-1 protocol.
-
-		The size is the device total minus that steady residency minus the
-		explicit ``GPU_KV_POOL_HEADROOM_GB``. ``gpu_memory_frac`` is NOT
-		applied again here: its slack is what covers the graph footprint the
-		PRE-capture measurement cannot see, and once that footprint is inside
-		the measurement, re-applying the fraction charges it twice and parks
-		``(1 - frac) * total`` permanently free with no named consumer. The
-		headroom constant is that consumer, measured and auditable.
-
-		The current (first) round keeps the provisional pool: its sequences
-		already hold pages, the captured graphs bake its addresses, and this
-		codebase deliberately refuses to recapture after a configured capture
-		(``_setup_cuda_graphs`` falls back to eager instead, and the reuse
-		lifecycle raises), so the live pool cannot be resized under them. With
-		the headroom sizing the provisional is the SMALLER pool (it still
-		carries the unmeasured-graph slack), so round 1 is a conservative
-		startup artifact, never an over-commitment. The cached size applies
-		from the NEXT pool creation (the per-round destroy/recreate that
-		already exists), from which point the page count is identical for
-		every round.
-		"""
-		if not self._gpu_kv_sizing_provisional:
-			return
-		self._gpu_kv_sizing_provisional = False
-
-		torch.cuda.synchronize(self.torch_device)
-		torch.cuda.empty_cache()
-		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
-		total_mem_gb = total_mem_bytes / (1024 ** 3)
-		used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
-		provisional_gb = self.gpu_kv_cache_size_gb
-		steady_used_gb = used_mem_gb - provisional_gb
-
-		final_gb = KVCacheManager.compute_final_pool_gb(
-			total_mem_gb,
-			used_mem_gb,
-			provisional_gb,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._finalize_gpu_kv_pool_after_capture(
+			self,
+			gpu_manager,
 		)
-
-		# Broadcast rank 0's decision so every rank resizes identically.
-		size_tensor = torch.tensor([final_gb], dtype=torch.float32, device=self.torch_device)
-		dist.broadcast(size_tensor, src=0)
-		final_gb = float(size_tensor.item())
-
-		# Fail-loud floor (contract invariant 3).
-		manager = self.gpu_paged_kv_cache_manager
-		stats = manager.get_stats()
-		bytes_per_page = (
-			provisional_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
-		)
-		final_pages = KVCacheManager.pool_pages_for_gb(final_gb, bytes_per_page)
-		bucket_sizes = list(getattr(self._graph.whole_model_bucketing, "bucket_sizes", []) or [1])
-		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
-		if final_gb <= 0 or final_pages < floor_pages:
-			raise RuntimeError(
-				f"[GPU-KV] Final pool below floor: {final_gb:.2f} GB "
-				f"(~{final_pages} pages) < {floor_pages} pages required for the "
-				f"largest decode bucket. Steady residency {steady_used_gb:.2f} GB "
-				f"of {total_mem_gb:.2f} GB leaves nothing above the "
-				f"{GPU_KV_POOL_HEADROOM_GB:.2f} GB pool headroom; fix the "
-				"configuration."
-			)
-
-		# Cache only: the live round keeps the provisional pool (its sequences
-		# hold pages and the captured graphs bake its addresses); every later
-		# pool creation uses the cached final size.
-		self._gpu_kv_cached_pool_gb = final_gb
-		if self.rank == 0:
-			logging.info(
-				f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
-				f"(~{final_pages} pages; steady used {steady_used_gb:.2f} GB of "
-				f"{total_mem_gb:.2f} GB; headroom {GPU_KV_POOL_HEADROOM_GB:.2f} GB; "
-				f"provisional {provisional_gb:.2f} GB stays for this round, delta "
-				f"{final_gb - provisional_gb:+.2f} GB; cached for every later pool "
-				"creation)"
-			)
-			logging.info(
-				"[GPU-KV] Pool margin is now the explicit %.2f GB headroom; "
-				"gpu_memory_frac=%.3f bounds only the pre-capture provisional "
-				"measurement (the frac-based final size would have been %.2f GB)",
-				GPU_KV_POOL_HEADROOM_GB,
-				self.gpu_memory_frac,
-				provisional_pool_gb(
-					total_mem_gb, self.gpu_memory_frac, steady_used_gb, floor_gb=None
-				),
-			)
 
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
@@ -18698,21 +14221,14 @@ class BatchGenWorker:
 		# Use model's max_position_embeddings (not the deployment max_model_len) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		# Phase C: only whole-model graph remains for GLM-5 (other modes retired).
-		# The dsa/moe/dsa_full/layer enables are pinned False so the now-dead
-		# downstream branches stay typeable until a subsequent commit deletes
-		# them outright. The whole-model graph is the only live path here.
-		glm5_dsa_graph_enabled = False
-		glm5_dsa_full_graph_enabled = False
-		glm5_moe_graph_enabled = False
-		glm5_layer_graph_enabled = False
+		# Phase C: only the whole-model graph remains for GLM-5 (the dsa / moe /
+		# dsa_full / layer modes are retired and their branches deleted).
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
-			and "glm" in model_name_l
 		)
 		if glm5_whole_graph_enabled:
-			whole_graph_required = self._glm5_whole_model_graph_requested_for_current_batch()
+			# The request is the requirement: requested here means required.
+			whole_graph_required = glm5_whole_graph_enabled
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 			capture_attempted = bool(
@@ -19056,17 +14572,9 @@ class BatchGenWorker:
 				)
 			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
-			probe_layers_env = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS", "")
-			if probe_layers_env.strip().lower() == "all":
-				compare_probe_layers = tuple(range(len(self.model.model.layers)))
-			elif probe_layers_env.strip():
-				compare_probe_layers = tuple(
-					int(part.strip())
-					for part in probe_layers_env.split(",")
-					if part.strip()
-				)
-			else:
-				compare_probe_layers = ()
+			compare_probe_layers = self._glm5_whole_model_graph_probe_layers(
+				len(self.model.model.layers)
+			)
 			whole_seg = Glm5WholeModelSegment(
 				model=self.model,
 				device=self.torch_device,
@@ -19498,39 +15006,15 @@ class BatchGenWorker:
 				)
 		self._record_decode_graph_capture()
 
-	def decoding_continuous(
+	def _bind_decode_entry_model_state(
 		self,
-		new_tokens: torch.Tensor,
-		decode_uuids: List[str],
-		batch: List[int],
-		past_key_states: Optional[torch.Tensor] = None,
-		past_value_states: Optional[torch.Tensor] = None,
-		scale_dict: Optional[dict] = None,
-	) -> Tuple[List[str], List[int]]:
-		"""
-		Continuous decoding with optimized collective operations.
-
-		Key optimizations:
-		1. Single batched all_gather per page boundary (vs 10+ in original)
-		2. Single page table rebuild per boundary (vs 4 in original)
-		3. Reduced logging overhead
-		4. No timing object allocation in hot path
-		"""
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = True
-		
-		strategy = strategy_for(self.engine_config.Basic_Config.attn_mode)
-		if strategy is not DecodeStrategy.DECOUPLED_GPU:
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1, strategy)
-			return decode_uuids, batch
-		
-		# Setup
-		gpu_manager = self.gpu_paged_kv_cache_manager
-		if gpu_manager is None:
-			gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
-		
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		
+		gpu_manager,
+		worker_view,
+		scale_dict,
+		past_key_states,
+		past_value_states,
+		batch,
+	):
 		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
 		Attn_Wrapper.host_paged_kv_worker_view = worker_view
 		Attn_Wrapper.scale = scale_dict
@@ -19571,1397 +15055,230 @@ class BatchGenWorker:
 						f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
 					)
 
-		# Async state
-		self._pending_kv_append_tasks = []
-		self._pending_kv_append_tensors = []
-		
-		pending_async_task = None
-		pending_load_uuids = []
-		pending_load_local = []
-		pending_load_global = []
-		
-		# Validation
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid and uuid not in self._sequences_with_gpu_kv:
-				self._sequences_with_gpu_kv.add(uuid)
-		
-		# Use cumulative counters that persist across prefill/decode switches
-		# Initialize instance vars if not present (shouldn't happen, but safety)
-		if not hasattr(self, '_cumulative_decode_iterations'):
-			self._cumulative_decode_iterations = 0
-		if not hasattr(self, '_cumulative_decode_boundaries'):
-			self._cumulative_decode_boundaries = 0
-		if not hasattr(self, '_cumulative_boundary_ms'):
-			self._cumulative_boundary_ms = 0.0
-		if not hasattr(self, '_cumulative_forward_ms'):
-			self._cumulative_forward_ms = 0.0
-
-		# Local iteration counter (for boundary interval tracking within this decode round)
-		local_iteration = 0
-		last_boundary = 0
-		global_batch_size = len(self.global_batch)
-		# Re-entry can be admitted with exactly enough host capacity for the
-		# current context.  Force one planner pass before the first forward so
-		# the next token never relies on an emergency append allocation.
-		force_host_boundary = self._host_capacity_due_all_ranks(batch)
-
-		# ========== INITIAL MOE BUFFER SYNC ==========
-		# Sync buffer size BEFORE first forward pass to prevent overflow.
-		# The boundary sync (in _page_boundary_fast) only happens after DECISION_INTERVAL
-		# iterations, but the first forward pass runs immediately. Without this sync,
-		# if one rank has more tokens than the initial estimate (ceil(total/world_size)),
-		# we get buffer overflow.
-		max_batch_size = self._sync_decode_moe_rank_counts(batch, reason="decode_entry")
-
-		# OPTIMIZATION: Track if page table was verified since last batch change
-		# Avoids redundant page table checks between boundaries
-		_page_table_verified_this_batch = True  # Start True after entry check
-
-		# P0: Pre-allocate pinned memory and one reusable completion event for the
-		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
-		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
-		_new_tokens_ready = torch.cuda.Event()
-		# Deferred readback (DECODE_DEFERRED_TOKEN_READBACK): two alternating
-		# pinned slots so the in-flight step's copy never targets the buffer
-		# the host is about to read, plus the one launched-but-unread step.
-		# Read once per round so the loop never mixes the two step shapes.
-		_deferred_readback = DECODE_DEFERRED_TOKEN_READBACK
-		_readback_ring = None
-		if _deferred_readback:
-			_readback_ring = TokenReadbackRing(
-				max(max_batch_size, 1),
-				lambda n: torch.empty(n, 1, dtype=torch.long, pin_memory=True),
-				torch.cuda.Event,
-			)
-		_pending_step = None
-		_bad_rows_drain_due = False
-		self._decode_tokens_unread = False
-
-		# Device-resident per-request sampling parameters. Rebuilding them each
-		# step meant three `torch.tensor(..., device=cuda)` calls, i.e. three
-		# pageable-source H2D copies that block the host until the whole-model
-		# graph replay already queued on this stream retires. Resident, the step
-		# path does one integer compare and three slices instead.
-		#
-		# Local to this decode round for the same reason as the accumulators
-		# above: a hot reload rebinds methods on the live worker, so a device
-		# buffer kept on `self` could outlive a slot-layout change. A new round
-		# starts a new residency.
-		_model_device = next(self.model.parameters()).device
-		if _model_device != self.torch_device:
-			raise RuntimeError(
-				f"Rank {self.rank}: decode device mismatch — model parameters are "
-				f"on {_model_device} but worker torch_device is {self.torch_device}; "
-				"the resident sampling tensors would be allocated on the wrong device"
-			)
-		_sampling_residency = DecodeSamplingResidency(
-			max(max_batch_size, 1), self.torch_device
+	def _read_decode_step_model_metadata(
+		self,
+		global_decode_sequences,
+		batch,
+		probe_adapter,
+		probe_round_request,
+		probe_mismatch_logged,
+	):
+		AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
+			global_decode_sequences
 		)
-
-		# Heartbeat state for the rate-limited [DECODE] progress line below
-		_hb_last_time = time.perf_counter()
-		_hb_tokens = 0
-		# Per-worker step counters behind the rate-limited ``step.counters``
-		# event. Plain ints/floats that persist across decode rounds, so a
-		# window spanning several short rounds still reports.
-		_step_counters = getattr(self, "_step_counters", None)
-		if _step_counters is None:
-			_step_counters = StepCounters(logging.getLogger(__name__), _hb_last_time)
-			self._step_counters = _step_counters
-		_step_counters.begin_round(_hb_last_time)
-		# Host-KV health line: same cadence, one per node (see _log_host_kv_health)
-		_hkv_last_time = time.perf_counter()
-
-		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
-		# this decode round: a hot reload rebinds methods on the live worker,
-		# so an accumulator kept on ``self`` could outlive a slot-layout change.
-		_step_split = new_decode_step_split()
-		# Device-side time of the forward+sample segment from reusable timing
-		# events, so the heartbeat reports real GPU forward time next to the
-		# CPU split. The ring never makes the host wait (see
-		# batchgen.worker.step_timing). Its record points sit in this loop
-		# body, outside any graph capture: every capture site is a scoped
-		# ``torch.cuda.graph`` context that ends before its callee returns
-		# here, and this loop only replays graphs (a missing whole-model
-		# bucket falls back to eager below instead of capturing).
-		_fwd_ring = ForwardEventRing(
-			FORWARD_EVENT_RING_SLOTS,
-			lambda: torch.cuda.Event(enable_timing=True),
-		)
-		# Criticality probe of the resident graph, if this round's configure
-		# installed one. Each replayed step's ring pair is tagged with the
-		# probe's level, so the harvested device times feed it with no wait of
-		# their own. A job admitted mid-round with a different request is
-		# reported once and ignored: the graph is fixed until the next
-		# configure.
-		_probe = getattr(self, "_criticality_probe", None)
-		_probe_adapter = self._graph.cuda_graph_adapter
-		_probe_round_request = getattr(self, "_criticality_probe_request", None)
-		_probe_mismatch_logged = False
-		if _probe is not None:
-			_probe.begin_round()
-
-		# Main decode loop — enable decode watchdog for monitoring
-		self.enable_decode_watchdog()
-		while decode_uuids:
-			# --- Decode-step teardown boundary (top of step) ---
-			# The second of this loop's two flag tests.  The one after the token
-			# readback below catches a rank the abort just freed; this one
-			# catches the ordinary case where teardown began between steps, so
-			# the step never issues any work at all.  See the post-readback
-			# check for why neither may break out of this loop, and for why the
-			# in-flight local work is quiesced on the way out.
-			if self._cohort_shutdown_requested():
-				self._cohort_shutdown_observed = True
-				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
-				return decode_uuids, batch
-
-			local_iteration += 1
-			self._cumulative_decode_iterations += 1
-
-			# Feed watchdogs to prevent timeout during long decoding
-			self.feed_watchdog()
-			self.feed_decode_watchdog()
-
-			# Step counters: field bumps and one time compare per step; the
-			# event payload is built only when its interval has elapsed.
-			_step_now_s = time.perf_counter()
-			_step_rows = len(decode_uuids)
-			_step_counters.add_step(_step_now_s, _step_rows)
-			_step_counters.maybe_emit(_step_now_s, STEP_COUNTERS_INTERVAL_S)
-
-			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
-			# monitor sees liveness during long decode phases
-			_hb_tokens += _step_rows
-			if self.rank == 0 and _step_now_s - _hb_last_time >= 30.0:
-				_hb_elapsed = time.perf_counter() - _hb_last_time
-				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
-				_split_txt = ""
-				if _step_split[0] > 0:
-					_split_txt = " " + format_decode_step_split(_step_split)
-					_step_split = new_decode_step_split()
-				_split_txt += _fwd_ring.take_summary()
-				logging.info(
-					f"[DECODE] step={self._cumulative_decode_iterations} "
-					f"active={len(decode_uuids)} finished={_hb_finished} "
-					f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
+		if (
+			AttnWrapperBase.batchgen_debug is not None
+			and probe_adapter is not None
+			and not probe_mismatch_logged
+		):
+			try:
+				_step_probe_request = probe_adapter.criticality_probe_request(
+					AttnWrapperBase.batchgen_debug, graph_enabled=True
 				)
-				# The sampling fallback count is now accumulated on device so
-				# the step path never reads it back. Drain it here, where the
-				# sampled-token readback has already caught the device up, so an
-				# invalid-probability row still surfaces instead of going silent.
-				# With a deferred step in flight the device has NOT caught up
-				# (that read would stall a whole forward), so the drain moves to
-				# the next pipeline drain at the page boundary.
-				if _pending_step is not None:
-					_bad_rows_drain_due = True
-				else:
-					self._warn_sampling_bad_rows(_sampling_residency)
-				_hb_last_time = time.perf_counter()
-				_hb_tokens = 0
-
-			# Host KV is shared per node, so local rank 0 of every node reports
-			# its own regions; the audit walks the region under its locks, which
-			# is why it rides this ~30 s cadence and never runs per step.
-			if self.local_rank == 0 and time.perf_counter() - _hkv_last_time >= 30.0:
-				self._log_host_kv_health()
-				_hkv_last_time = time.perf_counter()
-
-			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
-			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:
-				# [DEFERRED_READBACK_BOUNDARY_DRAIN] Every boundary decision
-				# (completion, eviction, loads, watermark, loop exit) reads stop
-				# state, so the deferred step is fully consumed first -- on
-				# every rank, at the same step, which keeps the boundary in DP
-				# lockstep. Nothing is enqueued behind it, so the drain may end
-				# in the usual device-wide sync.
-				if _pending_step is not None:
-					_finish = self._finish_deferred_decode_step(
-						_pending_step, _readback_ring, overlapped=False
-					)
-					_pending_step = None
-					if _finish != _DECODE_WAIT_COMPLETED:
-						self._cohort_shutdown_observed = True
-						self._quiesce_decode_for_cohort_shutdown(pending_async_task)
-						return decode_uuids, batch
-					if _bad_rows_drain_due:
-						_bad_rows_drain_due = False
-						self._warn_sampling_bad_rows(_sampling_residency)
-				last_boundary = local_iteration
-				force_host_boundary = False
-
-				(decode_uuids, batch,
-				 pending_async_task, pending_load_uuids,
-				 pending_load_local, pending_load_global,
-				 timing, watermark_triggered) = self._page_boundary_fast(
-					decode_uuids, batch, gpu_manager,
-					pending_async_task, pending_load_uuids,
-					pending_load_local, pending_load_global
+			except ValueError as _probe_exc:
+				_step_probe_request = _probe_exc
+			if _step_probe_request != probe_round_request:
+				probe_mismatch_logged = True
+				logging.warning(
+					"Rank %s: [CRITICALITY_PROBE] a job admitted mid-round requests a "
+					"different criticality probe (%s); this round keeps the request "
+					"it was configured with until the next decode configure",
+					self.rank,
+					_step_probe_request,
 				)
-				# `batch` has been rebound to a new ordered row list; anything
-				# keyed to the previous rows (the resident sampling tensors) is
-				# now stale.
-				self._bump_decode_row_epoch()
+		self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+		self._configure_glm5_dispatch_trace(global_decode_sequences)
+		return probe_mismatch_logged
 
-				self._cumulative_boundary_ms += timing.total_ms
-				self._cumulative_decode_boundaries += 1
+	def _rebind_decode_replay_model_metadata(
+		self,
+		batch_sequences,
+		cache_seqlens,
+		max_ctx,
+		batch,
+		new_tokens,
+		page_table_verified,
+		gpu_manager,
+	):
+		if batch:
+			Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
+			(
+				Attn_Wrapper.cache_seqlens,
+				Attn_Wrapper.position_ids,
+			) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
+			Attn_Wrapper.max_seqlen = max_ctx
 
-				# Batch may have changed - need to verify page table
-				_page_table_verified_this_batch = False
+			# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+			AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
+			AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+			AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+			AttnWrapperBase.max_seqlen = max_ctx
 
-				# Post-boundary: verify page table matches batch and fix if needed
-				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
-					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+			# Per-step DSA dispatch hint: count sequences whose cache is
+			# short enough to take the dense short-circuit instead of
+			# indexer scoring. Computing once here instead of inside
+			# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
+			# per decode step on DSA models (GLM-5).
+			_reset_glm5_dsa_step_state(
+				GLM5AttnWrapper,
+				Attn_Wrapper.cache_seqlens,
+				getattr(self.model_config, "index_topk", None),
+			)
 
-					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						# Fix: Rebuild page table to match batch
-						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-
-				# Page table is now verified for this batch
-				_page_table_verified_this_batch = True
-
-				# Check if watermark triggered - interrupt decode for prefill
-				if watermark_triggered:
-					# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
-					# Without this, KV data may not be fully written to host when sequences
-					# are later resumed, causing KV corruption and gibberish output.
-					num_waited = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
-					if num_waited > 0:
-						logging.info(
-							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
-							f"before putting sequences ON_HOLD"
-						)
-
-					# An in-flight boundary load must be integrated before the
-					# hold: its rows are not in decode_uuids yet, but they
-					# already hold GPU pages with registered shared-page keys.
-					# Dropping them here strands those pages and the row's
-					# next load trips the writable-page sharing guard
-					# (cohort-fatal SCHED_INVARIANT).
-					if pending_load_uuids:
-						decode_uuids, batch = self._integrate_pending_async_load(
-							pending_async_task, pending_load_uuids,
-							pending_load_local, pending_load_global,
-							decode_uuids, batch, gpu_manager,
-						)
-						pending_async_task = None
-						pending_load_uuids = []
-						pending_load_local = []
-						pending_load_global = []
-
-					logging.info(
-						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
-						f"sequences ON_HOLD, will trigger prefill"
-					)
-					# Put all remaining sequences ON_HOLD
-					self._put_sequences_on_hold(decode_uuids)
-					# Exit decode loop - will return to generate() which will trigger prefill
-					break
-
-				# Poll for new admissions at each page boundary.
-				# New batches may have been submitted during decode — drain them
-				# and break for prefill if QUEUEING sequences arrive.
-				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
-						logging.info(
-							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
-							f"total in batch: {len(self.global_batch)}"
-						)
-					has_q = self.global_batch.has_queueing()
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
-						num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
-						logging.info(
-							f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
-							f"watermark={watermark_triggered} admitted={admitted}"
-						)
-					if has_q and watermark_triggered:
-						if self.rank == 0:
-							logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
-						break
-
-				# Detailed logging at every boundary (only rank 0)
-				if self.rank == 0:
-					# Get status counts
-					# - in_decode: sequences currently in decode batch (IN_DECODE status)
-					# - onhold: sequences paused with host KV (ON_HOLD status)  
-					# - prefilled: sequences prefilled but not yet decoding (PREFILLED status)
-					# - host_kv_total: total sequences with host KV = prefilled + onhold + in_decode
-					num_in_decode = timing.total_active
-					num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
-					num_prefilled = timing.total_prefilled
-					num_completed_total = timing.total_completed_cumulative
-					num_host_kv_total = num_prefilled + num_onhold + num_in_decode
-					
-					# Get page stats if available
-					page_info = ""
-					if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
-						ps = self._host_kv_page_stats
-						page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
-
-					if BATCHGEN_CB_DEBUG:
-						# Detailed timing log when debug is enabled
-						logging.info(
-							f"[Decode Interval {self._cumulative_decode_boundaries}] "
-							f"iter={self._cumulative_decode_iterations}, "
-							f"total={timing.total_ms:.1f}ms | "
-							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
-							f"wait_async={timing.wait_async_load_ms:.1f}, "
-							f"finalize={timing.finalize_load_ms:.1f}, "
-							f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
-							f"gather={timing.gather_ms:.1f}, "
-							f"proc={timing.process_ms:.1f}, "
-							f"ext={timing.extension_ms:.1f}, "
-							f"load_sel={timing.load_select_ms:.1f}, "
-							f"load_alloc={timing.load_alloc_ms:.1f}, "
-							f"load_launch={timing.load_launch_ms:.1f}, "
-							f"rebuild={timing.rebuild_ms:.1f}, "
-							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
-							f"barrier={timing.barrier_ms:.1f}ms | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-					else:
-						# Minimal log without timing details
-						logging.info(
-							f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-				
-				if not decode_uuids:
-					# Check for pending loads
-					if pending_load_uuids:
-						decode_uuids, batch = self._integrate_pending_async_load(
-							pending_async_task, pending_load_uuids,
-							pending_load_local, pending_load_global,
-							decode_uuids, batch, gpu_manager,
-						)
-						self._rebuild_page_table_for_batch(batch, gpu_manager)
-						self._sync_decode_moe_rank_counts(
-							batch,
-							reason="post_pending_load_finalize",
-						)
-						
-						if batch:
-							new_tokens = self._rebuild_input_tokens(batch)
-						
-						pending_async_task = None
-						pending_load_uuids = []
-						pending_load_local = []
-						pending_load_global = []
-						
-						if decode_uuids:
-							force_host_boundary = self._host_capacity_due_all_ranks(batch)
-							continue
-					break
-
-				# Newly loaded ON_HOLD/PREFILLED rows may have a reservation that
-				# ends exactly at their current context.  Run the planner once more
-				# before forward; the check is collective but boundary-rate, not
-				# token-rate.
-				force_host_boundary = self._host_capacity_due_all_ranks(batch)
-				if force_host_boundary:
-					continue
-				
+			if new_tokens.shape[0] != len(batch):
 				new_tokens = self._rebuild_input_tokens(batch)
-				# DEBUG: Log tokens rebuild after boundary
-				if new_tokens.shape[0] != len(batch):
-					logging.error(
-						f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
-						f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
-					)
-			
-			# Forward pass
-			forward_start = time.perf_counter()
+		else:
+			Attn_Wrapper.attention_mask = None
+			Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+			Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+			Attn_Wrapper.max_seqlen = 0
+			Attn_Wrapper.cur_batch = []
+			new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+			# Also bind empty state to AttnWrapperBase for GPT-OSS
+			AttnWrapperBase.attention_mask = None
+			AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+			AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+			AttnWrapperBase.max_seqlen = 0
+			AttnWrapperBase.cur_batch = []
+			GLM5AttnWrapper._dsa_short_count = 0
+			GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+			self._decode_metadata_batch_key = None
+			self._decode_metadata_cpu_seqlens = None
 
-			# Pre-compute batch_sequences for use in both forward setup and update loop
-			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
-			global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
-			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
-				global_decode_sequences
-			)
-			if (
-				AttnWrapperBase.batchgen_debug is not None
-				and _probe_adapter is not None
-				and not _probe_mismatch_logged
-			):
-				try:
-					_step_probe_request = _probe_adapter.criticality_probe_request(
-						AttnWrapperBase.batchgen_debug, graph_enabled=True
-					)
-				except ValueError as _probe_exc:
-					_step_probe_request = _probe_exc
-				if _step_probe_request != _probe_round_request:
-					_probe_mismatch_logged = True
-					logging.warning(
-						"Rank %s: [CRITICALITY_PROBE] a job admitted mid-round requests a "
-						"different criticality probe (%s); this round keeps the request "
-						"it was configured with until the next decode configure",
-						self.rank,
-						_step_probe_request,
-					)
-			self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
-			self._configure_glm5_dispatch_trace(global_decode_sequences)
+		if batch:
+			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+			AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
+			# OPTIMIZATION: Only check page table if not already verified this batch
+			# Between boundaries, batch doesn't change so page table stays valid
+			if not page_table_verified:
+				# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
+				# This is the root cause of KV corruption after resume - if they don't match,
+				# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
+				if gpu_manager and gpu_manager._gpu_page_table_manager:
+					slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+					batch_global_order = Attn_Wrapper.cur_batch
+					if slot_order != batch_global_order:
+						# Fix: Rebuild page table to match batch order
+						gpu_manager.rebuild_page_table(batch_global_order)
+						# Log page rebuild for affected sequences
+						for seq in batch_sequences:
+							seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
+								f"batch_size={len(batch)}")
+				page_table_verified = True
 
-			# Invariant check: cache_seqlens must not exceed allocated pages.
-			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
-			if BATCHGEN_DECODE_ASSERT and batch:
-				for seq in batch_sequences:
-					max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
-					if seq.current_context_length > max_tokens:
-						logging.error(
-							f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
-							f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
-							f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
-							f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
-							f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
-							f"status={seq.status})"
-						)
-						raise RuntimeError(
-							f"cache_seqlens overrun: ctx={seq.current_context_length} > "
-							f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
-							f"{max_tokens} for {seq.uuid[:8]}"
-						)
+		return new_tokens, page_table_verified
 
-			_split_t0 = time.perf_counter()
-			# Start marker of this step's device forward+sample time. Takes a
-			# free ring slot or skips timing this step; never waits.
-			_fwd_slot = _fwd_ring.begin(torch.cuda.current_stream(self.torch_device))
-			# Probe level of this step; stays None unless the graph replays.
-			_probe_tag = None
-			with torch.inference_mode():
-				if batch:
-					# Collect context lengths with invariant validation
-					# ALWAYS: current_context_length == original_prompt_length + decoded_length
-					cache_seqlens = []
-					for seq in batch_sequences:
-						ctx_len = seq.current_context_length
-						expected = seq.original_prompt_length + seq.decoded_length
-						if ctx_len != expected:
-							logging.error(
-								f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
-								f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
-								f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-							)
-							seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-								f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
-							seq.current_context_length = expected
-							ctx_len = expected
-						cache_seqlens.append(ctx_len)
+	def _install_decode_kv_append_callbacks(self, batch, batch_sequences):
+		# KV append callback — deferred: accumulate during forward, single sync after
+		current_batch = list(batch)
+		_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
-					max_ctx = max(cache_seqlens)
+		if _kv_worker_view is not None:
+			# ``batch_sequences`` was resolved from this same ``batch``
+			# above and neither the batch nor the local->uuid map moves
+			# inside a step, so re-resolving every row through
+			# _local_to_uuid_map + get_sequence here was pure
+			# duplication.
+			_kv_seq_ids = []
+			_kv_seq_lengths = []
+			for seq in batch_sequences:
+				_kv_seq_ids.append(seq.global_idx)
+				_kv_seq_lengths.append(seq.current_context_length - 1)
+			self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
+			self._deferred_kv_entries = []
+			self._deferred_kv_entries_aux = []
+			self._deferred_kv_worker_view = _kv_worker_view
+			self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
-					# DIAG: Log cache_seqlens at first iteration of each decode group
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
-						fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
-						resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
-						logging.info(
-							f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
-							f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
-							f"max_ctx={max_ctx}"
-						)
-						for uid, dl, ctx in fresh[:5]:
-							logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
-						for uid, dl, ctx, pg in resumed[:5]:
-							logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
+		if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
+			# SYNC MODE: Immediately write each layer's KV to host (no deferral)
+			_sync_kv_seq_ids = _kv_seq_ids
+			_sync_kv_seq_lengths = _kv_seq_lengths
+			_sync_kv_worker_view = _kv_worker_view
+			def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+				if k_tensor.dim() == 3:
+					k_tensor = k_tensor.unsqueeze(2)
+				if v_tensor is not None and v_tensor.dim() == 3:
+					v_tensor = v_tensor.unsqueeze(2)
+				torch.cuda.synchronize(self.torch_device)
+				task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+					layer_idx=layer_idx,
+					sequence_ids=_sync_kv_seq_ids,
+					k_tensor=k_tensor,
+					v_tensor=v_tensor,
+					sequence_lengths=_sync_kv_seq_lengths,
+				)
+				if task is not None:
+					task.wait()
+		else:
+			def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+				self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
 
-					Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
-					(
-						Attn_Wrapper.cache_seqlens,
-						Attn_Wrapper.position_ids,
-					) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
-					Attn_Wrapper.max_seqlen = max_ctx
+		Attn_Wrapper.kv_append_callback = kv_append_callback
+		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+		AttnWrapperBase.kv_append_callback = kv_append_callback
 
-					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-					AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.max_seqlen = max_ctx
-
-					# Per-step DSA dispatch hint: count sequences whose cache is
-					# short enough to take the dense short-circuit instead of
-					# indexer scoring. Computing once here instead of inside
-					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
-					# per decode step on DSA models (GLM-5).
-					_reset_glm5_dsa_step_state(
-						GLM5AttnWrapper,
-						Attn_Wrapper.cache_seqlens,
-						getattr(self.model_config, "index_topk", None),
-					)
-
-					if new_tokens.shape[0] != len(batch):
-						new_tokens = self._rebuild_input_tokens(batch)
-				else:
-					Attn_Wrapper.attention_mask = None
-					Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
-					Attn_Wrapper.max_seqlen = 0
-					Attn_Wrapper.cur_batch = []
-					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					# Also bind empty state to AttnWrapperBase for GPT-OSS
-					AttnWrapperBase.attention_mask = None
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.max_seqlen = 0
-					AttnWrapperBase.cur_batch = []
-					GLM5AttnWrapper._dsa_short_count = 0
-					GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-					self._decode_metadata_batch_key = None
-					self._decode_metadata_cpu_seqlens = None
-				
-				if batch:
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-					# OPTIMIZATION: Only check page table if not already verified this batch
-					# Between boundaries, batch doesn't change so page table stays valid
-					if not _page_table_verified_this_batch:
-						# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
-						# This is the root cause of KV corruption after resume - if they don't match,
-						# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
-						if gpu_manager and gpu_manager._gpu_page_table_manager:
-							slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-							batch_global_order = Attn_Wrapper.cur_batch
-							if slot_order != batch_global_order:
-								# Fix: Rebuild page table to match batch order
-								gpu_manager.rebuild_page_table(batch_global_order)
-								# Log page rebuild for affected sequences
-								for seq in batch_sequences:
-									seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
-										f"batch_size={len(batch)}")
-						_page_table_verified_this_batch = True
-				
-				# NOTE: Do NOT skip forward pass even with empty batch!
-				# MoE models have all-to-all collective operations that ALL ranks must participate in.
-				# Skipping would cause deadlock as other ranks wait for this rank.
-
-				# MoE buffer sync: only needed at decision boundaries (batch size changes).
-				# Between boundaries, batch size is constant — skip the all_reduce + .item()
-				# CPU-GPU sync that drains the GPU pipeline every step.
-				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				# Phase C: layer-graph mode retired; only whole-model needs the
-				# globally-synced rank-count reuse.
-				if (
-					self._graph.whole_model_graph
-					or self._glm5_whole_model_graph_requested_for_current_batch()
+		# DSA: auxiliary KV append callback for indexer host cache.
+		# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
+		# to _deferred_kv_entries_aux; _flush_deferred_kv_to_host launches
+		# primary and aux appends together and the per-step
+		# [KV_APPEND_DRAIN] after the token readback completes both.
+		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		if aux_view is not None:
+			if BATCHGEN_SYNC_KV:
+				def kv_append_callback_aux(
+					layer_idx: int,
+					k_tensor: torch.Tensor,
+					v_tensor: torch.Tensor = None,
+					scale_tensor: torch.Tensor = None,
 				):
-					# Whole-model graph needs globally synced counts for NCCL bucket
-					# matching, but the count vector only changes at decode-entry,
-					# page-boundary, and async-load-finalize sync points. Reusing it
-					# avoids a per-token NCCL all_gather + D2H .item() sync.
-					_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
-					_cached_local_bsz = int(getattr(self, "_current_decode_local_batch_size", -1))
-					_max_bs = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-					if _all_rank_counts is None or _max_bs <= 0 or _cached_local_bsz != len(batch):
-						_max_bs = self._sync_decode_moe_rank_counts(
-							batch,
-							reason="decode_step_batch_change",
-						)
-						_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
-					_max_bs = max(int(_max_bs), 1)
-				else:
-					# Per-layer graph or eager: no NCCL in graph, use local batch size
-					_max_bs = max(len(batch), 1)
-					_all_rank_counts = None
-
-				# KV append callback — deferred: accumulate during forward, single sync after
-				current_batch = list(batch)
-				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-
-				if _kv_worker_view is not None:
-					# ``batch_sequences`` was resolved from this same ``batch``
-					# above and neither the batch nor the local->uuid map moves
-					# inside a step, so re-resolving every row through
-					# _local_to_uuid_map + get_sequence here was pure
-					# duplication.
-					_kv_seq_ids = []
-					_kv_seq_lengths = []
-					for seq in batch_sequences:
-						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
-					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
-					self._deferred_kv_entries = []
-					self._deferred_kv_entries_aux = []
-					self._deferred_kv_worker_view = _kv_worker_view
-					self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-
-				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
-					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
-					_sync_kv_seq_ids = _kv_seq_ids
-					_sync_kv_seq_lengths = _kv_seq_lengths
-					_sync_kv_worker_view = _kv_worker_view
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						if k_tensor.dim() == 3:
-							k_tensor = k_tensor.unsqueeze(2)
-						if v_tensor is not None and v_tensor.dim() == 3:
-							v_tensor = v_tensor.unsqueeze(2)
-						torch.cuda.synchronize(self.torch_device)
-						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
-							layer_idx=layer_idx,
-							sequence_ids=_sync_kv_seq_ids,
-							k_tensor=k_tensor,
-							v_tensor=v_tensor,
-							sequence_lengths=_sync_kv_seq_lengths,
-						)
-						if task is not None:
-							task.wait()
-				else:
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
-
-				Attn_Wrapper.kv_append_callback = kv_append_callback
-				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-				AttnWrapperBase.kv_append_callback = kv_append_callback
-
-				# DSA: auxiliary KV append callback for indexer host cache.
-				# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
-				# to _deferred_kv_entries_aux; _flush_deferred_kv_to_host launches
-				# primary and aux appends together and the per-step
-				# [KV_APPEND_DRAIN] after the token readback completes both.
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-				if aux_view is not None:
-					if BATCHGEN_SYNC_KV:
-						def kv_append_callback_aux(
-							layer_idx: int,
-							k_tensor: torch.Tensor,
-							v_tensor: torch.Tensor = None,
-							scale_tensor: torch.Tensor = None,
-						):
-							self._append_decode_kv_to_host_aux_async(
-								layer_idx, current_batch, k_tensor, v_tensor,
-								scale_tensor,
-							)
-					else:
-						def kv_append_callback_aux(
-							layer_idx: int,
-							k_tensor: torch.Tensor,
-							v_tensor: torch.Tensor = None,
-							scale_tensor: torch.Tensor = None,
-						):
-							valid_layers = self._aux_layers_with_slots()
-							if valid_layers is not None and layer_idx not in valid_layers:
-								return
-							self._deferred_kv_entries_aux.append(
-								(layer_idx, k_tensor, v_tensor, scale_tensor)
-							)
-					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
-				else:
-					AttnWrapperBase.kv_append_callback_aux = None
-
-				# Phase C: layer-graph mode retired; only the whole-model graph
-				# may need re-warmup here.
-				if self._glm5_whole_model_graph_current_bucket_missing():
-					logging.info(
-						f"Rank {self.rank}: GLM-5 whole-model CUDA graph was not captured "
-						"during decode configuration; using eager decode instead of "
-						"capturing in the decode loop"
+					self._append_decode_kv_to_host_aux_async(
+						layer_idx, current_batch, k_tensor, v_tensor,
+						scale_tensor,
 					)
-					self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
-
-				self._log_glm5_graph_path_for_forward(
-					local_bsz=len(batch),
-					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
-					rank_counts=getattr(self, "_current_decode_rank_token_counts", None),
-					gpu_manager=gpu_manager,
-					decode_iter=self._cumulative_decode_iterations,
-				)
-				# Phase C: DSA-only graph metadata prep retired (DSA graph mode
-				# is no longer reachable). The whole-model graph's FA3 sparse
-				# decode needs no per-forward attention scheduler metadata.
-
-				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
-					local_iteration=local_iteration,
-					local_bsz=len(batch),
-					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
-				)
-
-				# Forward
-				# Phase C: layer-graph mode retired. The whole-model graph
-				# composes per-layer captures internally; no separate
-				# layer-graph dispatch is needed.
-
-				# Decode admission is bounded by the per-rank decode width and
-				# the bucket ladder is derived to cover it, so on a graph
-				# deployment no step is wider than the top bucket; one that is
-				# fails loud here instead of running eager.
-				self._assert_decode_step_within_graph_buckets(_max_bs)
-				_glm5_whole_graph_active = bool(
-					self._graph.glm5_whole_model_graph
-					and self._graph.cuda_graph_manager is not None
-				)
-				if _glm5_whole_graph_active:
-					_glm5_whole_bucket = self._graph.whole_model_bucketing.get_padded_size(_max_bs)
-					# An all_short capture never runs indexer scoring, so a
-					# step whose longest context exceeds index_topk must NOT
-					# replay it: top-k selection would be silently skipped.
-					# Leaving the graph here either falls back to eager
-					# (correct top-k) or, under a required graph, raises
-					# below with reason=all_short_exceeded.
-					_glm5_all_short_exceeded = bool(
-						self._graph.glm5_whole_model_all_short
-						and int(self._graph.glm5_whole_model_index_topk or 0)
-						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-						> int(self._graph.glm5_whole_model_index_topk)
-					)
-					_glm5_whole_graph_active = (
-						not _glm5_all_short_exceeded
-						and _glm5_whole_bucket not in self._graph.glm5_whole_model_graph_failed_buckets
-						and self._graph.cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
-						and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._graph.whole_model_segment, "max_seqlen", 0))
-						and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == self._graph.glm5_whole_model_graph_signature
-					)
-				if (
-					self._glm5_whole_model_graph_requested_for_current_batch()
-					and not _glm5_whole_graph_active
+			else:
+				def kv_append_callback_aux(
+					layer_idx: int,
+					k_tensor: torch.Tensor,
+					v_tensor: torch.Tensor = None,
+					scale_tensor: torch.Tensor = None,
 				):
-					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
-					if _required_reason in self._WHOLE_GRAPH_EAGER_SERVABLE_REASONS:
-						# A step longer than the captured span runs eager --
-						# correct, just slower. Every rank evaluates this from
-						# the globally-synced `_max_bs` and its own identical
-						# span, so all ranks take this branch together and the
-						# graph's baked NCCL ops stay matched.
-						self._warn_decode_graph_span_exceeded(
-							int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
-							int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0),
-						)
-					else:
-						raise RuntimeError(
-							"GLM-5 whole-model CUDA graph was required but no replayable "
-							"whole-model graph is available for this decode step "
-							f"(bucket={_required_bucket}, reason={_required_reason})"
-						)
-				_use_graph = (
-					self._graph.whole_model_graph
-					and self._graph.cuda_graph_manager is not None
-					and (
-						not self._graph.glm5_whole_model_graph
-						or _glm5_whole_graph_active
+					valid_layers = self._aux_layers_with_slots()
+					if valid_layers is not None and layer_idx not in valid_layers:
+						return
+					self._deferred_kv_entries_aux.append(
+						(layer_idx, k_tensor, v_tensor, scale_tensor)
 					)
-				)
-				if _use_graph:
-					_glm5_whole_compare = bool(
-						self._graph.glm5_whole_model_graph
-						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
-					)
-					_glm5_whole_timing = bool(
-						self._graph.glm5_whole_model_graph
-						and self._glm5_whole_model_graph_timing_requested_for_current_batch()
-					)
-					_glm5_whole_timing_items = {}
-					_glm5_skip_graph_kv_offload = False
-					# Whole-model CUDA graph replay.
-					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
-					# computation, NOT local len(batch). The graph has NCCL all_reduce
-					# baked inside — all ranks MUST replay the same bucket's graph,
-					# otherwise mismatched NCCL ops cause deadlock.
-					batch_size = len(batch)
-					bucket = self._graph.whole_model_bucketing.get_padded_size(_max_bs)
-					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
-					# and an adapter is present, route replay through it. Legacy path
-					# (default) preserves today's behavior exactly.
-					# K2.5 always routes whole-model replay through the adapter
-					# (no legacy non-adapter K2.5 whole-model path exists).
-					_k25_whole_active = self._graph.k25_whole_model_graph
-					_adapter_dual_active = (
-						self._graph.cuda_graph_adapter is not None
-						and (
-							_k25_whole_active
-							or (
-								self._graph.cuda_graph_adapter_dual
-								and self._graph.glm5_whole_model_graph
-							)
-						)
-					)
-					_wm_seg_name = (
-						self._graph.whole_model_segment_name or "glm5_whole_model"
-					)
-					_adapter_decision = None
-					_adapter_batch_state = None
-					if _adapter_dual_active:
-						_adapter_batch_state = self._graph.make_batch_state(
-							local_bsz=batch_size,
-							max_rank_bsz=_max_bs,
-							rank_token_counts=_all_rank_counts,
-							cache_seqlens=AttnWrapperBase.cache_seqlens,
-							position_ids=AttnWrapperBase.position_ids,
-							max_seqlen=int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
-							cur_batch_sequence_ids=tuple(getattr(AttnWrapperBase, "cur_batch", None) or ()),
-							gpu_kv_manager=gpu_manager,
-							decode_iter=0,
-							input_ids=new_tokens,
-							device=self.torch_device,
-						)
-						_adapter_decision = self._graph.cuda_graph_adapter.eligibility(_adapter_batch_state)
-						if _adapter_decision.mode.value != "whole_model":
-							logging.info(
-								"Phase B: adapter eligibility=%s/%s; using legacy path for parity",
-								_adapter_decision.mode.value, _adapter_decision.reason,
-							)
-							_adapter_dual_active = False
-					if _adapter_dual_active:
-						# ADAPTER PATH (Phase B dual gate)
-						replay_inputs = self._graph.cuda_graph_adapter.prepare_replay_inputs(
-							decision=_adapter_decision,
-							batch_state=_adapter_batch_state,
-							segment_name=_wm_seg_name,
-						)
-						# Delay-table update for this step's level: an async copy
-						# on this stream, ahead of the replay that reads it.
-						if _probe is not None:
-							_probe_tag = _probe.before_replay(local_iteration)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_replay_start = time.perf_counter()
-						graph_out = self._graph.cuda_graph_manager.replay(
-							_wm_seg_name, _max_bs, **replay_inputs,
-						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["replay_ms"] = (
-								time.perf_counter() - _glm5_replay_start
-							) * 1000.0
-						# K2.5 whole-model eager-vs-graph compare via the standard
-						# model-agnostic facility (observability-only; does NOT change
-						# token selection). GLM-5 keeps its own bespoke compare block
-						# below; this path serves any adapter that has no such block.
-						if _k25_whole_active:
-							_dbg = self._graph.cuda_graph_adapter.debug_options(_adapter_batch_state)
-							if _dbg.compare_against_eager:
-								# graph_out has padded bucket rows; the eager reference
-								# produces local_bsz (=batch_size) rows. Slice to align.
-								# Graph probe keys are `probe_layer_<NNN>_hidden`; the
-								# eager reference uses `hidden_states_layer_<i>` — remap
-								# so the diff aligns by key.
-								_graph_cmp = {}
-								for _k, _v in graph_out.items():
-									_vs = _v[:batch_size]
-									if _k.startswith("probe_layer_") and _k.endswith("_hidden"):
-										_idx = int(_k[len("probe_layer_"):-len("_hidden")])
-										_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
-									else:
-										_graph_cmp[_k] = _vs
-								_report = self._graph.compare_decode_outputs(
-									adapter=self._graph.cuda_graph_adapter,
-									decision=_adapter_decision,
-									batch_state=_adapter_batch_state,
-									segment_name=_wm_seg_name,
-									captured_inputs=replay_inputs,
-									graph_outputs=_graph_cmp,
-									probe_layers=_dbg.probe_layers,
-									atol=_dbg.compare_atol,
-									rtol=_dbg.compare_rtol,
-									fail_on_mismatch=_dbg.fail_on_mismatch,
-								)
-								_log = logging.info if _report.passed else logging.error
-								_log(
-									"[K25_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s "
-									"status=%s max_abs=%.6g max_rel=%.6g mismatched=%s "
-									"probes=%s",
-									self.rank, _adapter_decision.bucket, batch_size,
-									"OK" if _report.passed else "MISMATCH",
-									_report.max_abs, _report.max_rel,
-									_report.mismatched_keys, _report.probe_results,
-								)
-					elif self._graph.glm5_whole_model_graph:
-						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-						aux_manager = getattr(
-							gpu_manager,
-							"auxiliary",
-							getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
-						)
-						if aux_manager is None:
-							raise RuntimeError("GLM-5 whole-model graph replay requires auxiliary GPU KV manager")
-						graph_inputs = self._prepare_glm5_layer_graph_inputs(
-							local_bsz=batch_size,
-							bucket=bucket,
-							gpu_manager=gpu_manager,
-							graph_max_seqlen_override=int(getattr(self._graph.whole_model_segment, "max_seqlen", 0) or 0),
-						)
-						# Delay-table update for this step's level: an async copy
-						# on this stream, ahead of the replay that reads it.
-						if _probe is not None:
-							_probe_tag = _probe.before_replay(local_iteration)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_replay_start = time.perf_counter()
-						graph_out = self._graph.cuda_graph_manager.replay(
-							"glm5_whole_model", _max_bs,
-							input_ids=new_tokens[:batch_size],
-							cache_seqlens=graph_inputs["cache_seqlens"],
-							position_ids=graph_inputs["position_ids"],
-							primary_slot_indices=graph_inputs["primary_slot_indices"],
-							aux_slot_indices=graph_inputs["aux_slot_indices"],
-							rank_token_counts=_all_rank_counts,
-							num_valid_tokens=graph_inputs["num_valid_tokens"],
-						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["replay_ms"] = (
-								time.perf_counter() - _glm5_replay_start
-							) * 1000.0
-					else:
-						# A rank with no decode rows (it may never have built an
-						# active page table) passes zero-row inputs and replays
-						# the same bucket as an all-padding batch, so the in-graph
-						# MoE collectives still line up across ranks.
-						from batchgen.models.openai.gpt_oss_120b.whole_model_graph_inputs import (
-							whole_model_replay_page_inputs,
-						)
-						_pt_mgr = gpu_manager._gpu_page_table_manager
-						pt_slice, slot_slice = whole_model_replay_page_inputs(
-							active_page_table=_pt_mgr.gpu_table,
-							slot_index_tensor=_pt_mgr._slot_index_tensor,
-							batch_size=batch_size,
-							max_pages_per_seq=self._graph.whole_model_segment.max_pages_per_seq,
-							device=self.torch_device,
-						)
-						graph_out = self._graph.cuda_graph_manager.replay(
-							"whole_model", bucket,
-							input_ids=new_tokens,
-							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-							page_table=pt_slice,
-							slot_indices=slot_slice,
-						)
+			AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
+		else:
+			AttnWrapperBase.kv_append_callback_aux = None
 
-					logits = graph_out["logits"][:batch_size]
-					graph_hidden_states = graph_out.get("hidden_states")
-					if graph_hidden_states is not None:
-						graph_hidden_states = graph_hidden_states[:batch_size]
-					if _glm5_whole_compare:
-						graph_probe_hidden_states = {
-							key: value[:batch_size]
-							for key, value in graph_out.items()
-							if key.startswith("probe_layer_")
-						}
-						graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_eager_start = time.perf_counter()
-						with self._glm5_force_segmented_graph_eager():
-							if getattr(self._graph.whole_model_segment, "compare_probe_layers", ()):
-								eager_probe_outputs = self._graph.whole_model_segment.run_model_with_probes(
-									input_ids=new_tokens,
-									attention_mask=Attn_Wrapper.attention_mask,
-									position_ids=Attn_Wrapper.position_ids,
-									use_layer_segments=False,
-								)
-								eager_hidden_states = eager_probe_outputs["hidden_states"]
-								eager_logits = eager_probe_outputs["logits"]
-								eager_probe_hidden_states = {
-									key: value
-									for key, value in eager_probe_outputs.items()
-									if key.startswith("probe_layer_")
-								}
-							else:
-								eager_model_outputs = self.model.model(
-									input_ids=new_tokens,
-									attention_mask=Attn_Wrapper.attention_mask,
-									position_ids=Attn_Wrapper.position_ids,
-									use_cache=False,
-								)
-								eager_hidden_states = eager_model_outputs[0][:, -1, :]
-								eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
-								eager_probe_hidden_states = {}
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["eager_ms"] = (
-								time.perf_counter() - _glm5_eager_start
-							) * 1000.0
-						eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
-						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
-						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
-							compare_glm5_whole_model_graph_logits,
-						)
-						compare = compare_glm5_whole_model_graph_logits(
-							eager_logits=eager_logits,
-							graph_logits=logits,
-							eager_hidden_states=eager_hidden_states,
-							graph_hidden_states=graph_hidden_states,
-							eager_probe_hidden_states=eager_probe_hidden_states,
-							graph_probe_hidden_states=graph_probe_hidden_states,
-							eager_tokens=eager_tokens_for_compare,
-							graph_tokens=graph_tokens_for_compare,
-							atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
-							rtol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
-						)
-						_log = logging.info if compare["ok"] else logging.error
-						_log(
-							"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
-							"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
-							"hidden_mean_abs=%.6g probe_first_mismatch=%s "
-							"probe_max_abs=%.6g probe_mean_abs=%.6g "
-							"argmax_mismatch=%s token_mismatch=%s",
-							self.rank,
-							bucket,
-							batch_size,
-							"OK" if compare["ok"] else "MISMATCH",
-							compare["max_abs"],
-							compare["mean_abs"],
-							compare["hidden_max_abs"],
-							compare["hidden_mean_abs"],
-							compare["probe_first_mismatch"],
-							compare["probe_max_abs"],
-							compare["probe_mean_abs"],
-							compare["argmax_mismatch"],
-							compare["token_mismatch"],
-						)
-						if not compare["ok"] and self._glm5_whole_model_graph_compare_fail_on_mismatch():
-							raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
-						_glm5_skip_graph_kv_offload = True
-					else:
-						new_tokens_out = self._select_tokens(
-							logits,
-							batch_sequences,
-							residency=_sampling_residency,
-							batch_rows=batch,
-						)
+	# One reader per bound decode-step term (S6 fold: the S4b binder named
+	# one reader per call site; the bodies were identical, and ``Attn_Wrapper``
+	# is ``AttnWrapperBase``).
+	def _read_decode_max_seqlen(self):
+		return int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
 
-					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
-						# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
-						# contiguous-only clone path; no per-layer fallback branch).
-						if _glm5_whole_timing:
-							_glm5_offload_start = time.perf_counter()
-						self._graph.cuda_graph_adapter.stage_post_graph_kv(
-							decision=_adapter_decision,
-							batch_state=_adapter_batch_state,
-							graph_outputs=graph_out,
-						)
-						if _glm5_whole_timing:
-							_glm5_whole_timing_items["offload_callback_ms"] = (
-								time.perf_counter() - _glm5_offload_start
-							) * 1000.0
-					elif not _glm5_skip_graph_kv_offload:
-						if _glm5_whole_timing:
-							_glm5_offload_start = time.perf_counter()
-						# Fire KV host offload callbacks for all layers.
-						# KV buffers are static-address tensors written inside the graph.
-						# Stage primary and aux as two contiguous clones before async
-						# D2H; cloning per layer adds 156 small GPU copies per decode
-						# token on GLM-5 and dominates the whole-graph replay overhead.
-						kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
-						wm_seg = self._graph.whole_model_segment
-						if (
-							batch_size > 0
-							and kv_cb is not None
-							and wm_seg is not None
-							and wm_seg._kv_buffers is not None
-						):
-							primary_stage = None
-							primary_key_buffer = getattr(wm_seg, "_kv_key_buffer", None)
-							if primary_key_buffer is not None:
-								primary_stage = primary_key_buffer[:, :batch_size].clone()
-							for layer_idx in range(wm_seg.num_layers):
-								kv_buf = wm_seg._kv_buffers[layer_idx]
-								# K2.5 MLA has no separate V cache — pass None for v_tensor
-								v_buf = kv_buf.get("value")
-								v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
-								k_tensor = (
-									primary_stage[layer_idx]
-									if primary_stage is not None
-									else kv_buf["key"][:batch_size].clone()
-								)
-								kv_cb(
-									layer_idx,
-									k_tensor,
-									v_clone,
-								)
-						aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
-						aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
-						if batch_size > 0 and aux_cb is not None and aux_buffers is not None:
-							aux_stage = None
-							aux_key_buffer = getattr(wm_seg, "_aux_kv_key_buffer", None)
-							if aux_key_buffer is not None:
-								aux_stage = aux_key_buffer[:, :batch_size].clone()
-							for layer_idx in range(wm_seg.num_layers):
-								aux_cb(
-									layer_idx,
-									aux_stage[layer_idx]
-									if aux_stage is not None
-									else aux_buffers[layer_idx]["key"][:batch_size].clone(),
-									None,
-								)
-						if _glm5_whole_timing:
-							_glm5_whole_timing_items["offload_callback_ms"] = (
-								time.perf_counter() - _glm5_offload_start
-							) * 1000.0
-					if _glm5_whole_timing:
-						logging.info(
-							"[GLM5_WHOLE_GRAPH_TIMING] rank=%s bucket=%s batch=%s replay_ms=%.3f "
-							"eager_ms=%.3f offload_callback_ms=%.3f compare=%s",
-							self.rank,
-							bucket,
-							batch_size,
-							_glm5_whole_timing_items.get("replay_ms", -1.0),
-							_glm5_whole_timing_items.get("eager_ms", -1.0),
-							_glm5_whole_timing_items.get("offload_callback_ms", -1.0),
-							_glm5_whole_compare,
-						)
-				else:
-					# Per-layer graph or eager forward
-					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
-					# Without this, the model generates position_ids = [[0]] for all decode steps,
-					# causing RoPE to be applied at position 0 instead of the actual token position.
-					# Graph replays above stream nothing; an eager step is one
-					# weight pass and carries the next step's while decode runs.
-					self._weight_passes.begin(carry=True)
-					outputs = self._glm5_decode_model_forward(new_tokens)
-					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
-					self._weight_passes.end()
-				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
+	def _read_decode_cur_batch(self):
+		return tuple(getattr(AttnWrapperBase, "cur_batch", None) or ())
 
-			new_tokens = new_tokens_out
-			_split_t1 = time.perf_counter()
-			# End marker, queued on the same stream ahead of the token copy below.
-			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device), tag=_probe_tag)
+	def _read_decode_cache_seqlens(self):
+		return AttnWrapperBase.cache_seqlens
 
-			if _deferred_readback:
-				# [DEFERRED_READBACK] This step is enqueued; only now wait for
-				# the PREVIOUS step's tokens, so its host tail (KV drain,
-				# bookkeeping, next setup) runs while this forward runs.
-				bs = new_tokens.shape[0]
-				_rb_slot = _readback_ring.launch(
-					new_tokens, bs, torch.cuda.current_stream(self.torch_device)
-				)
-				_split_t2 = time.perf_counter()
-				_rb_marks = []
-				if _pending_step is not None:
-					_finish = self._finish_deferred_decode_step(
-						_pending_step, _readback_ring, overlapped=True, marks=_rb_marks
-					)
-					_pending_step = None
-					if _finish != _DECODE_WAIT_COMPLETED:
-						self._cohort_shutdown_observed = True
-						self._quiesce_decode_for_cohort_shutdown(pending_async_task)
-						return decode_uuids, batch
-				else:
-					_rb_marks = [_split_t2, _split_t2, _split_t2]
-				# One step's host-KV appends in flight at a time: the previous
-				# step's were drained just above.
-				self._flush_deferred_kv_to_host()
-				_split_kv = time.perf_counter()
-				_pending_step = self._begin_deferred_decode_step(
-					batch, batch_sequences, _rb_slot, bs, local_iteration
-				)
-				_split_end = time.perf_counter()
-				self._cumulative_forward_ms += (_split_end - forward_start) * 1000
-				accumulate_decode_step_split(
-					_step_split,
-					deferred_decode_step_marks(
-						forward_start, _split_t0, _split_t1, _split_t2,
-						_rb_marks[0], _rb_marks[1], _rb_marks[2],
-						_split_kv, _split_end,
-					),
-				)
-				_harvested = _fwd_ring.harvest()
-				if _probe is not None:
-					for _tag, _elapsed_ms in _harvested:
-						_probe.record(_tag, _elapsed_ms)
-				from batchgen.timing import get_decode_timer
-				_dt = get_decode_timer()
-				if _dt and _dt.enabled:
-					_dt.log_summary()
-					_dt.reset()
-				continue
+	def _read_decode_position_ids(self):
+		return AttnWrapperBase.position_ids
 
-			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
-			# exact token-readback boundary before launching host-KV copies on their
-			# independent D2H stream.
-			bs = new_tokens.shape[0]
-			if bs > _new_tokens_pinned.shape[0]:
-				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
-			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
-			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
+	def _read_decode_attention_mask(self):
+		return AttnWrapperBase.attention_mask
 
-			# Host-KV offload orders its own stream with a device-side event, so
-			# launching it needs no host wait. The host first waits for the
-			# sampled-token readback (needed for exact EOS and output bookkeeping),
-			# then drains the append tasks below.
-			self._flush_deferred_kv_to_host()
-			_split_t2 = time.perf_counter()
-			# --- The measured production wedge point, made pollable ---
-			# This was a blocking `_new_tokens_ready.synchronize()`.  A rank
-			# whose peer died mid-decode blocks there below Python and runs
-			# nothing again: the teardown boundary below is unreachable, and
-			# aborting the dead communicator does not free it.
-			# _wait_decode_tokens keeps
-			# that exact call, byte for byte, whenever the shutdown probe is
-			# unarmed, and otherwise polls the event so the flag can be seen.
-			_decode_wait = self._wait_decode_tokens(_new_tokens_ready)
-			_split_t3 = time.perf_counter()
+	def _read_decode_kv_append_callbacks(self):
+		return (
+			getattr(AttnWrapperBase, 'kv_append_callback', None),
+			getattr(AttnWrapperBase, 'kv_append_callback_aux', None),
+		)
 
-			# --- Decode-step teardown boundary (the abandoned token wait) ---
-			# The wait gave up on an event that may never fire, so NOTHING this
-			# step produced may be read: the sampled tokens are not in the
-			# pinned buffer, and the step's host-KV appends are parked behind
-			# the same dead device work.  That is why this exit sits BEFORE the
-			# per-step drain below rather than after it -- that drain is
-			# unbounded and ends in a device sync, i.e. the same unwakeable
-			# state one level down.  The D1 invariant it exists for is kept
-			# instead by _quiesce_decode_for_cohort_shutdown, which runs the
-			# same local drain under a deadline and self-exits rather than
-			# unwind with those unlocked page-table readers still live.
-			#
-			# As with the two flag checks, the exit RETURNS (a break would run
-			# the post-loop drain, which syncs errors across ranks on the
-			# aborted communicator) and latches, so the supervisor names this
-			# ordered-via-decode-boundary.
-			if _decode_wait == _DECODE_WAIT_ABANDONED:
-				self._cohort_shutdown_observed = True
-				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
-				return decode_uuids, batch
-
-			# [KV_APPEND_DRAIN] Complete this step's host appends before the
-			# next step. Each task is a std::async thread that reads the worker
-			# view's page table on its own thread at execution time, with no
-			# lock. Letting up to 256 of them stay in flight across steps meant
-			# they could overlap the next admission wave's register/allocate on
-			# the main thread; a torn read then lands one token's KV in a page
-			# that now belongs to a freshly prefilled sequence. Measured on the
-			# 512x4096 K3 contract: every victim was in a wave after the first
-			# and collapsed at its 2nd or ~28th token, while the first wave (no
-			# page-table mutation in flight) was clean. The drain sits after the
-			# token readback only so its wait (which ends in a full device sync)
-			# gets its own split slot instead of being charged to the copy
-			# launch; nothing between the launch above and here touches a page
-			# table. defer_errors=True keeps it a purely local wait (a guarded
-			# collective would deadlock when only some ranks have tasks); the
-			# deferred errors surface at the next boundary PHASE 0 or loop-exit
-			# drain, both of which sync errors across ranks.
-			if self._pending_kv_append_tasks:
-				self._wait_pending_kv_append_tasks(defer_errors=True)
-
-			# --- Decode-step teardown boundary (the measured wedge point) ---
-			# The sync a few lines up is where a rank whose peer died mid-decode
-			# is stuck, far below Python, and where the cohort abort releases it.
-			# The release is SILENT: the sync returns normally and nothing raises
-			# afterwards -- in graph mode nothing ever will -- so this flag test
-			# is the only thing that can retire the freed rank.  It sits as close
-			# to the sync as the step's own invariants allow, because the window
-			# is finite: the rank resumes stepping and then re-wedges
-			# permanently, with no second warning.
-			#
-			# It sits AFTER the drain above, not before it, and that ordering is
-			# a correctness requirement rather than a preference.  The appends
-			# this step launched are std::async threads holding unlocked
-			# pointers into the worker view's page table, and the ordered
-			# teardown this exit leads to releases that mapping.  Returning with
-			# them still in flight is a use-after-free during teardown, so the
-			# step always finishes draining what it started.
-			#
-			# The exit is a RETURN, not a break.  Breaking would fall into this
-			# loop's post-loop cleanup, which drains with
-			# sync_distributed_errors=True and so issues a fresh
-			# dist.all_gather_object on the communicator that was just aborted
-			# -- which the dead peer will never join.
-			if self._cohort_shutdown_requested():
-				self._cohort_shutdown_observed = True
-				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
-				return decode_uuids, batch
-
-			_split_t4 = time.perf_counter()
-			# One host read of this step's sampled tokens for the whole
-			# microbatch, replacing two `.item()` calls per row below.
-			new_token_ids = _new_tokens_pinned[:bs].reshape(-1).tolist()
-			if len(new_token_ids) < len(batch_sequences):
-				raise RuntimeError(
-					f"decode sampled {len(new_token_ids)} tokens for "
-					f"{len(batch_sequences)} rows"
-				)
-
-			# [COMPLETED_ROW_SKIP] A row that is already retired must not
-			# receive a trajectory token and must not be advanced below;
-			# losing this skip writes a token into a retired row's book.
-			# The predicate is still evaluated exactly once per row, and it
-			# reads only that row's own fields, so deciding every row before
-			# the appends cannot change any row's answer.
-			_row_active = [
-				not self._is_sequence_completed(seq) for seq in batch_sequences
-			]
-			# One batched QueryBook append for the step, over the live rows
-			# only, instead of one pybind call per row.
-			self._append_trajectory_tokens(
-				[seq for seq, live in zip(batch_sequences, _row_active) if live],
-				[tok for tok, live in zip(new_token_ids, _row_active) if live],
-			)
-
-			# Update sequences (reuse batch_sequences from forward pass setup)
-			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if not _row_active[i]:
-					continue
-
-				seq.decoded_length += 1
-				seq.current_context_length = (
-					seq.original_prompt_length + seq.decoded_length
-				)
-
-				# Already on the host from this step's single tolist()
-				token_id = new_token_ids[i]
-				self._apply_decode_row_token(seq, token_id, i, local_iteration)
-
-			_split_t5 = time.perf_counter()
-			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
-			# Per-step CPU wall split (setup, fwd_launch, kv_launch, readback,
-			# kv_drain, bookkeeping), without adding any device sync of its own.
-			accumulate_decode_step_split(
-				_step_split,
-				(forward_start, _split_t0, _split_t1, _split_t2, _split_t3, _split_t4, _split_t5),
-			)
-			# Non-blocking harvest of finished forward timing pairs; elapsed
-			# time is read only from pairs whose two events already completed.
-			_harvested = _fwd_ring.harvest()
-			if _probe is not None:
-				for _tag, _elapsed_ms in _harvested:
-					_probe.record(_tag, _elapsed_ms)
-
-			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
-			from batchgen.timing import get_decode_timer
-			_dt = get_decode_timer()
-			if _dt and _dt.enabled:
-				_dt.log_summary()
-				_dt.reset()
-
-		# Cleanup
-		if _pending_step is not None:
-			# Every loop exit leaves through the page boundary, which drains
-			# the deferred step; a step still pending here means an exit path
-			# skipped that drain and its tokens would be lost.
-			raise DeferredTokenReadbackError(
-				f"Rank {self.rank}: decode loop exited with the sampled tokens of "
-				f"local step {_pending_step.local_iteration} still unread"
-			)
-		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
-		if pending_async_task is not None:
-			pending_async_task.wait()
-			torch.cuda.synchronize(self.torch_device)
-		_step_now_s = time.perf_counter()
-		_step_counters.end_round(_step_now_s)
-		_step_counters.maybe_emit(_step_now_s, STEP_COUNTERS_INTERVAL_S)
-		# Decode intervals shorter than the 30 s heartbeat (128-token probes,
-		# small admission waves) would otherwise never report their step split.
-		if self.rank == 0 and _step_split[0] > 0:
-			logging.info(
-				f"[DECODE] interval end: steps={int(_step_split[0])} "
-				f"{format_decode_step_split(_step_split)}{_fwd_ring.take_summary()}"
-			)
-		if _probe is not None:
-			# The loop exits after the last step's readback, so its pair has
-			# completed; this harvest still never waits.
-			for _tag, _elapsed_ms in _fwd_ring.harvest():
-				_probe.record(_tag, _elapsed_ms)
-			if self.rank == 0:
-				logging.info(_probe.report())
-
+	def _teardown_decode_model_state(self):
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
 		Attn_Wrapper.past_key_states = None
@@ -20993,24 +15310,61 @@ class BatchGenWorker:
 		GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 		GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
 
-		# Summary (uses cumulative counters for accurate cross-round totals)
-		# Only show when BATCHGEN_CB_LOG=DEBUG
-		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
-			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
-			avg_round = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
-			logging.debug(
-				f"\n{'='*50}\n"
-				f"DECODE SUMMARY (Rank 0)\n"
-				f"{'='*50}\n"
-				f"Total Iterations: {self._cumulative_decode_iterations}, Total Rounds: {self._cumulative_decode_boundaries}\n"
-				f"Avg forward: {avg_forward:.2f}ms\n"
-				f"Avg round overhead: {avg_round:.2f}ms\n"
-				f"Round overhead/token: {avg_round / self.DECISION_INTERVAL:.3f}ms\n"
-				f"{'='*50}"
-			)
+	def _whole_model_replay_page_inputs(self, **kwargs):
+		from batchgen.models.openai.gpt_oss_120b.whole_model_graph_inputs import (
+			whole_model_replay_page_inputs,
+		)
+		return whole_model_replay_page_inputs(**kwargs)
 
-		self.disable_decode_watchdog()
-		return decode_uuids, batch
+	def _compare_glm5_whole_model_graph_logits(self, **kwargs):
+		from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
+			compare_glm5_whole_model_graph_logits,
+		)
+		return compare_glm5_whole_model_graph_logits(
+			**kwargs,
+			atol=self._glm5_whole_model_graph_compare_tolerance("glm5_whole_model_graph_compare_atol"),
+			rtol=self._glm5_whole_model_graph_compare_tolerance("glm5_whole_model_graph_compare_rtol"),
+		)
+
+	def _decode_whole_model_segment_name(self):
+		return self._graph.whole_model_segment_name or "glm5_whole_model"
+
+	def decoding_continuous(
+		self,
+		new_tokens: torch.Tensor,
+		decode_uuids: List[str],
+		batch: List[int],
+		past_key_states: Optional[torch.Tensor] = None,
+		past_value_states: Optional[torch.Tensor] = None,
+		scale_dict: Optional[dict] = None,
+	) -> Tuple[List[str], List[int]]:
+		"""
+		Continuous decoding with optimized collective operations.
+
+		Key optimizations:
+		1. Single batched all_gather per page boundary (vs 10+ in original)
+		2. Single page table rebuild per boundary (vs 4 in original)
+		3. Reduced logging overhead
+		4. No timing object allocation in hot path
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = True
+
+		strategy = strategy_for(self.engine_config.Basic_Config.attn_mode)
+		if strategy is not DecodeStrategy.DECOUPLED_GPU:
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1, strategy)
+			return decode_uuids, batch
+
+		return DecoupledGpuDecode().run(
+			self,
+			self,
+			decode_uuids,
+			batch,
+			new_tokens,
+			past_key_states,
+			past_value_states,
+			scale_dict,
+		)
 
 	def _wait_pending_kv_append_tasks(
 		self,
@@ -21019,92 +15373,18 @@ class BatchGenWorker:
 		defer_errors: bool = False,
 		device_sync: bool = True,
 	) -> int:
-		"""
-		Wait for all pending KV append tasks at page boundary.
-		Returns the number of tasks that were waited for.
-		
-		CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
-		Without this, KV data may not be fully written to host memory when
-		sequences are later resumed, causing KV corruption.
-
-		``device_sync=False`` is only for the deferred-readback decode step,
-		where the next forward is already enqueued and a device-wide sync
-		would wait for it; see _finish_deferred_decode_step for why each
-		task's own copy-stream sync suffices there.
-		"""
-		deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
-		if not hasattr(self, '_pending_kv_append_tasks'):
-			if sync_distributed_errors:
-				error_payload = {
-					"rank": self.rank,
-					"errors": list(deferred_errors),
-				} if deferred_errors else None
-				all_errors = [None] * self.world_size
-				dist.all_gather_object(all_errors, error_payload)
-				if hasattr(self, "_deferred_kv_append_wait_errors"):
-					self._deferred_kv_append_wait_errors.clear()
-				flat_errors = [e for e in all_errors if e is not None]
-				if flat_errors:
-					raise RuntimeError(
-						f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
-					)
-			elif deferred_errors and not defer_errors:
-				raise RuntimeError(
-					f"Rank {self.rank}: KV append/offload failed: {deferred_errors[:4]}"
-				)
-			return 0
-		
-		num_tasks = len(self._pending_kv_append_tasks)
-		wait_errors = list(deferred_errors)
-		if deferred_errors and hasattr(self, "_deferred_kv_append_wait_errors"):
-			self._deferred_kv_append_wait_errors.clear()
-		for task in self._pending_kv_append_tasks:
-			if task is not None:
-				try:
-					task.wait()
-				except Exception as e:
-					wait_errors.append(f"{type(e).__name__}: {e}")
-		
-		# CRITICAL FIX: Sync CUDA after waiting for tasks
-		# The async tasks use a separate CUDA stream for D2H copies.
-		# Even though each task internally syncs its stream via cudaEventSynchronize,
-		# we need a full device sync to ensure ALL pending operations complete
-		# before we allow GPU pages to be freed/reused.
-		if device_sync and num_tasks > 0 and not wait_errors:
-			try:
-				torch.cuda.synchronize(self.torch_device)
-			except Exception as e:
-				wait_errors.append(f"{type(e).__name__}: {e}")
-		
-		self._pending_kv_append_tasks.clear()
-		
-		# CRITICAL: Clear tensor references AFTER tasks complete
-		# Tensors can now be safely garbage collected / memory reused
-		if hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors.clear()
-
-		if sync_distributed_errors:
-			error_payload = {
-				"rank": self.rank,
-				"errors": wait_errors,
-			} if wait_errors else None
-			all_errors = [None] * self.world_size
-			dist.all_gather_object(all_errors, error_payload)
-			flat_errors = [e for e in all_errors if e is not None]
-			if flat_errors:
-				raise RuntimeError(
-					f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
-				)
-		elif wait_errors and defer_errors:
-			if not hasattr(self, "_deferred_kv_append_wait_errors"):
-				self._deferred_kv_append_wait_errors = []
-			self._deferred_kv_append_wait_errors.extend(wait_errors)
-		elif wait_errors:
-			raise RuntimeError(
-				f"Rank {self.rank}: KV append/offload failed: {wait_errors[:4]}"
-			)
-		
-		return num_tasks
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._wait_pending_kv_append_tasks(
+			self,
+			sync_distributed_errors=sync_distributed_errors,
+			defer_errors=defer_errors,
+			device_sync=device_sync,
+		)
 
 	def _rebuild_page_table_for_batch(
 		self,
@@ -21340,20 +15620,12 @@ class BatchGenWorker:
 				
 				if (new_token_idx - 1) % 32 == 0:
 					for idx in range(new_token_idx - 1, new_token_idx + 31):
-						if "deepseek" in self.model_config.model_type:
-							past_kv_byte_size = (
-								(max(self.max_input_length + idx + 1, max_cache_len))
-								* self.model_config.compressed_kv_dim
-							)
-						elif "mixtral" in self.model_config.model_type:
-							past_kv_byte_size = (
-								(max(self.max_input_length + idx, max_cache_len))
-								* self.model_config.num_key_value_heads
-								* self.model_config.head_dim
-								* 2
-							)
-						else:
-							raise ValueError(f"Model architecture {self.model_config.model_type} not supported yet.")
+						past_kv_byte_size = legacy_past_kv_byte_size(
+							self.model_config,
+							max_input_length=self.max_input_length,
+							token_idx=idx,
+							max_cache_len=max_cache_len,
+						)
 
 						for layer_idx in range(self.model_config.num_hidden_layers):
 							for micro_batch_idx in range(num_micro_batches):
@@ -21453,402 +15725,56 @@ class BatchGenWorker:
 			self._append_trajectory_token(seq, int(new_tokens[idx].item()))
 
 	def init_nvshmem(self):
-		"""Initialize NVSHMEM only once per batch, not per decode iteration."""
-		if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
-			if self.rank == 0:
-				logging.debug("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled")
-			return
-		
-		# Check if already initialized this run
-		if getattr(self, '_nvshmem_initialized_this_run', False):
-			logging.debug(f"Rank {self.rank}: NVSHMEM already initialized this run, skipping")
-			return
-			
-		import nvshmem.core as nvshmem
-		from cuda.core.experimental import Device    
-		rank = dist.get_rank()
-		world_size = dist.get_world_size()
-		local_rank = rank % torch.cuda.device_count()
-		torch.cuda.set_device(local_rank)
-
-		dev = Device(local_rank)
-		dev.set_current()
-		dist.barrier()
-		nvshmem_init(
-			global_rank=rank,
-			local_rank=local_rank,
-			world_size=world_size,
-			device=dev
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine.init_nvshmem(
+			self,
 		)
-		self._nvshmem_initialized_this_run = True
-		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
-
-	def _init_torch_dist(self):
-		# Use maximum timeout (about 24 days) to handle long server idle periods
-		# timedelta max is about 999999999 days, but NCCL has internal limits
-		# 35791 minutes ≈ 24.8 days, which is close to the max NCCL supports
-		timeout = timedelta(days=24)
-		try:
-			dist.init_process_group(
-				backend="nccl",
-				init_method="tcp://" + self.dist_init_addr,
-				world_size=self.world_size,
-				rank=self.global_rank,
-				device_id=torch.device(f"cuda:{self.local_rank}"),
-				timeout=timeout,
-			)
-			logging.info(f"Rank {self.rank}: torch.distributed initialized with timeout={timeout}")
-		except RuntimeError as e:
-			logging.error(f"Failed to initialize torch distributed: {e}")
-			raise
-
-	def _ensure_dist_healthy(self) -> bool:
-		"""
-		Ensure torch.distributed is healthy before starting a new batch.
-
-		This performs a lightweight health check first. Only if the check fails
-		does it attempt to reinitialize with coordinated retries.
-
-		The key insight is: DON'T destroy a working connection. Only reinit if broken.
-
-		Returns True if healthy, False if reinit failed after all retries.
-		"""
-		MAX_REINIT_RETRIES = 5
-		INITIAL_RETRY_DELAY = 2.0  # seconds
-
-		# Step 1: Check if dist is even initialized
-		if not dist.is_initialized():
-			logging.warning(f"Rank {self.rank}: torch.distributed not initialized, attempting init...")
-			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
-
-		# Step 2: Quick health check - use async op with short timeout
-		try:
-			health_tensor = torch.ones(1, device=self.torch_device)
-			work = dist.all_reduce(health_tensor, op=dist.ReduceOp.SUM, async_op=True)
-
-			# Wait with short timeout (10 seconds should be enough for healthy connection)
-			success = work.wait(timeout=timedelta(seconds=10))
-			if not success:
-				raise RuntimeError("Health check timed out")
-
-			expected = float(self.world_size)
-			if abs(health_tensor.item() - expected) > 1e-6:
-				raise RuntimeError(f"Health check mismatch: got {health_tensor.item()}, expected {expected}")
-
-			logging.debug(f"Rank {self.rank}: torch.distributed health check passed")
-			return True
-
-		except Exception as e:
-			logging.warning(f"Rank {self.rank}: torch.distributed health check failed: {e}")
-			logging.info(f"Rank {self.rank}: Attempting coordinated reinit...")
-			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
-
-	def _coordinated_dist_reinit(self, max_retries: int, initial_delay: float) -> bool:
-		"""
-		Perform coordinated torch.distributed reinitialization with retries.
-
-		The challenge: when NCCL is broken, we can't use NCCL to coordinate.
-		Solution: Use exponential backoff retries. Rank 0 (which hosts TCPStore)
-		will eventually be ready when other ranks retry.
-
-		Args:
-			max_retries: Maximum number of reinit attempts
-			initial_delay: Initial delay between retries (doubles each attempt)
-
-		Returns:
-			True if reinit succeeded, False otherwise
-		"""
-		delay = initial_delay
-
-		for attempt in range(max_retries):
-			logging.info(f"Rank {self.rank}: Reinit attempt {attempt + 1}/{max_retries}")
-
-			# Step 1: Clean up existing process group
-			if dist.is_initialized():
-				try:
-					dist.destroy_process_group()
-					logging.debug(f"Rank {self.rank}: Destroyed existing process group")
-				except Exception as e:
-					logging.warning(f"Rank {self.rank}: Error destroying process group: {e}")
-
-			# Step 2: Clean up PyNccl communicator (must be done after destroying dist)
-			if hasattr(self, 'comm') and self.comm is not None:
-				try:
-					self.comm.destroy()
-					logging.debug(f"Rank {self.rank}: Destroyed PyNccl communicator")
-				except Exception as e:
-					logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {e}")
-				self.comm = None
-
-			# Step 3: Wait before retry (exponential backoff)
-			# Rank 0 waits less so it sets up TCPStore first
-			rank_delay = delay * (0.5 if self.rank == 0 else 1.0)
-			logging.debug(f"Rank {self.rank}: Waiting {rank_delay:.1f}s before reinit...")
-			time.sleep(rank_delay)
-
-			# Step 4: Try to reinitialize
-			try:
-				self._init_torch_dist()
-				logging.info(f"Rank {self.rank}: torch.distributed reinitialized successfully on attempt {attempt + 1}")
-				return True
-			except Exception as e:
-				logging.warning(f"Rank {self.rank}: Reinit attempt {attempt + 1} failed: {e}")
-				delay *= 2  # Exponential backoff
-
-		logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed after {max_retries} attempts")
-		return False
 
 	def _check_and_reinit_pynccl(self) -> bool:
-		"""
-		Check if PyNccl communicator is healthy. If not, attempt to reinitialize.
-		Returns True if communicator is healthy (or was successfully reinitialized).
-		"""
-		if self.comm is None:
-			# Will be lazily initialized in generate()
-			return True
-
-		# Skip health check if communicator is not available (e.g., single GPU)
-		if not self.comm.available:
-			logging.debug(f"Rank {self.rank}: PyNccl communicator not available, skipping health check")
-			return True
-
-		try:
-			# Quick health check using PyNccl all_reduce
-			# CRITICAL: Must enable the communicator first - it's disabled by default after init
-			health_tensor = torch.ones(1, device=self.torch_device, dtype=torch.float32)
-			with self.comm.change_state(enable=True):
-				self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
-			torch.cuda.synchronize(self.torch_device)
-
-			expected = float(self.world_size)
-			if abs(health_tensor.item() - expected) > 1e-6:
-				raise RuntimeError(f"PyNccl health check mismatch: got {health_tensor.item()}, expected {expected}")
-
-			logging.debug(f"Rank {self.rank}: PyNccl health check passed")
-			return True
-			
-		except Exception as e:
-			logging.warning(f"Rank {self.rank}: PyNccl health check failed: {e}")
-			logging.info(f"Rank {self.rank}: Attempting to reinitialize PyNccl communicator...")
-
-			# Destroy old communicator
-			try:
-				if self.comm is not None:
-					self.comm.destroy()
-					self.comm = None
-					logging.info(f"Rank {self.rank}: NCCL communicator destroyed successfully")
-			except Exception as destroy_e:
-				logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {destroy_e}")
-				self.comm = None
-
-			# Destroy old group (releases TCPStore and port)
-			try:
-				if self._nccl_group is not None:
-					# The group's store should be garbage collected when group is deleted
-					del self._nccl_group
-					self._nccl_group = None
-					# Force garbage collection to release TCPStore socket
-					gc.collect()
-					logging.info(f"Rank {self.rank}: NCCL group destroyed successfully")
-			except Exception as group_e:
-				logging.warning(f"Rank {self.rank}: Error destroying NCCL group: {group_e}")
-				self._nccl_group = None
-
-			# Synchronize all ranks before any tries to recreate (uses torch.distributed)
-			# This ensures all ranks have released their connections before rank 0
-			# tries to create a new TCPStore server
-			try:
-				if dist.is_initialized():
-					dist.barrier()
-					logging.debug(f"Rank {self.rank}: Barrier after NCCL cleanup passed")
-			except Exception as barrier_e:
-				logging.warning(f"Rank {self.rank}: Barrier after NCCL cleanup failed: {barrier_e}")
-
-			# Find next available port for reinitialization
-			# Rank 0 finds the port, then broadcasts to all ranks
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR", "127.0.0.1")
-			selected_port = self._nccl_port
-			if self.rank == 0:
-				try:
-					selected_port = self._find_available_pynccl_port(
-						comm_master_addr,
-						self._nccl_port + 1,
-					)
-					logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl reinit")
-				except RuntimeError as e:
-					logging.error(f"Rank 0: Failed to find available port: {e}")
-					selected_port = -1
-			# Broadcast port to all ranks
-			port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
-			dist.broadcast(port_tensor, src=0)
-			self._nccl_port = port_tensor.item()
-			if self._nccl_port < 0:
-				return False
-			logging.debug(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
-
-			# Delay to allow OS to fully release resources
-			# Rank 0 needs extra time since it's the TCPStore server
-			if self.rank == 0:
-				time.sleep(1.0)
-			else:
-				time.sleep(0.5)
-
-			# Will be reinitialized lazily in generate()
-			return True
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_rank_sync_engine", None)
+		if engine is None:
+			from batchgen.worker.rank_sync_engine import RankSyncEngine
+			engine = RankSyncEngine()
+			self._rank_sync_engine = engine
+		return engine._check_and_reinit_pynccl(
+			self,
+		)
 
 	def _unregister_fp8_weights(self):
-		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
-		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
-			return
-
-		# Models whose MoE layers don't expose DeepSeek-style `.mlp` (e.g.
-		# Kimi-Linear uses `.block_sparse_moe` with BF16 experts) have no FP8
-		# weights to unregister.
-		_fkd = self.loaded_model_config.first_k_dense_replace
-		if _fkd < len(self.model.model.layers) and not hasattr(
-			self.model.model.layers[_fkd], 'mlp'
-		):
-			return
-
-		for layer_idx in range(len(self.model.model.layers)):
-			attn_module = self.model.model.layers[layer_idx].self_attn
-			if hasattr(attn_module, '_unregister_fp8_weights'):
-				attn_module._unregister_fp8_weights()
-			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
-				shared_experts = getattr(self.model.model.layers[layer_idx].mlp, 'shared_experts', None)
-				if shared_experts is not None and hasattr(shared_experts, '_unregister_fp8_weights'):
-					shared_experts._unregister_fp8_weights()
-				for routed_expert_idx in range(self.model_config.num_local_experts):
-					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
-						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
-				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
-					self.model.model.layers[layer_idx].mlp.cleanup()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._unregister_fp8_weights(
+			self,
+		)
 
 	def _release_decode_graph_state(self) -> None:
-		"""Drop the decode instance's captured graphs and their bookkeeping."""
-		self._graph.cuda_graph_manager = None
-		self._graph.glm5_moe_cuda_graph_manager = None
-		self._graph.glm5_layer_cuda_graph_manager = None
-		self._graph.glm5_layer_graph_failed_buckets = set()
-		self._graph.glm5_layer_graph_capture_attempted_for_batch = False
-		self._graph.glm5_layer_graph_signature = None
-		self._graph.glm5_layer_graph_max_seqlen = None
-		self._graph.glm5_dsa_graph_capture_attempted_for_batch = False
-		self._graph.glm5_moe_graph_capture_attempted_for_batch = False
-		self._graph.glm5_dsa_graph_page_table_change_after_capture_logged = False
-		self._graph.whole_model_segment = None
-		self._graph.glm5_whole_model_all_short = False
-		self._graph.glm5_whole_model_index_topk = 0
-		self._graph.whole_model_bucketing = None
-		self._graph.glm5_whole_model_capture_input_ids = None
-		self._graph.glm5_moe_graph_failed_buckets = set()
-		self._graph.whole_model_graph = False
-		self._graph.glm5_whole_model_graph = False
-		self._graph.glm5_whole_model_graph_failed_buckets = set()
-		self._graph.glm5_whole_model_graph_capture_attempted_for_batch = False
-		self._graph.glm5_whole_model_graph_state_change_after_capture_logged = False
-		self._graph.glm5_whole_model_graph_signature = None
-		self._graph.glm5_whole_model_graph_unavailable_reason = None
-		# The probe's spin nodes live in the graphs dropped above.
-		self._criticality_probe = None
-		# Adapter holds Python refs to model/segment/KV manager via _ctx;
-		# without release_context() the captured segment's static KV buffers
-		# survive empty_cache() and prefill OOMs on the next batch.
-		if self._graph.cuda_graph_adapter is not None:
-			self._graph.cuda_graph_adapter.release_context()
-		# A later decode instance is a new owner and captures its own graphs.
-		self._graph.decode_graph_captures = 0
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine._release_decode_graph_state(
+			self,
+		)
 
 	def deep_free_model_memory(self):
-		"""Release model memory without CPU transfer overhead.
-
-		Previous implementation moved model to CPU before deletion, causing
-		unnecessary PCIe traffic for large models. This minimal approach:
-		1. Synchronizes CUDA to ensure pending ops complete
-		2. Deletes model reference directly
-		3. Releases memory back to CUDA allocator
-		"""
-		if not hasattr(self, 'model') or self.model is None:
-			return
-
-		self._phase_mem_switch_index = (
-			getattr(self, "_phase_mem_switch_index", 0) + 1
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_worker_lifecycle_engine", None)
+		if engine is None:
+			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
+			engine = WorkerLifecycleEngine()
+			self._worker_lifecycle_engine = engine
+		return engine.deep_free_model_memory(
+			self,
 		)
-		self._log_phase_memory_ledger("deep_free_enter")
-
-		# Stage timings on every rank: the first decode configure after the
-		# streamed wave-1 prefill spent 34 s here on rank 0 (r30) / ~30 s on
-		# node 1 (r29), intermittently, with nothing logged.
-		_df_t0 = time.perf_counter()
-		# Ensure all GPU operations complete before deletion
-		if torch.cuda.is_available():
-			torch.cuda.synchronize(self.torch_device)
-		_df_t1 = time.perf_counter()
-
-		# Free WGMMA shared buffers if they exist (class-level, survives model deletion).
-		# Only when the GLM-5 model module is already loaded: importing it here
-		# on a non-GLM-5 server walks the GLM-5 JIT extensions -- MEASURED r33
-		# (K3, 2x8 H200, shared TORCH_EXTENSIONS_DIR): del=30.2 s on every rank
-		# of one node (0.2 s on the other) at the first decode configure.
-		_glm5_model_module = sys.modules.get("batchgen.models.glm.glm5.model")
-		if _glm5_model_module is not None:
-			Glm5MoE = getattr(_glm5_model_module, "Glm5MoE", None)
-			if Glm5MoE is not None and getattr(Glm5MoE, '_wgmma_shared_bufs', None) is not None:
-				Glm5MoE._wgmma_shared_bufs.free_buffers()
-				Glm5MoE._wgmma_shared_bufs = None
-				Glm5MoE._wgmma_next_layer_id = 0
-
-		# Delete model directly without CPU transfer
-		del self.model
-		self.model = None
-		# Decode graph state belongs to the decode instance that captured it.
-		# A held decode instance replays those graphs on its next activation
-		# (capture-once), so freeing the live prefill model must not drop
-		# them; they go when the decode instance itself is retired, whose
-		# phase_exit clears the manager's hold before this runs.
-		if not self.parallel_manager.holds_instance("decode"):
-			self._release_decode_graph_state()
-
-		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
-		# (INT4 contiguous weight buffers, MoE class-level buffers)
-		_df_t2 = time.perf_counter()
-		if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-			pm = self.parallel_manager
-			if hasattr(pm, "_release_streamed_sp8_prefill"):
-				pm._release_streamed_sp8_prefill()
-			# The worker is not the only owner of the model: the parallel strategy
-			# manager keeps its own reference from configure_prefill/
-			# configure_decoding. Leaving that reference set is what made this
-			# function a measured no-op on the decode->prefill switch (allocated
-			# bytes unchanged across the call): the decode model was really freed
-			# later, by the refcount drop when configure_prefill rebound pm.model,
-			# so it stayed resident through the KV destroy and the first part of the
-			# prefill configure. Dropping it here is what makes the function free
-			# what its name says it frees.
-			#
-			# Persistent instances own their model tuples; the guard keeps those
-			# references intact while a suspend transition is in progress.
-			if not getattr(pm, "persistent_phase_instances", False):
-				if getattr(pm, "model", None) is not None:
-					pm.model = None
-			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
-				if hasattr(pm, attr):
-					delattr(pm, attr)
-		_df_t3 = time.perf_counter()
-
-		# Release memory
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		_df_t4 = time.perf_counter()
-		gc.collect()
-		logging.info(
-			f"[DECODE] Rank {self.rank}: deep_free_model_memory sync={_df_t1 - _df_t0:.1f}s "
-			f"del={_df_t2 - _df_t1:.1f}s release_streamed={_df_t3 - _df_t2:.1f}s "
-			f"empty_cache={_df_t4 - _df_t3:.1f}s gc={time.perf_counter() - _df_t4:.1f}s"
-		)
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		# After empty_cache: what is still held here is what this switch
-		# did NOT give back, which is the number the rebuild path's
-		# net-zero invariant is read from.
-		self._log_phase_memory_ledger("deep_free_done")

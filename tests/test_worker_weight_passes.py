@@ -21,10 +21,30 @@ import pytest
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
+ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
 WORKER_CLASS = next(
     node for node in TREE.body
     if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
 )
+ENGINE_CLASS = next(
+    node for node in ENGINE_TREE.body
+    if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
+)
+DECODE_RUN = next(
+    node for node in ENGINE_CLASS.body
+    if isinstance(node, ast.FunctionDef) and node.name == "run"
+)
+PREFILL_ENGINE = (
+    Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "prefill_engine.py"
+)
+PREFILL_ENGINE_CLASS = next(
+    node for node in ast.parse(PREFILL_ENGINE.read_text()).body
+    if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine"
+)
+# S5b: the prefill forwards moved verbatim to PrefillEngine (self = worker);
+# their weight-pass statements are the same statements in the same order.
+PREFILL_ENGINE_FORWARDS = ("prefill", "prefill_prepacked", "_prefill_prepacked_pool")
 
 
 def _load_weight_passes():
@@ -387,8 +407,12 @@ def test_misuse_fails_loud():
 
 
 def _method(name):
+    if name == "decoding_continuous":
+        # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+        return DECODE_RUN
+    owner = PREFILL_ENGINE_CLASS if name in PREFILL_ENGINE_FORWARDS else WORKER_CLASS
     return next(
-        node for node in WORKER_CLASS.body
+        node for node in owner.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
 
@@ -567,20 +591,24 @@ def test_no_other_model_forward_escapes_the_weight_passes():
         "_decoding_legacy_modes", "_glm5_decode_model_forward",
     }
     found = set()
-    for function in WORKER_CLASS.body:
+    # S4b covers decode_engine.py's run; S5b extends the walk to every
+    # PrefillEngine method so the moved open-coded prefill loops stay checked.
+    functions = [*WORKER_CLASS.body, DECODE_RUN, *PREFILL_ENGINE_CLASS.body]
+    for function in functions:
         if not isinstance(function, ast.FunctionDef):
             continue
+        owner = "decoding_continuous" if function is DECODE_RUN else function.name
         for call in _forward_calls(function, _is_model_forward):
-            site = (function.name, ast.unparse(call.func))
+            site = (owner, ast.unparse(call.func))
             if site in UNSTREAMED_FORWARDS:
                 found.add(site)
                 continue
-            assert function.name in wrapped, site
+            assert owner in wrapped, site
     # The list holds no stale entry.
     assert found == set(UNSTREAMED_FORWARDS)
     callers = {
-        function.name
-        for function in WORKER_CLASS.body
+        "decoding_continuous" if function is DECODE_RUN else function.name
+        for function in functions
         if isinstance(function, ast.FunctionDef)
         and _forward_calls(
             function, lambda func: func == "self._glm5_decode_model_forward"
@@ -639,14 +667,23 @@ def test_worker_calls_no_removed_weight_buffer_binding():
 
 def test_profiled_prefill_records_the_pass_counts_without_stopping_the_producer():
     prefill = _method("prefill_prepacked")
-    assert not any(
+    # S5b: the K3 profile record moved verbatim into the worker helper the
+    # engine body calls at the span's former position (spec F3 item 4).
+    profile_log = _method("_emit_k3_prefill_profile_log")
+    assert any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "stop_h2d_worker"
+        and ast.unparse(node.func) == "self._emit_k3_prefill_profile_log"
         for node in ast.walk(prefill)
     )
+    for function in (prefill, profile_log):
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "stop_h2d_worker"
+            for node in ast.walk(function)
+        )
     record = next(
-        node for node in ast.walk(prefill)
+        node for node in ast.walk(profile_log)
         if isinstance(node, ast.Dict)
         and any(
             isinstance(key, ast.Constant) and key.value == "weight_stream"

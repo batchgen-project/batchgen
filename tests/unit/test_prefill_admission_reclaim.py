@@ -45,7 +45,13 @@ from batchgen.prefix_reuse.trajectory_commit import (
 )
 from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 import batchgen.sequence as sequence_module
+from batchgen.worker.rank_context import node_of_rank
 from batchgen.sequence import SequenceStatus
+from tests.worker_method_source import (
+    delegated_method_names,
+    load_prefill_engine_methods,
+    worker_shaped_method_node,
+)
 from batchgen.worker.kv_plan import (
     NodeCapacityReport,
     prefill_owner_demand_pages,
@@ -93,7 +99,9 @@ METHODS = (
     # reclaim share the reserve-time collective helper above.
     "_gather_host_kv_stats_by_node",
     "_reclaim_host_prefix_pages_for_growth",
-    "_prefill_pool_segment_host_pages",
+    # S5a: _prefill_pool_segment_host_pages moved to PrefillEngine; it is
+    # lifted from the engine source below (same real-source discipline) so the
+    # worker's lazy engine-import delegator never runs in these CPU fakes.
     "_prefill_sequence_limits",
     "_trajectory_frontier_eviction_hook",
     "_describe_prefill_admission_blockers",
@@ -120,8 +128,12 @@ def _worker_methods(dist):
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
     )
+    # S10a: a delegated method compiles from its engine body (worker shape).
     wanted = [
-        copy.deepcopy(node) for node in worker.body
+        worker_shaped_method_node(node.name)
+        if node.name in delegated_method_names()
+        else copy.deepcopy(node)
+        for node in worker.body
         if isinstance(node, ast.FunctionDef) and node.name in METHODS
     ]
     assert {node.name for node in wanted} == set(METHODS)
@@ -145,10 +157,17 @@ def _worker_methods(dist):
         "_sequence_module": sequence_module,
         "NodeCapacityReport": NodeCapacityReport,
         "prefill_owner_demand_pages": prefill_owner_demand_pages,
+        "node_of_rank": node_of_rank,
         "verdict_node_capacity": verdict_node_capacity,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
-    return {name: namespace[name] for name in METHODS}
+    methods = {name: namespace[name] for name in METHODS}
+    # S5a pin migration: the pool-segment reader's real source now lives on
+    # PrefillEngine; lift it with the worker-shaped adapter.
+    methods.update(
+        load_prefill_engine_methods(["_prefill_pool_segment_host_pages"], namespace)
+    )
+    return methods
 
 
 class FakeDist:

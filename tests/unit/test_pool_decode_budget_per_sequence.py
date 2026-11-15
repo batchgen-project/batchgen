@@ -29,13 +29,15 @@ from batchgen.worker.rank_context import RankContext
 from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from batchgen.sequence import SequenceBatch, SequenceEntry
 from batchgen.worker.prefill import compute_prefill_host_reservation
-from tests.worker_method_source import load_worker_functions, load_worker_methods
+from tests.worker_method_source import load_worker_functions, load_worker_shaped_methods
 
 _admitted_prompt_ids = load_worker_functions(
     ["_admitted_prompt_ids"], {"np": np, "torch": torch}
 )["_admitted_prompt_ids"]
 
-_METHODS = load_worker_methods(
+# S9: Init runs in WorkerLifecycleEngine; the shaped loader compiles its body
+# in the worker's shape so this namespace reaches it as before.
+_METHODS = load_worker_shaped_methods(
     [
         "Init",
         "_get_effective_chunk_size",

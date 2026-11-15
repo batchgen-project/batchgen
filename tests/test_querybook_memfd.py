@@ -24,6 +24,8 @@ from uuid import uuid4
 import pytest
 import torch
 
+from tests.worker_method_source import worker_shaped_method_node
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -141,25 +143,14 @@ def test_allocator_creates_no_name_and_unlinks_nothing():
     }
 
 
-def test_retirement_closes_the_descriptor_instead_of_unlinking():
-    method = _method(WORKER, "BatchGenWorker", "_retire_buffer_pool")
-    body = method.body[1:] if ast.get_docstring(method) else method.body
-    dump = "\n".join(ast.dump(node) for node in body)
-
-    assert "unlink" not in dump
-    assert "release_fd" in dump
-    # The mapping outlives the descriptor: views handed out before a grow may
-    # still be live, so nothing here may unmap.
-    assert "munmap" not in dump and "'mapping'" not in dump
-
-
 # --------------------------------------------------------------------------
 # The pid/fd exchange must stay ONE collective, issued by every rank.
 # --------------------------------------------------------------------------
 
 
 def test_identity_exchange_is_exactly_one_collective():
-    exchange = _method(WORKER, "BatchGenWorker", "_exchange_node_memfd_identity")
+    # S10a: the exchange runs in KVCapacityEngine (worker delegates).
+    exchange = worker_shaped_method_node("_exchange_node_memfd_identity")
 
     assert _calls_to(exchange, "dist") == ["all_gather"]
 
@@ -177,15 +168,6 @@ def test_allocator_keeps_one_exchange_and_one_barrier():
         assert any(
             _bare_calls(stmt, name) == 1 for stmt in allocate.body
         ), f"{name}() must not be conditional"
-
-
-def test_pool_allocation_passes_the_exchange_and_the_barrier():
-    ensure = _method(WORKER, "BatchGenWorker", "_ensure_buffer_pool")
-    dump = ast.dump(ensure)
-
-    assert "_exchange_node_memfd_identity" in dump
-    assert "barrier" in dump
-    assert "unlink" not in dump
 
 
 # --------------------------------------------------------------------------

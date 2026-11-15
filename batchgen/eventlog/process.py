@@ -48,6 +48,43 @@ _NATIVE_LEVEL_BY_PYTHON_LEVEL = (
 
 EXIT_EVENT = "process.exit"
 
+# ---- the worker exit protocol (shared by the worker supervisor in
+# server_worker_main_loop and the worker's own quiesce self-exit) ----------
+
+# Exit status for a worker that ends itself (os._exit) instead of letting a
+# wedged rank hold the cohort teardown open.  It must be distinguishable from
+# every status a worker can otherwise produce, because the manager reports a worker's
+# exitcode verbatim as the reason a cohort went down:
+#   0        the clean pool-shutdown exit (batchgen_worker.py)
+#   1        every fatal path in the worker supervisor
+#   128+n    process_utils' signal translation (SIGINT 130, SIGKILL 137, ...)
+#   -n       multiprocessing's own rendering of a signal death (SIGKILL -9)
+# 86 is outside all of those ranges, so a self-exit can never be read back as a
+# fatal error, a clean exit, or a signal.  The manager needs no change to reap
+# it: it interprets no status value specially (it only formats exitcode into its
+# exit reason), proc.join returns on death like any other exit, and a worker
+# that is already dead when the fallback leg runs is filtered out of it before
+# the signal-fallback marker is logged, so that marker correctly does not claim
+# a worker that ended itself.
+WORKER_SELF_EXIT_CODE = 86
+
+# Exit-path markers.  Every worker that reaches its ordered teardown emits
+# exactly one of these, so a teardown can be read back per worker instead of
+# inferred from timings.  The signal-fallback path has no marker here: a
+# force-killed worker never runs Python again, so WorkerManager emits that one.
+EXIT_PATH_SENTINEL = "ordered-via-sentinel"
+EXIT_PATH_FLAG = "ordered-via-flag"
+EXIT_PATH_ABORT = "ordered-via-abort"
+EXIT_PATH_DECODE_BOUNDARY = "ordered-via-decode-boundary"
+
+# Not an ordered teardown: this worker ended itself rather than let a wedged
+# rank hold the cohort's teardown open (the supervisor's shutdown watchdog, or
+# the worker's quiesce deadline).  The watchdog logs it from its own thread,
+# which owns the GIL while the main thread is stuck below Python, so unlike the
+# signal fallback this marker CAN come from the worker itself.
+EXIT_PATH_SELF_EXIT = "self-exit"
+
+
 
 def native_log_level() -> str:
     """The level the native (C++/spdlog) loggers of this process are built at.
@@ -208,6 +245,37 @@ def current_run() -> Optional[RunIdentity]:
 def current_settings() -> Optional[Tuple[str, str]]:
     """``(log_dir, level)`` of the last :func:`configure_process` call."""
     return _settings
+
+
+def flush_logs_before_exit() -> None:
+    """Push buffered log records out before an exit that runs no handlers.
+
+    ``os._exit`` is the only way out of a process whose main thread is stuck
+    below Python, and it bypasses interpreter shutdown entirely: no atexit
+    hooks, no ``logging.shutdown()``, no stream flush.  Anything still sitting
+    in a handler's buffer at that moment is lost, which would make the
+    self-exit marker -- the one line that attributes the exit -- the most likely
+    record to disappear.  Every flush is individually guarded: this runs on the
+    way out of a failing teardown and must not raise there.
+
+    The event log's root handler only queues records, so its ``flush()`` is a
+    no-op; ``eventlog.flush`` waits until the listener thread has written
+    everything queued so far.
+    """
+    try:
+        eventlog.flush()
+    except Exception:
+        pass
+    for handler in list(logging.getLogger().handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
 
 
 def record_exit(

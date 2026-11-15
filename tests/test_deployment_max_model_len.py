@@ -24,13 +24,15 @@ from batchgen.config.max_model_len import (
 )
 from batchgen.worker import startup_transient
 from batchgen.worker.kv_manager import KVCacheManager
+from batchgen.worker.kv_plan import provisional_pool_gb
+from batchgen.worker.rank_context import node_of_rank
 from tests.test_kv_fixed_address_page_table import MANAGER
 from tests.test_prompt_rejection_fails_one_request import (
     _chat_line, _items, _scheduler,
 )
 from tests.test_batch_in_progress_failure import bs
 from tests.worker.worker_fakes import make_graph_state
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_methods, load_worker_shaped_methods
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,8 +117,10 @@ def test_real_page_table_rows_use_length_not_batch_hints(page_size, prompt, deco
 
 
 def test_pool_input_matches_the_residency_formula():
-    assert KVCacheManager.provisional_pool_gb(20, 8, 0.75) == 7
-    assert KVCacheManager.provisional_pool_gb(20, 16, 0.75) == -1
+    # One owner (kv_plan): ``total * frac - used``; no floor on this path.
+    assert provisional_pool_gb(20, 0.75, 8, floor_gb=None) == 7
+    assert provisional_pool_gb(20, 0.75, 16, floor_gb=None) == -1
+    assert not hasattr(KVCacheManager, "provisional_pool_gb")
 
 
 def test_launch_limit_is_a_worker_argument():
@@ -173,11 +177,12 @@ def test_pool_is_verified_before_allocation_and_recreation_uses_cached_size():
         assert op == "MIN"
         tensor.fill_(6)  # a peer has less space than this rank's 7 GiB
 
-    init = load_worker_methods(["_init_gpu_kv_with_actual_size"], {
+    # S10a: the actual-size init runs in KVCapacityEngine (shaped body).
+    init = load_worker_shaped_methods(["_init_gpu_kv_with_actual_size"], {
         "torch": SimpleNamespace(cuda=cuda, tensor=torch.tensor, float64=torch.float64),
         "dist": SimpleNamespace(all_reduce=reduce_pool, ReduceOp=SimpleNamespace(MIN="MIN")),
         "KVCacheManager": KVCacheManager, "logging": logging, "gc": gc,
-        "GPU_KV_POOL_HEADROOM_GB": 2,
+        "GPU_KV_POOL_HEADROOM_GB": 2, "provisional_pool_gb": provisional_pool_gb,
     })["_init_gpu_kv_with_actual_size"]
     worker = SimpleNamespace(
         gpu_paged_kv_cache_manager=None, _phase="decode", rank=0, local_rank=0,
@@ -236,6 +241,7 @@ def test_worker_collects_remote_host_regions_before_accepting_length(monkeypatch
         "verify_max_model_len": verify_max_model_len,
         "QueryBook": SimpleNamespace(TOKEN_BYTES=4),
         "dist": SimpleNamespace(all_gather_object=gather),
+        "node_of_rank": node_of_rank,
     })["_verify_deployment_max_model_len"]
     worker = SimpleNamespace(
         huggingface_ckpt_name="test-model", rank=0, local_rank=0,
@@ -297,7 +303,10 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
 
     worker._init_gpu_kv_with_actual_size = size_pool
     worker._build_persistent_phase_instances = size_pool
-    prepare = load_worker_methods(["prepare_deployment"], {
+    # S9: prepare_deployment runs in WorkerLifecycleEngine (shaped body).
+    # rb5: main's prepare_deployment reads _startup_transient (the probe seam),
+    # so the lift injects it like the pre-S9 worker lift did.
+    prepare = load_worker_shaped_methods(["prepare_deployment"], {
         "logging": logging, "_startup_transient": startup_transient,
     })["prepare_deployment"]
     prepare(worker)

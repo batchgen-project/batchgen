@@ -744,11 +744,10 @@ def test_growth_pages_owner_caps_only_outside_the_reachable_domain():
 
 
 def test_append_site_calls_the_owner_and_no_inline_ceil():
-    tree = ast.parse(WORKER.read_text())
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_ensure_host_kv_append_capacity"
-    )
+    # S10c: the append-capacity check runs in KVCapacityEngine (worker shape).
+    from tests.worker_method_source import worker_shaped_method_node
+
+    fn = worker_shaped_method_node("_ensure_host_kv_append_capacity")
     calls = [ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)]
     assert calls.count("seq.get_host_growth_pages") == 1
     assert "math.ceil" not in calls
@@ -778,6 +777,16 @@ def test_kv_plan_imports_stdlib_only():
 
 
 def _compile_worker_method(name, namespace):
+    # S10b: the host-capacity collectives run in KVCapacityEngine; compile
+    # the engine body in the worker's shape.
+    from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
+    if name in delegated_method_names():
+        module = ast.fix_missing_locations(
+            ast.Module(body=[worker_shaped_method_node(name)], type_ignores=[])
+        )
+        exec(compile(module, str(WORKER), "exec"), namespace)
+        return namespace[name]
     tree = ast.parse(WORKER.read_text())
     cls = next(
         n for n in tree.body

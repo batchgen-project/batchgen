@@ -181,3 +181,18 @@ def attach_prefix_state(fake, **overrides):
         PrefixReuseState(rank=rank, world_size=world_size), overrides
     )
     return fake
+
+
+def attach_prefill_state(fake):
+    """Attach the stateless prefill engine seam to a worker fake.
+
+    ``prefill_engine`` imports no native KV-cache module: the
+    ``DualHostKVCoordinator`` isinstance (S5 carve-out #5) and the temporary
+    ``GPUPagedKVCacheManager`` construction (carve-out #6) stay on the worker,
+    so the engine module is CPU-importable. The import stays function-local so
+    only tests that actually attach the engine load it.
+    """
+    from batchgen.worker.prefill_engine import PrefillEngine
+
+    fake._prefill_engine = PrefillEngine()
+    return fake

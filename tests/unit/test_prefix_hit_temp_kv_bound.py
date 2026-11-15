@@ -29,7 +29,13 @@ from batchgen.prefix_reuse.materialization import (
     temporary_kv_page_tokens,
     temporary_kv_pages,
 )
-from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
+from tests.worker_method_source import (
+    PREFILL_ENGINE_CLASS,
+    PREFILL_ENGINE_SOURCE,
+    WORKER_SOURCE,
+    load_prefill_engine_methods,
+    load_worker_methods,
+)
 from tests.worker.worker_fakes import attach_prefix_state
 
 
@@ -177,7 +183,7 @@ def test_hits_and_pages_must_come_together_with_one_entry_per_sequence():
 # ------------------------------------------------- worker planning seam
 
 
-_PLAN = load_worker_methods(
+_PLAN = load_prefill_engine_methods(
     [
         "_plan_prefill_micro_batches",
         "_prefill_model_pass_count",
@@ -304,7 +310,7 @@ class _FakeCuda:
 
 @pytest.mark.parametrize("pool_enabled", [False, True])
 def test_budget_is_free_memory_beside_the_workspace(pool_enabled):
-    measure = load_worker_methods(
+    measure = load_prefill_engine_methods(
         ["_measure_prefill_prefix_kv_budget"],
         {
             "torch": SimpleNamespace(cuda=_FakeCuda(free=100 * 2**30)),
@@ -329,7 +335,7 @@ def test_budget_is_free_memory_beside_the_workspace(pool_enabled):
 
 
 def test_no_workspace_means_no_budget():
-    measure = load_worker_methods(
+    measure = load_prefill_engine_methods(
         ["_measure_prefill_prefix_kv_budget"],
         {
             "torch": SimpleNamespace(cuda=_FakeCuda(free=100 * 2**30)),
@@ -499,11 +505,19 @@ def test_split_materialization_reaches_the_same_final_state():
 # ------------------------------------------------ structural wiring
 
 
+# S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+_ENGINE_FORWARDS = {"prefill_prepacked"}
+
+
 def _method(name):
-    tree = ast.parse(WORKER_SOURCE.read_text())
+    source, owner = (
+        (PREFILL_ENGINE_SOURCE, PREFILL_ENGINE_CLASS) if name in _ENGINE_FORWARDS
+        else (WORKER_SOURCE, "BatchGenWorker")
+    )
+    tree = ast.parse(source.read_text())
     cls = next(
         n for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "BatchGenWorker"
+        if isinstance(n, ast.ClassDef) and n.name == owner
     )
     return next(
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
