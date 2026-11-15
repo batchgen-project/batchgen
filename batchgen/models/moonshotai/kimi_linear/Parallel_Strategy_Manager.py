@@ -357,6 +357,12 @@ class KimiLinearParallelStrategyManager:
             )
         self._comm = None
         self._resident_ep_built = False
+        # The MoE blocks this manager attached a resident layer to. The shard
+        # is manager-owned, so its release walks this record, never
+        # ``self.model``: the worker's end-of-interval deep free drops the
+        # model reference while the captured decode graph still keeps the
+        # model, and the shard on it, alive.
+        self._resident_ep_moes = []
         self._streamed_sp8_buffer = None
         self._prefill_moe_mode = (
             "streamed_sp8" if self._distributed_weight_sharded else "streamed"
@@ -911,6 +917,13 @@ class KimiLinearParallelStrategyManager:
         here). This drops only the bookkeeping that refers to dead modules, so
         each phase instance stages what it needs at its own build.
         """
+        if self._resident_ep_moes:
+            raise RuntimeError(
+                "Kimi-K3 model rebuild with the previous model's resident EP "
+                f"shard still attached to {len(self._resident_ep_moes)} MoE "
+                "blocks: the decode exit never released it, so the new build "
+                "would allocate beside the whole unreachable shard"
+            )
         self._resident_ep_built = False
         self._streamed_sp8_buffer = None
         # The instance tuples hold the dead model; publishing them again is
@@ -985,13 +998,8 @@ class KimiLinearParallelStrategyManager:
 
         released_bytes = 0
         released_layers = 0
-        for layer in self.model.model.layers:
-            moe = getattr(layer, "block_sparse_moe", None)
-            resident = (
-                getattr(moe, "_resident_ep_moe", None)
-                if moe is not None
-                else None
-            )
+        for moe in self._resident_ep_moes:
+            resident = getattr(moe, "_resident_ep_moe", None)
             if resident is None:
                 continue
             shard = getattr(resident, "shard", None)
@@ -1000,6 +1008,7 @@ class KimiLinearParallelStrategyManager:
             moe._resident_ep_moe = None
             released_layers += 1
 
+        self._resident_ep_moes = []
         self._resident_ep_built = False
         torch.cuda.empty_cache()
         if self.rank == 0:
@@ -2127,6 +2136,12 @@ class KimiLinearParallelStrategyManager:
                 cfg.moe_intermediate_size,
                 device,
             )
+        self._resident_ep_moes = [
+            moe
+            for layer in self.model.model.layers
+            if (moe := getattr(layer, "block_sparse_moe", None)) is not None
+            and getattr(moe, "_resident_ep_moe", None) is not None
+        ]
         self._resident_ep_built = True
 
     def _init_streamed_sp8_prefill(self):
@@ -3293,15 +3308,16 @@ class KimiLinearParallelStrategyManager:
             else:
                 self.decode_instance = None
                 # A retired decode instance owns nothing. The resident EP
-                # shard is a manager-owned buffer, not a tensor of the model
-                # being dropped, so dropping the references below never frees
-                # its ~84 GiB/rank (world16 K3): release it here, while
-                # self.model is still alive for the per-layer walk. SUSPEND
-                # already releases it; RETIRE leaving it mapped OOMs the
-                # following prefill build on 2x8 H200 (the only deployment
-                # whose profile declines instance reuse).
-                if self.model is not None:
-                    self.release_decode_routed_experts()
+                # shard and the decode graph are
+                # manager-owned and stay mapped through any reference drop:
+                # the captured graph keeps the model alive. Release them here
+                # even when the worker's end-of-interval deep free already
+                # dropped self.model; the release walks the manager's own
+                # record of resident blocks. Every profile with a positive
+                # resident_ep_prefill_token_cap declines instance reuse and
+                # exits decode here; leaving them mapped OOMs the next prefill
+                # build wherever the shard and that build do not both fit.
+                self.release_decode_routed_experts()
             self.model = None
             self.weight_copy_task = {}
             return

@@ -78,6 +78,7 @@ def _psm(*, model=None, built=False, graph=None, buffer=None):
     psm = SimpleNamespace(
         model=model,
         _resident_ep_built=built,
+        _resident_ep_moes=[],
         _streamed_sp8_buffer=buffer,
         _decode_graph=graph,
     )
