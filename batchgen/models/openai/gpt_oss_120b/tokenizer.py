@@ -160,6 +160,17 @@ _H_MARKER_RE = re.compile(
     )
 )
 _H_RECIPIENT_RE = re.compile(r"(?:^|\s)to=(\S+)")
+
+
+def _is_bare_grammar_markers(text: str) -> bool:
+    """True when the text is grammar markers and whitespace only.
+
+    Such a completion (e.g. a lone ``<|return|>`` that the decode slice's
+    min-token floor refused to treat as EOS) carries no message payload and
+    must parse as an empty message instead of leaking the raw marker into
+    user-visible content.
+    """
+    return bool(text) and not _H_MARKER_RE.sub("", text).strip()
 _H_FUNCTIONS_PREFIX = "functions."
 _H_ASSISTANT = "assistant"
 
@@ -734,6 +745,11 @@ class GPTOssTokenizer(BaseTokenizer):
     def parse_thinking(self, text: str) -> Tuple[Optional[str], str]:
         items = parse_harmony(text)
         if not any(isinstance(item, HarmonyMessage) for item in items):
+            if _is_bare_grammar_markers(text):
+                # A completion that is nothing but grammar markers (e.g. a
+                # first-token <|return|> that the decode slice's min-token
+                # floor kept) is a valid empty message, not raw content.
+                return None, ""
             if text.strip():
                 self._warn_no_harmony_markers()
             return None, text
@@ -768,6 +784,9 @@ class GPTOssTokenizer(BaseTokenizer):
             isinstance(item, HarmonyMessage) and item.kind == _TOOL_CALL
             for item in items
         ):
+            if not any(isinstance(item, HarmonyMessage) for item in items) \
+                    and _is_bare_grammar_markers(text):
+                return None, ""
             return None, text
 
         tool_calls: List[dict] = []

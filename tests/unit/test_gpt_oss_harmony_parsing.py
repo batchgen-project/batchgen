@@ -846,3 +846,37 @@ def test_include_special_tokens_flag_still_parses(tmp_path, byte_tokenizer):
     )
     assert text == SIMPLE_TURN
     assert message["content"] == "5"
+
+
+# --------------------------------------------------------------------------- #
+# A completion that is nothing but grammar markers is an empty message
+# (first-token stop: the decode slice's min-token floor keeps the marker)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bare", ["<|return|>", "<|call|>", "<|end|>",
+                                  "<|return|>\n", " <|call|> "])
+def test_bare_stop_marker_parses_as_empty_message(bare, caplog):
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        reasoning, content, calls = _chain(bare)
+    assert reasoning is None
+    assert content == ""
+    assert calls is None
+    assert caplog.records == []
+
+
+def test_bare_marker_with_payload_still_falls_back_raw():
+    # Anything beyond markers keeps the existing raw fallback.
+    reasoning, content = _parser().parse_thinking("<|return|>oops")
+    assert reasoning is None
+    assert content == "<|return|>oops"
+
+
+def test_parse_tool_calls_alone_empties_a_bare_marker():
+    # parse_tool_calls may run without parse_thinking (thinking parsing
+    # off); a bare marker is an empty message there too. The --no-parse
+    # contract is unaffected: with parsing off the server never calls
+    # either method.
+    tok = _parser()
+    calls, content = tok.parse_tool_calls("<|return|>")
+    assert calls is None and content == ""
