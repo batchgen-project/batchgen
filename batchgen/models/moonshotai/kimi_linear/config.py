@@ -26,6 +26,10 @@ from pathlib import Path
 from batchgen.config.model_config import BaseModelConfig
 from batchgen.config.model_registry import register_config
 
+# Loading this family's config (the model registry's auto-import) also
+# registers its JIT coverage declarations.
+from . import jit_coverage  # noqa: F401
+
 
 # HF config.json key -> BatchGen canonical dataclass field name.
 _HF_ALIASES = {

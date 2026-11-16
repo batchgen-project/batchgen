@@ -16,6 +16,7 @@ import pathlib
 import pytest
 
 import batchgen.models.glm.glm5.jit_coverage  # noqa: F401 - registers glm5
+import batchgen.models.moonshotai.kimi_linear.jit_coverage  # noqa: F401
 from batchgen_kernels import jit_site_registry as REG
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -77,7 +78,7 @@ def _scan_calls(inventory, root=_ROOT):
 
 
 @pytest.mark.parametrize("inventory", REG.backend_inventories(),
-                         ids=lambda inv: inv.backend)
+                         ids=lambda inv: f"{inv.backend}-{inv.family}")
 def test_inventory_names_every_backend_call(inventory):
     found = _scan_calls(inventory)
     pinned = {key: count for key, (count, _) in inventory.call_sites.items()}
