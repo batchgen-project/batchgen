@@ -525,3 +525,36 @@ def test_dsa_deployment_prefers_the_live_page_size(k31_config, k3_config):
     deployment = fn(psm, [1, 256])
     assert deployment.page_size == 32 and deployment.max_decode_rows == 256
     assert fn(_psm(k3_config, cap=0, prompt=0), [1]) is None
+
+
+# --------------------------------------------------------------------------- #
+#  o_norm floor: the site is warmed even without a prefill token cap          #
+# --------------------------------------------------------------------------- #
+def test_o_norm_minimal_counts_cover_both_alignment_classes():
+    from batchgen.models.moonshotai.kimi_linear.triton_prewarm import (
+        o_norm_minimal_token_counts,
+    )
+    for heads in (1, 4, 16, 17, 34):
+        counts = o_norm_minimal_token_counts(heads)
+        rows = [t * heads for t in counts]
+        assert any(r % 16 == 0 for r in rows), (heads, rows)
+        if heads % 16:
+            # The unaligned class exists only when heads is not itself a
+            # multiple of 16 (observed missing key: 17 heads per rank).
+            assert any(r % 16 for r in rows), (heads, rows)
+        assert 1 in counts
+
+
+def test_kda_prefill_entries_always_include_the_o_norm_site():
+    from batchgen.models.moonshotai.kimi_linear import triton_prewarm as tp
+
+    class _Proj:
+        weight = type("W", (), {"dtype": None, "device": None})()
+
+    module = type("M", (), {
+        "num_heads": 17, "head_dim": 128, "q_proj": _Proj(), "o_norm": None,
+    })()
+    entries = tp.kda_prefill_entries(module, template=None, segment_tokens=8192,
+                                     shapes=(), max_prefill_tokens=0)
+    names = [e.name for e in entries]
+    assert any(name.startswith("kda_o_norm/") for name in names), names

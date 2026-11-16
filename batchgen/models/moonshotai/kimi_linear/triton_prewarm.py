@@ -42,6 +42,7 @@ Importable without Triton or fla: every GPU dependency is imported lazily.
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -382,6 +383,23 @@ def gated_norm_sites(config, attn_tp_size: int) -> List[GatedNormSite]:
     return [GatedNormSite("kda_o_norm", int(config.kda_head_dim), heads // tp)]
 
 
+def o_norm_minimal_token_counts(heads: int) -> List[int]:
+    """The smallest token counts that cover the o_norm kernel's runtime-int
+    classes: one flattened row count (``tokens * heads``) divisible by 16 and
+    one that is not (reachable only when ``heads`` itself is not a multiple
+    of 16), plus a one-token call for the smallest grid.
+
+    This is the floor the site always gets, whether or not a prefill token
+    cap is plumbed through: the kernel's autotune key is per (width, heads),
+    so a site that never runs here compiles inside the first request
+    (observed 2026-11-16, k3a3 leg1: the 17-head KDA o_norm key was missing
+    and the first batch compiled nine binaries plus its autotune record).
+    """
+    heads = int(heads)
+    aligned = 16 // math.gcd(heads, 16)
+    return sorted({1, aligned, aligned + 1})
+
+
 def o_norm_token_counts(heads: int, max_tokens: int) -> List[int]:
     """Token counts that reach every o_norm block count up to
     ``max_tokens``, each with a row count divisible by 16 and one that is not."""
@@ -422,14 +440,17 @@ def kda_prefill_entries(module, template, segment_tokens: int,
     weight = module.q_proj.weight
     entries.extend(beta_sigmoid_entries(module.num_heads, weight.dtype,
                                         weight.device))
+    heads, head_dim = int(module.num_heads), int(module.head_dim)
+    tokens_list = o_norm_minimal_token_counts(heads)
     if max_prefill_tokens > 0:
-        heads, head_dim = int(module.num_heads), int(module.head_dim)
-        tokens_list = o_norm_token_counts(heads, max_prefill_tokens)
-        entries.append(PrewarmEntry(
-            f"kda_o_norm/max{int(max_prefill_tokens)}",
-            partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
-                    weight.dtype, weight.device),
-        ))
+        tokens_list = sorted(
+            set(tokens_list) | set(o_norm_token_counts(heads, max_prefill_tokens))
+        )
+    entries.append(PrewarmEntry(
+        f"kda_o_norm/max{int(max_prefill_tokens)}",
+        partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
+                weight.dtype, weight.device),
+    ))
     return entries
 
 
