@@ -555,10 +555,15 @@ class DecoupledGpuDecode:
             # Probe level of this step; stays None unless the graph replays.
             _probe_tag = None
             with torch.inference_mode():
+                # A rank with no decode rows still runs the step (MoE
+                # collectives) and binds empty metadata; the binder reads
+                # these only for a non-empty batch, but they are its
+                # arguments on every path.
+                cache_seqlens = []
+                max_ctx = 0
                 if batch:
                     # Collect context lengths with invariant validation
                     # ALWAYS: current_context_length == original_prompt_length + decoded_length
-                    cache_seqlens = []
                     for seq in batch_sequences:
                         ctx_len = seq.current_context_length
                         expected = seq.original_prompt_length + seq.decoded_length
