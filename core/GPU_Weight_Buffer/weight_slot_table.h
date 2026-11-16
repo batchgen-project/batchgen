@@ -29,8 +29,8 @@
 //   FILLING          reserved by the producer; named once claim() runs
 //   PRESENT          copied, not yet handed to a consumer
 //   LEASED           handed to a consumer by lease()
-//   PENDING_RELEASE  released by the consumer, reusable once its compute
-//                    stream passes the recorded event (reclaim())
+//   PENDING_RELEASE  released by the consumer or by a produce-only record,
+//                    reusable once its event and any peer gate pass
 // Every named slot carries the weight pass it was produced for.
 //
 // A weight pass is one traversal of every module type's installed list, i.e.
@@ -55,6 +55,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -153,6 +154,7 @@ class WeightSlotTable {
         int64_t copied = 0;
         int64_t skipped = 0;
         int64_t released_on_landing = 0;
+        int64_t produce_only = 0;
     };
 
     struct PassSummary {
@@ -268,6 +270,42 @@ class WeightSlotTable {
         return pass;
     }
 
+    // Declare an open pass produce-only: this rank's consumer runs no
+    // forward for it. The producer still copies, lands and publishes every
+    // record this rank owns (peers in the pass read them) and declines the
+    // records it would have pulled, counting them at barrier B. Group pass
+    // alignment begins such a pass on every rank whose local pass count is
+    // short of the group maximum.
+    void mark_produce_only(int64_t pass) {
+        this->require_open(pass, "mark produce-only");
+        this->produce_only_passes_.insert(pass);
+    }
+
+    bool produce_only(int64_t pass) const {
+        return this->produce_only_passes_.count(pass) != 0;
+    }
+
+    // Advance the cursor past a replica record of a produce-only pass
+    // without a slot: the rank consumes nothing, so it never pulls, and the
+    // caller counts the record at barrier B.
+    void decline_produce_only(const std::string& module_type,
+                              const std::string& module_name) {
+        const Production next = this->next_production(module_type);
+        if (next.kind != WeightProduction::kCopy ||
+            next.module_name != module_name) {
+            throw std::runtime_error(
+                "Producer declined " + module_name + " for " + module_type +
+                ", but its cursor is at " + this->describe_cursors());
+        }
+        if (!this->produce_only(next.pass)) {
+            throw std::runtime_error(
+                "Producer declined " + module_name + " of pass " +
+                std::to_string(next.pass) + ", which is not produce-only");
+        }
+        this->pass_counts_[next.pass][module_type].skipped += 1;
+        this->advance(module_type);
+    }
+
     // Declare every module of an open pass that is not leased as skipped:
     // PRESENT frees, FILLING releases on landing, not yet produced becomes a
     // pending skip. A LEASED slot of the pass throws and changes nothing.
@@ -368,6 +406,7 @@ class WeightSlotTable {
                 violation + " Held: " + this->describe_held());
         }
         this->open_passes_.pop_front();
+        this->produce_only_passes_.erase(pass);
         summary.pass = pass;
         for (const auto& [module_type, module_names] : this->lists_) {
             if (!module_names.empty()) {
@@ -413,6 +452,7 @@ class WeightSlotTable {
         this->pending_skips_.clear();
         this->pass_counts_.clear();
         this->open_passes_.clear();
+        this->produce_only_passes_.clear();
         for (auto& [module_type, cursor] : this->cursors_) {
             cursor = Cursor{this->next_pass_, 0};
         }
@@ -689,6 +729,42 @@ class WeightSlotTable {
         return ref;
     }
 
+    // PRESENT -> PENDING_RELEASE for a produced record with no consumer
+    // lease (a HostShared module this rank owns but does not consume). The
+    // slot stays out of FREE until every peer has passed barrier B(frame);
+    // frame is the flat frame index the record belongs to.
+    SlotRef release_unconsumed(const std::string& module_name, int64_t pass,
+                               int64_t frame) {
+        // The record's own pass, not the current one: with a carried pass
+        // the producer lands records of the NEXT pass while the oldest is
+        // still open, and both can be produce-only padding passes.
+        if (!this->is_open(pass)) {
+            throw std::runtime_error(
+                "Cannot release unconsumed " + module_name + ": pass " +
+                std::to_string(pass) + " is not open (" +
+                this->describe_open() + ")");
+        }
+        auto resident = this->index_.find(Key{module_name, pass});
+        if (resident == this->index_.end()) {
+            throw std::runtime_error(
+                "Cannot release unconsumed missing weight-buffer record for " +
+                module_name + " (pass " + std::to_string(pass) + ")");
+        }
+        const SlotRef ref = resident->second;
+        Slot& slot = this->slot_at(ref.module_type, ref.index);
+        if (slot.state != WeightSlotState::kPresent) {
+            throw this->transition_error("release unconsumed", module_name,
+                                         slot.state, ref.module_type,
+                                         ref.index);
+        }
+        this->index_.erase(resident);
+        slot.state = WeightSlotState::kPendingRelease;
+        slot.reclaim_gate = true;
+        slot.reclaim_frame = frame;
+        this->pass_counts_[slot.pass][ref.module_type].produce_only += 1;
+        return ref;
+    }
+
     // LEASED -> PENDING_RELEASE for every name, or for none when any name is
     // duplicated or not LEASED in the current pass.
     std::vector<SlotRef> release_async(
@@ -731,14 +807,48 @@ class WeightSlotTable {
         return refs;
     }
 
-    // PENDING_RELEASE -> FREE, once the consumer's event has completed.
+    // PENDING_RELEASE -> FREE, once the consumer's event has completed. A
+    // produce-only HostShared release also needs the peer barrier predicate.
     void reclaim(const std::string& module_type, int64_t index) {
+        this->reclaim_impl(module_type, index, nullptr);
+    }
+
+    // As above, with the peer barrier: returns false and leaves the slot
+    // PENDING_RELEASE while all_peers_passed(frame) does not hold for a
+    // gated slot.
+    bool reclaim(
+        const std::string& module_type, int64_t index,
+        const std::function<bool(const std::string&, int64_t)>&
+            all_peers_passed) {
+        return this->reclaim_impl(module_type, index, &all_peers_passed);
+    }
+
+    // Mark an already pending release as peer-gated, for callers that build
+    // the record kind separately from the slot transition.
+    void set_reclaim_gate(const std::string& module_type, int64_t index,
+                          int64_t frame) {
         Slot& slot = this->slot_at(module_type, index);
         if (slot.state != WeightSlotState::kPendingRelease) {
-            throw this->transition_error("reclaim", slot.name, slot.state,
-                                         module_type, index);
+            throw this->transition_error("set reclaim gate", slot.name,
+                                         slot.state, module_type, index);
         }
-        slot = Slot{};
+        slot.reclaim_gate = true;
+        slot.reclaim_frame = frame;
+    }
+
+    // Arm the gate on a slot that is still FILLING/PRESENT/LEASED: a
+    // HostShared producer arms at landing, long before the consumer's
+    // release turns the slot PENDING_RELEASE. The gate survives until
+    // reclaim resets the slot.
+    void arm_reclaim_gate(const std::string& module_type, int64_t index,
+                          int64_t frame) {
+        Slot& slot = this->slot_at(module_type, index);
+        if (slot.state == WeightSlotState::kFree) {
+            throw this->transition_error("arm reclaim gate", slot.name,
+                                         slot.state, module_type, index);
+        }
+        slot.reclaim_gate = true;
+        slot.reclaim_frame = frame;
     }
 
     /* Routing-informed skip, in the current pass */
@@ -965,6 +1075,8 @@ class WeightSlotTable {
         std::string name;
         int64_t pass = 0;
         bool release_on_landing = false;
+        bool reclaim_gate = false;
+        int64_t reclaim_frame = 0;
     };
 
     struct Installed {
@@ -1099,10 +1211,38 @@ class WeightSlotTable {
         return std::runtime_error(oss.str());
     }
 
+    // all_peers_passed == nullptr: the caller has no peer barrier, so a
+    // gated slot is an error instead of a silent early reuse.
+    bool reclaim_impl(
+        const std::string& module_type, int64_t index,
+        const std::function<bool(const std::string&, int64_t)>*
+            all_peers_passed) {
+        Slot& slot = this->slot_at(module_type, index);
+        if (slot.state != WeightSlotState::kPendingRelease) {
+            throw this->transition_error("reclaim", slot.name, slot.state,
+                                         module_type, index);
+        }
+        if (slot.reclaim_gate) {
+            if (all_peers_passed == nullptr) {
+                throw std::runtime_error(
+                    "Cannot reclaim " + module_type + "[" +
+                    std::to_string(index) +
+                    "]: all peers have not passed B(frame " +
+                    std::to_string(slot.reclaim_frame) + ")");
+            }
+            if (!(*all_peers_passed)(module_type, slot.reclaim_frame)) {
+                return false;
+            }
+        }
+        slot = Slot{};
+        return true;
+    }
+
     std::unordered_map<std::string, std::vector<Slot>> slots_;
     std::map<Key, SlotRef> index_;
     // (pass, module name) whose copy in that pass the producer skips.
     std::set<std::pair<int64_t, std::string>> pending_skips_;
+    std::set<int64_t> produce_only_passes_;
     // installed module name -> its type and position in the type's list.
     std::unordered_map<std::string, Installed> installed_;
     std::unordered_map<std::string, std::vector<std::string>> lists_;

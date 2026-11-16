@@ -151,6 +151,121 @@ void HtoD_Engine::blocking_copy_(void* dst, void* src, int64_t size) {
     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
 };
 
+void HtoD_Engine::complete_landing_(PendingLanding& landing) {
+    // Blocks until the module's copies are done when they are not yet;
+    // drain_landings_ already checked the event on the non-blocking path.
+    CUDA_CHECK(cudaEventSynchronize(landing.event));
+    if (landing.profile_start != nullptr) {
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, landing.profile_start,
+                                        landing.event));
+        std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+        if (this->weight_profile_enabled_) {
+            this->weight_profile_copy_seconds_[landing.module_type] +=
+                static_cast<double>(elapsed_ms) / 1000.0;
+        }
+        CUDA_CHECK(cudaEventDestroy(landing.profile_start));
+        landing.profile_start = nullptr;
+    }
+    CUDA_CHECK(cudaEventDestroy(landing.event));
+    landing.event = nullptr;
+    if (landing.host_lease) {
+        this->weights_storage_.release_module(landing.module_name);
+    }
+    const bool present = this->gpu_weight_buffer_.weights_copy_complete(
+        landing.module_type, landing.module_name, landing.buffer_idx);
+    this->count_module_(landing.replica_pull ? this->replica_pulled_modules_
+                                             : this->copied_modules_,
+                        landing.module_type);
+    if (!present) {
+        this->count_module_(this->released_on_landing_modules_,
+                            landing.module_type);
+    }
+    if (landing.has_role && !landing.replica_pull &&
+        landing.role_kind ==
+            static_cast<uint8_t>(WeightRecordKind::HostShared)) {
+        if (!present) {
+            throw std::runtime_error(
+                "HostShared module " + landing.module_name +
+                " was released on landing; the produce-only path is not "
+                "implemented in this slice");
+        }
+        ReplicaPlanRuntime& plan = *this->replica_plan_;
+        this->gpu_weight_buffer_.arm_peer_release_gate(
+            landing.module_type, landing.buffer_idx,
+            static_cast<int64_t>(landing.flat));
+        plan.block.publish_slot(plan.member_index, landing.flat,
+                                landing.role_record_index,
+                                static_cast<uint64_t>(landing.buffer_idx));
+        this->replica_mark_owned_landed_(landing.role_type_index,
+                                         landing.flat);
+        if (this->gpu_weight_buffer_.pass_produce_only(landing.pass)) {
+            // Produce-only pass: no consumer will lease this record. The
+            // slot leaves PRESENT now; its reclaim stays gated on every
+            // peer passing barrier B of the frame, so peers read it for as
+            // long as they need it.
+            this->gpu_weight_buffer_.release_unconsumed(
+                landing.module_name, landing.pass,
+                static_cast<int64_t>(landing.flat));
+        }
+    }
+    if (landing.has_role) {
+        this->replica_mark_terminal_(landing.role_type_index, landing.flat);
+    }
+    this->logger_->debug("Landed module: {} in buffer: {}",
+                         landing.module_name, landing.buffer_idx);
+}
+
+bool HtoD_Engine::drain_landings_(bool make_space) {
+    bool any = false;
+    while (!this->pending_landings_.empty()) {
+        PendingLanding& front = this->pending_landings_.front();
+        const cudaError_t status = cudaEventQuery(front.event);
+        if (status == cudaErrorNotReady) {
+            // Only held host leases bound issue depth; replica pulls are
+            // bounded by their ring-slot claims (kMaxInFlightLandings note).
+            if (!(make_space &&
+                  this->pending_host_landings_ >= kMaxInFlightLandings)) {
+                break;
+            }
+            // Staging bound reached: complete_landing_ blocks on the oldest
+            // event (FIFO drain frees a host lease within a bounded prefix).
+        } else {
+            CUDA_CHECK(status);
+        }
+        PendingLanding landing = std::move(front);
+        this->pending_landings_.pop_front();
+        if (landing.host_lease) {
+            --this->pending_host_landings_;
+        }
+        this->complete_landing_(landing);
+        any = true;
+    }
+    return any;
+}
+
+void HtoD_Engine::flush_landings_(bool swallow_errors) {
+    while (!this->pending_landings_.empty()) {
+        PendingLanding landing = std::move(this->pending_landings_.front());
+        this->pending_landings_.pop_front();
+        if (landing.host_lease) {
+            --this->pending_host_landings_;
+        }
+        if (!swallow_errors) {
+            this->complete_landing_(landing);
+            continue;
+        }
+        // Failure/teardown path: landings may hit aborted slot transitions;
+        // the pass abort already reconciled the table.
+        try {
+            this->complete_landing_(landing);
+        } catch (const std::exception& error) {
+            this->logger_->warn("Landing of {} dropped on teardown: {}",
+                                landing.module_name, error.what());
+        }
+    }
+}
+
 void HtoD_Engine::clear_kv_copy_queue() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     try {
@@ -257,6 +372,11 @@ void HtoD_Engine::fail_producer_(const std::string& module_type,
     std::string failure = module_name.empty()
                               ? message
                               : module_name + ": " + message;
+    if (this->replica_plan_ != nullptr) {
+        // Peers polling this member's barriers fail fast on the abort word
+        // instead of waiting out the stall timeout.
+        this->replica_plan_->block.abort(this->replica_plan_->member_index);
+    }
     if (leased) {
         try {
             this->weights_storage_.release_module(module_name);
@@ -294,7 +414,8 @@ py::dict HtoD_Engine::weight_stream_status() {
         std::unordered_set<std::string> module_types;
         for (const auto* counter :
              {&this->copied_modules_, &this->skipped_modules_,
-              &this->released_on_landing_modules_}) {
+              &this->released_on_landing_modules_,
+              &this->replica_pulled_modules_}) {
             for (const auto& [module_type, count] : *counter) {
                 module_types.insert(module_type);
             }
@@ -312,6 +433,7 @@ py::dict HtoD_Engine::weight_stream_status() {
             entry["skipped"] = count(this->skipped_modules_);
             entry["released_on_landing"] =
                 count(this->released_on_landing_modules_);
+            entry["replica_pulled"] = count(this->replica_pulled_modules_);
             by_type[module_type.c_str()] = entry;
         }
         result["by_type"] = by_type;
@@ -376,8 +498,283 @@ py::dict HtoD_Engine::weight_stream_status() {
     }
     result["passes"] = passes;
     result["schedule_lost"] = snapshot.schedule_lost;
+    {
+        // Producer-thread counters, read without a lock: diagnostics only.
+        py::dict producer;
+        static const char* kSectionNames[kSecCount] = {
+            "next", "acquire", "fetch", "claim", "issue", "drain",
+            "pull_gate"};
+        for (size_t index = 0; index < kSecCount; ++index) {
+            producer[kSectionNames[index]] =
+                this->producer_section_ns_[index] / 1e9;
+        }
+        producer["records"] = this->producer_records_;
+        producer["ring_full_spins"] = this->producer_ring_full_;
+        result["producer_seconds"] = producer;
+    }
     return result;
 }
+
+void HtoD_Engine::install_replica_plan(
+    int64_t member_index, int64_t group_size, uint64_t layers_per_pass,
+    uint32_t records_per_frame,
+    const std::vector<ReplicaModuleInstall>& modules,
+    torch::Tensor control_block,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_fds,
+    const std::unordered_map<std::string, std::vector<int64_t>>& peer_bytes,
+    const std::unordered_map<
+        std::string,
+        std::vector<std::tuple<int64_t, int64_t, int64_t>>>& fields) {
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "install_replica_plan requires a stopped producer");
+    }
+    if (group_size < 2) {
+        throw std::runtime_error(
+            "a single-member group installs no plan; the uninstalled engine "
+            "is that group");
+    }
+    auto runtime = std::make_unique<ReplicaPlanRuntime>(
+        ReplicaControlBlock::attach(control_block.data_ptr(),
+                                    static_cast<size_t>(
+                                        control_block.nbytes())));
+    // Types in sorted order, identical on every member (each installs the
+    // same task). Barrier words, owned and total counts are per type.
+    std::set<std::string> type_names;
+    for (const auto& module : modules) {
+        type_names.insert(module.module_type);
+    }
+    size_t next_type = 0;
+    for (const auto& name : type_names) {
+        runtime->type_index[name] = next_type++;
+    }
+    if (runtime->block.members() != static_cast<size_t>(group_size) ||
+        runtime->block.records_per_frame() !=
+            static_cast<size_t>(records_per_frame) ||
+        runtime->block.num_types() != runtime->type_index.size()) {
+        throw std::runtime_error(
+            "control block geometry does not match the installed plan");
+    }
+    runtime->member_index = member_index;
+    runtime->group_size = group_size;
+    runtime->layers_per_pass = layers_per_pass;
+    runtime->records_per_frame = records_per_frame;
+    runtime->block_backing = std::move(control_block);
+    runtime->owned_per_type_pos.assign(
+        runtime->type_index.size(),
+        std::vector<uint32_t>(layers_per_pass, 0));
+    runtime->total_per_type_pos.assign(
+        runtime->type_index.size(),
+        std::vector<uint32_t>(layers_per_pass, 0));
+    runtime->a_cursor.assign(runtime->type_index.size(), 0);
+    runtime->b_cursor.assign(runtime->type_index.size(), 0);
+    runtime->cursor_init.assign(runtime->type_index.size(), false);
+    for (const auto& module : modules) {
+        if (module.layer_position >= layers_per_pass) {
+            throw std::runtime_error(
+                "module " + module.module + " is outside the pass layout");
+        }
+        ReplicaModuleInstall entry = module;
+        entry.type_index = static_cast<uint32_t>(
+            runtime->type_index.at(module.module_type));
+        ++runtime->total_per_type_pos[entry.type_index]
+                                     [module.layer_position];
+        if (entry.kind !=
+            static_cast<uint8_t>(WeightRecordKind::Replica)) {
+            ++runtime->owned_per_type_pos[entry.type_index]
+                                         [module.layer_position];
+        }
+        runtime->modules[module.module] = entry;
+    }
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    const int device = this->engine_config_.basic_config.device;
+    for (const auto& [module_type, fds] : peer_fds) {
+        if (fds.size() != static_cast<size_t>(group_size)) {
+            throw std::runtime_error(
+                "peer fds of " + module_type +
+                " must hold one entry per member");
+        }
+        auto bytes_entry = peer_bytes.find(module_type);
+        if (bytes_entry == peer_bytes.end() ||
+            bytes_entry->second.size() != static_cast<size_t>(group_size)) {
+            throw std::runtime_error(
+                "peer byte sizes of " + module_type +
+                " must hold one entry per member");
+        }
+        auto field_layout = fields.find(module_type);
+        if (field_layout == fields.end() || field_layout->second.empty()) {
+            throw std::runtime_error("missing ring field layout for " +
+                                     module_type);
+        }
+        for (const auto& [offset, stride, nbytes] : field_layout->second) {
+            if (offset < 0 || stride <= 0 || nbytes <= 0 || nbytes > stride) {
+                throw std::runtime_error("invalid ring field range of " +
+                                         module_type);
+            }
+        }
+        const auto [own_base, own_bytes] =
+            this->gpu_weight_buffer_.ring_segment_base(module_type);
+        auto& bases = runtime->segment_base[module_type];
+        for (int64_t member = 0; member < group_size; ++member) {
+            if (member == member_index) {
+                if (fds[member] >= 0) {
+                    throw std::runtime_error(
+                        "this member's own fd slot of " + module_type +
+                        " must be -1");
+                }
+                bases.push_back(own_base);
+                continue;
+            }
+            const int64_t mapped = bytes_entry->second[member];
+            if (fds[member] < 0 || mapped <= 0 || mapped < own_bytes) {
+                throw std::runtime_error(
+                    "peer segment of " + module_type + " from member " +
+                    std::to_string(member) + " has fd " +
+                    std::to_string(fds[member]) + " and " +
+                    std::to_string(mapped) + " bytes, need >= " +
+                    std::to_string(own_bytes));
+            }
+            auto import = std::make_shared<batchgen_vmm::VmmPeerImport>(
+                static_cast<int>(fds[member]), static_cast<size_t>(mapped),
+                device);
+            bases.push_back(import->data());
+            runtime->keepalive.push_back(std::move(import));
+        }
+        runtime->fields[module_type] = field_layout->second;
+    }
+    runtime->pull_streams.resize(group_size, nullptr);
+    for (int64_t member = 0; member < group_size; ++member) {
+        if (member == member_index) {
+            continue;
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&runtime->pull_streams[member],
+                                             cudaStreamNonBlocking));
+    }
+    ReplicaControlBlock block = runtime->block;
+    this->gpu_weight_buffer_.set_peer_release_gate(
+        [block, types = runtime->type_index](
+            const std::string& module_type, int64_t frame) mutable -> bool {
+            auto found = types.find(module_type);
+            if (found == types.end()) {
+                // A slot of a type outside the plan is never peer-gated.
+                return true;
+            }
+            return block.first_waiting(found->second,
+                                       ReplicaControlBlock::Barrier::B,
+                                       static_cast<uint64_t>(frame)) ==
+                   block.members();
+        });
+    this->replica_plan_ = std::move(runtime);
+    this->logger_->info(
+        "Replica plan installed: member {} of {}, {} records/frame, {} "
+        "layer positions",
+        member_index, group_size, records_per_frame, layers_per_pass);
+}
+
+void HtoD_Engine::uninstall_replica_plan() {
+    if (this->replica_plan_ == nullptr) {
+        return;
+    }
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "uninstall_replica_plan requires a stopped producer");
+    }
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    for (cudaStream_t stream : this->replica_plan_->pull_streams) {
+        if (stream != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+        }
+    }
+    this->gpu_weight_buffer_.set_peer_release_gate(nullptr);
+    this->replica_plan_.reset();
+    this->logger_->info("Replica plan uninstalled");
+}
+
+void HtoD_Engine::replica_note_issue_(size_t type, uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    if (!plan.cursor_init[type]) {
+        // The producer meets a type's records in frame order, so the first
+        // record carries the type's lowest frame of this install.
+        plan.a_cursor[type] = flat_frame;
+        plan.b_cursor[type] = flat_frame;
+        plan.cursor_init[type] = true;
+    }
+}
+
+void HtoD_Engine::replica_advance_a_(size_t type) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    while (true) {
+        const uint64_t frame = plan.a_cursor[type];
+        const uint32_t owned =
+            plan.owned_per_type_pos[type][frame % plan.layers_per_pass];
+        if (owned == 0) {
+            // This member owns nothing of the frame: no consumer waits on
+            // its word there, the cursor steps across without posting.
+            ++plan.a_cursor[type];
+            continue;
+        }
+        auto landed = plan.owned_landed.find({type, frame});
+        if (landed == plan.owned_landed.end() || landed->second < owned) {
+            return;  // the prefix ends at the first incomplete owned frame
+        }
+        plan.block.advance(plan.member_index, type,
+                           ReplicaControlBlock::Barrier::A, frame);
+        plan.owned_landed.erase(landed);
+        ++plan.a_cursor[type];
+    }
+}
+
+void HtoD_Engine::replica_advance_b_(size_t type) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    while (true) {
+        const uint64_t frame = plan.b_cursor[type];
+        const uint32_t total =
+            plan.total_per_type_pos[type][frame % plan.layers_per_pass];
+        if (total == 0) {
+            ++plan.b_cursor[type];
+            continue;
+        }
+        auto terminal = plan.terminal.find({type, frame});
+        if (terminal == plan.terminal.end() || terminal->second < total) {
+            return;
+        }
+        plan.block.advance(plan.member_index, type,
+                           ReplicaControlBlock::Barrier::B, frame);
+        plan.terminal.erase(terminal);
+        plan.wait_since.erase({type, frame});
+        ++plan.b_cursor[type];
+    }
+}
+
+void HtoD_Engine::replica_mark_owned_landed_(size_t type,
+                                             uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    ++plan.owned_landed[{type, flat_frame}];
+    this->replica_advance_a_(type);
+}
+
+void HtoD_Engine::replica_mark_terminal_(size_t type, uint64_t flat_frame) {
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    ++plan.terminal[{type, flat_frame}];
+    this->replica_advance_b_(type);
+}
+
+
+namespace {
+struct SectionTimer {
+    explicit SectionTimer(uint64_t& sink)
+        : sink_(sink), start_(std::chrono::steady_clock::now()) {}
+    ~SectionTimer() {
+        sink_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_)
+                .count());
+    }
+    uint64_t& sink_;
+    std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
 
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
@@ -534,8 +931,10 @@ void HtoD_Engine::HtoD_Worker() {
             }
             // The type's cursor (pass, position) lives in the weight buffer,
             // next to the passes the consumer armed.
-            const auto next =
-                this->gpu_weight_buffer_.next_production(module_type);
+            const auto next = [&] {
+                SectionTimer timer(this->producer_section_ns_[kSecNext]);
+                return this->gpu_weight_buffer_.next_production(module_type);
+            }();
             if (next.kind == WeightProduction::kNone ||
                 next.kind == WeightProduction::kParked) {
                 // Nothing installed (e.g. persistent experts), or the type
@@ -543,15 +942,93 @@ void HtoD_Engine::HtoD_Worker() {
                 continue;
             }
             weights_parked = false;
+            // Record kind under the installed replica plan. Without a plan
+            // (single-member group, decode, daemon sources) every module is
+            // HostPrivate and the flow below is exactly the historic one.
+            const ReplicaModuleInstall* role = nullptr;
+            uint64_t flat = 0;
+            if (this->replica_plan_ != nullptr) {
+                auto found = this->replica_plan_->modules.find(
+                    next.module_name);
+                if (found == this->replica_plan_->modules.end()) {
+                    this->fail_producer_(module_type, -1, next.module_name,
+                                         false,
+                                         "module is absent from the installed "
+                                         "replica plan");
+                    break;
+                }
+                role = &found->second;
+                flat = flat_frame(static_cast<uint64_t>(next.pass),
+                                  role->layer_position,
+                                  this->replica_plan_->layers_per_pass);
+                this->replica_note_issue_(role->type_index, flat);
+            }
+            if (role != nullptr &&
+                role->kind ==
+                    static_cast<uint8_t>(WeightRecordKind::Replica) &&
+                next.kind == WeightProduction::kCopy) {
+                ReplicaPlanRuntime& plan = *this->replica_plan_;
+                const size_t type = role->type_index;
+                SectionTimer pull_gate_timer(
+                    this->producer_section_ns_[kSecPullGate]);
+                const uint64_t owner_a = plan.block.passed(
+                    static_cast<size_t>(role->owner_member), type,
+                    ReplicaControlBlock::Barrier::A);
+                const bool owner_ready =
+                    owner_a != ReplicaControlBlock::kNone && owner_a >= flat;
+                if (plan.block.aborted(
+                        static_cast<size_t>(role->owner_member))) {
+                    this->fail_producer_(module_type, -1, next.module_name,
+                                         false,
+                                         "peer member " +
+                                             std::to_string(
+                                                 role->owner_member) +
+                                             " aborted its weight pass");
+                    break;
+                }
+                if (!owner_ready) {
+                    auto waiting =
+                        plan.wait_since.emplace(
+                                std::make_pair(type, flat),
+                                std::chrono::steady_clock::now())
+                            .first;
+                    const auto waited =
+                        std::chrono::steady_clock::now() - waiting->second;
+                    if (waited >= GPU_Weight_Buffer::kStallTimeout) {
+                        this->fail_producer_(
+                            module_type, -1, next.module_name, false,
+                            "peer member " +
+                                std::to_string(role->owner_member) +
+                                " has not passed barrier A of frame " +
+                                std::to_string(flat) + " for " +
+                                std::to_string(
+                                    std::chrono::duration_cast<
+                                        std::chrono::seconds>(waited)
+                                        .count()) +
+                                " s (module " + next.module_name + ")");
+                        break;
+                    }
+                    // Not an error and not progress: the loop goes on to
+                    // serve the on-demand and KV queues, then backs off.
+                    progressed = false;
+                    continue;
+                }
+                plan.wait_since.erase(std::make_pair(type, flat));
+            }
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
             std::optional<std::reference_wrapper<module_weight_tensor_map>>
                 buffer;
             int64_t buffer_idx = -1;
             if (next.kind == WeightProduction::kCopy) {
-                auto optional_buffer =
-                    this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
+                auto optional_buffer = [&] {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecAcquire]);
+                    return this->gpu_weight_buffer_.acquireEmptyBuffer(
+                        module_type);
+                }();
                 if (!optional_buffer.has_value()) {
+                    ++this->producer_ring_full_;
                     continue;
                 }
                 buffer = optional_buffer->first;
@@ -575,11 +1052,122 @@ void HtoD_Engine::HtoD_Worker() {
                         module_type + " is not its cursor module " +
                         next.module_name);
                 }
+                if (role != nullptr &&
+                    role->kind ==
+                        static_cast<uint8_t>(WeightRecordKind::Replica) &&
+                    this->gpu_weight_buffer_.pass_produce_only(next.pass)) {
+                    // Produce-only pass: this rank runs no forward, so it
+                    // never pulls. The record is counted at barrier B and
+                    // the reserved slot goes back untouched.
+                    this->gpu_weight_buffer_.abandon(module_type, buffer_idx);
+                    queue.try_pop(module_name);
+                    queue.push(module_name);
+                    this->gpu_weight_buffer_.decline_produce_only(
+                        module_type, module_name);
+                    this->count_module_(this->skipped_modules_, module_type);
+                    this->replica_mark_terminal_(role->type_index, flat);
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                    continue;
+                }
+                if (role != nullptr &&
+                    role->kind ==
+                        static_cast<uint8_t>(WeightRecordKind::Replica)) {
+                    // Pull the owner's landed slot over NVLink. No host
+                    // acquisition and no daemon lease on this path.
+                    ReplicaPlanRuntime& plan = *this->replica_plan_;
+                    const auto claim = [&] {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecClaim]);
+                        return this->gpu_weight_buffer_.claim_for_copy(
+                            module_type, buffer_idx, module_name);
+                    }();
+                    queue.try_pop(module_name);
+                    queue.push(module_name);
+                    if (claim == WeightProduction::kSkip) {
+                        this->gpu_weight_buffer_.retire_skip(module_type,
+                                                             module_name);
+                        this->count_module_(this->skipped_modules_,
+                                            module_type);
+                        this->replica_mark_terminal_(role->type_index, flat);
+                        this->set_producer_state_(ProducerState::kIdle, "");
+                        continue;
+                    }
+                    this->set_producer_state_(ProducerState::kCopying,
+                                              module_name, next.pass);
+                    const uint64_t slot_index = plan.block.owned_slot(
+                        static_cast<size_t>(role->owner_member), flat,
+                        role->record_index);
+                    if (slot_index == ReplicaControlBlock::kNone) {
+                        throw std::runtime_error(
+                            "owner passed barrier A of frame " +
+                            std::to_string(flat) + " without publishing " +
+                            module_name);
+                    }
+                    const auto& field_layout = plan.fields.at(module_type);
+                    char* src_base = static_cast<char*>(
+                        plan.segment_base.at(module_type)
+                            [role->owner_member]);
+                    char* dst_base = static_cast<char*>(
+                        plan.segment_base.at(module_type)
+                            [plan.member_index]);
+                    cudaStream_t stream =
+                        plan.pull_streams[role->owner_member];
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecDrain]);
+                        this->drain_landings_(true);
+                    }
+                    // Field-major arena: a slot is one range per field, so
+                    // the pull is one copy per field instead of one slot-
+                    // stride span.
+                    uint64_t pulled_bytes = 0;
+                    for (const auto& [offset, field_stride, nbytes] :
+                         field_layout) {
+                        char* src = src_base + offset +
+                                    static_cast<int64_t>(slot_index) *
+                                        field_stride;
+                        char* dst = dst_base + offset +
+                                    buffer_idx * field_stride;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            dst, src, static_cast<size_t>(nbytes),
+                            cudaMemcpyDeviceToDevice, stream));
+                        pulled_bytes += static_cast<uint64_t>(nbytes);
+                    }
+                    PendingLanding landing;
+                    landing.module_type = module_type;
+                    landing.module_name = module_name;
+                    landing.buffer_idx = buffer_idx;
+                    landing.bytes = pulled_bytes;
+                    landing.replica_pull = true;
+                    landing.pass = next.pass;
+                    landing.has_role = true;
+                    landing.role_kind = role->kind;
+                    landing.role_type_index = role->type_index;
+                    landing.role_record_index = role->record_index;
+                    landing.flat = flat;
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecIssue]);
+                        CUDA_CHECK(cudaEventCreate(&landing.event));
+                        CUDA_CHECK(cudaEventRecord(landing.event, stream));
+                    }
+                    ++this->producer_records_;
+                    this->pending_landings_.push_back(std::move(landing));
+                    {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecDrain]);
+                        this->drain_landings_(false);
+                    }
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                    continue;
+                }
                 this->set_producer_state_(ProducerState::kAcquiring,
                                           module_name, next.pass);
-                auto fetched =
-                    this->weights_storage_.get_module_weights_storage(
+                auto fetched = [&] {
+                    SectionTimer timer(this->producer_section_ns_[kSecFetch]);
+                    return this->weights_storage_.get_module_weights_storage(
                         module_name, &this->terminate_flag_);
+                }();
                 if (!fetched.has_value()) {
                     // Stop requested before the daemon readied the module:
                     // nothing is leased, and the module stays at the head of
@@ -593,14 +1181,31 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 lease_held = true;
                 const auto src = std::move(*fetched);
-                const auto claim = this->gpu_weight_buffer_.claim_for_copy(
-                    module_type, buffer_idx, module_name);
+                const auto claim = [&] {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecClaim]);
+                    return this->gpu_weight_buffer_.claim_for_copy(
+                        module_type, buffer_idx, module_name);
+                }();
                 // Only this thread pops: the head is still module_name. It
                 // goes back to the tail, so the next pass reads the list in
                 // the same order.
                 queue.try_pop(module_name);
                 queue.push(module_name);
                 if (claim == WeightProduction::kSkip) {
+                    if (role != nullptr &&
+                        role->kind == static_cast<uint8_t>(
+                                          WeightRecordKind::HostShared)) {
+                        // Produce-only (copy for the peers, release without
+                        // a consumer) is not wired yet, and no enabled
+                        // configuration can reach it: replicated schedules
+                        // never skip. Fail loud rather than strand peers.
+                        throw std::runtime_error(
+                            "routing-informed skip of HostShared module " +
+                            module_name +
+                            " needs the produce-only path, which this "
+                            "transport slice does not implement");
+                    }
                     // No copy, but the daemon lease is still released so the
                     // node FIFO advances. The cursor moves past the module
                     // only after that, so its pass cannot end while the lease
@@ -610,11 +1215,41 @@ void HtoD_Engine::HtoD_Worker() {
                     this->gpu_weight_buffer_.retire_skip(module_type,
                                                          module_name);
                     this->count_module_(this->skipped_modules_, module_type);
+                    if (role != nullptr) {
+                        this->replica_mark_terminal_(role->type_index, flat);
+                    }
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
                 }
                 this->set_producer_state_(ProducerState::kCopying, module_name,
                                           next.pass);
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecDrain]);
+                    this->drain_landings_(true);
+                }
+                PendingLanding landing;
+                landing.module_type = module_type;
+                landing.module_name = module_name;
+                landing.buffer_idx = buffer_idx;
+                landing.host_lease = true;
+                landing.pass = next.pass;
+                if (role != nullptr) {
+                    landing.has_role = true;
+                    landing.role_kind = role->kind;
+                    landing.role_type_index = role->type_index;
+                    landing.role_record_index = role->record_index;
+                    landing.flat = flat;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(
+                        this->weight_profile_mutex_);
+                    if (this->weight_profile_enabled_) {
+                        CUDA_CHECK(cudaEventCreate(&landing.profile_start));
+                        CUDA_CHECK(cudaEventRecord(landing.profile_start,
+                                                   this->HtoD_stream));
+                    }
+                }
                 auto dst = buffer->get();
                 void* src_ptr;
                 int64_t src_byte_size;
@@ -655,10 +1290,12 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
-                    auto copy_start = std::chrono::steady_clock::now();
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
-                    auto copy_end = std::chrono::steady_clock::now();
+                    CUDA_CHECK(cudaSetDevice(
+                        this->engine_config_.basic_config.device));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        slot->second.data_ptr(), src_ptr, src_byte_size,
+                        cudaMemcpyHostToDevice, this->HtoD_stream));
+                    landing.bytes += static_cast<uint64_t>(src_byte_size);
                     {
                         std::lock_guard<std::mutex> lock(
                             this->weight_profile_mutex_);
@@ -666,17 +1303,23 @@ void HtoD_Engine::HtoD_Worker() {
                             this->weight_profile_tensors_[module_type] += 1;
                             this->weight_profile_bytes_[module_type] +=
                                 static_cast<uint64_t>(src_byte_size);
-                            this->weight_profile_copy_seconds_[module_type] +=
-                                std::chrono::duration<double>(copy_end -
-                                                              copy_start)
-                                    .count();
                         }
                     }
                 }
-                // Released before the landing: once no slot of the pass is
-                // FILLING, the producer holds no lease of it either.
+                // The landing releases the host lease once the module's
+                // copies complete; the bounded in-flight queue caps how many
+                // leases copies can hold at once.
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecIssue]);
+                    CUDA_CHECK(cudaEventCreate(&landing.event));
+                    CUDA_CHECK(cudaEventRecord(landing.event,
+                                               this->HtoD_stream));
+                }
+                ++this->producer_records_;
                 lease_held = false;
-                this->weights_storage_.release_module(module_name);
+                ++this->pending_host_landings_;
+                this->pending_landings_.push_back(std::move(landing));
                 {
                     std::lock_guard<std::mutex> lock(
                         this->weight_profile_mutex_);
@@ -684,15 +1327,10 @@ void HtoD_Engine::HtoD_Worker() {
                         this->weight_profile_modules_[module_type] += 1;
                     }
                 }
-                this->logger_->debug("Copied module: {} to buffer: {}",
-                                     module_name, buffer_idx);
-                const bool present =
-                    this->gpu_weight_buffer_.weights_copy_complete(
-                        module_type, module_name, buffer_idx);
-                this->count_module_(this->copied_modules_, module_type);
-                if (!present) {
-                    this->count_module_(this->released_on_landing_modules_,
-                                        module_type);
+                {
+                    SectionTimer timer(
+                        this->producer_section_ns_[kSecDrain]);
+                    this->drain_landings_(false);
                 }
                 this->set_producer_state_(ProducerState::kIdle, "");
             } catch (const std::exception& error) {
@@ -708,10 +1346,27 @@ void HtoD_Engine::HtoD_Worker() {
             }
         }
         if (!progressed) {
+            try {
+                progressed = this->drain_landings_(false);
+            } catch (const std::exception& error) {
+                this->fail_producer_("", -1, "", false, error.what());
+            }
+        }
+        if (!progressed) {
             if (weights_parked && this->kv_copy_task_queue_.empty()) {
                 // No type has an armed position to produce and no KV copy is
                 // queued: block until a pass is armed, a task is queued or
                 // the producer is stopped, instead of sleeping in a loop.
+                if (!this->pending_landings_.empty()) {
+                    // Finish the in-flight landings before parking: nothing
+                    // wakes the producer when an event completes.
+                    try {
+                        this->flush_landings_(false);
+                    } catch (const std::exception& error) {
+                        this->fail_producer_("", -1, "", false, error.what());
+                    }
+                    continue;
+                }
                 std::unique_lock<std::mutex> lock(this->producer_wake_mutex_);
                 this->producer_wake_cv_.wait(lock, [this, wake_seen] {
                     return this->terminate_flag_ ||
@@ -727,6 +1382,9 @@ void HtoD_Engine::HtoD_Worker() {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
+    // Stop/failure exit: land or drop whatever is still in flight so the
+    // joined producer leaves no event, lease or FILLING slot behind.
+    this->flush_landings_(true);
 };
 
 
@@ -761,6 +1419,7 @@ void HtoD_Engine::set_weight_copy_queue(
         this->copied_modules_.clear();
         this->skipped_modules_.clear();
         this->released_on_landing_modules_.clear();
+        this->replica_pulled_modules_.clear();
         if (this->producer_state_ == static_cast<int>(ProducerState::kFailed)) {
             this->producer_state_ = static_cast<int>(
                 this->HtoD_worker_.joinable() ? ProducerState::kIdle

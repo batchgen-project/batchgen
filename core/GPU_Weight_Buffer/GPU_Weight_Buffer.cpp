@@ -150,7 +150,28 @@ void GPU_Weight_Buffer::append_ring_slots_(const std::string& module_type,
             .dtype(torch::kUInt8)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false);
-    const torch::Tensor storage = torch::zeros({total}, options);
+    // The segment is VMM-backed so the replica transport can export it to
+    // node peers as a POSIX fd mapping of exactly this range (slice 2c). The
+    // tensor view keeps the mapping alive; releasing the last view unmaps
+    // and returns the memory immediately, outside the torch pool.
+    // Field-major layout: a slot is several per-field ranges rather than one
+    // contiguous span, so the replica pull addresses records through the
+    // per-field table (ring_field_layout) instead of one slot stride.
+    const int device = this->engine_config_.basic_config.device;
+    auto backing =
+        std::make_shared<batchgen_vmm::VmmRingSegment>(device, total);
+    const torch::Tensor storage = torch::from_blob(
+        backing->data(), {total}, [backing](void*) {}, options);
+    this->segments_[module_type].push_back(storage);
+    this->segment_backings_[module_type].push_back(backing);
+    auto& layout = this->segment_fields_[module_type];
+    layout.clear();
+    for (const Field& field : fields) {
+        const int64_t field_stride =
+            (field.nbytes + kAlign - 1) / kAlign * kAlign;
+        layout.push_back(RingFieldRange{field.offset, field_stride,
+                                        field.nbytes});
+    }
     buffers.reserve(buffers.size() + static_cast<size_t>(count));
     for (int64_t index = 0; index < count; ++index) {
         module_weight_tensor_map slot;
@@ -201,13 +222,20 @@ void GPU_Weight_Buffer::synchronizePendingReleasesLocked() {
 }
 
 void GPU_Weight_Buffer::drainPendingReleasesLocked() {
+    // Teardown path: the caller has already run the group barrier, so a
+    // still-armed peer gate has no peer left to wait for.
     while (!this->pending_releases_.empty()) {
         PendingRelease& pending = this->pending_releases_.front();
-        CUDA_CHECK(cudaEventSynchronize(pending.event));
-        for (const auto& [module_type, buffer_idx] : pending.slots) {
-            this->slots_.reclaim(module_type, buffer_idx);
+        if (pending.event != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(pending.event));
+            CUDA_CHECK(cudaEventDestroy(pending.event));
+            pending.event = nullptr;
         }
-        CUDA_CHECK(cudaEventDestroy(pending.event));
+        for (const auto& [module_type, buffer_idx] : pending.slots) {
+            this->slots_.reclaim(
+                module_type, buffer_idx,
+                [](const std::string&, int64_t) { return true; });
+        }
         this->pending_releases_.pop_front();
     }
 }
@@ -250,20 +278,52 @@ void GPU_Weight_Buffer::waitWithoutStallLocked(
     }
 }
 
+void GPU_Weight_Buffer::set_peer_release_gate(
+    std::function<bool(const std::string&, int64_t)> gate) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->peer_release_gate_ = std::move(gate);
+}
+
+void GPU_Weight_Buffer::arm_peer_release_gate(const std::string& module_type,
+                                              int64_t index, int64_t frame) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.arm_reclaim_gate(module_type, index, frame);
+}
+
 void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
     for (auto it = this->pending_releases_.begin();
          it != this->pending_releases_.end();) {
-        const cudaError_t status = cudaEventQuery(it->event);
-        if (status == cudaErrorNotReady) {
-            ++it;
-            continue;
+        if (it->event != nullptr) {
+            const cudaError_t status = cudaEventQuery(it->event);
+            if (status == cudaErrorNotReady) {
+                ++it;
+                continue;
+            }
+            CUDA_CHECK(status);
+            CUDA_CHECK(cudaEventDestroy(it->event));
+            it->event = nullptr;
         }
-        CUDA_CHECK(status);
+        // The event completed. A peer-gated slot (a HostShared module whose
+        // frame some member has not finished reading) stays PENDING_RELEASE
+        // until the gate passes; the entry is kept with event == nullptr.
+        std::vector<std::pair<std::string, int64_t>> still_gated;
         for (const auto& [module_type, buffer_idx] : it->slots) {
-            this->slots_.reclaim(module_type, buffer_idx);
+            static const std::function<bool(const std::string&, int64_t)>
+                kUngated = [](const std::string&, int64_t) { return true; };
+            const bool reclaimed = this->slots_.reclaim(
+                module_type, buffer_idx,
+                this->peer_release_gate_ ? this->peer_release_gate_
+                                         : kUngated);
+            if (!reclaimed) {
+                still_gated.emplace_back(module_type, buffer_idx);
+            }
         }
-        CUDA_CHECK(cudaEventDestroy(it->event));
-        it = this->pending_releases_.erase(it);
+        if (still_gated.empty()) {
+            it = this->pending_releases_.erase(it);
+        } else {
+            it->slots = std::move(still_gated);
+            ++it;
+        }
     }
 }
 
@@ -298,6 +358,8 @@ void GPU_Weight_Buffer::Init() {
     for (auto& [module_type, num_buffer] : num_buffers) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->buffers_[module_type].clear();
+        this->segments_[module_type].clear();
+        this->segment_backings_[module_type].clear();
         this->slots_.reset_type(module_type, num_buffer);
         this->append_ring_slots_(module_type, num_buffer);
     }
@@ -404,9 +466,36 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     return this->buffers_.at(slot.module_type).at(slot.index);
 }
 
-int64_t GPU_Weight_Buffer::begin_pass() {
+int64_t GPU_Weight_Buffer::begin_pass(bool produce_only) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->slots_.begin_pass();
+    const int64_t pass = this->slots_.begin_pass();
+    if (produce_only && pass != 0) {
+        this->slots_.mark_produce_only(pass);
+    }
+    return pass;
+}
+
+bool GPU_Weight_Buffer::pass_produce_only(int64_t pass) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->slots_.produce_only(pass);
+}
+
+void GPU_Weight_Buffer::decline_produce_only(const std::string& module_type,
+                                             const std::string& module_name) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.decline_produce_only(module_type, module_name);
+    this->bumpProgressLocked();
+}
+
+void GPU_Weight_Buffer::release_unconsumed(const std::string& module_name,
+                                           int64_t pass, int64_t frame) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const auto ref = this->slots_.release_unconsumed(module_name, pass, frame);
+    // No consumer event: the entry is immediately reclaimable once every
+    // peer has passed barrier B of the record's frame.
+    this->pending_releases_.push_back(PendingRelease{
+        nullptr, {{ref.module_type, ref.index}}});
+    this->cv_.notify_all();
 }
 
 GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::cancel_pass(int64_t pass) {
@@ -436,8 +525,61 @@ void GPU_Weight_Buffer::wait_pass_drained(int64_t pass) {
                    this->slots_.count_in_pass(pass,
                                               WeightSlotState::kFilling) == 0;
         });
-    // A forward boundary: waiting for the consumer's release events is fine.
-    this->drainPendingReleasesLocked();
+    // A forward boundary: waiting for the consumer's release events is
+    // fine, and a peer-gated release is reclaimed only once every member
+    // has passed barrier B of its frame -- reclaiming earlier would let the
+    // next pass overwrite a slot a slower peer is still reading.
+    this->drainPendingReleasesGatedLocked(lock);
+}
+
+void GPU_Weight_Buffer::drainPendingReleasesGatedLocked(
+    std::unique_lock<std::mutex>& lock) {
+    const auto deadline = std::chrono::steady_clock::now() + kStallTimeout;
+    for (;;) {
+        for (auto it = this->pending_releases_.begin();
+             it != this->pending_releases_.end();) {
+            if (it->event != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(it->event));
+                CUDA_CHECK(cudaEventDestroy(it->event));
+                it->event = nullptr;
+            }
+            static const std::function<bool(const std::string&, int64_t)>
+                kUngated = [](const std::string&, int64_t) { return true; };
+            std::vector<std::pair<std::string, int64_t>> still_gated;
+            for (const auto& [module_type, buffer_idx] : it->slots) {
+                if (!this->slots_.reclaim(module_type, buffer_idx,
+                                          this->peer_release_gate_
+                                              ? this->peer_release_gate_
+                                              : kUngated)) {
+                    still_gated.emplace_back(module_type, buffer_idx);
+                }
+            }
+            if (still_gated.empty()) {
+                it = this->pending_releases_.erase(it);
+            } else {
+                it->slots = std::move(still_gated);
+                ++it;
+            }
+        }
+        if (this->pending_releases_.empty()) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::ostringstream held;
+            for (const auto& pending : this->pending_releases_) {
+                for (const auto& [module_type, buffer_idx] : pending.slots) {
+                    held << " " << module_type << "[" << buffer_idx << "]";
+                }
+            }
+            throw std::runtime_error(
+                "peer-gated weight releases did not clear within the stall "
+                "timeout; a group member is not passing barrier B. Gated:" +
+                held.str());
+        }
+        // Gate progress comes from peers writing the shared control block,
+        // which never notifies this condition variable: poll.
+        this->cv_.wait_for(lock, std::chrono::milliseconds(50));
+    }
 }
 
 WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(int64_t pass) {
@@ -577,6 +719,52 @@ GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::skip_modules(
     // As cancel_pass: a waiter on a module just skipped re-checks and throws.
     this->cv_.notify_all();
     return counts;
+}
+
+std::vector<torch::Tensor> GPU_Weight_Buffer::ring_segments(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segments_.find(module_type);
+    return found == this->segments_.end() ? std::vector<torch::Tensor>{}
+                                          : found->second;
+}
+
+std::pair<int, int64_t> GPU_Weight_Buffer::ring_segment_export_fd(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_backings_.find(module_type);
+    if (found == this->segment_backings_.end() || found->second.size() != 1) {
+        throw std::runtime_error(
+            "ring_segment_export_fd needs exactly one segment of " +
+            module_type + ", have " +
+            std::to_string(found == this->segment_backings_.end()
+                               ? 0
+                               : found->second.size()));
+    }
+    const auto& backing = found->second.front();
+    return {backing->export_fd(),
+            static_cast<int64_t>(backing->mapped_bytes())};
+}
+
+std::pair<void*, int64_t> GPU_Weight_Buffer::ring_segment_base(
+    const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_backings_.find(module_type);
+    if (found == this->segment_backings_.end() || found->second.size() != 1) {
+        throw std::runtime_error(
+            "ring_segment_base needs exactly one segment of " + module_type);
+    }
+    const auto& backing = found->second.front();
+    return {backing->data(), static_cast<int64_t>(backing->mapped_bytes())};
+}
+
+std::vector<GPU_Weight_Buffer::RingFieldRange>
+GPU_Weight_Buffer::ring_field_layout(const std::string& module_type) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->segment_fields_.find(module_type);
+    return found == this->segment_fields_.end()
+               ? std::vector<RingFieldRange>{}
+               : found->second;
 }
 
 GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
@@ -786,6 +974,8 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            this->segments_["routed_expert"].clear();
+            this->segment_backings_["routed_expert"].clear();
 
             // Optional: Force memory cleanup for routed_expert tensors only
             if (torch::cuda::is_available()) {
@@ -1010,6 +1200,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            this->segments_["routed_expert"].clear();
+            this->segment_backings_["routed_expert"].clear();
 
             // Optional: Force memory cleanup
             if (torch::cuda::is_available()) {

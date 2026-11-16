@@ -314,6 +314,7 @@ def test_prefill_nsys_profile_is_inert_without_batch_debug():
     worker = SimpleNamespace(
         _batchgen_debug={},
         _debug_flag_enabled=lambda value: False,
+        _active_batchgen_debug_for_sequences=lambda sequences: None,
     )
 
     active = begin(worker, local_bsz=42, global_bsz=336)

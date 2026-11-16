@@ -36,6 +36,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
@@ -146,6 +148,124 @@ static void advise_transparent_huge_pages(
 }
 
 // Helper function for page touching with signal handling
+
+// The creator's touch threads used to first-touch the shared weight memfd
+// on whichever NUMA node the scheduler placed them, so each server
+// lifetime drew a random page placement and the prefill H2D rate swung
+// with the draw. Interleaving the mapping before the touch makes every
+// lifetime's placement deterministic. Raw syscalls: the runtime images
+// ship libnuma.so.1 without the dev headers (numa_compat.h).
+static bool read_online_nodes(unsigned long* mask_out, int* max_node_out) {
+    std::ifstream online("/sys/devices/system/node/online");
+    std::string text;
+    if (!online || !std::getline(online, text)) {
+        return false;
+    }
+    unsigned long mask = 0;
+    int max_node = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t next = text.find(',', pos);
+        std::string part = text.substr(
+            pos, next == std::string::npos ? std::string::npos : next - pos);
+        size_t dash = part.find('-');
+        int lo = std::stoi(part.substr(0, dash));
+        int hi = dash == std::string::npos ? lo
+                                           : std::stoi(part.substr(dash + 1));
+        for (int node = lo; node <= hi && node < 64; ++node) {
+            mask |= 1UL << node;
+            max_node = std::max(max_node, node);
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    *mask_out = mask;
+    *max_node_out = max_node;
+    return mask != 0;
+}
+
+static bool read_node_cpuset(int node, cpu_set_t* set_out) {
+    std::ifstream cpulist("/sys/devices/system/node/node" +
+                          std::to_string(node) + "/cpulist");
+    std::string text;
+    if (!cpulist || !std::getline(cpulist, text)) {
+        return false;
+    }
+    CPU_ZERO(set_out);
+    size_t pos = 0;
+    bool any = false;
+    while (pos < text.size()) {
+        size_t next = text.find(',', pos);
+        std::string part = text.substr(
+            pos, next == std::string::npos ? std::string::npos : next - pos);
+        size_t dash = part.find('-');
+        int lo = std::stoi(part.substr(0, dash));
+        int hi = dash == std::string::npos ? lo
+                                           : std::stoi(part.substr(dash + 1));
+        for (int cpu = lo; cpu <= hi && cpu < CPU_SETSIZE; ++cpu) {
+            CPU_SET(cpu, set_out);
+            any = true;
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return any;
+}
+
+static void interleave_weight_mapping(
+    const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
+    unsigned long mask = 0;
+    int max_node = 0;
+    if (!read_online_nodes(&mask, &max_node) || max_node == 0) {
+        logger->info("Weights NUMA interleave skipped: single node");
+        return;
+    }
+    const long rc = syscall(SYS_mbind, ptr, static_cast<unsigned long>(len),
+                            MPOL_INTERLEAVE, &mask,
+                            static_cast<unsigned long>(max_node + 2), 0UL);
+    if (rc != 0) {
+        logger->warn("Weights NUMA interleave mbind failed: {}",
+                     strerror(errno));
+        return;
+    }
+    logger->info("Weights NUMA policy: MPOL_INTERLEAVE nodes mask {:#x}",
+                 mask);
+}
+
+static void log_weight_numa_composition(
+    const std::shared_ptr<spdlog::logger>& logger, void* ptr, int64_t len) {
+    // Sample with a prime stride: a power-of-two stride aliases against
+    // the touch threads' power-of-two stripes and reads one node only
+    // (measured: numastat showed thetrue split while the aligned sample
+    // claimed 100% on one node). Per-leg evidence of the placement.
+    const int64_t step = 97LL << 20;
+    const int count = static_cast<int>(
+        std::min<int64_t>(1024, (len + step - 1) / step));
+    if (count <= 0) return;
+    std::vector<void*> pages(count);
+    std::vector<int> status(count, -1);
+    for (int index = 0; index < count; ++index) {
+        pages[index] = static_cast<char*>(ptr) +
+                       std::min<int64_t>(int64_t(index) * step, len - 1);
+    }
+    const long rc = syscall(SYS_move_pages, 0, static_cast<unsigned long>(count),
+                            pages.data(), nullptr, status.data(), 0);
+    if (rc != 0) {
+        logger->warn("Weights NUMA composition sample failed: {}",
+                     strerror(errno));
+        return;
+    }
+    std::unordered_map<int, int> per_node;
+    for (int node : status) ++per_node[node];
+    std::string summary;
+    for (const auto& [node, pages_on_node] : per_node) {
+        summary += "node" + std::to_string(node) + "=" +
+                   std::to_string(pages_on_node * 100 / count) + "% ";
+    }
+    logger->info("Weights NUMA composition ({} x 1GiB samples): {}", count,
+                 summary);
+}
+
 bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
                  int64_t size, long page_size, bool multi_threaded) {
     // Set up signal handlers
@@ -164,20 +284,69 @@ bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
         logger->info("Attempting multi-threaded memory initialization...");
         const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
         const int64_t chunk_size = size / num_threads;
-        
+
+        // Weight pages are shared by every GPU on both sockets, so their
+        // placement must not depend on where the scheduler happens to run
+        // the touch threads. Neither the per-VMA mbind nor a thread-level
+        // interleave policy is honored by this kernel's shmem huge-page
+        // allocations (both measured as single-node placements), so the
+        // split is built structurally instead: threads are pinned to a
+        // node's CPUs and fault alternating stripes, and local first-touch
+        // does the rest. A single-node host keeps the historic layout.
+        unsigned long node_mask = 0;
+        int max_node = 0;
+        int nodes = 1;
+        if (read_online_nodes(&node_mask, &max_node) && max_node > 0) {
+            nodes = 0;
+            for (int node = 0; node <= max_node; ++node) {
+                if (node_mask & (1UL << node)) ++nodes;
+            }
+        }
+        const int64_t stripe = 64LL << 20;
+
         std::vector<std::thread> threads;
         std::atomic<int> failed_threads(0);
-        
+
         for (int i = 0; i < num_threads; i++) {
             threads.emplace_back([=, &failed_threads]() {
-                int64_t start_offset = i * chunk_size;
-                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
-                
+                const int node = nodes > 1 ? i % nodes : 0;
+                if (nodes > 1) {
+                    cpu_set_t cpus;
+                    if (read_node_cpuset(node, &cpus)) {
+                        pthread_setaffinity_np(pthread_self(), sizeof(cpus),
+                                               &cpus);
+                    }
+                }
                 g_in_page_touch = true;
                 if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
-                        p[offset] = 0;
+                    if (nodes > 1) {
+                        // Stripe s belongs to node s % nodes; the node's
+                        // threads split its stripes round-robin.
+                        const int per_node = num_threads / nodes > 0
+                                                 ? num_threads / nodes
+                                                 : 1;
+                        const int lane = (i / nodes) % per_node;
+                        for (int64_t s = 0; s * stripe < size; ++s) {
+                            if (s % nodes != node) continue;
+                            if ((s / nodes) % per_node != lane) continue;
+                            const int64_t start = s * stripe;
+                            const int64_t end =
+                                std::min<int64_t>(start + stripe, size);
+                            for (int64_t offset = start; offset < end;
+                                 offset += page_size) {
+                                p[offset] = 0;
+                            }
+                        }
+                    } else {
+                        const int64_t start_offset = i * chunk_size;
+                        const int64_t end_offset =
+                            (i == num_threads - 1) ? size
+                                                   : start_offset + chunk_size;
+                        for (int64_t offset = start_offset;
+                             offset < end_offset; offset += page_size) {
+                            p[offset] = 0;
+                        }
                     }
                 } else {
                     logger->warn("Thread {} caught signal during page touch", i);
@@ -186,11 +355,11 @@ bool touch_pages(const std::shared_ptr<spdlog::logger>& logger, void* ptr,
                 g_in_page_touch = false;
             });
         }
-        
+
         for (auto& t : threads) {
             t.join();
         }
-        
+
         success = (failed_threads == 0);
         if (!success) {
             logger->warn("{} threads failed during initialization", failed_threads.load());
@@ -349,7 +518,9 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                 logger->warn("hugepage memfd mmap failed: {}", strerror(errno));
                 ptr = nullptr;
                 close(fd);
-            } else if (!touch_pages(logger, ptr, size, hugetlb_page_size, true)) {
+            } else if (interleave_weight_mapping(logger, ptr, hugetlb_size),
+                       !touch_pages(logger, ptr, size, hugetlb_page_size,
+                                    true)) {
                 logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
                 munmap(ptr, hugetlb_size);
                 ptr = nullptr;
@@ -357,6 +528,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
             } else {
                 allocated_size = hugetlb_size;
                 using_huge_pages = true;
+                log_weight_numa_composition(logger, ptr, allocated_size);
                 *out_memfd_fd = fd;
                 logger->info(
                     "Weights allocated via memfd_create(MFD_HUGETLB) "
@@ -411,6 +583,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                     std::string(strerror(err)));
             }
             allocated_size = aligned_size;
+            interleave_weight_mapping(logger, ptr, allocated_size);
             advise_transparent_huge_pages(logger, ptr, allocated_size,
                                           enable_thp);
             if (enable_thp) {
@@ -424,8 +597,15 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
                         "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
                 } else {
                     auto touch_start = std::chrono::high_resolution_clock::now();
+                    // Stride by the BASE page size: with host THP
+                    // disabled ([never]) the shmem mapping faults in 4K
+                    // pages, and a 2MB stride populated only one page in
+                    // 512 - the serial weight loader then first-touched
+                    // the rest on its own node, which is where the random
+                    // per-lifetime placement came from. Under active THP
+                    // the extra writes land in already-faulted blocks.
                     bool ok = touch_pages(logger, ptr, allocated_size,
-                                          huge_page_size,
+                                          page_size,
                                           /*multi_threaded=*/true);
                     auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - touch_start).count();
@@ -440,6 +620,7 @@ void* allocate_shared_pinned_memory(const std::string& log_level,
             } else if (!touch_pages(logger, ptr, size, page_size, true)) {
                 logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
+            log_weight_numa_composition(logger, ptr, allocated_size);
             *out_memfd_fd = fd;
             logger->info("Weights allocated via memfd_create ({:.1f} GB, {} pages)",
                          allocated_size / (1024.0 * 1024.0 * 1024.0),

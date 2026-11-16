@@ -265,12 +265,12 @@ class StepObservabilityEngine:
         *,
         local_bsz: int,
         global_bsz: int,
+        debug: dict,
     ) -> bool:
         """Start a batch-debug-gated nsys prefill capture window."""
         # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
         # worker keeps every original self. spelling. The engine is stateless.
         self = worker
-        debug = self._batchgen_debug or {}
         if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
             return False
 

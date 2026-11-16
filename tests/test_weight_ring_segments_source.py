@@ -45,7 +45,11 @@ def test_helper_carves_one_allocation_with_ordered_aligned_fields():
     body = _function(
         BUFFER.read_text(), "void GPU_Weight_Buffer::append_ring_slots_("
     )
-    assert body.count("torch::zeros(") == 1
+    # The single segment is VMM-backed (exportable by fd, slice 2c); the
+    # tensor is a view of that mapping, never a torch pool allocation.
+    assert body.count("VmmRingSegment>(") == 1
+    assert "torch::from_blob(" in body
+    assert "torch::zeros(" not in body
     assert "std::sort(names.begin(), names.end());" in body
     assert "constexpr int64_t kAlign = 256;" in body
     # Field-major arena: each field owns one contiguous block across all
