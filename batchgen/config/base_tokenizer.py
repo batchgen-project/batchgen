@@ -51,6 +51,11 @@ class BaseTokenizer(ABC):
         bos_token_id: Beginning-of-sequence token ID
         vocab_size: Size of the vocabulary
         padding_side: Side to pad on ("left" or "right")
+        parse_thinking_default: Whether chat responses run
+            :meth:`parse_thinking` when the server leaves ``--parse-thinking``
+            unset. The server flag, when given either way, overrides it.
+        parse_tool_call_default: The same for :meth:`parse_tool_calls` and
+            ``--parse-tool-call``.
     """
 
     eos_token_id: int
@@ -58,6 +63,13 @@ class BaseTokenizer(ABC):
     bos_token_id: Optional[int]
     vocab_size: int
     padding_side: str = "right"
+
+    # Model-declared output parsing defaults. A model whose raw completion is
+    # not a usable chat answer (its reasoning and answer are separate messages
+    # of an output grammar) declares True, so an API client gets
+    # reasoning_content / content / tool_calls without extra server flags.
+    parse_thinking_default: bool = False
+    parse_tool_call_default: bool = False
 
     @abstractmethod
     def encode(
@@ -83,6 +95,14 @@ class BaseTokenizer(ABC):
         skip_special_tokens: bool = False,
     ) -> str:
         """Decode token IDs to text.
+
+        The worker decodes a completion up to and including the stop token it
+        ended on, with ``skip_special_tokens=True`` unless the server runs
+        with ``--detokenization-include-special-tokens``. So this method
+        decides whether a stop token appears in the completion text: one that
+        terminates the model's output grammar (and that its parsers need)
+        must survive ``skip_special_tokens=True``; every other stop token
+        must be dropped by it.
 
         Args:
             token_ids: List of token IDs to decode

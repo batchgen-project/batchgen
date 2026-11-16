@@ -37,6 +37,11 @@ from batchgen.prefix_reuse.wave_plan import (
     prefill_plan_work,
     validate_wave_prefix_plan,
 )
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -485,17 +490,26 @@ def _mirror_rank(
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=world_size,
-        local_world_size=world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
-        _prefix_sequence_states={},
         _prefill_pool_wave=None,
-        _trajectory_session_groups=None,
-        _trajectory_arena_payload={},
-        _trajectory_mirrored_restores={},
-        _trajectory_frontier_committer=(
+        _host_views_by_group=lambda: {0: _FakeView({})},
+        _reserve_trajectory_arenas=lambda uuids: {},
+        _trajectory_restore_payload=lambda: {},
+        _adopt_mirrored_trajectory_arenas=lambda arenas: None,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=world_size,
+        decode_group_size=attn_tp_size,
+    )
+    attach_prefix_state(worker, prefix_sequence_states={})
+    attach_trajectory_state(
+        worker,
+        trajectory_session_groups=None,
+        trajectory_arena_payload={},
+        trajectory_mirrored_restores={},
+        trajectory_frontier_committer=(
             None
             if registry is None
             else SimpleNamespace(
@@ -510,10 +524,6 @@ def _mirror_rank(
                 ),
             )
         ),
-        _host_views_by_group=lambda: {0: _FakeView({})},
-        _reserve_trajectory_arenas=lambda uuids: {},
-        _trajectory_restore_payload=lambda: {},
-        _adopt_mirrored_trajectory_arenas=lambda arenas: None,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -560,7 +570,7 @@ def test_every_rank_folds_every_leaders_summary_on_the_mirror(stub_modules):
         False,
     ]
     for rank in range(world_size):
-        index = workers[rank]._trajectory_session_groups
+        index = workers[rank]._traj.trajectory_session_groups
         assert len(index) == 2, rank
         assert index.get(left_record.session_key).owning_group_id == 0
         assert index.get(right_record.session_key).owning_group_id == 1
@@ -571,7 +581,8 @@ def test_every_rank_folds_every_leaders_summary_on_the_mirror(stub_modules):
             == 1
         )
     # World-identical: every rank folded the same list in the same order.
-    assert len({tuple(w._trajectory_session_groups.entries) for w in workers.values()}) == 1
+    # migrated: w._trajectory_session_groups -> w._traj.trajectory_session_groups, same owner object.
+    assert len({tuple(w._traj.trajectory_session_groups.entries) for w in workers.values()}) == 1
 
 
 def test_an_idle_leader_still_publishes_its_sessions_on_a_flag_on_pass(
@@ -618,7 +629,7 @@ def test_an_idle_leader_still_publishes_its_sessions_on_a_flag_on_pass(
     assert "global_ids" not in fake_dist.slots[0]
     # Every rank -- the idle group's follower included -- resolves BOTH groups.
     for rank in range(world_size):
-        index = workers[rank]._trajectory_session_groups
+        index = workers[rank]._traj.trajectory_session_groups
         assert len(index) == 2, rank
         assert index.get(left_record.session_key).owning_group_id == 0
         assert index.get(right_record.session_key).owning_group_id == 1
@@ -642,7 +653,8 @@ def test_a_flag_off_mirror_publishes_no_summary_and_builds_no_map(stub_modules):
     leader._mirror_group_host_kv(["g0"], {})
 
     assert fake_dist.slots[0]["frontier_sessions"] == {}
-    assert leader._trajectory_session_groups is None
+    # migrated: leader._trajectory_session_groups -> leader._traj.trajectory_session_groups, same owner object.
+    assert leader._traj.trajectory_session_groups is None
 
 
 def test_the_fold_runs_before_the_leaders_early_return():
@@ -689,8 +701,6 @@ def _assign_worker(
         ]
     )
     worker = SimpleNamespace(
-        rank=0,
-        world_size=world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         # The real GlobalBatch is iterable AND resolves by uuid; a
         # SimpleNamespace cannot route dunder lookups, so the batch is its own
@@ -713,14 +723,22 @@ def _assign_worker(
         _any_sequence_batchgen_debug=True,
         # Residency selects the real packer without the packing_v2 flag.
         _prefill_prefix_pool_enabled=lambda: False,
-        _trajectory_book=SimpleNamespace(
-            has_sequence=lambda uuid: uuid in tokens_by_uuid
-        ),
-        _trajectory_session_groups=index,
-        _trajectory_restorer=None,
         _trajectory_tokens=lambda seq, length=None: _FakeTokens(
             tokens_by_uuid[seq.uuid][: length if length else None]
         ),
+    )
+    attach_identity(
+        worker,
+        rank=0, world_size=world_size, local_world_size=world_size,
+        decode_group_size=attn_tp_size,
+    )
+    attach_trajectory_state(
+        worker,
+        trajectory_book=SimpleNamespace(
+            has_sequence=lambda uuid: uuid in tokens_by_uuid
+        ),
+        trajectory_session_groups=index,
+        trajectory_restorer=None,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -935,7 +953,7 @@ def test_resident_placement_is_identical_under_shuffled_orders(stub_modules):
         placed = {uuid: seq.decode_dp_group for uuid, seq in seqs.items()}
         assert expected is None or placed == expected
         expected = placed
-        index = worker._trajectory_session_groups
+        index = worker._traj.trajectory_session_groups
         ideal_offgroup = (96 * 4 - len(G0_TOKENS)) / (2 * 4)
         assert abs(index.placed_offgroup - ideal_offgroup) <= 1
         assert index.honored_on_owner + index.placed_offgroup == 96
@@ -954,7 +972,7 @@ def test_evicted_reentry_hard_pin_survives_residency_and_load(stub_modules):
     assert evicted.decode_dp_group == 0
     assert evicted.evicted_from_dp_group is None
     assert {seqs[uuid].decode_dp_group for uuid in tokens} == {1}
-    assert worker._trajectory_session_groups.placed_offgroup == len(tokens)
+    assert worker._traj.trajectory_session_groups.placed_offgroup == len(tokens)
 
 
 def test_no_residency_and_no_packing_keeps_existing_path(stub_modules):
@@ -991,10 +1009,10 @@ def test_offgroup_continuations_miss_and_pool_full_prefix_once(stub_modules, cap
     lookup = _worker_methods(["_lookup_trajectory_frontiers"])["_lookup_trajectory_frontiers"]
     worker._get_trajectory_restorer = lambda: local_restorer
     worker._owns_host_kv = lambda seq: seq.decode_dp_group == 1
-    worker._trajectory_attachments = {}
+    worker._traj.trajectory_attachments = {}
     with caplog.at_level(logging.INFO):
         lookup(worker, offgroup)
-    assert worker._trajectory_attachments == {}
+    assert worker._traj.trajectory_attachments == {}
     assert local_restorer.counters()["trajectory_hits"] == 0
     assert local_restorer.counters()["trajectory_lookups"] == len(offgroup)
 

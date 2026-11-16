@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from batchgen.query_book import QueryBook
+from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from tests.worker_method_source import (
     WORKER_SOURCE,
     load_worker_functions,
@@ -87,13 +88,19 @@ def _worker(prompts, *, model_context_length=64, max_decode_length=8):
         model_context_length=model_context_length,
         _response_queue=_Queue(),
         global_batch=_Batch(sequences),
-        _trajectory_book=QueryBook(
-            capacity_bytes=len(prompts) * model_context_length * 4,
-            page_tokens=model_context_length,
-        ),
         _publish_trajectory_pool_capacity=lambda: None,
         _prefill_prefix_pool_enabled=lambda: False,
     )
+    attach_trajectory_state(
+        worker,
+        trajectory_book=QueryBook(
+            capacity_bytes=len(prompts) * model_context_length * 4,
+            page_tokens=model_context_length,
+        ),
+    )
+    attach_prefix_state(worker)
+    # Alias kept for the assertions below.
+    worker._trajectory_book = worker._traj.trajectory_book
     uuids = [seq.uuid for seq in sequences]
     ids = [_ADMITTED_PROMPT_IDS(_entry(u, p)) for u, p in zip(uuids, prompts)]
     return worker, uuids, ids

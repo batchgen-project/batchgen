@@ -217,6 +217,8 @@ class GLM5ParallelStrategyManager:
         # The decode CUDA graph's capture bucket list, for the Triton prewarm's
         # bucket-keyed entries. The worker derives it from its CUDA-graph
         # arguments; None until something hands it over (see triton_prewarm).
+        # Nothing does yet: with the graph on, the prewarm logs that once
+        # (``report_unset_decode_buckets``).
         self.decode_graph_buckets = None
 
     @property
@@ -517,19 +519,50 @@ class GLM5ParallelStrategyManager:
             self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
-    def prewarm_decode_graphs(self, gpu_manager=None):
+    def prewarm_decode_graphs(self, gpu_manager=None, decode_buckets=None):
         """Compile the decode kernels keyed on the KV page-table geometry.
 
         The worker calls this with its GPU KV manager right before CUDA-graph
-        warmup on every decode configure. It runs the geometry phase of the
-        Triton prewarm the first time and again whenever the page-table
-        widths change, then arms the late-compile guard; any other call
-        returns at once.
+        warmup: once at the startup graph capture (before readiness) and on
+        every decode configure. It runs the geometry phase of the Triton
+        prewarm the first time and again whenever the page-table widths
+        change; any other call returns at once.
+
+        ``decode_buckets`` is the graph bucket ladder the worker captures.
+        It bounds the geometry span (the context-proportional statics cap),
+        so the worker hands it down here — nothing else sets it.
         """
         if gpu_manager is None:
             return 0.0
+        if decode_buckets is not None:
+            self.decode_graph_buckets = [int(b) for b in decode_buckets]
+        # This call is the only channel that hands the worker's capture
+        # ladder down, so HERE a missing ladder with the whole-model decode
+        # graph enabled is a real wiring fault — earlier prewarm phases run
+        # before the ladder exists and must not report it missing.
+        from batchgen.models.glm.glm5.triton_prewarm import (
+            report_unset_decode_buckets,
+        )
+        report_unset_decode_buckets(
+            self.decode_graph_buckets,
+            whole_model_graph=bool(
+                self.engine_config.Basic_Config.enable_cuda_graphs),
+            rank=self.global_rank,
+        )
         return self._prewarm_triton_kernels(PHASE_GEOMETRY,
                                             gpu_manager=gpu_manager)
+
+    def arm_late_compile_guard(self):
+        """Arm the Triton and DeepGEMM late-compile guards for good.
+
+        The worker calls this as its rank reports ready; every kernel
+        compiled after it is reported as late.
+        """
+        if not torch.cuda.is_available():
+            return
+        from .triton_prewarm import arm_at_readiness
+
+        arm_at_readiness(self.global_rank)
 
     def _triton_prewarm_partition(self):
         """``(part_index, part_count, barrier)`` for one prewarm phase.
@@ -2138,7 +2171,7 @@ class GLM5ParallelStrategyManager:
                 bucket = entry.split(":", 1)[0]
                 seen_types.setdefault(bucket, []).append(entry)
             for bucket, entries in seen_types.items():
-                logging.warning(
+                logging.info(
                     f"[SKELETON q_a/kv_a trace] {bucket}: {len(entries)} entries; "
                     f"examples: {entries[:3]}"
                 )
@@ -2148,7 +2181,7 @@ class GLM5ParallelStrategyManager:
             # Bucket summary — a zero count for attn_norm or gate_bias means
             # those keys never matched the checkpoint and silently remain at
             # init (ones for norms, zeros for bias).
-            logging.warning(
+            logging.info(
                 f"[SKELETON-BUCKETS loaded] {dict(loaded_bucket)}"
             )
             if missing_bucket:

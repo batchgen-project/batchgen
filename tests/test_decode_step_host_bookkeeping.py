@@ -23,12 +23,23 @@ next to this one.
 import ast
 from pathlib import Path
 
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
 SOURCE = WORKER.read_text()
 TREE = ast.parse(SOURCE)
 
 
 def _method(name):
+    if name == "decoding_continuous":
+        # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+        tree = ast.parse(ENGINE.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DecoupledGpuDecode")
+        return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    # S10c: a delegated method resolves to its engine body (worker shape).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(n for n in ast.walk(TREE)
                 if isinstance(n, ast.FunctionDef) and n.name == name)
 
@@ -66,7 +77,8 @@ def test_host_kv_append_capacity_uses_the_maintained_gid_index():
 def test_decode_step_resolves_host_kv_metadata_from_batch_sequences():
     # batch_sequences is resolved once per step for the forward; re-resolving
     # the same rows for the host-KV append metadata was pure duplication.
-    fn = _method("decoding_continuous")
+    # S4b: the KV metadata producer moved to the worker binder method.
+    fn = _method("_install_decode_kv_append_callbacks")
     assert len(_assign_to(fn, "_kv_seq_ids")) == 1
     loop = next(
         n for n in ast.walk(fn)
@@ -151,7 +163,10 @@ def test_the_batched_helper_does_not_decide_which_rows_are_live():
     # completion check of its own, the skip would live in two places.
     fn = _method("_append_trajectory_tokens")
     assert not _calls(fn, "self._is_sequence_completed")
-    assert len(_calls(fn, "self._trajectory_book.append_tokens")) == 1
+    # S3.5 migration: the helper now appends through the TrajectoryStore
+    # delegate (self._traj.append_tokens), not the raw QueryBook attribute.
+    # migrated: self._trajectory_book.append_tokens -> self._traj.append_tokens, same owner object.
+    assert len(_calls(fn, "self._traj.append_tokens")) == 1
 
 
 # ------------------------------------------------------------- debug scanning

@@ -23,12 +23,16 @@ import ast
 from pathlib import Path
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+ENGINE = Path(__file__).resolve().parents[1] / "batchgen" / "worker" / "decode_engine.py"
 
 
 def _method(name):
-    tree = ast.parse(WORKER.read_text())
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    source = ENGINE.read_text() if name == "decoding_continuous" else WORKER.read_text()
+    tree = ast.parse(source)
     return next(n for n in ast.walk(tree)
-                if isinstance(n, ast.FunctionDef) and n.name == name)
+                if isinstance(n, ast.FunctionDef)
+                and n.name == ("run" if name == "decoding_continuous" else name))
 
 
 def _is_wait_call(node):

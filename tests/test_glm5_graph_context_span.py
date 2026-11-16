@@ -35,6 +35,12 @@ from batchgen.config.graph_span_policy import (
     graph_context_span_cap_tokens,
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
+from tests.worker.worker_fakes import make_graph_state
+from tests.worker_method_source import (
+    STEP_OBSERVABILITY_SOURCE,
+    delegated_method_names,
+    worker_shaped_method_node,
+)
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -50,6 +56,10 @@ def _worker_class() -> ast.ClassDef:
 
 
 def _worker_method(name: str) -> ast.FunctionDef:
+    # S7/S10a: the span warning (StepObservabilityEngine) and the KV pool
+    # sizing (KVCapacityEngine) run in their engines (worker delegates).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     for stmt in _worker_class().body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name == name:
             return stmt
@@ -82,7 +92,10 @@ BUDGET_BYTES = GRAPH_CONTEXT_STATICS_BUDGET_BYTES
 BYTES_PER_TOKEN_PER_ROW = GRAPH_CONTEXT_STATICS_BYTES_PER_TOKEN_PER_ROW
 SPAN_ALIGN = GRAPH_CONTEXT_SPAN_ALIGN
 SPAN_FLOOR = GRAPH_CONTEXT_SPAN_FLOOR_TOKENS
-WARN_INTERVAL_S = _module_constant("_GRAPH_SPAN_WARN_INTERVAL_S")
+# S7: the rate-limit constant moved with the warning into the engine module.
+WARN_INTERVAL_S = _assigned_value(
+    ast.parse(STEP_OBSERVABILITY_SOURCE.read_text()).body, "_GRAPH_SPAN_WARN_INTERVAL_S"
+)
 EAGER_SERVABLE_REASONS = _class_constant(
     "_WHOLE_GRAPH_EAGER_SERVABLE_REASONS"
 )
@@ -413,15 +426,17 @@ def _path_state_worker(*, captured_span: int, bucket: int = 2):
     return types.SimpleNamespace(
         model_name="glm-5.3",
         _glm5_whole_model_graph_requested_for_current_batch=lambda: True,
-        _glm5_whole_model_graph_unavailable_reason=None,
-        _cuda_graph_manager=manager,
-        _glm5_whole_model_graph=True,
-        _glm5_whole_model_graph_failed_buckets=set(),
-        _whole_model_segment=types.SimpleNamespace(max_seqlen=captured_span),
-        _glm5_whole_model_all_short=False,
-        _glm5_whole_model_index_topk=2048,
-        _glm5_whole_model_graph_signature="sig",
         _glm5_whole_model_graph_capture_signature=lambda bucket_: "sig",
+        _graph=make_graph_state(
+            glm5_whole_model_graph_unavailable_reason=None,
+            cuda_graph_manager=manager,
+            glm5_whole_model_graph=True,
+            glm5_whole_model_graph_failed_buckets=set(),
+            whole_model_segment=types.SimpleNamespace(max_seqlen=captured_span),
+            glm5_whole_model_all_short=False,
+            glm5_whole_model_index_topk=2048,
+            glm5_whole_model_graph_signature="sig",
+        ),
     )
 
 
@@ -455,16 +470,22 @@ def test_decode_step_only_raises_for_a_non_eager_servable_reason():
     no replayable graph existed, including for a step merely longer than the
     capture.
     """
+    # S4b: the decode loop body (and this raise) runs in DecoupledGpuDecode.
+    engine_tree = ast.parse(
+        (_WORKER_SRC.parent / "worker" / "decode_engine.py").read_text()
+    )
     raises = [
         node
-        for node in ast.walk(_worker_class())
+        for scope in (_worker_class(), engine_tree)
+        for node in ast.walk(scope)
         if isinstance(node, ast.Raise)
         and "no replayable" in ast.unparse(node)
     ]
     assert len(raises) == 1, [ast.unparse(r) for r in raises]
     guards = [
         node
-        for node in ast.walk(_worker_class())
+        for scope in (_worker_class(), engine_tree)
+        for node in ast.walk(scope)
         if isinstance(node, ast.If)
         and "_WHOLE_GRAPH_EAGER_SERVABLE_REASONS" in ast.unparse(node.test)
     ]
@@ -501,7 +522,9 @@ def test_capture_no_longer_raises_when_the_batch_is_past_the_span():
 
 def test_span_warn_names_both_lengths_and_is_rate_limited(caplog):
     warn = _compile("_warn_decode_graph_span_exceeded")
-    worker = types.SimpleNamespace(rank=3, _decode_graph_span_warn_monotonic=None)
+    worker = types.SimpleNamespace(
+        rank=3, _graph=make_graph_state(decode_graph_span_warn_monotonic=None)
+    )
 
     with caplog.at_level(logging.WARNING):
         warn(worker, 65536, 32832)
@@ -515,7 +538,7 @@ def test_span_warn_names_both_lengths_and_is_rate_limited(caplog):
     assert "eager decode" in message
 
     # Past the interval it speaks again.
-    worker._decode_graph_span_warn_monotonic = (
+    worker._graph.decode_graph_span_warn_monotonic = (
         time.monotonic() - WARN_INTERVAL_S - 1.0
     )
     caplog.clear()

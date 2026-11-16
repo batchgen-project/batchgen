@@ -186,5 +186,5 @@ def test_random_serving_shapes_compile_nothing_after_prewarm():
                              device)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-    assert dg.check_late_compiles(0, "random serving shapes", strict=True) == 0
+    assert dg.check_late_compiles(0, "random serving shapes", strict=True) == ()
     assert _kernel_dirs(cache) == prewarmed

@@ -524,7 +524,6 @@ class DeepSeek_Initializer:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
-            self.engine_config.Basic_Config.attn_mode = 1
             self.engine_config.Basic_Config.module_types = [
                 "attn",
                 "routed_expert",
@@ -640,7 +639,6 @@ class DeepSeek_Initializer:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
-            self.engine_config.Basic_Config.attn_mode = 1
             self.engine_config.Basic_Config.module_types = [
                 "attn",
                 "routed_expert",

@@ -103,7 +103,6 @@ def resolve_glm5_3d_mtp(min_rows: int) -> int:
 
 
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
-_GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
 _GLM5_PREFILL_GROUPED_TOKEN_WINDOW = 16_384
 _GLM5_PREFILL_GROUPED_TILEM_AVG = 64
@@ -155,16 +154,22 @@ def _glm5_prefill_grouped_gemm_backend() -> str:
     rather than read as a default, because a silently ignored arm switch
     would make the two arms the same run.
     """
+    from batchgen_kernels.jit_site_registry import (
+        check_slot_backend,
+        default_backend,
+    )
+
+    from . import jit_coverage  # noqa: F401 - registers the family's slots
+
     value = _glm5_moe_debug_dict().get("prefill_grouped_gemm")
     if value is None:
-        return "deepgemm"
+        return default_backend("glm5", "prefill_grouped_gemm")
     if not isinstance(value, str):
         raise ValueError("prefill_grouped_gemm must be a string")
     mode = value.strip().lower()
-    if mode not in {"deepgemm", "cute_ptrs"}:
-        raise ValueError(
-            f"prefill_grouped_gemm must be 'deepgemm' or 'cute_ptrs', got {value!r}"
-        )
+    # The registry is the only allowlist: an unvalidated or uncovered backend
+    # is refused with a named error, never read as a default.
+    check_slot_backend("glm5", "prefill_grouped_gemm", mode)
     return mode
 
 
@@ -207,10 +212,7 @@ def _glm5_moe_graph_compare_active() -> bool:
     if _glm5_moe_debug_mode() == "eager":
         return False
     debug = _glm5_moe_debug_dict()
-    return (
-        _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
-        or os.environ.get(_GLM5_MOE_GRAPH_COMPARE_ENV, "0") == "1"
-    )
+    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
 
 
 def _glm5_moe_graph_compare_layer_enabled(layer_idx: int) -> bool:
@@ -1687,7 +1689,9 @@ class Glm5MoE(nn.Module):
         self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
-        self._fp8_blockwise_ready = False
+        # Tri-state: None until the FP8 blockwise weight stacking runs (it
+        # sets True), explicit False only when the 3d path is disabled.
+        self._fp8_blockwise_ready = None
         self._moe_cuda_graph_manager = None
         self._moe_cuda_graph_segment_name = None
         self._moe_cuda_graph_segment = None
@@ -2598,7 +2602,7 @@ class Glm5MoE(nn.Module):
         buf.resize_if_needed(num_global)
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
-            logging.warning(
+            logging.info(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_ragged + reduce_weighted_scatter "
                 "(compact ragged MoE)")
             Glm5MoE._warned_k25_path = True
@@ -2703,7 +2707,7 @@ class Glm5MoE(nn.Module):
         `_triton_compute` wholesale when they are unavailable.
         """
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
-            logging.warning(
+            logging.info(
                 "[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d (compact ragged, "
                 f"capacity={buf.capacity} rows)")
             Glm5MoE._warned_gemm_3d = True

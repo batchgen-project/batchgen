@@ -1,4 +1,16 @@
-"""Build an FA3 page-size-1 table from GLM-5 logical top-k positions."""
+"""Build an FA3 page-size-1 table from GLM-5 logical top-k positions.
+
+Kernel revision r2 of ``_transform_selected_positions_kernel``: the page-table
+width ``max_pages_per_seq`` is a runtime int listed in ``do_not_specialize``.
+r1 took it as a ``tl.constexpr``, and eager decode hands the ACTIVE page-table
+width, which follows the longest live sequence, so a long-context eager run
+compiled a new binary each time that width changed. The width only enters the
+in-table compare, the last-column clamp and the row offset ``slot * width``:
+integer operations on the same values in both revisions (``slot`` and the
+logical page are int64), so r2's outputs are bit-identical to r1's. The
+structural constexprs (``index_topk``, ``page_size``, the ``has_*`` flags,
+``block``) are unchanged.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +19,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pages_per_seq"])
 def _transform_selected_positions_kernel(
     page_table,
     slot_indices,
@@ -16,7 +28,7 @@ def _transform_selected_positions_kernel(
     long_topk_indices,
     physical_token_ids,
     selected_lengths,
-    max_pages_per_seq: tl.constexpr,
+    max_pages_per_seq,
     index_topk: tl.constexpr,
     page_size: tl.constexpr,
     has_slot_indices: tl.constexpr,

@@ -94,6 +94,7 @@ with every ``masked_m`` zero, so the kernel loads no tile of them (a fresh
 copy would be close to a GiB per projection).
 """
 
+import collections
 import logging
 import os
 from dataclasses import dataclass
@@ -155,6 +156,43 @@ class DenseSite:
     n: int
     k: int
     via: str
+
+
+@dataclass(frozen=True)
+class ContiguousSite:
+    """One ``m_grouped_fp8_gemm_nt_contiguous`` call shape.
+
+    N, K AND the group count are compiled into the kernel (the generated
+    source instantiates ``num_groups`` as a template argument), so a witness
+    must run at the serving group count — a G=1 witness compiles a different
+    kernel, which the wza-8-3 r1 leg proved: serving at G=256 late-compiled
+    the exact block configs the G=1 witnesses had already built. The block
+    CONFIG selection itself models the group count as 1 (the host wrapper
+    passes num_groups=1 to the selector), which that run confirmed.
+    """
+
+    name: str
+    n: int
+    k: int
+    groups: int
+
+
+def contiguous_sites(shapes) -> List["ContiguousSite"]:
+    """The grouped prefill S1/S3 GEMMs of the DEFAULT contiguous-MoE backend
+    (``Glm5MoE._forward_prefill_grouped_impl`` via
+    ``grouped_fp8_deepgemm_gemm``): gate and up share one [N, K], down is the
+    transpose. The serving dense stack spans every routed expert of the
+    frame; the resident deployments stack all of them, so that is the
+    compiled-in group count."""
+    groups = int(shapes.num_routed_experts)
+    return [
+        ContiguousSite("contiguous:moe_gate_up",
+                       shapes.expert_intermediate_size, shapes.hidden_size,
+                       groups),
+        ContiguousSite("contiguous:moe_down",
+                       shapes.hidden_size, shapes.expert_intermediate_size,
+                       groups),
+    ]
 
 
 @dataclass(frozen=True)
@@ -280,134 +318,18 @@ def _normal_reps(n: int, k: int, max_rows: int, num_sms: int) -> Tuple[int, ...]
 #  Inventory: every DeepGEMM call in the GLM-5 serving sources
 # ============================================================================
 
-# ``(path, enclosing function, callee) -> (call count, what it reaches)``.
-# "wrapper" marks the call inside a helper whose own call sites are listed;
-# "unreachable: ..." names why GLM-5 serving never runs it. The test scans
-# ``INVENTORY_PATHS`` for calls of ``deep_gemm.<kernel>`` and of
-# ``INVENTORY_CALLEES`` and requires this table to match exactly.
-INVENTORY_PATHS = (
-    "batchgen/models/glm",
-    "batchgen/attention/dsa",
-    "batchgen/attention/mla/fa3_backend.py",
-    "batchgen/attention/mla/flashmla_backend.py",
-    "batchgen/gemm/w8a8_deepgemm.py",
-    "batchgen_kernels/attention/dsa",
-)
-INVENTORY_CALLEES = (
-    "w8a8_deepgemm", "w8a16_gemm", "_gemm", "gemm",
-    "_fp8_linear_from_quantized", "indexer_wk_proj_deepgemm_out",
-    "run_deepgemm_masked_moe", "masked_gemm", "deep_gemm_paged_mqa_logits",
-    "paged_mqa_logits_schedule_meta",
-)
-# ``deep_gemm`` attributes that launch no JIT kernel.
-INVENTORY_NON_KERNELS = ("get_num_sms", "set_pdl", "get_pdl")
+# The deep_gemm backend's static call-site contract lives in the family's
+# JIT coverage declarations (registered with the shared registry, which the
+# repo-wide scanner test reads). This module keeps the GLM-5 prewarm sites
+# the table's ``reaches`` names refer to.
+# Absolute import: the CPU test suite loads this module from its file path
+# (no package context), where a relative import cannot resolve.
+from batchgen.models.glm.glm5.jit_coverage import DEEP_GEMM_INVENTORY
 
-_FA3 = "batchgen/attention/mla/fa3_backend.py"
-_FLASHMLA = "batchgen/attention/mla/flashmla_backend.py"
-_SELECTOR = "batchgen/attention/dsa/glm5_decode_selector.py"
-_GLM5 = "batchgen/models/glm/glm5/"
-_SCORER = "batchgen_kernels/attention/dsa/paged_mqa_scorer.py"
-_UNFUSED_EXPERT = ("expert_gate_up", "expert_down", "shared_gate_up_unfused",
-                   "shared_down_unfused")
-
-CALL_SITES: Dict[Tuple[str, str, str], Tuple[int, Any]] = {
-    # Prefill attention (dense FA3 path; GLM-5.2/5.3 for prompts up to
-    # index_topk), q_a, q_b, kv_a, kv_b, o_proj in call order.
-    (_FA3, "mla_prefill_flashattention3_w8a16_deepgemm_prepacked", "_gemm"):
-        (5, ("q_a", "q_b", "kv_a", "kv_b", "o_proj")),
-    (_FA3, "_mla_prefill_single_sequence_chunked", "gemm"):
-        (5, ("kv_a", "kv_b", "q_a", "q_b", "o_proj")),
-    (_FA3, "w8a16_gemm", "deep_gemm.fp8_gemm_nt"): (1, "wrapper"),
-    (_FA3, "mla_prefill_flashattention3_w8a16_deepgemm", "w8a16_gemm"):
-        (5, "unreachable: GLM-5 prefill requires prepack_mode"),
-    (_FA3, "mla_prefill_w8a16_deepgemm", "w8a16_gemm"):
-        (5, "unreachable: not bound by the GLM-5 manager"),
-    (_FA3, "mla_prefill_flashattention3_fused_dequant", "w8a16_gemm"):
-        (4, "unreachable: not bound by the GLM-5 manager"),
-    (_FLASHMLA, "mla_decoding_flashmla_attn_mode_3_bf16", "w8a8_deepgemm"):
-        (4, "unreachable: use_dense_mla only"),
-    (_FLASHMLA, "mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv",
-     "w8a8_deepgemm"): (4, "unreachable: use_dense_mla only"),
-    (_FLASHMLA, "mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn",
-     "w8a8_deepgemm"): (4, "unreachable: use_dense_mla only"),
-    # Eager decode attention and the per-layer DSA graph's projections.
-    (_SELECTOR, "build_glm5_dsa_flashmla_inputs", "w8a8_deepgemm"):
-        (4, ("q_a", "q_b_wq_b", "q_b", "kv_a")),
-    (_SELECTOR, "build_glm5_dsa_graph_segment_inputs", "w8a8_deepgemm"):
-        (3, ("q_a", "q_b", "kv_a")),
-    ("batchgen/gemm/w8a8_deepgemm.py", "w8a8_deepgemm",
-     "deep_gemm.fp8_gemm_nt"): (1, "wrapper"),
-    ("batchgen/gemm/w8a8_deepgemm.py", "w8a8_deepgemm", "masked_gemm"):
-        (1, "wrapper"),
-    # Decode graph segments: masked one-group GEMMs and the DeepGEMM wk.
-    (_GLM5 + "cuda_graph_segments.py", "Glm5FullDsaAttnSegment.forward",
-     "w8a8_deepgemm"): (3, ("masked:qkv_a", "masked:q_b", "masked:q_b_wq_b",
-                            "masked:o_proj")),
-    (_GLM5 + "cuda_graph_segments.py", "Glm5FullDsaAttnSegment.forward",
-     "indexer_wk_proj_deepgemm_out"): (1, ("indexer_wk_graph",)),
-    (_GLM5 + "reuse_topk_segment.py", "Glm5ReuseTopkAttnSegment.forward",
-     "w8a8_deepgemm"): (3, ("masked:qkv_a", "masked:q_b", "masked:o_proj")),
-    # Indexer and MLP modules.
-    (_GLM5 + "model.py", "Glm5Indexer.compute_indexer_kv", "w8a16_gemm"):
-        (1, ("indexer_wk",)),
-    (_GLM5 + "model.py", "Glm5Indexer.score_and_select", "w8a16_gemm"):
-        (1, "unreachable: reference scorer, no GLM-5 caller"),
-    (_GLM5 + "model.py", "Glm5Indexer.score_and_select_relu_gated",
-     "w8a16_gemm"): (1, "unreachable: reference scorer, no GLM-5 caller"),
-    (_GLM5 + "model.py", "Glm5Expert.deepgemm_forward", "w8a16_gemm"):
-        (3, _UNFUSED_EXPERT),
-    (_GLM5 + "model.py", "Glm5MLP._forward_slice", "w8a16_gemm"):
-        (3, ("dense_mlp_gate_up", "dense_mlp_down")),
-    # MoE.
-    (_GLM5 + "moe_cuda_graph_segments.py", "Glm5MoEGraphSegment._forward_deepep",
-     "run_deepgemm_masked_moe"): (1, ("masked:moe_gate_up", "masked:moe_down")),
-    (_GLM5 + "moe_deepgemm_masked.py", "run_deepgemm_masked_moe",
-     "masked_gemm"): (2, "wrapper"),
-    (_GLM5 + "wrappers.py", "GLM5ExpertWrapper._forward_unfused", "w8a16_gemm"):
-        (3, _UNFUSED_EXPERT),
-    (_GLM5 + "wrappers.py", "GLM5ExpertWrapper._forward_fused_gate_up",
-     "deep_gemm.fp8_gemm_nt"): (2, ("shared_gate_up_fused",
-                                    "shared_down_fused")),
-    # Attention wrappers: eager decode and the legacy DSA graph's o_proj.
-    (_GLM5 + "wrappers.py", "GLM5AttnWrapper._forward_decode_dsa_eager",
-     "w8a8_deepgemm"): (1, ("o_proj",)),
-    (_GLM5 + "wrappers.py", "GLM5AttnWrapper._project_dsa_attn_heads",
-     "w8a8_deepgemm"): (1, ("o_proj",)),
-    # Packed sparse prefill (GLM-5.2/5.3).
-    (_GLM5 + "sparse_prefill.py", "_fp8_linear_from_quantized",
-     "deep_gemm.fp8_gemm_nt"): (1, "wrapper"),
-    (_GLM5 + "sparse_prefill.py", "_compute_indexer_kv_from_quantized_hidden",
-     "_fp8_linear_from_quantized"): (1, ("indexer_wk",)),
-    (_GLM5 + "sparse_prefill.py", "select_packed_glm52_topk",
-     "_fp8_linear_from_quantized"): (1, ("indexer_wq_b",)),
-    (_GLM5 + "sparse_prefill.py", "glm52_sparse_prefill_prepacked",
-     "_fp8_linear_from_quantized"): (3, ("q_a", "kv_a", "q_b")),
-    (_GLM5 + "sparse_prefill.py", "glm52_sparse_prefill_prepacked",
-     "w8a16_gemm"): (1, ("o_proj",)),
-    (_GLM5 + "sparse_prefill.py", "_score_packed_indexer_topk_chunk",
-     "deep_gemm.fp8_mqa_logits"): (1, ("mqa_logits",)),
-    (_GLM5 + "sparse_prefill.py", "validate_glm52_sparse_prefill_runtime",
-     "deep_gemm.fp8_mqa_logits"): (1, ("mqa_logits",)),
-    # The DeepGEMM wk projection and the paged-MQA scorer.
-    ("batchgen_kernels/attention/dsa/indexer_wk_proj_deepgemm.py",
-     "indexer_wk_proj_deepgemm_out", "deep_gemm.fp8_gemm_nt"): (1, "wrapper"),
-    (_SCORER, "deep_gemm_paged_mqa_logits", "deep_gemm.fp8_paged_mqa_logits"):
-        (1, "wrapper"),
-    (_SCORER, "paged_mqa_logits_schedule_meta",
-     "deep_gemm.get_paged_mqa_logits_metadata"): (1, "wrapper"),
-    (_SCORER, "paged_mqa_score_and_topk", "deep_gemm_paged_mqa_logits"):
-        (1, ("paged_mqa",)),
-    (_SCORER, "paged_mqa_score_and_topk", "paged_mqa_logits_schedule_meta"):
-        (1, ("paged_mqa",)),
-    (_SCORER, "paged_mqa_score_and_topk_prepared_out",
-     "deep_gemm_paged_mqa_logits"): (1, ("paged_mqa",)),
-    (_SCORER, "paged_mqa_step_prologue_out", "paged_mqa_logits_schedule_meta"):
-        (1, ("paged_mqa",)),
-    (_SCORER, "warm_paged_mqa_logits", "deep_gemm_paged_mqa_logits"):
-        (1, ("paged_mqa",)),
-    (_SCORER, "warm_paged_mqa_logits", "paged_mqa_logits_schedule_meta"):
-        (1, ("paged_mqa",)),
-}
+CALL_SITES = DEEP_GEMM_INVENTORY.call_sites
+INVENTORY_PATHS = DEEP_GEMM_INVENTORY.paths
+INVENTORY_CALLEES = DEEP_GEMM_INVENTORY.callees
+INVENTORY_NON_KERNELS = DEEP_GEMM_INVENTORY.non_kernels
 
 
 def table_site_names() -> set:
@@ -423,6 +345,7 @@ def table_site_names() -> set:
              for site in dense_sites(shapes, phase)}
     names.update("masked:" + site.name for site in masked_dense_sites(shapes))
     names.update("masked:" + site.name for site in masked_moe_sites(shapes, 1))
+    names.update(site.name for site in contiguous_sites(shapes))
     names.update(("mqa_logits", "paged_mqa"))
     return names
 
@@ -539,6 +462,38 @@ def _run_masked_moe(weight, weight_scale, expected_m: int, device,
     fn((x, x_scale), (weight, weight_scale), out, masked_m, int(expected_m))
 
 
+def _run_contiguous(site: ContiguousSite, rows: int, device,
+                    fn: Optional[Callable] = None) -> None:
+    """One contiguous-kernel call of ``site`` at ``rows`` packed rows (always
+    128-aligned, as serving row totals are), through the serving wrapper.
+
+    The B stack has the SITE's group count (compiled into the kernel); every
+    row maps to group 0, which compiles and runs the kernel without touching
+    the other groups' weights. The stack is transient (fp8 G x N x K, a few
+    GB for the full expert count) and freed when the call returns.
+    """
+    if fn is None:
+        from batchgen.moe.grouped_fp8_deepgemm_moe import (
+            grouped_fp8_deepgemm_gemm,
+        )
+
+        fn = grouped_fp8_deepgemm_gemm
+    rows = int(rows)
+    groups = max(1, int(site.groups))
+    x_fp8 = torch.zeros((rows, site.k), dtype=torch.float8_e4m3fn,
+                        device=device)
+    x_scale = torch.ones((site.k // SCALE_BLOCK, rows), dtype=torch.float32,
+                         device=device)
+    weight = torch.zeros((groups, site.n, site.k),
+                         dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.ones((groups, -(-site.n // SCALE_BLOCK),
+                        -(-site.k // SCALE_BLOCK)), dtype=torch.float32,
+                       device=device)
+    out = torch.empty((rows, site.n), dtype=torch.bfloat16, device=device)
+    layout = torch.zeros((rows,), dtype=torch.int32, device=device)
+    fn(x_fp8, x_scale, weight, scale, output=out, grouped_layout=layout)
+
+
 def _run_paged_mqa(batch: int, num_heads: int, head_dim: int, page_size: int,
                    device, fn: Optional[Callable] = None) -> None:
     """``get_paged_mqa_logits_metadata`` and ``fp8_paged_mqa_logits`` at one
@@ -617,12 +572,46 @@ def _dense_entries(sites: Sequence[DenseSite], max_rows: int, num_sms: int,
     return first + rest
 
 
+def _contiguous_entries(sites: Sequence[ContiguousSite], max_rows: int,
+                        num_sms: int, device) -> List[PrewarmEntry]:
+    """One entry per distinct ``(N, K)`` and representative packed row total.
+    N and K are compiled into the contiguous kernel and the representatives
+    are one-per-key within a shape, so every entry compiles a distinct key."""
+    entries: List[PrewarmEntry] = []
+    seen_shapes = set()
+    for site in sites:
+        shape = (site.n, site.k, site.groups)
+        if shape in seen_shapes:
+            continue
+        seen_shapes.add(shape)
+        for rows in _contiguous_reps(site.n, site.k, int(max_rows),
+                                     int(num_sms)):
+            entries.append(PrewarmEntry(
+                f"deepgemm/{site.name}/{site.n}x{site.k}/m{rows}",
+                partial(_run_contiguous, site, rows, device),
+            ))
+    return entries
+
+
+@lru_cache(maxsize=None)
+def _contiguous_reps(n: int, k: int, max_rows: int,
+                     num_sms: int) -> Tuple[int, ...]:
+    return tuple(_dg.contiguous_representative_ms(n, k, max_rows, num_sms))
+
+
 def prefill_entries(shapes, device, *, max_rows: int,
-                    num_sms: int) -> List[PrewarmEntry]:
-    """Every prefill Normal site over ``[1, max_rows]`` and, on the packed
-    sparse prefill, the indexer's ``fp8_mqa_logits``."""
+                    num_sms: int,
+                    contiguous_max_rows: int = 0) -> List[PrewarmEntry]:
+    """Every prefill Normal site over ``[1, max_rows]``; the grouped
+    contiguous-MoE sites over ``[1, contiguous_max_rows]`` when that bound is
+    given (it is the packed expert-row capacity, tokens x topk plus segment
+    padding, not the token count); and, on the packed sparse prefill, the
+    indexer's ``fp8_mqa_logits``."""
     entries = _dense_entries(dense_sites(shapes, PHASE_PREFILL), max_rows,
                              num_sms, device)
+    if contiguous_max_rows > 0:
+        entries += _contiguous_entries(contiguous_sites(shapes),
+                                       contiguous_max_rows, num_sms, device)
     if shapes.sparse_prefill:
         entries.append(PrewarmEntry(
             f"deepgemm/mqa_logits/h{shapes.index_n_heads}"
@@ -764,45 +753,79 @@ def jit_cache_dir() -> Path:
     return Path(root) / "cache"
 
 
-def cache_kernel_count(path: Optional[Path] = None) -> int:
-    """Compiled kernels in the cache: its ``kernel.*`` directories."""
+def cache_kernel_names(path: Optional[Path] = None) -> frozenset:
+    """Compiled kernels in the cache: the names of its ``kernel.*``
+    directories (``kernel.<family>.<hash>``)."""
     path = jit_cache_dir() if path is None else Path(path)
     try:
         names = os.listdir(path)
     except FileNotFoundError:
-        return 0
-    return sum(1 for name in names
-               if name.startswith("kernel.") and (path / name).is_dir())
+        return frozenset()
+    return frozenset(name for name in names
+                     if name.startswith("kernel.") and (path / name).is_dir())
 
 
-_BASELINE: Optional[int] = None
+def kernel_family(name: str) -> str:
+    """``kernel.<family>.<hash>`` -> ``<family>``: the DeepGEMM kernel that
+    a cache entry instantiates."""
+    parts = name.split(".")
+    return parts[1] if len(parts) > 1 else name
 
 
-def record_baseline(rank) -> int:
-    """The cache's kernel count once the geometry phase is done; later
-    compiles are measured against it."""
+# The kernel names the cache held when the guard was armed (None: not armed).
+# A set, not a count: a late compile that lands while another entry leaves
+# the cache keeps the count but adds a name.
+_BASELINE: Optional[frozenset] = None
+# Call sites already told that the guard is not armed (one WARNING each).
+_UNARMED_REPORTED: set = set()
+
+
+def record_baseline(rank) -> frozenset:
+    """Arm the guard: snapshot the cache's kernel names. Later compiles are
+    the names that are not in it."""
     global _BASELINE
-    _BASELINE = cache_kernel_count()
-    logger.info("%s rank=%s DeepGEMM cache %s holds %d kernels after the "
-                "prewarm", LOG_TAG, rank, jit_cache_dir(), _BASELINE)
+    _BASELINE = cache_kernel_names()
+    logger.info("%s rank=%s DeepGEMM cache %s holds %d kernels; late-compile "
+                "guard armed on their names", LOG_TAG, rank, jit_cache_dir(),
+                len(_BASELINE))
     return _BASELINE
 
 
-def check_late_compiles(rank, where: str, strict: bool = False) -> int:
-    """Kernels DeepGEMM compiled since the baseline (0 before the first
-    geometry phase). Logged at WARNING; ``strict`` raises instead. The cache
-    is node-wide, so the count includes every rank of the node."""
+def check_late_compiles(rank, where: str,
+                        strict: bool = False) -> Optional[Tuple[str, ...]]:
+    """The kernel names DeepGEMM compiled since the baseline, sorted, each
+    reported once (logged at WARNING with its family; ``strict`` raises).
+    The cache is node-wide, so the names include every rank of the node.
+
+    None when the guard is not armed: nothing is known about the compiles
+    at ``where``, and that is logged at INFO (once per call site) rather
+    than passed off as "no late compile". The guard arms at readiness, so
+    a startup-sequence check before the baseline exists is the expected
+    state, not a warning condition.
+    """
     global _BASELINE
     if _BASELINE is None:
-        return 0
-    count = cache_kernel_count()
-    late = count - _BASELINE
-    if late <= 0:
-        return 0
-    message = (f"DeepGEMM compiled {late} kernels after the prewarm "
-               f"(cache {jit_cache_dir()}: {_BASELINE} -> {count}, seen at "
-               f"{where})")
-    _BASELINE = count
+        if where not in _UNARMED_REPORTED:
+            _UNARMED_REPORTED.add(where)
+            logger.info(
+                "%s rank=%s DeepGEMM late-compile guard not armed at %s: no "
+                "kernel-name baseline is recorded yet, so kernels DeepGEMM "
+                "compiles here are NOT checked", LOG_TAG, rank, where,
+            )
+        return None
+    names = cache_kernel_names()
+    late = tuple(sorted(names - _BASELINE))
+    if not late:
+        return ()
+    families = collections.Counter(kernel_family(name) for name in late)
+    message = (
+        f"DeepGEMM compiled {len(late)} kernels after the prewarm (seen at "
+        f"{where}, cache {jit_cache_dir()}): families "
+        + ", ".join(f"{family} x{count}"
+                    for family, count in sorted(families.items()))
+        + "; names " + ", ".join(late)
+    )
+    _BASELINE = _BASELINE | names
     logger.warning("%s rank=%s %s", LOG_TAG, rank, message)
     if strict:
         raise LateDeepGemmCompileError(message)

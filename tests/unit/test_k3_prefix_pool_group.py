@@ -28,6 +28,12 @@ from types import SimpleNamespace
 from typing import List, Optional, Sequence
 
 import pytest
+
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
 import torch
 
 from batchgen.prefix_reuse import wave_runtime
@@ -64,6 +70,29 @@ TOKEN_CAP = 64
 
 
 WORKER_TREE = ast.parse(WORKER.read_text())
+ENGINE = WORKER.parents[0] / "worker" / "prefill_engine.py"
+ENGINE_TREE = ast.parse(ENGINE.read_text())
+
+_MOVED = {
+    "_plan_prefill_micro_batches", "_prefill_model_pass_count",
+    "_prefill_prefix_pool_enabled", "_pool_prefill_group_safe",
+    "_prefill_pool_group", "_prefill_pool_free_state_slots",
+    "_next_pool_segment_sid", "_prefix_rank_packing_mode",
+    "_prefix_rank_cost_profile_disabled", "_cached_prefix_rank_cost_profile",
+    "_materialized_prefix_hits", "_unmaterializable_frontier",
+    "_plan_prefill_pool_wave", "_prefill_pool_psm_layout",
+    "_prefill_pool_page_dims", "_prefill_pool_page_bytes",
+    "_measure_prefill_prefix_kv_budget", "_construct_prefill_pool",
+    "_check_pool_plan_identical", "_prefill_pool_layout",
+    "_replace_prefix_lookup_hits", "_settle_trajectory_restore_plan",
+    "_prefill_pool_segment_host_pages", "_allocate_prefill_pool_host_pages",
+    "_materialized_segment_loader", "_prefix_pool_index_key_carrier",
+    "_materialized_pool_index_key_layers", "_load_materialized_segments",
+    "_pool_probe_debug", "_new_pool_epilogue_tracer",
+    "_record_unsharded_epilogue_gather", "_new_pool_kernel_dump_recorder",
+    "_pool_pad_poison_enabled", "_new_pool_offload_check_recorder",
+    "_finish_prefill_pool_wave", "_release_pool_segment_refs",
+}
 
 
 def _worker_class():
@@ -76,37 +105,58 @@ def _worker_method_node(name):
                 if isinstance(node, ast.FunctionDef) and node.name == name)
 
 
+def _engine_method_node(name):
+    klass = next(node for node in ENGINE_TREE.body
+                 if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine")
+    return next(node for node in klass.body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
 def _worker_methods(names, globals_=None):
     """Compile the named worker methods onto one shared namespace of fakes."""
-    wanted = [copy.deepcopy(_worker_method_node(name)) for name in names]
-    module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List, "Optional": Optional, "Sequence": Sequence,
         "hashlib": hashlib, "logging": logging, "math": math,
         "replace": dataclasses.replace,
+        "DualHostKVCoordinator": type("DualHostKVCoordinator", (), {}),
         **(globals_ or {}),
     }
-    exec(compile(module, str(WORKER), "exec"), namespace)
-    return {name: namespace[name] for name in names}
+    loaded = {}
+    for name in names:
+        source = ENGINE if name in _MOVED else WORKER
+        node = copy.deepcopy(
+            _engine_method_node(name) if name in _MOVED else _worker_method_node(name)
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        scope = dict(namespace)
+        exec(compile(module, str(source), "exec"), scope)
+        function = scope[name]
+        if name in _MOVED:
+            def worker_method(worker, *args, _function=function, **kwargs):
+                return _function(None, worker, *args, **kwargs)
+            function = worker_method
+        loaded[name] = function
+    return loaded
 
 
 def _worker_probe_debug_keys():
-    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+    """``_POOL_PROBE_DEBUG_KEYS`` as prefill_engine.py declares it.
 
-    The keys are module-level literals in the worker so that a prefill which
-    armed no probe never imports a probe module to find that out; the compiled
-    seam methods close over them, so the harness has to supply them.
+    The keys are module-level literals in the engine module (their only
+    reader) so that a prefill which armed no probe never imports a probe
+    module to find that out; the compiled seam methods close over them, so the
+    harness has to supply them.
     """
     literals = {
         node.targets[0].id: node.value.value
-        for node in WORKER_TREE.body
+        for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign) and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
     }
     assign = next(
-        node for node in WORKER_TREE.body
+        node for node in ENGINE_TREE.body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
@@ -312,6 +362,7 @@ def _plan_worker(
             "_plan_prefill_pool_wave",
             "_check_pool_plan_identical",
             "_prefill_pool_layout",
+            "_prefill_host_view_is_dual",
             "_prefill_pool_psm_layout",
             "_prefill_pool_page_dims",
             "_prefill_pool_group",
@@ -355,9 +406,6 @@ def _plan_worker(
         parallel_manager.prefill_pool_layout = lambda: dict(layout)
         parallel_manager.supports_group_pool_prefill = lambda: True
     worker = SimpleNamespace(
-        rank=rank,
-        local_rank=0,
-        world_size=attn_tp_size,
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,
@@ -371,11 +419,8 @@ def _plan_worker(
         host_paged_kv_worker_view=object(),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         prefix_cache_coordinator=RecordingCoordinator(),
-        _prefix_sequence_states={},
         _prefill_pool_base=(0, 0, 0),
         # No trajectory frontier in play: no attachment, no mirrored index.
-        _trajectory_attachments={},
-        _trajectory_session_groups=None,
         # No worker-wide batchgen_debug: the batch-level flags are the only
         # source, and none of these sequences sets one.
         _batchgen_debug=None,
@@ -385,6 +430,17 @@ def _plan_worker(
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=attn_tp_size, local_world_size=8, local_rank=0,
+        decode_group_size=attn_tp_size,
+    )
+    attach_prefix_state(worker, prefix_sequence_states={})
+    attach_trajectory_state(
+        worker,
+        trajectory_attachments={},
+        trajectory_session_groups=None,
     )
     worker._trajectory_tokens = (
         lambda seq, length=None, **_: seq.input_ids[0, :length]
@@ -590,7 +646,8 @@ def test_too_few_state_slots_drops_the_pool_on_every_rank(monkeypatch, rank):
     assert worker._plan_prefill_pool_wave(UUIDS, {}) is None
     # A declined plan leaves the lookup states untouched; the CALLER releases
     # the hits for a pool-only model (K3), uniformly across the group.
-    assert worker._prefix_sequence_states == {}
+    # migrated: worker._prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states == {}
 
 
 def test_enough_state_slots_keeps_the_pool(monkeypatch):
@@ -677,19 +734,22 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=2,
-        local_world_size=8,
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         host_paged_kv_worker_view=views[0],
-        _prefix_sequence_states=states if states is not None else {},
         _host_views_by_group=lambda: views,
         _prefill_pool_wave=wave,
-        _pool_member_sids={},
-        _pool_sid_members={},
-        _pool_sid_counter=0,
     )
+    attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
+                    decode_group_size=2)
+    attach_prefix_state(
+        worker,
+        prefix_sequence_states=states if states is not None else {},
+        pool_member_sids={},
+        pool_sid_members={},
+        pool_sid_counter=0,
+    )
+    attach_trajectory_state(worker)
     return _bind(worker, methods)
 
 
@@ -740,7 +800,8 @@ def test_follower_installs_the_leaders_segment_pages(monkeypatch):
     assert len(views_by_rank[0][0].table[sid]) == len(SHARED) // PAGE_TOKENS
     # Nothing was allocated a second time: the follower only set a page table.
     assert views_by_rank[1][0].backend is views_by_rank[0][0].backend
-    assert workers[1]._pool_member_sids == {}
+    # migrated: workers[1]._pool_member_sids -> workers[1]._prefix.pool_member_sids, same owner object.
+    assert workers[1]._prefix.pool_member_sids == {}
     # The follower also took the leader's chain for each member sequence.
     for global_id in GLOBAL_IDS:
         assert workers[1].states[global_id].shared_page_ids_for_group(0) == tuple(
@@ -785,7 +846,6 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
         ],
     )
     worker = SimpleNamespace(
-        rank=rank,
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         prefix_cache_coordinator=coordinator,
@@ -793,11 +853,16 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
             namespace_digest=(1, 2, 3, 4), publish_boundary_tokens=PAGE_TOKENS,
             max_nodes=64,
         ),
-        _prefix_sequence_states=states,
         _prefill_pool_wave=wave,
-        _pool_member_sids={},
-        _pool_sid_members={},
         _host_views_by_group=lambda: views,
+    )
+    attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
+                    decode_group_size=2)
+    attach_prefix_state(
+        worker,
+        prefix_sequence_states=states,
+        pool_member_sids={},
+        pool_sid_members={},
     )
     return _bind(worker, methods)
 
@@ -877,8 +942,8 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     worker = _finish_worker(
         0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
     )
-    worker._pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
-    worker._pool_sid_members = {-1: 2}
+    worker._prefix.pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
+    worker._prefix.pool_sid_members = {-1: 2}
 
     worker._release_pool_segment_refs(GLOBAL_IDS[0])
     assert backend.released == []  # one member still reads the segment
@@ -1037,7 +1102,7 @@ def test_pool_collectives_are_not_rank_conditional():
         ("_plan_prefill_pool_wave", "all_reduce"),
         ("_check_pool_plan_identical", "all_gather"),
     ):
-        method = _worker_method_node(name)
+        method = _engine_method_node(name)
         parents = _parents(method)
         calls = [
             node for node in ast.walk(method)

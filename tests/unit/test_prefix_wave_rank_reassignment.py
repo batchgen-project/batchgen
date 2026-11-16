@@ -13,7 +13,9 @@ from typing import List
 import pytest
 import torch
 
-from batchgen.query_book import bind_local_sequence_to_query_book, release_local_query_slot
+from batchgen.query_book import bind_query_book_slot, release_query_book_slot
+from tests.worker.worker_fakes import attach_identity
+from tests.worker_method_source import load_prefill_engine_methods
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -34,9 +36,31 @@ def _worker_class():
 
 def _worker_methods(*names):
     """Exec the named methods on a fresh namespace of fakes."""
+    moved = {
+        "_prefix_rank_packing_mode",
+        "_prefix_rank_cost_profile_disabled",
+        "_cached_prefix_rank_cost_profile",
+    }
+    if any(name in moved for name in names):
+        namespace = {
+            "List": List,
+            "hashlib": hashlib,
+            "logging": logging,
+            "torch": torch,
+        }
+        loaded = {}
+        for name in names:
+            if name in moved:
+                loaded[name] = load_prefill_engine_methods([name], namespace)[name]
+        remaining = [name for name in names if name not in moved]
+    else:
+        loaded = {}
+        remaining = list(names)
+    if not remaining:
+        return loaded
     wanted = [node for node in _worker_class().body
-              if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert len(wanted) == len(names), [node.name for node in wanted]
+              if isinstance(node, ast.FunctionDef) and node.name in remaining]
+    assert len(wanted) == len(remaining), [node.name for node in wanted]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List,
@@ -47,10 +71,11 @@ def _worker_methods(*names):
             all_gather=lambda out, value: [item.copy_(value) for item in out]
         ),
         "SequenceStatus": SequenceStatus,
-        "release_local_query_slot": release_local_query_slot,
+        "release_query_book_slot": release_query_book_slot,
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
-    return {name: namespace[name] for name in names}
+    loaded.update({name: namespace[name] for name in remaining})
+    return loaded
 
 
 def _assignment_method():
@@ -80,12 +105,13 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         old = "a" if rank == 0 else "b"
         new = "b" if rank == 0 else "a"
         worker_state = SimpleNamespace(
-            rank=rank, world_size=2, global_batch=batch,
+            global_batch=batch,
             prefix_cache_runtime_config=SimpleNamespace(
                 group_specs=[SimpleNamespace(raw_page_tokens=2)]),
-            _uuid_to_local_map={old: 4}, _local_to_uuid_map={4: old},
-            query_book={4: object()}, _free_local_indices=set(),
+            query_book={0: object()},
         )
+        attach_identity(worker_state, rank=rank, world_size=2,
+                        local_world_size=2, bound={old: 0})
         # Prompts live in the trajectory book after admission.
         worker_state._trajectory_tokens = (
             lambda seq, length=None, **_: prompts[seq.uuid][:length]
@@ -104,19 +130,20 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         assert worker_state._uuid_to_local_map == {}
         assert worker_state._local_to_uuid_map == {}
         assert worker_state.query_book == {}
-        assert worker_state._free_local_indices == {4}
+        assert worker_state._free_local_indices == {0}
         assert seqs[new].assigned_rank == rank
 
         # Config prefill binds the new owner into the released local slot.
-        idx, next_idx = bind_local_sequence_to_query_book(
+        # The freed slot must be reused, so the never-used counter must not
+        # advance -- the same pair the raw-container helper used to return.
+        counter_before = worker_state.seq_table.next_local_idx
+        idx = bind_query_book_slot(
             new, seqs[new], query_book=worker_state.query_book,
-            local_to_uuid_map=worker_state._local_to_uuid_map,
-            uuid_to_local_map=worker_state._uuid_to_local_map,
-            free_local_indices=worker_state._free_local_indices,
-            next_local_idx=5,
+            table=worker_state.seq_table,
         )
-        assert (idx, next_idx) == (4, 5)
-        assert worker_state._local_to_uuid_map == {4: new}
+        assert idx == 0
+        assert worker_state.seq_table.next_local_idx == counter_before
+        assert worker_state._local_to_uuid_map == {0: new}
 
 
 def _legacy_must_not_run(*a, **k):
@@ -164,7 +191,7 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         assign_rank=lambda uuid, owner: setattr(seqs[uuid], "assigned_rank", owner),
     )
     worker_state = SimpleNamespace(
-        rank=rank, world_size=world_size, global_batch=batch, local_rank=rank,
+        global_batch=batch,
         model_name="gpt-oss-120b", torch_device=torch.device("cpu"),
         # A cached profile keeps the CUDA device-name lookup out of this test.
         # Pre-seeded cache (keyed by the A/B arm, False = profile arm),
@@ -177,10 +204,11 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         _active_batchgen_debug_for_sequences=lambda batch_sequences: {
             "prefix_rank_assignment_mode": "packing_v2"
         },
-        _uuid_to_local_map=dict(slots), _local_to_uuid_map={v: k for k, v in slots.items()},
         query_book={index: object() for index in slots.values()},
-        _free_local_indices=set(),
     )
+    attach_identity(worker_state, rank=rank, world_size=world_size,
+                    local_world_size=world_size, local_rank=rank,
+                    bound=dict(slots))
     worker_state._prefix_rank_packing_mode = types.MethodType(
         _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
         worker_state,
@@ -240,6 +268,7 @@ def test_packing_mode_pins_the_evicted_member_and_repacks_only_queued(monkeypatc
         _install_packer(monkeypatch, (1, 0), recorder)
         moved_away = "q0" if rank == 0 else "q1"
         worker_state = _packing_worker(rank, seqs, {moved_away: 4})
+        free_before = set(worker_state._free_local_indices)
         assign(worker_state, ["e", "q0", "q1"], current_wave=True)
 
         assert recorder["prompts"] == [[4, 5, 6], [7, 8]]
@@ -251,7 +280,7 @@ def test_packing_mode_pins_the_evicted_member_and_repacks_only_queued(monkeypatc
         assert worker_state._uuid_to_local_map == {}
         assert worker_state._local_to_uuid_map == {}
         assert worker_state.query_book == {}
-        assert worker_state._free_local_indices == {4}
+        assert worker_state._free_local_indices == free_before | {4}
 
 
 def test_packing_mode_keeps_the_evicted_members_slot(monkeypatch):
@@ -261,10 +290,12 @@ def test_packing_mode_keeps_the_evicted_members_slot(monkeypatch):
     _install_packer(monkeypatch, (1, 1), recorder)
     seqs = _mixed_wave(1)
     worker_state = _packing_worker(1, seqs, {"e": 6, "q1": 7})
+    free_before = set(worker_state._free_local_indices)
     _assignment_method()(worker_state, ["e", "q0", "q1"], current_wave=True)
     assert seqs["e"].assigned_rank == 1 and seqs["q1"].assigned_rank == 1
     assert worker_state._uuid_to_local_map == {"e": 6, "q1": 7}
-    assert worker_state._free_local_indices == set()
+    # No slot is returned (the set is the fixture's, unchanged).
+    assert worker_state._free_local_indices == free_before
 
 
 def test_packing_mode_raises_when_ranks_disagree(monkeypatch):

@@ -21,6 +21,8 @@ from types import ModuleType, SimpleNamespace
 from typing import Optional
 import pytest
 
+from tests.worker_method_source import worker_shaped_method_node
+
 from batchgen.models.openai.gpt_oss_120b.converted_ckpt_plan import (
     check_converted_ckpt_format,
     plan_converted_ckpt_load,
@@ -69,19 +71,9 @@ def _top_level_function(path: Path, name: str, globals_=None):
 
 
 def _worker_method(name: str, globals_=None):
-    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
-    worker = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
-    )
-    method = copy.deepcopy(
-        next(
-            node
-            for node in worker.body
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        )
-    )
+    # S8: a RankSync method resolves to its RankSyncEngine body, in the
+    # worker's shape (the worker keeps only a same-name delegator).
+    method = worker_shaped_method_node(name)
     module = ast.Module(
         body=[
             ast.ClassDef(

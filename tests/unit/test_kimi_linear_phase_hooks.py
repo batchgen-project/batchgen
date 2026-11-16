@@ -215,12 +215,15 @@ def test_prefill_suspend_makes_no_delegate_call():
 
 
 @pytest.mark.parametrize("key", [PREFILL, DECODE], ids=["prefill", "decode"])
-def test_retire_makes_no_delegate_call(key):
+def test_retire_releases_the_routed_experts(key):
+    # The resident shard is manager-owned and either phase may have built it
+    # (prefill under the resident-EP handoff): a retired instance must hand
+    # it back even though the instance itself is dropped.
     psm, calls, _ = _isolated_psm()
     psm._resident_ep_built = True
-    psm._active_phase = "decode"
+    psm._active_phase = key.phase
     assert psm.phase_exit(key, ExitMode.RETIRE) is None
-    assert calls == []
+    assert calls == [("release_decode_routed_experts", (), {})]
 
 
 def test_unsupported_mode_is_rejected():

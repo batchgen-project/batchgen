@@ -63,10 +63,6 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "DeepSeek-V4-Pro": "deepseek_v4",
     "DeepSeek-R1": "deepseek_v3",
     "DeepSeek-V3": "deepseek_v3",
-    "DeepSeek-V2-Lite": "deepseek_v2",
-    "DeepSeek-V2": "deepseek_v2",
-    "Mixtral-8x22B": "mixtral",
-    "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
     # GLM-5 and GLM-5.1 share tokenizer.json (vocab_size=154880, identical
     # EOS/pad), but GLM-5.1 ships a richer chat template (tool_to_json macro,
@@ -210,9 +206,7 @@ def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
 _TOKENIZER_MODULES = {
     "deepseek_v4": "batchgen.models.deepseek.deepseekv4_flash.tokenizer",
     "deepseek_v3": "batchgen.models.deepseek.deepseekv3.tokenizer",
-    "deepseek_v2": "batchgen.models.deepseek.deepseekv2.tokenizer",
     "gpt_oss": "batchgen.models.openai.gpt_oss_120b.tokenizer",
-    "mixtral": "batchgen.models.mixtral.tokenizer",
     "kimi_k25": "batchgen.models.moonshotai.kimi_k25.tokenizer",
     "kimi_linear": "batchgen.models.moonshotai.kimi_linear.tokenizer",
     "kimi_k3": "batchgen.models.moonshotai.kimi_k3.tokenizer",

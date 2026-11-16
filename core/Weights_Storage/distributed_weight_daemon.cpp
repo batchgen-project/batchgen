@@ -239,12 +239,45 @@ void wait_request(ucp_worker_h worker, void* request) {
     }
 }
 
-void close_endpoint(ucp_worker_h worker, ucp_ep_h endpoint) {
+// Teardown-only close (the only endpoint-close path: Stop() owns every
+// endpoint's end of life). A dead peer parks the graceful flush close on an
+// endpoint timeout, and a thrown close would abort Stop() half way, leaking
+// the remaining endpoints, rkeys and workers. Force-close skips the flush,
+// and a close error is reported to stderr instead of thrown.
+void close_endpoint_for_stop(ucp_worker_h worker, ucp_ep_h endpoint) {
     if (endpoint == nullptr) {
         return;
     }
     ucp_request_param_t params{};
-    wait_request(worker, ucp_ep_close_nbx(endpoint, &params));
+    params.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
+    params.flags = UCP_EP_CLOSE_FLAG_FORCE;
+    void* request = ucp_ep_close_nbx(endpoint, &params);
+    if (request == nullptr) {
+        return;
+    }
+    if (UCS_PTR_IS_ERR(request)) {
+        std::fprintf(
+            stderr,
+            "[distributed-weight-daemon] endpoint close during stop: %s\n",
+            ucs_status_string(UCS_PTR_STATUS(request)));
+        return;
+    }
+    while (true) {
+        const ucs_status_t status = ucp_request_check_status(request);
+        if (status == UCS_INPROGRESS) {
+            ucp_worker_progress(worker);
+            std::this_thread::yield();
+            continue;
+        }
+        if (status != UCS_OK) {
+            std::fprintf(
+                stderr,
+                "[distributed-weight-daemon] endpoint close during stop: %s\n",
+                ucs_status_string(status));
+        }
+        ucp_request_free(request);
+        return;
+    }
 }
 
 // Spread each owner's eight egress rails over the (num_nodes - 1) nodes that
@@ -1933,6 +1966,36 @@ struct DistributedWeightDaemon::Impl {
         return cohort_epoch;
     }
 
+    // The two failure latches, named as in the summary. failure_mutex and
+    // cohort_mutex are taken one after the other, never together, and each
+    // only for a copy. A fault text carries bytes a worker sent, so the dump
+    // replaces invalid UTF-8 instead of throwing.
+    std::string Status() {
+        nlohmann::json status;
+        status["network_ready"] = network_ready.load();
+        {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            const bool transport_failed = failed.load();
+            status["failed"] = transport_failed;
+            status["failure"] = failure_message;
+            status["failure_class"] =
+                transport_failed ? "transport_fatal" : "none";
+        }
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            status["cohort"] = {
+                {"epoch", cohort_epoch},
+                {"state", cohort_state_name(cohort_state)},
+                {"faulted", cohort_faulted},
+                {"fault", cohort_fault},
+                {"fault_class",
+                 cohort_faulted ? "cohort_recoverable" : "none"},
+            };
+        }
+        return status.dump(-1, ' ', false,
+                           nlohmann::json::error_handler_t::replace);
+    }
+
     std::uint64_t BeginCohortSwap() {
         if (!started.load()) {
             fail("distributed weights daemon is not started");
@@ -2159,7 +2222,7 @@ struct DistributedWeightDaemon::Impl {
                     remote.rkey = nullptr;
                 }
                 if (remote.endpoint != nullptr) {
-                    close_endpoint(rails[rail].worker,
+                    close_endpoint_for_stop(rails[rail].worker,
                                    remote.endpoint);
                     remote.endpoint = nullptr;
                 }
@@ -2169,7 +2232,7 @@ struct DistributedWeightDaemon::Impl {
                 }
             }
             for (ucp_ep_h endpoint : incoming_endpoints[rail]) {
-                close_endpoint(rails[rail].worker, endpoint);
+                close_endpoint_for_stop(rails[rail].worker, endpoint);
             }
             for (int fd : incoming_controls[rail]) {
                 close(fd);
@@ -2222,6 +2285,8 @@ std::string DistributedWeightDaemon::FinishCohortSwap(
     double timeout_seconds) {
     return impl_->FinishCohortSwap(timeout_seconds);
 }
+
+std::string DistributedWeightDaemon::Status() { return impl_->Status(); }
 
 void DistributedWeightDaemon::PrepareStop() { impl_->PrepareStop(); }
 

@@ -67,19 +67,26 @@ BatchGen output follows the OpenAI Batch API format. Each line in the output JSO
 }
 ```
 
-Note: `--parse-thinking` and `--parse-tool-call` only apply to chat completion responses. Text completion responses always return raw decoded text.
+Note: `--parse-thinking` and `--parse-tool-call` only apply to chat completion responses. Text completion responses always return raw decoded text (for GPT-OSS this includes the harmony message markers and the closing `<|return|>` or `<|call|>`).
 
 ---
 
 ## Structured Output Fields
 
-By default, the raw decoded text (including any special tokens) is placed in `content`. The following server flags enable server-side parsing into structured fields.
+Each model declares whether its chat responses are parsed by default; `--parse-thinking` / `--no-parse-thinking` and `--parse-tool-call` / `--no-parse-tool-call` override that declaration for every model. GPT-OSS-120B parses both by default (see [GPT-OSS-120B](#gpt-oss-120b-harmony-output)); every other model returns the raw decoded text in `content` unless the flag is given.
+
+| Model | Thinking parsed by default | Tool calls parsed by default |
+|-------|----------------------------|------------------------------|
+| GPT-OSS-120B | yes | yes |
+| Every other model | no | no |
+
+Unparsed text is recoverable: the reasoning stays inline in `content` with its delimiters, and tool calls keep their markers.
 
 ### `--parse-thinking`
 
 Extracts model reasoning/thinking into a separate `reasoning_content` field. The `content` field contains only the visible answer.
 
-**Without `--parse-thinking`:**
+**Without `--parse-thinking` (or with `--no-parse-thinking`):**
 ```json
 {
   "content": "<think>Let me reason step by step...</think>The answer is 42.",
@@ -99,7 +106,7 @@ Extracts model reasoning/thinking into a separate `reasoning_content` field. The
 
 Extracts tool/function calls into an OpenAI-compatible `tool_calls` array.
 
-**Without `--parse-tool-call`:**
+**Without `--parse-tool-call` (or with `--no-parse-tool-call`):**
 ```json
 {
   "content": "Let me check.<｜tool▁call▁begin｜>get_weather\n{\"city\": \"London\"}<｜tool▁call▁end｜>",
@@ -138,7 +145,29 @@ Each model uses different special tokens for thinking and tool calls. BatchGen's
 | GLM-5 | `<think>...</think>` | `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` |
 | MiniMax-M2.5 | `<think>...</think>` | `<minimax:tool_call><invoke name="...">...</invoke></minimax:tool_call>` |
 
-GPT-OSS-120B writes its output in the harmony format, whose message markers are special tokens. Run the server with `--detokenization-include-special-tokens` as well, so the decoded text keeps them; without it the markers are stripped (`analysis...assistantfinal...`) and the output is returned raw in `content`. Decode stops at `<|call|>`, so a tool-calling turn ends with exactly one call; `content` is empty unless the model wrote a `final` or `commentary` preamble message first. A malformed or truncated message (for example a tool call cut off before `<|call|>` by `max_tokens`) is returned raw in `content` and logged as a warning.
+### GPT-OSS-120B harmony output
+
+GPT-OSS-120B writes its output in the harmony format, and the server parses it by default, as OpenAI's harmony serving does:
+
+| Harmony message | Response field |
+|-----------------|----------------|
+| `analysis` channel | `reasoning_content` |
+| `final` channel | `content` |
+| `commentary` channel without a recipient (a preamble) | `content` |
+| a message addressed to a function (`to=functions.NAME`), ended by `<\|call\|>` | `tool_calls` |
+
+```json
+{
+  "content": "5",
+  "reasoning_content": "The user asks: what is 2+3? So answer: 5."
+}
+```
+
+The harmony markers (`<|start|>`, `<|channel|>`, `<|constrain|>`, `<|message|>`, `<|end|>`, `<|call|>`, `<|return|>`) are special tokens in the checkpoint, but they are the structure of the output, so default detokenization keeps them; only `<|startoftext|>`, `<|endoftext|>` and the reserved tokens are stripped. `--detokenization-include-special-tokens` is not needed.
+
+Decode stops at `<|call|>`, so a tool-calling turn ends with exactly one call; `content` is empty unless the model wrote a `final` or `commentary` preamble message first. When `max_tokens` ends the output inside the `analysis` message, `reasoning_content` holds the reasoning written so far and `content` is empty (`finish_reason` is `length`). A malformed or truncated message (for example a tool call cut off before `<|call|>` by `max_tokens`) is returned raw in `content` and logged as a warning.
+
+With `--no-parse-thinking --no-parse-tool-call`, `content` is the raw harmony text with every marker, for example `<|channel|>analysis<|message|>The user asks: ...<|end|><|start|>assistant<|channel|>final<|message|>5<|return|>`. With only `--no-parse-thinking`, tool calls are still extracted and the remaining messages stay as harmony text in `content`.
 
 ### GPT-OSS-120B tool conversations
 
@@ -170,11 +199,11 @@ with open("results.jsonl", "r") as f:
         # Visible content
         print(f"[{custom_id}] {msg['content']}")
 
-        # Reasoning (when --parse-thinking is enabled)
+        # Reasoning (when thinking parsing is in effect)
         if msg.get("reasoning_content"):
             print(f"  Reasoning: {msg['reasoning_content'][:100]}...")
 
-        # Tool calls (when --parse-tool-call is enabled)
+        # Tool calls (when tool-call parsing is in effect)
         if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 fn = tc["function"]
@@ -185,5 +214,5 @@ with open("results.jsonl", "r") as f:
 
 ## See Also
 
-- [Server Flags](server-flags.md#output-parsing) - Enable `--parse-thinking` and `--parse-tool-call`
+- [Server Flags](server-flags.md#output-parsing) - `--[no-]parse-thinking` and `--[no-]parse-tool-call`
 - [Client API](client-api.md) - Submitting batches and downloading results

@@ -1,28 +1,36 @@
 """GPT-OSS harmony output parsing: channels, tool calls, and the tool-call stop.
 
-The parser runs on the completion text the worker decodes with
-``--detokenization-include-special-tokens`` (the harmony markers are special
-tokens). Covered here:
+GPT-OSS chat output is parsed by default (the tokenizer declares
+``parse_thinking_default`` / ``parse_tool_call_default``), and the parser runs
+on the completion text the worker decodes by default: the harmony grammar
+markers survive ``skip_special_tokens=True`` and the stop token is decoded
+with the completion. Covered here:
 
 * the marker spellings and ids, pinned to the checkpoint's tokenizer assets;
 * the decode stop set, pinned to ``generation_config.json`` (``<|call|>`` ends
   a tool-calling turn);
+* default decode keeping the grammar markers and stripping the rest;
 * ``parse_thinking`` / ``parse_tool_calls`` alone and chained the way the
   scheduler chains them;
 * malformed and truncated harmony degrading to raw content with a warning;
 * the shared response seam (``BatchScheduler._chat_completion_body``) on both
   the batch path (``_write_pool_completion``) and the turn path
-  (``build_turn_response``).
+  (``build_turn_response``);
+* the server flags resolving against the model default, and the whole default
+  path (worker decode, then the response seam) from sampled ids.
 """
 
 import __future__
 import ast
 import copy
+import dataclasses
+import importlib
 import importlib.util
 import json
 import logging
 import sys
 import time
+import types
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,10 +38,12 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 import tiktoken
+import torch
 
 from batchgen.config import tokenizer_assets as ta
 from batchgen.models.openai.gpt_oss_120b import tokenizer as gpt_oss_tok
 from batchgen.models.openai.gpt_oss_120b.tokenizer import (
+    GPT_OSS_GRAMMAR_TOKEN_IDS,
     GPT_OSS_SPECIAL_TOKENS,
     GPT_OSS_STOP_TOKEN_IDS,
     GPTOssTokenizer,
@@ -41,6 +51,7 @@ from batchgen.models.openai.gpt_oss_120b.tokenizer import (
     parse_harmony,
 )
 from batchgen.worker.completion import CompletionContext, CompletionHandler
+from tests.worker_method_source import load_worker_methods
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "batchgen" / "models" / "openai" / "gpt_oss_120b"
@@ -354,7 +365,8 @@ def test_header_without_message_marker_degrades(caplog):
 
 
 def test_text_without_harmony_markers_warns_once(caplog):
-    """The stripped decode (no --detokenization-include-special-tokens)."""
+    """Text with every marker stripped (what decode produced before the
+    grammar markers became non-skipped)."""
     tok = _parser()
     stripped = "analysisUser asks weather.assistantfinalIt is 21 C."
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
@@ -364,7 +376,7 @@ def test_text_without_harmony_markers_warns_once(caplog):
     assert second == (None, stripped)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "--detokenization-include-special-tokens" in warnings[0].getMessage()
+    assert "no harmony message markers" in warnings[0].getMessage()
     assert tok.parse_tool_calls(stripped) == (None, stripped)
 
 
@@ -417,7 +429,8 @@ def test_serialize_round_trips_through_parse():
 
 
 SEAM_METHODS = (
-    "_parse_output", "_chat_completion_body", "_write_pool_completion",
+    "_parse_output", "_effective_output_parsing", "_chat_completion_body",
+    "_write_pool_completion",
     "_append_pool_result_item", "build_turn_response",
 )
 
@@ -481,7 +494,8 @@ def _isolated_scheduler_class():
 MODEL = "openai/gpt-oss-120b"
 
 
-def _scheduler(tmp_path, parse_thinking=True, parse_tool_call=True):
+def _scheduler(tmp_path, parse_thinking=None, parse_tool_call=None, tok=None):
+    """The seam with the server's flags; None (the default) = model default."""
     cls = _isolated_scheduler_class()
     scheduler = cls.__new__(cls)
     scheduler.server_args = SimpleNamespace(
@@ -489,7 +503,7 @@ def _scheduler(tmp_path, parse_thinking=True, parse_tool_call=True):
         parse_thinking=parse_thinking,
         parse_tool_call=parse_tool_call,
     )
-    tok = _parser()
+    tok = _parser() if tok is None else tok
     scheduler._get_tokenizer = lambda model: tok
     scheduler._pool_request_meta = {
         "batch-1": {
@@ -575,3 +589,294 @@ def test_flags_off_leave_the_raw_harmony_text(tmp_path):
     )
     message = body["choices"][0]["message"]
     assert message == {"role": "assistant", "content": ANALYSIS + TOOL_CALL}
+
+
+# --------------------------------------------------------------------------- #
+# Default decode keeps the harmony grammar
+# --------------------------------------------------------------------------- #
+
+
+GRAMMAR_MARKERS = (
+    "<|start|>", "<|channel|>", "<|constrain|>", "<|message|>",
+    "<|end|>", "<|call|>", "<|return|>",
+)
+
+
+def test_grammar_token_ids_are_the_harmony_markers():
+    assert GPT_OSS_GRAMMAR_TOKEN_IDS == frozenset(
+        GPT_OSS_SPECIAL_TOKENS[m] for m in GRAMMAR_MARKERS
+    )
+
+
+def test_default_decode_keeps_grammar_markers(byte_tokenizer):
+    text = ANALYSIS + TOOL_CALL
+    ids = byte_tokenizer.encode(text)
+    assert byte_tokenizer.decode(ids, skip_special_tokens=True) == text
+    for marker in GRAMMAR_MARKERS:
+        (marker_id,) = byte_tokenizer.encode(marker)
+        assert byte_tokenizer.decode([marker_id], skip_special_tokens=True) == marker
+
+
+@pytest.mark.parametrize("token_id", [
+    GPT_OSS_SPECIAL_TOKENS["<|startoftext|>"],
+    GPT_OSS_SPECIAL_TOKENS["<|endoftext|>"],
+    GPT_OSS_SPECIAL_TOKENS["<|reserved_200000|>"],
+    GPT_OSS_SPECIAL_TOKENS["<|reserved_200011|>"],
+    200013, 200018, 201087,
+])
+def test_default_decode_strips_non_grammar_specials(byte_tokenizer, token_id):
+    body = byte_tokenizer.encode("<|channel|>final<|message|>hi")
+    assert byte_tokenizer.decode(body + [token_id], skip_special_tokens=True) == (
+        "<|channel|>final<|message|>hi"
+    )
+
+
+def test_include_special_tokens_decode_is_unchanged(byte_tokenizer):
+    ids = byte_tokenizer.encode(FINAL) + [GPT_OSS_SPECIAL_TOKENS["<|endoftext|>"]]
+    assert byte_tokenizer.decode(ids, skip_special_tokens=False) == FINAL + "<|endoftext|>"
+
+
+# --------------------------------------------------------------------------- #
+# Output parsing flags: None = the model's default, explicit flags override
+# --------------------------------------------------------------------------- #
+
+
+def _non_harmony_tokenizer():
+    from batchgen.config.tokenizer_registry import load_tokenizer
+    return load_tokenizer("deepseek-ai/DeepSeek-R1")
+
+
+def test_model_declared_defaults():
+    from batchgen.config.base_tokenizer import BaseTokenizer
+    assert (BaseTokenizer.parse_thinking_default,
+            BaseTokenizer.parse_tool_call_default) == (False, False)
+    assert (GPTOssTokenizer.parse_thinking_default,
+            GPTOssTokenizer.parse_tool_call_default) == (True, True)
+    tok = _non_harmony_tokenizer()
+    assert (tok.parse_thinking_default, tok.parse_tool_call_default) == (False, False)
+
+
+@pytest.mark.parametrize("flags, gpt_oss, other", [
+    ((None, None), (True, True), (False, False)),
+    ((True, True), (True, True), (True, True)),
+    ((False, False), (False, False), (False, False)),
+    ((False, None), (False, True), (False, False)),
+    ((None, False), (True, False), (False, False)),
+    ((True, None), (True, True), (True, False)),
+    ((None, True), (True, True), (False, True)),
+])
+def test_flag_resolution(tmp_path, flags, gpt_oss, other):
+    scheduler = _scheduler(tmp_path, *flags)
+    assert scheduler._effective_output_parsing(_parser()) == gpt_oss
+    assert scheduler._effective_output_parsing(_non_harmony_tokenizer()) == other
+
+
+def test_non_harmony_model_default_leaves_content_raw(tmp_path):
+    raw = "<think>Let me reason.</think>The answer is 42."
+    tok = _non_harmony_tokenizer()
+    body = _scheduler(tmp_path, tok=tok)._chat_completion_body(
+        "deepseek-ai/DeepSeek-R1", _worker_result(raw), int(time.time()),
+    )
+    assert body["choices"][0]["message"] == {"role": "assistant", "content": raw}
+    body = _scheduler(tmp_path, parse_thinking=True, tok=tok)._chat_completion_body(
+        "deepseek-ai/DeepSeek-R1", _worker_result(raw), int(time.time()),
+    )
+    message = body["choices"][0]["message"]
+    assert message["content"] == "The answer is 42."
+    assert message["reasoning_content"] == "Let me reason."
+
+
+# --------------------------------------------------------------------------- #
+# The default server path end to end: sampled ids -> worker decode -> response
+# --------------------------------------------------------------------------- #
+
+
+_WORKER_DECODE = load_worker_methods(
+    ["_decode_tokens_to_string"], {"torch": torch}
+)["_decode_tokens_to_string"]
+
+
+def _load_server_args_module():
+    """server_args without the batchgen.server package init (uvicorn)."""
+    previous = sys.modules.get("batchgen.server")
+    package = types.ModuleType("batchgen.server")
+    package.__path__ = [str(ROOT / "batchgen" / "server")]
+    sys.modules["batchgen.server"] = package
+    try:
+        return importlib.import_module("batchgen.server.server_args")
+    finally:
+        if previous is None:
+            sys.modules.pop("batchgen.server", None)
+        else:
+            sys.modules["batchgen.server"] = previous
+
+
+def _default_server_args():
+    """parse_thinking / parse_tool_call / detokenization defaults of ServerArgs."""
+    ServerArgs = _load_server_args_module().ServerArgs
+    fields = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+    return (fields["parse_thinking"], fields["parse_tool_call"],
+            fields["detokenization_include_special_tokens"])
+
+
+def _served_message(tmp_path, tok, sampled_text, *, max_tokens=None,
+                    parse_thinking=None, parse_tool_call=None,
+                    include_special_tokens=False):
+    """Run the sampled ids through the stop predicate, the real worker decode
+    and the real response seam, with the given server flags."""
+    ctx = CompletionContext(
+        eos_token_ids=frozenset(tok.eos_token_ids),
+        model_context_length=1 << 20, rank=0,
+    )
+    generated = []
+    for token_id in tok.encode(sampled_text):
+        generated.append(token_id)
+        if CompletionHandler.should_stop_at_eos(ctx, token_id):
+            break
+        if max_tokens is not None and len(generated) == max_tokens:
+            break
+    # The trajectory buffer is padded past the generated tokens.
+    buffer = torch.tensor(generated + [tok.pad_token_id] * 4, dtype=torch.int64)
+    worker = SimpleNamespace(
+        eos_token_ids=tok.eos_token_ids, pad_token_id=tok.pad_token_id,
+        tokenizer=tok,
+        detokenization_include_special_tokens=include_special_tokens,
+    )
+    text = _WORKER_DECODE(worker, buffer)
+    scheduler = _scheduler(tmp_path, parse_thinking, parse_tool_call, tok=tok)
+    body = scheduler._chat_completion_body(MODEL, _worker_result(text), int(time.time()))
+    return text, body["choices"][0]["message"]
+
+
+SIMPLE_TURN = (
+    "<|channel|>analysis<|message|>The user asks: what is 2+3? So answer: 5.<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>5<|return|>"
+)
+
+
+def test_server_defaults_resolve_to_the_model():
+    assert _default_server_args() == (None, None, False)
+
+
+def test_default_server_returns_reasoning_and_content(tmp_path, byte_tokenizer):
+    """The reported failure: with default flags gpt-oss content was
+    'analysisThe user asks: ... So answer: 5.assistantfinal5'."""
+    parse_thinking, parse_tool_call, include = _default_server_args()
+    text, message = _served_message(
+        tmp_path, byte_tokenizer, SIMPLE_TURN,
+        parse_thinking=parse_thinking, parse_tool_call=parse_tool_call,
+        include_special_tokens=include,
+    )
+    assert text == SIMPLE_TURN
+    assert message == {
+        "role": "assistant",
+        "content": "5",
+        "reasoning_content": "The user asks: what is 2+3? So answer: 5.",
+    }
+
+
+def test_default_server_truncated_analysis_is_partial_reasoning(tmp_path, byte_tokenizer):
+    prefix = "<|channel|>analysis<|message|>The user asks"
+    _, message = _served_message(
+        tmp_path, byte_tokenizer, SIMPLE_TURN,
+        max_tokens=len(byte_tokenizer.encode(prefix)),
+    )
+    assert message == {
+        "role": "assistant", "content": "", "reasoning_content": "The user asks",
+    }
+
+
+def test_default_server_tool_call_ended_by_call(tmp_path, byte_tokenizer):
+    fabricated = (
+        "<|start|>functions.get_weather to=assistant<|channel|>commentary"
+        '<|message|>{"temp": 99}<|end|>'
+    )
+    text, message = _served_message(
+        tmp_path, byte_tokenizer, ANALYSIS + TOOL_CALL + fabricated,
+    )
+    assert text.endswith("<|call|>")
+    _assert_tool_call_message(message)
+
+
+def test_default_server_truncated_tool_call_stays_raw(tmp_path, byte_tokenizer, caplog):
+    cut = len(byte_tokenizer.encode(ANALYSIS + TOOL_CALL)) - 3
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        text, message = _served_message(
+            tmp_path, byte_tokenizer, ANALYSIS + TOOL_CALL, max_tokens=cut,
+        )
+    assert "tool_calls" not in message
+    assert message["reasoning_content"] == "User asks weather in Paris. Use tool."
+    assert message["content"] == text[len(ANALYSIS):]
+    assert message["content"].startswith("<|start|>assistant<|channel|>commentary to=")
+    assert "<|call|>" not in message["content"]
+    assert "not <|call|>" in caplog.text
+
+
+def test_no_parse_flags_return_recoverable_raw_harmony(tmp_path, byte_tokenizer):
+    text, message = _served_message(
+        tmp_path, byte_tokenizer, SIMPLE_TURN,
+        parse_thinking=False, parse_tool_call=False,
+    )
+    assert message == {"role": "assistant", "content": SIMPLE_TURN}
+    # Recoverable: the raw content parses to the same answer.
+    assert _chain(message["content"])[:2] == (
+        "The user asks: what is 2+3? So answer: 5.", "5",
+    )
+
+
+def test_no_parse_thinking_alone_still_extracts_tool_calls(tmp_path, byte_tokenizer):
+    _, message = _served_message(
+        tmp_path, byte_tokenizer, ANALYSIS + TOOL_CALL, parse_thinking=False,
+    )
+    assert "reasoning_content" not in message
+    assert message["content"] == "<|start|>assistant" + ANALYSIS
+    assert [c["function"]["name"] for c in message["tool_calls"]] == ["get_weather"]
+
+
+def test_endoftext_stop_is_stripped(tmp_path, byte_tokenizer):
+    turn = "<|channel|>final<|message|>done<|endoftext|>"
+    text, message = _served_message(tmp_path, byte_tokenizer, turn)
+    assert text == "<|channel|>final<|message|>done"
+    assert message == {"role": "assistant", "content": "done"}
+
+
+def test_include_special_tokens_flag_still_parses(tmp_path, byte_tokenizer):
+    text, message = _served_message(
+        tmp_path, byte_tokenizer, SIMPLE_TURN, include_special_tokens=True,
+    )
+    assert text == SIMPLE_TURN
+    assert message["content"] == "5"
+
+
+# --------------------------------------------------------------------------- #
+# A completion that is nothing but grammar markers is an empty message
+# (first-token stop: the decode slice's min-token floor keeps the marker)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bare", ["<|return|>", "<|call|>", "<|end|>",
+                                  "<|return|>\n", " <|call|> "])
+def test_bare_stop_marker_parses_as_empty_message(bare, caplog):
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        reasoning, content, calls = _chain(bare)
+    assert reasoning is None
+    assert content == ""
+    assert calls is None
+    assert caplog.records == []
+
+
+def test_bare_marker_with_payload_still_falls_back_raw():
+    # Anything beyond markers keeps the existing raw fallback.
+    reasoning, content = _parser().parse_thinking("<|return|>oops")
+    assert reasoning is None
+    assert content == "<|return|>oops"
+
+
+def test_parse_tool_calls_alone_empties_a_bare_marker():
+    # parse_tool_calls may run without parse_thinking (thinking parsing
+    # off); a bare marker is an empty message there too. The --no-parse
+    # contract is unaffected: with parsing off the server never calls
+    # either method.
+    tok = _parser()
+    calls, content = tok.parse_tool_calls("<|return|>")
+    assert calls is None and content == ""

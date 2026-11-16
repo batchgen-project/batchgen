@@ -1759,24 +1759,33 @@ def _worker_seam(harness, restorer, *, compute_cached, planned):
         compile(ast.Module(body=nodes, type_ignores=[]), str(worker_source), "exec"),
         namespace,
     )
+    from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
     seq = SimpleNamespace(uuid="u9", global_idx=9, decode_dp_group=0)
     worker = SimpleNamespace(
         rank=0,
         global_batch=SimpleNamespace(get_sequence={"u9": seq}.get),
         _local_to_uuid_map={0: "u9"},
-        _trajectory_frontier_committer=harness.committer,
-        _trajectory_restorer=restorer,
-        _trajectory_mirrored_restores={},
-        _trajectory_attachments={9: _hit(harness, restorer)},
-        _prefix_sequence_states={
-            9: PrefixCacheSequenceState(
-                lookup_result=None,
-                attached_tokens=compute_cached,
-                compute_cached_tokens=compute_cached,
-                trajectory_restore_boundary=planned,
-            )
-        },
+        _host_views_by_group=lambda: {},
+        _next_pool_segment_sid=lambda: -1,
     )
+    attach_trajectory_state(
+        worker,
+        trajectory_frontier_committer=harness.committer,
+        trajectory_restorer=restorer,
+        trajectory_mirrored_restores={},
+        trajectory_attachments={9: _hit(harness, restorer)},
+    )
+    attach_prefix_state(worker, prefix_sequence_states={
+        9: PrefixCacheSequenceState(
+            lookup_result=None,
+            attached_tokens=compute_cached,
+            compute_cached_tokens=compute_cached,
+            trajectory_restore_boundary=planned,
+        )
+    })
+    # Aliases kept for the assertions below.
+    worker._trajectory_attachments = worker._traj.trajectory_attachments
+    worker._prefix_sequence_states = worker._prefix.prefix_sequence_states
     for name in names:
         setattr(worker, name, types.MethodType(namespace[name], worker))
     return worker, seq

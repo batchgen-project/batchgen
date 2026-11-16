@@ -22,6 +22,8 @@ from typing import List
 import pytest
 import torch
 
+from tests.worker.worker_fakes import attach_identity
+
 from batchgen.decode_dp_group import (
     decode_group_plan_digest,
     first_group_disagreement,
@@ -91,10 +93,12 @@ def _worker(seqs, *, rank, world_size, G, dist_obj=None, bound=()):
         "_owns_local_sequence",
         namespace={"dist": dist_obj} if dist_obj is not None else None,
     )
-    worker = SimpleNamespace(
-        rank=rank, world_size=world_size, torch_device=torch.device("cpu"),
-        global_batch=_Batch(seqs),
-        _uuid_to_local_map={uuid: index for index, uuid in enumerate(bound)},
+    worker = SimpleNamespace(torch_device=torch.device("cpu"),
+                             global_batch=_Batch(seqs))
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=world_size,
+        decode_group_size=G, bound=list(bound),
     )
     worker._decode_attn_tp_size = lambda: G
     for name, function in methods.items():

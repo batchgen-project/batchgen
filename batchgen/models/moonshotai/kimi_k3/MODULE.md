@@ -39,8 +39,9 @@ that renderer verbatim rather than porting it.
 
 ## Serving gates — decide these before running K3 in production
 
-1. **`--parse-thinking` is effectively required.** With the server defaults
-   (`parse_thinking=False`), the API `content` field is raw XTML, e.g.
+1. **`--parse-thinking` is effectively required.** K3 declares no parsing
+   default (`parse_thinking_default=False`), so without the flag the API
+   `content` field is raw XTML, e.g.
    `'thoughts<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|>'`.
    That decode is *correct* — `<|open|>/<|close|>/<|sep|>` are `"special": false`
    so `skip_special_tokens=True` must not strip them — but no other model in the

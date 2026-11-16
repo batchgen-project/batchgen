@@ -667,6 +667,26 @@ def run_runtime_preflight(server_args: object) -> str:
     if contract.require_deepgemm:
         _check_deepgemm()
 
+    # JIT coverage: every operator slot the model family declares must
+    # resolve to a validated backend whose key-space inventory is registered,
+    # or the launch would JIT-compile (or silently fall back) after readiness.
+    # Registrations are loaded by the model/tokenizer registry warm-ups above
+    # (each family's config imports its jit_coverage declarations), so this
+    # runs after _check_tokenizer.
+    from batchgen_kernels.jit_site_registry import (
+        JitCoverageError,
+        check_model_type_coverage,
+    )
+
+    try:
+        covered_slots = check_model_type_coverage(model_type)
+    except JitCoverageError as exc:
+        raise RuntimePreflightError(
+            f"JIT coverage check failed for model type {model_type!r}: {exc}"
+        ) from exc
+    if covered_slots:
+        _manifest["jit_slots"] = ", ".join(covered_slots)
+
     logger.info(
         "[runtime-preflight] passed model=%s model_type=%s root=%s manifest=%s",
         model,
