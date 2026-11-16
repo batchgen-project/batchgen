@@ -155,6 +155,9 @@ DEEP_GEMM_INVENTORY = register_backend_inventory(BackendInventory(
         (_SCORER, "warm_paged_mqa_logits", "paged_mqa_logits_schedule_meta"):
             (1, ("paged_mqa",)),
     },
+    # The shared DSA scorer sources above serve Kimi-K3.1 too; its own
+    # deep_gemm call sites are the kimi_linear part.
+    family="glm5",
 ))
 
 

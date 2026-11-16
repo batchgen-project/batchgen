@@ -1205,6 +1205,8 @@ class KimiLinearParallelStrategyManager:
 
     def configure_prefill(self):
         """Build the model if needed and switch to the selected prefill mode."""
+        if self._is_k3:
+            self._check_late_deepgemm_compiles("configure_prefill")
         if self.model is None:
             self._build_model()
         self._enter_prefill()
@@ -1222,6 +1224,13 @@ class KimiLinearParallelStrategyManager:
         phase switches return at once. The node-local attention-TP ranks share
         one Triton cache directory, so they split the compiles and meet at a
         barrier on that group before every rank loads the full set.
+
+        The prefill row bound is the larger of the micro-batch token cap and
+        the longest prompt: the micro-batch planner splits only between
+        sequences, so a longer prompt is a micro-batch of its own and reaches
+        the KDA o_norm at its full length. On Kimi-K3.1 the DSA indexer's
+        decode keys are planned from the deployment the decode configure
+        that ran first left behind (``_dsa_prewarm_deployment``).
         """
         if not torch.cuda.is_available():
             return
@@ -1250,24 +1259,91 @@ class KimiLinearParallelStrategyManager:
 
                 barrier = _group_barrier
 
+        cap = int(getattr(
+            self.engine_config.Module_Batching_Config,
+            "prefill_micro_batch_token_cap", 0) or 0)
+        prompt = int(basic.get_max_prompt_length() or 0)
         start = time.perf_counter()
         if prewarm_k3_triton_kernels(
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
-            max_prefill_tokens=int(getattr(
-                self.engine_config.Module_Batching_Config,
-                "prefill_micro_batch_token_cap", 0) or 0),
+            max_prefill_tokens=max(cap, prompt) if cap > 0 else 0,
             part_index=part_index,
             part_count=part_count,
             barrier=barrier,
             rank=self.global_rank,
+            attn_tp_size=int(self._attn_tp_size),
+            dsa_deployment=self._dsa_prewarm_deployment(buckets),
         ):
             logging.info(
                 "[K3_TRITON_WARMUP] rank=%s total wall=%.1fs",
                 self.global_rank,
                 time.perf_counter() - start,
             )
+
+    def _dsa_prewarm_deployment(self, buckets):
+        """The decode deployment facts the Kimi-K3.1 DSA kernel keys depend
+        on, or None for a model without the indexer.
+
+        * page size: the live GPU KV manager's when one is bound, else the
+          engine config's deployment page size (the startup decode probe's
+          source too); the dual coordinator keeps primary and aux equal;
+        * context bound: the larger of the configured deployment length and
+          the checkpoint's ``max_position_embeddings`` -- the verified
+          length (``prepare_deployment``, after this prewarm) never exceeds
+          it, and the DSA witnesses cover every page-table width below it;
+        * decode rows: the per-rank decode cap ``configure_decoding`` was
+          sized for (the K3 startup configures decode first), and at least
+          the top graph bucket.
+        """
+        config = self.loaded_model_config
+        dsa = getattr(config, "dsa", None)
+        if dsa is None or dsa() is None:
+            return None
+        from .dsa_prewarm import KimiDsaDeployment
+
+        basic = self.engine_config.Basic_Config
+        manager_config = getattr(AttnWrapperBase.gpu_paged_kv_manager,
+                                 "config", None)
+        page_size = int(
+            getattr(manager_config, "page_size_tokens", 0)
+            or getattr(getattr(self.engine_config, "Device_Paged_KV_Config",
+                               None), "page_size", 0)
+            or 0
+        )
+        max_model_len = max(
+            int(getattr(basic, "max_model_len", 0) or 0),
+            int(getattr(config, "max_position_embeddings", 0) or 0),
+        )
+        max_rows = max(
+            int(getattr(self, "padding_bsz", 0) or 0),
+            max((int(b) for b in buckets), default=0),
+        )
+        return KimiDsaDeployment(page_size=page_size,
+                                 max_model_len=max_model_len,
+                                 max_decode_rows=max_rows)
+
+    def arm_late_compile_guard(self):
+        """Arm the Triton and DeepGEMM late-compile guards for good.
+
+        The worker calls this as its rank reports ready; every kernel
+        compiled after it is reported as late (``triton_prewarm``).
+        """
+        if not self._is_k3 or not torch.cuda.is_available():
+            return
+        from .triton_prewarm import arm_at_readiness
+
+        arm_at_readiness(self.global_rank)
+
+    def _check_late_deepgemm_compiles(self, where):
+        """Log the DeepGEMM kernels compiled since readiness;
+        ``batchgen_debug.k3_triton_strict`` makes it raise."""
+        if not torch.cuda.is_available():
+            return
+        from .triton_prewarm import check_late_deepgemm_compiles
+
+        check_late_deepgemm_compiles(self.global_rank, where)
 
     def _enter_prefill(self):
         """Switch the built model to streamed, streamed-SP8 or resident-EP prefill.
@@ -1366,6 +1442,8 @@ class KimiLinearParallelStrategyManager:
                 "(max_tokens=1 still enters decode today — see PREFILL_PLAN "
                 "C4) or turn the flag off."
             )
+        if self._is_k3:
+            self._check_late_deepgemm_compiles("configure_decoding")
         if comm is not None:
             self._comm = comm
         if padding_bsz is not None:
