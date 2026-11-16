@@ -105,8 +105,7 @@ def test_random_prefill_shapes_compile_nothing_after_prewarm():
     if not recorder.install():
         pytest.skip("this Triton exposes no compile hooks")
     layer, template = _layer(), _template()
-    entries = tp.kda_prefill_entries(layer, template, SEGMENT_TOKENS,
-                                     max_prefill_tokens=MAX_PREFILL_TOKENS)
+    entries = tp.kda_prefill_entries(layer, template, SEGMENT_TOKENS)
     with torch.inference_mode():
         reports = tp.run_prewarm(entries, recorder=recorder)
     assert reports[0].failed == 0

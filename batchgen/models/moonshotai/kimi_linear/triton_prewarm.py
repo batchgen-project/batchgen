@@ -32,12 +32,17 @@ Parts:
   * ``prewarm_k3_triton_kernels``: phase 1 partitions the entries over the
     node-local attention-TP ranks, which share one Triton cache directory;
     after a barrier, phase 2 runs every entry on every rank, loading from
-    that cache into each process's in-memory kernel cache.
+    that cache into each process's in-memory kernel cache;
+  * on Kimi-K3.1 the DSA indexer's Triton and DeepGEMM entries
+    (``dsa_prewarm``) join the same list, and ``arm_at_readiness`` arms the
+    Triton guard for good and snapshots the DeepGEMM cache when the worker
+    reports ready, so a later compile of either backend is reported.
 
 Importable without Triton or fla: every GPU dependency is imported lazily.
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -85,6 +90,14 @@ PAGE_TABLE_COLS = (16, 17)
 # Page size when no paged-KV manager exists yet at prewarm time; the serving
 # page sizes are powers of two from 16 up, so all share this int class.
 DEFAULT_PAGE_SIZE_TOKENS = 64
+
+# Tag of the DeepGEMM late-compile guard's lines (the guard itself is the
+# model-agnostic one in ``glm5.deepgemm_prewarm``).
+DEEPGEMM_LOG_TAG = "[K3_DEEPGEMM_WARMUP]"
+
+
+class K3PrewarmGeometryError(RuntimeError):
+    """The live model disagrees with the config-derived prewarm shapes."""
 
 
 # ============================================================================
@@ -337,6 +350,57 @@ def _run_kda_decode(module, template, rows: int) -> None:
 O_NORM_ROWS_PER_BLOCK = 2048 * 32
 
 
+@dataclass(frozen=True)
+class GatedNormSite:
+    """One caller of fla's ``layer_norm_gated_fwd`` on the serving path:
+    the normalised width (a constexpr of the kernel) and the rows it
+    normalises per token (the input is ``[tokens, rows_per_token, width]``
+    flattened to ``tokens * rows_per_token`` rows)."""
+
+    name: str
+    width: int
+    rows_per_token: int
+
+
+def gated_norm_sites(config, attn_tp_size: int) -> List[GatedNormSite]:
+    """Every ``layer_norm_gated_fwd`` caller of a Kimi-Linear model.
+
+    The only one is the KDA output norm (``FusedRMSNormGated(head_dim)``,
+    applied to ``o.reshape(tokens, num_heads, head_dim)`` on prefill and
+    decode). KDA heads are sharded over attention TP. The MLA/DSA layers
+    gate with a plain sigmoid and normalise with ``KimiRMSNorm`` /
+    ``LayerNorm`` (``row_kernel_entries``, torch), and the latent MoE norm is
+    a ``KimiRMSNorm``: none of them reaches the gated kernel.
+    """
+    if not getattr(config, "linear_attn_config", None):
+        return []
+    heads = int(config.kda_num_heads)
+    tp = int(attn_tp_size)
+    if tp < 1 or heads % tp:
+        raise K3PrewarmGeometryError(
+            f"{heads} KDA heads do not shard over attention TP {tp}"
+        )
+    return [GatedNormSite("kda_o_norm", int(config.kda_head_dim), heads // tp)]
+
+
+def o_norm_minimal_token_counts(heads: int) -> List[int]:
+    """The smallest token counts that cover the o_norm kernel's runtime-int
+    classes: one flattened row count (``tokens * heads``) divisible by 16 and
+    one that is not (reachable only when ``heads`` itself is not a multiple
+    of 16), plus a one-token call for the smallest grid.
+
+    This is the floor the site always gets, alongside the block-count
+    coverage ``o_norm_token_counts`` derives from the serving row-block
+    constant: a site that never runs here compiles inside the first request
+    (observed 2026-11-16, k3a3/k3a4 leg1: the uncut packed range reached a
+    block-count key the prewarm never ran, and the first batch compiled
+    nine binaries plus its autotune record).
+    """
+    heads = int(heads)
+    aligned = 16 // math.gcd(heads, 16)
+    return sorted({1, aligned, aligned + 1})
+
+
 def o_norm_token_counts(heads: int, max_tokens: int) -> List[int]:
     """Token counts that reach every o_norm block count up to
     ``max_tokens``, each with a row count divisible by 16 and one that is not."""
@@ -364,8 +428,7 @@ def _run_o_norm(o_norm, heads: int, head_dim: int, tokens_list, dtype,
 
 
 def kda_prefill_entries(module, template, segment_tokens: int,
-                        shapes=KDA_PREFILL_SHAPES,
-                        max_prefill_tokens: int = 0) -> List[PrewarmEntry]:
+                        shapes=KDA_PREFILL_SHAPES) -> List[PrewarmEntry]:
     entries = [
         PrewarmEntry(
             f"kda_prefill/{shape.name}",
@@ -377,14 +440,23 @@ def kda_prefill_entries(module, template, segment_tokens: int,
     weight = module.q_proj.weight
     entries.extend(beta_sigmoid_entries(module.num_heads, weight.dtype,
                                         weight.device))
-    if max_prefill_tokens > 0:
-        heads, head_dim = int(module.num_heads), int(module.head_dim)
-        tokens_list = o_norm_token_counts(heads, max_prefill_tokens)
-        entries.append(PrewarmEntry(
-            f"kda_o_norm/max{int(max_prefill_tokens)}",
-            partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
-                    weight.dtype, weight.device),
-        ))
+    heads, head_dim = int(module.num_heads), int(module.head_dim)
+    # Serving runs the gated output norm in fixed row blocks of
+    # KDA_PREFILL_SEGMENT_TOKENS (serving_modules._o_norm_segments), so the
+    # reachable autotune keys are exactly those of 1..that-constant tokens;
+    # warm every block-count bucket in both row-alignment classes, plus the
+    # one-token floor for the smallest grid.
+    from .serving_modules import KDA_PREFILL_SEGMENT_TOKENS
+
+    tokens_list = sorted(
+        set(o_norm_minimal_token_counts(heads))
+        | set(o_norm_token_counts(heads, KDA_PREFILL_SEGMENT_TOKENS))
+    )
+    entries.append(PrewarmEntry(
+        f"kda_o_norm/seg{int(KDA_PREFILL_SEGMENT_TOKENS)}",
+        partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
+                weight.dtype, weight.device),
+    ))
     return entries
 
 
@@ -613,9 +685,54 @@ def row_kernel_entries(model, config, act_dtype, device) -> List[PrewarmEntry]:
     return entries
 
 
+def _check_o_norm_site(module, sites) -> None:
+    """The live KDA module must normalise the config-derived width over the
+    config-derived heads, or the o_norm entries would warm another key."""
+    site = next((s for s in sites if s.name == "kda_o_norm"), None)
+    if site is None:
+        return
+    live = (int(module.head_dim), int(module.num_heads))
+    if live != (site.width, site.rows_per_token):
+        raise K3PrewarmGeometryError(
+            f"KDA o_norm: the live module normalises width {live[0]} over "
+            f"{live[1]} heads, the config gives width {site.width} over "
+            f"{site.rows_per_token} heads per attention-TP rank"
+        )
+
+
+def dsa_prewarm_entries(config, dsa_deployment, device) -> List[PrewarmEntry]:
+    """Kimi-K3.1's DSA indexer entries (``dsa_prewarm``); none for K3."""
+    dsa = getattr(config, "dsa", None)
+    if dsa is None or dsa() is None:
+        return []
+    from batchgen.models.moonshotai.kimi_linear import dsa_prewarm
+
+    if dsa_deployment is None:
+        raise dsa_prewarm.KimiDsaPrewarmError(
+            "Kimi-K3.1 prewarm needs the decode deployment (page size, "
+            "context bound, decode row cap) to plan the DSA kernel keys"
+        )
+    shapes = dsa_prewarm.KimiDsaPrewarmShapes.from_config(
+        config,
+        page_size=dsa_deployment.page_size,
+        max_model_len=dsa_deployment.max_model_len,
+        max_decode_rows=dsa_deployment.max_decode_rows,
+    )
+    return dsa_prewarm.dsa_entries(shapes, device)
+
+
 def build_prewarm_entries(model, config, decode_buckets,
-                          max_prefill_tokens: int = 0) -> List[PrewarmEntry]:
-    """The deterministic entry list; identical on every rank of a node."""
+                          attn_tp_size: Optional[int] = None,
+                          dsa_deployment=None) -> List[PrewarmEntry]:
+    """The deterministic entry list; identical on every rank of a node.
+
+    ``attn_tp_size`` checks the live KDA module against ``gated_norm_sites``.
+    ``dsa_deployment`` (``dsa_prewarm.KimiDsaDeployment``) is required on
+    Kimi-K3.1. The o_norm coverage needs no deployment bound: serving runs
+    the norm in fixed ``KDA_PREFILL_SEGMENT_TOKENS`` row blocks
+    (``serving_modules._o_norm_segments``), so its reachable autotune keys
+    derive from that constant alone.
+    """
     from .serving_modules import KDA_PREFILL_SEGMENT_TOKENS
     from .wrappers import KimiLinearKDAWrapper
 
@@ -639,6 +756,9 @@ def build_prewarm_entries(model, config, decode_buckets,
             )
         else:
             act_dtype, device = weight.dtype, weight.device
+            if attn_tp_size is not None:
+                _check_o_norm_site(module,
+                                   gated_norm_sites(config, attn_tp_size))
             # The prefill mode's cap (_set_prefill_memory_tiling), else the
             # serving default the wrapper falls back to.
             segment_tokens = (
@@ -646,8 +766,7 @@ def build_prewarm_entries(model, config, decode_buckets,
                 or KDA_PREFILL_SEGMENT_TOKENS
             )
             entries.extend(kda_prefill_entries(
-                module, template, segment_tokens,
-                max_prefill_tokens=max_prefill_tokens))
+                module, template, segment_tokens))
             entries.extend(kda_decode_entries(module, template,
                                               decode_buckets))
     if device is None:
@@ -656,6 +775,7 @@ def build_prewarm_entries(model, config, decode_buckets,
     entries.extend(row_kernel_entries(model, config, act_dtype, device))
     entries.extend(mla_kv_write_entries(model, config, decode_buckets,
                                         device))
+    entries.extend(dsa_prewarm_entries(config, dsa_deployment, device))
     return entries
 
 
@@ -676,9 +796,11 @@ _PREWARM_DONE = False
 
 
 def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
-                              max_prefill_tokens=0, part_index=0,
-                              part_count=1, barrier=None, rank=0) -> bool:
-    """Compile every planned K3 Triton key, then arm the late-compile guard.
+                              part_index=0,
+                              part_count=1, barrier=None, rank=0,
+                              attn_tp_size=None, dsa_deployment=None) -> bool:
+    """Compile every planned K3 Triton key (and, on K3.1, the DSA indexer's
+    Triton and DeepGEMM keys), then arm the late-compile guard.
 
     Once per process: the in-memory kernel caches outlive model rebuilds,
     and a worker restart is a new process that runs it again. Returns
@@ -690,8 +812,10 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
     recorder = get_recorder()
     active = recorder if recorder.install() else None
     with torch.inference_mode():
-        entries = build_prewarm_entries(model, config, decode_buckets,
-                                        max_prefill_tokens=max_prefill_tokens)
+        entries = build_prewarm_entries(
+            model, config, decode_buckets,
+            attn_tp_size=attn_tp_size, dsa_deployment=dsa_deployment,
+        )
         run_prewarm(
             entries, recorder=active, part_index=part_index,
             part_count=part_count, barrier=barrier, rank=rank,
@@ -712,3 +836,35 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
         )
     _PREWARM_DONE = True
     return True
+
+
+# ============================================================================
+#  Readiness
+# ============================================================================
+
+
+def _deepgemm_guard():
+    """The model-agnostic DeepGEMM late-compile guard (node-wide kernel
+    cache, one baseline per process), imported on use."""
+    from batchgen.models.glm.glm5 import deepgemm_prewarm
+
+    return deepgemm_prewarm
+
+
+def arm_at_readiness(rank, strict: bool = False) -> None:
+    """Arm both late-compile guards for good when the worker reports ready:
+    the Triton guard refuses every later ``disarm`` and the DeepGEMM guard
+    snapshots the cache's kernel names, so every later compile of either
+    backend is reported as late."""
+    get_recorder()  # bind K3's log tag and batch-debug source first
+    _core.arm_at_readiness(strict=strict, rank=rank)
+    _deepgemm_guard().record_baseline(rank, log_tag=DEEPGEMM_LOG_TAG)
+
+
+def check_late_deepgemm_compiles(rank, where: str):
+    """Report the DeepGEMM kernels compiled since readiness (WARNING; raises
+    under ``batchgen_debug.k3_triton_strict``). None before readiness."""
+    return _deepgemm_guard().check_late_compiles(
+        rank, where, strict=strict_requested(_batch_debug()),
+        log_tag=DEEPGEMM_LOG_TAG,
+    )

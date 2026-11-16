@@ -780,19 +780,23 @@ _BASELINE: Optional[frozenset] = None
 _UNARMED_REPORTED: set = set()
 
 
-def record_baseline(rank) -> frozenset:
+def record_baseline(rank, log_tag: str = LOG_TAG) -> frozenset:
     """Arm the guard: snapshot the cache's kernel names. Later compiles are
-    the names that are not in it."""
+    the names that are not in it.
+
+    The guard is model-agnostic (the DeepGEMM cache is one per node and a
+    process serves one model); ``log_tag`` lets another model that shares
+    the DeepGEMM DSA kernels (Kimi-K3.1) report under its own tag."""
     global _BASELINE
     _BASELINE = cache_kernel_names()
     logger.info("%s rank=%s DeepGEMM cache %s holds %d kernels; late-compile "
-                "guard armed on their names", LOG_TAG, rank, jit_cache_dir(),
+                "guard armed on their names", log_tag, rank, jit_cache_dir(),
                 len(_BASELINE))
     return _BASELINE
 
 
-def check_late_compiles(rank, where: str,
-                        strict: bool = False) -> Optional[Tuple[str, ...]]:
+def check_late_compiles(rank, where: str, strict: bool = False,
+                        log_tag: str = LOG_TAG) -> Optional[Tuple[str, ...]]:
     """The kernel names DeepGEMM compiled since the baseline, sorted, each
     reported once (logged at WARNING with its family; ``strict`` raises).
     The cache is node-wide, so the names include every rank of the node.
@@ -810,7 +814,7 @@ def check_late_compiles(rank, where: str,
             logger.info(
                 "%s rank=%s DeepGEMM late-compile guard not armed at %s: no "
                 "kernel-name baseline is recorded yet, so kernels DeepGEMM "
-                "compiles here are NOT checked", LOG_TAG, rank, where,
+                "compiles here are NOT checked", log_tag, rank, where,
             )
         return None
     names = cache_kernel_names()
@@ -826,7 +830,7 @@ def check_late_compiles(rank, where: str,
         + "; names " + ", ".join(late)
     )
     _BASELINE = _BASELINE | names
-    logger.warning("%s rank=%s %s", LOG_TAG, rank, message)
+    logger.warning("%s rank=%s %s", log_tag, rank, message)
     if strict:
         raise LateDeepGemmCompileError(message)
     return late
