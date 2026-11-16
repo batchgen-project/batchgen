@@ -510,24 +510,20 @@ class KimiLinearParallelStrategyManager:
 
     def activate_decoding(self):
         """Switch the kept model into decode: map and refill the resident
-        shard in place; the decode graphs captured at startup are replayed."""
+        shard in place; the decode graphs captured at startup are replayed.
+
+        No ladder assertion here. The startup sequence activates decode
+        before the worker's capture seam runs, and may do so more than once
+        (``worker_lifecycle_engine.prepare_deployment``: load the decode
+        model, size the pool, THEN capture), so an activation cannot tell
+        "the ladder is not captured yet" from "a SUSPEND lost it". The
+        invariant lives where the capture happens instead:
+        ``prewarm_decode_graphs`` refuses to return without a ladder for a
+        kept instance, and a KV-signature change after capture fails loud.
+        """
         self._require_built_model("decoding")
         start = time.perf_counter()
-        reactivation = self.decode_instance is not None
         stages = self._enter_decoding()
-        if self.decode_graphs_persist_across_suspend and reactivation:
-            # A RE-activation: this instance was published and kept across a
-            # SUSPEND, so the ladder captured at startup must still be here.
-            # The FIRST activation builds the instance and runs before the
-            # startup capture, so it legitimately has no ladder yet.
-            graph = self._decode_graph
-            if graph is None or not graph.ladder_captured:
-                raise RuntimeError(
-                    f"Kimi-K3 rank {self.global_rank}: activate_decoding found "
-                    "the kept decode instance without its captured graph "
-                    "ladder; it is captured once per process before readiness "
-                    "and must survive every SUSPEND"
-                )
         self._log_phase_activation("decoding", start, stages)
         return self._publish_decode_instance()
 
