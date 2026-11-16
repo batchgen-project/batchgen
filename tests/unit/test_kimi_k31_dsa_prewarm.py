@@ -177,10 +177,10 @@ def test_constants_match_the_kernel_modules():
     logits = DSA_DIR / "paged_mqa_logits.py"
     assert assigned(logits, "PAGED_MQA_BLOCK_KV") == DP.PAGED_MQA_BLOCK_KV
     assert assigned(logits, "PAGED_MQA_NEXT_N") == DP.PAGED_MQA_NEXT_N
-    from batchgen_kernels.attention.dsa.indexer_k_quant import (
-        SCALE_BYTES_PER_TOKEN,
-    )
-    assert SCALE_BYTES_PER_TOKEN == DP.PAGE_SPLIT_SCALE_BYTES
+    # Read, never import: this module's package pulls in Triton, which a
+    # CPU-only test environment does not have.
+    quant = DSA_DIR / "indexer_k_quant.py"
+    assert assigned(quant, "SCALE_BYTES_PER_TOKEN") == DP.PAGE_SPLIT_SCALE_BYTES
     scorer = (DSA_DIR / "paged_mqa_scorer.py").read_text()
     assert "block_p = min(256, triton.next_power_of_2(max_pages))" in scorer
     assert "(batch + 31) // 32 * 32" in scorer
