@@ -38,6 +38,7 @@ Cross-rank layout contract (mirrors KimiK25MoE._forward_decode):
 """
 
 import logging
+import math
 import time
 
 import torch
@@ -46,9 +47,48 @@ from torch.distributed import ReduceOp
 from batchgen_kernels.triton.fused_moe_bf16 import fused_moe_bf16
 
 
+# ``batchgen.cuda_graph.vmm_arena.VmmArena.carve`` starts every view at a
+# multiple of this many bytes; sizing an arena rounds each row up to it.
+_CARVE_ALIGN_BYTES = 256
+
+
+def _round_up(value, multiple):
+    return (int(value) + int(multiple) - 1) // int(multiple) * int(multiple)
+
+
+def _shard_shapes(num_local, hidden_size, intermediate_size):
+    """``(w13_shape, w2_shape)`` of one layer's stacked shard."""
+    I, H = int(intermediate_size), int(hidden_size)
+    return (int(num_local), 2 * I, H), (int(num_local), H, I)
+
+
+def layer_shard_nbytes(num_local, hidden_size, intermediate_size,
+                       dtype=torch.bfloat16):
+    """Bytes one layer's stacked shard takes in an arena, carve alignment in."""
+    element = torch.empty((), dtype=dtype).element_size()
+    return sum(
+        _round_up(math.prod(shape) * element, _CARVE_ALIGN_BYTES)
+        for shape in _shard_shapes(num_local, hidden_size, intermediate_size)
+    )
+
+
+def fill_layer_shard(w13, w2, get_tensor, layer_idx, expert_start):
+    """Copy one layer's local experts host->GPU into the stacked rows in place.
+
+    The build and every refill of a kept shard write the same host tensors
+    (``core_engine.get_tensor``, address-stable) to the same rows.
+    """
+    I = w2.shape[2]
+    for i in range(w13.shape[0]):
+        tensors = get_tensor(f"routed_expert_{layer_idx}_{expert_start + i}")
+        w13[i, :I].copy_(tensors["w1.weight"])
+        w13[i, I:].copy_(tensors["w3.weight"])
+        w2[i].copy_(tensors["w2.weight"])
+
+
 def build_layer_shard(get_tensor, layer_idx, expert_start, num_local,
                       hidden_size, intermediate_size, device,
-                      dtype=torch.bfloat16):
+                      dtype=torch.bfloat16, arena=None):
     """Materialize one MoE layer's local expert shard as stacked GPU tensors.
 
     Copies each local expert's BF16 weights host->GPU exactly once, straight
@@ -69,19 +109,23 @@ def build_layer_shard(get_tensor, layer_idx, expert_start, num_local,
       -> ~21-27 GB static; leaves > 55 GB under the 86.4 GB ceiling for the
       paged-KV pool, staging buffers, NCCL and activations — fits.
 
+    ``arena``: a mapped fixed-address ``VmmArena`` to carve the stacks from
+    (they then keep their addresses for the arena's lifetime and are refilled
+    in place by ``fill_layer_shard``), or None for allocator-backed stacks.
+
     Returns:
         w13: (num_local, 2*I, H) stacked [gate; up] weights (gate first —
              the packing fused_moe_bf16 expects).
         w2:  (num_local, H, I) stacked down-projection weights.
     """
-    I, H = intermediate_size, hidden_size
-    w13 = torch.empty((num_local, 2 * I, H), dtype=dtype, device=device)
-    w2 = torch.empty((num_local, H, I), dtype=dtype, device=device)
-    for i in range(num_local):
-        tensors = get_tensor(f"routed_expert_{layer_idx}_{expert_start + i}")
-        w13[i, :I].copy_(tensors["w1.weight"])
-        w13[i, I:].copy_(tensors["w3.weight"])
-        w2[i].copy_(tensors["w2.weight"])
+    w13_shape, w2_shape = _shard_shapes(num_local, hidden_size, intermediate_size)
+    if arena is not None:
+        w13 = arena.carve(w13_shape, dtype)
+        w2 = arena.carve(w2_shape, dtype)
+    else:
+        w13 = torch.empty(w13_shape, dtype=dtype, device=device)
+        w2 = torch.empty(w2_shape, dtype=dtype, device=device)
+    fill_layer_shard(w13, w2, get_tensor, layer_idx, expert_start)
     return w13, w2
 
 
@@ -100,7 +144,7 @@ class ResidentEPMoELayer:
     num_tokens_per_rank = None
 
     def __init__(self, layer_idx, w13, w2, comm, world_size, rank,
-                 expert_start):
+                 expert_start, arena=None):
         self.layer_idx = layer_idx
         self.w13 = w13
         self.w2 = w2
@@ -109,10 +153,21 @@ class ResidentEPMoELayer:
         self.rank = rank
         self.expert_start = expert_start
         self.num_local_experts = w13.shape[0]
+        # The fixed-address arena the stacks are carved from, or None.
+        self.arena = arena
 
     @classmethod
     def set_num_tokens_per_rank(cls, num_tokens_per_rank):
         cls.num_tokens_per_rank = int(num_tokens_per_rank)
+
+    def require_resident(self, context):
+        """Refuse to touch the stacks while their arena has no physical memory."""
+        if self.arena is not None and not self.arena.is_mapped:
+            raise RuntimeError(
+                f"{context}: the resident EP BF16 shard's arena is unmapped "
+                "(decode SUSPEND released its HBM); reading it is an illegal "
+                "access, so the decode activation must map and refill it first"
+            )
 
     def forward(self, x_local, gate):
         """Resident-EP decode MoE over DP-sharded tokens.
@@ -127,6 +182,9 @@ class ResidentEPMoELayer:
             (num_local_tokens, H) summed routed-expert output for the local
             rows (all 256 experts, combined across ranks).
         """
+        self.require_resident(
+            f"resident-EP BF16 MoE forward (layer {self.layer_idx})"
+        )
         ntp = ResidentEPMoELayer.num_tokens_per_rank
         num_tokens, H = x_local.shape
         assert ntp is not None and ntp > 0, (
@@ -179,33 +237,90 @@ class ResidentEPMoELayer:
         return partial[start:start + num_tokens]
 
 
-def build_resident_ep_layers(model_layers, get_tensor, comm, world_size, rank,
-                             expert_start, num_local, intermediate_size,
-                             device):
-    """Materialize shards for every MoE layer and attach a ResidentEPMoELayer
-    to each ``block_sparse_moe`` as ``_resident_ep_moe`` (consumed by
-    ``moe_forward_serving``'s decode dispatch). Returns total bytes resident.
-    """
-    start_t = time.perf_counter()
-    total_bytes = 0
-    num_layers = 0
+def _resident_moe_layers(model_layers):
+    """``(layer_idx, block_sparse_moe)`` of every layer with routed experts."""
     for layer_idx, layer in enumerate(model_layers):
         moe = getattr(layer, "block_sparse_moe", None)
         if moe is None or moe.experts is None:
             continue
-        w13, w2 = build_layer_shard(
-            get_tensor, layer_idx, expert_start, num_local,
-            moe.moe_hidden_size, intermediate_size, device,
+        yield layer_idx, moe
+
+
+def resident_ep_arena_bytes(model_layers, num_local, intermediate_size,
+                            dtype=torch.bfloat16):
+    """Arena bytes every MoE layer's stacked shard takes (carve alignment in)."""
+    return sum(
+        layer_shard_nbytes(num_local, moe.moe_hidden_size, intermediate_size, dtype)
+        for _, moe in _resident_moe_layers(model_layers)
+    )
+
+
+def build_resident_ep_layers(model_layers, get_tensor, comm, world_size, rank,
+                             expert_start, num_local, intermediate_size,
+                             device, *, shards, arena=None):
+    """Make every MoE layer's stacked shard live and attach a ResidentEPMoELayer
+    to each ``block_sparse_moe`` as ``_resident_ep_moe`` (consumed by
+    ``moe_forward_serving``'s decode dispatch). Returns total bytes resident.
+
+    ``shards`` is the caller's ``{layer_idx: (w13, w2)}`` record. A layer
+    missing from it is built (stacks carved from ``arena`` when given) and
+    recorded; a recorded layer is refilled in place, so its stacks keep their
+    addresses. A block that already carries a resident layer (a kept decode
+    instance) must carry the recorded stacks; a block without one (a rebuilt
+    model) gets a new resident layer over them.
+    """
+    start_t = time.perf_counter()
+    moe_layers = list(_resident_moe_layers(model_layers))
+    unrecorded = [layer_idx for layer_idx, _ in moe_layers if layer_idx not in shards]
+    if unrecorded and len(unrecorded) != len(moe_layers):
+        raise RuntimeError(
+            f"resident EP shard record covers {len(moe_layers) - len(unrecorded)} "
+            f"of {len(moe_layers)} MoE layers (missing {unrecorded[:8]}); a "
+            "record is built whole once and only ever refilled"
         )
-        moe._resident_ep_moe = ResidentEPMoELayer(
-            layer_idx, w13, w2, comm, world_size, rank, expert_start,
+    stale = sorted(set(shards) - {layer_idx for layer_idx, _ in moe_layers})
+    if stale:
+        raise RuntimeError(
+            f"resident EP shard record holds layers {stale[:8]} the model has "
+            "no routed-expert block for; the record belongs to another model"
         )
+    total_bytes = 0
+    num_layers = 0
+    for layer_idx, moe in moe_layers:
+        recorded = shards.get(layer_idx)
+        if recorded is None:
+            w13, w2 = build_layer_shard(
+                get_tensor, layer_idx, expert_start, num_local,
+                moe.moe_hidden_size, intermediate_size, device, arena=arena,
+            )
+            shards[layer_idx] = (w13, w2)
+        else:
+            w13, w2 = recorded
+            if arena is not None and not arena.is_mapped:
+                raise RuntimeError(
+                    "build_resident_ep_layers: refilling a stacked shard whose "
+                    "arena is unmapped is an illegal access; map it first"
+                )
+            fill_layer_shard(w13, w2, get_tensor, layer_idx, expert_start)
+        resident = getattr(moe, "_resident_ep_moe", None)
+        if resident is None:
+            moe._resident_ep_moe = ResidentEPMoELayer(
+                layer_idx, w13, w2, comm, world_size, rank, expert_start,
+                arena=arena,
+            )
+        elif resident.w13 is not w13 or resident.w2 is not w2:
+            raise RuntimeError(
+                f"layer {layer_idx}: the attached resident EP layer holds "
+                "stacks other than the recorded ones"
+            )
         total_bytes += (w13.numel() * w13.element_size()
                         + w2.numel() * w2.element_size())
         num_layers += 1
     logging.info(
-        f"Rank {rank}: resident EP shards materialized — {num_layers} MoE "
-        f"layers x {num_local} experts, {total_bytes / (1024**3):.2f} GiB "
-        f"({time.perf_counter() - start_t:.1f}s, one-time H2D)"
+        f"Rank {rank}: resident EP shards "
+        f"{'materialized' if unrecorded else 'refilled in place'} — "
+        f"{num_layers} MoE layers x {num_local} experts, "
+        f"{total_bytes / (1024**3):.2f} GiB "
+        f"({time.perf_counter() - start_t:.1f}s)"
     )
     return total_bytes

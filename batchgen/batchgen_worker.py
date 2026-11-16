@@ -9986,6 +9986,21 @@ class BatchGenWorker:
 			self,
 		)
 
+	def _manager_decode_graphs_persist(self) -> bool:
+		"""Whether the strategy manager's kept decode instance owns decode
+		graphs that persist across a SUSPEND.
+
+		Such a manager captures its own ladder (``prewarm_decode_graphs``)
+		instead of the worker's whole-model graphs, and replays it for the
+		rest of the process, so the capture belongs before readiness exactly
+		as a whole-model capture does. A manager without the property (every
+		rebuild-per-configure lifecycle) answers False and nothing changes
+		for it.
+		"""
+		return bool(getattr(
+			self.parallel_manager, "decode_graphs_persist_across_suspend", False
+		))
+
 	def _whole_model_decode_graphs_requested(self) -> bool:
 		"""Whether this deployment requests whole-model decode graphs: GLM-5
 		whole-model, GPT-OSS-120B or Kimi K2.5 under ``--enable-cuda-graph``.
@@ -10322,10 +10337,17 @@ class BatchGenWorker:
 		decode configure finds ``_cuda_graph_manager`` set and captures nothing.
 		A manager that retires its decode instance on the switch (build-always
 		managers; a rank streaming part of its routed experts) rebuilds it, and
-		its graphs, at every decode configure, so this returns None for it, as
-		for every deployment that requests no whole-model decode graph.
+		its graphs, at every decode configure, so this returns None for it.
+
+		Two kinds of deployment capture here, by who owns the graphs: the
+		worker's whole-model graphs, and a manager-owned ladder that persists
+		across SUSPEND (``_manager_decode_graphs_persist``). A deployment that
+		owns neither captures nothing before readiness.
 		"""
-		if not self._whole_model_decode_graphs_requested():
+		if not (
+			self._whole_model_decode_graphs_requested()
+			or self._manager_decode_graphs_persist()
+		):
 			return None
 		live = self._live_phase_key
 		if live is None or live.phase != "decode":
@@ -10354,13 +10376,19 @@ class BatchGenWorker:
 		``_warmup_cuda_graphs``: the KV pool is sized and the decode instance
 		is live here, so the geometry-keyed kernels (Triton/DeepGEMM) compile
 		before readiness and the first decode configure's prewarm finds its
-		geometry already done.
+		geometry already done. That same prewarm IS the capture for a
+		manager-owned ladder (``_manager_decode_graphs_persist``): the manager
+		captures the buckets it will replay and fails loud if it captured
+		none, so the worker's whole-model capture and its counter below run
+		only for the graphs the worker owns.
 		"""
 		captures = self._graph.decode_graph_captures
 		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
 		self._current_decode_max_rank_batch_size = 1
 		self._bind_decode_attention_metadata_for_graph_config([])
 		self._prewarm_decode_jit()
+		if not self._whole_model_decode_graphs_requested():
+			return
 		self._warmup_cuda_graphs()
 		if (
 			self._graph.decode_graph_captures != captures + 1

@@ -347,6 +347,10 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _install_decode_weight_copy_queue=lambda: None,
         _init_gpu_kv_with_actual_size=lambda: events.append("verify_pool"),
         _glm5_whole_model_graph_requested_for_current_batch=lambda: capture,
+        # This deployment's graphs are the worker's whole-model graphs, so the
+        # startup capture runs _warmup_cuda_graphs; a manager-owned ladder
+        # returns after the JIT prewarm instead.
+        _whole_model_decode_graphs_requested=lambda: capture,
         _sync_decode_moe_rank_counts=lambda *args, **kwargs: None,
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
         _prewarm_decode_jit=lambda: events.append("jit_prewarm"),
