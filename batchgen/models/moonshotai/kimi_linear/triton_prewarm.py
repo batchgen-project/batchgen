@@ -389,9 +389,9 @@ def o_norm_minimal_token_counts(heads: int) -> List[int]:
     one that is not (reachable only when ``heads`` itself is not a multiple
     of 16), plus a one-token call for the smallest grid.
 
-    This is the floor the site always gets, whether or not a prefill token
-    cap is plumbed through: the kernel's autotune key is per (width, heads),
-    so a site that never runs here compiles inside the first request
+    This is the floor the site always gets, alongside the block-count
+    coverage ``o_norm_token_counts`` derives from the serving row-block
+    constant: a site that never runs here compiles inside the first request
     (observed 2026-11-16, k3a3 leg1: the 17-head KDA o_norm key was missing
     and the first batch compiled nine binaries plus its autotune record).
     """
@@ -427,8 +427,7 @@ def _run_o_norm(o_norm, heads: int, head_dim: int, tokens_list, dtype,
 
 
 def kda_prefill_entries(module, template, segment_tokens: int,
-                        shapes=KDA_PREFILL_SHAPES,
-                        max_prefill_tokens: int = 0) -> List[PrewarmEntry]:
+                        shapes=KDA_PREFILL_SHAPES) -> List[PrewarmEntry]:
     entries = [
         PrewarmEntry(
             f"kda_prefill/{shape.name}",
@@ -441,13 +440,19 @@ def kda_prefill_entries(module, template, segment_tokens: int,
     entries.extend(beta_sigmoid_entries(module.num_heads, weight.dtype,
                                         weight.device))
     heads, head_dim = int(module.num_heads), int(module.head_dim)
-    tokens_list = o_norm_minimal_token_counts(heads)
-    if max_prefill_tokens > 0:
-        tokens_list = sorted(
-            set(tokens_list) | set(o_norm_token_counts(heads, max_prefill_tokens))
-        )
+    # Serving runs the gated output norm in fixed row blocks of
+    # KDA_PREFILL_SEGMENT_TOKENS (serving_modules._o_norm_segments), so the
+    # reachable autotune keys are exactly those of 1..that-constant tokens;
+    # warm every block-count bucket in both row-alignment classes, plus the
+    # one-token floor for the smallest grid.
+    from .serving_modules import KDA_PREFILL_SEGMENT_TOKENS
+
+    tokens_list = sorted(
+        set(o_norm_minimal_token_counts(heads))
+        | set(o_norm_token_counts(heads, KDA_PREFILL_SEGMENT_TOKENS))
+    )
     entries.append(PrewarmEntry(
-        f"kda_o_norm/max{int(max_prefill_tokens)}",
+        f"kda_o_norm/seg{int(KDA_PREFILL_SEGMENT_TOKENS)}",
         partial(_run_o_norm, module.o_norm, heads, head_dim, tokens_list,
                 weight.dtype, weight.device),
     ))
@@ -716,16 +721,16 @@ def dsa_prewarm_entries(config, dsa_deployment, device) -> List[PrewarmEntry]:
 
 
 def build_prewarm_entries(model, config, decode_buckets,
-                          max_prefill_tokens: int = 0,
                           attn_tp_size: Optional[int] = None,
                           dsa_deployment=None) -> List[PrewarmEntry]:
     """The deterministic entry list; identical on every rank of a node.
 
-    ``max_prefill_tokens`` is the largest prefill micro-batch (the token cap,
-    or a longer prompt, which is a micro-batch of its own). ``attn_tp_size``
-    checks the live KDA module against ``gated_norm_sites``.
+    ``attn_tp_size`` checks the live KDA module against ``gated_norm_sites``.
     ``dsa_deployment`` (``dsa_prewarm.KimiDsaDeployment``) is required on
-    Kimi-K3.1.
+    Kimi-K3.1. The o_norm coverage needs no deployment bound: serving runs
+    the norm in fixed ``KDA_PREFILL_SEGMENT_TOKENS`` row blocks
+    (``serving_modules._o_norm_segments``), so its reachable autotune keys
+    derive from that constant alone.
     """
     from .serving_modules import KDA_PREFILL_SEGMENT_TOKENS
     from .wrappers import KimiLinearKDAWrapper
@@ -760,8 +765,7 @@ def build_prewarm_entries(model, config, decode_buckets,
                 or KDA_PREFILL_SEGMENT_TOKENS
             )
             entries.extend(kda_prefill_entries(
-                module, template, segment_tokens,
-                max_prefill_tokens=max_prefill_tokens))
+                module, template, segment_tokens))
             entries.extend(kda_decode_entries(module, template,
                                               decode_buckets))
     if device is None:
@@ -791,7 +795,7 @@ _PREWARM_DONE = False
 
 
 def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
-                              max_prefill_tokens=0, part_index=0,
+                              part_index=0,
                               part_count=1, barrier=None, rank=0,
                               attn_tp_size=None, dsa_deployment=None) -> bool:
     """Compile every planned K3 Triton key (and, on K3.1, the DSA indexer's
@@ -809,7 +813,6 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
     with torch.inference_mode():
         entries = build_prewarm_entries(
             model, config, decode_buckets,
-            max_prefill_tokens=max_prefill_tokens,
             attn_tp_size=attn_tp_size, dsa_deployment=dsa_deployment,
         )
         run_prewarm(

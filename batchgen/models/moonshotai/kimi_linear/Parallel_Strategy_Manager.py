@@ -1225,12 +1225,15 @@ class KimiLinearParallelStrategyManager:
         one Triton cache directory, so they split the compiles and meet at a
         barrier on that group before every rank loads the full set.
 
-        The prefill row bound is the larger of the micro-batch token cap and
-        the longest prompt: the micro-batch planner splits only between
-        sequences, so a longer prompt is a micro-batch of its own and reaches
-        the KDA o_norm at its full length. On Kimi-K3.1 the DSA indexer's
-        decode keys are planned from the deployment the decode configure
-        that ran first left behind (``_dsa_prewarm_deployment``).
+        The KDA o_norm needs no deployment-derived row bound: serving runs
+        it in fixed ``KDA_PREFILL_SEGMENT_TOKENS`` row blocks
+        (``serving_modules._o_norm_segments``), so its reachable autotune
+        keys derive from that constant alone — a config bound here can never
+        cover an uncut call (observed 2026-11-16: a ~62K-token micro-batch
+        compiled the NB=17 key after readiness while the bound said NB<=3).
+        On Kimi-K3.1 the DSA indexer's decode keys are planned from the
+        deployment the decode configure that ran first left behind
+        (``_dsa_prewarm_deployment``).
         """
         if not torch.cuda.is_available():
             return
@@ -1259,16 +1262,11 @@ class KimiLinearParallelStrategyManager:
 
                 barrier = _group_barrier
 
-        cap = int(getattr(
-            self.engine_config.Module_Batching_Config,
-            "prefill_micro_batch_token_cap", 0) or 0)
-        prompt = int(basic.get_max_prompt_length() or 0)
         start = time.perf_counter()
         if prewarm_k3_triton_kernels(
             self.model,
             self.loaded_model_config,
             decode_buckets=buckets,
-            max_prefill_tokens=max(cap, prompt) if cap > 0 else 0,
             part_index=part_index,
             part_count=part_count,
             barrier=barrier,

@@ -206,7 +206,7 @@ def test_every_declared_site_has_entries_and_no_entry_is_undeclared(
         k31_config):
     entries = DP.dsa_entries(_shapes(k31_config), "cpu")
     entries += [e for e in TP.kda_prefill_entries(
-        _o_norm_module(), None, 4096, shapes=(), max_prefill_tokens=65_536)
+        _o_norm_module(), None, 4096, shapes=())
         if e.name.startswith(COV.SITE_KDA_O_NORM)]
     sites = set(DP.planned_kernel_sites(entries))
     declared = {site for slot in COV.K31_DSA_JIT_KERNELS for site in slot.sites}
@@ -504,8 +504,10 @@ def test_prefill_row_bound_is_the_longest_prompt(k31_config):
             sys.modules[namespace_pkg + ".triton_prewarm"] = saved
     del monkey
     first, second = calls
-    assert first["max_prefill_tokens"] == 61_440
-    assert second["max_prefill_tokens"] == 16_384
+    # The o_norm row bound is the serving row-block constant, not a
+    # deployment knob, so the prewarm call carries no prefill token bound.
+    assert "max_prefill_tokens" not in first
+    assert "max_prefill_tokens" not in second
     assert first["attn_tp_size"] == 1
     deployment = first["dsa_deployment"]
     assert deployment == DP.KimiDsaDeployment(
@@ -555,6 +557,67 @@ def test_kda_prefill_entries_always_include_the_o_norm_site():
         "num_heads": 17, "head_dim": 128, "q_proj": _Proj(), "o_norm": None,
     })()
     entries = tp.kda_prefill_entries(module, template=None, segment_tokens=8192,
-                                     shapes=(), max_prefill_tokens=0)
+                                     shapes=())
     names = [e.name for e in entries]
     assert any(name.startswith("kda_o_norm/") for name in names), names
+
+
+def test_o_norm_coverage_reaches_every_serving_block_count():
+    """Serving cuts the o_norm into fixed row blocks, so the prewarmed token
+    counts must reach every autotune block-count bucket a <=block call can
+    key on, in both row-alignment classes."""
+    from batchgen.models.moonshotai.kimi_linear.serving_modules import (
+        KDA_PREFILL_SEGMENT_TOKENS,
+    )
+    from batchgen.models.moonshotai.kimi_linear.triton_prewarm import (
+        O_NORM_ROWS_PER_BLOCK,
+        o_norm_minimal_token_counts,
+        o_norm_token_counts,
+    )
+
+    for heads in (16, 17, 34):
+        counts = set(o_norm_minimal_token_counts(heads)) | set(
+            o_norm_token_counts(heads, KDA_PREFILL_SEGMENT_TOKENS))
+        covered = {}
+        for tokens in counts:
+            rows = tokens * heads
+            nb = -(-rows // O_NORM_ROWS_PER_BLOCK)
+            covered.setdefault(nb, set()).add(rows % 16 == 0)
+        max_nb = -(-KDA_PREFILL_SEGMENT_TOKENS * heads
+                   // O_NORM_ROWS_PER_BLOCK)
+        for nb in range(1, max_nb + 1):
+            lo = (nb - 1) * O_NORM_ROWS_PER_BLOCK
+            hi = nb * O_NORM_ROWS_PER_BLOCK
+            reachable = {
+                (tokens * heads) % 16 == 0
+                for tokens in range(1, KDA_PREFILL_SEGMENT_TOKENS + 1)
+                if lo < tokens * heads <= hi
+            }
+            assert covered.get(nb, set()) >= reachable, (heads, nb)
+
+
+def test_serving_o_norm_runs_in_fixed_row_blocks():
+    """_o_norm_segments cuts at the constant, reproduces the uncut call,
+    and the packed KDA prefill o_norm goes through it."""
+    import re
+
+    from batchgen.models.moonshotai.kimi_linear.serving_modules import (
+        _o_norm_segments as seg,
+    )
+
+    src = (KL_DIR / "serving_modules.py").read_text()
+    assert re.search(
+        r"_o_norm_segments\(self\.o_norm,\s*o\.reshape\(", src), (
+        "the packed KDA prefill o_norm call must go through _o_norm_segments")
+
+    calls = []
+
+    def fake_norm(o, z):
+        calls.append(int(o.shape[0]))
+        return o * 2 + z
+
+    o = torch.arange(150 * 3 * 4, dtype=torch.float32).reshape(150, 3, 4)
+    z = torch.ones_like(o)
+    out = seg(fake_norm, o, z, segment_tokens=64)
+    assert calls == [64, 64, 22]
+    assert torch.equal(out, o * 2 + z)

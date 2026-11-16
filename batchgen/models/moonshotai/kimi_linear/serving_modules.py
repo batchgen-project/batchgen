@@ -770,6 +770,30 @@ _KDA_CHUNK_SIZE = 64
 KDA_PREFILL_SEGMENT_TOKENS = 16384
 
 
+def _o_norm_segments(o_norm, o, z, segment_tokens=KDA_PREFILL_SEGMENT_TOKENS):
+    """Gated output norm over fixed ``segment_tokens`` row blocks.
+
+    The norm is per-row (each token-head row is reduced over ``head_dim``
+    independently), so cutting the packed range into fixed row blocks is
+    exact — unlike the GEMMs above, whose M must never change.
+
+    The cut is what BOUNDS the fla kernel's Triton autotune key set:
+    ``layer_norm_gated_fwd`` autotunes per ``NB = ceil(rows / 65536)``, so an
+    uncut call keys on the whole packed range — a long prompt is a micro-batch
+    of its own, reaching keys no startup prewarm can enumerate (observed
+    2026-11-16, k3a4 leg1: a ~62K-token range compiled the NB=17 key after
+    readiness). Every segmented call stays within the keys derived from
+    ``segment_tokens``, which the startup prewarm warms exactly
+    (``triton_prewarm.o_norm_token_counts``).
+    """
+    total = o.shape[0]
+    out = torch.empty_like(o)
+    for start in range(0, total, segment_tokens):
+        end = min(start + segment_tokens, total)
+        out[start:end] = o_norm(o[start:end], z[start:end])
+    return out
+
+
 def _kda_segment_plan(cu_list, segment_tokens):
     """Plan a segmented sweep over a packed (varlen) token range.
 
@@ -1072,8 +1096,10 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     Returns:
         (total_tokens, hidden) attention output.
 
-    The projections, the convs and the output norm/projection run over the
-    WHOLE packed range; only chunk_kda is segmented.  That split is deliberate:
+    The projections, the convs and the output projection run over the WHOLE
+    packed range; chunk_kda is segmented (``_kda_segment_plan``) and the
+    per-row output norm runs in fixed row blocks (``_o_norm_segments``, which
+    bounds its Triton autotune key set).  That split is deliberate:
       - Re-running an nn.Linear at a smaller M changes the cuBLAS kernel choice
         and therefore the result by ~3e-7, which this model amplifies without
         bound (see tests/gpu/test_kimi_k3_kda_fla_parity.py, test_F docstrings).
@@ -1154,7 +1180,7 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         _end_streamed_sp8_profile(profiler, "kda_chunk", span)
     span = profiler.begin_profile_span() if profiler is not None else None
 
-    o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
+    o = _o_norm_segments(self.o_norm, o.reshape(total, num_heads, head_dim), z)
     # All projections from ``hidden_states_2d`` have completed, so its storage
     # is dead until this attention result is returned. Reuse that exact
     # (total, hidden) allocation for the row-parallel output projection. At
