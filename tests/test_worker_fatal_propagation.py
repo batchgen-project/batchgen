@@ -42,6 +42,7 @@ def _isolated_functions(path, names, globals_):
 def _isolated_scheduler():
     methods = [
         _function(SCHEDULER, "_fail_all_active_batches", "BatchScheduler"),
+        _function(SCHEDULER, "_discard_failed_batch", "BatchScheduler"),
         _function(SCHEDULER, "_pool_completion_listener", "BatchScheduler"),
     ]
     module = ast.Module(
@@ -113,24 +114,34 @@ def test_pool_shutdown_error_fails_storage_before_acknowledgement():
     trace = []
     tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
 
-    class ResponseQueue:
-        def get(self, timeout):
-            trace.append(("queue_get", timeout))
-            return {"type": "pool_shutdown", "error": "rank 8\nTraceback"}
-
     class Worker:
-        response_queue = ResponseQueue()
-
-        def report_worker_fatal(self, error):
-            trace.append(("worker_ack", error))
+        def report_worker_fatal(self, error, persisted=False):
+            trace.append(("worker_ack", error, persisted))
 
     scheduler_type = _isolated_scheduler()
     scheduler = scheduler_type()
-    scheduler._stopped = SimpleNamespace(is_set=lambda: False)
+    # The listener loops until the scheduler stops; end it once the
+    # shutdown item has been acknowledged.
+    scheduler._stopped = SimpleNamespace(
+        is_set=lambda: any(item[0] == "worker_ack" for item in trace)
+    )
     scheduler.worker = Worker()
+    scheduler._pump_generation = 0
+    scheduler._completion_inbox = asyncio.Queue()
+    scheduler._completion_inbox.put_nowait(
+        (0, {"type": "pool_shutdown", "error": "rank 8\nTraceback"})
+    )
     scheduler._scheduling_pool = SimpleNamespace(
         _batch_trackers={"batch-1": tracker},
+        remove_batch_tracker=lambda batch_id: None,
+        clear_active_slots=lambda: trace.append(("slots_cleared",)),
     )
+    scheduler._intake_pool = SimpleNamespace(
+        remove_batch_entries=lambda batch_id: 0,
+        remove_batch_info=lambda batch_id: None,
+    )
+    scheduler._pool_request_meta = {}
+    scheduler._fail_pending_turns = lambda error_msg: None
     scheduler.storage = SimpleNamespace(
         update_batch_status=lambda batch_id, status, **kwargs: trace.append(
             ("storage", batch_id, {"status": status, **kwargs})
@@ -143,10 +154,13 @@ def test_pool_shutdown_error_fails_storage_before_acknowledgement():
     storage_index = next(i for i, item in enumerate(trace) if item[0] == "storage")
     ack_index = next(i for i, item in enumerate(trace) if item[0] == "worker_ack")
     assert storage_index < ack_index
+    assert trace[storage_index][1] == "batch-1"
     assert trace[storage_index][2] == {
         "status": "failed",
         "error": "worker_fatal: rank 8\nTraceback",
     }
+    # The scheduler persisted the fatal itself, so the ack must say so.
+    assert trace[ack_index][2] is True
 
 
 def test_worker_manager_acknowledges_before_requesting_shutdown():
