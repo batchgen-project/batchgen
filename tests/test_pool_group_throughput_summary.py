@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from batchgen.sequence import SequenceBatch, SequenceEntry
+from tests.worker.worker_fakes import attach_prefix_state
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
@@ -37,6 +38,8 @@ class _Worker:
     def __init__(self):
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
+        # S3.5: admission clears the prefix drain latch on the state owner.
+        attach_prefix_state(self)
 
     def _bind_admitted_prompts(self, uuids, prompt_ids):
         for u, token_ids in zip(uuids, prompt_ids):

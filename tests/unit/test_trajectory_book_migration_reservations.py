@@ -34,6 +34,7 @@ from batchgen.migration import MigrationOp
 from batchgen.query_book import QueryBook, make_query_book_entry
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.host_rebalancer import HostKVRebalancer
+from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
 from tests.worker_method_source import load_worker_methods
 
 WORKER_METHODS = (
@@ -169,19 +170,22 @@ def _make_cluster():
         worker.local_world_size = LOCAL_WORLD_SIZE
         worker.model_context_length = CONTEXT
         worker.enable_decode_preemption = True
-        worker._trajectory_book = QueryBook(
+        attach_trajectory_state(worker, trajectory_book=QueryBook(
             capacity_bytes=PAGE_COUNT * PAGE_TOKENS * QueryBook.TOKEN_BYTES,
             page_tokens=PAGE_TOKENS,
             storage=storages[_node(rank)],
-        )
+        ))
+        # Alias kept for the assertions below.
+        worker._trajectory_book = worker._traj.trajectory_book
         worker.global_batch = _GlobalBatch()
         worker.host_paged_kv_worker_view = _HostKV()
         worker.host_paged_kv_worker_view_aux = None
-        worker._uuid_to_local_map = {}
-        worker._local_to_uuid_map = {}
+        attach_identity(
+            worker,
+            rank=rank, world_size=WORLD_SIZE,
+            local_world_size=LOCAL_WORLD_SIZE,
+        )
         worker.query_book = {}
-        worker._free_local_indices = set()
-        worker._next_local_idx = 0
         worker._sequences_with_gpu_kv = set()
         worker._release_prefix_cache_attachments = lambda indices: None
         worker._get_or_create_gloo_group = lambda: None
@@ -214,10 +218,7 @@ def _admit(workers, prompts, owners):
             worker._trajectory_book.write_prompt(slot, torch.tensor(prompts[uuid]))
             worker.global_batch.get_sequence(uuid)._buffer_slot = slot
     for uuid, owner in owners.items():
-        local_idx = workers[owner]._next_local_idx
-        workers[owner]._next_local_idx += 1
-        workers[owner]._uuid_to_local_map[uuid] = local_idx
-        workers[owner]._local_to_uuid_map[local_idx] = uuid
+        workers[owner].seq_table.bind(uuid)
 
 
 def _decode(workers, uuid, owner, tokens):

@@ -13,24 +13,36 @@ from types import SimpleNamespace
 
 import math
 
+from batchgen.worker.kv_plan import effective_chunk_size
+
+
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+ENGINE = ROOT / "batchgen" / "worker" / "decode_engine.py"
 HOST_VIEW = ROOT / "core" / "KV_Storage" / "host_paged_kv_worker_view.h"
 
 
 def _worker_method(name):
-    source = WORKER.read_text()
+    # S10c: a delegated method's text is its engine body in the worker's shape.
+    if name in delegated_method_names():
+        return ast.unparse(worker_shaped_method_node(name)) + "\n"
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    source_path = ENGINE if name == "decoding_continuous" else WORKER
+    source = source_path.read_text()
     tree = ast.parse(source)
     worker = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        if isinstance(node, ast.ClassDef)
+        and node.name == ("DecoupledGpuDecode" if name == "decoding_continuous" else "BatchGenWorker")
     )
     method = next(
         node
         for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+        if isinstance(node, ast.FunctionDef)
+        and node.name == ("run" if name == "decoding_continuous" else name)
     )
     lines = source.splitlines(keepends=True)
     return textwrap.dedent("".join(lines[method.lineno - 1 : method.end_lineno]))
@@ -108,7 +120,10 @@ def test_effective_host_chunk_covers_one_decode_decision_interval():
     class _Entry:
         PAGE_SIZE = 64
 
-    namespace = {"math": math, "SequenceEntry": _Entry}
+    namespace = {
+        "math": math, "SequenceEntry": _Entry,
+        "effective_chunk_size": effective_chunk_size,
+    }
     exec(compile(source, str(WORKER), "exec"), namespace)
     worker = SimpleNamespace(
         adaptive_chunk_sizer=None,

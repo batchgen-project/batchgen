@@ -22,6 +22,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
+from batchgen import eventlog
+from tests.worker_method_source import (
+    RANK_SYNC_SOURCE,
+    delegated_method_names,
+    worker_shaped_method_node,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -994,7 +1001,6 @@ _WORKER_LOOP_HELPERS = (
     "_shutdown_requested",
     "_live_process_groups",
     "_abort_one_process_group",
-    "_flush_worker_logs",
     "_start_shutdown_abort_watchdog",
     "_resolve_main_loop_exit",
 )
@@ -1002,13 +1008,19 @@ _WORKER_LOOP_CONSTANTS = (
     "_SHUTDOWN_ABORT_GRACE_S",
     "_SHUTDOWN_FLAG_POLL_S",
     "_SHUTDOWN_SELF_EXIT_GRACE_S",
-    "_WORKER_SELF_EXIT_CODE",
-    "_EXIT_PATH_SENTINEL",
-    "_EXIT_PATH_FLAG",
-    "_EXIT_PATH_ABORT",
-    "_EXIT_PATH_DECODE_BOUNDARY",
-    "_EXIT_PATH_SELF_EXIT",
 )
+# The worker exit protocol the supervisor uses lives in eventlog.process
+# (shared with the worker's quiesce self-exit); lifted from that source.
+EXIT_PROTOCOL_PATH = ROOT / "batchgen/eventlog/process.py"
+_EXIT_PROTOCOL_CONSTANTS = (
+    "WORKER_SELF_EXIT_CODE",
+    "EXIT_PATH_SENTINEL",
+    "EXIT_PATH_FLAG",
+    "EXIT_PATH_ABORT",
+    "EXIT_PATH_DECODE_BOUNDARY",
+    "EXIT_PATH_SELF_EXIT",
+)
+_EXIT_PROTOCOL_FUNCTIONS = ("flush_logs_before_exit",)
 
 
 def _worker_loop_tree() -> ast.Module:
@@ -1072,6 +1084,19 @@ def _load_worker_loop_helpers() -> Dict[str, Any]:
     ]
     assert {node.name for node in functions} == set(_WORKER_LOOP_HELPERS)
     assert len(constants) == len(_WORKER_LOOP_CONSTANTS)
+    protocol_tree = ast.parse(EXIT_PROTOCOL_PATH.read_text())
+    protocol = [
+        node for node in protocol_tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in _EXIT_PROTOCOL_CONSTANTS
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name in _EXIT_PROTOCOL_FUNCTIONS)
+    ]
+    assert len(protocol) == len(_EXIT_PROTOCOL_CONSTANTS) + len(_EXIT_PROTOCOL_FUNCTIONS)
     namespace: Dict[str, Any] = {
         "Any": Any,
         "List": List,
@@ -1086,7 +1111,13 @@ def _load_worker_loop_helpers() -> Dict[str, Any]:
         # watchdog would fail for the wrong reason.
         "os": os,
         "sys": sys,
+        # flush_logs_before_exit drains the event log first.
+        "eventlog": eventlog,
     }
+    exec(
+        compile(ast.Module(body=protocol, type_ignores=[]), str(EXIT_PROTOCOL_PATH), "exec"),
+        namespace,
+    )
     module = ast.Module(body=constants + functions, type_ignores=[])
     exec(compile(module, str(WORKER_LOOP_PATH), "exec"), namespace)
     return namespace
@@ -1569,7 +1600,7 @@ def test_boundary_exit_names_the_abort_only_when_the_abort_fired():
         node for node in ast.walk(outer.body[0]) if isinstance(node, ast.Assign)
     )
     assert ast.unparse(assignment) == (
-        "exit_path = _EXIT_PATH_ABORT if aborted.is_set() else _EXIT_PATH_FLAG"
+        "exit_path = EXIT_PATH_ABORT if aborted.is_set() else EXIT_PATH_FLAG"
     )
 
 
@@ -1580,7 +1611,7 @@ def test_main_loop_guard_routes_an_abort_to_the_ordered_teardown():
         2, _Flag(1), RuntimeError("NCCL communicator was aborted"),
     )
 
-    assert exit_path == ns["_EXIT_PATH_ABORT"] == "ordered-via-abort"
+    assert exit_path == ns["EXIT_PATH_ABORT"] == "ordered-via-abort"
 
 
 @pytest.mark.parametrize("shutdown_flag", [None, _Flag(0)])
@@ -1690,9 +1721,9 @@ def test_ordered_teardown_is_not_poisoned_by_the_abort():
 
 def test_worker_exit_paths_are_all_logged():
     ns = _load_worker_loop_helpers()
-    assert ns["_EXIT_PATH_SENTINEL"] == "ordered-via-sentinel"
-    assert ns["_EXIT_PATH_FLAG"] == "ordered-via-flag"
-    assert ns["_EXIT_PATH_ABORT"] == "ordered-via-abort"
+    assert ns["EXIT_PATH_SENTINEL"] == "ordered-via-sentinel"
+    assert ns["EXIT_PATH_FLAG"] == "ordered-via-flag"
+    assert ns["EXIT_PATH_ABORT"] == "ordered-via-abort"
     # A few seconds, as designed: long enough for a healthy worker to leave its
     # loop, short enough that the 180s grace is no longer paid.
     assert 0 < ns["_SHUTDOWN_ABORT_GRACE_S"] <= 30
@@ -1713,8 +1744,13 @@ def test_worker_exit_paths_are_all_logged():
     # force-killed inside a native collective, so no Python runs in it again),
     # so the manager owns that marker and this module must not contain it as a
     # value anywhere.  Checked over string literals, not prose.
+    # The markers are defined by the exit protocol in eventlog.process, which
+    # the supervisor imports; the supervisor's own source plus that module is
+    # the worker side of the vocabulary.
     literals = {
-        node.value for node in ast.walk(_worker_loop_tree())
+        node.value
+        for tree in (_worker_loop_tree(), ast.parse(EXIT_PROTOCOL_PATH.read_text()))
+        for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "signal-fallback" not in literals
@@ -2015,9 +2051,11 @@ def _cohort_flag_probe_child(flag, observed, child_pid, deadline_s):
 # --------------------------------------------------------------------------
 
 BATCHGEN_WORKER_PATH = ROOT / "batchgen/batchgen_worker.py"
+DECODE_ENGINE_PATH = ROOT / "batchgen/worker/decode_engine.py"
 DUAL_COORDINATOR_PATH = ROOT / "batchgen/kv_cache/dual_host_kv_coordinator.py"
 
 _worker_tree_cache: Dict[str, ast.Module] = {}
+_decode_engine_tree_cache: Dict[str, ast.Module] = {}
 
 
 def _worker_tree() -> ast.Module:
@@ -2034,7 +2072,26 @@ def _worker_class() -> ast.ClassDef:
     )
 
 
+def _decode_engine_run() -> ast.FunctionDef:
+    if "run" not in _decode_engine_tree_cache:
+        _decode_engine_tree_cache["run"] = ast.parse(DECODE_ENGINE_PATH.read_text())
+    # S4b: body moved to decode_engine.DecoupledGpuDecode.run; same statements, same order.
+    tree = _decode_engine_tree_cache["run"]
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DecoupledGpuDecode"
+    )
+    return next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "run")
+
+
 def _worker_method(name: str) -> ast.FunctionDef:
+    if name == "decoding_continuous":
+        return _decode_engine_run()
+    # S8/S9: the RankSync and WorkerLifecycle methods run in their engines
+    # behind same-name worker delegators; resolve them to the engine body in
+    # the worker's shape.
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(
         node for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name == name
@@ -2099,7 +2156,7 @@ def _load_worker_shutdown_seam():
         "cohort_shutdown_observed",
     }
     members = [
-        node for node in _worker_class().body
+        _worker_method(node.name) for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     assert {node.name for node in members} == wanted, (
@@ -2566,7 +2623,7 @@ def test_watchdog_self_exits_when_the_loop_never_leaves(caplog):
         watchdog.join(timeout=30)
 
     assert not watchdog.is_alive()
-    assert exits == [ns["_WORKER_SELF_EXIT_CODE"]]
+    assert exits == [ns["WORKER_SELF_EXIT_CODE"]]
 
     markers = [
         record.getMessage() for record in caplog.records
@@ -2644,7 +2701,7 @@ def test_the_self_exit_marker_is_flushed_before_the_process_ends():
     flushes = [
         node for node in ast.walk(fn)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "_flush_worker_logs"
+        and ast.unparse(node.func) == "flush_logs_before_exit"
     ]
     exits = [
         node for node in ast.walk(fn)
@@ -2679,7 +2736,7 @@ def test_the_log_flush_cannot_raise_on_the_way_out():
     root = logging.getLogger()
     root.addHandler(handler)
     try:
-        ns["_flush_worker_logs"]()
+        ns["flush_logs_before_exit"]()
     finally:
         root.removeHandler(handler)
 
@@ -2694,7 +2751,7 @@ def test_the_self_exit_status_collides_with_nothing_the_manager_reads():
     process_utils, and -n multiprocessing's rendering of a signal death.
     """
     ns = _load_worker_loop_helpers()
-    code = ns["_WORKER_SELF_EXIT_CODE"]
+    code = ns["WORKER_SELF_EXIT_CODE"]
 
     assert isinstance(code, int)
     assert code not in (0, 1), "collides with the clean and fatal exits"
@@ -2769,7 +2826,7 @@ def test_the_signal_fallback_marker_skips_a_worker_that_exited_itself(
         def kill(self) -> None:
             self.exitcode = -9
 
-    self_exited = _Proc(2001, ns["_WORKER_SELF_EXIT_CODE"])
+    self_exited = _Proc(2001, ns["WORKER_SELF_EXIT_CODE"])
     forced = _Proc(2002, None)
     manager._join_lock = threading.Lock()
     manager.worker_process = SimpleNamespace(processes=[self_exited, forced])
@@ -2789,7 +2846,7 @@ def test_the_signal_fallback_marker_skips_a_worker_that_exited_itself(
         "[shutdown] worker exit path=signal-fallback rank-idx=1 pid=2002"
     ], markers
     # The self-exited worker was reaped untouched, keeping its own status.
-    assert self_exited.exitcode == ns["_WORKER_SELF_EXIT_CODE"]
+    assert self_exited.exitcode == ns["WORKER_SELF_EXIT_CODE"]
 
 
 # ---- marker accounting ---------------------------------------------------
@@ -2800,10 +2857,10 @@ def test_the_decode_boundary_marker_joins_the_exit_path_enumeration():
     to exist as a value and be distinct from the others."""
     ns = _load_worker_loop_helpers()
     ordered = [
-        ns["_EXIT_PATH_SENTINEL"],
-        ns["_EXIT_PATH_FLAG"],
-        ns["_EXIT_PATH_ABORT"],
-        ns["_EXIT_PATH_DECODE_BOUNDARY"],
+        ns["EXIT_PATH_SENTINEL"],
+        ns["EXIT_PATH_FLAG"],
+        ns["EXIT_PATH_ABORT"],
+        ns["EXIT_PATH_DECODE_BOUNDARY"],
     ]
     assert ordered == [
         "ordered-via-sentinel",
@@ -2814,11 +2871,16 @@ def test_the_decode_boundary_marker_joins_the_exit_path_enumeration():
     assert len(set(ordered)) == 4
     # Not an ordered exit, and deliberately named so it cannot be summed into
     # one by mistake.
-    assert ns["_EXIT_PATH_SELF_EXIT"] == "self-exit"
-    assert not ns["_EXIT_PATH_SELF_EXIT"].startswith("ordered-via-")
+    assert ns["EXIT_PATH_SELF_EXIT"] == "self-exit"
+    assert not ns["EXIT_PATH_SELF_EXIT"].startswith("ordered-via-")
 
+    # The markers are defined by the exit protocol in eventlog.process, which
+    # the supervisor imports; the supervisor's own source plus that module is
+    # the worker side of the vocabulary.
     literals = {
-        node.value for node in ast.walk(_worker_loop_tree())
+        node.value
+        for tree in (_worker_loop_tree(), ast.parse(EXIT_PROTOCOL_PATH.read_text()))
+        for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert set(ordered) | {"self-exit"} <= literals
@@ -2840,7 +2902,7 @@ def test_the_supervisor_names_the_decode_boundary_exit():
     assert any(
         isinstance(node, ast.Assign)
         and ast.unparse(node.targets[0]) == "exit_path"
-        and ast.unparse(node.value) == "_EXIT_PATH_DECODE_BOUNDARY"
+        and ast.unparse(node.value) == "EXIT_PATH_DECODE_BOUNDARY"
         for node in check.body
     )
     assert any(isinstance(node, ast.Break) for node in check.body)
@@ -2919,11 +2981,18 @@ _WORKER_QUIESCE_MEMBERS = (
 _WORKER_DECODE_WAIT_CONSTANTS = (
     "_DECODE_EVENT_SPIN_BUDGET_S",
     "_DECODE_EVENT_POLL_INTERVAL_S",
-    "_DECODE_WAIT_COMPLETED",
-    "_DECODE_WAIT_ABANDONED",
+)
+# The quiesce bounds moved with the quiesce into rank_sync_engine (S8).
+_RANK_SYNC_DECODE_WAIT_CONSTANTS = (
     "_COHORT_QUIESCE_DEADLINE_S",
     "_COHORT_QUIESCE_POLL_INTERVAL_S",
     "_COHORT_QUIESCE_DEADLINE_REASON",
+)
+# The wait's two outcomes have one owner, decode_engine (S6 F6); the worker
+# imports them, so they are lifted from the engine module.
+_ENGINE_DECODE_WAIT_CONSTANTS = (
+    "_DECODE_WAIT_COMPLETED",
+    "_DECODE_WAIT_ABANDONED",
 )
 
 
@@ -2952,22 +3021,28 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
     instead of ending pytest, and a shortened deadline where waiting out the
     real 5 s would only make the suite slow.
     """
-    tree = _worker_tree()
-    constants = [
-        node for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id in _WORKER_DECODE_WAIT_CONSTANTS
-            for target in node.targets
+    def _lift(tree, names):
+        found = [
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in names
+                for target in node.targets
+            )
+        ]
+        assert len(found) == len(names), (
+            "a decode-wait module constant was renamed or removed: "
+            f"{[ast.unparse(node.targets[0]) for node in found]}"
         )
-    ]
-    assert len(constants) == len(_WORKER_DECODE_WAIT_CONSTANTS), (
-        "a decode-wait module constant was renamed or removed: "
-        f"{[ast.unparse(node.targets[0]) for node in constants]}"
+        return found
+
+    constants = (
+        _lift(_worker_tree(), _WORKER_DECODE_WAIT_CONSTANTS)
+        + _lift(ast.parse(DECODE_ENGINE_PATH.read_text()), _ENGINE_DECODE_WAIT_CONSTANTS)
+        + _lift(ast.parse(RANK_SYNC_SOURCE.read_text()), _RANK_SYNC_DECODE_WAIT_CONSTANTS)
     )
     members = [
-        node for node in _worker_class().body
+        _worker_method(node.name) for node in _worker_class().body
         if isinstance(node, ast.FunctionDef)
         and node.name in _WORKER_DECODE_WAIT_MEMBERS
     ]
@@ -3122,9 +3197,10 @@ def _quiesce_self_exit_env():
     """The stubs a quiesce test needs to observe the self-exit and survive it.
 
     Returns ``(os_stub, module_stub, flushes, loop_ns)``: ``os._exit`` raises
-    ``_SelfExited`` instead of ending pytest, the supervisor module the marker
-    helper imports from is replaced by a namespace that records the flush, and
-    ``loop_ns`` carries the supervisor's real exit status and path name.
+    ``_SelfExited`` instead of ending pytest, the exit-protocol module the
+    marker helper imports from (``batchgen.eventlog.process``) is replaced by a
+    namespace that records the flush, and ``loop_ns`` carries the supervisor's
+    real exit status and path name.
     """
     flushes = []
 
@@ -3138,10 +3214,13 @@ def _quiesce_self_exit_env():
             raise _SelfExited(status)
 
     loop_ns = _load_worker_loop_helpers()
+    from batchgen.eventlog import process as real_exit_protocol
+
     stub = SimpleNamespace(
-        _EXIT_PATH_SELF_EXIT=loop_ns["_EXIT_PATH_SELF_EXIT"],
-        _WORKER_SELF_EXIT_CODE=loop_ns["_WORKER_SELF_EXIT_CODE"],
-        _flush_worker_logs=lambda: flushes.append("flush"),
+        EXIT_PATH_SELF_EXIT=loop_ns["EXIT_PATH_SELF_EXIT"],
+        WORKER_SELF_EXIT_CODE=loop_ns["WORKER_SELF_EXIT_CODE"],
+        flush_logs_before_exit=lambda: flushes.append("flush"),
+        record_exit=real_exit_protocol.record_exit,
     )
     return _Os, stub, flushes, loop_ns
 
@@ -3157,17 +3236,17 @@ def _run_quiesce_expecting_self_exit(worker, stub, pending_async_task):
     handler = _Capture()
     root = logging.getLogger()
     root.addHandler(handler)
-    previous = sys.modules.get("batchgen.server_worker_main_loop")
-    sys.modules["batchgen.server_worker_main_loop"] = stub
+    previous = sys.modules.get("batchgen.eventlog.process")
+    sys.modules["batchgen.eventlog.process"] = stub
     try:
         with pytest.raises(_SelfExited) as raised:
             worker._quiesce_decode_for_cohort_shutdown(pending_async_task)
     finally:
         root.removeHandler(handler)
         if previous is None:
-            del sys.modules["batchgen.server_worker_main_loop"]
+            del sys.modules["batchgen.eventlog.process"]
         else:
-            sys.modules["batchgen.server_worker_main_loop"] = previous
+            sys.modules["batchgen.eventlog.process"] = previous
     return raised.value.status, records
 
 
@@ -3598,7 +3677,7 @@ def test_appends_that_never_finish_self_exit_without_ever_blocking():
 
     status, records = _run_quiesce_expecting_self_exit(worker, module_stub, load)
 
-    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert status == loop_ns["WORKER_SELF_EXIT_CODE"]
     assert drained == [], (
         "the blocking drain must never run while a task is unproven -- that "
         "call holds the GIL and freezes every escape hatch"
@@ -3637,7 +3716,7 @@ def test_a_partially_drained_append_set_is_not_good_enough():
 
     status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
 
-    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert status == loop_ns["WORKER_SELF_EXIT_CODE"]
     assert drained == []
     assert stuck.done_calls > 1
     assert flushes == ["flush"]
@@ -3666,7 +3745,7 @@ def test_an_async_load_that_never_finishes_self_exits_before_the_drains():
 
     status, records = _run_quiesce_expecting_self_exit(worker, module_stub, load)
 
-    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert status == loop_ns["WORKER_SELF_EXIT_CODE"]
     assert drained == [] and load.waits == 0
     assert load.done_calls > 1
     assert flushes == ["flush"]
@@ -3705,7 +3784,7 @@ def test_the_device_probe_replaces_the_sync_and_respects_the_deadline():
     status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
     elapsed = time.perf_counter() - started
 
-    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert status == loop_ns["WORKER_SELF_EXIT_CODE"]
     assert drained == []
     assert never.queries > 1 and never.synchronized == 0
     assert elapsed < 2.0, f"the device probe was not bounded ({elapsed:.3f}s)"
@@ -3735,7 +3814,7 @@ def test_a_device_probe_that_cannot_be_recorded_is_not_proof():
 
     status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
 
-    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert status == loop_ns["WORKER_SELF_EXIT_CODE"]
     assert flushes == ["flush"]
     assert next(
         line for line in records if line.startswith("[shutdown]")
@@ -3775,26 +3854,27 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
         for node in ast.walk(fn) if isinstance(node, ast.ImportFrom)
     }
     assert imports == {
-        "batchgen.server_worker_main_loop": {
-            "_EXIT_PATH_SELF_EXIT",
-            "_WORKER_SELF_EXIT_CODE",
-            "_flush_worker_logs",
+        # The worker exit protocol the supervisor uses too, plus record_exit,
+        # which writes and flushes the CRITICAL process.exit record.
+        "batchgen.eventlog.process": {
+            "EXIT_PATH_SELF_EXIT",
+            "WORKER_SELF_EXIT_CODE",
+            "flush_logs_before_exit",
+            "record_exit",
         },
-        # Writes and flushes the CRITICAL process.exit record.
-        "batchgen.eventlog.process": {"record_exit"},
     }
     (exit_call,) = [
         node for node in ast.walk(fn)
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "os._exit"
     ]
-    assert ast.unparse(exit_call.args[0]) == "_WORKER_SELF_EXIT_CODE"
+    assert ast.unparse(exit_call.args[0]) == "WORKER_SELF_EXIT_CODE"
     # Log, then flush, then exit -- os._exit runs no handler and no flush.
     order = [
         ast.unparse(node.value.func) for node in fn.body
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
     assert order == [
-        "logging.error", "_flush_worker_logs", "record_exit", "os._exit",
+        "logging.error", "flush_logs_before_exit", "record_exit", "os._exit",
     ]
 
 

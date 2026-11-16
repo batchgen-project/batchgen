@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 
+from tests.worker.worker_fakes import attach_identity, attach_prefix_state
+
 import batchgen.sequence as sequence_module
 from batchgen.sequence import SequenceEntry, configure_page_buffers
 from batchgen.worker.prefill import (
@@ -145,11 +147,11 @@ def test_prefill_host_reservation_uses_the_configured_initial_buffer():
     worker = SimpleNamespace(
         rank=0,
         enable_prefix_cache=False,
-        _prefix_sequence_states={},
         _get_effective_chunk_size=lambda: CHUNK_TOKENS,
         _owns_host_kv=lambda s: True,
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
     )
+    attach_prefix_state(worker, prefix_sequence_states={})
 
     reservations, owner_requests = plan(worker, ["a"])
 
@@ -178,15 +180,15 @@ def test_prefill_selection_request_uses_the_configured_initial_buffer():
     make_request = _worker_method("_make_prefill_selection_request", namespace)
     seq = _sequence()
     worker = SimpleNamespace(
-        local_world_size=8,
         _decode_attn_tp_size=lambda: 1,
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
         # This test is about the page-buffer constant reaching the snapshot,
         # not about shared-prefix credit: report no shared segment so every
         # candidate keeps its standalone reservation.
         _admission_shared_prefix_segments=lambda uuids: {},
-        _shared_prefix_credit_applied=False,
     )
+    attach_identity(worker, rank=0, world_size=8, local_world_size=8)
+    attach_prefix_state(worker, prefix_sequence_states={}, shared_prefix_credit_applied=False)
 
     request = make_request(worker, ["a"], [1 << 20], num_nodes=1,
                            chunk_size=CHUNK_TOKENS)

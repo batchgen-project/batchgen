@@ -146,6 +146,7 @@ export NCCL_BUFFSIZE=16777216   # 16 MB
 ```bash
 python -m batchgen.launch_http_server \
     --model moonshotai/Kimi-K3 \
+    --max-model-len -1 \
     --converted-ckpt-dir /shared/models/Kimi-K3/converted_ckpt \
     --listen-port 10900 \
     --world-size 16 --nnodes 2 --node-rank 0 \
@@ -158,6 +159,13 @@ python -m batchgen.launch_http_server \
     --storage-path /shared/storage
 ```
 
+`--max-model-len -1` fits the deployment maximum sequence length to the GPU
+KV cache the server measures at startup. Without it the deployment maximum
+is the model's full context length, and the server refuses to start when one
+sequence of that length does not fit every rank's GPU KV cache. Pass an
+explicit length instead to pin it; `GET /v1/models` publishes the resolved
+limit.
+
 ### Node 1
 
 Identical, with `--node-rank 1` and the **same** `--dist-init-addr node0-ip:12355`:
@@ -165,6 +173,7 @@ Identical, with `--node-rank 1` and the **same** `--dist-init-addr node0-ip:1235
 ```bash
 python -m batchgen.launch_http_server \
     --model moonshotai/Kimi-K3 \
+    --max-model-len -1 \
     --converted-ckpt-dir /shared/models/Kimi-K3/converted_ckpt \
     --listen-port 10900 \
     --world-size 16 --nnodes 2 --node-rank 1 \

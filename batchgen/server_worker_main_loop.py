@@ -25,9 +25,17 @@ from batchgen.batchgen_worker import (
 	BatchGenWorkerArgs,
 	runs_startup_before_readiness,
 )
-from batchgen import eventlog
 from batchgen.deprecation import LegacyInferenceDeprecated
 from batchgen.eventlog import process as eventlog_process
+from batchgen.eventlog.process import (
+	EXIT_PATH_ABORT,
+	EXIT_PATH_DECODE_BOUNDARY,
+	EXIT_PATH_FLAG,
+	EXIT_PATH_SELF_EXIT,
+	EXIT_PATH_SENTINEL,
+	WORKER_SELF_EXIT_CODE,
+	flush_logs_before_exit,
+)
 from batchgen.server.process_utils import (
 	die_with_parent,
 	install_worker_signal_handlers,
@@ -75,36 +83,9 @@ _SHUTDOWN_FLAG_POLL_S = 0.25
 # rank in that state.
 _SHUTDOWN_SELF_EXIT_GRACE_S = 20.0
 
-# Exit status for that self-exit.  It must be distinguishable from every status
-# this worker can otherwise produce, because the manager reports a worker's
-# exitcode verbatim as the reason a cohort went down:
-#   0        the clean pool-shutdown exit (batchgen_worker.py)
-#   1        every fatal path here and in the worker supervisor
-#   128+n    process_utils' signal translation (SIGINT 130, SIGKILL 137, ...)
-#   -n       multiprocessing's own rendering of a signal death (SIGKILL -9)
-# 86 is outside all of those ranges, so a self-exit can never be read back as a
-# fatal error, a clean exit, or a signal.  The manager needs no change to reap
-# it: it interprets no status value specially (it only formats exitcode into its
-# exit reason), proc.join returns on death like any other exit, and a worker
-# that is already dead when the fallback leg runs is filtered out of it before
-# the signal-fallback marker is logged, so that marker correctly does not claim
-# a worker that ended itself.
-_WORKER_SELF_EXIT_CODE = 86
-
-# Exit-path markers.  Every worker that reaches its ordered teardown emits
-# exactly one of these, so a teardown can be read back per worker instead of
-# inferred from timings.  The signal-fallback path has no marker here: a
-# force-killed worker never runs Python again, so WorkerManager emits that one.
-_EXIT_PATH_SENTINEL = "ordered-via-sentinel"
-_EXIT_PATH_FLAG = "ordered-via-flag"
-_EXIT_PATH_ABORT = "ordered-via-abort"
-_EXIT_PATH_DECODE_BOUNDARY = "ordered-via-decode-boundary"
-
-# Not an ordered teardown: this worker ended itself rather than let a wedged
-# rank hold the cohort's teardown open.  It is logged by the watchdog thread,
-# which owns the GIL while the main thread is stuck below Python, so unlike the
-# signal fallback this marker CAN come from the worker itself.
-_EXIT_PATH_SELF_EXIT = "self-exit"
+# The worker exit protocol -- the self-exit status, the exit-path markers and
+# the pre-exit log flush -- is defined in batchgen.eventlog.process, shared
+# with the worker's own quiesce self-exit.
 
 # This worker's share of the run's liveness lock.  It is module state, not a
 # local, because it must outlive every function here: the kernel releases the
@@ -152,11 +133,20 @@ def _shutdown_worker_runtime(worker) -> None:
 		"gpu_paged_kv_cache_manager",
 		"host_paged_kv_worker_view",
 		"host_paged_kv_worker_view_aux",
-		"_cuda_graph_adapter",
-		"_cuda_graph_manager",
-		"_glm5_moe_cuda_graph_manager",
-		"_glm5_layer_cuda_graph_manager",
-		"_whole_model_segment",
+	):
+		if hasattr(worker, attr):
+			setattr(worker, attr, None)
+
+	# The decode-graph refs sit here, at the position they held in the list
+	# above: after the KV views and before the buffer pools, and before the
+	# first gc.collect() and the weights_storage release below.  GraphRuntime
+	# drops them in its own order -- adapter first, because its `_ctx` holds
+	# model, segment and KV-manager references.
+	graph = getattr(worker, "_graph", None)
+	if graph is not None:
+		graph.drop_refs_for_shutdown()
+
+	for attr in (
 		"_buffer_pool",
 		"_retired_buffer_pools",
 		"skeleton_state_dict",
@@ -335,37 +325,6 @@ def _abort_one_process_group(group: Any) -> None:
 	group.abort()
 
 
-def _flush_worker_logs() -> None:
-	"""Push buffered log records out before an exit that runs no handlers.
-
-	``os._exit`` is the only way out of a process whose main thread is stuck
-	below Python, and it bypasses interpreter shutdown entirely: no atexit
-	hooks, no ``logging.shutdown()``, no stream flush.  Anything still sitting
-	in a handler's buffer at that moment is lost, which would make the
-	self-exit marker -- the one line that attributes the exit -- the most likely
-	record to disappear.  Every flush is individually guarded: this runs on the
-	way out of a failing teardown and must not raise there.
-
-	The event log's root handler only queues records, so its ``flush()`` is a
-	no-op; ``eventlog.flush`` waits until the listener thread has written
-	everything queued so far.
-	"""
-	try:
-		eventlog.flush()
-	except Exception:
-		pass
-	for handler in list(logging.getLogger().handlers):
-		try:
-			handler.flush()
-		except Exception:
-			pass
-	for stream in (sys.stdout, sys.stderr):
-		try:
-			stream.flush()
-		except Exception:
-			pass
-
-
 def _start_shutdown_abort_watchdog(
 	global_rank: int,
 	shutdown_flag: Optional[Any],
@@ -403,7 +362,7 @@ def _start_shutdown_abort_watchdog(
 	enumerate_groups = live_process_groups or _live_process_groups
 	abort_group = abort_one_group or _abort_one_process_group
 	def _record_and_exit(code: int) -> None:
-		eventlog_process.record_exit(code, _EXIT_PATH_SELF_EXIT)
+		eventlog_process.record_exit(code, EXIT_PATH_SELF_EXIT)
 		os._exit(code)
 
 	self_exit = exit_process or _record_and_exit
@@ -487,14 +446,14 @@ def _start_shutdown_abort_watchdog(
 			return
 		logging.error(
 			"[shutdown] worker exit path=%s rank=%s pid=%s",
-			_EXIT_PATH_SELF_EXIT,
+			EXIT_PATH_SELF_EXIT,
 			global_rank,
 			os.getpid(),
 		)
 		# os._exit runs no handler and flushes nothing, so the marker above has
 		# to reach the log first or the exit is unattributable.
-		_flush_worker_logs()
-		self_exit(_WORKER_SELF_EXIT_CODE)
+		flush_logs_before_exit()
+		self_exit(WORKER_SELF_EXIT_CODE)
 
 	thread = threading.Thread(
 		target=_watch,
@@ -533,7 +492,7 @@ def _resolve_main_loop_exit(
 		global_rank,
 		exc_info=error,
 	)
-	return _EXIT_PATH_ABORT
+	return EXIT_PATH_ABORT
 
 
 def _setup_nccl_env():
@@ -882,6 +841,11 @@ def _server_worker_main_impl(
 	# an idle slot carries no budget, so nothing below is watched by it.
 	phase_reporter.leave()
 
+	# Ready means fully warm: every deliberate compile and capture ran above,
+	# so the late-compile guard arms before the ready signal and reports any
+	# later compile as a defect.
+	worker.arm_late_compile_guard_at_readiness()
+
 	# Each launcher owns a node-local event, so local rank 0 must signal its own
 	# WorkerManager. The global barrier above proves all workers are ready first.
 	_signal_local_worker_manager_ready(
@@ -937,7 +901,7 @@ def _server_worker_main_impl(
 	loop_exited = threading.Event()
 	aborted = threading.Event()
 	_start_shutdown_abort_watchdog(global_rank, shutdown_flag, loop_exited, aborted)
-	exit_path = _EXIT_PATH_SENTINEL
+	exit_path = EXIT_PATH_SENTINEL
 	try:
 		while True:
 			# --- STEP 0: Teardown boundary check ---
@@ -948,7 +912,7 @@ def _server_worker_main_impl(
 			# exactly how the first attempt at this fix failed validation.
 			# Testing the flag here is what actually retires the rank.
 			if _shutdown_requested(shutdown_flag):
-				exit_path = _EXIT_PATH_ABORT if aborted.is_set() else _EXIT_PATH_FLAG
+				exit_path = EXIT_PATH_ABORT if aborted.is_set() else EXIT_PATH_FLAG
 				logging.info(
 					"Rank %s: shutdown flag observed at the loop boundary; "
 					"running the ordered teardown",
@@ -1046,7 +1010,7 @@ def _server_worker_main_impl(
 				# pool_shutdown sentinel below is skipped: the cohort it would
 				# report to is the one being torn down.
 				if worker.cohort_shutdown_observed:
-					exit_path = _EXIT_PATH_DECODE_BOUNDARY
+					exit_path = EXIT_PATH_DECODE_BOUNDARY
 					logging.info(
 						"Rank %s: shutdown flag observed at the decode-step "
 						"boundary; running the ordered teardown",

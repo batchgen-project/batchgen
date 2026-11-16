@@ -995,7 +995,7 @@ class BatchScheduler:
         model: str,
         decoded_text: str,
     ) -> tuple[str, Optional[str], Optional[List[ToolCall]]]:
-        """Apply thinking/tool-call parsing if flags are enabled.
+        """Apply the thinking/tool-call parsing in effect for this model.
 
         Returns:
             (content, reasoning_content, tool_calls)
@@ -1008,13 +1008,17 @@ class BatchScheduler:
         if tokenizer is None:
             return content, reasoning_content, tool_calls
 
-        if self.server_args.parse_thinking:
+        parse_thinking, parse_tool_call = self._effective_output_parsing(
+            tokenizer
+        )
+
+        if parse_thinking:
             try:
                 reasoning_content, content = tokenizer.parse_thinking(content)
             except NotImplementedError:
                 pass
 
-        if self.server_args.parse_tool_call:
+        if parse_tool_call:
             try:
                 raw_calls, content = tokenizer.parse_tool_calls(content)
                 if raw_calls:
@@ -1033,6 +1037,22 @@ class BatchScheduler:
                 pass
 
         return content, reasoning_content, tool_calls
+
+    def _effective_output_parsing(self, tokenizer: Any) -> tuple[bool, bool]:
+        """(parse_thinking, parse_tool_call) for responses of this tokenizer.
+
+        An explicit server flag (``--[no-]parse-thinking``,
+        ``--[no-]parse-tool-call``) wins; an unset one (None) takes the
+        model's declared default (``BaseTokenizer.parse_thinking_default`` /
+        ``parse_tool_call_default``).
+        """
+        parse_thinking = self.server_args.parse_thinking
+        if parse_thinking is None:
+            parse_thinking = tokenizer.parse_thinking_default
+        parse_tool_call = self.server_args.parse_tool_call
+        if parse_tool_call is None:
+            parse_tool_call = tokenizer.parse_tool_call_default
+        return bool(parse_thinking), bool(parse_tool_call)
 
     def _get_tokenizer(self, model: str) -> Optional[Any]:
         """Load tokenizer for the given model.
@@ -1058,6 +1078,20 @@ class BatchScheduler:
 
         self._tokenizer = tokenizer
         self._tokenizer_model = model
+        parse_thinking, parse_tool_call = self._effective_output_parsing(
+            tokenizer
+        )
+        logger.info(
+            "Chat output parsing for %s: parse_thinking=%s (%s), "
+            "parse_tool_call=%s (%s)",
+            model,
+            parse_thinking,
+            "model default" if self.server_args.parse_thinking is None
+            else "server flag",
+            parse_tool_call,
+            "model default" if self.server_args.parse_tool_call is None
+            else "server flag",
+        )
         return tokenizer
 
     # ============ Per-turn path (POST /v1/turns) ============
@@ -1632,7 +1666,7 @@ class BatchScheduler:
                     waiter = self._turn_waiters.get(entry.batch_id)
                     if waiter is not None:
                         waiter.timing["admit_sent_at"] = sent_at
-            logger.warning(
+            logger.info(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
                 f"(intake remaining: {self._intake_pool.size()}, "
                 f"scheduling active: {self._scheduling_pool.num_active_slots()}, "

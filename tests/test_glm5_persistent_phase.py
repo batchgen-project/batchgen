@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from tests.worker.worker_fakes import attach_trajectory_state
 
 import pytest
 import torch
@@ -180,14 +181,14 @@ def test_persistent_phase_worker_gate_rejects_invalid_flag_on_modes():
     enabled = _isolated_worker_method("_persistent_phase_enabled")
     worker = SimpleNamespace(
         args=SimpleNamespace(persistent_phase_instances=True),
-        _trajectory_book=None,
         parallel_manager=SimpleNamespace(),
     )
+    attach_trajectory_state(worker)
 
     with pytest.raises(RuntimeError, match="requires the unified trajectory pool"):
         enabled(worker)
 
-    worker._trajectory_book = object()
+    worker._traj.trajectory_book = object()
     with pytest.raises(RuntimeError, match="is not supported"):
         enabled(worker)
 
@@ -313,6 +314,7 @@ def test_prefill_nsys_profile_is_inert_without_batch_debug():
     worker = SimpleNamespace(
         _batchgen_debug={},
         _debug_flag_enabled=lambda value: False,
+        _active_batchgen_debug_for_sequences=lambda sequences: None,
     )
 
     active = begin(worker, local_bsz=42, global_bsz=336)

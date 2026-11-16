@@ -318,6 +318,7 @@ export NCCL_BUFFSIZE=16777216  # 16MB buffer size
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --max-model-len -1 \
     --cache-dir /shared/models/DeepSeek-R1 \
     --listen-port 10900 \
     --world-size 16 \
@@ -328,11 +329,19 @@ python -m batchgen.launch_http_server \
     --host-kv-cache-size 256
 ```
 
+`--max-model-len -1` fits the deployment maximum sequence length to the GPU
+KV cache the server measures at startup. Without it the deployment maximum
+is the model's full context length, and the server refuses to start when one
+sequence of that length does not fit every rank's GPU KV cache. Pass an
+explicit length instead to pin it; `GET /v1/models` publishes the resolved
+limit.
+
 #### Node 1
 
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --max-model-len -1 \
     --cache-dir /shared/models/DeepSeek-R1 \
     --listen-port 10900 \
     --world-size 16 \
@@ -350,6 +359,7 @@ For single-node deployment with 8 H20 GPUs, enable Expert Parallelism with parti
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --max-model-len -1 \
     --cache-dir /shared/models/DeepSeek-R1 \
     --dist-init-addr "your-ip:33001" \
     --nnodes 1 \

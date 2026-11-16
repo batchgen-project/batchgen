@@ -1,7 +1,6 @@
 """Server argument parsing and validation utilities."""
 
 import argparse
-import os
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +13,6 @@ from batchgen.eventlog.process import (
     resolve_log_dir,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
-    GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
 from batchgen.server.runtime_identity import RuntimeIdentity
@@ -58,10 +56,6 @@ def _ensure_local_port_free(port: int, label: str) -> None:
 def _default_storage_path() -> Path:
     """Return default storage path under batchgen directory."""
     return Path(__file__).parent.parent / "storage"
-
-
-def _is_glm_model(model_name: Optional[str]) -> bool:
-    return "glm" in (model_name or "").lower()
 
 
 class WeightSourceError(ValueError):
@@ -170,17 +164,6 @@ def _validate_distributed_weight_source(args: "ServerArgs") -> None:
         )
 
 
-def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
-    # Phase C: mode env vars retired. Activation is gated by the
-    # `--enable-cuda-graph` / `--disable-cuda-graphs` CLI flags directly,
-    # consumed by the worker's `_glm5_whole_model_graph_requested_for_current_batch`
-    # via `args.enable_cuda_graph` / `args.disable_cuda_graphs`. Only the
-    # developer compare env var is still pinned here when graphs are
-    # explicitly disabled, to keep the compare facility off.
-    if args.disable_cuda_graphs and _is_glm_model(args.model):
-        os.environ[GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV] = "0"
-
-
 @dataclass
 class ServerArgs:
     """Server configuration."""
@@ -254,8 +237,11 @@ class ServerArgs:
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
-    parse_thinking: bool = False  # Extract reasoning_content from model output
-    parse_tool_call: bool = False  # Extract tool_calls from model output
+    # Output parsing of chat responses. None = the model's declared default
+    # (BaseTokenizer.parse_thinking_default / parse_tool_call_default);
+    # True / False = forced on / off for every model.
+    parse_thinking: Optional[bool] = None  # Extract reasoning_content from model output
+    parse_tool_call: Optional[bool] = None  # Extract tool_calls from model output
     enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -650,15 +636,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--parse-thinking",
-        action="store_true",
-        default=False,
-        help="Extract thinking/reasoning blocks from model output into reasoning_content field",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Extract thinking/reasoning blocks from chat output into the "
+             "reasoning_content field. Unset: the model's default (on for "
+             "GPT-OSS, whose harmony channels are always parsed; off for "
+             "every other model). --no-parse-thinking returns the raw "
+             "decoded text, delimiters included, in content.",
     )
     parser.add_argument(
         "--parse-tool-call",
-        action="store_true",
-        default=False,
-        help="Extract tool call blocks from model output into tool_calls array",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Extract tool call blocks from chat output into the tool_calls "
+             "array. Unset: the model's default (on for GPT-OSS, off for "
+             "every other model). --no-parse-tool-call leaves calls as raw "
+             "text in content.",
     )
     cuda_graph_group = parser.add_mutually_exclusive_group()
     cuda_graph_group.add_argument(
@@ -1119,5 +1112,4 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
-    _apply_cuda_graph_cli_env_defaults(server_args)
     return server_args

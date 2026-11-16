@@ -20,6 +20,7 @@ point; it does not re-implement anything.
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
 from typing import Any, Dict, Iterable
 
@@ -27,6 +28,49 @@ WORKER_SOURCE = (
     pathlib.Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
 )
 WORKER_CLASS = "BatchGenWorker"
+PREFILL_ENGINE_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "prefill_engine.py"
+)
+PREFILL_ENGINE_CLASS = "PrefillEngine"
+RANK_SYNC_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "rank_sync_engine.py"
+)
+RANK_SYNC_CLASS = "RankSyncEngine"
+STEP_OBSERVABILITY_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "step_observability_engine.py"
+)
+STEP_OBSERVABILITY_CLASS = "StepObservabilityEngine"
+WORKER_LIFECYCLE_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "worker_lifecycle_engine.py"
+)
+WORKER_LIFECYCLE_CLASS = "WorkerLifecycleEngine"
+KV_CAPACITY_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "kv_capacity_engine.py"
+)
+KV_CAPACITY_CLASS = "KVCapacityEngine"
+# The worker-seam engines (S8, S7, S9, S10a) whose methods the worker reaches through
+# same-name canonical delegators.
+DELEGATED_ENGINES = (
+    (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
+    (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
+    (WORKER_LIFECYCLE_SOURCE, WORKER_LIFECYCLE_CLASS),
+    (KV_CAPACITY_SOURCE, KV_CAPACITY_CLASS),
+)
 
 
 def load_worker_methods(
@@ -109,4 +153,173 @@ def load_worker_functions(
         raise AssertionError(
             f"{WORKER_SOURCE} has no module-level function(s) {sorted(missing)}"
         )
+    return loaded
+
+
+def load_prefill_engine_methods(
+    names: Iterable[str],
+    namespace: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compile S5a ``PrefillEngine`` methods from their real source.
+
+    The engine methods have the explicit S4b-style seam ``(self, worker, ...)``.
+    This helper adapts them back to the worker-shaped call used by CPU fakes:
+    the engine instance is stateless, so ``None`` is sufficient for its
+    pre-rebinding ``self`` and the fake is passed as ``worker``.
+    """
+    wanted = set(names)
+    tree = ast.parse(
+        PREFILL_ENGINE_SOURCE.read_text(), filename=str(PREFILL_ENGINE_SOURCE)
+    )
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == PREFILL_ENGINE_CLASS
+    ]
+    if len(classes) != 1:
+        raise AssertionError(
+            f"expected exactly one class {PREFILL_ENGINE_CLASS} in "
+            f"{PREFILL_ENGINE_SOURCE}, found {len(classes)}"
+        )
+
+    loaded: Dict[str, Any] = {}
+    for node in classes[0].body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in wanted:
+            continue
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        scope: Dict[str, Any] = dict(namespace)
+        exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
+        engine_method = scope[node.name]
+
+        def worker_method(worker, *args, _engine_method=engine_method, **kwargs):
+            return _engine_method(None, worker, *args, **kwargs)
+
+        loaded[node.name] = worker_method
+
+    missing = wanted - set(loaded)
+    if missing:
+        raise AssertionError(
+            f"{PREFILL_ENGINE_CLASS} has no method(s) {sorted(missing)} in "
+            f"{PREFILL_ENGINE_SOURCE}"
+        )
+    return loaded
+
+
+def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
+    """An engine method ``(self, worker, ...)`` back in its worker shape.
+
+    The S5/S8 engines take the worker as an explicit collaborator and rebind
+    ``self = worker`` as the first statement after the docstring, so the moved
+    body is statement for statement the old worker method. Dropping exactly
+    that parameter and that one statement gives the original method's AST,
+    which is what a structural pin written against the worker method reads.
+    """
+    method = copy.deepcopy(node)
+    args = method.args.args
+    if len(args) < 2 or args[0].arg != "self" or args[1].arg != "worker":
+        raise AssertionError(f"{node.name} is not an engine method (self, worker, ...)")
+    del args[1]
+    rebinds = [
+        index for index, stmt in enumerate(method.body)
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id == "self"
+        and isinstance(stmt.value, ast.Name)
+        and stmt.value.id == "worker"
+    ]
+    if len(rebinds) != 1:
+        raise AssertionError(f"{node.name}: expected one `self = worker`, found {len(rebinds)}")
+    del method.body[rebinds[0]]
+    return method
+
+
+def _class_methods(path: pathlib.Path, class_name: str) -> Dict[str, ast.FunctionDef]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return {
+        node.name: node for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def rank_sync_method_names() -> set:
+    """The worker methods whose bodies live in ``RankSyncEngine`` (S8)."""
+    return set(_class_methods(RANK_SYNC_SOURCE, RANK_SYNC_CLASS))
+
+
+def step_observability_method_names() -> set:
+    """The worker methods whose bodies live in ``StepObservabilityEngine`` (S7)."""
+    return set(_class_methods(STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS))
+
+
+def worker_shaped_method_node(name: str) -> ast.FunctionDef:
+    """The body a worker method runs, in the worker's own shape.
+
+    For a method S8/S7/S9/S10a moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
+    / ``WorkerLifecycleEngine`` / ``KVCapacityEngine``
+    the worker keeps a canonical delegator; the statements that run are the
+    engine's, so this returns the engine method converted back by
+    :func:`engine_method_as_worker_method`. Every other name resolves to the
+    worker class method itself.
+    """
+    for source, class_name in DELEGATED_ENGINES:
+        engine = _class_methods(source, class_name)
+        if name in engine:
+            return engine_method_as_worker_method(engine[name])
+    worker = _class_methods(WORKER_SOURCE, WORKER_CLASS)
+    if name not in worker:
+        raise AssertionError(f"{WORKER_CLASS} has no method {name}")
+    return copy.deepcopy(worker[name])
+
+
+def delegated_method_source(name: str) -> str:
+    """The raw source text of a delegated method's engine body.
+
+    Text pins that used to slice the worker file keep their assertions
+    byte-identical by reading the engine's own source segment (located by
+    AST, so no indentation or delimiter assumptions). The segment is the
+    engine method as written: its ``worker`` parameter and the ``self =
+    worker`` rebinding are part of it.
+    """
+    for source, class_name in DELEGATED_ENGINES:
+        engine = _class_methods(source, class_name)
+        if name in engine:
+            return ast.get_source_segment(source.read_text(), engine[name])
+    raise KeyError(f"{name} is not a delegated engine method")
+
+
+def delegated_method_names() -> set:
+    """Every worker method whose body lives in a delegated engine (S8/S7/S9/S10a)."""
+    names: set = set()
+    for source, class_name in DELEGATED_ENGINES:
+        names |= set(_class_methods(source, class_name))
+    return names
+
+
+def load_worker_shaped_methods(
+    names: Iterable[str],
+    namespace: Dict[str, Any],
+) -> Dict[str, Any]:
+    """:func:`load_worker_methods` for the bodies that actually run.
+
+    A delegated method compiles from its engine body in the worker's shape,
+    so the caller's ``namespace`` (stub ``torch``, ``sys``, ...) reaches the
+    moved statements exactly as it reached them on the worker; every other
+    name compiles from the worker class as before.
+    """
+    loaded: Dict[str, Any] = {}
+    for name in names:
+        node = worker_shaped_method_node(name)
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        scope: Dict[str, Any] = dict(namespace)
+        exec(compile(module, str(WORKER_SOURCE), "exec"), scope)  # noqa: S102
+        loaded[name] = scope[name]
     return loaded

@@ -32,6 +32,7 @@ import torch
 
 from batchgen.query_book import QueryBook
 from batchgen.sequence import SequenceBatch, SequenceEntry
+from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from tests.worker_method_source import load_worker_functions, load_worker_methods
 
 SERVER = Path(__file__).resolve().parents[1] / "batchgen" / "server"
@@ -233,7 +234,13 @@ def test_the_worker_binds_the_ids_it_receives(tmp_path):
         def __init__(self):
             self.global_batch = SequenceBatch()
             self._group_uuids = set()
-            self._trajectory_book = QueryBook(capacity_bytes=64 * 4, page_tokens=64)
+            attach_trajectory_state(
+                self,
+                trajectory_book=QueryBook(capacity_bytes=64 * 4, page_tokens=64),
+            )
+            attach_prefix_state(self)
+            # Alias kept for the assertions below.
+            self._trajectory_book = self._traj.trajectory_book
 
         def _publish_trajectory_pool_capacity(self):
             pass

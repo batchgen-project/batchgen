@@ -11,6 +11,8 @@ from typing import Dict, MutableMapping, Optional, Sequence, Set, Tuple
 
 import torch
 
+from batchgen.worker.sequence_table import SequenceTable
+
 
 class QueryBookCapacityError(RuntimeError):
     """A QueryBook operation exceeded the configured fixed capacity."""
@@ -1100,6 +1102,47 @@ def make_query_book_entry(sequence) -> QueryBookEntry:
     )
 
 
+def bind_query_book_slot(
+    uuid: str,
+    sequence,
+    *,
+    query_book: MutableMapping[int, QueryBookEntry],
+    table: SequenceTable,
+    local_idx: Optional[int] = None,
+) -> int:
+    """Bind ``uuid`` in ``table`` and refresh the slot's query-book entry.
+
+    The slot binding (both maps and the free-slot allocator) is
+    ``SequenceTable.bind``; this function owns only the query-book half.
+    """
+    if sequence is None:
+        raise KeyError(f"Sequence with UUID {uuid} not found in global_batch")
+
+    local_idx = table.bind(uuid, local_idx)
+    query_book[local_idx] = make_query_book_entry(sequence)
+    return local_idx
+
+
+def release_query_book_slot(
+    uuid: str,
+    *,
+    query_book: MutableMapping[int, QueryBookEntry],
+    table: SequenceTable,
+) -> Optional[int]:
+    """Unbind ``uuid`` from ``table`` and drop its query-book entry.
+
+    Returns the freed slot, or ``None`` if ``uuid`` was not bound. Callers
+    release the sequence's KV resources BEFORE this; see
+    ``SequenceTable.unbind``.
+    """
+    local_idx = table.unbind(uuid)
+    if local_idx is None:
+        return None
+
+    query_book.pop(local_idx, None)
+    return local_idx
+
+
 def bind_local_sequence_to_query_book(
     uuid: str,
     sequence,
@@ -1111,20 +1154,21 @@ def bind_local_sequence_to_query_book(
     next_local_idx: int,
     local_idx: Optional[int] = None,
 ) -> Tuple[int, int]:
-    if sequence is None:
-        raise KeyError(f"Sequence with UUID {uuid} not found in global_batch")
+    """Pinned raw-container form of ``bind_query_book_slot``.
 
-    if local_idx is None:
-        if free_local_indices:
-            local_idx = free_local_indices.pop()
-        else:
-            local_idx = next_local_idx
-            next_local_idx += 1
-
-    local_to_uuid_map[local_idx] = uuid
-    uuid_to_local_map[uuid] = local_idx
-    query_book[local_idx] = make_query_book_entry(sequence)
-    return local_idx, next_local_idx
+    Mutates the given containers in place through ``SequenceTable.adopting``
+    and returns ``(local_idx, next_local_idx)``.
+    """
+    table = SequenceTable.adopting(
+        local_to_uuid=local_to_uuid_map,
+        uuid_to_local=uuid_to_local_map,
+        free_local_indices=free_local_indices,
+        next_local_idx=next_local_idx,
+    )
+    local_idx = bind_query_book_slot(
+        uuid, sequence, query_book=query_book, table=table, local_idx=local_idx
+    )
+    return local_idx, table.next_local_idx
 
 
 def release_local_query_slot(
@@ -1135,11 +1179,11 @@ def release_local_query_slot(
     query_book: MutableMapping[int, QueryBookEntry],
     free_local_indices: Set[int],
 ) -> Optional[int]:
-    local_idx = uuid_to_local_map.pop(uuid, None)
-    if local_idx is None:
-        return None
-
-    local_to_uuid_map.pop(local_idx, None)
-    query_book.pop(local_idx, None)
-    free_local_indices.add(local_idx)
-    return local_idx
+    """Pinned raw-container form of ``release_query_book_slot``."""
+    table = SequenceTable.adopting(
+        local_to_uuid=local_to_uuid_map,
+        uuid_to_local=uuid_to_local_map,
+        free_local_indices=free_local_indices,
+        next_local_idx=0,
+    )
+    return release_query_book_slot(uuid, query_book=query_book, table=table)

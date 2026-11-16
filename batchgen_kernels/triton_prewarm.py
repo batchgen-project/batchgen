@@ -140,19 +140,43 @@ class LateCompileGuard:
     it takes down the worker pool, and the flags of every sequence in the
     step are merged, so a co-scheduled batch's shape can trigger it. Strict
     is therefore for acceptance runs only, never the default.
+
+    ``mark_ready`` records that the worker reported ready. From then on
+    nothing compiles deliberately: ``disarm`` is refused, so a prewarm phase
+    that runs after readiness keeps the guard armed and its compiles are
+    reported as late.
     """
 
     def __init__(self, debug_source: Optional[Callable[[], dict]] = None,
                  strict_keys=DEFAULT_STRICT_KEYS):
         self._mode = DISARMED
+        self._ready = False
         self._debug_source = debug_source or _no_debug
         self.strict_keys = _normalise_keys(strict_keys)
 
     def arm(self, strict: bool = False) -> None:
         self._mode = STRICT if strict else LOG
 
-    def disarm(self) -> None:
+    def disarm(self) -> bool:
+        """Disarm for a deliberate prewarm phase; False (and still armed)
+        once the guard is ready."""
+        if self._ready:
+            return False
         self._mode = DISARMED
+        return True
+
+    def mark_ready(self, strict: bool = False) -> None:
+        """Readiness: arm (strict when asked, never weaker than before) and
+        refuse every later ``disarm``."""
+        self._ready = True
+        if strict:
+            self._mode = STRICT
+        elif self._mode == DISARMED:
+            self._mode = LOG
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
 
     @property
     def armed_mode(self) -> str:
@@ -448,6 +472,26 @@ def get_recorder(
         return _RECORDER
 
 
+def arm_at_readiness(strict: bool = False, *, rank=None) -> bool:
+    """Arm the process-wide guard for good when the worker reports ready.
+
+    Installs the recorder's hooks if no prewarm did, then ``mark_ready``:
+    every later compilation, a prewarm phase's included, is late. Returns
+    whether the hooks are installed (False: this Triton has none, and the
+    install already logged why). A model that binds its own log tag and
+    debug source must create the recorder first (its ``get_recorder``).
+    """
+    recorder = get_recorder()
+    installed = recorder.install()
+    recorder.guard.mark_ready(strict=strict)
+    logger.info(
+        "%s rank=%s readiness: late-compile guard armed (%s); every later "
+        "Triton compile is reported as late, prewarm phases included",
+        recorder.log_tag, rank, recorder.guard.armed_mode,
+    )
+    return installed
+
+
 # ============================================================================
 #  Phases
 # ============================================================================
@@ -478,6 +522,10 @@ def _run_phase(name, entries, recorder, rank, sync,
         try:
             entry.run()
             sync()
+        except LateTritonCompileError:
+            # A strict guard (armed at readiness) refusing a phase's compile:
+            # that is the verdict strict mode exists to deliver.
+            raise
         except Exception:  # noqa: BLE001 - one bad entry must not stop startup
             failed += 1
             logger.warning(

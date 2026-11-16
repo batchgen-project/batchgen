@@ -31,6 +31,13 @@ class DistributedWeightDaemon {
     std::uint64_t CohortEpoch();
     std::uint64_t BeginCohortSwap();
     std::string FinishCohortSwap(double timeout_seconds);
+    // The daemon's health, for the server process that polls it while the
+    // pool serves: the transport latch (permanent; only a cold restart
+    // clears it) and the current cohort's fault (cleared by the next cohort
+    // swap). A JSON object, like FinishCohortSwap's report. It only copies
+    // under leaf mutexes, so a poll never waits behind a fetch, a swap or
+    // file I/O.
+    std::string Status();
     void PrepareStop();
     void Stop();
 

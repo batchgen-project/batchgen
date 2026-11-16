@@ -3,7 +3,7 @@
 Validates _decode_tokens_to_string behavior and the gather-by-string pattern
 that replaced the old gather-by-tensor approach (which OOMed at 12K+ sequences).
 
-Run with: python tests/test_result_gathering.py
+Run with: python -m pytest tests/unit/test_result_gathering.py
 """
 
 import sys
@@ -11,42 +11,44 @@ import torch
 from dataclasses import dataclass
 from typing import List, Set, Optional
 
+from tests.worker_method_source import load_worker_methods
 
-# ---- Mock classes to test _decode_tokens_to_string in isolation ----
+
+# ---- The real BatchGenWorker._decode_tokens_to_string on a stub worker ----
+
+_DECODE = load_worker_methods(
+    ["_decode_tokens_to_string"], {"torch": torch}
+)["_decode_tokens_to_string"]
+
 
 class MockTokenizer:
-    """Minimal tokenizer mock that maps token IDs to strings."""
-    def __init__(self):
-        # Simple vocab: token_id -> "t{id}"
-        pass
+    """Maps token id N to "tN"; the stop ids are its special tokens."""
+
+    def __init__(self, special_ids: Set[int]):
+        self.special_ids = set(special_ids)
 
     def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
+        if skip_special_tokens:
+            token_ids = [t for t in token_ids if t not in self.special_ids]
         return " ".join(f"t{t}" for t in token_ids)
 
 
 class MockWorker:
-    """Minimal mock of BatchGenWorker with just the fields needed for _decode_tokens_to_string."""
-    def __init__(self, eos_token_ids: Set[int], pad_token_id: int = 0):
+    """The fields BatchGenWorker._decode_tokens_to_string reads."""
+
+    def __init__(
+        self,
+        eos_token_ids: Set[int],
+        pad_token_id: int = 0,
+        detokenization_include_special_tokens: bool = False,
+    ):
         self.eos_token_ids = eos_token_ids
         self.pad_token_id = pad_token_id
-        self.tokenizer = MockTokenizer()
+        self.detokenization_include_special_tokens = detokenization_include_special_tokens
+        self.tokenizer = MockTokenizer(eos_token_ids)
 
     def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
-        """Exact copy of BatchGenWorker._decode_tokens_to_string."""
-        if tokens.dim() > 1:
-            tokens = tokens.squeeze(0)
-
-        tokens_list = tokens.tolist()
-
-        eos_positions = [i for i, t in enumerate(tokens_list) if t in self.eos_token_ids and i >= min_tokens]
-
-        if eos_positions:
-            end_pos = eos_positions[0]
-        else:
-            non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
-            end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
-
-        return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
+        return _DECODE(self, tokens, min_tokens=min_tokens)
 
 
 # ---- Tests ----
@@ -68,9 +70,60 @@ def test_eos_respects_min_tokens():
     # [EOS=2, 10, 20, EOS=2, PAD=0]
     tokens = torch.tensor([[2, 10, 20, 2, 0]], dtype=torch.int64)
     result = worker._decode_tokens_to_string(tokens, min_tokens=1)
-    # EOS at position 0 is < min_tokens=1, skip it. Next EOS at position 3.
-    assert result == "t2 t10 t20", f"Expected 't2 t10 t20', got '{result}'"
+    # EOS at position 0 is < min_tokens=1, so it does not end the text; the
+    # next EOS (position 3) does. Both are special and dropped by the decode.
+    assert result == "t10 t20", f"Expected 't10 t20', got '{result}'"
+    worker = MockWorker(
+        eos_token_ids={2}, pad_token_id=0, detokenization_include_special_tokens=True
+    )
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    assert result == "t2 t10 t20 t2", f"Expected 't2 t10 t20 t2', got '{result}'"
     print("  PASS: test_eos_respects_min_tokens")
+
+
+def test_first_token_stop_is_honored_when_nothing_follows():
+    """The min-token floor defers only to a LATER EOS: a sequence that is
+    one EOS plus padding genuinely ended, and the slice must end at that
+    EOS instead of resurrecting it through the non-pad fallback."""
+    worker = MockWorker(eos_token_ids={2}, pad_token_id=0)
+    tokens = torch.tensor([[2, 0, 0, 0]], dtype=torch.int64)
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    # Slice is [EOS]; the EOS is special and dropped by the decode.
+    assert result == "", f"Expected '', got '{result}'"
+    worker = MockWorker(
+        eos_token_ids={2}, pad_token_id=0, detokenization_include_special_tokens=True
+    )
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    assert result == "t2", f"Expected 't2', got '{result}'"
+
+
+def test_early_eos_with_content_after_keeps_the_fallback():
+    """An early EOS followed by real tokens and NO later EOS keeps the
+    old whole-slice fallback (the floor suppressed that EOS)."""
+    worker = MockWorker(eos_token_ids={2}, pad_token_id=0)
+    tokens = torch.tensor([[2, 10, 20, 0]], dtype=torch.int64)
+    result = worker._decode_tokens_to_string(tokens, min_tokens=1)
+    assert result == "t10 t20", f"Expected 't10 t20', got '{result}'"
+
+
+def test_stop_token_is_decoded_with_the_completion():
+    """The slice ends after the stop token; decode decides if it shows."""
+    tokens = torch.tensor([[10, 20, 2, 30, 0]], dtype=torch.int64)
+    calls = []
+
+    worker = MockWorker(eos_token_ids={2}, pad_token_id=0)
+    real_decode = worker.tokenizer.decode
+    worker.tokenizer.decode = lambda ids, skip_special_tokens=False: (
+        calls.append((list(ids), skip_special_tokens))
+        or real_decode(ids, skip_special_tokens=skip_special_tokens)
+    )
+    assert worker._decode_tokens_to_string(tokens) == "t10 t20"
+    assert calls == [([10, 20, 2], True)]
+
+    worker = MockWorker(
+        eos_token_ids={2}, pad_token_id=0, detokenization_include_special_tokens=True
+    )
+    assert worker._decode_tokens_to_string(tokens) == "t10 t20 t2"
 
 
 def test_no_eos_strips_padding():
@@ -205,6 +258,7 @@ if __name__ == "__main__":
     tests = [
         test_basic_decode,
         test_eos_respects_min_tokens,
+        test_stop_token_is_decoded_with_the_completion,
         test_no_eos_strips_padding,
         test_all_padding,
         test_1d_input,

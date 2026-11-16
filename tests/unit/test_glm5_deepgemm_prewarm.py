@@ -23,7 +23,6 @@ Loaded by file path (no ``import batchgen``); no CUDA, Triton or DeepGEMM.
 Run: python -m pytest tests/unit/test_glm5_deepgemm_prewarm.py -q
 """
 
-import ast
 import collections
 import importlib.util
 import logging
@@ -185,60 +184,16 @@ def test_page_split_scale_bytes_match_the_cache_format():
 
 
 # --------------------------------------------------------------------------- #
-#  Inventory pin
+#  Inventory pin — the repo-wide scanner lives in test_jit_site_registry.py;
+#  this file keeps the GLM-5-owned check that every reachable table name is a
+#  prewarm site.
 # --------------------------------------------------------------------------- #
-def _scan_calls():
-    """``(path, enclosing function, callee) -> count`` over the inventory."""
-    files = set()
-    for rel in DGP.INVENTORY_PATHS:
-        path = _ROOT / rel
-        files.update([path] if path.is_file() else path.rglob("*.py"))
-    callees = set(DGP.INVENTORY_CALLEES)
-    found = collections.Counter()
-
-    class Visitor(ast.NodeVisitor):
-        def __init__(self, rel):
-            self.rel, self.stack = rel, []
-
-        def _scope(self, node):
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        visit_ClassDef = visit_FunctionDef = visit_AsyncFunctionDef = _scope
-
-        def visit_Call(self, node):
-            func, callee = node.func, None
-            if (isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "deep_gemm"
-                    and func.attr not in DGP.INVENTORY_NON_KERNELS):
-                callee = "deep_gemm." + func.attr
-            elif isinstance(func, ast.Name) and func.id in callees:
-                callee = func.id
-            if callee is not None:
-                scope = ".".join(self.stack) or "<module>"
-                found[(self.rel, scope, callee)] += 1
-            self.generic_visit(node)
-
-    for path in sorted(files):
-        if path.name in ("triton_prewarm.py", "deepgemm_prewarm.py"):
-            continue
-        rel = path.relative_to(_ROOT).as_posix()
-        Visitor(rel).visit(ast.parse(path.read_text()))
-    return found
 
 
-def test_inventory_names_every_deepgemm_call():
-    found = _scan_calls()
-    pinned = {key: count for key, (count, _) in DGP.CALL_SITES.items()}
-    missing = {k: v for k, v in found.items() if k not in pinned}
-    stale = {k: v for k, v in pinned.items() if k not in found}
-    changed = {k: (pinned[k], found[k]) for k in pinned.keys() & found.keys()
-               if pinned[k] != found[k]}
-    assert missing == {}, "DeepGEMM calls the site table does not name"
-    assert stale == {}, "site-table calls that no longer exist"
-    assert changed == {}, "call counts changed (pinned, found)"
+
+
+
+
 
 
 def test_inventory_sites_are_table_sites():
@@ -540,30 +495,34 @@ def test_version_mismatch_warns_with_both_versions(monkeypatch, caplog):
     assert caplog.records == []
 
 
-def test_late_compiles_are_counted_logged_and_strict(monkeypatch, tmp_path,
-                                                     caplog):
+def test_late_compiles_are_named_logged_and_strict(monkeypatch, tmp_path,
+                                                   caplog):
     monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(DGP, "_BASELINE", None)
+    monkeypatch.setattr(DGP, "_UNARMED_REPORTED", set())
     cache = tmp_path / "cache"
     assert DGP.jit_cache_dir() == cache
-    assert DGP.cache_kernel_count() == 0
-    # Before the first geometry phase there is nothing to compare against.
+    assert DGP.cache_kernel_names() == frozenset()
+    # Before the guard is armed nothing is known: None, not "no compile".
     (cache / "kernel.sm90_fp8_gemm_1d2d.a").mkdir(parents=True)
-    assert DGP.check_late_compiles(0, "configure_prefill") == 0
+    assert DGP.check_late_compiles(0, "configure_prefill") is None
     (cache / "tmp.partial").mkdir()
     (cache / "kernel.stray_file").write_text("")
-    assert DGP.record_baseline(0) == 1
-    assert DGP.check_late_compiles(0, "configure_prefill") == 0
+    assert DGP.record_baseline(0) == {"kernel.sm90_fp8_gemm_1d2d.a"}
+    assert DGP.check_late_compiles(0, "configure_prefill") == ()
     (cache / "kernel.sm90_fp8_gemm_1d2d.b").mkdir()
     (cache / "kernel.transpose_fp32.c").mkdir()
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger=DGP.logger.name):
-        assert DGP.check_late_compiles(3, "configure_decoding") == 2
+        assert DGP.check_late_compiles(3, "configure_decoding") == (
+            "kernel.sm90_fp8_gemm_1d2d.b", "kernel.transpose_fp32.c")
     message, = [r.getMessage() for r in caplog.records]
     assert message.startswith("[GLM5_DEEPGEMM_WARMUP] rank=3 DeepGEMM "
                               "compiled 2 kernels after the prewarm")
     assert "configure_decoding" in message
-    # Reported once: the baseline moves to the new count.
-    assert DGP.check_late_compiles(3, "configure_prefill") == 0
+    assert "sm90_fp8_gemm_1d2d x1, transpose_fp32 x1" in message
+    # Reported once: the baseline takes in the new names.
+    assert DGP.check_late_compiles(3, "configure_prefill") == ()
     (cache / "kernel.sm90_paged_mqa_logits_metadata.d").mkdir()
     with pytest.raises(DGP.LateDeepGemmCompileError, match="compiled 1"):
         DGP.check_late_compiles(0, "configure_prefill", strict=True)
@@ -575,3 +534,65 @@ def test_imports_without_deepgemm_or_triton(monkeypatch):
     module = _load(_GLM5_DIR / "deepgemm_prewarm.py",
                    "_glm5_deepgemm_prewarm_no_gpu_deps")
     assert callable(module.geometry_entries)
+
+
+# --------------------------------------------------------------------------- #
+#  Grouped contiguous prefill MoE entries
+# --------------------------------------------------------------------------- #
+def test_contiguous_sites_are_the_grouped_prefill_gemm_shapes():
+    shapes = _shapes()
+    sites = {s.name: (s.n, s.k, s.groups) for s in DGP.contiguous_sites(shapes)}
+    # The group count is compiled into the kernel, so the sites carry the
+    # serving stack size (every routed expert).
+    assert sites == {
+        "contiguous:moe_gate_up": (2048, 6144, 256),
+        "contiguous:moe_down": (6144, 2048, 256),
+    }
+
+
+def test_prefill_entries_without_a_contiguous_bound_add_no_contiguous_entry():
+    shapes = _shapes()
+    entries = DGP.prefill_entries(shapes, "cpu", max_rows=MAX_ROWS,
+                                  num_sms=NUM_SMS)
+    assert not [e for e in entries if "contiguous" in e.name]
+
+
+def test_prefill_entries_cover_every_contiguous_key_of_the_row_range():
+    shapes = _shapes()
+    bound = 70_000
+    entries = DGP.prefill_entries(shapes, "cpu", max_rows=MAX_ROWS,
+                                  num_sms=NUM_SMS,
+                                  contiguous_max_rows=bound)
+    rows_by_shape = collections.defaultdict(list)
+    for e in entries:
+        if "contiguous" not in e.name:
+            continue
+        _, name, nk, m = e.name.split("/")
+        n, k = (int(v) for v in nk.split("x"))
+        assert int(m[1:]) % DG.CONTIGUOUS_BLOCK_M == 0
+        rows_by_shape[(name, n, k)].append(int(m[1:]))
+    assert set(rows_by_shape) == {
+        ("contiguous:moe_gate_up", 2048, 6144),
+        ("contiguous:moe_down", 6144, 2048),
+    }
+    for (name, n, k), rows in rows_by_shape.items():
+        assert rows == DG.contiguous_representative_ms(n, k, bound,
+                                                       num_sms=NUM_SMS)
+
+
+def test_run_contiguous_builds_the_serving_call(monkeypatch):
+    site = DGP.ContiguousSite("contiguous:moe_gate_up", 256, 512, groups=3)
+    fn = _Recorder()
+    DGP._run_contiguous(site, 128, "cpu", fn=fn)
+    (args, kwargs), = fn.calls
+    x_fp8, x_scale, b, sfb = args
+    assert x_fp8.shape == (128, 512) and x_fp8.dtype == torch.float8_e4m3fn
+    assert x_scale.shape == (512 // 128, 128)
+    # The B stack carries the site's compiled-in group count.
+    assert b.shape == (3, 256, 512) and b.stride(0) == 256 * 512
+    assert sfb.shape == (3, 2, 4)
+    assert kwargs["output"].shape == (128, 256)
+    assert kwargs["output"].dtype == torch.bfloat16
+    layout = kwargs["grouped_layout"]
+    assert layout.shape == (128,) and layout.dtype == torch.int32
+    assert bool((layout == 0).all())

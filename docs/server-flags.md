@@ -84,6 +84,16 @@ While the pool is restarting or down, `/health` answers `503` and
 `POST /v1/batches` answers `503` with `Retry-After`. The earlier `/v1/reload`
 endpoint no longer exists.
 
+With `--distributed-weight-config`, the node's weight daemon is part of the
+pool: the server reads its state every second, and a failed daemon takes the
+pool down exactly as a worker exit does (`workers_down`, or with cluster
+fail-fast the exit of every node), with `/health` answering `503` and naming
+`distributed weight daemon on node <n> failed ...`. A transport failure
+(`transport_fatal`) needs a cold restart; a failed worker cohort
+(`cohort_recoverable`) is recovered by `POST /v1/workers/restart`.
+`GET /v1/workers/status` reports the daemon's state under
+`distributed_weights`.
+
 ### Coordinated worker-pool restart
 
 A worker cohort is one `torch.distributed` world spanning every node, so
@@ -434,8 +444,15 @@ When a process exits because of a fatal error, its last record is a CRITICAL
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--parse-thinking` | `false` | Extract thinking/reasoning blocks into `reasoning_content` field |
-| `--parse-tool-call` | `false` | Extract tool call blocks into `tool_calls` array |
+| `--parse-thinking` / `--no-parse-thinking` | model default | Extract thinking/reasoning blocks into the `reasoning_content` field. Unset, the model's own default applies: on for GPT-OSS, off for every other model. `--no-parse-thinking` returns the raw decoded text, delimiters included, in `content`. |
+| `--parse-tool-call` / `--no-parse-tool-call` | model default | Extract tool call blocks into the `tool_calls` array. Unset, the model's own default applies: on for GPT-OSS, off for every other model. `--no-parse-tool-call` leaves calls as raw text in `content`. |
+
+GPT-OSS parses by default because its raw output is a sequence of harmony
+messages, not an answer: the `analysis` channel becomes `reasoning_content`,
+`final` and recipient-less `commentary` become `content`, and messages
+addressed to a function become `tool_calls`. The server log names the parsing
+in effect when it loads the tokenizer (`Chat output parsing for <model>: ...`).
+See [Output Format](output-format.md#structured-output-fields).
 
 ---
 
@@ -516,7 +533,7 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | `--input-ids-pool-size-gb` | `50.0` | Fixed node-shared budget, in GiB, of the int32 token-id pool. The number of sequences the server can hold is derived from this budget and the model's maximum context. Must be positive. |
 | `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
-| `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
+| `--detokenization-include-special-tokens` | `false` | Include every special token in detokenized output. By default the tokenizer strips special tokens, except those a model declares part of its output grammar (GPT-OSS keeps its harmony markers). The stop token a sequence ended on is decoded with the completion either way; it shows in the text only when this flag is set or the token is grammar (GPT-OSS `<\|return\|>`, `<\|call\|>`). |
 
 ---
 

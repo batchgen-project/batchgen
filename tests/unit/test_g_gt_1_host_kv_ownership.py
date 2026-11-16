@@ -23,6 +23,13 @@ from typing import List, Sequence
 
 import pytest
 
+from tests.worker.worker_fakes import (
+    attach_identity,
+    attach_prefix_state,
+    attach_trajectory_state,
+)
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
@@ -36,6 +43,9 @@ def _worker_class():
 
 
 def _worker_method_node(name):
+    # S10c: a delegated method resolves to its engine body (worker shape).
+    if name in delegated_method_names():
+        return worker_shaped_method_node(name)
     return next(node for node in _worker_class().body
                 if isinstance(node, ast.FunctionDef) and node.name == name)
 
@@ -188,14 +198,16 @@ def _rank(rank, *, attn_tp_size, world_size, seqs, views, fake_dist,
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
-        rank=rank,
-        world_size=world_size,
-        local_world_size=local_world_size,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
-        _prefix_sequence_states={},
         _host_views_by_group=lambda: views,
     )
+    attach_identity(
+        worker,
+        rank=rank, world_size=world_size, local_world_size=local_world_size,
+        decode_group_size=attn_tp_size,
+    )
+    attach_prefix_state(worker, prefix_sequence_states={})
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
     return worker
@@ -290,14 +302,16 @@ def test_g2_group_registers_once_and_mirrors_identical_page_tables(monkeypatch):
     assert views_by_rank[0][1].table[100] == [901, 2000, 2001]
 
     # Both ranks hold prefix state; the follower's carries no lookup result.
-    assert set(workers[1]._prefix_sequence_states) == {100, 101}
-    mirrored = workers[1]._prefix_sequence_states[100]
+    # migrated: workers[1]._prefix_sequence_states -> workers[1]._prefix.prefix_sequence_states, same owner object.
+    assert set(workers[1]._prefix.prefix_sequence_states) == {100, 101}
+    mirrored = workers[1]._prefix.prefix_sequence_states[100]
     assert mirrored.lookup_result is None
     assert mirrored.attached_tokens == PAGE_TOKENS
     assert mirrored.compute_cached_tokens == PAGE_TOKENS
     assert mirrored.shared_page_ids_for_group(0) == (900,)
     assert mirrored.shared_page_ids_for_group(1) == (901,)
-    assert workers[1]._prefix_sequence_states[101].shared_page_ids_for_group(0) == ()
+    # migrated: workers[1]._prefix_sequence_states -> workers[1]._prefix.prefix_sequence_states, same owner object.
+    assert workers[1]._prefix.prefix_sequence_states[101].shared_page_ids_for_group(0) == ()
     # The mirror also feeds back into the caller's dict, which the follower's
     # rank-local metadata loop reads for its private page count.
     assert workers[1].states[100].attached_tokens == PAGE_TOKENS
@@ -335,7 +349,8 @@ def test_g1_mirror_runs_no_collective_and_touches_nothing(monkeypatch):
 
     assert fake_dist.calls == 0
     assert views[0].table == {}
-    assert worker._prefix_sequence_states == {}
+    # migrated: worker._prefix_sequence_states -> worker._prefix.prefix_sequence_states, same owner object.
+    assert worker._prefix.prefix_sequence_states == {}
     assert states[100].lookup_result is not None  # untouched
 
 
@@ -497,15 +512,19 @@ def _selection_request(attn_tp_size, monkeypatch):
         prefill_order=None,
     )
     worker = SimpleNamespace(
-        rank=0, local_world_size=8,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
         # This test is about the replication factor, not shared-prefix credit:
         # report no shared segment so the candidate keeps its standalone
         # reservation and the factor is the only thing under test.
         _admission_shared_prefix_segments=lambda uuids: {},
-        _shared_prefix_credit_applied=False,
     )
+    attach_identity(
+        worker,
+        rank=0, world_size=8, local_world_size=8,
+        decode_group_size=attn_tp_size,
+    )
+    attach_prefix_state(worker, shared_prefix_credit_applied=False)
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
     return worker._make_prefill_selection_request(
@@ -619,8 +638,10 @@ def test_g2_growth_extends_the_shared_chain_once_and_mirrors_it(monkeypatch):
         )
 
     # Growth mirrors page tables only; the prefix attachment stays the leader's.
-    assert workers[0]._prefix_sequence_states == {}
-    assert workers[1]._prefix_sequence_states == {}
+    # migrated: workers[0]._prefix_sequence_states -> workers[0]._prefix.prefix_sequence_states, same owner object.
+    assert workers[0]._prefix.prefix_sequence_states == {}
+    # migrated: workers[1]._prefix_sequence_states -> workers[1]._prefix.prefix_sequence_states, same owner object.
+    assert workers[1]._prefix.prefix_sequence_states == {}
     assert fake_dist.calls == 2
 
 
@@ -663,35 +684,44 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
     )
     seqs = _seqs(group=0)
     worker = SimpleNamespace(
-        rank=rank,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(
             get_sequence=seqs.get,
             get_sequences_by_status=lambda status: [],
         ),
-        _uuid_to_local_map={"a": 0, "b": 1},
         core_engine=SimpleNamespace(host_paged_kv_worker_view=views[0]),
         host_paged_kv_worker_view_aux=views[1],
         _prefix_integrity=False,
         enable_prefix_cache=True,
-        _prefix_sequence_states=states,
-        _pool_member_sids={},
-        _pool_sid_members={},
         # M3 Slice 2: no trajectory flag on this path, so nothing is attached
         # and the release seam has nothing of its own to drop.
-        _trajectory_attachments={},
         # No committer was ever built on this path, so there is no snapshot
         # arena to give back -- which is exactly what the release seam must
         # tolerate on a run that never turned the trajectory flag on.
-        _trajectory_frontier_committer=None,
-        _trajectory_arena_payload={},
-        _trajectory_mirrored_restores={},
-        _trajectory_restorer=None,
         prefix_cache_coordinator=coordinator,
         gpu_paged_kv_cache_manager=None,
         # K3 semantics: ONE prefix group (primary); the indexer-key aux region
         # lives outside the groups and is handled by the explicit aux path.
         _host_views_by_group=lambda: {0: views[0]},
+    )
+    attach_identity(
+        worker,
+        rank=rank, world_size=8, local_world_size=8,
+        decode_group_size=attn_tp_size, bound={"a": 0, "b": 1},
+    )
+    attach_prefix_state(
+        worker,
+        prefix_sequence_states=states,
+        pool_member_sids={},
+        pool_sid_members={},
+    )
+    attach_trajectory_state(
+        worker,
+        trajectory_attachments={},
+        trajectory_frontier_committer=None,
+        trajectory_arena_payload={},
+        trajectory_mirrored_restores={},
+        trajectory_restorer=None,
     )
     for name, function in methods.items():
         setattr(worker, name, types.MethodType(function, worker))
@@ -756,6 +786,22 @@ def test_g2_follower_release_drops_its_mirror_without_freeing_shared_pages(
 # --------------------------------------------------------------------------- #
 
 
+SEQUENCE = Path(__file__).resolve().parents[2] / "batchgen" / "sequence.py"
+
+
+def _sequence_entry_method(name):
+    """Compile one ``SequenceEntry`` method from its source (no batchgen import)."""
+    tree = ast.parse(SEQUENCE.read_text())
+    entry = next(node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and node.name == "SequenceEntry")
+    fn = copy.deepcopy(next(node for node in entry.body
+                            if isinstance(node, ast.FunctionDef) and node.name == name))
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    namespace = {"math": math}
+    exec(compile(module, str(SEQUENCE), "exec"), namespace)
+    return namespace[name]
+
+
 def _append_worker(attn_tp_size, view):
     methods = _worker_methods(
         ["_ensure_host_kv_append_capacity", "_decode_attn_tp_size"],
@@ -768,6 +814,10 @@ def _append_worker(attn_tp_size, view):
         kv_token_budget=64 * PAGE_TOKENS,
         current_context_length=2 * PAGE_TOKENS, decoded_length=64,
         status=SimpleNamespace(name="IN_DECODE"),
+    )
+    # The append path derives growth pages through the SequenceEntry owner.
+    seq.get_host_growth_pages = types.MethodType(
+        _sequence_entry_method("get_host_growth_pages"), seq
     )
     worker = SimpleNamespace(
         rank=1,

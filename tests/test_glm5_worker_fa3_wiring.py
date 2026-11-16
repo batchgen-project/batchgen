@@ -23,10 +23,14 @@ import typing
 import pytest
 
 from batchgen.sequence import SequenceStatus
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKER_SRC = _REPO_ROOT / "batchgen/batchgen_worker.py"
+# The decode loop (and its inline whole-graph replay gate) lives in the
+# decode engine since the S4b extraction.
+_DECODE_ENGINE_SRC = _REPO_ROOT / "batchgen/worker/decode_engine.py"
 _GLM5_DIR = _REPO_ROOT / "batchgen/models/glm/glm5"
 _SEGMENTS_SRC = _GLM5_DIR / "cuda_graph_segments.py"
 
@@ -108,7 +112,7 @@ def test_build_block_derives_all_short_from_required_tokens():
     # scoring kernels use), never from model_config: a local-checkpoint
     # config may not carry the field.
     assert "index_topk_cfg = int(getattr(_first_indexer, 'index_topk', 0) or 0)" in src
-    assert "self._glm5_whole_model_index_topk = index_topk_cfg" in src
+    assert "self._graph.glm5_whole_model_index_topk = index_topk_cfg" in src
     assert "model_config, 'index_topk'" not in src
     # ONE general graph lifetime (POIS 2026-10-13): the lifetime is no longer
     # derived per batch from required_seqlen vs index_topk. That derivation
@@ -121,7 +125,7 @@ def test_build_block_derives_all_short_from_required_tokens():
         "all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg"
         not in src
     )
-    assert "self._glm5_whole_model_all_short = all_short" in src
+    assert "self._graph.glm5_whole_model_all_short = all_short" in src
     # graph_max_seqlen keeps the capacity-based sizing.
     assert "graph_max_seqlen = int(capacity_seqlen)" in src
 
@@ -136,8 +140,13 @@ def test_both_segment_constructors_receive_all_short(ctor):
 
 def test_all_short_flag_is_reset_with_the_whole_model_segment():
     tree = _tree(_WORKER_SRC)
+    # S9: the release-state helper runs in WorkerLifecycleEngine; scan the
+    # delegated engine bodies (worker shape) alongside the worker.
+    functions = list(ast.walk(tree)) + [
+        worker_shaped_method_node(name) for name in sorted(delegated_method_names())
+    ]
     resets = 0
-    for fn in ast.walk(tree):
+    for fn in functions:
         if not isinstance(fn, ast.FunctionDef):
             continue
         for body in (
@@ -147,10 +156,12 @@ def test_all_short_flag_is_reset_with_the_whole_model_segment():
             if isinstance(getattr(node, field, None), list)
         ):
             for idx, stmt in enumerate(body):
-                if ast.unparse(stmt) != "self._whole_model_segment = None":
+                if ast.unparse(stmt) != "self._graph.whole_model_segment = None":
                     continue
                 following = [ast.unparse(s) for s in body[idx + 1 : idx + 2]]
-                assert following == ["self._glm5_whole_model_all_short = False"], (
+                assert following == [
+                    "self._graph.glm5_whole_model_all_short = False"
+                ], (
                     fn.name,
                     following,
                 )
@@ -177,7 +188,7 @@ def test_whole_graph_path_state_has_all_short_exceeded_eager_return():
         )
     )
     test_src = ast.unparse(guard.test)
-    assert "_glm5_whole_model_all_short" in test_src
+    assert "glm5_whole_model_all_short" in test_src
     assert "current_max_seqlen > index_topk_cfg" in test_src
     # The check runs after the captured-max_seqlen guard.
     order = [r for r in returns if "max_seqlen_exceeds_capture" in r or "all_short_exceeded" in r]
@@ -324,12 +335,12 @@ def test_inline_replay_gate_blocks_an_exceeded_all_short_graph():
     """The decode loop's inline gate (not just the advisory path-state) must
     refuse to replay an all_short capture once the longest context passes
     index_topk; under a required graph that surfaces as reason=all_short_exceeded."""
-    source = _WORKER_SRC.read_text()
+    source = _DECODE_ENGINE_SRC.read_text()
     gate = source[source.index("_glm5_whole_graph_active = bool("):]
     gate = gate[: gate.index("_use_graph = (")]
     assert "_glm5_all_short_exceeded" in gate
     assert "not _glm5_all_short_exceeded" in gate
-    assert "_glm5_whole_model_all_short" in gate
+    assert "glm5_whole_model_all_short" in gate
 
 
 def test_admission_refuses_over_budget_rows_in_an_all_short_lifetime():
@@ -339,18 +350,19 @@ def test_admission_refuses_over_budget_rows_in_an_all_short_lifetime():
     source = _WORKER_SRC.read_text()
     anchor = source.index("DecodeScheduler.select_decode_batch")
     window = source[anchor: anchor + 2500]
-    assert "_glm5_whole_model_all_short" in window
+    assert "glm5_whole_model_all_short" in window
     assert "kv_token_budget" in window
     assert "raise RuntimeError" in window
 
 
 def test_guards_read_the_stored_index_topk():
     source = _WORKER_SRC.read_text()
-    assert source.count("_glm5_whole_model_index_topk", 0) >= 5
+    assert source.count("glm5_whole_model_index_topk", 0) >= 5
     # No guard reads index_topk off model_config any more (the step-state
     # hint helper at module level is a separate, pre-existing consumer).
-    gate = source[source.index("_glm5_whole_graph_active = bool("):]
+    engine_source = _DECODE_ENGINE_SRC.read_text()
+    gate = engine_source[engine_source.index("_glm5_whole_graph_active = bool("):]
     gate = gate[: gate.index("_use_graph = (")]
-    assert "_glm5_whole_model_index_topk" in gate
+    assert "glm5_whole_model_index_topk" in gate
     admission = source[source.index("DecodeScheduler.select_decode_batch"):][:2500]
-    assert "_glm5_whole_model_index_topk" in admission
+    assert "glm5_whole_model_index_topk" in admission
