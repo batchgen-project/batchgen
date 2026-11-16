@@ -178,6 +178,22 @@ class KimiLinearInitializer:
         self.engine_config.Basic_Config.distributed_weight_transport = (
             self.distributed_weight_transport
         )
+        if self.distributed_weight_transport == "hierarchical_gdr":
+            # S4: hierarchical_gdr always runs the engine-bound replica
+            # seam, which lands each frame's cross-node broadcast in ring
+            # slots, one collective per frame: the routed ring must hold
+            # two frames of this slot's expert block (one landing, one
+            # being consumed).
+            group_size = int(self.engine_config.Basic_Config.attention_group_size)
+            num_experts = int(self.model_config.num_local_experts)
+            if num_experts % group_size:
+                raise ValueError(
+                    f"{num_experts} routed experts do not split over "
+                    f"{group_size} slots"
+                )
+            self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer[
+                "routed_expert"
+            ] = 2 * (num_experts // group_size)
         if self.global_rank == 0:
             logging.info(
                 "K3 distributed weight transport = "

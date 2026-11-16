@@ -35,6 +35,7 @@ enum class WeightRecordKind : uint8_t {
     HostShared = 0,
     HostPrivate = 1,
     Replica = 2,
+    CrossReplica = 3,
 };
 
 enum class WeightFrameRecordState : uint8_t {
@@ -152,6 +153,54 @@ inline std::vector<WeightRecord> install_record_kinds(
     return records;
 }
 
+// Build the cross-node record map from the source root's local owner map.
+// Non-source members receive a CrossReplica record for every source record.
+inline std::vector<WeightRecord> install_cross_record_kinds(
+    const std::vector<int64_t>& cross_node_group, int64_t rank,
+    int64_t source_root, const std::vector<int64_t>& intra_node_group,
+    const std::map<std::string, int64_t>& intra_owner_by_module) {
+    validate_replica_group(cross_node_group);
+    if (std::find(cross_node_group.begin(), cross_node_group.end(), rank) ==
+        cross_node_group.end()) {
+        throw std::invalid_argument("Rank " + std::to_string(rank) +
+                                    " is not in the cross-node group");
+    }
+    if (std::find(cross_node_group.begin(), cross_node_group.end(),
+                  source_root) == cross_node_group.end()) {
+        throw std::invalid_argument(
+            "Source root " + std::to_string(source_root) +
+            " is not in the cross-node group");
+    }
+    validate_replica_group(intra_node_group);
+    if (std::find(intra_node_group.begin(), intra_node_group.end(),
+                  source_root) == intra_node_group.end()) {
+        throw std::invalid_argument(
+            "Source root " + std::to_string(source_root) +
+            " is not in the intra-node group");
+    }
+
+    std::vector<WeightRecord> records;
+    records.reserve(intra_owner_by_module.size());
+    for (const auto& [module, owner] : intra_owner_by_module) {
+        if (std::find(intra_node_group.begin(), intra_node_group.end(), owner) ==
+            intra_node_group.end()) {
+            throw std::invalid_argument("Owner " + std::to_string(owner) +
+                                        " of " + module +
+                                        " is outside the intra-node group");
+        }
+        const WeightRecordKind kind =
+            rank != source_root
+                ? WeightRecordKind::CrossReplica
+                : owner == rank
+                    ? (intra_node_group.size() > 1
+                           ? WeightRecordKind::HostShared
+                           : WeightRecordKind::HostPrivate)
+                    : WeightRecordKind::Replica;
+        records.push_back(WeightRecord{module, owner, cross_node_group, kind});
+    }
+    return records;
+}
+
 struct WeightFrame {
     uint64_t pass = 0;
     uint64_t layer_position = 0;
@@ -237,6 +286,7 @@ struct WeightFrameAccounting {
     bool may_post_barrier_a() const {
         for (size_t index = 0; index < states.size(); ++index) {
             if (kinds[index] != WeightRecordKind::Replica &&
+                kinds[index] != WeightRecordKind::CrossReplica &&
                 states[index] != WeightFrameRecordState::kLanded) {
                 return false;
             }
@@ -250,6 +300,15 @@ struct WeightFrameAccounting {
             states.begin(), states.end(), [](WeightFrameRecordState state) {
                 return state != WeightFrameRecordState::kPending;
             });
+    }
+
+    void mark_cross_replica_landed(size_t index) {
+        check_index(index);
+        if (kinds[index] != WeightRecordKind::CrossReplica) {
+            throw std::invalid_argument(
+                "External completion requires a CrossReplica record");
+        }
+        mark_landed(index);
     }
 
    private:
@@ -269,5 +328,35 @@ struct WeightFrameAccounting {
         }
         states[index] = next;
     }
+};
+
+struct CrossReplicaLandingLog {
+    void record_landing(uint64_t frame_flat, size_t record_index) {
+        const auto frame_it = frames_.find(frame_flat);
+        if (frame_it == frames_.end()) {
+            pending_[frame_flat].push_back(record_index);
+            return;
+        }
+        frame_it->second->mark_cross_replica_landed(record_index);
+    }
+
+    void register_frame(uint64_t frame_flat, WeightFrameAccounting& accounting) {
+        if (frames_.find(frame_flat) != frames_.end()) {
+            throw std::invalid_argument("Frame is already registered");
+        }
+        frames_.emplace(frame_flat, &accounting);
+        const auto pending_it = pending_.find(frame_flat);
+        if (pending_it == pending_.end()) {
+            return;
+        }
+        for (const size_t record_index : pending_it->second) {
+            accounting.mark_cross_replica_landed(record_index);
+        }
+        pending_.erase(pending_it);
+    }
+
+   private:
+    std::map<uint64_t, WeightFrameAccounting*> frames_;
+    std::map<uint64_t, std::vector<size_t>> pending_;
 };
 

@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import socket
+import threading
 import sys
 import time
 from typing import (
@@ -8703,6 +8704,226 @@ class BatchGenWorker:
 		self.core_engine.uninstall_replica_plan()
 		self._replica_plan_installed = False
 
+	def _install_cross_node_broadcast_plan(self) -> None:
+		"""Declare this member's cross-node transport plan (replica seam S3).
+
+		Runs on the streamed hierarchical path only: it derives the member's
+		cross-node group, record kinds and frame-ordered broadcast plan from
+		the installed weight-copy task and keeps them on the worker, where the
+		producer binding (engine side, validated on the node) picks them up.
+		The seam is the only cross-node payload transport (S4): a streamed
+		hierarchical multi-node member that cannot derive a plan fails the
+		launch instead of falling back to a model-layer path.
+		"""
+		self._cross_node_broadcast_plan = None
+		transport = getattr(
+			self.parallel_manager, "_distributed_weight_transport", None
+		)
+		if transport != "hierarchical_gdr":
+			return
+		if self.world_size % self.local_world_size:
+			logging.info(
+				"[XREPLICA] no cross-node plan: world %d is not a whole "
+				"number of %d-rank nodes", self.world_size,
+				self.local_world_size,
+			)
+			return
+		num_nodes = self.world_size // self.local_world_size
+		if num_nodes < 2:
+			return
+		from batchgen.weight_replica_transport import build_cross_node_plan
+
+		try:
+			plan = build_cross_node_plan(
+				self.weight_copy_task,
+				num_nodes=num_nodes,
+				local_world=self.local_world_size,
+				rank=self.rank,
+				num_experts=int(self.parallel_manager.num_experts),
+			)
+		except ValueError as error:
+			raise RuntimeError(
+				"hierarchical_gdr requires a cross-node seam plan; "
+				f"derivation failed: {error}"
+			) from error
+		self._cross_node_broadcast_plan = plan
+		if self.rank == plan.group.source_root or self.local_rank == 0:
+			logging.info(
+				"[XREPLICA] cross-node plan: slot=%d group=%s source_root=%d "
+				"frames=%d cross_records=%d",
+				plan.group.local_slot, list(plan.group.ranks),
+				plan.group.source_root, len(plan.broadcast.frames),
+				sum(1 for kind in plan.kinds.values()
+					if kind == "CrossReplica"),
+			)
+
+	def _start_cross_comm_thread(self) -> None:
+		"""Bind the engine-bound cross-node transport to the K3 layer (S3b).
+
+		The NCCL collective of each frame is issued by the layer at its
+		deterministic launch point (the model thread's gate, see
+		``StreamedSP8LayerBuffer.seam_broadcaster``), never from a free-running
+		thread: ``NCCL_LAUNCH_ORDER_IMPLICIT`` turns each GPU's host launch
+		order into completion edges, so a cross-node launch issued out of that
+		order deadlocks against the TP8 collectives. This thread only waits
+		for each launched frame's CUDA event and feeds the engine: receiver
+		completions through the mailbox, and the source reclaim gate.
+		"""
+		import queue as _queue
+
+		from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8LayerBuffer
+		from batchgen.weight_replica_group import derive_frame_plan
+
+		plan = self._cross_node_broadcast_plan
+		group, root, is_source = self.parallel_manager.cross_seam_transport()
+		frame_plan = derive_frame_plan(self.weight_copy_task)
+		if plan is None or group is None or frame_plan is None:
+			raise RuntimeError(
+				"seam broadcaster needs a declared plan, a cross group and a "
+				"frame plan"
+			)
+		layer_position = {
+			int(layer): position
+			for position, layer in enumerate(frame_plan.layer_sequence)
+		}
+		layers_per_pass = len(frame_plan.layer_sequence)
+		expected = {
+			frame.frame % layers_per_pass: len(frame.records)
+			for frame in plan.broadcast.frames
+		}
+		engine = self.core_engine
+		rank = self.rank
+		comm_stream = torch.cuda.Stream(device=self.local_rank)
+		done = _queue.Queue()
+		stop_event = threading.Event()
+
+		class _SeamBroadcaster:
+			"""Issue one frame's cross-node collective at the layer's gate."""
+
+			def __init__(self):
+				self.last_flat = None
+
+			def _next_flat(self, position: int) -> int:
+				if self.last_flat is None:
+					return position
+				last = self.last_flat % layers_per_pass
+				step = position - last
+				if step <= 0:
+					step += layers_per_pass
+				return self.last_flat + step
+
+			def enqueue(self, layer_idx: int) -> None:
+				position = layer_position.get(int(layer_idx))
+				if position is None or position not in expected:
+					raise RuntimeError(
+						f"Rank {rank}: layer {layer_idx} has no cross-node frame"
+					)
+				flat = self._next_flat(position)
+				want = expected[position]
+				staged = engine.replica_cross_wait_staged(
+					flat, want, int(PREFETCH_TIMEOUT_MS)
+				)
+				if len(staged) < want:
+					raise RuntimeError(
+						f"Rank {rank}: frame {flat} (layer {layer_idx}) staged "
+						f"{len(staged)}/{want} records before the launch timeout"
+					)
+				staged = sorted(staged)
+				# The collective runs on the process group's own internal
+				# stream; an event recorded on the ambient stream completes
+				# immediately and does NOT cover the NCCL work, so completion
+				# is tracked through the Work handles the group returns.
+				# One NCCL group per frame: the frame's records x tensors are
+				# issued as a single coalesced launch. Issued one by one, these
+				# per-record messages serialize on the stream and stay far
+				# below large-message RDMA bandwidth, so receivers stall on
+				# ring landings. The whole frame is ring-resident (two frames
+				# of slots), so completing it as one unit cannot starve the
+				# producer.
+				records = []
+				with torch.cuda.stream(comm_stream):
+					with dist._coalescing_manager(
+						group=group, device=comm_stream.device, async_ops=True,
+					) as coalesced:
+						for _index, mtype, mname, _source in staged:
+							# Resolve by the record's (frame, index) key: a
+							# (type, name) scan can land on another in-flight
+							# frame's slot (name recurs across passes).
+							views = engine.replica_cross_slot_views(flat, _index)
+							for tensor_name in sorted(views):
+								dist.broadcast(
+									views[tensor_name], root,
+									group=group, async_op=True,
+								)
+							records.append(_index)
+				self.last_flat = flat
+				done.put((flat, list(coalesced.works), records))
+
+		PREFETCH_TIMEOUT_MS = 300_000
+
+		def _complete() -> None:
+			while not stop_event.is_set():
+				try:
+					flat, works, records = done.get(timeout=1.0)
+				except _queue.Empty:
+					continue
+				try:
+					# The frame's coalesced group completes as one unit; every
+					# record is then released (source) or reported landed
+					# (receiver) through the same per-record seam calls.
+					for work in works:
+						while not work.is_completed():
+							if stop_event.is_set():
+								return
+							time.sleep(0.001)
+					for record_index in records:
+						if is_source:
+							engine.replica_cross_source_done(
+								flat, record_index
+							)
+						else:
+							engine.replica_cross_complete(flat, record_index)
+					engine.replica_cross_frame_done(flat)
+				except RuntimeError as error:
+					if stop_event.is_set():
+						return
+					logging.error(
+						"[XREPLICA] rank %d completion of frame %d failed: %s",
+						rank, flat, error,
+					)
+					return
+
+		StreamedSP8LayerBuffer.seam_broadcaster = _SeamBroadcaster()
+		thread = threading.Thread(
+			target=_complete, name="xreplica-complete", daemon=True
+		)
+		thread.start()
+		self._cross_comm_stop = stop_event
+		self._cross_comm_thread = thread
+		if is_source or self.local_rank == 0:
+			logging.info(
+				"[XREPLICA] seam broadcaster bound: source=%s root=%d "
+				"frames/pass=%d (launch at the layer gate)",
+				is_source, root, len(expected),
+			)
+
+	def _stop_cross_comm_thread(self) -> None:
+		from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8LayerBuffer
+
+		StreamedSP8LayerBuffer.seam_broadcaster = None
+		stop_event = getattr(self, "_cross_comm_stop", None)
+		thread = getattr(self, "_cross_comm_thread", None)
+		if stop_event is None or thread is None:
+			return
+		stop_event.set()
+		thread.join(timeout=10.0)
+		if thread.is_alive():
+			logging.warning(
+				"[XREPLICA] comm thread did not stop within 10 s"
+			)
+		self._cross_comm_stop = None
+		self._cross_comm_thread = None
+
 	def _install_replica_transport(self) -> None:
 		"""Install the node replica weight transport for this prefill phase.
 
@@ -8723,22 +8944,46 @@ class BatchGenWorker:
 			stagger_task_for_member,
 		)
 
+		transport = getattr(
+			self.parallel_manager, "_distributed_weight_transport", None
+		)
+		seam_requested = (
+			getattr(self.parallel_manager, "cross_seam_enabled", None)
+			is not None
+			and self.parallel_manager.cross_seam_enabled()
+		)
+		cross_seam = (
+			seam_requested
+			and transport == "hierarchical_gdr"
+			and getattr(self, "_cross_node_broadcast_plan", None) is not None
+		)
+
 		def _decline(reason: str) -> None:
+			if seam_requested:
+				# Under the seam every member already holds the full
+				# schedule, so a member without the engine binding would
+				# fetch records it does not own: never run that silently.
+				raise RuntimeError(
+					f"Rank {self.rank}: cross-node replica seam requested "
+					f"but the transport cannot install: {reason}"
+				)
 			if self.rank == 0:
 				logging.info(
 					"[REPLICA] transport not installed: %s", reason
 				)
 
+		if seam_requested and not cross_seam:
+			_decline("no cross-node plan was declared for this member")
 		if not dist.is_initialized():
 			_decline("torch.distributed is not initialized")
 			return
-		if getattr(self.args, "distributed_weight_config", None):
+		if (
+			getattr(self.args, "distributed_weight_config", None)
+			and not cross_seam
+		):
 			_decline("daemon-backed weight source (spec v4, 4.1)")
 			return
-		transport = getattr(
-			self.parallel_manager, "_distributed_weight_transport", None
-		)
-		if transport == "hierarchical_gdr":
+		if transport == "hierarchical_gdr" and not cross_seam:
 			_decline("hierarchical_gdr weight source (spec v4, 4.1)")
 			return
 		plan = derive_frame_plan(self.weight_copy_task)
@@ -8787,24 +9032,53 @@ class BatchGenWorker:
 		gathered = [None] * self.world_size
 		dist.all_gather_object(gathered, record)
 		_mark("gather")
-		groups = compute_replica_groups({r.rank: r for r in gathered})
-		group = sorted(groups[self.rank])
-		if len(group) < 2:
-			_decline("replica group has one member")
-			return
-		owners = derive_owner_map(group, self.weight_copy_task, plan)
-		kinds = install_record_kinds(self.rank, group, owners)
+		if cross_seam:
+			# Under streamed SP8 every rank of a node streams a different
+			# expert shard, so no intra-node peer shares this member's
+			# records; the members that do share them live on other nodes
+			# and cannot share memory. The engine therefore runs a
+			# single-member group: routed experts take their cross-node
+			# kind (source root: owned; others: CrossReplica, landed by the
+			# comm thread), every other record is this rank's own host copy.
+			group = [self.rank]
+			owners = {
+				name: self.rank
+				for names in self.weight_copy_task.values()
+				for name in names
+			}
+			kinds = {name: "HostPrivate" for name in owners}
+			for name, kind in self._cross_node_broadcast_plan.kinds.items():
+				if name not in kinds:
+					raise RuntimeError(
+						f"Rank {self.rank}: cross-node plan names {name}, "
+						"which is not in the installed task"
+					)
+				# The source root owns every record of its slot; with no
+				# intra peers a shared record has no reader but itself.
+				kinds[name] = (
+					"CrossReplica" if kind == "CrossReplica" else "HostShared"
+				)
+		else:
+			groups = compute_replica_groups({r.rank: r for r in gathered})
+			group = sorted(groups[self.rank])
+			if len(group) < 2:
+				_decline("replica group has one member")
+				return
+			owners = derive_owner_map(group, self.weight_copy_task, plan)
+			kinds = install_record_kinds(self.rank, group, owners)
 		member_index = group.index(self.rank)
 		# Stagger this member's within-layer walk (own block first, then
 		# the other owners round-robin) and rebuild the engine queue to
 		# match; the producer has not started. Record identity stays
-		# canonical by name, so barriers are unaffected.
-		staggered = stagger_task_for_member(
-			self.weight_copy_task, plan, owners, group, self.rank
-		)
-		if staggered != self.weight_copy_task:
-			self.weight_copy_task = staggered
-			self.core_engine.set_weight_copy_queue(staggered)
+		# canonical by name, so barriers are unaffected. A single-member
+		# group has no other owner to stagger against.
+		if len(group) > 1:
+			staggered = stagger_task_for_member(
+				self.weight_copy_task, plan, owners, group, self.rank
+			)
+			if staggered != self.weight_copy_task:
+				self.weight_copy_task = staggered
+				self.core_engine.set_weight_copy_queue(staggered)
 		layers_per_pass = len(plan.layer_sequence)
 		# Record indices: one frame's records in (sorted type, in-frame
 		# position) order, identical on every member.
@@ -8815,6 +9089,13 @@ class BatchGenWorker:
 			offset += plan.frame_size[module_type]
 		records_per_frame = offset
 		num_types = len(type_offsets)
+		from batchgen.weight_replica_transport import in_frame_positions
+
+		# Record index = the record's position among its type's records in
+		# its frame (canonical order), never the raw expert id: a streamed
+		# SP8 slot holds a block of global expert ids, while the per-frame
+		# record table is sized by the frame's record count.
+		positions = in_frame_positions(self.weight_copy_task, plan)
 		modules = []
 		for module_type in sorted(self.weight_copy_task):
 			names = self.weight_copy_task[module_type]
@@ -8824,7 +9105,12 @@ class BatchGenWorker:
 				self.engine_config.GPU_Buffer_Config
 				.num_prefill_module_buffer[module_type]
 			)
-			if ring_slots < 2 * plan.frame_size[module_type]:
+			# Only records that peers read need the two-frame rendezvous;
+			# under the seam that is the routed experts alone (every other
+			# type is each rank's own host copy).
+			if (
+				not cross_seam or module_type == "routed_expert"
+			) and ring_slots < 2 * plan.frame_size[module_type]:
 				# A ring that cannot hold the two-frame rendezvous cannot
 				# replicate; the model keeps its single-member behaviour.
 				_decline(
@@ -8834,14 +9120,15 @@ class BatchGenWorker:
 				)
 				return
 			for name in names:
-				layer_position, expert = plan.position[name]
-				record_index = type_offsets[module_type] + (
-					0 if expert is None else expert
-				)
+				layer_position, _expert = plan.position[name]
+				record_index = type_offsets[module_type] + positions[name]
 				owner_member = group.index(owners[name])
-				kind = {"HostShared": 0, "HostPrivate": 1, "Replica": 2}[
-					kinds[name]
-				]
+				kind = {
+					"HostShared": 0,
+					"HostPrivate": 1,
+					"Replica": 2,
+					"CrossReplica": 3,
+				}[kinds[name]]
 				modules.append(
 					(
 						module_type,
@@ -8858,6 +9145,23 @@ class BatchGenWorker:
 		# (member, type): frame completion is monotone only within a type.
 		key = (len(group), records_per_frame, num_types)
 		cached = self._replica_block_cache.get(key)
+		if cached is None and cross_seam:
+			# A single-member group shares the block with nobody: a
+			# process-private mapping replaces the node-shared one, whose
+			# creator handshake assumes every node rank joins one group.
+			nbytes = int(
+				core_engine.replica_control_block_bytes(
+					len(group), records_per_frame, num_types
+				)
+			)
+			# The block's header is cache-line aligned (alignas(64)) and the
+			# CPU allocator does not promise that alignment, so carve an
+			# aligned window out of a slightly larger buffer; the slice keeps
+			# the backing storage alive.
+			backing = torch.zeros(nbytes + 64, dtype=torch.uint8)
+			start = (-backing.data_ptr()) % 64
+			cached = (backing[start:start + nbytes], None)
+			self._replica_block_cache[key] = cached
 		if cached is None:
 			nbytes = int(
 				core_engine.replica_control_block_bytes(
@@ -9028,6 +9332,7 @@ class BatchGenWorker:
 		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
 		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
+		self._stop_cross_comm_thread()
 		self._uninstall_replica_transport()
 		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
 		if sp8_reentry:
@@ -9054,6 +9359,23 @@ class BatchGenWorker:
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		if not streamed_sp8 and any(self.weight_copy_task.values()):
 			self._install_replica_transport()
+		if streamed_sp8 and any(self.weight_copy_task.values()):
+			self._install_cross_node_broadcast_plan()
+			if (
+				self._cross_node_broadcast_plan is not None
+				and getattr(
+					self.parallel_manager, "cross_seam_enabled", None
+				) is not None
+				and self.parallel_manager.cross_seam_enabled()
+			):
+				# Replica seam S3b: the engine owns the record state machine
+				# (CrossReplica kinds from the plan) and the comm thread owns
+				# the payload collective; the layer runs the uniform
+				# single-node ingress (PSM passed it cross_group=None).
+				self._install_replica_transport()
+				if self._replica_plan_installed:
+					self.core_engine.replica_cross_enable()
+					self._start_cross_comm_thread()
 		if any(self.weight_copy_task.values()):
 			self.core_engine.start_h2d_worker()
 		self._streamed_sp8_h2d_installed = streamed_sp8
@@ -9162,6 +9484,10 @@ class BatchGenWorker:
 			prefill_debug.get("weight_pass_end_delay")
 		)
 		AttnWrapperBase.batchgen_debug = prefill_debug or None
+		from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer
+		StreamedSP8MXFP4MoELayer.verify_bytes_enabled = self._debug_flag_enabled(
+			prefill_debug.get("k3_seam_verify_bytes")
+		)
 		_default_k3_prefill_mode = "streamed"
 		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
 			_default_k3_prefill_mode = (

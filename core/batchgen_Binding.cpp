@@ -661,6 +661,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("install_replica_plan", &BatchGen::install_replica_plan)
         .def("ring_segment_export_fd", &BatchGen::ring_segment_export_fd)
         .def("uninstall_replica_plan", &BatchGen::uninstall_replica_plan)
+        .def("replica_cross_enable", &BatchGen::replica_cross_enable)
+        .def("replica_cross_wait_staged",
+             &BatchGen::replica_cross_wait_staged,
+             py::call_guard<py::gil_scoped_release>())
+        .def("replica_cross_slot_views", &BatchGen::replica_cross_slot_views)
+        .def("replica_cross_complete", &BatchGen::replica_cross_complete,
+             py::call_guard<py::gil_scoped_release>())
+        .def("replica_cross_source_done",
+             &BatchGen::replica_cross_source_done,
+             py::call_guard<py::gil_scoped_release>())
+        .def("replica_cross_frame_done", &BatchGen::replica_cross_frame_done,
+             py::call_guard<py::gil_scoped_release>())
         .def("ring_segments", &BatchGen::ring_segments)
         .def("ring_field_layout", &BatchGen::ring_field_layout)
         .def("clear_kv_buffer", &BatchGen::clear_kv_buffer)

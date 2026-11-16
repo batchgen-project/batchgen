@@ -409,7 +409,12 @@ PINS = {
             "kind": "class",
             "bases": [],
             "fields": [],
-            "members": {},
+            # Replica seam S4: the copy engine owns the cross-node payload
+            # transport; the layer only holds the broadcaster hook that the
+            # worker binds for hierarchical GDR (None for host_rdma).
+            "members": {
+                "seam_broadcaster": "None",
+            },
             "public_methods": [
                 "allow_cross_launch",
                 "allow_full_overwrite",
@@ -456,6 +461,8 @@ PINS = {
             "fields": [],
             "members": {
                 "prefill_routed_kernel": "'dequant_once'",
+                # Batch-level byte-verify debug flag (batchgen_debug).
+                "verify_bytes_enabled": "False",
             },
             "public_methods": [
                 "begin_profile_span",

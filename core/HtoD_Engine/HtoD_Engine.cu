@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <algorithm>
 #include "spdlog/spdlog.h"
 #include <chrono>
 #include <memory>
@@ -199,6 +200,25 @@ void HtoD_Engine::complete_landing_(PendingLanding& landing) {
                                 static_cast<uint64_t>(landing.buffer_idx));
         this->replica_mark_owned_landed_(landing.role_type_index,
                                          landing.flat);
+        if (plan.cross->enabled) {
+            // Cross-node source: stage the landed slot for the comm
+            // thread's broadcast; its reclaim stays gated on
+            // broadcast_passed through the composed release gate.
+            {
+                std::lock_guard<std::mutex> lock(plan.cross->mutex);
+                ReplicaPlanRuntime::CrossStaged entry;
+                entry.module_type = landing.module_type;
+                entry.module_name = landing.module_name;
+                entry.buffer_idx = landing.buffer_idx;
+                entry.pass = landing.pass;
+                entry.source = true;
+                plan.cross->staged.emplace(
+                    std::make_pair(landing.flat,
+                                   landing.role_record_index),
+                    std::move(entry));
+            }
+            plan.cross->cv.notify_all();
+        }
         if (this->gpu_weight_buffer_.pass_produce_only(landing.pass)) {
             // Produce-only pass: no consumer will lease this record. The
             // slot leaves PRESENT now; its reclaim stays gated on every
@@ -530,9 +550,25 @@ void HtoD_Engine::install_replica_plan(
             "install_replica_plan requires a stopped producer");
     }
     if (group_size < 2) {
-        throw std::runtime_error(
-            "a single-member group installs no plan; the uninstalled engine "
-            "is that group");
+        // A single-member group still needs a plan when any of its records
+        // has a reader outside this engine: cross-node records land through
+        // the comm thread, and an owned record is read by cross-node peers
+        // until their broadcast passes. With every record private, the
+        // uninstalled engine is exactly that group.
+        const bool has_external_reader = std::any_of(
+            modules.begin(), modules.end(),
+            [](const ReplicaModuleInstall& module) {
+                return module.kind ==
+                           static_cast<uint8_t>(
+                               WeightRecordKind::CrossReplica) ||
+                       module.kind ==
+                           static_cast<uint8_t>(WeightRecordKind::HostShared);
+            });
+        if (!has_external_reader) {
+            throw std::runtime_error(
+                "a single-member group with only private records installs "
+                "no plan; the uninstalled engine is that group");
+        }
     }
     auto runtime = std::make_unique<ReplicaPlanRuntime>(
         ReplicaControlBlock::attach(control_block.data_ptr(),
@@ -652,12 +688,31 @@ void HtoD_Engine::install_replica_plan(
     }
     ReplicaControlBlock block = runtime->block;
     this->gpu_weight_buffer_.set_peer_release_gate(
-        [block, types = runtime->type_index](
-            const std::string& module_type, int64_t frame) mutable -> bool {
+        [block, types = runtime->type_index, cross = runtime->cross](
+            const std::string& module_type, int64_t index,
+            int64_t frame) mutable -> bool {
             auto found = types.find(module_type);
             if (found == types.end()) {
                 // A slot of a type outside the plan is never peer-gated.
                 return true;
+            }
+            if (cross) {
+                // The slot stays held while ITS OWN record's cross
+                // broadcast is in flight: a staged source entry bound to
+                // this slot is the in-flight marker (erased per record by
+                // replica_cross_source_done). A whole-frame condition here
+                // deadlocks: the ring holds far fewer slots than a frame
+                // has records, so slots must turn over inside the frame.
+                std::lock_guard<std::mutex> lock(cross->mutex);
+                if (cross->enabled) {
+                    for (const auto& [key, entry] : cross->staged) {
+                        if (entry.source &&
+                            entry.buffer_idx == index &&
+                            entry.module_type == module_type) {
+                            return false;
+                        }
+                    }
+                }
             }
             return block.first_waiting(found->second,
                                        ReplicaControlBlock::Barrier::B,
@@ -689,6 +744,188 @@ void HtoD_Engine::uninstall_replica_plan() {
     this->gpu_weight_buffer_.set_peer_release_gate(nullptr);
     this->replica_plan_.reset();
     this->logger_->info("Replica plan uninstalled");
+}
+
+void HtoD_Engine::replica_cross_enable() {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error(
+            "replica_cross_enable requires an installed replica plan");
+    }
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "replica_cross_enable requires a stopped producer");
+    }
+    std::lock_guard<std::mutex> lock(this->replica_plan_->cross->mutex);
+    this->replica_plan_->cross->enabled = true;
+}
+
+std::vector<std::tuple<uint32_t, std::string, std::string, bool>>
+HtoD_Engine::replica_cross_wait_staged(uint64_t flat_frame, size_t expected,
+                                       int64_t timeout_ms) {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error("no replica plan installed");
+    }
+    auto cross = this->replica_plan_->cross;
+    std::vector<std::tuple<uint32_t, std::string, std::string, bool>> out;
+    std::unique_lock<std::mutex> lock(cross->mutex);
+    const auto collect = [&] {
+        out.clear();
+        auto it = cross->staged.lower_bound({flat_frame, 0});
+        for (; it != cross->staged.end() && it->first.first == flat_frame;
+             ++it) {
+            out.emplace_back(it->first.second, it->second.module_type,
+                             it->second.module_name, it->second.source);
+        }
+        return out.size() >= expected;
+    };
+    cross->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), collect);
+    collect();
+    return out;
+}
+
+module_weight_tensor_map HtoD_Engine::replica_cross_slot_views(
+    uint64_t flat_frame, uint32_t record_index) {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error("no replica plan installed");
+    }
+    auto cross = this->replica_plan_->cross;
+    std::string module_type;
+    int64_t buffer_idx = -1;
+    {
+        std::lock_guard<std::mutex> lock(cross->mutex);
+        auto found = cross->staged.find({flat_frame, record_index});
+        if (found != cross->staged.end()) {
+            module_type = found->second.module_type;
+            buffer_idx = found->second.buffer_idx;
+        }
+    }
+    if (buffer_idx < 0) {
+        throw std::runtime_error(
+            "record " + std::to_string(record_index) + " of frame " +
+            std::to_string(flat_frame) + " is not cross-staged");
+    }
+    return this->gpu_weight_buffer_.peek_slot_views(module_type, buffer_idx);
+}
+
+void HtoD_Engine::replica_cross_complete(uint64_t flat_frame,
+                                         uint32_t record_index) {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error("no replica plan installed");
+    }
+    auto cross = this->replica_plan_->cross;
+    {
+        std::lock_guard<std::mutex> lock(cross->mutex);
+        auto found = cross->staged.find({flat_frame, record_index});
+        if (found == cross->staged.end()) {
+            throw std::runtime_error(
+                "cross completion for unstaged record " +
+                std::to_string(record_index) + " of frame " +
+                std::to_string(flat_frame));
+        }
+        if (found->second.source) {
+            throw std::runtime_error(
+                "cross completion addresses a source record; the source "
+                "lands through its own host copy");
+        }
+        cross->landed_mailbox.emplace_back(flat_frame, record_index);
+    }
+    cross->cv.notify_all();
+    // The mailbox is drained only by the producer loop. At the end of a pass
+    // the producer parks on producer_wake_cv_ with nothing to produce, so a
+    // completion that lands after the park would never be drained and the
+    // frame's receiver slots would stay FILLING forever and stall the whole
+    // cohort. A completion is a wake event.
+    this->wake_producer();
+}
+
+void HtoD_Engine::replica_cross_source_done(uint64_t flat_frame,
+                                            uint32_t record_index) {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error("no replica plan installed");
+    }
+    auto cross = this->replica_plan_->cross;
+    {
+        std::lock_guard<std::mutex> lock(cross->mutex);
+        auto found = cross->staged.find({flat_frame, record_index});
+        if (found == cross->staged.end()) {
+            throw std::runtime_error(
+                "cross source completion for unstaged record " +
+                std::to_string(record_index) + " of frame " +
+                std::to_string(flat_frame));
+        }
+        if (!found->second.source) {
+            throw std::runtime_error(
+                "cross source completion addresses a receiver record");
+        }
+        // Erasing the staged entry lifts this slot's in-flight hold in the
+        // peer release gate; the producer can reclaim it on its next
+        // acquire sweep.
+        cross->staged.erase(found);
+    }
+    cross->cv.notify_all();
+    this->wake_producer();
+}
+
+void HtoD_Engine::replica_cross_frame_done(uint64_t flat_frame) {
+    if (this->replica_plan_ == nullptr) {
+        throw std::runtime_error("no replica plan installed");
+    }
+    auto cross = this->replica_plan_->cross;
+    std::lock_guard<std::mutex> lock(cross->mutex);
+    for (const auto& [module_type, _index] :
+         this->replica_plan_->type_index) {
+        cross->broadcast_passed.insert({module_type, flat_frame});
+    }
+    // Source entries of the frame are no longer needed once the broadcast
+    // is done; receiver entries leave through the mailbox drain.
+    for (auto it = cross->staged.lower_bound({flat_frame, 0});
+         it != cross->staged.end() && it->first.first == flat_frame;) {
+        if (it->second.source) {
+            it = cross->staged.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void HtoD_Engine::replica_drain_cross_mailbox_() {
+    if (this->replica_plan_ == nullptr) {
+        return;
+    }
+    ReplicaPlanRuntime& plan = *this->replica_plan_;
+    std::deque<std::pair<uint64_t, uint32_t>> landed;
+    std::vector<ReplicaPlanRuntime::CrossStaged> entries;
+    {
+        std::lock_guard<std::mutex> lock(plan.cross->mutex);
+        if (!plan.cross->enabled || plan.cross->landed_mailbox.empty()) {
+            return;
+        }
+        landed.swap(plan.cross->landed_mailbox);
+        entries.reserve(landed.size());
+        for (const auto& key : landed) {
+            auto found = plan.cross->staged.find(key);
+            if (found == plan.cross->staged.end()) {
+                throw std::runtime_error(
+                    "cross mailbox entry without a staged record (frame " +
+                    std::to_string(key.first) + ")");
+            }
+            entries.push_back(found->second);
+            plan.cross->staged.erase(found);
+        }
+    }
+    for (size_t i = 0; i < landed.size(); ++i) {
+        const auto& entry = entries[i];
+        const bool present = this->gpu_weight_buffer_.weights_copy_complete(
+            entry.module_type, entry.module_name, entry.buffer_idx);
+        this->count_module_(this->copied_modules_, entry.module_type);
+        if (!present) {
+            this->count_module_(this->released_on_landing_modules_,
+                                entry.module_type);
+        }
+        const auto type = plan.type_index.at(entry.module_type);
+        this->replica_mark_terminal_(type, landed[i].first);
+        this->gpu_weight_buffer_.note_producer_progress();
+    }
 }
 
 void HtoD_Engine::replica_note_issue_(size_t type, uint64_t flat_frame) {
@@ -922,6 +1159,7 @@ void HtoD_Engine::HtoD_Worker() {
             }
         };
 
+        this->replica_drain_cross_mailbox_();
         for (auto& module_type :
              this->engine_config_.basic_config.module_types) {
             // A failed producer copies nothing until set_weight_copy_queue;
@@ -1015,6 +1253,10 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 plan.wait_since.erase(std::make_pair(type, flat));
             }
+            const bool cross_record =
+                role != nullptr &&
+                role->kind ==
+                    static_cast<uint8_t>(WeightRecordKind::CrossReplica);
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
             std::optional<std::reference_wrapper<module_weight_tensor_map>>
@@ -1053,8 +1295,9 @@ void HtoD_Engine::HtoD_Worker() {
                         next.module_name);
                 }
                 if (role != nullptr &&
-                    role->kind ==
-                        static_cast<uint8_t>(WeightRecordKind::Replica) &&
+                    (role->kind ==
+                         static_cast<uint8_t>(WeightRecordKind::Replica) ||
+                     cross_record) &&
                     this->gpu_weight_buffer_.pass_produce_only(next.pass)) {
                     // Produce-only pass: this rank runs no forward, so it
                     // never pulls. The record is counted at barrier B and
@@ -1066,6 +1309,45 @@ void HtoD_Engine::HtoD_Worker() {
                         module_type, module_name);
                     this->count_module_(this->skipped_modules_, module_type);
                     this->replica_mark_terminal_(role->type_index, flat);
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                    continue;
+                }
+                if (cross_record) {
+                    // Cross-node record: the payload arrives through the
+                    // comm thread's broadcast into the claimed slot. Stage
+                    // the slot and continue; the completion returns through
+                    // the mailbox and the frame books advance there.
+                    ReplicaPlanRuntime& plan = *this->replica_plan_;
+                    const auto claim = [&] {
+                        SectionTimer timer(
+                            this->producer_section_ns_[kSecClaim]);
+                        return this->gpu_weight_buffer_.claim_for_copy(
+                            module_type, buffer_idx, module_name);
+                    }();
+                    queue.try_pop(module_name);
+                    queue.push(module_name);
+                    if (claim == WeightProduction::kSkip) {
+                        this->gpu_weight_buffer_.retire_skip(module_type,
+                                                             module_name);
+                        this->count_module_(this->skipped_modules_,
+                                            module_type);
+                        this->replica_mark_terminal_(role->type_index, flat);
+                        this->set_producer_state_(ProducerState::kIdle, "");
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(plan.cross->mutex);
+                        ReplicaPlanRuntime::CrossStaged entry;
+                        entry.module_type = module_type;
+                        entry.module_name = module_name;
+                        entry.buffer_idx = buffer_idx;
+                        entry.pass = static_cast<uint64_t>(next.pass);
+                        entry.source = false;
+                        plan.cross->staged.emplace(
+                            std::make_pair(flat, role->record_index),
+                            std::move(entry));
+                    }
+                    plan.cross->cv.notify_all();
                     this->set_producer_state_(ProducerState::kIdle, "");
                     continue;
                 }

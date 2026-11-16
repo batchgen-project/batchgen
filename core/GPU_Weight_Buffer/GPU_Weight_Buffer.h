@@ -136,6 +136,11 @@ class GPU_Weight_Buffer {
     SkipCounts skip_modules(const std::vector<std::string>& module_names);
     SlotSnapshot slot_snapshot() const;
 
+    // Tensor views of one ring slot's buffers (cross-node transport reads
+    // a staged slot without leasing it; the reclaim gate holds the slot).
+    module_weight_tensor_map peek_slot_views(const std::string& module_type,
+                                             int64_t buffer_idx) const;
+
     void reset_prefill_buffer();
     void reset_decoding_buffer();
     void reset_weight_stream_profile(bool enabled);
@@ -154,7 +159,7 @@ class GPU_Weight_Buffer {
     // engine installs a predicate over the cohort control block's barrier
     // B; nullptr means no gate (every reclaim proceeds on its event alone).
     void set_peer_release_gate(
-        std::function<bool(const std::string&, int64_t)> gate);
+        std::function<bool(const std::string&, int64_t, int64_t)> gate);
     // Reclaims every pending release at a pass boundary, honoring the peer
     // gate (polls; throws after kStallTimeout).
     void drainPendingReleasesGatedLocked(std::unique_lock<std::mutex>& lock);
@@ -231,7 +236,7 @@ class GPU_Weight_Buffer {
     uint64_t progress_epoch_ = 0;                  // under mutex_
     std::deque<PendingRelease> pending_releases_;
     // (module type, frame) -> every member passed B; under mutex_
-    std::function<bool(const std::string&, int64_t)> peer_release_gate_;
+    std::function<bool(const std::string&, int64_t, int64_t)> peer_release_gate_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

@@ -447,6 +447,56 @@ py::dict BatchGen::get_tensor(std::string module_key)
     return this->weights_storage_.get_tensor(module_key);
 }
 
+void BatchGen::replica_cross_enable() {
+    this->h2d_engine_.replica_cross_enable();
+}
+
+std::vector<std::tuple<int64_t, std::string, std::string, bool>>
+BatchGen::replica_cross_wait_staged(int64_t flat_frame, int64_t expected,
+                                    int64_t timeout_ms) {
+    auto staged = this->h2d_engine_.replica_cross_wait_staged(
+        static_cast<uint64_t>(flat_frame), static_cast<size_t>(expected),
+        timeout_ms);
+    std::vector<std::tuple<int64_t, std::string, std::string, bool>> out;
+    out.reserve(staged.size());
+    for (auto& [record_index, module_type, module, source] : staged) {
+        out.emplace_back(static_cast<int64_t>(record_index),
+                         std::move(module_type), std::move(module), source);
+    }
+    return out;
+}
+
+py::dict BatchGen::replica_cross_slot_views(int64_t flat_frame,
+                                            int64_t record_index) {
+    auto views = this->h2d_engine_.replica_cross_slot_views(
+        static_cast<uint64_t>(flat_frame),
+        static_cast<uint32_t>(record_index));
+    py::dict out;
+    for (auto& [tensor_name, tensor] : views) {
+        out[py::str(tensor_name)] = tensor;
+    }
+    return out;
+}
+
+void BatchGen::replica_cross_complete(int64_t flat_frame,
+                                      int64_t record_index) {
+    this->h2d_engine_.replica_cross_complete(
+        static_cast<uint64_t>(flat_frame),
+        static_cast<uint32_t>(record_index));
+}
+
+void BatchGen::replica_cross_source_done(int64_t flat_frame,
+                                         int64_t record_index) {
+    this->h2d_engine_.replica_cross_source_done(
+        static_cast<uint64_t>(flat_frame),
+        static_cast<uint32_t>(record_index));
+}
+
+void BatchGen::replica_cross_frame_done(int64_t flat_frame) {
+    this->h2d_engine_.replica_cross_frame_done(
+        static_cast<uint64_t>(flat_frame));
+}
+
 void BatchGen::start_h2d_worker() {
     this->h2d_engine_.Start();
 }

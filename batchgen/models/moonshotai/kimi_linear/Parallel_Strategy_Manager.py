@@ -263,6 +263,11 @@ class KimiLinearParallelStrategyManager:
         self._hierarchical_gdr = (
             self._distributed_weight_transport == "hierarchical_gdr"
         )
+        # S4: hierarchical_gdr IS the replica seam - the copy engine owns
+        # the cross-node payload transport on every member and the layer
+        # runs the uniform single-node ingress. There is no model-layer
+        # broadcast path any more.
+        self._cross_seam = self._hierarchical_gdr
 
         # `model_config` is a ModelConfig, which has NO `n_routed_experts`
         # field at all — the old `getattr(..., 256) or 256` here therefore
@@ -1185,16 +1190,6 @@ class KimiLinearParallelStrategyManager:
                 moe, "shared_experts", None
             ) is not None:
                 task["shared_expert"].append(f"shared_expert_{layer_idx}")
-            if (
-                self._hierarchical_gdr
-                and self.prefill_uses_streamed_sp8()
-                and not self._cross_weight_source
-            ):
-                # Hierarchical GDR: every rank that is not one of the eight
-                # sources receives this layer's shard over the cross-node
-                # broadcast, so it must request nothing at all from the host
-                # store.
-                continue
             for e_idx in range(len(moe.experts)):
                 if self.prefill_uses_streamed_sp8():
                     start = self._attn_tp_rank * (
@@ -2193,9 +2188,6 @@ class KimiLinearParallelStrategyManager:
                 if getattr(layer, "block_sparse_moe", None) is not None
                 and getattr(layer.block_sparse_moe, "experts", None) is not None
             ],
-            cross_group=self._cross_weight_group,
-            cross_root=self._cross_weight_root,
-            cross_source=self._cross_weight_source,
         )
         row_group = (
             self._attn_tp_size,
@@ -2941,6 +2933,18 @@ class KimiLinearParallelStrategyManager:
                 self._cross_weight_root = ((g * num_nodes) // G) * G + g
         self._cross_weight_source = (
             self.global_rank == self._cross_weight_root
+        )
+
+    def cross_seam_enabled(self) -> bool:
+        """The copy engine owns the cross-node payload transport (S3b)."""
+        return self._cross_seam
+
+    def cross_seam_transport(self):
+        """(group, source root, is_source) of this member's cross group."""
+        return (
+            self._cross_weight_group,
+            self._cross_weight_root,
+            self._cross_weight_source,
         )
 
     def _head_shard_kda_tensor(self, name, tensor):
