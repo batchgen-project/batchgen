@@ -781,10 +781,10 @@ def _o_norm_segments(o_norm, o, z, segment_tokens=KDA_PREFILL_SEGMENT_TOKENS):
     ``layer_norm_gated_fwd`` autotunes per ``NB = ceil(rows / 65536)``, so an
     uncut call keys on the whole packed range — a long prompt is a micro-batch
     of its own, reaching keys no startup prewarm can enumerate (observed
-    2026-11-16, k3a4 leg1: a ~62K-token range compiled the NB=17 key after
-    readiness). Every segmented call stays within the keys derived from
-    ``segment_tokens``, which the startup prewarm warms exactly
-    (``triton_prewarm.o_norm_token_counts``).
+    2026-11-16, k3a4 leg1: a ~91K-token packed range, 12 rows per token at
+    attn-TP 8, compiled the NB=17 key after readiness). Every segmented call
+    stays within the keys derived from ``segment_tokens``, which the startup
+    prewarm warms exactly (``triton_prewarm.o_norm_token_counts``).
     """
     total = o.shape[0]
     out = torch.empty_like(o)

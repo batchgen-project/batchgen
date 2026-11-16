@@ -392,8 +392,9 @@ def o_norm_minimal_token_counts(heads: int) -> List[int]:
     This is the floor the site always gets, alongside the block-count
     coverage ``o_norm_token_counts`` derives from the serving row-block
     constant: a site that never runs here compiles inside the first request
-    (observed 2026-11-16, k3a3 leg1: the 17-head KDA o_norm key was missing
-    and the first batch compiled nine binaries plus its autotune record).
+    (observed 2026-11-16, k3a3/k3a4 leg1: the uncut packed range reached a
+    block-count key the prewarm never ran, and the first batch compiled
+    nine binaries plus its autotune record).
     """
     heads = int(heads)
     aligned = 16 // math.gcd(heads, 16)
