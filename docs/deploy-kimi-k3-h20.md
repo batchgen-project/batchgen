@@ -84,6 +84,7 @@ export NCCL_IB_GID_INDEX=3 UCX_IB_GID_INDEX=3
 
 python -m batchgen.launch_http_server \
     --model moonshotai/Kimi-K3 \
+    --max-model-len -1 \
     --converted-ckpt-dir /shared/models/Kimi-K3/converted_ckpt \
     --distributed-weight-config /shared/dwconfig/node${RANK}.json \
     --listen-port 10900 \
@@ -95,6 +96,13 @@ python -m batchgen.launch_http_server \
     --parse-thinking \
     --storage-path /shared/storage
 ```
+
+`--max-model-len -1` fits the deployment maximum sequence length to the GPU
+KV cache the server measures at startup. Without it the deployment maximum
+is the model's full context length, and the server refuses to start when one
+sequence of that length does not fit every rank's GPU KV cache. Pass an
+explicit length instead to pin it; `GET /v1/models` publishes the resolved
+limit.
 
 H20-specific notes (the rest matches the H200 guide):
 

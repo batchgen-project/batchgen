@@ -116,6 +116,7 @@ source /path/to/env/activate_batchgen.sh
 
 numactl --interleave=all python -m batchgen.launch_http_server \
     --model zai-org/GLM-5.3-FP8 \
+    --max-model-len -1 \
     --cache-dir /local/models/GLM-5.3-FP8 \
     --converted-ckpt-dir /local/models/GLM-5.3-FP8/converted_ckpt \
     --listen-port 10904 \
@@ -135,6 +136,13 @@ numactl --interleave=all python -m batchgen.launch_http_server \
     --parse-thinking \
     --startup-timeout 3600
 ```
+
+`--max-model-len -1` fits the deployment maximum sequence length to the GPU
+KV cache the server measures at startup. Without it the deployment maximum
+is the model's full context length, and the server refuses to start when one
+sequence of that length does not fit every rank's GPU KV cache. Pass an
+explicit length instead to pin it; `GET /v1/models` publishes the resolved
+limit.
 
 This is the qualified configuration. With persistent phase instances, the
 weights and both phase instances leave little free GPU memory. `--gpu-memory-frac
