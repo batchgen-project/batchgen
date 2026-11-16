@@ -1977,8 +1977,9 @@ class BatchGenWorker:
 			raise
 		self._publish_trajectory_pool_capacity()
 
-		# packing_v2: order the admission by prompt prefix before ownership,
-		# so a prefix family is not split across two prefill waves.
+		# Order the admission by prompt prefix before ownership, so a prefix
+		# family is not split across two prefill waves. Skipped on a wave
+		# that opted out with prefix_rank_assignment_mode 'global_idx'.
 		if self._prefill_prefix_pool_enabled():
 			self._stamp_prefix_prefill_order(valid_uuids)
 
@@ -2302,9 +2303,11 @@ class BatchGenWorker:
 		Idempotent (skips already-grouped seqs) and deterministic across ranks:
 		identical inputs -> identical map.
 
-		``packing_v2`` batches served through the in-wave prefix pool with more
-		than one group instead pack by predicted prefill seconds, so a prefix
-		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
+		A wave served through the in-wave prefix pool with more than one group
+		instead packs by predicted prefill seconds, so a prefix family shares
+		one group's pool (``_pack_decode_dp_groups_for_sharing``). That is the
+		default; ``prefix_rank_assignment_mode: "global_idx"`` takes the
+		L^2 assignment above instead.
 
 		A committed trajectory contributes resident leading tokens on its owning
 		group to that same objective, even without ``packing_v2``. The packer
@@ -11025,7 +11028,7 @@ class BatchGenWorker:
 		)
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
-		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
+		"""Order a pool-served admission by prompt prefix, not by arrival.
 
 		Prefill waves are cut by free Host-KV pages in candidate order, and a
 		wave releases its prefix pool before the next one starts. A prefix

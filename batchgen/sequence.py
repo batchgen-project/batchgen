@@ -70,7 +70,8 @@ class SequenceEntry:
         'status', 'decoded_length', 'current_context_length',
         'input_ids', 'decoded_tokens',
         'kv_token_budget', 'assigned_rank', 'eos_reached',
-        # Prefix-grouped admission order (packing_v2); unset means global_idx.
+        # Prefix-grouped admission order, the default assignment; a wave on
+        # prefix_rank_assignment_mode 'global_idx' leaves this unset.
         'prefill_order',
         # Decode-side DP-group (M2b): 0..num_dp-1, the group of G ranks that
         # owns this sequence in DP-(world/G) x TP-G decode. None until the
