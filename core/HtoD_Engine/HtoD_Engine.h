@@ -327,10 +327,63 @@ class HtoD_Engine {
         std::vector<uint64_t> a_cursor;
         std::vector<uint64_t> b_cursor;
         std::vector<bool> cursor_init;
+        // Cross-node transport (S3b): the comm thread (Python) stages and
+        // broadcasts slot payloads and feeds completions; the frame books
+        // above stay producer-thread-only, so completions arrive through a
+        // mailbox the producer drains on its loop.
+        struct CrossStaged {
+            std::string module_type;
+            std::string module_name;
+            int64_t buffer_idx = -1;
+            uint64_t pass = 0;
+            bool source = false;  // broadcast src (landed HostShared slot)
+        };
+        struct CrossState {
+            std::mutex mutex;
+            std::condition_variable cv;
+            // (flat frame, record index) -> staged payload slot
+            std::map<std::pair<uint64_t, uint32_t>, CrossStaged> staged;
+            // receiver completions fed by the comm thread
+            std::deque<std::pair<uint64_t, uint32_t>> landed_mailbox;
+            // (module type, flat frame) whose whole-frame broadcast is done;
+            // composed into the reclaim gate so a source slot cannot be
+            // reused while a peer still reads it.
+            std::set<std::pair<std::string, uint64_t>> broadcast_passed;
+            bool enabled = false;
+        };
+        std::shared_ptr<CrossState> cross = std::make_shared<CrossState>();
         ReplicaPlanRuntime(ReplicaControlBlock attached)
             : block(attached) {}
     };
     std::unique_ptr<ReplicaPlanRuntime> replica_plan_;
+
+   public:
+    /* Cross-node transport API (S3b). enable before the producer starts;
+       the wait/complete calls come from the comm thread. */
+    void replica_cross_enable();
+    // Blocks (producer-independent) until >= expected records of the frame
+    // are staged or timeout; returns (record_index, type, name, source).
+    std::vector<std::tuple<uint32_t, std::string, std::string, bool>>
+    replica_cross_wait_staged(uint64_t flat_frame, size_t expected,
+                              int64_t timeout_ms);
+    // Tensor views of a staged record's payload slot, resolved by the
+    // record's own (frame, index) key. A (type, name) lookup is NOT frame
+    // safe: ``staged`` holds entries of several in-flight frames and a
+    // module name recurs across passes, so a name scan can resolve to a
+    // slot the producer has already refilled for a later frame.
+    module_weight_tensor_map replica_cross_slot_views(uint64_t flat_frame,
+                                                      uint32_t record_index);
+    // Receiver completion: the broadcast wrote this record's dst slot.
+    void replica_cross_complete(uint64_t flat_frame, uint32_t record_index);
+    // Source completion: this record's broadcast finished; the staged
+    // entry is erased, lifting the slot's in-flight hold in the gate.
+    void replica_cross_source_done(uint64_t flat_frame,
+                                   uint32_t record_index);
+    // Whole-frame broadcast done: lifts the source-slot reclaim gate.
+    void replica_cross_frame_done(uint64_t flat_frame);
+
+   private:
+    void replica_drain_cross_mailbox_();
     // Producer-side frame hooks; no-ops without an installed plan.
     void replica_mark_terminal_(size_t type, uint64_t flat_frame);
     void replica_mark_owned_landed_(size_t type, uint64_t flat_frame);

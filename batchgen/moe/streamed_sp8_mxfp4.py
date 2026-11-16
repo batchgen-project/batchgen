@@ -33,6 +33,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import logging
+
 import torch
 import torch.distributed as dist
 
@@ -82,6 +84,13 @@ class StreamedSP8LayerBuffer:
     model thread confirms every layer-``L`` reader has been enqueued.
     """
 
+    # Replica seam (engine-bound cross-node transport): when set, the copy
+    # engine lands every member's shard in ring slots and this object issues
+    # each frame's cross-node collective. It is called ONLY at this layer's
+    # deterministic launch points (the model thread's gate), so every GPU keeps
+    # one host launch order between TP8 and cross-node collectives.
+    seam_broadcaster = None
+
     def __init__(
         self,
         *,
@@ -95,9 +104,6 @@ class StreamedSP8LayerBuffer:
         latent_size: int,
         acquire_batch_size: int,
         layer_indices=None,
-        cross_group=None,
-        cross_root=None,
-        cross_source: bool = False,
     ):
         if tp_size <= 1 or num_experts % tp_size:
             raise ValueError(
@@ -109,18 +115,11 @@ class StreamedSP8LayerBuffer:
         self.tp_group = tp_group
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
-        self.cross_group = cross_group
-        self.cross_root = cross_root
-        self.cross_source = bool(cross_source)
-        if cross_group is not None and cross_root is None:
-            raise ValueError(
-                "hierarchical cross-node weight transport needs the global "
-                "root rank of the cross-node group"
-            )
-        # host_rdma: every rank pulls its own shard from its node's host store.
-        # hierarchical_gdr: only the group's source rank does; the rest receive
-        # the same bytes from the broadcast below.
-        self._acquires_from_host = cross_group is None or self.cross_source
+        # host_rdma: every rank pulls its own shard from its node's host
+        # store. hierarchical_gdr (always the engine-bound seam, S4): the
+        # copy engine lands every member's shard in the ring, so the layer
+        # runs the same single-node ingress on every member.
+        self._acquires_from_host = True
         self.num_experts = int(num_experts)
         self.experts_per_rank = self.num_experts // self.tp_size
         self.expert_start = self.tp_rank * self.experts_per_rank
@@ -139,16 +138,10 @@ class StreamedSP8LayerBuffer:
         )
         self.local = None
         self.compute = None
-        self._cross_status = None
         self._expert_offsets = torch.arange(
             self.experts_per_rank, dtype=torch.int64, device=self.device
         )
         self._prefetch_stream = torch.cuda.Stream(device=self.device)
-        self._status_stream = (
-            torch.cuda.Stream(device=self.device)
-            if self.cross_group is not None
-            else None
-        )
         # ``self.local`` is the assembly source and is single-buffered too.
         # The next layer's ingress may only overwrite it once the previous
         # copy has read it.  On the first boundary that copy ran on the
@@ -182,10 +175,6 @@ class StreamedSP8LayerBuffer:
                 )
                 for name, shape in self.shapes.items()
             }
-            if self.cross_group is not None:
-                self._cross_status = torch.empty(
-                    (1,), dtype=torch.int32, device=self.device
-                )
 
     def _acquire_local_shard(
         self,
@@ -210,7 +199,21 @@ class StreamedSP8LayerBuffer:
                 order_wait_end_s=None,
                 broadcast_enqueue_s=None,
             )
-        source_error = None
+        seam = self.seam_broadcaster
+        if seam is not None:
+            # The ring slots of this layer become PRESENT only after the frame's
+            # cross-node collective lands, and that collective must be issued
+            # at this layer's gate: open it, launch, hand the order back to the
+            # model thread, and only then wait for the ring.
+            if cross_launch_gate is not None and not cross_launch_gate():
+                return
+            seam.enqueue(int(layer_idx))
+            if enabled:
+                profile_host.broadcast_enqueue_s = time.perf_counter()
+            if cross_launch_callback is not None:
+                cross_launch_callback()
+            cross_launch_gate = None
+            cross_launch_callback = None
         if self._acquires_from_host:
             if enabled:
                 profile_host.acquisition_start_s = time.perf_counter()
@@ -223,128 +226,54 @@ class StreamedSP8LayerBuffer:
             ]
             # Hold every slot in this bounded batch until its D2D copy
             # completes.
-            try:
-                for begin in range(0, len(names), self.acquire_batch_size):
-                    acquired = []
-                    batch = names[begin:begin + self.acquire_batch_size]
-                    try:
-                        with torch.cuda.stream(copy_stream):
-                            for local_offset, module_name in enumerate(
-                                batch, start=begin
-                            ):
-                                weights = self.core_engine.get_weights(
-                                    module_name
+            for begin in range(0, len(names), self.acquire_batch_size):
+                acquired = []
+                batch = names[begin:begin + self.acquire_batch_size]
+                try:
+                    with torch.cuda.stream(copy_stream):
+                        for local_offset, module_name in enumerate(
+                            batch, start=begin
+                        ):
+                            weights = self.core_engine.get_weights(
+                                module_name
+                            )
+                            acquired.append(module_name)
+                            validate_routed_expert_slot(
+                                module_name, weights, self.shapes
+                            )
+                            for tensor_name in self.shapes:
+                                self.local[tensor_name][local_offset].copy_(
+                                    weights[tensor_name]
                                 )
-                                acquired.append(module_name)
-                                validate_routed_expert_slot(
-                                    module_name, weights, self.shapes
-                                )
-                                for tensor_name in self.shapes:
-                                    self.local[tensor_name][local_offset].copy_(
-                                        weights[tensor_name]
-                                    )
-                    finally:
-                        # Both transports release each bounded batch as soon as
-                        # its copies have landed in ``self.local``, so the ring
-                        # only ever has to hold ``acquire_batch_size`` slots and
-                        # the next batch can reuse the ones just freed.
-                        copy_stream.synchronize()
-                        for module_name in acquired:
-                            self.core_engine.free_weights_buffer(module_name)
-            except BaseException as exc:
-                if self.cross_group is None:
-                    raise
-                source_error = exc
-            if enabled and source_error is None:
+                finally:
+                    # Both transports release each bounded batch as soon as
+                    # its copies have landed in ``self.local``, so the ring
+                    # only ever has to hold ``acquire_batch_size`` slots and
+                    # the next batch can reuse the ones just freed.
+                    copy_stream.synchronize()
+                    for module_name in acquired:
+                        self.core_engine.free_weights_buffer(module_name)
+            if enabled:
                 profile_host.acquisition_end_s = time.perf_counter()
 
-        # A source-side Python/storage failure must be announced before peers
-        # enter the six large payload broadcasts. Otherwise the other three
-        # nodes can wait forever after the source thread has already unwound.
-        #
-        # Host/ring acquisition above is free to run as early as this thread
-        # starts, but the cross-node communicator is not: the model thread
-        # issues every TP8 collective of the current layer first and only then
-        # opens this gate, so every GPU keeps one deterministic TP8 ->
-        # cross-node launch order.  A cancelled gate means the phase is tearing
-        # down; issuing the status broadcast then would park this thread
-        # against peers that will never join it.
         if cross_launch_gate is not None and not cross_launch_gate():
             return
-        if not self._broadcast_source_status(
-            self._status_stream or copy_stream, source_error is None
-        ):
-            if source_error is not None:
-                raise source_error
-            raise RuntimeError(
-                f"hierarchical_gdr source rank {self.cross_root} failed "
-                f"to acquire layer {layer_idx}"
-            )
-
-        # Cross-node replication is part of ingress, not of assembly: it
-        # writes ``self.local`` only, so it inherits the same WAR event and
-        # the same early-ingress overlap as the host copies above, and it
-        # necessarily precedes the local-to-compute copy that reads
-        # ``self.local``.
-        self._broadcast_local_shard(copy_stream)
-        if enabled and self.cross_group is not None:
-            profile_host.broadcast_enqueue_s = time.perf_counter()
         if cross_launch_callback is not None:
             cross_launch_callback()
         if publish_profile_host:
             profile._prefill_profile_host_records.append(profile_host)
-
-    def _broadcast_source_status(self, stream, source_ok: bool) -> bool:
-        """Tell peers whether the source shard is ready for payload ingress."""
-        if self.cross_group is None:
-            return True
-        profile = StreamedSP8MXFP4MoELayer
-        with torch.cuda.stream(stream):
-            if self.cross_source:
-                self._cross_status.fill_(1 if source_ok else 0)
-            dist.broadcast(
-                self._cross_status, self.cross_root, group=self.cross_group
+        if getattr(profile, "verify_bytes_enabled", False):
+            sums = {
+                tensor_name: int(
+                    self.local[tensor_name].view(torch.uint8).long().sum().item()
+                )
+                for tensor_name in sorted(self.shapes)
+            }
+            logging.warning(
+                "[SEAM_VERIFY] layer=%d expert_start=%d %s",
+                int(layer_idx), int(self.expert_start),
+                " ".join(f"{k}={v}" for k, v in sums.items()),
             )
-            # ``stream`` is a non-default pool stream on the background
-            # prefetch thread. Keep the scalar read in this context so its D2H
-            # copy is ordered after the status broadcast rather than racing a
-            # stale or uninitialized value on the thread's default stream.
-            ok = bool(self._cross_status.item())
-        if profile._prefill_profile_enabled:
-            profile._prefill_profile_cross_status_calls += 1
-            if not ok:
-                profile._prefill_profile_cross_status_failures += 1
-        return ok
-
-    def _broadcast_local_shard(self, stream):
-        """Replicate the source rank's 112-expert shard to the other nodes.
-
-        No-op for ``host_rdma``, where every rank has already pulled its own
-        shard, so that path stays byte-identical.
-        """
-        if self.cross_group is None:
-            return
-        profile = StreamedSP8MXFP4MoELayer
-        enabled = profile._prefill_profile_enabled
-        span = []
-        with torch.cuda.stream(stream):
-            if enabled:
-                _profile_mark(span)
-            for tensor_name in self.shapes:
-                tensor = self.local[tensor_name]
-                dist.broadcast(tensor, self.cross_root, group=self.cross_group)
-                if enabled:
-                    profile._prefill_profile_cross_broadcast_calls += 1
-                    profile._prefill_profile_cross_broadcast_bytes += (
-                        tensor.numel() * tensor.element_size()
-                    )
-            if enabled:
-                _profile_mark(span)
-        if enabled:
-            # Published only once BOTH ends are recorded, so a broadcast that
-            # raised leaves no half pair behind for the snapshot to read.
-            profile._prefill_profile_broadcast_spans.append(tuple(span))
-            profile._prefill_profile_cross_source = self.cross_source
 
     def _assemble_compute_shard(self, stream=None):
         """Phase two: publish the ingressed shard to the compute buffer.
@@ -465,10 +394,14 @@ class StreamedSP8LayerBuffer:
             # cross-node broadcasts have been issued before the model thread is
             # allowed to issue the next layer's attention all-reduce.
             cross_launch_allowed=(
-                threading.Event() if self.cross_group is not None else None
+                threading.Event()
+                if self.seam_broadcaster is not None
+                else None
             ),
             cross_launch_enqueued=(
-                threading.Event() if self.cross_group is not None else None
+                threading.Event()
+                if self.seam_broadcaster is not None
+                else None
             ),
             overwrite_allowed=threading.Event(),
             cancelled=False,
@@ -599,7 +532,7 @@ class StreamedSP8LayerBuffer:
         Host-RDMA has no cross-node GPU collective and is a no-op here.
         """
         pending = self._pending
-        if self.cross_group is None or pending is None:
+        if pending is None or pending.cross_launch_enqueued is None:
             return
         # Every layer's attention calls this, so a dense layer between two MoE
         # layers would re-enter an already satisfied handoff. Keep the FIRST
@@ -712,10 +645,10 @@ class StreamedSP8LayerBuffer:
         nodes.  This transport-only drive deliberately skips attention, routed
         and shared expert compute, scale expansion, and logits.
         """
-        if self.cross_group is None:
+        if self.seam_broadcaster is None:
             raise RuntimeError(
-                "transport-only streamed-SP8 participation requires "
-                "hierarchical GDR"
+                "transport-only streamed-SP8 participation requires the "
+                "hierarchical-GDR replica seam"
             )
         if self._pending is not None:
             raise RuntimeError(
@@ -828,6 +761,14 @@ class StreamedSP8MXFP4MoELayer:
     # the model stream and read once after prefill, so diagnostics do not add
     # a host synchronization at every layer boundary.
     _prefill_finite_checks = []
+
+    # Batch-level byte-verification (batchgen_debug.k3_seam_verify_bytes):
+    # after every layer's local-shard acquisition, log one uint64 sum per
+    # tensor of the aggregated ``local`` buffer. The slot-group members
+    # [s, 8+s, 16+s, 24+s] assemble the same shard from full-replica stores,
+    # so equal sums across members prove the transport delivered the exact
+    # bytes, independent of decode nondeterminism.
+    verify_bytes_enabled = False
 
     @classmethod
     def reset_prefill_profile(cls, enabled: bool) -> None:

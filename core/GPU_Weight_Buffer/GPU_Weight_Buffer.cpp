@@ -234,7 +234,7 @@ void GPU_Weight_Buffer::drainPendingReleasesLocked() {
         for (const auto& [module_type, buffer_idx] : pending.slots) {
             this->slots_.reclaim(
                 module_type, buffer_idx,
-                [](const std::string&, int64_t) { return true; });
+                [](const std::string&, int64_t, int64_t) { return true; });
         }
         this->pending_releases_.pop_front();
     }
@@ -278,8 +278,21 @@ void GPU_Weight_Buffer::waitWithoutStallLocked(
     }
 }
 
+module_weight_tensor_map GPU_Weight_Buffer::peek_slot_views(
+    const std::string& module_type, int64_t buffer_idx) const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto found = this->buffers_.find(module_type);
+    if (found == this->buffers_.end() || buffer_idx < 0 ||
+        buffer_idx >= static_cast<int64_t>(found->second.size())) {
+        throw std::out_of_range("peek_slot_views: no slot " +
+                                std::to_string(buffer_idx) + " of " +
+                                module_type);
+    }
+    return found->second[static_cast<size_t>(buffer_idx)];
+}
+
 void GPU_Weight_Buffer::set_peer_release_gate(
-    std::function<bool(const std::string&, int64_t)> gate) {
+    std::function<bool(const std::string&, int64_t, int64_t)> gate) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     this->peer_release_gate_ = std::move(gate);
 }
@@ -308,8 +321,11 @@ void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
         // until the gate passes; the entry is kept with event == nullptr.
         std::vector<std::pair<std::string, int64_t>> still_gated;
         for (const auto& [module_type, buffer_idx] : it->slots) {
-            static const std::function<bool(const std::string&, int64_t)>
-                kUngated = [](const std::string&, int64_t) { return true; };
+            static const std::function<bool(const std::string&, int64_t,
+                                            int64_t)>
+                kUngated = [](const std::string&, int64_t, int64_t) {
+                    return true;
+                };
             const bool reclaimed = this->slots_.reclaim(
                 module_type, buffer_idx,
                 this->peer_release_gate_ ? this->peer_release_gate_
@@ -399,7 +415,13 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    const auto slot = this->slots_.release(module_name);
+    const auto [slot, deferred] = this->slots_.release(module_name);
+    if (deferred) {
+        // Reclaim-gated slot (cross broadcast may still read it): park it
+        // for the gated drain instead of handing it back to the producer.
+        this->pending_releases_.push_back(
+            PendingRelease{nullptr, {{slot.module_type, slot.index}}});
+    }
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
                          module_name, slot.module_type, slot.index);
 };
@@ -543,8 +565,11 @@ void GPU_Weight_Buffer::drainPendingReleasesGatedLocked(
                 CUDA_CHECK(cudaEventDestroy(it->event));
                 it->event = nullptr;
             }
-            static const std::function<bool(const std::string&, int64_t)>
-                kUngated = [](const std::string&, int64_t) { return true; };
+            static const std::function<bool(const std::string&, int64_t,
+                                            int64_t)>
+                kUngated = [](const std::string&, int64_t, int64_t) {
+                    return true;
+                };
             std::vector<std::pair<std::string, int64_t>> still_gated;
             for (const auto& [module_type, buffer_idx] : it->slots) {
                 if (!this->slots_.reclaim(module_type, buffer_idx,

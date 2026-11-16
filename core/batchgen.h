@@ -129,6 +129,17 @@ class BatchGen {
     std::pair<int64_t, int64_t> ring_segment_export_fd(
         const std::string& module_type);
     void uninstall_replica_plan();
+    // Cross-node transport (S3b): comm-thread surface over the staged
+    // payload slots and their completions.
+    void replica_cross_enable();
+    std::vector<std::tuple<int64_t, std::string, std::string, bool>>
+    replica_cross_wait_staged(int64_t flat_frame, int64_t expected,
+                              int64_t timeout_ms);
+    py::dict replica_cross_slot_views(int64_t flat_frame,
+                                      int64_t record_index);
+    void replica_cross_complete(int64_t flat_frame, int64_t record_index);
+    void replica_cross_source_done(int64_t flat_frame, int64_t record_index);
+    void replica_cross_frame_done(int64_t flat_frame);
     std::vector<torch::Tensor> ring_segments(const std::string& module_type);
     std::vector<std::tuple<int64_t, int64_t, int64_t>> ring_field_layout(
         const std::string& module_type);

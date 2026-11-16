@@ -405,6 +405,7 @@ def _sp8_schedule_manager(*, hierarchical_gdr, cross_source=False):
     manager._attn_tp_rank = 3
     manager._hierarchical_gdr = hierarchical_gdr
     manager._cross_weight_source = cross_source
+    manager._cross_seam = False
     manager.prefill_uses_streamed_sp8 = lambda: True
     moe = type("MoE", (), {
         "experts": [object()] * 896,
@@ -421,7 +422,7 @@ def _sp8_schedule_manager(*, hierarchical_gdr, cross_source=False):
     return manager
 
 
-def test_hierarchical_gdr_schedules_host_ingress_on_source_ranks_only():
+def test_hierarchical_gdr_every_member_requests_its_own_shard():
     path = (
         ROOT
         / "batchgen"
@@ -438,20 +439,19 @@ def test_hierarchical_gdr_schedules_host_ingress_on_source_ranks_only():
             "_build_weight_copy_task",
         ).__get__(manager)()["routed_expert"]
 
-    # A source rank keeps exactly its contiguous 112-expert shard: the eight
-    # sources between them still cover all 896 experts of the layer.
-    source = routed(
-        _sp8_schedule_manager(hierarchical_gdr=True, cross_source=True)
-    )
-    assert len(source) == 112
-    assert source[0] == "routed_expert_0_336"
-    assert source[-1] == "routed_expert_0_447"
-
-    # The 24 non-source ranks receive the shard over the cross-node broadcast
-    # and must request nothing from the host store.
-    assert routed(
-        _sp8_schedule_manager(hierarchical_gdr=True, cross_source=False)
-    ) == []
+    # S4: the engine-bound seam delivers cross records, and EVERY member -
+    # source or not - requests its own contiguous 112-expert shard from its
+    # node's host store (the producer stages it; receivers land the
+    # broadcast through the same record state machine).
+    for cross_source in (True, False):
+        shard = routed(
+            _sp8_schedule_manager(
+                hierarchical_gdr=True, cross_source=cross_source
+            )
+        )
+        assert len(shard) == 112
+        assert shard[0] == "routed_expert_0_336"
+        assert shard[-1] == "routed_expert_0_447"
 
 
 def test_hierarchical_gdr_builds_the_exact_cross_node_group_and_root_map():
@@ -1052,8 +1052,21 @@ def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
     # The routed-expert ring is bounded by the base planner's depth-8 slot
     # budget. Sizing it to a whole 112-expert TP8 shard here would reserve ~12
     # GiB of ring per rank for an ingress that now releases each bounded batch
-    # as soon as its copies land.
-    assert "num_prefill_module_buffer" not in source
+    # as soon as its copies land. The one exception is the engine-bound
+    # cross-node seam, whose frame is the whole shard: it sizes the ring to
+    # two frames, and only under that gate.
+    tree = ast.parse(source)
+    sizing = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and "num_prefill_module_buffer" in ast.unparse(node.targets[0])
+    ]
+    assert len(sizing) == 1
+    guard = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and sizing[0] in ast.walk(node)
+    )
+    assert "hierarchical_gdr" in ast.unparse(guard.test)
 
 
 def test_streamed_sp8_sharded_carry_preserves_shared_all_reduce():
@@ -1515,7 +1528,13 @@ def _mock_sp8_buffer(
 
     buffer = type("Buffer", (), {})()
     buffer.device = "cuda:0"
-    buffer.cross_group = cross_group
+    # S4: the replica seam is the only cross-node transport. A test that
+    # used to pass a layer communicator now gets a bound seam broadcaster;
+    # the fake acquire below still logs the cross launch itself.
+    buffer.seam_broadcaster = (
+        SimpleNamespace(enqueue=lambda layer_idx: None)
+        if cross_group is not None else None
+    )
     buffer._pending = None
     buffer._next_layer = {3: 4}
     buffer._prefetch_stream = prefetch_stream
@@ -1560,7 +1579,7 @@ def test_streamed_sp8_transport_only_pass_drives_bytes_without_model_math():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     trace = []
     buffer = SimpleNamespace(
-        cross_group="cross4",
+        seam_broadcaster=SimpleNamespace(enqueue=lambda layer_idx: None),
         _pending=None,
         layer_indices=(1, 3, 7),
         _load_layer_bytes=lambda layer: trace.append(("bytes", layer)),
@@ -1584,16 +1603,18 @@ def test_streamed_sp8_transport_only_pass_drives_bytes_without_model_math():
     ]
 
 
-def test_streamed_sp8_transport_only_pass_rejects_host_rdma():
+def test_streamed_sp8_transport_only_pass_requires_a_bound_seam():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    buffer = SimpleNamespace(cross_group=None, _pending=None, layer_indices=())
+    buffer = SimpleNamespace(
+        seam_broadcaster=None, _pending=None, layer_indices=()
+    )
     participate = _isolated_method(
         path,
         "StreamedSP8LayerBuffer",
         "participate_empty_prefill_pass",
     ).__get__(buffer)
 
-    with pytest.raises(RuntimeError, match="requires hierarchical GDR"):
+    with pytest.raises(RuntimeError, match="replica seam"):
         participate()
 
 
@@ -2504,9 +2525,6 @@ def test_streamed_sp8_profile_does_not_synchronize_each_layer():
         "_acquire_local_shard": _function(
             path, "StreamedSP8LayerBuffer", "_acquire_local_shard"
         ),
-        "_broadcast_local_shard": _function(
-            path, "StreamedSP8LayerBuffer", "_broadcast_local_shard"
-        ),
         "_profile_mark": next(
             node
             for node in ast.parse(path.read_text()).body
@@ -2608,23 +2626,12 @@ def test_streamed_sp8_e0_records_are_gated_on_the_profile_flag():
         any("profile" in test for test in stack) for stack in publish
     ), publish
 
-    broadcast = _function(
-        path, "StreamedSP8LayerBuffer", "_broadcast_local_shard"
-    )
-    broadcast_guards = _name_call_guards(broadcast, "_profile_mark")
-    assert len(broadcast_guards) == 2
-    assert all(
-        any("enabled" in test for test in stack)
-        for stack in broadcast_guards
-    ), broadcast_guards
-
     acquire = ast.unparse(
         _function(path, "StreamedSP8LayerBuffer", "_acquire_local_shard")
     )
     assert "enabled = profile._prefill_profile_enabled" in acquire
     assert "profile_host.acquisition_start_s = time.perf_counter()" in acquire
     assert "profile_host.acquisition_end_s = time.perf_counter()" in acquire
-    assert "if enabled and source_error is None:" in acquire
     assert "profile_host.broadcast_enqueue_s = time.perf_counter()" in acquire
 
     allow = ast.unparse(
@@ -3042,9 +3049,7 @@ class _FakeStreamContext:
 def _sp8_ingress_buffer(
     trace,
     *,
-    cross_group,
-    cross_root,
-    cross_source,
+    seam,
     experts_per_rank=2,
     acquire_batch_size=2,
 ):
@@ -3091,16 +3096,19 @@ def _sp8_ingress_buffer(
     buffer.compute = {
         name: _FakeShardTensor(name, trace) for name in SIX_TENSORS
     }
-    buffer._cross_status = _FakeShardTensor("source_status", trace)
     buffer.tp_group = "tp8"
     buffer.expert_start = 336
     buffer.experts_per_rank = experts_per_rank
     buffer.acquire_batch_size = acquire_batch_size
-    buffer.cross_group = cross_group
-    buffer.cross_root = cross_root
-    buffer.cross_source = cross_source
-    buffer._status_stream = _FakeIngressStream(trace)
-    buffer._acquires_from_host = cross_group is None or cross_source
+    # S4: the replica seam is the only cross-node transport; every member
+    # acquires its own shard from its node's host store.
+    buffer.seam_broadcaster = (
+        SimpleNamespace(
+            enqueue=lambda layer_idx: trace.append(("seam_enqueue", layer_idx))
+        )
+        if seam else None
+    )
+    buffer._acquires_from_host = True
     buffer._allocate = lambda: None
     buffer._local_free = SimpleNamespace(
         record=lambda stream: trace.append(("local_free",))
@@ -3113,8 +3121,6 @@ def _sp8_ingress_buffer(
     )
     for name in (
         "_acquire_local_shard",
-        "_broadcast_source_status",
-        "_broadcast_local_shard",
         "_assemble_compute_shard",
     ):
         setattr(
@@ -3132,16 +3138,16 @@ def _op_span(trace, op):
     return positions[0], positions[-1]
 
 
-def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
+def test_hierarchical_gdr_seam_enqueue_gates_the_host_ingress():
     trace = []
     stream = _FakeIngressStream(trace)
-    # Four experts over a depth-2 ring: the source must complete the shard in
-    # two bounded batches, so the ring is NOT required to hold it whole.
+    # Four experts over a depth-2 ring: the member completes its shard in two
+    # bounded batches; under the seam the frame collective is enqueued at the
+    # layer gate BEFORE the ring is consumed, and the layer itself issues no
+    # dist collective at all.
     buffer, profile = _sp8_ingress_buffer(
         trace,
-        cross_group="cross3",
-        cross_root=11,
-        cross_source=True,
+        seam=True,
         experts_per_rank=4,
         acquire_batch_size=2,
     )
@@ -3155,125 +3161,44 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     buffer._assemble_compute_shard(stream=stream)
 
     ops = [entry[0] for entry in trace]
-    assert ops.count("get_weights") == 4
-    assert ops.count("broadcast") == 7
-    # Six same-rank local->compute copies, and no weight collective at all.
-    assert ops.count("assemble") == 6
+    # Gate -> seam enqueue -> handoff, all before the host ingress batches.
+    assert ops.count("seam_enqueue") == 1
+    assert "broadcast" not in ops
     assert "all_gather" not in ops
-    assert [(entry[1], entry[2]) for entry in trace if entry[0] == "assemble"] == [
-        (name, name) for name in SIX_TENSORS
-    ]
-    # Host ingress -> cross-node replication -> same-rank assembly. The copy
-    # reads self.local, so it must follow every broadcast into it.
-    assert _op_span(trace, "get_weights")[1] < _op_span(trace, "broadcast")[0]
-    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "assemble")[0]
-    # The host shard is pulled BEFORE the gate is consulted, so ingress starts
-    # early; the status broadcast and all six payload broadcasts are issued
-    # only after the model thread released it.
-    assert _op_span(trace, "get_weights")[1] < _op_span(trace, "cross_gate")[0]
-    assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "broadcast")[0]
-    assert _op_span(trace, "broadcast")[1] < _op_span(
-        trace, "cross_launch_handoff"
-    )[0]
-
-    # Each bounded batch is synchronized and released on its own, and the first
-    # batch's slots are freed BEFORE the second batch acquires -- that is what
-    # lets a depth-2 ring carry a four-expert shard.
+    assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "seam_enqueue")[0]
+    assert (
+        _op_span(trace, "seam_enqueue")[1]
+        < _op_span(trace, "cross_launch_handoff")[0]
+    )
+    assert (
+        _op_span(trace, "cross_launch_handoff")[1]
+        < _op_span(trace, "get_weights")[0]
+    )
+    # Each bounded batch is synchronized and released on its own, and ingress
+    # precedes the same-rank assembly that reads self.local.
+    assert ops.count("get_weights") == 4
     assert ops.count("synchronize") == 2
     assert ops.count("free_weights") == 4
-    assert trace[:10] == [
-        ("get_weights", "routed_expert_7_336"),
-        ("get_weights", "routed_expert_7_337"),
-        ("synchronize",),
-        ("free_weights", "routed_expert_7_336"),
-        ("free_weights", "routed_expert_7_337"),
-        ("get_weights", "routed_expert_7_338"),
-        ("get_weights", "routed_expert_7_339"),
-        ("synchronize",),
-        ("free_weights", "routed_expert_7_338"),
-        ("free_weights", "routed_expert_7_339"),
-    ]
-    # Every lease is released before the cross-node phase begins, so no slot is
-    # held across the gate, the status broadcast or the payload broadcasts.
-    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
-    # Releases are not deferred behind an H2D completion event any more: the
-    # per-batch stream synchronize is the whole ordering.
-    assert "h2d_record" not in ops
-    assert "h2d_synchronize" not in ops
-
-    broadcasts = [
-        entry for entry in trace
-        if entry[0] == "broadcast" and entry[1] != "source_status"
-    ]
-    assert [entry[1] for entry in broadcasts] == list(SIX_TENSORS)
-    assert {(entry[2], entry[3]) for entry in broadcasts} == {(11, "cross3")}
-    assert profile._prefill_profile_cross_broadcast_calls == 6
-    assert profile._prefill_profile_cross_broadcast_bytes == 6 * 1024
-    assert profile._prefill_profile_cross_source is True
-    assert profile._prefill_profile_cross_status_calls == 1
-    assert profile._prefill_profile_cross_status_failures == 0
-
-    # E0: exactly one complete broadcast pair, and it BRACKETS the six payload
-    # broadcasts -- the status broadcast and the assembly stay outside it.
-    assert len(profile._prefill_profile_broadcast_spans) == 1
-    opened, closed = profile._prefill_profile_broadcast_spans[0]
-    payload = [
-        index
-        for index, entry in enumerate(trace)
-        if entry[0] == "broadcast" and entry[1] != "source_status"
-    ]
-    assert opened.order < payload[0]
-    assert payload[-1] < closed.order
-    assert closed.order < _op_span(trace, "assemble")[0]
-    # The synchronous ingress records acquisition and enqueue timestamps; it
-    # has no async gate or model-thread ordering wait.
+    assert ops.count("assemble") == 6
+    assert _op_span(trace, "get_weights")[1] < _op_span(trace, "assemble")[0]
+    assert trace[-6:] == [("assemble", name, name) for name in SIX_TENSORS] or [
+        (entry[1], entry[2]) for entry in trace if entry[0] == "assemble"
+    ] == [(name, name) for name in SIX_TENSORS]
+    # The layer writes no broadcast profile state any more; the host pull and
+    # the enqueue stamp are still recorded.
+    assert profile._prefill_profile_cross_broadcast_calls == 0
+    assert profile._prefill_profile_broadcast_spans == []
     assert len(profile._prefill_profile_host_records) == 1
     host = profile._prefill_profile_host_records[0]
     assert host.acquisition_end_s >= host.acquisition_start_s
     assert host.broadcast_enqueue_s is not None
     assert host.gate_open_s is None
-    assert host.order_wait_begin_s is None
-    assert host.order_wait_end_s is None
-
-
-def test_hierarchical_gdr_non_source_rank_receives_without_host_ingress():
-    trace = []
-    stream = _FakeIngressStream(trace)
-    buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group="cross3", cross_root=11, cross_source=False
-    )
-
-    buffer._acquire_local_shard(7, stream=stream)
-    buffer._assemble_compute_shard(stream=stream)
-
-    ops = [entry[0] for entry in trace]
-    # 24 of the 32 ranks touch the host store for no expert at all, but they
-    # still enter every cross-node broadcast and still assemble their shard.
-    assert "get_weights" not in ops
-    assert ops.count("broadcast") == 7
-    assert ops.count("assemble") == 6
-    assert "all_gather" not in ops
-    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "assemble")[0]
-    assert profile._prefill_profile_cross_broadcast_calls == 6
-    assert profile._prefill_profile_cross_source is False
-    assert profile._prefill_profile_cross_status_calls == 1
-    assert profile._prefill_profile_cross_status_failures == 0
-    # A synchronous non-source rank pulls nothing from host but still records
-    # that its cross-node payloads were enqueued.
-    assert len(profile._prefill_profile_broadcast_spans) == 1
-    assert len(profile._prefill_profile_host_records) == 1
-    host = profile._prefill_profile_host_records[0]
-    assert host.acquisition_start_s is None
-    assert host.acquisition_end_s is None
-    assert host.broadcast_enqueue_s is not None
 
 
 def test_host_rdma_transport_runs_no_cross_node_collective():
     trace = []
     stream = _FakeIngressStream(trace)
-    buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group=None, cross_root=None, cross_source=False
-    )
+    buffer, profile = _sp8_ingress_buffer(trace, seam=False)
 
     buffer._acquire_local_shard(7, stream=stream)
     buffer._assemble_compute_shard(stream=stream)
@@ -3281,6 +3206,7 @@ def test_host_rdma_transport_runs_no_cross_node_collective():
     ops = [entry[0] for entry in trace]
     assert ops.count("get_weights") == 2
     assert "broadcast" not in ops
+    assert "seam_enqueue" not in ops
     assert ops.count("assemble") == 6
     assert "all_gather" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0
@@ -3288,8 +3214,8 @@ def test_host_rdma_transport_runs_no_cross_node_collective():
     assert profile._prefill_profile_cross_source is False
     assert profile._prefill_profile_cross_status_calls == 0
     assert profile._prefill_profile_cross_status_failures == 0
-    # No cross-node communicator exists, so neither the broadcast pair nor the
-    # ordering handoff has anything to time -- but the host pull still does.
+    # No seam is bound, so there is nothing cross-node to time -- but the
+    # host pull still records its sample.
     assert "profile_mark" not in ops
     assert profile._prefill_profile_broadcast_spans == []
     assert len(profile._prefill_profile_host_records) == 1
@@ -3302,66 +3228,27 @@ def test_streamed_sp8_synchronous_first_layer_still_times_the_handoff():
     trace = []
     stream = _FakeIngressStream(trace)
     # ``load`` acquires the first layer inline, with no gate to wait on.
-    buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group="cross3", cross_root=11, cross_source=True
-    )
+    buffer, profile = _sp8_ingress_buffer(trace, seam=True)
 
     buffer._acquire_local_shard(7, stream=stream)
 
+    assert [entry[0] for entry in trace].count("seam_enqueue") == 1
     assert len(profile._prefill_profile_host_records) == 1
     host = profile._prefill_profile_host_records[0]
     assert host.acquisition_end_s >= host.acquisition_start_s
     assert host.broadcast_enqueue_s is not None
     assert host.gate_open_s is None
-    assert len(profile._prefill_profile_broadcast_spans) == 1
-    opened, closed = profile._prefill_profile_broadcast_spans[0]
-    assert opened.order < closed.order
-
-
-def test_hierarchical_gdr_source_failure_announces_status_before_raising():
-    trace = []
-    stream = _FakeIngressStream(trace)
-    buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group="cross3", cross_root=11, cross_source=True
-    )
-
-    def fail_source(name):
-        raise RuntimeError("source load failed")
-
-    buffer.core_engine.get_weights = fail_source
-    with pytest.raises(RuntimeError, match="source load failed"):
-        buffer._acquire_local_shard(
-            7,
-            stream=stream,
-            cross_launch_gate=lambda: trace.append(("cross_gate",)) or True,
-        )
-
-    broadcasts = [entry for entry in trace if entry[0] == "broadcast"]
-    assert broadcasts == [("broadcast", "source_status", 11, "cross3")]
-    assert "assemble" not in [entry[0] for entry in trace]
-    # Even the failure announcement is a cross-node collective, so it stays
-    # behind the gate; announcing it early would reorder this rank's
-    # communicator launches against its peers'.
-    assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "broadcast")[0]
-    assert profile._prefill_profile_cross_broadcast_calls == 0
-    assert profile._prefill_profile_cross_status_calls == 1
-    assert profile._prefill_profile_cross_status_failures == 1
-    # A failed ingress publishes nothing: no half broadcast pair, no
-    # acquisition sample timing the failure, no ordering handoff.
+    # The layer issues no payload collective of its own under the seam.
     assert profile._prefill_profile_broadcast_spans == []
-    assert profile._prefill_profile_host_records == []
 
 
 def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     trace = []
     stream = _FakeIngressStream(trace)
-    buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group="cross3", cross_root=11, cross_source=True
-    )
+    buffer, profile = _sp8_ingress_buffer(trace, seam=True)
 
-    # Teardown cancels the gate. The peers are unwinding too, so this rank must
-    # issue neither the status broadcast nor any payload broadcast -- but it
-    # must still release the ring leases its host ingress took.
+    # Teardown cancels the gate. Under the seam the gate is consulted BEFORE
+    # anything else: no frame is enqueued, no ring slot is ever touched.
     buffer._acquire_local_shard(
         7,
         stream=stream,
@@ -3370,16 +3257,12 @@ def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     )
 
     ops = [entry[0] for entry in trace]
-    assert ops.count("get_weights") == 2
+    assert "seam_enqueue" not in ops
+    assert "get_weights" not in ops
     assert "broadcast" not in ops
     assert "cross_launch_handoff" not in ops
     assert "assemble" not in ops
-    # The leases were already released by their own bounded batch, so a
-    # cancelled gate returns early without stranding a single ring slot.
-    assert ops.count("free_weights") == 2
-    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
-    assert "h2d_record" not in ops
-    assert "h2d_synchronize" not in ops
+    assert "free_weights" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 0
     # A cancelled gate publishes no partial host or event record.
@@ -3388,43 +3271,20 @@ def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     assert profile._prefill_profile_host_records == []
 
 
-def test_hierarchical_gdr_status_read_is_stream_ordered_after_broadcast():
-    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    function = _function(
-        path, "StreamedSP8LayerBuffer", "_broadcast_source_status"
-    )
-    item_calls = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "item"
-    ]
-    stream_contexts = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.With)
-        and "torch.cuda.stream(stream)" in ast.unparse(node)
-    ]
-    assert len(item_calls) == 1
-    assert len(stream_contexts) == 1
-    assert item_calls[0] in set(ast.walk(stream_contexts[0]))
-
-
-def test_cross_node_broadcast_stays_inside_the_early_ingress_phase():
+def test_cross_node_seam_launch_stays_inside_the_early_ingress_phase():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     acquire = ast.unparse(
         _function(path, "StreamedSP8LayerBuffer", "_acquire_local_shard")
     )
-    # Phase one writes self.local only, so the broadcast inherits the existing
-    # WAR event and overlaps the current layer's compute.
-    assert "self._broadcast_local_shard(copy_stream)" in acquire
-    # Phase two is the parked assembly copy; carrying the broadcast there would
+    # Phase one owns the cross-node launch: the frame collective is enqueued
+    # through the seam at this layer's gate, inside early ingress.
+    assert "seam.enqueue(int(layer_idx))" in acquire
+    # Phase two is the parked assembly copy; carrying the launch there would
     # serialize the cross-node transfer behind the overwrite handshake.
     assemble = ast.unparse(
         _function(path, "StreamedSP8LayerBuffer", "_assemble_compute_shard")
     )
-    assert "_broadcast_local_shard" not in assemble
+    assert "seam" not in assemble
 
 
 def test_streamed_sp8_node_empty_check_happens_after_the_load():
@@ -3642,6 +3502,18 @@ def test_streamed_sp8_reinterprets_offline_marlin_as_int32():
     assert actual.numel() * actual.element_size() == packed.numel()
 
 
+def test_cross_completion_wakes_the_parked_producer():
+    source = (ROOT / "core" / "HtoD_Engine" / "HtoD_Engine.cu").read_text()
+    complete = source[
+        source.index("void HtoD_Engine::replica_cross_complete"):
+        source.index("void HtoD_Engine::replica_cross_frame_done")
+    ]
+    # The cross mailbox is drained only by the producer loop; a parked
+    # producer (end of pass) must be woken by the completion or the last
+    # frame's receiver slots stay FILLING forever.
+    assert "wake_producer()" in complete
+
+
 def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     path = ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
     source = path.read_text()
@@ -3653,7 +3525,7 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
         source.index("void GPU_Weight_Buffer::releaseBuffersAsync")
     ]
     table_release = table[
-        table.index("SlotRef release(const std::string& module_name)"):
+        table.index("std::pair<SlotRef, bool> release(const std::string& module_name)"):
         table.index("std::vector<SlotRef> release_async(")
     ]
     get_weights = source[

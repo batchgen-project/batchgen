@@ -703,8 +703,13 @@ class WeightSlotTable {
         return ref;
     }
 
-    // LEASED -> FREE, in the current pass.
-    SlotRef release(const std::string& module_name) {
+    // LEASED -> FREE, in the current pass. A slot with an armed reclaim
+    // gate (a HostShared record whose frame's cross broadcast may still be
+    // reading it) must NOT go straight to FREE: it becomes PENDING_RELEASE
+    // and the caller parks it for the gated drain (deferred == true). A
+    // synchronous FREE would let the producer refill the slot while the
+    // seam broadcast is still reading it.
+    std::pair<SlotRef, bool> release(const std::string& module_name) {
         const std::optional<int64_t> pass = this->current_pass();
         auto resident = this->index_.end();
         std::optional<WeightSlotState> state;
@@ -725,8 +730,13 @@ class WeightSlotTable {
         }
         const SlotRef ref = resident->second;
         this->index_.erase(resident);
-        this->slot_at(ref.module_type, ref.index) = Slot{};
-        return ref;
+        Slot& slot = this->slot_at(ref.module_type, ref.index);
+        if (slot.reclaim_gate) {
+            slot.state = WeightSlotState::kPendingRelease;
+            return {ref, true};
+        }
+        slot = Slot{};
+        return {ref, false};
     }
 
     // PRESENT -> PENDING_RELEASE for a produced record with no consumer
@@ -818,7 +828,7 @@ class WeightSlotTable {
     // gated slot.
     bool reclaim(
         const std::string& module_type, int64_t index,
-        const std::function<bool(const std::string&, int64_t)>&
+        const std::function<bool(const std::string&, int64_t, int64_t)>&
             all_peers_passed) {
         return this->reclaim_impl(module_type, index, &all_peers_passed);
     }
@@ -1215,7 +1225,7 @@ class WeightSlotTable {
     // gated slot is an error instead of a silent early reuse.
     bool reclaim_impl(
         const std::string& module_type, int64_t index,
-        const std::function<bool(const std::string&, int64_t)>*
+        const std::function<bool(const std::string&, int64_t, int64_t)>*
             all_peers_passed) {
         Slot& slot = this->slot_at(module_type, index);
         if (slot.state != WeightSlotState::kPendingRelease) {
@@ -1230,7 +1240,8 @@ class WeightSlotTable {
                     "]: all peers have not passed B(frame " +
                     std::to_string(slot.reclaim_frame) + ")");
             }
-            if (!(*all_peers_passed)(module_type, slot.reclaim_frame)) {
+            if (!(*all_peers_passed)(module_type, index,
+                                     slot.reclaim_frame)) {
                 return false;
             }
         }

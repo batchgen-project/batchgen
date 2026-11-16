@@ -74,6 +74,46 @@ int main() {
     CHECK(rank1[0].kind == WeightRecordKind::Replica);
     CHECK(rank1[1].kind == WeightRecordKind::HostShared);
 
+    const std::vector<int64_t> cross_group = {0, 4};
+    const std::vector<int64_t> intra_group = {0, 1, 2, 3};
+    const std::map<std::string, int64_t> intra_owners = {
+        {"local", 0}, {"remote", 1},
+    };
+    const auto cross_source = install_cross_record_kinds(
+        cross_group, 0, 0, intra_group, intra_owners);
+    CHECK(cross_source.size() == 2);
+    CHECK(cross_source[0].kind == WeightRecordKind::HostShared);
+    CHECK(cross_source[1].kind == WeightRecordKind::Replica);
+    const auto cross_member = install_cross_record_kinds(
+        cross_group, 4, 0, intra_group, intra_owners);
+    CHECK(cross_member[0].kind == WeightRecordKind::CrossReplica);
+    CHECK(cross_member[1].kind == WeightRecordKind::CrossReplica);
+
+    WeightFrameAccounting pending_cross(cross_member);
+    CHECK(pending_cross.may_post_barrier_a());
+    CHECK(!pending_cross.may_post_barrier_b());
+
+    CrossReplicaLandingLog landing_log;
+    landing_log.record_landing(41, 0);
+    WeightFrameAccounting registered_cross(cross_member);
+    landing_log.register_frame(41, registered_cross);
+    CHECK(!registered_cross.may_post_barrier_b());
+    registered_cross.mark_landed(1);
+    CHECK(registered_cross.may_post_barrier_b());
+
+    CrossReplicaLandingLog invalid_log;
+    WeightFrameAccounting source_accounting(cross_source);
+    invalid_log.register_frame(42, source_accounting);
+    expect_throw(__LINE__, [&] { invalid_log.record_landing(42, 0); },
+                 "CrossReplica");
+
+    CrossReplicaLandingLog double_log;
+    WeightFrameAccounting double_accounting(cross_member);
+    double_log.register_frame(43, double_accounting);
+    double_log.record_landing(43, 0);
+    expect_throw(__LINE__, [&] { double_log.record_landing(43, 0); },
+                 "already terminal");
+
     CHECK(flat_frame(2, 3, 4) == 7);
     const WeightFrameMap frames(4);
     CHECK(frames.at(2, 3).flat == 7);
