@@ -513,8 +513,13 @@ class KimiLinearParallelStrategyManager:
         shard in place; the decode graphs captured at startup are replayed."""
         self._require_built_model("decoding")
         start = time.perf_counter()
+        reactivation = self.decode_instance is not None
         stages = self._enter_decoding()
-        if self.decode_graphs_persist_across_suspend:
+        if self.decode_graphs_persist_across_suspend and reactivation:
+            # A RE-activation: this instance was published and kept across a
+            # SUSPEND, so the ladder captured at startup must still be here.
+            # The FIRST activation builds the instance and runs before the
+            # startup capture, so it legitimately has no ladder yet.
             graph = self._decode_graph
             if graph is None or not graph.ladder_captured:
                 raise RuntimeError(
