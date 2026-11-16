@@ -74,6 +74,7 @@ from .moe_ragged import (
     ragged_row_capacity as _glm5_ragged_row_capacity,
     reduce_weighted_scatter_bf16_ordered as _glm5_reduce_ordered,
     require_ragged_kernels as _glm5_require_ragged_kernels,
+    silu_mul_quant_ragged as _glm5_silu_mul_quant_ragged,
 )
 
 _GLM5_3D_MTP_ENV = "BATCHGEN_GLM5_3D_MTP"
@@ -170,6 +171,45 @@ def _glm5_prefill_grouped_gemm_backend() -> str:
     # The registry is the only allowlist: an unvalidated or uncovered backend
     # is refused with a named error, never read as a default.
     check_slot_backend("glm5", "prefill_grouped_gemm", mode)
+    return mode
+
+
+def _glm5_prefill_s1_act_quant_backend(gemm_backend: str) -> str:
+    """The activation + quant step between the grouped S1 and S3 GEMMs.
+
+    Default ``unfused`` keeps the measured chain: torch SiLU and mul over
+    the two S1 outputs, then the column-major CUDA ragged quant (whose
+    scales the GEMM wrapper transposes per call). ``fused`` is the A/B arm
+    (batchgen_debug key ``prefill_s1_act_quant``, batch-level): one ragged
+    Triton kernel does SiLU*up and the FP8 group quant in a single pass and
+    writes row-major scales, so the transpose shim is not paid. The default
+    moves only after a measured ABBA on this arm; until then the fused
+    kernel also runs un-prewarmed (its first launch JIT-compiles), which
+    the measuring leg must account for.
+
+    Only the two spellings are accepted — a mistyped value is refused
+    rather than read as the other arm, because a silently ignored switch
+    would make the two arms the same run. The fused arm exists only behind
+    the ``deepgemm`` grouped backend: the ``cute_ptrs`` arm fuses S1 itself
+    and feeds a column-major-scale S3 kernel, so the combination is refused
+    rather than half-applied.
+    """
+    value = _glm5_moe_debug_dict().get("prefill_s1_act_quant")
+    if value is None:
+        return "unfused"
+    if not isinstance(value, str):
+        raise ValueError("prefill_s1_act_quant must be a string")
+    mode = value.strip().lower()
+    if mode not in {"fused", "unfused"}:
+        raise ValueError(
+            "prefill_s1_act_quant must be 'fused' or 'unfused', got "
+            f"{value!r}"
+        )
+    if mode == "fused" and gemm_backend != "deepgemm":
+        raise ValueError(
+            "prefill_s1_act_quant='fused' requires the deepgemm grouped "
+            f"backend; the {gemm_backend!r} arm fuses S1 differently"
+        )
     return mode
 
 
@@ -1468,11 +1508,13 @@ class Glm5PrefillMoEBuffers:
         )
         # Second S1 output for the unfused backend (gate and up are separate
         # dense GEMMs there); allocated on first use so the incumbent arm
-        # never pays for it. The fp32 SFB stacks follow the same rule.
+        # never pays for it. The fp32 SFB stacks follow the same rule, and
+        # so does the fused act arm's row-major scale matrix.
         self.s1_partner = None
         self.sfb_gate = None
         self.sfb_up = None
         self.sfb_down = None
+        self.inter_scale_rows = None
 
         self.expert_counts = torch.zeros(
             self.num_experts, dtype=torch.int32, device=device
@@ -1554,6 +1596,24 @@ class Glm5PrefillMoEBuffers:
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+
+    def ensure_inter_scale_rows(self) -> torch.Tensor:
+        """Row-major fp32 [capacity, N/128] scales for the fused act arm.
+
+        Zero-FILLED once, like the column-major quant buffers: the fused
+        ragged kernel writes live rows only, and a zero scale on an
+        alignment hole is finite, which is all the GEMM's whole-M-tile TMA
+        loads need (the hazard the zero init guards against is a stale NaN,
+        never the value).
+        """
+        if self.inter_scale_rows is None:
+            self.inter_scale_rows = torch.zeros(
+                self.capacity,
+                self.intermediate_size // 128,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        return self.inter_scale_rows
 
     def ensure_deepgemm_scale_stacks(self, n_blocks: int, k_blocks: int):
         """Persistent fp32 SFB stacks for the m-grouped backend.
@@ -3121,6 +3181,7 @@ class Glm5MoE(nn.Module):
         output = torch.empty_like(hidden_flat)
 
         backend = _glm5_prefill_grouped_gemm_backend()
+        act_backend = _glm5_prefill_s1_act_quant_backend(backend)
         if backend == "deepgemm":
             from batchgen.moe.grouped_fp8_deepgemm_moe import (
                 build_grouped_layout,
@@ -3251,24 +3312,41 @@ class Glm5MoE(nn.Module):
                     output=buf.s1_partner[:m_chunk],
                     grouped_layout=grouped_layout,
                 )
-                torch.nn.functional.silu(
-                    buf.intermediate[:m_chunk], inplace=True
-                )
-                buf.intermediate[:m_chunk].mul_(buf.s1_partner[:m_chunk])
-                _glm5_act_quant_ragged(
-                    buf.intermediate,
-                    counts,
-                    cu_seqlens,
-                    buf.inter_fp8,
-                    buf.inter_scale,
-                    row_align=row_align,
-                )
+                if act_backend == "fused":
+                    # One pass: SiLU*up + FP8 group quant over the live
+                    # ragged rows, writing the row-major SFA the contiguous
+                    # API takes directly (no transpose shim on this arm).
+                    scale_rows = buf.ensure_inter_scale_rows()
+                    _glm5_silu_mul_quant_ragged(
+                        buf.intermediate[:m_chunk],
+                        buf.s1_partner[:m_chunk],
+                        buf.inter_fp8[:m_chunk].view(torch.float8_e4m3fn),
+                        scale_rows[:m_chunk],
+                        counts,
+                        cu_seqlens,
+                    )
+                    s3_scale, s3_rows_major = scale_rows, True
+                else:
+                    torch.nn.functional.silu(
+                        buf.intermediate[:m_chunk], inplace=True
+                    )
+                    buf.intermediate[:m_chunk].mul_(buf.s1_partner[:m_chunk])
+                    _glm5_act_quant_ragged(
+                        buf.intermediate,
+                        counts,
+                        cu_seqlens,
+                        buf.inter_fp8,
+                        buf.inter_scale,
+                        row_align=row_align,
+                    )
+                    s3_scale, s3_rows_major = buf.inter_scale, False
                 grouped_fp8_deepgemm_gemm(
                     buf.inter_fp8.view(torch.float8_e4m3fn),
-                    buf.inter_scale,
+                    s3_scale,
                     down_d, down_sfb,
                     output=buf.expert_out[:m_chunk],
                     grouped_layout=grouped_layout,
+                    x_scale_rows_major=s3_rows_major,
                 )
                 _glm5_reduce_ordered(
                     buf.expert_out,

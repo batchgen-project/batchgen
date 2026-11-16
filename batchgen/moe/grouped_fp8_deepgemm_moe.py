@@ -195,6 +195,7 @@ def grouped_fp8_deepgemm_gemm(
     *,
     output: Tensor,
     grouped_layout: Tensor,
+    x_scale_rows_major: bool = False,
 ) -> Tensor:
     """One m-grouped contiguous GEMM over a dense weight stack.
 
@@ -203,11 +204,29 @@ def grouped_fp8_deepgemm_gemm(
     exact-extent fp32 [G, N/128, K/128] scales. ``output`` is bf16 [m, N]
     and ``grouped_layout`` the int32 [m] row map from
     :func:`build_grouped_layout` in the same group order.
+
+    ``x_scale_rows_major`` says ``x_scale`` is already the fp32
+    [rows, K/128] row-major matrix this API takes as SFA (the fused ragged
+    act-quant writes that layout directly), so no transpose shim runs;
+    the default reads the engines' column-major [K/128, rows] buffers
+    through :func:`_scale_rows_first`.
     """
     symbol, _ = _get_deepgemm()
     rows = output.shape[0]
     if grouped_layout.shape[0] != rows:
         raise ValueError("grouped_layout rows must match the output rows")
-    sfa = _scale_rows_first(x_scale, rows)
+    if x_scale_rows_major:
+        if x_scale.ndim != 2 or x_scale.stride(-1) != 1:
+            raise ValueError(
+                "a rows-major activation scale must be 2-D with a "
+                f"contiguous last dim; got strides {tuple(x_scale.stride())}"
+            )
+        if x_scale.shape[0] < rows:
+            raise ValueError(
+                "rows-major activation scale has fewer rows than the batch"
+            )
+        sfa = x_scale[:rows]
+    else:
+        sfa = _scale_rows_first(x_scale, rows)
     symbol((x_fp8[:rows], sfa), (b, sfb), output, grouped_layout)
     return output
