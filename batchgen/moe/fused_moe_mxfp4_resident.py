@@ -64,6 +64,7 @@ the ntp layout contract.
 """
 
 import logging
+import math
 import time
 
 import torch
@@ -218,19 +219,39 @@ def compact_dispatch_route_stats_by_chunk(
     ).tolist()
 
 
+# ``batchgen.cuda_graph.vmm_arena.VmmArena.carve`` starts every view at a
+# multiple of this many bytes; sizing an arena rounds each row up to it.
+_CARVE_ALIGN_BYTES = 256
+
+# The three projections of one local expert, in carve and pointer-table order.
+_PROJECTIONS = ("w1", "w3", "w2")
+
+
+def _round_up(value, multiple):
+    return (int(value) + int(multiple) - 1) // int(multiple) * int(multiple)
+
+
 class MXFP4LayerShard:
     """One MoE layer's local expert shard, repacked into marlin tile order once.
 
     Holds the resident (marlin_qw int32, marlin_s uint8 E8M0) tensors for w1/w3/w2 of
     every local expert (kept alive so their ``data_ptr()`` stays valid) plus the
     six per-expert int64 pointer arrays the grouped marlin kernels consume.
+
+    ``arena`` is the fixed-address ``VmmArena`` the tensors are carved from, or
+    None for allocator-backed tensors. Carved tensors keep their addresses
+    across ``arena.unmap()`` / ``map()``, so the pointer tables and every graph
+    that baked them stay valid; their contents are undefined after a ``map()``
+    until ``refill_layer_shard`` runs, and reading them while the arena is
+    unmapped is an illegal access (``require_resident``).
     """
 
-    def __init__(self, num_local, N, K_latent, device):
+    def __init__(self, num_local, N, K_latent, device, arena=None):
         self.num_local = int(num_local)
         self.N = int(N)                  # moe_intermediate_size
         self.K_latent = int(K_latent)    # routed_expert_hidden_size (latent)
         self.device = device
+        self.arena = arena
         # resident weight tensors, indexed [local_expert] -> dict(proj -> (qw, s))
         self._tensors = []
         # pointer arrays, filled by build_layer_shard
@@ -252,6 +273,15 @@ class MXFP4LayerShard:
                 total += qw.numel() * qw.element_size()
                 total += s.numel() * s.element_size()
         return total
+
+    def require_resident(self, context):
+        """Refuse to touch the shard while its arena has no physical memory."""
+        if self.arena is not None and not self.arena.is_mapped:
+            raise RuntimeError(
+                f"{context}: the resident EP MXFP4 shard's arena is unmapped "
+                "(decode SUSPEND released its HBM); reading it is an illegal "
+                "access, so the decode activation must map and refill it first"
+            )
 
 
 def _stage_registration_boundary_packed(packed, scale):
@@ -287,31 +317,99 @@ def _stage_registration_boundary_packed(packed, scale):
     return packed.clone()
 
 
-def _repack_projection(packed, scale, device):
-    """Repack one MXFP4 projection ([n_out, k_in//pack] uint8 + [n_out, k_in//gs]
-    uint8 E8M0) into (marlin_qw int32, marlin_s uint8 E8M0). Shapes are inferred from
-    ``packed`` so the same helper serves w1/w3 (n_out=N, k_in=K) and w2
-    (n_out=K, k_in=N)."""
+def _k3_mxfp4_layout():
+    """``(_MARLIN_TILE, MXFP4_PACK_FACTOR, repack_mxfp4_to_marlin_device)``.
+
+    The K3 MXFP4 tile, pack factor and device repack belong to the model's
+    layout module. This is this file's ONE import site for them: the layer
+    boundary counts each import of a model module, and the resident shard
+    needs the same three in its layout, build and refill paths.
+    """
     from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+        _MARLIN_TILE,
         repack_mxfp4_to_marlin_device,
     )
     from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
         MXFP4_PACK_FACTOR,
     )
 
+    return _MARLIN_TILE, MXFP4_PACK_FACTOR, repack_mxfp4_to_marlin_device
+
+
+def _projection_layout(packed, scale):
+    """``((qw_shape, qw_dtype), (s_shape, s_dtype))`` of one projection's
+    resident marlin tensors, from its host source alone.
+
+    Stored marlin (int32 ``packed``) is resident as-is. The uint8 layout
+    repacks to ``repack_mxfp4_to_marlin_device``'s outputs: marlin_qw
+    ``[k_in // 16, n_out * 2]`` int32 and marlin_s ``[k_in // 32, n_out]``
+    uint8 E8M0 (one scale per 32-element group, ``scale.shape[1]`` groups).
+    Deterministic, so an arena can be sized before anything is copied.
+    """
+    _MARLIN_TILE, MXFP4_PACK_FACTOR, _ = _k3_mxfp4_layout()
+
+    if packed.dtype == torch.int32:
+        return (
+            (tuple(packed.shape), torch.int32),
+            (tuple(scale.shape), scale.dtype),
+        )
+    n_out = int(packed.shape[0])
+    k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
+    return (
+        ((k_in // _MARLIN_TILE, n_out * 2), torch.int32),
+        ((int(scale.shape[1]), n_out), torch.uint8),
+    )
+
+
+def _copy_into_row(row, src, what):
+    """Copy ``src`` into the resident ``row`` it was laid out for, or raise."""
+    if tuple(row.shape) != tuple(src.shape) or row.dtype != src.dtype:
+        raise RuntimeError(
+            f"resident MXFP4 {what}: source {tuple(src.shape)}/{src.dtype} "
+            f"does not match its resident row {tuple(row.shape)}/{row.dtype}"
+        )
+    row.copy_(src)
+
+
+def _repack_projection(packed, scale, qw_row, s_row):
+    """Write one MXFP4 projection ([n_out, k_in//pack] uint8 + [n_out, k_in//gs]
+    uint8 E8M0, or stored-marlin int32 + E8M0) into its resident rows
+    (marlin_qw int32, marlin_s uint8 E8M0). Shapes are inferred from ``packed``
+    so the same helper serves w1/w3 (n_out=N, k_in=K) and w2 (n_out=K, k_in=N).
+
+    The rows are preallocated (``_projection_layout``): the first build and
+    every refill write the same bytes to the same addresses."""
+    _, MXFP4_PACK_FACTOR, repack_mxfp4_to_marlin_device = _k3_mxfp4_layout()
+
     if packed.dtype == torch.int32:
         # Stored marlin (task #53 offline): packed IS marlin_qw int32; scale
         # IS the marlin-order uint8 E8M0 consumed directly by the K3 kernel.
         packed = _stage_registration_boundary_packed(packed, scale)
-        return packed.to(device), scale.to(device)
+        _copy_into_row(qw_row, packed, "marlin_qw")
+        _copy_into_row(s_row, scale, "marlin_s")
+        return
     n_out = int(packed.shape[0])
     k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
-    return repack_mxfp4_to_marlin_device(
+    device = qw_row.device
+    qw, s = repack_mxfp4_to_marlin_device(
         packed.to(device), scale.to(device), k_in, n_out, scale_bf16=False
     )
+    _copy_into_row(qw_row, qw, "marlin_qw")
+    _copy_into_row(s_row, s, "marlin_s")
 
 
-def build_layer_shard(expert_sources, device, kernel_version=None):
+def layer_shard_nbytes(expert_sources):
+    """Bytes one layer's resident rows take in an arena, carve alignment included."""
+    total = 0
+    for src in expert_sources:
+        for proj in _PROJECTIONS:
+            for shape, dtype in _projection_layout(*src[proj]):
+                nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+                total += _round_up(nbytes, _CARVE_ALIGN_BYTES)
+    return total
+
+
+def build_layer_shard(expert_sources, device, kernel_version=None, arena=None):
     """Repack one layer's local experts into a resident marlin shard, ONCE.
 
     Args:
@@ -325,6 +423,10 @@ def build_layer_shard(expert_sources, device, kernel_version=None):
         kernel_version: grouped MXFP4 kernel version (1 or 3) bound to the
             shard's ``s1_fn``/``s3_fn``; None selects 3 on sm_90 when every
             scale byte is within its range, else 1.
+        arena: a mapped fixed-address ``VmmArena`` to carve the resident rows
+            from (they then keep their addresses for the arena's lifetime and
+            are refilled in place by ``refill_layer_shard``), or None for
+            allocator-backed rows.
 
     Returns:
         MXFP4LayerShard with the six int64 pointer arrays and kernels set.
@@ -333,30 +435,39 @@ def build_layer_shard(expert_sources, device, kernel_version=None):
     if num_local == 0:
         raise ValueError("build_layer_shard: no local experts")
     # Infer N (=w1.n_out) and K_latent (=w1.k_in) from expert 0's gate projection.
-    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
-        MXFP4_PACK_FACTOR,
-    )
+    _MARLIN_TILE, MXFP4_PACK_FACTOR, _ = _k3_mxfp4_layout()
     w1_packed0 = expert_sources[0]["w1"][0]
     if w1_packed0.dtype == torch.int32:
         # Stored marlin: w1 marlin_qw is [K_latent // _MARLIN_TILE, N * 2].
-        from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
-            _MARLIN_TILE,
-        )
         K_latent = int(w1_packed0.shape[0]) * _MARLIN_TILE
         N = int(w1_packed0.shape[1]) // 2
     else:
         N = int(w1_packed0.shape[0])
         K_latent = int(w1_packed0.shape[1]) * MXFP4_PACK_FACTOR
 
-    shard = MXFP4LayerShard(num_local, N, K_latent, device)
+    if arena is not None:
+        carve = arena.carve
+    else:
+        def carve(shape, dtype):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+    shard = MXFP4LayerShard(num_local, N, K_latent, device, arena=arena)
     gate_B, gate_s, up_B, up_s, down_B, down_s = ([] for _ in range(6))
     for src in expert_sources:
-        w1_qw, w1_s = _repack_projection(src["w1"][0], src["w1"][1], device)  # gate
-        w3_qw, w3_s = _repack_projection(src["w3"][0], src["w3"][1], device)  # up
-        w2_qw, w2_s = _repack_projection(src["w2"][0], src["w2"][1], device)  # down
-        shard._tensors.append(
-            {"w1": (w1_qw, w1_s), "w3": (w3_qw, w3_s), "w2": (w2_qw, w2_s)}
-        )
+        rows = {}
+        for proj in _PROJECTIONS:  # w1 gate, w3 up, w2 down
+            packed, scale = src[proj]
+            (qw_shape, qw_dtype), (s_shape, s_dtype) = _projection_layout(
+                packed, scale
+            )
+            qw_row = carve(qw_shape, qw_dtype)
+            s_row = carve(s_shape, s_dtype)
+            _repack_projection(packed, scale, qw_row, s_row)
+            rows[proj] = (qw_row, s_row)
+        shard._tensors.append(rows)
+        w1_qw, w1_s = rows["w1"]
+        w3_qw, w3_s = rows["w3"]
+        w2_qw, w2_s = rows["w2"]
         gate_B.append(w1_qw.data_ptr()); gate_s.append(w1_s.data_ptr())
         up_B.append(w3_qw.data_ptr()); up_s.append(w3_s.data_ptr())
         down_B.append(w2_qw.data_ptr()); down_s.append(w2_s.data_ptr())
@@ -372,6 +483,29 @@ def build_layer_shard(expert_sources, device, kernel_version=None):
     shard.down_scales_ptrs = _ptrs(down_s)
     _bind_grouped_kernels(shard, kernel_version)
     return shard
+
+
+def refill_layer_shard(shard, expert_sources):
+    """Rewrite a built shard's resident rows in place from the host sources.
+
+    The decode activation of a kept instance runs this after ``arena.map()``:
+    the rows, the six pointer tables and the bound kernels are the first
+    build's, so every pointer a captured graph baked stays valid, and the
+    bytes written are the same bytes the build wrote (the same host tensors
+    through the same ``_repack_projection``, registration-boundary staging
+    included). The kernel binding is not redone: v3 eligibility was decided
+    from these exact scale bytes.
+    """
+    shard.require_resident("refill_layer_shard")
+    if len(expert_sources) != shard.num_local:
+        raise RuntimeError(
+            f"refill_layer_shard: {len(expert_sources)} expert sources for a "
+            f"shard of {shard.num_local} local experts"
+        )
+    for rows, src in zip(shard._tensors, expert_sources):
+        for proj in _PROJECTIONS:
+            qw_row, s_row = rows[proj]
+            _repack_projection(src[proj][0], src[proj][1], qw_row, s_row)
 
 
 def _bind_grouped_kernels(shard, kernel_version):
@@ -777,6 +911,9 @@ class ResidentEPMXFP4MoELayer:
             (T, H) routed expert-path output (down->experts->combine->norm->up),
             WITHOUT the shared expert (added by the caller).
         """
+        self.shard.require_resident(
+            f"resident-EP MXFP4 MoE forward (layer {self.layer_idx})"
+        )
         if self.world_size != 1:
             return self._forward_ep(x, gate, x_group=x_group)
         T, H = x.shape
@@ -986,52 +1123,122 @@ class ResidentEPMXFP4MoELayer:
         return y
 
 
+def _resident_moe_layers(model_layers):
+    """``(layer_idx, block_sparse_moe)`` of every layer with routed experts."""
+    for layer_idx, layer in enumerate(model_layers):
+        moe = getattr(layer, "block_sparse_moe", None)
+        if moe is None or moe.experts is None:
+            continue
+        yield layer_idx, moe
+
+
+def layer_expert_sources(get_tensor, layer_idx, expert_start, num_local):
+    """One layer's local expert sources from the host copy-engine store.
+
+    Keys ``routed_expert_{layer}_{expert}`` -> ``w{1,3,2}.weight_{packed,scale}``
+    (``k3/mxfp4_layout.routed_expert_tensor_names``). The store's tensors are
+    address-stable, so the same sources serve the build and every refill.
+    """
+    expert_sources = []
+    for i in range(num_local):
+        t = get_tensor(f"routed_expert_{layer_idx}_{expert_start + i}")
+        expert_sources.append({
+            "w1": (t["w1.weight_packed"], t["w1.weight_scale"]),
+            "w3": (t["w3.weight_packed"], t["w3.weight_scale"]),
+            "w2": (t["w2.weight_packed"], t["w2.weight_scale"]),
+        })
+    return expert_sources
+
+
+def resident_ep_mxfp4_arena_bytes(model_layers, get_tensor, expert_start,
+                                  num_local):
+    """Arena bytes every MoE layer's resident shard takes (carve alignment in)."""
+    return sum(
+        layer_shard_nbytes(
+            layer_expert_sources(get_tensor, layer_idx, expert_start, num_local)
+        )
+        for layer_idx, _ in _resident_moe_layers(model_layers)
+    )
+
+
 def build_resident_ep_mxfp4_layers(model_layers, get_tensor, comm, world_size,
-                                   rank, expert_start, num_local, device):
-    """Materialize MXFP4 marlin shards for every MoE layer and attach a
+                                   rank, expert_start, num_local, device, *,
+                                   shards, arena=None):
+    """Make every MoE layer's resident MXFP4 marlin shard live and attach a
     ``ResidentEPMXFP4MoELayer`` to each ``block_sparse_moe`` as
     ``_resident_ep_moe`` (consumed by ``moe_forward_serving``'s decode dispatch).
 
-    Source is ``core_engine.get_tensor`` (the host copy-engine store), keys
-    ``routed_expert_{layer}_{expert}`` -> ``w{1,3,2}.weight_{packed,scale}``
-    (``k3/mxfp4_layout.routed_expert_tensor_names``). Returns total resident
-    bytes.
+    ``shards`` is the caller's ``{layer_idx: MXFP4LayerShard}`` record. A layer
+    missing from it is built (rows carved from ``arena`` when given) and
+    recorded; a recorded layer is refilled in place (``refill_layer_shard``),
+    so its rows, pointer tables and every graph that baked them keep their
+    addresses. A block that already carries a resident layer (a kept decode
+    instance) must carry the recorded shard; a block without one (a rebuilt
+    model) gets a new resident layer over it.
+
+    Source is ``core_engine.get_tensor`` (the host copy-engine store, see
+    ``layer_expert_sources``). Returns total resident bytes.
 
     NOTE (M3.1a): the pytest gate builds the layer directly from the block's
     experts at world=1; this server-side build path is NOT exercised by that
     gate and is verified by the main loop's server run.
     """
     start_t = time.perf_counter()
+    moe_layers = list(_resident_moe_layers(model_layers))
+    unrecorded = [layer_idx for layer_idx, _ in moe_layers if layer_idx not in shards]
+    if unrecorded and len(unrecorded) != len(moe_layers):
+        raise RuntimeError(
+            f"resident EP shard record covers {len(moe_layers) - len(unrecorded)} "
+            f"of {len(moe_layers)} MoE layers (missing {unrecorded[:8]}); a "
+            "record is built whole once and only ever refilled"
+        )
     total_bytes = 0
     num_layers = 0
-    for layer_idx, layer in enumerate(model_layers):
-        moe = getattr(layer, "block_sparse_moe", None)
-        if moe is None or moe.experts is None:
-            continue
-        expert_sources = []
-        for i in range(num_local):
-            t = get_tensor(f"routed_expert_{layer_idx}_{expert_start + i}")
-            expert_sources.append({
-                "w1": (t["w1.weight_packed"], t["w1.weight_scale"]),
-                "w3": (t["w3.weight_packed"], t["w3.weight_scale"]),
-                "w2": (t["w2.weight_packed"], t["w2.weight_scale"]),
-            })
-        shard = build_layer_shard(expert_sources, device)
-        moe._resident_ep_moe = ResidentEPMXFP4MoELayer(
-            layer_idx, shard,
-            moe.routed_expert_down_proj,
-            moe.routed_expert_norm if getattr(moe, "latent_moe_use_norm", False)
-            else None,
-            moe.routed_expert_up_proj,
-            comm=comm, world_size=world_size, rank=rank,
-            expert_start=expert_start,
+    built = 0
+    seen = set()
+    for layer_idx, moe in moe_layers:
+        seen.add(layer_idx)
+        expert_sources = layer_expert_sources(
+            get_tensor, layer_idx, expert_start, num_local
         )
+        shard = shards.get(layer_idx)
+        if shard is None:
+            shard = build_layer_shard(expert_sources, device, arena=arena)
+            shards[layer_idx] = shard
+            built += 1
+        else:
+            refill_layer_shard(shard, expert_sources)
+        resident = getattr(moe, "_resident_ep_moe", None)
+        if resident is None:
+            moe._resident_ep_moe = ResidentEPMXFP4MoELayer(
+                layer_idx, shard,
+                moe.routed_expert_down_proj,
+                moe.routed_expert_norm
+                if getattr(moe, "latent_moe_use_norm", False)
+                else None,
+                moe.routed_expert_up_proj,
+                comm=comm, world_size=world_size, rank=rank,
+                expert_start=expert_start,
+            )
+        elif resident.shard is not shard:
+            raise RuntimeError(
+                f"layer {layer_idx}: the attached resident EP layer holds a "
+                "shard other than the recorded one; its rows are not the rows "
+                "the decode graphs and pointer tables were built against"
+            )
         total_bytes += shard.nbytes()
         num_layers += 1
+    stale = sorted(set(shards) - seen)
+    if stale:
+        raise RuntimeError(
+            f"resident EP shard record holds layers {stale[:8]} the model has "
+            "no routed-expert block for; the record belongs to another model"
+        )
     logging.info(
-        f"Rank {rank}: resident EP MXFP4 marlin shards materialized — "
+        f"Rank {rank}: resident EP MXFP4 marlin shards "
+        f"{'materialized' if built else 'refilled in place'} — "
         f"{num_layers} MoE layers x {num_local} experts, "
         f"{total_bytes / (1024**3):.2f} GiB "
-        f"({time.perf_counter() - start_t:.1f}s, one-time repack)"
+        f"({time.perf_counter() - start_t:.1f}s)"
     )
     return total_bytes

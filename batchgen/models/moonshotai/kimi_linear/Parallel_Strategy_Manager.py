@@ -20,8 +20,11 @@ BF16-only design (simpler than K2.5):
     use pooled conv/recurrent state (KimiLinearKDAWrapper pools).
   - Decode CUDA graphs (decode_graph_mode="graph"|"compare", M5.2 Phase A):
     per-layer attention spans plus the K3 resident-MXFP4 MoE segments are
-    captured/replayed by KimiLinearDecodeGraph (cuda_graph_segments.py). A
-    startup prewarm captures the first admitted bucket before decode;
+    captured/replayed by KimiLinearDecodeGraph (cuda_graph_segments.py). The
+    adapter's first prewarm captures its whole bucket ladder; a kept decode
+    instance does that once per process, before readiness, and replays it
+    across every phase switch (the resident EP shard lives in a fixed-address
+    VmmArena that SUSPEND unmaps and activation refills in place);
     "eager" (default) installs the adapter but replays nothing, so
     batchgen_debug can switch modes on a live server; "off" installs nothing.
 
@@ -361,6 +364,8 @@ class KimiLinearParallelStrategyManager:
                 "stream_all_modules off."
             )
         self._comm = None
+        # True while the resident EP shard is mapped, filled and attached to
+        # the live model (what a decode forward or graph replay may read).
         self._resident_ep_built = False
         # The MoE blocks this manager attached a resident layer to. The shard
         # is manager-owned, so its release walks this record, never
@@ -368,6 +373,15 @@ class KimiLinearParallelStrategyManager:
         # model reference while the captured decode graph still keeps the
         # model, and the shard on it, alive.
         self._resident_ep_moes = []
+        # Process-lifetime home of the resident EP shard: one fixed-address
+        # VmmArena per rank, created and carved into per-(layer, local expert,
+        # projection) rows by the first build, plus the per-layer shard record
+        # (rows, pointer tables, bound kernels) over it. Decode SUSPEND unmaps
+        # the arena, so its HBM serves the streamed prefill; every later build
+        # maps it again and refills the same rows from the host store, so the
+        # pointer tables and every decode graph that baked them stay valid.
+        self._resident_ep_arena = None
+        self._resident_ep_shards = {}
         self._streamed_sp8_buffer = None
         self._prefill_moe_mode = (
             "streamed_sp8" if self._distributed_weight_sharded else "streamed"
@@ -415,9 +429,13 @@ class KimiLinearParallelStrategyManager:
         branch sits after the reuse branch: publishing ``decode_instance``
         there would release the resident shard every wave and rebuild it from
         the node store for the resident prefill. Those deployments decline
-        and keep the rebuild lifecycle. Remove the handoff decline once the
-        resident shard lives at fixed addresses and the handoff is integrated
-        into this protocol.
+        and keep the rebuild lifecycle: their decode instance, and with it its
+        decode graph adapter, is retired at every switch and rebuilt at the
+        next decode configure, which captures that adapter's ladder once.
+        The shard lives at fixed addresses on both lifecycles; what still
+        keeps the handoff out is that the resident prefill would have to run
+        inside the kept decode instance's phase protocol (prefill on a decode
+        instance whose shard is mapped across the switch), which is not wired.
         """
         if not self.reuse_phase_instances:
             return False
@@ -440,8 +458,32 @@ class KimiLinearParallelStrategyManager:
         """
         return bool(self._resident_ep_built and self._active_phase == "decode")
 
+    @property
+    def decode_graphs_persist_across_suspend(self):
+        """Whether the kept decode instance owns decode graphs that outlive SUSPEND.
+
+        True when this deployment keeps its decode instance across phase
+        switches (``_instances_are_reused``) and the planner selected a
+        captured decode graph mode. The graphs are this manager's
+        (``KimiLinearDecodeGraph``), captured once per process by the
+        worker's startup decode graph capture through
+        ``prewarm_decode_graphs`` before readiness, and replayed by every
+        later decode activation: SUSPEND keeps them, the resident EP shard
+        they bake lives at fixed addresses (``_resident_ep_arena``), and the
+        KV pool is remapped at its reserved addresses by the worker.
+        """
+        return bool(
+            self._instances_are_reused
+            and self._decode_graph_mode() in ("graph", "compare")
+        )
+
     def release_decode_routed_experts(self):
-        """Release the decode graph and then this rank's resident EP shard."""
+        """Return the resident EP shard's HBM; its addresses stay reserved.
+
+        Decode SUSPEND: the resident layers, their pointer tables and the
+        captured decode graphs are kept; only the arena's physical memory is
+        released (``_release_resident_ep_decode``).
+        """
         self._release_resident_ep_decode()
 
     def _publish_prefill_instance(self):
@@ -472,16 +514,26 @@ class KimiLinearParallelStrategyManager:
         return self._publish_prefill_instance()
 
     def activate_decoding(self):
-        """Switch the built model into decode: resident shard and decode graph."""
+        """Switch the kept model into decode: map and refill the resident
+        shard in place; the decode graphs captured at startup are replayed."""
         self._require_built_model("decoding")
         start = time.perf_counter()
         stages = self._enter_decoding()
+        if self.decode_graphs_persist_across_suspend:
+            graph = self._decode_graph
+            if graph is None or not graph.ladder_captured:
+                raise RuntimeError(
+                    f"Kimi-K3 rank {self.global_rank}: activate_decoding found "
+                    "the kept decode instance without its captured graph "
+                    "ladder; it is captured once per process before readiness "
+                    "and must survive every SUSPEND"
+                )
         self._log_phase_activation("decoding", start, stages)
         return self._publish_decode_instance()
 
     def _log_phase_activation(self, phase, start, stages):
-        # Every rank: the resident shard is rebuilt on each switch into decode,
-        # and a slow node is only visible in its own ranks' timings.
+        # Every rank: the resident shard is refilled on each switch into
+        # decode, and a slow node is only visible in its own ranks' timings.
         total = time.perf_counter() - start
         memory = ""
         if torch.cuda.is_available():
@@ -616,7 +668,11 @@ class KimiLinearParallelStrategyManager:
         )
 
     def release_decode_graph(self):
-        """Drop captured decode graphs; they bake GPU KV-pool addresses."""
+        """Drop captured decode graphs; they bake GPU KV-pool addresses.
+
+        Only at decode RETIRE and at a model rebuild: a kept decode instance
+        replays its graphs across every SUSPEND.
+        """
         if self._decode_graph is not None:
             self._decode_graph.release()
             self._decode_graph = None
@@ -926,9 +982,17 @@ class KimiLinearParallelStrategyManager:
             raise RuntimeError(
                 "Kimi-K3 model rebuild with the previous model's resident EP "
                 f"shard still attached to {len(self._resident_ep_moes)} MoE "
-                "blocks: the decode exit never released it, so the new build "
-                "would allocate beside the whole unreachable shard"
+                "blocks: the decode exit never retired it, so the new build "
+                "would attach beside layers of a model nobody serves"
             )
+        if self._resident_ep_arena is not None and self._resident_ep_arena.is_mapped:
+            raise RuntimeError(
+                "Kimi-K3 model rebuild with the resident EP arena still "
+                "mapped: the decode exit never released its HBM"
+            )
+        # The shard record and its arena are process-lifetime and survive
+        # the rebuild; the next build maps the arena and attaches new
+        # resident layers over the same rows.
         self._resident_ep_built = False
         self._streamed_sp8_buffer = None
         # The instance tuples hold the dead model; publishing them again is
@@ -976,14 +1040,17 @@ class KimiLinearParallelStrategyManager:
             return
 
     def _release_resident_ep_decode(self):
-        """Drop phase-inactive resident decode experts before streamed prefill.
+        """Return the phase-inactive resident shard's HBM before streamed prefill.
 
         A world16 K3 rank's resident MXFP4 EP shard occupies about 84 GiB. It
         is never read by streamed-SP8 prefill, whose experts arrive through
         the layer ring, so retaining both copies forces exact-64K prompts into
-        one-sequence model passes. Decode graphs bake the resident shard's
-        addresses and must be released first; configure_decoding rebuilds the
-        shard and reinstalls/captures graphs before the next decode forward.
+        one-sequence model passes. The shard lives in the fixed-address arena:
+        unmapping it returns the physical memory while the rows keep their
+        virtual addresses, so the resident layers, their pointer tables and
+        the decode graphs that baked them are all kept. The next decode build
+        (``_init_resident_ep_decode``) maps the arena and refills the rows.
+        Retiring the decode instance is ``_retire_resident_ep_decode``.
         """
         # Class-level, so it belongs to the PASS that allocated it and not to
         # any model instance: it must go back whether or not a shard is
@@ -999,31 +1066,61 @@ class KimiLinearParallelStrategyManager:
         if not self._resident_ep_built:
             return 0
 
-        self.release_decode_graph()
-
         released_bytes = 0
         released_layers = 0
         for moe in self._resident_ep_moes:
             resident = getattr(moe, "_resident_ep_moe", None)
             if resident is None:
                 continue
-            shard = getattr(resident, "shard", None)
-            if shard is not None and hasattr(shard, "nbytes"):
-                released_bytes += int(shard.nbytes())
-            moe._resident_ep_moe = None
+            released_bytes += self._resident_layer_nbytes(resident)
             released_layers += 1
 
-        self._resident_ep_moes = []
+        # The last decode step (eager or a graph replay) may still be reading
+        # the rows on the device; unmapping under it is an illegal access.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        start = time.perf_counter()
+        self._resident_ep_arena.unmap()
         self._resident_ep_built = False
-        torch.cuda.empty_cache()
         if self.rank == 0:
             logging.info(
                 "[K3_PREFILL_MOE] released resident decode shards: "
-                "%d layers, %.2f GiB",
+                "%d layers, %.2f GiB (arena unmapped in %.3fs; rows, pointer "
+                "tables and decode graphs kept)",
                 released_layers,
                 released_bytes / (1024 ** 3),
+                time.perf_counter() - start,
             )
         return released_bytes
+
+    @staticmethod
+    def _resident_layer_nbytes(resident):
+        """Resident weight bytes of one attached resident EP layer."""
+        shard = getattr(resident, "shard", None)
+        if shard is not None and hasattr(shard, "nbytes"):
+            return int(shard.nbytes())
+        total = 0
+        for name in ("w13", "w2"):
+            tensor = getattr(resident, name, None)
+            if tensor is not None:
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    def _retire_resident_ep_decode(self):
+        """Retire the decode instance's resident state (decode RETIRE).
+
+        Drops the decode graphs (they hold the model this instance served),
+        returns the shard's HBM if it is still mapped and detaches the
+        resident layers from the MoE blocks. The arena reservation and the
+        shard record outlive the instance: a rebuilt model attaches new
+        resident layers over the same rows (``_init_resident_ep_decode``).
+        A no-op when nothing is attached.
+        """
+        self.release_decode_graph()
+        self._release_resident_ep_decode()
+        for moe in self._resident_ep_moes:
+            moe._resident_ep_moe = None
+        self._resident_ep_moes = []
 
     def _set_streamed_sp8_prefill_enabled(self, enabled):
         self._set_prefill_memory_tiling(enabled, token_tile=8192)
@@ -1398,10 +1495,12 @@ class KimiLinearParallelStrategyManager:
     def _enter_decoding(self):
         """Switch the built model to decode.
 
-        Releases the streamed-SP8 prefill state, materializes the resident EP
-        shard when it is not built, and installs a fresh decode graph adapter
-        (the previous one was released with the shard whose addresses it
-        bakes). Returns stage timings in seconds.
+        Releases the streamed-SP8 prefill state, makes the resident EP shard
+        live when it is not (first build: carve the arena; every later build:
+        map it and refill the same rows), and installs the decode graph
+        adapter, or keeps the one a kept decode instance already owns (its
+        graphs bake the shard's fixed addresses). Returns stage timings in
+        seconds.
         """
         self._active_phase = "decode"
         self.loaded_model_config.phase = "decode"
@@ -1456,8 +1555,9 @@ class KimiLinearParallelStrategyManager:
         # pass-through to the wrapper path) but is present, so a batch-level
         # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
         # on a live server — the project's debug-flag policy (cf.
-        # glm5_moe_mode), instead of a cold restart per experiment. Buckets
-        # capture lazily, so eager mode costs no capture time or memory.
+        # glm5_moe_mode), instead of a cold restart per experiment. The
+        # ladder is captured by the first prewarm in a captured mode, so
+        # eager mode costs no capture time or memory.
         # "off" is the rollback escape that installs nothing at all.
         if self._decode_graph is not None:
             self._decode_graph.set_mode(mode)
@@ -1536,13 +1636,21 @@ class KimiLinearParallelStrategyManager:
         return True
 
     def prewarm_decode_graphs(self, gpu_manager=None, decode_buckets=None):
-        """Capture the first K3 decode bucket before measured decode starts.
+        """Capture the decode graph adapter's whole bucket ladder, once.
 
         GPU KV allocation is intentionally worker-owned and happens after this
         manager's ``configure_decoding`` call.  The worker therefore passes
         the initialized manager here so the graph's MLA capture can bind its
         stable page-table/K-cache addresses without duplicating KV lifecycle
         logic in the PSM.
+
+        The adapter captures its ladder at its first prewarm and only replays
+        afterwards (``KimiLinearDecodeGraph.prewarm_decode_graphs``). A kept
+        decode instance (``decode_graphs_persist_across_suspend``) reaches
+        that first prewarm through the worker's startup decode graph capture,
+        before readiness; every later decode configure only verifies the KV
+        storage the ladder baked. A rebuilt instance captures its own ladder
+        at its decode configure.
 
         ``decode_buckets`` is ignored: this manager's bucket ladder comes
         from the planner (``Basic_Config.decode_graph_buckets``), and the
@@ -1558,7 +1666,20 @@ class KimiLinearParallelStrategyManager:
             AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(
                 gpu_manager, "auxiliary", None
             )
-        return self._decode_graph.prewarm_decode_graphs()
+        captured = self._decode_graph.prewarm_decode_graphs()
+        if (
+            self.decode_graphs_persist_across_suspend
+            and not self._decode_graph.ladder_captured
+        ):
+            # The worker's startup capture relies on this call to have
+            # captured the kept instance's ladder before readiness; returning
+            # without it would move the capture after readiness silently.
+            raise RuntimeError(
+                f"Kimi-K3 rank {self.global_rank}: decode graph prewarm "
+                "captured no ladder for a kept decode instance whose graphs "
+                "persist across SUSPEND"
+            )
+        return captured
 
     @torch.inference_mode()
     def startup_decode_probe_step(self, padding_bsz: int) -> None:
@@ -2067,14 +2188,59 @@ class KimiLinearParallelStrategyManager:
             for name, value in saved_attention_state.items():
                 setattr(AttnWrapperBase, name, value)
 
+    def _make_resident_ep_arena(self, nbytes):
+        """Reserve one fixed-address virtual range for the resident EP shard.
+
+        Split out so the lifecycle can be exercised without a device: CUDA
+        VMM is the only production implementation.
+        """
+        from batchgen.cuda_graph.vmm_arena import VmmArena
+
+        # 512 MiB chunks keep the round-up waste under 0.5 GiB of HBM.
+        return VmmArena(
+            self.engine_config.Basic_Config.device_torch,
+            nbytes,
+            chunk_bytes=512 << 20,
+        )
+
+    def _resident_ep_arena_bytes(self, mxfp4):
+        """Bytes the whole resident EP shard takes in the arena."""
+        if mxfp4:
+            from batchgen.moe.fused_moe_mxfp4_resident import (
+                resident_ep_mxfp4_arena_bytes,
+            )
+
+            return resident_ep_mxfp4_arena_bytes(
+                self.model.model.layers,
+                self.core_engine.get_tensor,
+                self.local_expert_start,
+                self.experts_per_rank,
+            )
+        from batchgen.moe.fused_moe_bf16_resident import resident_ep_arena_bytes
+
+        return resident_ep_arena_bytes(
+            self.model.model.layers,
+            self.experts_per_rank,
+            self.loaded_model_config.moe_intermediate_size,
+        )
+
     def _init_resident_ep_decode(self):
-        """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
-        attach a ResidentEPMoELayer to every MoE block.
+        """Make the resident EP shard live on the model (idempotent) and attach
+        a resident layer to every MoE block.
+
+        The shard lives in a process-lifetime fixed-address arena. The first
+        build creates the arena, carves it into one row per (layer, local
+        expert, projection) and builds the pointer tables over those rows;
+        every later build (after a decode SUSPEND or RETIRE) maps the arena
+        again and refills the same rows in place, so the pointer tables and
+        every captured decode graph keep valid addresses. Blocks that still
+        carry their resident layer (a kept decode instance) keep it; a
+        rebuilt model gets new resident layers over the recorded rows.
 
         Source is the host copy-engine weight storage (core_engine.get_tensor,
-        the exact tensors the streamed path consumes) — after this one-time
-        H2D there is no per-step expert traffic in decode. HBM arithmetic for
-        the ~84 GiB/rank K3 world16 shards lives at the allocation site
+        the exact tensors the streamed path consumes) — after this H2D there
+        is no per-step expert traffic in decode. HBM arithmetic for the
+        ~84 GiB/rank K3 world16 shards lives at the allocation site
         (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
         """
         if self._resident_ep_built:
@@ -2089,7 +2255,23 @@ class KimiLinearParallelStrategyManager:
         device = self.engine_config.Basic_Config.device_torch
         from .k3.mxfp4_expert import is_mxfp4_quantized
 
-        if is_mxfp4_quantized(cfg):
+        mxfp4 = is_mxfp4_quantized(cfg)
+        if self._resident_ep_arena is None:
+            self._resident_ep_arena = self._make_resident_ep_arena(
+                self._resident_ep_arena_bytes(mxfp4)
+            )
+        elif self._resident_ep_arena.is_mapped:
+            raise RuntimeError(
+                f"Kimi-K3 rank {self.global_rank}: resident EP build found the "
+                "arena still mapped while the shard is marked released"
+            )
+        # The prefill phase's cached blocks go back to the driver first: the
+        # arena maps physical memory outside the caching allocator.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._resident_ep_arena.map()
+
+        if mxfp4:
             # K3 MXFP4 LatentMoE (M3.1a): repack-once marlin shards + a resident
             # layer that runs the latent dataflow (down/norm/up seam). The BF16
             # stacked shard cannot represent it (hidden-space, no latent seam).
@@ -2106,6 +2288,8 @@ class KimiLinearParallelStrategyManager:
                 self.local_expert_start,
                 self.experts_per_rank,
                 device,
+                shards=self._resident_ep_shards,
+                arena=self._resident_ep_arena,
             )
             if self._latent_projections_sharded():
                 for layer in self.model.model.layers:
@@ -2130,6 +2314,8 @@ class KimiLinearParallelStrategyManager:
                 self.experts_per_rank,
                 cfg.moe_intermediate_size,
                 device,
+                shards=self._resident_ep_shards,
+                arena=self._resident_ep_arena,
             )
         self._resident_ep_moes = [
             moe
@@ -3300,9 +3486,12 @@ class KimiLinearParallelStrategyManager:
     def phase_exit(self, key: PhaseKey, mode: ExitMode) -> None:
         """Leave ``key.phase`` in ``mode`` while retaining reusable state.
 
-        RETIRE mechanics remain worker-owned. On decode SUSPEND, only routed
-        experts are released; KDA state pools are manager-owned and survive so
-        the next activation keeps recurrent and convolution state intact.
+        RETIRE mechanics remain worker-owned. On decode SUSPEND only the
+        resident EP shard's physical memory is released (the arena is
+        unmapped); the resident layers, pointer tables and captured decode
+        graphs are kept for the next activation, which maps and refills the
+        shard in place. KDA state pools are manager-owned and survive so the
+        next activation keeps recurrent and convolution state intact.
         """
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
@@ -3313,16 +3502,18 @@ class KimiLinearParallelStrategyManager:
                 self.decode_instance = None
             # A retired instance owns nothing. The resident EP shard is
             # manager-owned and is built by whichever phase uses it: decode,
-            # and prefill too under the resident-EP prefill handoff. It stays
-            # mapped through any reference drop (the manager's record of
-            # resident blocks holds it, and a captured decode graph keeps the
-            # model alive), so release it here for either phase, even when the
-            # worker's end-of-interval deep free already dropped self.model.
-            # The release is a no-op when no shard is attached. Every profile
-            # with a positive resident_ep_prefill_token_cap declines instance
-            # reuse and exits here; a shard left mapped makes the next build
-            # fail its unreleased-shard check.
-            self.release_decode_routed_experts()
+            # and prefill too under the resident-EP prefill handoff. Its arena
+            # stays mapped through any reference drop (VMM memory is not
+            # returned by dropping refs, and a captured decode graph keeps the
+            # model alive), so retire it here for either phase, even when the
+            # worker's end-of-interval deep free already dropped self.model:
+            # drop the decode graphs, unmap the arena, detach the resident
+            # layers. The arena reservation and the shard record stay for the
+            # next build. A no-op when nothing is attached. Every profile with
+            # a positive resident_ep_prefill_token_cap declines instance reuse
+            # and exits here; a shard left attached makes the next build fail
+            # its unreleased-shard check.
+            self._retire_resident_ep_decode()
             self.model = None
             self.weight_copy_task = {}
             return
