@@ -125,6 +125,7 @@ too small for them: start the container with `--ipc=host` or a `--shm-size` such
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m batchgen.launch_http_server \
     --model openai/gpt-oss-120b \
+    --max-model-len -1 \
     --cache-dir /models/gpt-oss-120b/original \
     --converted-ckpt-dir /storage/gpt-oss-120b/converted_ckpt \
     --dist-init-addr "localhost:33001" \
@@ -138,6 +139,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m batchgen.launch_http_server \
     --storage-path /storage \
     --save-result
 ```
+
+`--max-model-len -1` fits the deployment maximum sequence length to the GPU
+KV cache the server measures at startup. Without it the deployment maximum
+is the model's full context length, and the server refuses to start when one
+sequence of that length does not fit every rank's GPU KV cache. Pass an
+explicit length instead to pin it; `GET /v1/models` publishes the resolved
+limit.
 
 For other GPU configurations, adjust `CUDA_VISIBLE_DEVICES` and `--world-size`:
 - 4 GPUs: `CUDA_VISIBLE_DEVICES=0,1,2,3` with `--world-size 4`
