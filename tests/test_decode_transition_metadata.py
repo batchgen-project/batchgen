@@ -5,7 +5,7 @@ import pytest
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.prefill import compute_prefill_host_reservation
-from tests.worker_method_source import delegated_method_source
+from tests.worker_method_source import delegated_method_source, worker_shaped_method_node
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,15 +56,7 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
 
 
 def test_worker_prefill_plan_delegates_page_rounding_to_shared_helper():
-    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
-    method = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
-        for node in node.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_prefill_host_reservation_plan"
-    )
+    method = worker_shaped_method_node("_prefill_host_reservation_plan")
     assert any(
         isinstance(call.func, ast.Name)
         and call.func.id == "compute_prefill_host_reservation"

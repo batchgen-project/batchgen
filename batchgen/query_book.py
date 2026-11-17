@@ -18,6 +18,10 @@ class QueryBookCapacityError(RuntimeError):
     """A QueryBook operation exceeded the configured fixed capacity."""
 
 
+class QueryBookPoolCapacityError(RuntimeError):
+    """A QueryBook pool request exceeded the rows/width actually allocated."""
+
+
 @dataclass(frozen=True)
 class QueryBookSlot:
     """Lengths for one stable sequence slot."""

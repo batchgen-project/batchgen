@@ -1,5 +1,6 @@
 """Interface-stability pins for the batch-planning modules: sequence,
-query_book, continuous_batching, batch_order, planner and migration.
+query_book, continuous_batching, prefill.batch_order, planner and
+worker.kv_migration_types (the former migration module).
 
 These signatures are load-bearing for downstream callers; changing one is
 deliberate -- update this pin in the same PR and say why in the PR
@@ -26,7 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 # Frozen by reading the defining sources' AST.
 PINS = {
-    "batchgen/batch_order.py": {
+    "batchgen/prefill/batch_order.py": {
         "batch_matches_expected_uuid_order": {
             "kind": "function",
             "params": ["local_indices", "expected_uuids", "uuid_to_local_map"],
@@ -145,7 +146,7 @@ PINS = {
             "returns": "None",
         },
     },
-    "batchgen/migration.py": {
+    "batchgen/worker/kv_migration_types.py": {
         "HostKVStats": {
             "kind": "class",
             "bases": [],

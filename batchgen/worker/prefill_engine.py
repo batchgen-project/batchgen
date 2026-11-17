@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
-from batchgen.batch_order import (
+from batchgen.prefill.batch_order import (
     build_prefill_sequence_spans,
     prefill_sequence_spans_to_cu_seqlens,
     prefill_sequence_spans_to_global_seq_ids,
