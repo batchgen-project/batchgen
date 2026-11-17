@@ -99,6 +99,9 @@ def _isolated_psm():
     psm.decode_instance = None
     psm._resident_ep_built = False
     psm._active_phase = None
+    # The production property reads engine config; the isolated class takes
+    # it as a plain attribute. Default False = per-phase models.
+    psm._instances_are_reused = False
     return psm, calls, results
 
 
@@ -250,3 +253,39 @@ def test_unsupported_phase_is_rejected(hook, arg):
     with pytest.raises(ValueError, match="unsupported phase 'verify'"):
         getattr(psm, hook)(key, arg)
     assert calls == []
+
+
+@pytest.mark.parametrize("retired", [PREFILL, DECODE], ids=["prefill", "decode"])
+def test_reused_retire_drops_both_instance_aliases(retired):
+    """With one reused model aliased by both instance references, retiring
+    either phase must clear BOTH, or the next phase_enter of the other phase
+    activates against the freed model. The resident shard is retired too."""
+    psm, calls, _ = _isolated_psm()
+    psm._instances_are_reused = True
+    psm._resident_ep_built = True
+    psm._active_phase = "decode"
+    shared = (object(), {})
+    psm.prefill_instance = shared
+    psm.decode_instance = shared
+    psm.model = shared[0]
+    psm.phase_exit(retired, ExitMode.RETIRE)
+    assert psm.prefill_instance is None
+    assert psm.decode_instance is None
+    assert psm.model is None
+    assert calls == [("_retire_resident_ep_decode", (), {})]
+
+
+def test_per_phase_retire_keeps_the_other_instance():
+    """Without reuse the phases hold separate models: retiring decode must
+    not drop a live prefill instance."""
+    psm, calls, _ = _isolated_psm()
+    psm._instances_are_reused = False
+    psm._resident_ep_built = True
+    psm._active_phase = "decode"
+    keep = (object(), {})
+    psm.prefill_instance = keep
+    psm.decode_instance = (object(), {})
+    psm.phase_exit(DECODE, ExitMode.RETIRE)
+    assert psm.prefill_instance is keep
+    assert psm.decode_instance is None
+    assert psm.model is None

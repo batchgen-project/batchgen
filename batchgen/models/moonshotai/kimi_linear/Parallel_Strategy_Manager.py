@@ -3591,6 +3591,14 @@ class KimiLinearParallelStrategyManager:
             # and exits here; a shard left attached makes the next build fail
             # its unreleased-shard check.
             self._retire_resident_ep_decode()
+            if self._instances_are_reused:
+                # The reused design holds ONE model aliased by both instance
+                # references. Retiring it must drop BOTH, or the next
+                # phase_enter of the other phase takes the activate path
+                # against the model the worker just deep-freed and fails in
+                # _require_built_model.
+                self.prefill_instance = None
+                self.decode_instance = None
             self.model = None
             self.weight_copy_task = {}
             return
