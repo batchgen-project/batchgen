@@ -329,6 +329,7 @@ class _FakeLayerForGraph:
 class _FakeDsaSegment:
     max_seqlen = 16
     index_topk = 8
+    consumes_fused_hidden_fp8 = False
     primary_blocked_k = torch.empty(1, 1, 1, 6)
     aux_blocked_k = torch.empty(1, 1, 1, 3)
 

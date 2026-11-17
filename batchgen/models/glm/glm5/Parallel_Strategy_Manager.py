@@ -1437,8 +1437,6 @@ class GLM5ParallelStrategyManager:
                 "_dsa_prev_topk_indices",
                 "glm5_decode_primary_slot_indices",
                 "glm5_decode_aux_slot_indices",
-                "glm5_dsa_graph_forward_state",
-                "glm5_dsa_flashmla_graph_metadata",
             )
         }
         saved_rank_token_counts = Glm5MoE._rank_token_counts
@@ -1463,8 +1461,6 @@ class GLM5ParallelStrategyManager:
             GLM5AttnWrapper._dsa_prev_topk_indices = None
             GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
             GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
-            GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-            GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
             # No rank padding in the probe: every rank's plan_bsz rows are
             # real, so dispatch masks nothing.
             Glm5MoE._rank_token_counts = None
