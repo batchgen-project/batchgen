@@ -74,11 +74,14 @@ def _model(*, attached):
     return SimpleNamespace(model=SimpleNamespace(layers=layers))
 
 
-def _psm(*, model=None, built=False, graph=None, buffer=None):
+def _psm(*, model=None, built=False, graph=None, buffer=None, mapped=False):
     psm = SimpleNamespace(
         model=model,
         _resident_ep_built=built,
         _resident_ep_moes=[],
+        # The process-lifetime arena record: a rebuild is only legal once
+        # the decode exit unmapped it.
+        _resident_ep_arena=SimpleNamespace(is_mapped=mapped),
         _streamed_sp8_buffer=buffer,
         _decode_graph=graph,
     )

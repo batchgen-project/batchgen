@@ -781,6 +781,20 @@ def _install_worker(trace, *, streamed_sp8=True, task=None):
         _weight_passes=SimpleNamespace(
             close=lambda: trace.append(("close_weight_passes",))
         ),
+        # Every install parks the cross-node transports before rebuilding.
+        _stop_cross_comm_thread=lambda: trace.append(("stop_cross_comm",)),
+        _uninstall_replica_transport=lambda: trace.append(
+            ("uninstall_replica_transport",)
+        ),
+        # The streamed path declares the cross-node plan; without a seam-aware
+        # parallel manager the plan stays None and no transport installs.
+        _install_cross_node_broadcast_plan=lambda: trace.append(
+            ("install_cross_node_broadcast_plan",)
+        ),
+        _cross_node_broadcast_plan=None,
+        _install_replica_transport=lambda: trace.append(
+            ("install_replica_transport",)
+        ),
         weight_copy_task=task if task is not None else {"routed_expert": ["a", "b"]},
         _streamed_sp8_h2d_installed=False,
         _streamed_sp8_weight_copy_fingerprint=None,
@@ -799,11 +813,14 @@ def test_streamed_sp8_ring_is_allocated_once_and_the_queue_reinstalled(monkeypat
     assert trace == [
         ("close_weight_passes",),
         ("stop_h2d_worker",),
+        ("stop_cross_comm",),
+        ("uninstall_replica_transport",),
         ("reset_prefill_buffer",),
         ("reset_weight_stream_profile", False),
         ("expert_profile", False),
         ("sp8_profile", False),
         ("set_weight_copy_queue", {"routed_expert": ["a", "b"]}),
+        ("install_cross_node_broadcast_plan",),
         ("start_h2d_worker",),
     ]
     assert worker._streamed_sp8_h2d_installed
@@ -819,10 +836,13 @@ def test_streamed_sp8_ring_is_allocated_once_and_the_queue_reinstalled(monkeypat
     assert trace == [
         ("close_weight_passes",),
         ("stop_h2d_worker",),
+        ("stop_cross_comm",),
+        ("uninstall_replica_transport",),
         ("reset_weight_stream_profile", False),
         ("expert_profile", False),
         ("sp8_profile", False),
         ("set_weight_copy_queue", {"routed_expert": ["a", "b"]}),
+        ("install_cross_node_broadcast_plan",),
         ("start_h2d_worker",),
     ]
     assert worker._streamed_sp8_weight_copy_fingerprint == fingerprint
@@ -872,9 +892,12 @@ def test_non_streamed_prefill_reallocates_the_ring_on_every_install(monkeypatch)
     assert [entry[0] for entry in trace] == [
         "close_weight_passes",
         "stop_h2d_worker",
+        "stop_cross_comm",
+        "uninstall_replica_transport",
         "reset_prefill_buffer",
         "reset_weight_stream_profile",
         "set_weight_copy_queue",
+        "install_replica_transport",
         "start_h2d_worker",
     ] * 2
     assert worker._streamed_sp8_h2d_installed is False
