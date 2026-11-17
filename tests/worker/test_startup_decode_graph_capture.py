@@ -258,6 +258,9 @@ def test_retained_instance_captures_inside_the_probe_before_the_prefill_switch()
     assert worker.events == [
         "comm", "decode_build", "pool_sized",
         ("sync_counts", "startup_graph_capture"), ("bind_metadata", ()),
+        # The decode JIT prewarm runs inside the startup capture, before
+        # the graphs bake the kernels they replay.
+        "jit_prewarm",
         "graph_setup", "pool_finalized",
         ("to_prefill", ExitMode.SUSPEND),
     ]
