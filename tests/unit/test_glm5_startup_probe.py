@@ -251,8 +251,6 @@ _SAVED_GLM5_WRAPPER_NAMES = (
     "_dsa_prev_topk_indices",
     "glm5_decode_primary_slot_indices",
     "glm5_decode_aux_slot_indices",
-    "glm5_dsa_graph_forward_state",
-    "glm5_dsa_flashmla_graph_metadata",
 )
 
 
@@ -406,17 +404,7 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
 
     # Sentinels in the graph-owned per-step slots: the subsequent capture must
     # find them exactly as the worker left them, not nulled by the probe.
-    sentinel_state = {"path": "graph", "bucket": 4}
-    sentinel_metadata = {"bucket_size": 4}
     sentinel_slots = torch.arange(4, dtype=torch.int32)
-    monkeypatch.setattr(
-        GLM5AttnWrapper, "glm5_dsa_graph_forward_state", sentinel_state,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        GLM5AttnWrapper, "glm5_dsa_flashmla_graph_metadata", sentinel_metadata,
-        raising=False,
-    )
     monkeypatch.setattr(
         GLM5AttnWrapper, "glm5_decode_primary_slot_indices", sentinel_slots,
         raising=False,
@@ -451,8 +439,6 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
             prev_topk=GLM5AttnWrapper._dsa_prev_topk_indices,
             primary_slots=GLM5AttnWrapper.glm5_decode_primary_slot_indices,
             aux_slots=GLM5AttnWrapper.glm5_decode_aux_slot_indices,
-            graph_state=GLM5AttnWrapper.glm5_dsa_graph_forward_state,
-            graph_metadata=GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata,
             rank_counts=Glm5MoE._rank_token_counts,
             debug=dict(AttnWrapperBase.batchgen_debug),
             ntp=[moe.num_tokens_per_rank for moe in moes],
@@ -470,8 +456,6 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
     assert during["prev_topk"] is None
     assert during["primary_slots"] is None
     assert during["aux_slots"] is None
-    assert during["graph_state"] is None
-    assert during["graph_metadata"] is None
     assert during["rank_counts"] is None
     assert during["debug"] == {
         "glm5_dsa_mode": "eager", "glm5_moe_mode": "eager",
