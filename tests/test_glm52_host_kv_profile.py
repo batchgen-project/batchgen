@@ -87,10 +87,12 @@ def test_only_glm52_aux_is_page_split_fp8(monkeypatch):
         for name, profile in config._PROFILE_REGISTRY.items()
         if profile.page_format == config.PAGE_FORMAT_FP8_PAGE_SPLIT
     ]
-    assert page_split == ["glm5_2_indexer"]
+    # GLM-5.2 and K3.1 both carry their indexer keys in the page-split
+    # FP8 layout; every other profile stays flat.
+    assert page_split == ["glm5_2_indexer", "kimi_k31_indexer"]
 
     for name, profile in config._PROFILE_REGISTRY.items():
-        if name == "glm5_2_indexer":
+        if name in ("glm5_2_indexer", "kimi_k31_indexer"):
             continue
         assert profile.page_format == config.PAGE_FORMAT_CONTIGUOUS_AOS, name
         assert profile.kv_dtype == "bfloat16", name
