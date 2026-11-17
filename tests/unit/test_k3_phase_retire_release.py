@@ -92,13 +92,19 @@ def _exit_psm(model):
     psm.release_decode_routed_experts = (
         lambda: psm._release_calls.append("release")
     )
+    # RETIRE delegates to the retire helper (graphs, arena, detach); the
+    # exit tests pin that the delegation happens, the helper has its own
+    # tests below.
+    psm._retire_resident_ep_decode = (
+        lambda: psm._release_calls.append("retire")
+    )
     return psm
 
 
 def test_decode_retire_releases_resident_shard():
     psm = _exit_psm(object())
     psm.phase_exit(DECODE, ExitMode.RETIRE)
-    assert psm._release_calls == ["release"]
+    assert psm._release_calls == ["retire"]
     assert psm.model is None
     assert psm.decode_instance is None
     assert psm.weight_copy_task == {}
@@ -109,7 +115,7 @@ def test_decode_retire_after_worker_dropped_model_still_releases():
     # shard is still mapped and must go back here.
     psm = _exit_psm(None)
     psm.phase_exit(DECODE, ExitMode.RETIRE)
-    assert psm._release_calls == ["release"]
+    assert psm._release_calls == ["retire"]
     assert psm.model is None
 
 
@@ -121,7 +127,7 @@ def test_prefill_retire_releases_a_resident_prefill_shard():
     psm = _exit_psm(model)
     psm.prefill_instance = (model, {})
     psm.phase_exit(PREFILL, ExitMode.RETIRE)
-    assert psm._release_calls == ["release"]
+    assert psm._release_calls == ["retire"]
     assert psm.prefill_instance is None
     assert psm.model is None
     # A prefill retire leaves the decode instance tuple to its own exit.
@@ -153,6 +159,18 @@ class _Shard:
         return self._nbytes
 
 
+class _Arena:
+    """The fixed-address resident arena: unmap frees HBM, rows survive."""
+
+    def __init__(self, events):
+        self._events = events
+        self.is_mapped = True
+
+    def unmap(self):
+        self._events.append("arena_unmap")
+        self.is_mapped = False
+
+
 @pytest.fixture
 def owner_psm(monkeypatch):
     events = []
@@ -163,25 +181,35 @@ def owner_psm(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "batchgen.moe.fused_moe_mxfp4_resident", fake_module
     )
+    import time
+
     fake_torch = SimpleNamespace(
-        cuda=SimpleNamespace(empty_cache=lambda: events.append("empty_cache"))
+        cuda=SimpleNamespace(is_available=lambda: False)
     )
     cls = _isolated_class(
-        {"_release_resident_ep_decode", "_reset_model_attached_state"},
+        {
+            "_release_resident_ep_decode",
+            "_resident_layer_nbytes",
+            "_retire_resident_ep_decode",
+            "_reset_model_attached_state",
+        },
         {
             "torch": fake_torch,
+            "time": time,
             "logging": SimpleNamespace(info=lambda *a, **k: None),
             "RuntimeError": RuntimeError,
             "getattr": getattr,
             "hasattr": hasattr,
             "int": int,
             "len": len,
+            "staticmethod": staticmethod,
         },
     )
     psm = cls()
     psm.rank = 0
     psm.model = None
     psm._resident_ep_built = True
+    psm._resident_ep_arena = _Arena(events)
     psm._streamed_sp8_buffer = None
     psm.prefill_instance = None
     psm.decode_instance = None
@@ -194,44 +222,56 @@ def owner_psm(monkeypatch):
     return psm, events
 
 
-def test_release_walks_the_manager_record_without_a_model(owner_psm):
+def test_release_unmaps_the_arena_but_keeps_the_rows(owner_psm):
     psm, events = owner_psm
     blocks = list(psm._resident_ep_moes)
     assert psm.model is None
     released = psm._release_resident_ep_decode()
     assert released == 2 * (3 << 30)
-    assert all(block._resident_ep_moe is None for block in blocks)
-    assert psm._resident_ep_moes == []
+    assert events == ["prefill_output", "arena_unmap"]
     assert psm._resident_ep_built is False
-    # Graphs bake the shard's addresses: they go before the shard does.
-    assert events.index("decode_graph") < events.index("empty_cache")
+    # Rows, pointer tables and graphs are kept: the layers stay attached
+    # and the next decode build maps and refills the arena in place.
+    assert all(block._resident_ep_moe is not None for block in blocks)
+    assert psm._resident_ep_moes == blocks
 
 
 def test_release_is_idempotent(owner_psm):
     psm, _ = owner_psm
     psm._release_resident_ep_decode()
     assert psm._release_resident_ep_decode() == 0
+
+
+def test_retire_drops_graphs_before_the_arena_and_detaches(owner_psm):
+    psm, events = owner_psm
+    blocks = list(psm._resident_ep_moes)
+    psm._retire_resident_ep_decode()
+    # Graphs bake the shard's addresses: they go before the shard does.
+    assert events.index("decode_graph") < events.index("arena_unmap")
+    assert all(block._resident_ep_moe is None for block in blocks)
     assert psm._resident_ep_moes == []
 
 
-def test_rebuild_with_unreleased_shard_fails_loud(owner_psm):
+def test_rebuild_with_unretired_shard_fails_loud(owner_psm):
     psm, _ = owner_psm
+    # A release alone keeps the layers attached; only retire detaches them.
+    psm._release_resident_ep_decode()
     with pytest.raises(RuntimeError, match="still attached to 2 MoE blocks"):
         psm._reset_model_attached_state()
 
 
-def test_handoff_prefill_shard_release_lets_the_decode_build_proceed(owner_psm):
-    # resident prefill built the shard -> prefill RETIRE releases it -> the
+def test_handoff_prefill_shard_retire_lets_the_decode_build_proceed(owner_psm):
+    # resident prefill built the shard -> prefill RETIRE retires it -> the
     # decode configure's rebuild finds an empty record.
     psm, _ = owner_psm
-    psm._release_resident_ep_decode()
+    psm._retire_resident_ep_decode()
     psm._reset_model_attached_state()
     assert psm._resident_ep_moes == []
 
 
-def test_rebuild_after_release_resets_bookkeeping(owner_psm):
+def test_rebuild_after_retire_resets_bookkeeping(owner_psm):
     psm, _ = owner_psm
-    psm._release_resident_ep_decode()
+    psm._retire_resident_ep_decode()
     psm._reset_model_attached_state()
     assert psm._resident_ep_built is False
     assert psm.decode_instance is None

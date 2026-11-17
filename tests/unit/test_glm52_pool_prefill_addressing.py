@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 import torch
 
-pytest.importorskip("triton")
+from tests.triton_cpu_stub import importorskip_real_triton  # noqa: E402
+
+importorskip_real_triton()
 from batchgen.models.glm.glm5 import sparse_prefill  # noqa: E402
 
 

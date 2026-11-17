@@ -5,7 +5,9 @@ Needs the native core engine (HostPagedKVConfig); skipped where it is absent.
 
 import pytest
 
-pytest.importorskip("triton")
+from tests.triton_cpu_stub import importorskip_real_triton
+
+importorskip_real_triton()
 dual = pytest.importorskip("batchgen.kv_cache.dual_host_kv_coordinator")
 from batchgen.prefix_reuse.config import (  # noqa: E402
     PrefixKVGroupSemantic,

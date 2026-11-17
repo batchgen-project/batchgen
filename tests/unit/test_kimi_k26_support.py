@@ -12,40 +12,49 @@ from types import SimpleNamespace
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_module(module_name: str, path: Path):
+# Every sys.modules entry below goes through ``monkeypatch.setitem``: these are
+# private file loads and stand-ins (``ServerArgs = object`` and friends), and a
+# raw write outlived the test, so a later file that imported
+# ``batchgen.server.server_args`` got the stand-in instead of the dataclass.
+
+
+def _load_module(monkeypatch, module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    monkeypatch.setitem(sys.modules, module_name, module)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def _load_process_utils():
+def _load_process_utils(monkeypatch):
     return _load_module(
+        monkeypatch,
         "batchgen.server.process_utils",
         REPO_ROOT / "batchgen" / "server" / "process_utils.py",
     )
 
 
-def _load_model_name_utils():
+def _load_model_name_utils(monkeypatch):
     return _load_module(
+        monkeypatch,
         "batchgen.config.model_name_utils",
         REPO_ROOT / "batchgen" / "config" / "model_name_utils.py",
     )
 
 
-def _load_scheduler_modules():
+def _load_scheduler_modules(monkeypatch):
     if "batchgen" not in sys.modules:
         pkg = types.ModuleType("batchgen")
         pkg.__path__ = [str(REPO_ROOT / "batchgen")]
-        sys.modules["batchgen"] = pkg
+        monkeypatch.setitem(sys.modules, "batchgen", pkg)
     if "batchgen.server" not in sys.modules:
         pkg = types.ModuleType("batchgen.server")
         pkg.__path__ = [str(REPO_ROOT / "batchgen" / "server")]
-        sys.modules["batchgen.server"] = pkg
+        monkeypatch.setitem(sys.modules, "batchgen.server", pkg)
 
     io_struct = _load_module(
+        monkeypatch,
         "batchgen.server.io_struct",
         REPO_ROOT / "batchgen" / "server" / "io_struct.py",
     )
@@ -61,18 +70,19 @@ def _load_scheduler_modules():
         module = types.ModuleType(module_name)
         for name, value in attrs.items():
             setattr(module, name, value)
-        sys.modules[module_name] = module
+        monkeypatch.setitem(sys.modules, module_name, module)
 
     batch_scheduler = _load_module(
+        monkeypatch,
         "batchgen.server.batch_scheduler",
         REPO_ROOT / "batchgen" / "server" / "batch_scheduler.py",
     )
     return io_struct, batch_scheduler
 
 
-def test_kimi_k26_backend_model_name_helper_and_byte_size():
-    model_name_utils = _load_model_name_utils()
-    process_utils = _load_process_utils()
+def test_kimi_k26_backend_model_name_helper_and_byte_size(monkeypatch):
+    model_name_utils = _load_model_name_utils(monkeypatch)
+    process_utils = _load_process_utils(monkeypatch)
 
     assert model_name_utils.is_kimi_k25_backend_model("moonshotai/Kimi-K2.5")
     assert model_name_utils.is_kimi_k25_backend_model("moonshotai/Kimi-K2.6")
@@ -133,8 +143,9 @@ def test_kimi_assets_include_preserve_thinking_updates():
     assert "preserve_thinking: bool = False" in tokenizer_text
 
 
-def test_chat_request_accepts_preserve_thinking_and_reasoning_content():
-    io_struct, _ = _load_scheduler_modules()
+def test_chat_request_accepts_preserve_thinking_and_reasoning_content(
+        monkeypatch):
+    io_struct, _ = _load_scheduler_modules(monkeypatch)
     ChatCompletionRequest = io_struct.ChatCompletionRequest
 
     req = ChatCompletionRequest(
@@ -150,8 +161,9 @@ def test_chat_request_accepts_preserve_thinking_and_reasoning_content():
     assert req.messages[0].reasoning_content == "hidden"
 
 
-def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
-    io_struct, batch_scheduler = _load_scheduler_modules()
+def test_scheduler_forwards_preserve_thinking_and_reasoning_content(
+        monkeypatch):
+    io_struct, batch_scheduler = _load_scheduler_modules(monkeypatch)
     ChatCompletionRequest = io_struct.ChatCompletionRequest
     BatchScheduler = batch_scheduler.BatchScheduler
 
