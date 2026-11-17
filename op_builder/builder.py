@@ -626,14 +626,17 @@ class CUDAOpBuilder(OpBuilder):
 
         1. `TORCH_CUDA_ARCH_LIST` takes priority over `cross_compile_archs`.
         2. If neither is set default compute capabilities will be used
-        3. Under `jit_mode` compute capabilities of all visible cards will be used plus PTX
+        3. Under `jit_mode` compute capabilities of all visible cards will be used
 
         Format:
 
         - `TORCH_CUDA_ARCH_LIST` may use ; or whitespace separators. Examples:
 
         TORCH_CUDA_ARCH_LIST="6.1;7.5;8.6" pip install ...
-        TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX" pip install ...
+
+        A `+PTX` suffix is refused (PR_MERGE_POLICY.md §1.8): targets are
+        SASS-only, and a missing arch fails loud at load instead of falling
+        back to a silent driver JIT.
 
         - `cross_compile_archs` uses ; separator.
 
@@ -647,7 +650,6 @@ class CUDAOpBuilder(OpBuilder):
                 if cc not in ccs:
                     ccs.append(cc)
             ccs = sorted(ccs)
-            ccs[-1] += "+PTX"
         else:
             # Cross-compile mode, compile for various architectures
             # env override takes priority
@@ -674,13 +676,17 @@ class CUDAOpBuilder(OpBuilder):
         args = []
         self.enable_bf16 = True
         for cc in ccs:
-            # "major.minor" with an optional +PTX suffix; majors can be two
-            # digits (10.0, 10.3), so never index into the string.
-            major, minor = cc.removesuffix("+PTX").split(".")
+            if cc.endswith("+PTX"):
+                raise RuntimeError(
+                    f"{self.name}: arch entry {cc!r} requests a PTX embed; "
+                    "PR_MERGE_POLICY.md §1.8 forbids PTX embeds — list every "
+                    "SASS arch explicitly instead"
+                )
+            # "major.minor"; majors can be two digits (10.0, 10.3), so never
+            # index into the string.
+            major, minor = cc.split(".")
             num = f"{int(major)}{int(minor)}"
             args.append(f"-gencode=arch=compute_{num},code=sm_{num}")
-            if cc.endswith("+PTX"):
-                args.append(f"-gencode=arch=compute_{num},code=compute_{num}")
 
             if int(major) <= 7:
                 self.enable_bf16 = False

@@ -71,8 +71,15 @@ deleted — on their own PRs.)
    `*.bin`), wheels (`*.whl`), or compiled extensions. Never `git add -f` past `.gitignore`.
 7. **Loose utilities at the repository root.** The only `.py` permitted at root is `setup.py`.
    Tooling belongs in `scripts/`.
+8. **Kernel arch-packaging violations** (the release packaging policy's per-PR subset, after
+   vLLM/flashinfer practice). In build flags under `batchgen_kernels/` or `op_builder/`:
+   no PTX embeds — never `code=compute_XX` (SASS-only `code=sm_XX` targets; missing-arch at
+   runtime fails loud rather than falling back to a silent driver JIT); no blanket `sm_103a` /
+   `compute_103a` — a `103a` variant is reserved for kernels using sm_103-exclusive
+   instructions and must be registered in the allowlist inside
+   `tests/contracts/test_kernel_arch_policy.py`, which pins the whole tree to the same rules.
 
-Every line H1–H7 is mechanically checkable; see [§8](#8-ci-enforcement).
+Every line H1–H8 is mechanically checkable; see [§8](#8-ci-enforcement).
 
 ---
 

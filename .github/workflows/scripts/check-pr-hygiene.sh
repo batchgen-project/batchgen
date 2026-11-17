@@ -123,6 +123,25 @@ for f in ${CHANGED_PROD[@]+"${CHANGED_PROD[@]}"}; do
   fi
 done
 
+# ---- §1.8 kernel arch packaging (added lines in kernel build trees) ----
+# Per-PR subset of the per-arch release packaging policy: SASS-only targets
+# (no PTX embeds), and no blanket sm_103a outside the contract-test allowlist.
+KERNEL_BUILD_RE='^(batchgen_kernels|op_builder)/'
+CHANGED_KBUILD=()
+while IFS= read -r _f; do [[ -n "$_f" ]] && CHANGED_KBUILD+=("$_f"); done \
+  < <(git diff --name-only "$merge_base"...HEAD | grep -E "$KERNEL_BUILD_RE" || true)
+for f in ${CHANGED_KBUILD[@]+"${CHANGED_KBUILD[@]}"}; do
+  added="$(git diff "$merge_base"...HEAD -- "$f" \
+    | awk '/^\+\+\+/{next} /^\+/{print}' | grep -vF 'noqa: hygiene' || true)"
+  [[ -z "$added" ]] && continue
+  if printf '%s\n' "$added" | grep -Eq 'code=compute_'; then
+    block "§1.8 PTX embed (code=compute_) added in kernel build flags: $f"
+  fi
+  if printf '%s\n' "$added" | grep -Eq '(sm|compute)_103a'; then
+    block "§1.8 sm_103a target added — reserved for sm_103-exclusive kernels via the contract-test allowlist: $f"
+  fi
+done
+
 # ---- §2 change-type boundary (path-scope, §2.4–§2.6) ----
 # A `model`/`kernel` PR may touch only its allowlist; the scaffolding layer is core-only.
 declared=()
