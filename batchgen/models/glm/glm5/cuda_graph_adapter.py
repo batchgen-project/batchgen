@@ -192,8 +192,15 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         if aux_manager is None:
             raise RuntimeError("Glm5CudaGraphAdapter requires auxiliary GPU KV manager")
 
-        max_pages_per_seq = int(primary_manager.max_pages_per_sequence)
-        max_aux_pages_per_seq = int(aux_manager.max_pages_per_sequence)
+        # Page-table width comes from the managers' CUDA-graph storage, the
+        # same source the worker's capture path reads
+        # (GPUPagedKVCacheManager exposes no max_pages_per_sequence attribute).
+        max_pages_per_seq = int(
+            primary_manager.get_cuda_graph_page_table_storage().shape[1]
+        )
+        max_aux_pages_per_seq = int(
+            aux_manager.get_cuda_graph_page_table_storage().shape[1]
+        )
         vocab_size = int(model.config.vocab_size)
         hidden_size = int(model.config.hidden_size)
         num_heads = int(attn0.num_heads)
