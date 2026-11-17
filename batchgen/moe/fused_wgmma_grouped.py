@@ -26,6 +26,8 @@ import logging
 
 import torch
 
+_logger = logging.getLogger(__name__)
+
 
 # Module-level state
 _grouped_wgmma_available = None
@@ -50,7 +52,7 @@ def _check_wgmma_support() -> bool:
     device = torch.cuda.current_device()
     cc = torch.cuda.get_device_capability(device)
     if cc[0] != 9:
-        logging.debug(f"WGMMA requires compute capability 9.x, found {cc[0]}.{cc[1]}")
+        _logger.debug(f"WGMMA requires compute capability 9.x, found {cc[0]}.{cc[1]}")
         return False
     return True
 
@@ -73,10 +75,10 @@ def _load_grouped_module():
         _grouped_module = batchgen_kernels.load_extension(
             "batchgen_kernels.moe._C_grouped_mxfp4_wgmma", allow_dev_jit=False
         )
-        logging.info("Loaded pre-compiled WGMMA fused grouped MXFP4 MoE kernels")
+        _logger.info("Loaded pre-compiled WGMMA fused grouped MXFP4 MoE kernels")
         return _grouped_module
     except ImportError:
-        logging.warning(
+        _logger.warning(
             "WGMMA grouped MXFP4 MoE kernels unavailable (no AOT extension; "
             "DEV-JIT skipped — `-arch=sm_90a` shorthand emits a compute_90 PTX "
             "fallback that ptxas rejects for wgmma). Not on the K3 marlin decode "
@@ -84,7 +86,7 @@ def _load_grouped_module():
         )
         return None
     except Exception as e:
-        logging.warning(f"Failed to load WGMMA grouped MoE kernels: {e}")
+        _logger.warning(f"Failed to load WGMMA grouped MoE kernels: {e}")
         return None
 
 
@@ -100,7 +102,7 @@ def is_grouped_wgmma_available() -> bool:
         return False
 
     if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
-        logging.info("WGMMA grouped kernels disabled by BATCHGEN_DISABLE_WGMMA_GROUPED")
+        _logger.info("WGMMA grouped kernels disabled by BATCHGEN_DISABLE_WGMMA_GROUPED")
         _grouped_wgmma_available = False
         return False
 
