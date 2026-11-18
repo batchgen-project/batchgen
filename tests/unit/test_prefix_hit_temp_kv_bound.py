@@ -505,8 +505,8 @@ def test_split_materialization_reaches_the_same_final_state():
 # ------------------------------------------------ structural wiring
 
 
-# S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
-_ENGINE_FORWARDS = {"prefill_prepacked"}
+# S5b/R2: prefill bodies moved verbatim to PrefillEngine.
+_ENGINE_FORWARDS = {"prefill_prepacked", "_config_prefill_for_batch"}
 
 
 def _method(name):

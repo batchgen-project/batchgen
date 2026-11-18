@@ -45,6 +45,7 @@ from tests.worker_method_source import (
     WORKER_SOURCE,
     load_worker_methods,
     load_worker_shaped_methods,
+    worker_shaped_method_node,
 )
 
 GLM5 = "zai-org/GLM-5-FP8"
@@ -333,11 +334,9 @@ def test_page_table_request_carries_the_top_bucket_only_for_graph_deployments():
 
 
 def test_capture_logs_and_checks_the_derived_ladder():
-    cls = _worker_class(_worker_tree())
-    setup = next(
-        f for f in cls.body
-        if isinstance(f, ast.FunctionDef) and f.name == "_setup_cuda_graphs"
-    )
+    # Repatriation: the capture loop runs in GraphRuntime; read it in the
+    # worker's shape through the delegation map.
+    setup = worker_shaped_method_node("_setup_cuda_graphs")
     body = ast.unparse(setup)
     assert "bucket_sizes = self._decode_graph_bucket_sizes()" in body
     assert "check_decode_width_within_buckets(decode_width, bucket_sizes)" in body

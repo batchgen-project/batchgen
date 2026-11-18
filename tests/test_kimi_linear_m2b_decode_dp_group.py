@@ -467,15 +467,10 @@ def test_prefill_selection_groups_candidates_before_requiring_a_group():
     selection request is built; it is idempotent, so re-entrant sequences keep
     the group their head-sharded KDA state already lives on.
     """
-    tree = ast.parse(WORKER.read_text())
-    worker = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
-    )
-    method = next(
-        node for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_prefill_batch"
-    )
+    # R2: _prepare_prefill_batch's body lives on PrefillEngine.
+    from tests.worker_method_source import worker_shaped_method_node
+
+    method = worker_shaped_method_node("_prepare_prefill_batch")
     assign_line = selection_line = None
     for node in ast.walk(method):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):

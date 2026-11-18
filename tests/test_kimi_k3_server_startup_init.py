@@ -906,7 +906,10 @@ def test_non_streamed_prefill_reallocates_the_ring_on_every_install(monkeypatch)
 
 def test_startup_and_per_batch_prefill_share_one_installer():
     startup = _function(WORKER, "prepare_kimi_k3_startup", "BatchGenWorker")
-    config = _function(WORKER, "_config_prefill_for_batch", "BatchGenWorker")
+    # R2: _config_prefill_for_batch's body lives on PrefillEngine.
+    from tests.worker_method_source import worker_shaped_method_node
+
+    config = worker_shaped_method_node("_config_prefill_for_batch")
 
     for function in (startup, config):
         assert "_install_prefill_weight_copy_pipeline" in _calls(function)

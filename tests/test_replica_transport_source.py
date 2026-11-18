@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "core/HtoD_Engine/HtoD_Engine.cu"
 BUFFER = ROOT / "core/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp"
 WORKER = ROOT / "batchgen/batchgen_worker.py"
+# The install body lives on the stateless engine since the repatriation move;
+# the worker keeps a same-name delegator.
+TRANSPORT_ENGINE = ROOT / "batchgen/worker/replica_transport_engine.py"
 
 
 def _producer(source: str) -> str:
@@ -109,9 +112,8 @@ def test_ring_segments_are_shared_by_vmm_fd_not_torch_ipc():
     left foreign contexts (minutes and GiBs on a serving worker); segments
     now travel as exported VMM fds over SCM_RIGHTS and import maps only the
     segment range read-only."""
-    worker = WORKER.read_text()
-    install = worker[worker.index("def _install_replica_transport"):
-                     worker.index("def _install_prefill_weight_copy_pipeline")]
+    engine_src = TRANSPORT_ENGINE.read_text()
+    install = engine_src[engine_src.index("def _install_replica_transport"):]
     assert "reduce_tensor" not in install
     assert "ring_segment_export_fd" in install
     assert "send_fds" in install and "recv_fds" in install
@@ -147,9 +149,8 @@ def test_barrier_words_are_per_member_and_type():
 
 
 def test_worker_declines_rather_than_crashes_non_participants():
-    source = WORKER.read_text()
-    body = source[source.index("def _install_replica_transport"):
-                  source.index("def _install_prefill_weight_copy_pipeline")]
+    source = TRANSPORT_ENGINE.read_text()
+    body = source[source.index("def _install_replica_transport"):]
     for reason in (
         "daemon-backed weight source",
         "hierarchical_gdr weight source",

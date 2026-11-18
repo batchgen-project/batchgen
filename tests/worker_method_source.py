@@ -63,14 +63,31 @@ KV_CAPACITY_SOURCE = (
     / "kv_capacity_engine.py"
 )
 KV_CAPACITY_CLASS = "KVCapacityEngine"
-# The worker-seam engines (S8, S7, S9, S10a) whose methods the worker reaches through
-# same-name canonical delegators.
+GRAPH_RUNTIME_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "graph_runtime.py"
+)
+GRAPH_RUNTIME_CLASS = "GraphRuntime"
+# The worker-seam engines (S8, S7, S9, S10a, repatriation) whose methods the
+# worker reaches through same-name canonical delegators. Only an engine method
+# in the delegated shape ``(self, worker, ...)`` is a delegator; engines that
+# also carry their own state API (GraphRuntime) keep those methods out of the
+# delegation scan via that shape filter.
 DELEGATED_ENGINES = (
     (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
     (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
     (WORKER_LIFECYCLE_SOURCE, WORKER_LIFECYCLE_CLASS),
     (KV_CAPACITY_SOURCE, KV_CAPACITY_CLASS),
+    (PREFILL_ENGINE_SOURCE, PREFILL_ENGINE_CLASS),
+    (GRAPH_RUNTIME_SOURCE, GRAPH_RUNTIME_CLASS),
 )
+
+
+def _is_delegator_shape(node: ast.FunctionDef) -> bool:
+    args = node.args.args
+    return len(args) >= 2 and args[0].arg == "self" and args[1].arg == "worker"
 
 
 def load_worker_methods(
@@ -271,7 +288,7 @@ def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     """
     for source, class_name in DELEGATED_ENGINES:
         engine = _class_methods(source, class_name)
-        if name in engine:
+        if name in engine and _is_delegator_shape(engine[name]):
             return engine_method_as_worker_method(engine[name])
     worker = _class_methods(WORKER_SOURCE, WORKER_CLASS)
     if name not in worker:
@@ -290,7 +307,7 @@ def delegated_method_source(name: str) -> str:
     """
     for source, class_name in DELEGATED_ENGINES:
         engine = _class_methods(source, class_name)
-        if name in engine:
+        if name in engine and _is_delegator_shape(engine[name]):
             return ast.get_source_segment(source.read_text(), engine[name])
     raise KeyError(f"{name} is not a delegated engine method")
 
@@ -299,7 +316,10 @@ def delegated_method_names() -> set:
     """Every worker method whose body lives in a delegated engine (S8/S7/S9/S10a)."""
     names: set = set()
     for source, class_name in DELEGATED_ENGINES:
-        names |= set(_class_methods(source, class_name))
+        names |= {
+            name for name, node in _class_methods(source, class_name).items()
+            if _is_delegator_shape(node)
+        }
     return names
 
 
