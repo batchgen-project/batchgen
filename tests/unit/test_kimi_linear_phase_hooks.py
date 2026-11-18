@@ -40,6 +40,7 @@ _STUBBED = {
     "activate_prefill",
     "activate_decoding",
     "release_decode_routed_experts",
+    "_retire_resident_ep_decode",
 }
 
 PREFILL = PhaseKey("prefill", "streamed")
@@ -218,12 +219,14 @@ def test_prefill_suspend_makes_no_delegate_call():
 def test_retire_releases_the_routed_experts(key):
     # The resident shard is manager-owned and either phase may have built it
     # (prefill under the resident-EP handoff): a retired instance must hand
-    # it back even though the instance itself is dropped.
+    # it back even though the instance itself is dropped. RETIRE retires the
+    # arena (graphs dropped, memory unmapped, layers detached) rather than
+    # taking SUSPEND's keep-the-graphs path.
     psm, calls, _ = _isolated_psm()
     psm._resident_ep_built = True
     psm._active_phase = key.phase
     assert psm.phase_exit(key, ExitMode.RETIRE) is None
-    assert calls == [("release_decode_routed_experts", (), {})]
+    assert calls == [("_retire_resident_ep_decode", (), {})]
 
 
 def test_unsupported_mode_is_rejected():

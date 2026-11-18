@@ -675,6 +675,7 @@ def test_preflight_contracts_match_the_legacy_contract():
         modules=("flash_attn_interface", "flash_mla", "libucx"),
         extensions=(RP._COMMON_EXTENSIONS + RP._GLM5_DSA_EXTENSIONS
                     + RP._DSA_MOE_WGMMA_EXTENSIONS),
+        hopper_extensions=RP._DSA_FP8_HOPPER_EXTENSIONS,
         require_deepgemm=True,
     )
     glm = {t: c for t, c in RP._CONTRACTS.items() if t.startswith("glm")}
@@ -684,7 +685,9 @@ def test_preflight_contracts_match_the_legacy_contract():
 def test_sparse_prefill_sets_match_the_legacy_sets():
     assert FAMILY.SPARSE_PREFILL_MODEL_TYPES == _LEGACY_SPARSE_PREFILL_MODEL_TYPES
     assert TP.SPARSE_PREFILL_MODEL_TYPES == _LEGACY_SPARSE_PREFILL_MODEL_TYPES
-    assert PR._DSA_MODEL_TYPES == frozenset(_LEGACY_SPARSE_PREFILL_MODEL_TYPES)
+    # prefix_reuse serves every DSA family; only the GLM members belong to
+    # this file's legacy-equivalence guarantee.
+    assert PR._GLM_DSA_MODEL_TYPES == frozenset(_LEGACY_SPARSE_PREFILL_MODEL_TYPES)
 
 
 # --------------------------------------------------------------------------- #

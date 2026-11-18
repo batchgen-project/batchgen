@@ -1,61 +1,23 @@
 """CUDA-free contracts for the GLM-5 startup decode probe."""
 
 import gc
-import importlib.machinery
-import importlib.util
-import sys
-import types
 import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.triton_cpu_stub import install_triton_cpu_stub
+
 # ---------------------------------------------------------------------------- #
 #  triton stub: glm5/model.py defines its Triton kernels at import time, so a
 #  CPU environment without triton needs a decorator-only stand-in. The kernel
 #  bodies never run here (no fake is registered under a real triton install).
+#  The stub is the shared one: sys.modules outlives this file, so a private
+#  partial stub here broke every later file that imports batchgen.kv_cache.
 # ---------------------------------------------------------------------------- #
 
-if importlib.util.find_spec("triton") is None:  # pragma: no branch
-
-    def _stub_module(name):
-        mod = types.ModuleType(name)
-        mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
-        mod.__version__ = "0.0.0-cpu-stub"
-        return mod
-
-    _triton = _stub_module("triton")
-
-    def _jit(fn=None, **_kwargs):
-        if fn is None:
-            return lambda f: f
-        return fn
-
-    _triton.jit = _jit
-    _triton.cdiv = lambda a, b: (a + b - 1) // b
-    _triton.autotune = lambda *a, **k: (lambda f: f)
-    _triton.heuristics = lambda *a, **k: (lambda f: f)
-    _triton.Config = lambda *a, **k: None
-
-    class _TlName:
-        def __getitem__(self, item):
-            return item
-
-        def __call__(self, *args, **kwargs):
-            return None
-
-    _tl = _stub_module("triton.language")
-
-    def _tl_getattr(name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return _TlName()
-
-    _tl.__getattr__ = _tl_getattr
-    _triton.language = _tl
-    sys.modules["triton"] = _triton
-    sys.modules["triton.language"] = _tl
+install_triton_cpu_stub()
 
 from batchgen.models.glm.glm5.Parallel_Strategy_Manager import (  # noqa: E402
     GLM5ParallelStrategyManager,
@@ -289,8 +251,6 @@ _SAVED_GLM5_WRAPPER_NAMES = (
     "_dsa_prev_topk_indices",
     "glm5_decode_primary_slot_indices",
     "glm5_decode_aux_slot_indices",
-    "glm5_dsa_graph_forward_state",
-    "glm5_dsa_flashmla_graph_metadata",
 )
 
 
@@ -444,17 +404,7 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
 
     # Sentinels in the graph-owned per-step slots: the subsequent capture must
     # find them exactly as the worker left them, not nulled by the probe.
-    sentinel_state = {"path": "graph", "bucket": 4}
-    sentinel_metadata = {"bucket_size": 4}
     sentinel_slots = torch.arange(4, dtype=torch.int32)
-    monkeypatch.setattr(
-        GLM5AttnWrapper, "glm5_dsa_graph_forward_state", sentinel_state,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        GLM5AttnWrapper, "glm5_dsa_flashmla_graph_metadata", sentinel_metadata,
-        raising=False,
-    )
     monkeypatch.setattr(
         GLM5AttnWrapper, "glm5_decode_primary_slot_indices", sentinel_slots,
         raising=False,
@@ -489,8 +439,6 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
             prev_topk=GLM5AttnWrapper._dsa_prev_topk_indices,
             primary_slots=GLM5AttnWrapper.glm5_decode_primary_slot_indices,
             aux_slots=GLM5AttnWrapper.glm5_decode_aux_slot_indices,
-            graph_state=GLM5AttnWrapper.glm5_dsa_graph_forward_state,
-            graph_metadata=GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata,
             rank_counts=Glm5MoE._rank_token_counts,
             debug=dict(AttnWrapperBase.batchgen_debug),
             ntp=[moe.num_tokens_per_rank for moe in moes],
@@ -508,8 +456,6 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
     assert during["prev_topk"] is None
     assert during["primary_slots"] is None
     assert during["aux_slots"] is None
-    assert during["graph_state"] is None
-    assert during["graph_metadata"] is None
     assert during["rank_counts"] is None
     assert during["debug"] == {
         "glm5_dsa_mode": "eager", "glm5_moe_mode": "eager",

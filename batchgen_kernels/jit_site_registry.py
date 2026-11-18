@@ -25,6 +25,14 @@ Two layers:
   names the prewarm site(s) a call compiles through, ``"wrapper"`` for a
   helper whose own call sites are listed, or ``"unreachable: ..."``.
 
+  One backend may be called from several model families' sources (the DSA
+  indexer's DeepGEMM kernels serve GLM-5 and Kimi-K3.1). Each family then
+  registers its own inventory PART for the backend: it names its ``family``,
+  its scan roots (disjoint from every other part's, so one call site has one
+  owner) and its own table, and the scanner holds each part's roots to its
+  own table. ``backend_inventories`` lists the parts; ``backend_inventory``
+  is the backend's merged view.
+
 * **Operator slots** — a replaceable operator slot a model family declares:
   its validated backends (each marked ``("jit", <inventory backend>)`` or
   ``("aot",)``) and the default. ``check_slot_backend`` is the ONLY
@@ -61,13 +69,17 @@ class JitCoverageError(RuntimeError):
 
 @dataclass(frozen=True)
 class BackendInventory:
-    """One JIT backend's static call-site contract."""
+    """One JIT backend's static call-site contract (or one family's part of
+    it, see the module docstring)."""
 
     backend: str
     paths: Tuple[str, ...]
     callees: Tuple[str, ...]
     non_kernels: Tuple[str, ...]
     call_sites: Mapping[Tuple[str, str, str], Tuple[int, Any]]
+    #: The model family owning this part. Required once a backend has more
+    #: than one part; a single unnamed part is the backend's whole contract.
+    family: str = ""
 
 
 @dataclass(frozen=True)
@@ -93,21 +105,52 @@ class OperatorSlot:
             )
 
 
-_INVENTORIES: Dict[str, BackendInventory] = {}
+# backend -> family -> part
+_INVENTORIES: Dict[str, Dict[str, BackendInventory]] = {}
 _SLOTS: Dict[Tuple[str, str], OperatorSlot] = {}
 _MODEL_TYPE_FAMILIES: Dict[str, str] = {}
 
 
+def _paths_overlap(a: str, b: str) -> bool:
+    a, b = a.rstrip("/"), b.rstrip("/")
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
 def register_backend_inventory(inventory: BackendInventory) -> BackendInventory:
-    """Register a backend's call-site contract (idempotent re-registration
-    of an identical contract is a no-op; a conflicting one is refused)."""
-    existing = _INVENTORIES.get(inventory.backend)
-    if existing is not None and existing != inventory:
+    """Register a backend's call-site contract, or one family's part of it.
+
+    Idempotent re-registration of an identical part is a no-op. Refused: a
+    different part for an already registered ``(backend, family)``; a second
+    part when either part names no family; a part whose scan roots overlap
+    another part's (a call site would have two owners).
+    """
+    parts = _INVENTORIES.setdefault(inventory.backend, {})
+    existing = parts.get(inventory.family)
+    if existing is not None:
+        if existing != inventory:
+            raise JitCoverageError(
+                f"backend {inventory.backend!r} is already registered with a "
+                f"different inventory for family {inventory.family!r}"
+            )
+        return existing
+    if parts and (not inventory.family or "" in parts):
         raise JitCoverageError(
             f"backend {inventory.backend!r} is already registered with a "
-            "different inventory"
+            "different inventory; a backend with several inventory parts "
+            "needs every part to name its family"
         )
-    _INVENTORIES[inventory.backend] = inventory
+    for other in parts.values():
+        clashes = sorted(
+            (mine, theirs) for mine in inventory.paths for theirs in other.paths
+            if _paths_overlap(mine, theirs)
+        )
+        if clashes:
+            raise JitCoverageError(
+                f"backend {inventory.backend!r}: the {inventory.family!r} "
+                f"inventory's scan roots overlap the {other.family!r} part's "
+                f"{clashes}; every call site needs exactly one owner"
+            )
+    parts[inventory.family] = inventory
     return inventory
 
 
@@ -151,19 +194,36 @@ def check_model_type_coverage(model_type: str) -> Tuple[str, ...]:
 
 
 def backend_inventories() -> Tuple[BackendInventory, ...]:
-    """Every registered backend inventory (for the repo-wide scanner)."""
-    return tuple(_INVENTORIES.values())
+    """Every registered inventory part (for the repo-wide scanner, which
+    holds each part's scan roots to that part's table)."""
+    return tuple(part for parts in _INVENTORIES.values()
+                 for part in parts.values())
 
 
 def backend_inventory(backend: str) -> BackendInventory:
-    """One backend's inventory; raises ``JitCoverageError`` when unknown."""
-    try:
-        return _INVENTORIES[backend]
-    except KeyError:
+    """One backend's inventory, merged over its family parts (scan roots,
+    callees and non-kernels in registration order, every call site); raises
+    ``JitCoverageError`` when unknown."""
+    parts = tuple(_INVENTORIES.get(backend, {}).values())
+    if not parts:
         raise JitCoverageError(
             f"JIT backend {backend!r} has no registered call-site inventory; "
-            f"registered: {sorted(_INVENTORIES)}"
-        ) from None
+            f"registered: {sorted(b for b, p in _INVENTORIES.items() if p)}"
+        )
+    if len(parts) == 1:
+        return parts[0]
+
+    def merged(name):
+        return tuple(dict.fromkeys(v for part in parts
+                                   for v in getattr(part, name)))
+
+    call_sites: Dict[Tuple[str, str, str], Tuple[int, Any]] = {}
+    for part in parts:
+        call_sites.update(part.call_sites)
+    return BackendInventory(
+        backend=backend, paths=merged("paths"), callees=merged("callees"),
+        non_kernels=merged("non_kernels"), call_sites=call_sites,
+    )
 
 
 def slots_for(family: str) -> Tuple[OperatorSlot, ...]:

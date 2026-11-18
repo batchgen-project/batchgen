@@ -1,11 +1,12 @@
 """GLM-5 debug behaviors are reachable only through ``batchgen_debug`` keys.
 
-The nine ``BATCHGEN_GLM5_*`` env-var entry points (dispatch trace, MoE graph
-compare, graph-path log, whole-model graph compare / timing / compare-fail /
-probe layers / compare atol / compare rtol) are retired: the server-level graph
-mode is decided by the CLI at startup, and a batch-level key only selects
-compare / trace behavior within it. Each behavior is pinned here through its
-key, and each retired env var is pinned as not honored.
+The ``BATCHGEN_GLM5_*`` env-var entry points (dispatch trace, graph-path log,
+whole-model graph compare / timing / compare-fail / probe layers / compare
+atol / compare rtol, and the per-layer DSA/MoE graph modes deleted with that
+subsystem) are retired: the server-level graph mode is decided by the CLI at
+startup, and a batch-level key only selects compare / trace behavior within
+it. Each behavior is pinned here through its key, and each retired env var is
+pinned as not honored.
 
 The worker methods are compiled from source (``load_worker_methods``) and the
 models helper is lifted from its module source, so these run without the GPU
@@ -36,6 +37,15 @@ RETIRED_ENV_VARS = (
     "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS",
     "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL",
     "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL",
+    # Per-layer DSA/MoE graph subsystem, deleted with its readers; the only
+    # remaining constants live in cuda_graph/flags.py's boot warning list.
+    "BATCHGEN_GLM5_DSA_CUDA_GRAPH",
+    "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH",
+    "BATCHGEN_GLM5_MOE_CUDA_GRAPH",
+    "BATCHGEN_GLM5_DSA_GRAPH_COMPARE",
+    "BATCHGEN_GLM5_DSA_GRAPH_COMPARE_LAYERS",
+    "BATCHGEN_GLM5_MOE_GRAPH_COMPARE_LAYERS",
+    "BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL",
 )
 
 _METHODS = (
@@ -168,49 +178,17 @@ def test_compare_tolerances_refuse_non_numbers_by_name(bad):
         )
 
 
-# ------------------------------------------------------ MoE graph compare
-
-
-def _lift_models_function(name: str, namespace: dict):
-    path = ROOT / "batchgen" / "models" / "glm" / "glm5" / "model.py"
-    tree = ast.parse(path.read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace[name]
-
-
-@pytest.mark.parametrize(
-    "debug,expected",
-    [
-        ({"glm5_moe_graph_compare": True}, True),
-        ({"glm5_moe_graph_compare": True, "glm5_moe_mode": "eager"}, False),
-        ({}, False),
-    ],
-)
-def test_moe_graph_compare_follows_its_key_and_ignores_the_retired_env(
-    debug, expected, all_retired_env_vars_set
-):
-    def debug_flag_enabled(value):
-        return value is True or value in ("1", 1)
-
-    mode = debug.get("glm5_moe_mode")
-    active = _lift_models_function(
-        "_glm5_moe_graph_compare_active",
-        {
-            "_glm5_moe_debug_mode": lambda: mode,
-            "_glm5_moe_debug_dict": lambda: debug,
-            "_debug_flag_enabled": debug_flag_enabled,
-        },
-    )
-    assert active() is expected
-
-
 # --------------------------------------------- no reader of the retired vars
 
 
 def test_no_retired_env_var_is_read_under_batchgen():
+    # cuda_graph/flags.py holds the removed names on purpose: its boot-time
+    # warning tells users the vars are no longer recognized.
+    warner = ROOT / "batchgen" / "cuda_graph" / "flags.py"
     hits = []
     for path in sorted((ROOT / "batchgen").rglob("*.py")):
+        if path == warner:
+            continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value in RETIRED_ENV_VARS:

@@ -89,6 +89,10 @@ def _worker(manager, events):
     worker._weight_passes = SimpleNamespace(
         close=lambda: events.append("weight_close")
     )
+    # The replica-transport seam is worker-owned; the phase tests fake it.
+    worker._uninstall_replica_transport = lambda: events.append(
+        "uninstall_replica_transport"
+    )
     worker.core_engine = SimpleNamespace(
         stop_h2d_worker=lambda: events.append("stop_h2d"),
         clear_kv_copy_queue=lambda: events.append("clear_kv"),

@@ -2308,10 +2308,22 @@ class WorkerManager:
                 try:
                     self._finish_distributed_weight_swap()
                 except Exception:
-                    logger.exception(
-                        "Distributed weight cohort swap after the worker "
-                        "failure did not complete; the next restart retries it"
-                    )
+                    if self._stopping:
+                        # An intentional shutdown reached the daemon while the
+                        # swap was finishing. Expected: the daemon refuses new
+                        # work once it is stopping, and no restart follows to
+                        # retry anything, so this is a one-line reason rather
+                        # than a failure with a traceback.
+                        logger.info(
+                            "Distributed weight cohort swap after the worker "
+                            "failure was interrupted by the shutdown"
+                        )
+                    else:
+                        logger.exception(
+                            "Distributed weight cohort swap after the worker "
+                            "failure did not complete; the next restart "
+                            "retries it"
+                        )
         finally:
             if self._cluster_fail_fast:
                 # Still holding the teardown, so no restart can begin between

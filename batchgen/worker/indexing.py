@@ -26,6 +26,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class UnmappedLocalIndexError(RuntimeError):
+    """A local index has no uuid binding at resolution time.
+
+    Raised instead of shrinking the result: a shorter output silently
+    shifts every later batch position onto the wrong sequence's KV.
+    """
+
+
 @dataclass(frozen=True)
 class IndexLookupRequest:
     """Frozen snapshot passed to each ``IndexManager`` call.
@@ -60,9 +68,12 @@ class IndexManager:
     ) -> List[int]:
         """Convert local indices to global sequence IDs (``global_idx`` from ``SequenceEntry``).
 
-        Logs at ``ERROR`` when any local index is unmapped — length
-        mismatch between input and output causes KV corruption (wrong
-        sequence KV read for wrong batch position).
+        Raises :class:`UnmappedLocalIndexError` when any local index is
+        unmapped — a length mismatch between input and output causes KV
+        corruption (wrong sequence KV read for wrong batch position), so
+        the condition is fatal, never a shortened result. No current
+        caller tolerates absence; a caller that legitimately can must use
+        an explicit tolerant variant, not this one.
         """
         global_seq_ids: List[int] = []
         missing_indices: List[int] = []
@@ -75,10 +86,11 @@ class IndexManager:
                 missing_indices.append(local_idx)
 
         if missing_indices:
-            logger.error(
-                f"Rank {req.rank}: MISSING LOCAL INDICES in local_indices_to_global_seq_ids! "
-                f"input_len={len(local_indices)}, output_len={len(global_seq_ids)}, "
-                f"missing={missing_indices[:10]}..."
+            raise UnmappedLocalIndexError(
+                f"Rank {req.rank}: {len(missing_indices)} of "
+                f"{len(local_indices)} local indices have no uuid binding "
+                f"(first missing: {missing_indices[:10]}); a shortened "
+                f"result would address the wrong sequence's KV"
             )
         return global_seq_ids
 

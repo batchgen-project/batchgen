@@ -275,9 +275,8 @@ class AttnWrapperBase(BaseModuleWrapper):
     scale: ClassVar[Optional[List[torch.Tensor]]] = None
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
-    # Phase C: _dsa_short_count and glm5_decode_*_slot_indices /
-    # glm5_dsa_graph_forward_state / glm5_dsa_flashmla_graph_metadata
-    # moved to GLM5AttnWrapper subclass (batchgen/models/glm/glm5/wrappers.py)
+    # Phase C: _dsa_short_count and glm5_decode_*_slot_indices moved to
+    # GLM5AttnWrapper subclass (batchgen/models/glm/glm5/wrappers.py)
     # per audit §A finding #8.
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None

@@ -1,7 +1,9 @@
 import torch
 import pytest
+from types import SimpleNamespace
 
-import batchgen.models.glm.glm5.moe_cuda_graph_segments as glm5_moe_graph
+from batchgen.cuda_graph import BatchSizeBucketing
+
 from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
     Glm5DecoderLayerGraphSegment,
     make_glm5_layer_graph_segment_name,
@@ -38,34 +40,6 @@ class _FakeInnerModel:
 
 class _FakeModel:
     model = _FakeInnerModel()
-
-
-def test_glm5_moe_graph_loads_fp8_ops_through_shared_loader_once(monkeypatch):
-    import batchgen_kernels
-
-    calls = []
-
-    class _FakeFp8Ops:
-        @staticmethod
-        def act_quant_3d(x, seqlens):
-            calls.append((x, seqlens))
-            return "quantized"
-
-    loads = []
-
-    def _load_extension(name):
-        loads.append(name)
-        return _FakeFp8Ops()
-
-    monkeypatch.setattr(batchgen_kernels, "load_extension", _load_extension)
-    monkeypatch.setattr(glm5_moe_graph, "_fp8_ops_module", None)
-    x = object()
-    seqlens = object()
-
-    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
-    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
-    assert loads == ["batchgen_kernels.moe._C_fp8_blockwise_ops"]
-    assert calls == [(x, seqlens), (x, seqlens)]
 
 
 def _make_segment(**kwargs):
@@ -358,6 +332,7 @@ class _FakeLayerForGraph:
 class _FakeDsaSegment:
     max_seqlen = 16
     index_topk = 8
+    consumes_fused_hidden_fp8 = False
     primary_blocked_k = torch.empty(1, 1, 1, 6)
     aux_blocked_k = torch.empty(1, 1, 1, 3)
 
@@ -548,3 +523,75 @@ def test_glm5_whole_model_forward_counts_the_probe_marks_per_forward():
     from batchgen.models.glm.glm5.criticality_probe import SITE_INDEX
 
     assert probe.layer_marks[SITE_INDEX["after_attention"]] == 2
+
+
+def test_adapter_build_segments_reads_page_width_from_graph_storage(monkeypatch):
+    """build_segments sizes segments from the managers' CUDA-graph page-table
+    storage — the same source the worker's capture path reads. The KV manager
+    exposes no ``max_pages_per_sequence`` attribute, so the old read raised
+    AttributeError on the first call (the GLM-5 adapter seam was unreachable
+    and hid it)."""
+
+    import sys
+    import types as _types
+
+    from batchgen.models.glm.glm5.cuda_graph_adapter import Glm5CudaGraphAdapter
+
+    built = {}
+
+    class _FakeWholeSegment:
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+
+    fake_segments = _types.ModuleType(
+        "batchgen.models.glm.glm5.whole_model_cuda_graph_segments"
+    )
+    fake_segments.Glm5WholeModelSegment = _FakeWholeSegment
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen.models.glm.glm5.whole_model_cuda_graph_segments",
+        fake_segments,
+    )
+
+    class _Manager:
+        def __init__(self, width, kv_dtype):
+            self._width = width
+            self.config = SimpleNamespace(kv_dtype=kv_dtype)
+
+        def get_cuda_graph_page_table_storage(self):
+            return torch.full((4, self._width), -1, dtype=torch.int32)
+
+    attn = SimpleNamespace(
+        module=SimpleNamespace(
+            indexer=SimpleNamespace(index_topk=2048), num_heads=8
+        )
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]),
+        config=SimpleNamespace(vocab_size=151552, hidden_size=4096),
+    )
+    gpu_kv = SimpleNamespace(
+        primary=_Manager(96, torch.bfloat16),
+        auxiliary=_Manager(33, torch.float8_e4m3fn),
+    )
+
+    adapter = Glm5CudaGraphAdapter(
+        model_config=SimpleNamespace(),
+        engine_config=SimpleNamespace(),
+        world_size=16,
+        rank=0,
+    )
+    bundle = adapter.build_segments(
+        model=model,
+        bucketing=BatchSizeBucketing([1, 2, 4]),
+        gpu_kv_manager=gpu_kv,
+        world_size=16,
+        rank=0,
+        device=torch.device("cpu"),
+        max_seqlen_cap=8192,
+    )
+
+    assert built["max_pages_per_seq"] == 96
+    assert built["max_aux_pages_per_seq"] == 33
+    assert built["aux_kv_staging_dtype"] == torch.float8_e4m3fn
+    assert bundle.whole_model is not None

@@ -28,46 +28,24 @@ What these tests are defending:
 
 import ast
 import pathlib
-import sys
 import types
 
 import pytest
 import torch
 
+from tests.triton_cpu_stub import install_triton_cpu_stub
+
 
 def _import_kda_state_pool():
     """The real state pool, stubbing Triton only on a CPU-only box.
 
-    ``batchgen.kv_cache`` pulls in a Triton kernel module on import; the stub
-    convention is ``tests/unit/test_kda_layer_map_isolation.py``'s, so CI keeps
-    importing the real Triton when it is present.
+    ``batchgen.kv_cache`` pulls in a Triton kernel module on import. The stub
+    is the shared ``tests.triton_cpu_stub`` one, installed only when Triton is
+    absent, so CI keeps importing the real Triton and every test file on a
+    CPU box sees the same stub.
     """
 
-    try:
-        from batchgen.kv_cache.kda_state_gpu_manager import (
-            KDAStateGPUConfig,
-            KDAStateGPUManager,
-        )
-
-        return KDAStateGPUConfig, KDAStateGPUManager
-    except ModuleNotFoundError as exc:
-        if exc.name != "triton":
-            raise
-    triton_stub = types.ModuleType("triton")
-    triton_stub.jit = lambda fn: fn
-    triton_stub.autotune = lambda *args, **kwargs: (lambda fn: fn)
-    triton_stub.Config = lambda *args, **kwargs: None
-    triton_stub.cdiv = lambda a, b: -(-a // b)
-    language_stub = types.ModuleType("triton.language")
-    language_stub.constexpr = object
-    triton_stub.language = language_stub
-    extra_stub = types.ModuleType("triton.language.extra")
-    extra_stub.libdevice = types.ModuleType("triton.language.extra.libdevice")
-    language_stub.extra = extra_stub
-    sys.modules["triton"] = triton_stub
-    sys.modules["triton.language"] = language_stub
-    sys.modules["triton.language.extra"] = extra_stub
-    sys.modules["triton.language.extra.libdevice"] = extra_stub.libdevice
+    install_triton_cpu_stub()
     from batchgen.kv_cache.kda_state_gpu_manager import (
         KDAStateGPUConfig,
         KDAStateGPUManager,

@@ -72,15 +72,57 @@ def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
         if isinstance(node, ast.FunctionDef) and node.name == "prefill_prepacked"
     )
 
-    for function_name in ("_config_prefill_for_batch", "prefill_prepacked"):
-        calls = [
-            node
-            for node in ast.walk(functions[function_name])
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_active_batchgen_debug_for_sequences"
-        ]
-        assert calls, (
-            f"{function_name} must resolve batchgen_debug from the active "
-            "SequenceEntry objects used by persistent pool admissions"
-        )
+    # The invariant is that both prefill stages see batchgen_debug resolved
+    # from the admitted SequenceEntry objects, which is the only place a
+    # persistent pool admission carries it. prefill_prepacked resolves it
+    # itself. _config_prefill_for_batch no longer calls the resolver inline:
+    # the phase key owns the resolution and publishes it, and the config stage
+    # reads that published view. Pin the chain, not one call site, so the pin
+    # keeps guarding the invariant wherever the resolution lives.
+    prepacked_calls = [
+        node
+        for node in ast.walk(functions["prefill_prepacked"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_active_batchgen_debug_for_sequences"
+    ]
+    assert prepacked_calls, (
+        "prefill_prepacked must resolve batchgen_debug from the active "
+        "SequenceEntry objects used by persistent pool admissions"
+    )
+
+    key_calls = [
+        node
+        for node in ast.walk(functions["_desired_phase_key"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_active_batchgen_debug_for_sequences"
+    ]
+    assert key_calls, (
+        "_desired_phase_key must resolve batchgen_debug from the active "
+        "SequenceEntry objects before it publishes the phase debug view"
+    )
+
+    published = [
+        node
+        for node in ast.walk(functions["_desired_phase_key"])
+        if isinstance(node, ast.Attribute)
+        and node.attr == "_phase_prefill_debug"
+        and isinstance(node.ctx, ast.Store)
+    ]
+    assert published, (
+        "_desired_phase_key must publish the resolved view as "
+        "_phase_prefill_debug"
+    )
+
+    consumed = [
+        node
+        for node in ast.walk(functions["_config_prefill_for_batch"])
+        if isinstance(node, ast.Attribute)
+        and node.attr == "_phase_prefill_debug"
+        and isinstance(node.ctx, ast.Load)
+    ]
+    assert consumed, (
+        "_config_prefill_for_batch must read the published "
+        "_phase_prefill_debug instead of a batch-independent debug dict"
+    )
