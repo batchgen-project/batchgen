@@ -116,9 +116,11 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     ]
     # whole-model CUDA-graph decode on H200 (SGLang: cuda-graph-backend-decode full)
     assert config.Basic_Config.decode_graph_mode == "graph"
+    # solved from the row's memory budget (machine_profile
+    # solve_streamed_prefill_cap), in whole 4,096-row KDA segments
     assert (
         config.Module_Batching_Config.prefill_micro_batch_token_cap
-        == 8 * 65_536
+        == 114 * 4_096
     )
     assert (
         config.Module_Batching_Config
@@ -137,6 +139,17 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
         config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
         == 40 * GIB
     )
+
+
+def test_h200_four_node_plan_solves_its_own_streamed_cap():
+    config = _plan("h200", world_size=32)
+
+    assert config.Module_Batching_Config.prefill_micro_batch_token_cap == 115 * 4_096
+    # decode-side values are the two-node row's until measured on four nodes
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
+    assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
+    assert config.Module_Batching_Config.k3_shard_latent_projections is True
+    assert config.Module_Batching_Config.k3_shard_vocab_parallel is True
 
 
 def test_b300_single_node_plan_takes_its_own_kv_solved_slots():
@@ -173,7 +186,7 @@ def test_gb300_two_tray_plan_carries_the_inherited_values():
     [
         ("h20", 16),   # an EP16 shard does not fit an H20 GPU
         ("h200", 8),   # the EP8 shard does not fit an H200 GPU
-        ("h200", 32),  # never measured
+        ("h200", 64),  # never measured
         ("b300", 16),  # never measured
         ("gb300", 4),  # one tray cannot hold the routed expert set
         ("b200", 8),   # no K3 row

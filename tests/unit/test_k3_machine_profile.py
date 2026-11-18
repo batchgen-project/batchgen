@@ -16,10 +16,14 @@ from batchgen.models.moonshotai.kimi_linear.machine_profile import (
     K3_PREFILL_ACTIVATION_BYTES_PER_ROW,
     K3_PROFILE_ATTENTION_GROUP_SIZE,
     K3_PROFILES,
+    K3_STREAMED_PREFILL_CAP_QUANTUM,
+    K3_STREAMED_PREFILL_HEADROOM_GIB,
+    K3DecodeBudget,
     UnsupportedK3TopologyError,
     k3_engine_profile,
     k3_profile_knob_names,
     solve_kda_user_slots,
+    solve_streamed_prefill_cap,
 )
 
 GIB = 1024 ** 3
@@ -29,7 +33,7 @@ IDS = [f"{row.family.value}-w{row.world_size}" for row in ROWS]
 
 def test_the_supported_topologies_are_exactly_these():
     assert sorted((fam.value, world) for fam, world in K3_PROFILES) == [
-        ("b300", 8), ("gb300", 8), ("h20", 32), ("h200", 16),
+        ("b300", 8), ("gb300", 8), ("h20", 32), ("h200", 16), ("h200", 32),
     ]
 
 
@@ -93,6 +97,67 @@ def test_streamed_cap_against_crossover_and_hbm(row):
         _exception(row, "prefill_micro_batch_token_cap", True, "tracked")
     if not (stream_bound or overrun):
         assert reason is None, f"stale exception on {row.family.value}: {reason}"
+
+
+def _budget(**overrides):
+    values = dict(
+        device_total_gib=100.0, gpu_memory_frac=1.0, non_slot_base_gib=50.0,
+        prefill_non_expert_gib=20.0, graph_reserve_gib=2.0,
+        full_length_tokens=4096, source="test",
+    )
+    values.update(overrides)
+    return K3DecodeBudget(**values)
+
+
+def test_streamed_cap_solve_is_the_budget_identity():
+    budget = _budget()
+    cap = solve_streamed_prefill_cap(budget)
+    free_bytes = (100.0 - 20.0 - K3_STREAMED_PREFILL_HEADROOM_GIB) * GIB
+    # whole KDA segments, the largest count that fits, and not one more
+    assert cap % K3_STREAMED_PREFILL_CAP_QUANTUM == 0
+    assert cap * K3_PREFILL_ACTIVATION_BYTES_PER_ROW <= free_bytes
+    assert (
+        (cap + K3_STREAMED_PREFILL_CAP_QUANTUM)
+        * K3_PREFILL_ACTIVATION_BYTES_PER_ROW
+        > free_bytes
+    )
+    # more memory in use before the pass -> a smaller cap, never the same one
+    assert solve_streamed_prefill_cap(_budget(prefill_non_expert_gib=40.0)) < cap
+    assert solve_streamed_prefill_cap(_budget(gpu_memory_frac=0.9)) < cap
+
+
+def test_streamed_cap_solve_refuses_a_budget_below_one_segment():
+    with pytest.raises(ValueError, match="less than one KDA segment"):
+        solve_streamed_prefill_cap(_budget(prefill_non_expert_gib=96.0))
+
+
+@pytest.mark.parametrize("world_size", [16, 32])
+def test_h200_rows_solve_their_streamed_cap_from_the_budget(world_size):
+    row = k3_engine_profile(MachineFamily.H200, world_size)
+    assert row.prefill_micro_batch_token_cap == solve_streamed_prefill_cap(
+        row.decode_budget
+    )
+    # The cap that ran out of memory on both topologies is no longer planned,
+    # and no exception is needed to carry a solved cap.
+    assert row.prefill_micro_batch_token_cap < 518_718
+    assert "prefill_micro_batch_token_cap" not in row.derivation_exceptions
+    assert "solve_streamed_prefill_cap" in row.sources["prefill_micro_batch_token_cap"]
+
+
+def test_h200_four_node_row_states_what_is_measured_and_what_is_inherited():
+    row = k3_engine_profile(MachineFamily.H200, 32)
+    two_node = k3_engine_profile(MachineFamily.H200, 16)
+    assert row.num_nodes == 4
+    assert row.decode_budget.prefill_non_expert_gib == pytest.approx(39.55, abs=0.01)
+    # an EP32 rank holds half the EP16 resident shard
+    assert two_node.decode_budget.non_slot_base_gib - row.decode_budget.non_slot_base_gib == (
+        pytest.approx(42.10, abs=0.01)
+    )
+    assert row.kda_slots_basis.startswith("inherited:")
+    for knob in ("kda_user_slots", "resident_ep_prefill_token_cap",
+                 "prefix_pool_workspace_bytes"):
+        assert getattr(row, knob) == getattr(two_node, knob)
+        assert "provisional" in row.sources[knob]
 
 
 @pytest.mark.parametrize("row", ROWS, ids=IDS)

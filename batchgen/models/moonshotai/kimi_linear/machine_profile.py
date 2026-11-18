@@ -190,6 +190,38 @@ def solve_kda_user_slots(
     return free_gib / (slot_gib + kv_gib)
 
 
+#: Device memory the streamed-prefill cap solve leaves unplanned: allocator
+#: fragmentation and the parts of a pass that do not grow with its rows
+#: (per-layer weight staging, chunk-bounded normalization temporaries).
+K3_STREAMED_PREFILL_HEADROOM_GIB = 4.0
+
+#: The cap is taken in whole KDA prefill segments.
+K3_STREAMED_PREFILL_CAP_QUANTUM = 4096
+
+
+def solve_streamed_prefill_cap(budget: K3DecodeBudget) -> int:
+    """Largest streamed-prefill micro-batch (node rows) the budget holds.
+
+    A streamed pass releases the resident shard, so its rows compete only
+    with ``prefill_non_expert_gib``: ``rows * K3_PREFILL_ACTIVATION_BYTES_PER_ROW
+    = budget - prefill non-expert - headroom``. Every rank plans from the
+    same row, so the cap is identical across ranks; it is never read from a
+    rank's live free memory.
+    """
+    free_bytes = (
+        budget.budget_gib
+        - budget.prefill_non_expert_gib
+        - K3_STREAMED_PREFILL_HEADROOM_GIB
+    ) * _GIB
+    rows = int(free_bytes // K3_PREFILL_ACTIVATION_BYTES_PER_ROW)
+    if rows < K3_STREAMED_PREFILL_CAP_QUANTUM:
+        raise ValueError(
+            "the streamed-prefill budget holds less than one KDA segment: "
+            f"{free_bytes / _GIB:.2f} GiB free"
+        )
+    return rows - rows % K3_STREAMED_PREFILL_CAP_QUANTUM
+
+
 @dataclass(frozen=True)
 class K3EngineProfile:
     """Every machine-dependent K3 knob for one (family, node count) at TP8."""
@@ -232,7 +264,9 @@ def k3_profile_knob_names() -> tuple[str, ...]:
 # Values shared by rows (each row still states its own source).               #
 # --------------------------------------------------------------------------- #
 
-_H200_STREAMED_CAP = 524_288
+#: The streamed cap the Blackwell rows ran under the retired memory tiers.
+#: The H200 rows solve theirs (``solve_streamed_prefill_cap``).
+_INHERITED_STREAMED_CAP = 524_288
 _H200_RESIDENT_CAP = 16_384
 _H200_RESIDENT_CHUNK_ROWS = 2_048
 _H200_GROUPED_CHUNK_ROWS = 32_768
@@ -319,6 +353,20 @@ _H20_W32 = K3EngineProfile(
 # (MEASURED 2026-09-05, world16 resident-EP decode): at 192 unsharded slots,
 # parked prefilled sequences that GPU KV could not decode cut node throughput
 # from 382 to 219 tok/s, which is why the solve is taken at full length.
+_H200_W16_BUDGET = K3DecodeBudget(
+    device_total_gib=139.81,
+    gpu_memory_frac=0.97,
+    non_slot_base_gib=106.6,
+    prefill_non_expert_gib=39.96,
+    graph_reserve_gib=2.0,
+    full_length_tokens=4096,
+    source=(
+        "MEASURED 2026-09-05: non-slot base 119.66 GB unsharded at frac "
+        "0.97, minus 8.3 + 3.84 GiB of sharding; prefill non-expert = "
+        "42.91 GB in use at the first iteration of a streamed pass"
+    ),
+)
+
 _H200_W16 = K3EngineProfile(
     family=MachineFamily.H200,
     num_nodes=2,
@@ -329,32 +377,21 @@ _H200_W16 = K3EngineProfile(
         "measured: 2-node world16 resident-EP decode with sharded latent and "
         "vocab, short-decode corpus fully admitted from the first wave"
     ),
-    prefill_micro_batch_token_cap=_H200_STREAMED_CAP,
+    prefill_micro_batch_token_cap=solve_streamed_prefill_cap(_H200_W16_BUDGET),
     resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
     prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
     prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
-    decode_budget=K3DecodeBudget(
-        device_total_gib=139.81,
-        gpu_memory_frac=0.97,
-        non_slot_base_gib=106.6,
-        prefill_non_expert_gib=39.96,
-        graph_reserve_gib=2.0,
-        full_length_tokens=4096,
-        source=(
-            "MEASURED 2026-09-05: non-slot base 119.66 GB unsharded at frac "
-            "0.97, minus 8.3 + 3.84 GiB of sharding; prefill non-expert = "
-            "42.91 GB in use at the first iteration of a streamed pass"
-        ),
-    ),
+    decode_budget=_H200_W16_BUDGET,
     sources=MappingProxyType({
         "shard_latent_projections": "measured: TP8-sharded latent validated on 2-node H200",
         "shard_vocab_parallel": "measured: vocab-parallel validated on 2-node H200",
         "kda_user_slots": "measured (see kda_slots_basis)",
         "prefill_micro_batch_token_cap": (
-            "eight 64K node-local prompts in one layer-wise pass with the "
-            "resident shard released"
+            "solved from decode_budget: the rows the device holds beside the "
+            "prefill non-expert memory with the resident shard released "
+            "(solve_streamed_prefill_cap)"
         ),
         "resident_ep_prefill_token_cap": (
             "~25 GB beside the 84 GiB resident shard; the global FP32 MoE "
@@ -373,13 +410,69 @@ _H200_W16 = K3EngineProfile(
             "grouped MoE FP32 output at the chunk cap, plus margin"
         ),
     }),
-    derivation_exceptions=MappingProxyType({
-        "prefill_micro_batch_token_cap": (
-            "tracked HBM overrun: a 518,718-row streamed pass ran out of "
-            "memory (sub-project "
-            "k3-streamed-prefill-microbatch-cap-exceeds-activation-budget); "
-            "the cap stays until that sub-project measures the limit"
+)
+
+# H200, 4 nodes x 8 (world 32).
+#
+# MEASURED 2026-11-15 on a 4-node group (Kimi-K3.1-Pro, sharded latent and
+# vocab): 42.47 GB in use before the first streamed pass; a 128-prompt batch
+# of ~8K tokens prefilled and decoded; a 512-prompt batch ran out of memory
+# with its micro-batches at 524,288 node rows, which is why the cap is solved
+# here rather than inherited. The decode side is not measured on this
+# topology: the slot count is the two-node row's, and the non-slot base is
+# that row's minus the half of the resident shard an EP32 rank no longer
+# holds.
+_H200_W32_BUDGET = K3DecodeBudget(
+    device_total_gib=139.81,
+    gpu_memory_frac=0.97,
+    non_slot_base_gib=106.6 - (
+        K3_GEOMETRY.resident_shard_bytes(16) - K3_GEOMETRY.resident_shard_bytes(32)
+    ) / _GIB,
+    prefill_non_expert_gib=42.47e9 / _GIB,
+    graph_reserve_gib=2.0,
+    full_length_tokens=4096,
+    source=(
+        "MEASURED 2026-11-15: 42.47 GB in use before the first streamed pass "
+        "on a 4-node group; non-slot base ESTIMATED as the two-node base "
+        "minus the EP16-to-EP32 resident shard difference"
+    ),
+)
+
+_INHERITED_H200_W16 = (
+    "inherited from the two-node h200 row; provisional until measured on "
+    "four nodes"
+)
+
+_H200_W32 = K3EngineProfile(
+    family=MachineFamily.H200,
+    num_nodes=4,
+    shard_latent_projections=True,
+    shard_vocab_parallel=True,
+    kda_user_slots=256,
+    kda_slots_basis="inherited: " + _INHERITED_H200_W16,
+    prefill_micro_batch_token_cap=solve_streamed_prefill_cap(_H200_W32_BUDGET),
+    resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
+    resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
+    prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
+    prefill_collective_stripe_threshold_rows=_H200_STRIPE_THRESHOLD_ROWS,
+    prefix_pool_workspace_bytes=_H200_PREFIX_POOL_BYTES,
+    decode_budget=_H200_W32_BUDGET,
+    sources=MappingProxyType({
+        "shard_latent_projections": (
+            "measured 2026-11-15: 4-node runs with sharded latent prefilled "
+            "and decoded"
         ),
+        "shard_vocab_parallel": "measured 2026-11-15: same runs, vocab-parallel on",
+        "kda_user_slots": _INHERITED_H200_W16,
+        "prefill_micro_batch_token_cap": (
+            "solved from decode_budget (solve_streamed_prefill_cap); the "
+            "inherited 524,288 rows ran out of memory on 2026-11-15"
+        ),
+        "resident_ep_prefill_token_cap": _INHERITED_H200_W16,
+        "resident_prefill_chunk_rows": _INHERITED_H200_W16,
+        "prefill_grouped_chunk_rows": _INHERITED_H200_W16,
+        "prefill_collective_stripe_threshold_rows": _INHERITED_H200_W16,
+        "prefix_pool_workspace_bytes": _INHERITED_H200_W16,
     }),
 )
 
@@ -407,7 +500,7 @@ _B300_W8 = K3EngineProfile(
     shard_vocab_parallel=True,
     kda_user_slots=360,
     kda_slots_basis="kv-solve",
-    prefill_micro_batch_token_cap=_H200_STREAMED_CAP,
+    prefill_micro_batch_token_cap=_INHERITED_STREAMED_CAP,
     resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
@@ -455,7 +548,7 @@ _GB300_W8 = K3EngineProfile(
     shard_vocab_parallel=True,
     kda_user_slots=256,
     kda_slots_basis="inherited: " + _INHERITED_H200,
-    prefill_micro_batch_token_cap=_H200_STREAMED_CAP,
+    prefill_micro_batch_token_cap=_INHERITED_STREAMED_CAP,
     resident_ep_prefill_token_cap=_H200_RESIDENT_CAP,
     resident_prefill_chunk_rows=_H200_RESIDENT_CHUNK_ROWS,
     prefill_grouped_chunk_rows=_H200_GROUPED_CHUNK_ROWS,
@@ -488,7 +581,7 @@ _GB300_W8 = K3EngineProfile(
 
 K3_PROFILES: Mapping[tuple[MachineFamily, int], K3EngineProfile] = MappingProxyType({
     (row.family, row.world_size): row
-    for row in (_H20_W32, _H200_W16, _B300_W8, _GB300_W8)
+    for row in (_H20_W32, _H200_W16, _H200_W32, _B300_W8, _GB300_W8)
 })
 
 
