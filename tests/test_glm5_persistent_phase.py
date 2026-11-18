@@ -318,6 +318,54 @@ def test_prefill_nsys_profile_is_inert_without_batch_debug():
     assert active is False
 
 
+def test_prefill_nsys_profile_reads_the_admitted_sequences_debug():
+    # A pool-served wave never populates the worker-level debug dict: the
+    # batch flag lives on the admitted sequences, and the capture window must
+    # open from there or the pool path cannot be profiled at all.
+    begin = _isolated_worker_method("_nsys_prefill_profile_begin")
+    seen = {}
+
+    class _Engine:
+        def _nsys_prefill_profile_begin(self, worker, **kwargs):
+            seen.update(kwargs)
+            return True
+
+    sequences = [object(), object()]
+    lookups = []
+
+    def _debug_for(seqs):
+        lookups.append(seqs)
+        return {"glm5_prefill_nsys_profile": True}
+
+    worker = SimpleNamespace(
+        _batchgen_debug={},
+        _step_observability_engine=_Engine(),
+        _active_batchgen_debug_for_sequences=_debug_for,
+    )
+
+    assert begin(worker, local_bsz=3, global_bsz=24, sequences=sequences) is True
+    assert lookups == [sequences]
+    assert seen == {
+        "local_bsz": 3,
+        "global_bsz": 24,
+        "debug": {"glm5_prefill_nsys_profile": True},
+    }
+
+
+def test_prefill_nsys_window_wraps_the_only_prefill_dispatch():
+    # Both prefill forwards (per-batch and the in-wave pool, which
+    # prefill_prepacked dispatches to) are entered from one place; the window
+    # must bracket it, and no second caller may bypass the bracket.
+    source = (ROOT / "batchgen" / "batchgen_worker.py").read_text()
+    begin = source.index("self._nsys_prefill_profile_begin(")
+    dispatch = source.index("self.prefill_prepacked(local_prefill_indices)")
+    end = source.index("self._nsys_prefill_profile_end(_prefill_profile_active)")
+    assert begin < dispatch < end
+    assert source.count("self.prefill_prepacked(") == 1
+    assert source.count("self.prefill(local_prefill_indices)") == 1
+    assert begin < source.index("self.prefill(local_prefill_indices)") < end
+
+
 def test_cuda_python_runtime_dependency_is_declared():
     requirements = (ROOT / "requirements.txt").read_text().splitlines()
     assert "cuda-python==13.3.1" in requirements
