@@ -178,6 +178,12 @@ def _name_patterns() -> Tuple[Tuple[str, Glm5Release], ...]:
     )
 
 
+def releases_by_name() -> Dict[str, Glm5Release]:
+    """Released name -> release: the ids the GLM config resolver looks a
+    ``--model`` value up in (through ``batchgen.config.model_identity``)."""
+    return dict(_name_patterns())
+
+
 def model_name_patterns() -> Dict[str, str]:
     """Pattern -> model_type rows of ``model_registry.MODEL_NAME_PATTERNS``."""
     return {pattern: release.model_type for pattern, release in _name_patterns()}
