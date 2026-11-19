@@ -116,6 +116,113 @@ def test_kda_release_without_optional_model_is_noop(monkeypatch):
     store.free_kda_sequences([1, 2])
 
 
+def _state_owner(*, built=True):
+    """A model-declared recurrent-state owner, pools built or not."""
+    freed = []
+    manager = SimpleNamespace(
+        config=SimpleNamespace(num_state_items=4),
+        sequence_state_items={7: 0},
+    )
+    return SimpleNamespace(
+        state_manager=manager if built else None,
+        slot_manager=object() if built else None,
+        free_sequences=freed.extend,
+        freed=freed,
+    )
+
+
+def test_model_without_recurrent_state_reads_as_absent():
+    # The provider returning None is a model that declares no owner.
+    for store in (TrajectoryStore(), TrajectoryStore(recurrent_state_owner=lambda: None)):
+        assert store.kda_state_manager() is None
+        assert store.kda_stats() == (-1, -1)
+        store.free_kda_sequences([1, 2])
+        with pytest.raises(TrajectoryStateUnavailable, match="this deployment has none"):
+            store.build_committer(
+                rank=0,
+                runtime=SimpleNamespace(),
+                group_geometry=(1, 0, True),
+                host_views_provider=lambda: {},
+                next_pseudo_sid=lambda: -1,
+            )
+
+
+def test_declared_owner_serves_manager_stats_and_release():
+    owner = _state_owner()
+    store = TrajectoryStore(recurrent_state_owner=lambda: owner)
+    assert store.kda_state_manager() is owner.state_manager
+    assert store.kda_stats() == (4, 1)
+    store.free_kda_sequences([])
+    store.free_kda_sequences(iter([3, 5]))
+    assert owner.freed == [3, 5]
+
+
+def test_owner_before_its_pools_exist_is_a_noop():
+    owner = _state_owner(built=False)
+    store = TrajectoryStore(recurrent_state_owner=lambda: owner)
+    assert store.kda_state_manager() is None
+    assert store.kda_stats() == (-1, -1)
+    store.free_kda_sequences([3])
+    assert owner.freed == []
+
+
+def test_owner_is_resolved_on_every_call_not_cached():
+    # The store is built before the worker has a PSM, so the first answer
+    # (None) must not stick once the model has declared its owner.
+    declared = []
+    store = TrajectoryStore(
+        recurrent_state_owner=lambda: declared[0] if declared else None
+    )
+    assert store.kda_state_manager() is None
+    declared.append(_state_owner())
+    assert store.kda_state_manager() is declared[0].state_manager
+
+
+# The seam: the worker names no model to reach the state; it asks the PSM.
+def test_worker_resolves_the_owner_through_the_psm_declaration():
+    resolve = _worker_method_from_source("_recurrent_state_owner")
+    owner = object()
+    assert resolve(SimpleNamespace()) is None
+    assert resolve(SimpleNamespace(parallel_manager=None)) is None
+    assert resolve(SimpleNamespace(parallel_manager=SimpleNamespace())) is None
+    declaring = SimpleNamespace(recurrent_state_owner=lambda: owner)
+    assert resolve(SimpleNamespace(parallel_manager=declaring)) is owner
+
+
+def test_scaffolding_never_imports_the_model_state_wrapper():
+    root = Path(__file__).parents[2] / "batchgen"
+    worker = (root / "batchgen_worker.py").read_text()
+    assert "TrajectoryStore(recurrent_state_owner=self._recurrent_state_owner)" in worker
+    for path in [root / "batchgen_worker.py", *sorted((root / "worker").glob("*.py"))]:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            elif isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            else:
+                continue
+            for module in modules:
+                assert not module.endswith("kimi_linear.wrappers"), (path.name, node.lineno)
+
+
+def test_kimi_linear_psm_declares_the_kda_wrapper_as_owner():
+    # Read from source: importing the PSM needs the GPU kernel stack.
+    path = (
+        Path(__file__).parents[2] / "batchgen" / "models" / "moonshotai"
+        / "kimi_linear" / "Parallel_Strategy_Manager.py"
+    )
+    psm = next(
+        node for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "KimiLinearParallelStrategyManager"
+    )
+    declares = next(
+        node for node in psm.body
+        if isinstance(node, ast.FunctionDef) and node.name == "recurrent_state_owner"
+    )
+    assert ast.unparse(declares.body[-1]) == "return KimiLinearKDAWrapper"
+
+
 def test_frontier_prefix_is_available_without_eager_builder():
     store = TrajectoryStore()
     assert isinstance(store.FRONTIER_PREFIX, str)
@@ -355,8 +462,8 @@ def test_follower_trajectory_state_unavailable_raises(monkeypatch):
 	from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
 
 	monkeypatch.setattr(KimiLinearKDAWrapper, "state_manager", None, raising=False)
-	# Constructed the way the worker constructs it: the KDA wrapper is injected.
-	store = TrajectoryStore(kda_wrapper_loader=lambda: KimiLinearKDAWrapper)
+	# Constructed the way the worker constructs it: the owner is injected.
+	store = TrajectoryStore(recurrent_state_owner=lambda: KimiLinearKDAWrapper)
 	store.trajectory_mirrored_restores = {9: {}}
 	worker = SimpleNamespace()
 	worker._traj = store

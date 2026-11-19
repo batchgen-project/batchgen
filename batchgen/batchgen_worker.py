@@ -205,12 +205,6 @@ from batchgen.worker.step_observability_engine import StepObservabilityEngine
 from batchgen.worker.rank_sync_engine import RankSyncEngine
 
 
-def _load_kda_wrapper():
-	# The only model-package import behind TrajectoryStore: batchgen/worker/
-	# must not depend on batchgen.models, so the store receives this loader.
-	# ImportError propagates so each store call site keeps its old handling.
-	from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-	return KimiLinearKDAWrapper
 from batchgen.worker.rank_context import RankContext, node_of_rank
 from batchgen.worker.sequence_table import SequenceTable
 from batchgen.utils import config_torch_module_initializer
@@ -1109,7 +1103,7 @@ class BatchGenWorker:
 		self.local_world_size = args.local_world_size
 		# S3.5 state owners.  They are created eagerly so flag-off paths are
 		# plain field reads and the pool pseudo-sid seed is unconditional.
-		self._traj = TrajectoryStore(kda_wrapper_loader=_load_kda_wrapper)
+		self._traj = TrajectoryStore(recurrent_state_owner=self._recurrent_state_owner)
 		self._prefix = PrefixReuseState(rank=self.rank, world_size=self.world_size)
 		self.pynccl_port_base = args.pynccl_port_base
 		self.pynccl_port_span = args.pynccl_port_span
@@ -4157,6 +4151,18 @@ class BatchGenWorker:
 			self,
 			local_sequence_ids,
 		)
+
+	def _recurrent_state_owner(self):
+		"""Owner of the model's per-sequence recurrent state, or None.
+
+		Read from the PSM like the other optional model declarations, so the
+		worker names no model: a model that keeps no such state declares
+		nothing, and before the PSM is built no state pool can exist yet.
+		"""
+		declares = getattr(
+			getattr(self, "parallel_manager", None), "recurrent_state_owner", None
+		)
+		return None if declares is None else declares()
 
 	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
 		# The engine receives this worker as its sole state collaborator.
