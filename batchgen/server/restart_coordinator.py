@@ -17,6 +17,14 @@ keys and the store itself, from server start on.  A node that is gone -- killed
 hard, or never started -- publishes nothing, so its silence is the only signal
 the others get.
 
+A heartbeat proves the liveness of ONE server process: each beat carries the
+incarnation of the process that wrote it, and a watcher follows the first
+incarnation it sees for a peer.  The cohort a process belongs to dies with it,
+so a node whose key is then written by another incarnation has lost its old
+process -- however soon its new one started beating -- and a new process can
+only ever join a cluster through a start-up of its own, never by continuing
+its predecessor's heartbeat.
+
 A single-node server creates no store at all and every method here returns
 immediately, so its restart keeps exactly the phases and timings it had; only
 the epoch is still counted, locally, because it names the cohort a restart
@@ -29,6 +37,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -69,16 +78,19 @@ _REASON_MAX_CHARS = 400
 # connected before node 0 finished its own start-up up to that point.
 _RUN_IDENTITY_WAIT_S = 60.0
 
-# Cluster liveness.  Every node bumps its heartbeat key this often; a peer
-# whose key has not moved for PEER_DEAD_S is gone.  A peer that never wrote one
-# is still starting -- connecting to node 0's store and staging weights can
-# take minutes -- so its absence turns fatal only JOIN_GRACE_S after this
-# node's watch began, which is also what bounds a peer that never starts.
-# The same grace bounds the other direction: node 0 opens its store first
-# thing in its start-up, so a peer that cannot connect to it for JOIN_GRACE_S
-# fails its start-up naming node 0.
+# Cluster liveness.  Every node rewrites its heartbeat key this often with its
+# process incarnation and a beat count; a peer whose key has not moved for
+# PEER_DEAD_S is gone, and so is one whose key a different incarnation now
+# holds: the process that was watched can never beat again.  A peer that never
+# wrote one is still starting -- connecting to node 0's store and staging
+# weights can take minutes -- so its absence turns fatal only JOIN_GRACE_S
+# after this node's watch began, which is also what bounds a peer that never
+# starts.  The same grace bounds the other direction: node 0 opens its store
+# first thing in its start-up, so a peer that cannot connect to it for
+# JOIN_GRACE_S fails its start-up naming node 0.
 # Node 0 owns the store in its own process, so no store call succeeding for
-# CONTROL_DEAD_S means node 0 is gone.
+# CONTROL_DEAD_S means node 0 is gone; a restarted node 0 is a new, empty
+# store that no old peer's connection reaches.
 HEARTBEAT_S = 2.0
 PEER_DEAD_S = 15.0
 JOIN_GRACE_S = 600.0
@@ -160,6 +172,26 @@ def _down_key(generation: int, node: int) -> str:
 
 def _alive_key(node: int) -> str:
     return f"alive/node{node}"
+
+
+# Separates the incarnation from the beat count in a heartbeat value. Neither
+# part is a time: a heartbeat is judged on the watcher's own clock only.
+_ALIVE_SEP = ":"
+
+
+def _alive_value(incarnation: str, beat: int) -> str:
+    return f"{incarnation}{_ALIVE_SEP}{beat}"
+
+
+def _parse_alive(key: str, value: Any) -> Tuple[str, str]:
+    """The (incarnation, beat) a heartbeat value names; anything else fails."""
+    incarnation, sep, beat = _text(value).rpartition(_ALIVE_SEP)
+    if not sep or not incarnation or not beat:
+        raise ValueError(
+            f"heartbeat {key} holds {_text(value)!r}, not "
+            f"'<incarnation>{_ALIVE_SEP}<beat>'"
+        )
+    return incarnation, beat
 
 
 def _text(value: Any) -> str:
@@ -261,11 +293,17 @@ class RestartCoordinator:
         self._control_error: Optional[str] = None
         self._reported_error: Optional[str] = None
         self._reported_down: set = set()
-        # Liveness as this node's follower saw it: when the watch began, each
-        # peer's last heartbeat value and when it last moved, and the peers
-        # already reported lost.
+        # This server process, as its heartbeat names it to the peers: one
+        # coordinator per server process, so a fresh process is a fresh
+        # incarnation. Random rather than derived from a pid or a time, so
+        # it never repeats across hosts, containers or clocks.
+        self._incarnation = uuid.uuid4().hex
+        self._beats = 0
+        # Liveness as this node's follower saw it: when the watch began, for
+        # each peer the incarnation it follows, that incarnation's last beat
+        # and when the beat last moved, and the peers already reported lost.
         self._watch_started_at: Optional[float] = None
-        self._peer_ticks: Dict[int, Tuple[str, float]] = {}
+        self._peer_ticks: Dict[int, Tuple[str, str, float]] = {}
         self._reported_lost: set = set()
         # When a store call last succeeded on the follower or the heartbeat.
         # Once nothing has for CONTROL_DEAD_S the store is declared dead:
@@ -305,6 +343,11 @@ class RestartCoordinator:
     def control_error(self) -> Optional[str]:
         return self._control_error
 
+    @property
+    def incarnation(self) -> str:
+        """The server process this node's heartbeat proves alive."""
+        return self._incarnation
+
     def start(self) -> None:
         """Open the control store; node 0 hosts it for the server's whole life.
 
@@ -321,12 +364,13 @@ class RestartCoordinator:
         else:
             self._store = self._connect_to_node0()
         logger.info(
-            "Restart control store %s at %s:%d (node %d of %d)",
+            "Restart control store %s at %s:%d (node %d of %d, incarnation %s)",
             "hosted" if self._node_rank == 0 else "connected",
             self._host,
             self._port,
             self._node_rank,
             self._nnodes,
+            self._incarnation,
         )
 
     def _open_store(self) -> Any:
@@ -663,40 +707,69 @@ class RestartCoordinator:
         clock, so a peer's clock never matters and a follower that was busy
         for minutes does not mistake a live peer for a dead one: by then the
         value has moved.
+
+        What is watched is one server process: the first incarnation seen for
+        a peer. A beat of another incarnation is no movement of that one --
+        the watched process is gone and can never beat again -- so it is lost
+        at once, ``age`` being how long ago it last beat. That holds however
+        soon the new process started and however long this follower was away.
         """
         store = self._require_store()
         for node in range(self._nnodes):
             if node == self._node_rank or node in self._reported_lost:
                 continue
             key = _alive_key(node)
+            replaced_by = None
             if store.check([key]):
-                tick = _text(store.get(key))
+                incarnation, beat = _parse_alive(key, store.get(key))
                 seen = self._peer_ticks.get(node)
-                if seen is None or seen[0] != tick:
-                    self._peer_ticks[node] = (tick, now)
+                if seen is None or (seen[0] == incarnation and seen[1] != beat):
+                    self._peer_ticks[node] = (incarnation, beat, now)
                     continue
-                age = now - seen[1]
+                watched, _beat, moved_at = seen
+                age = now - moved_at
                 limit = self._peer_dead_s
+                if incarnation != watched:
+                    replaced_by = incarnation
+                    limit = 0.0
             else:
                 started = self._watch_started_at
                 age = 0.0 if started is None else now - started
                 limit = self._join_grace_s
             if age >= limit:
                 self._reported_lost.add(node)
-                logger.error(
-                    "Peer node %d heartbeat %s for %.1fs",
-                    node,
-                    "stopped" if node in self._peer_ticks else "never seen",
-                    age,
-                )
+                if replaced_by is not None:
+                    logger.error(
+                        "Peer node %d server process %s is gone: incarnation "
+                        "%s now beats in its place, %.1fs after its last beat",
+                        node,
+                        self._peer_ticks[node][0],
+                        replaced_by,
+                        age,
+                    )
+                else:
+                    logger.error(
+                        "Peer node %d heartbeat %s for %.1fs",
+                        node,
+                        "stopped" if node in self._peer_ticks else "never seen",
+                        age,
+                    )
                 return node, age
         return None
 
     # ---------------------- Heartbeat ----------------------
     def _beat(self) -> None:
-        """Advance this node's heartbeat by one tick."""
+        """Advance this node's heartbeat by one beat of this incarnation.
+
+        Written whole, never added to: a counter any process can advance
+        would let a successor carry on its predecessor's heartbeat.
+        """
+        self._beats += 1
         try:
-            self._require_store().add(_alive_key(self._node_rank), 1)
+            self._require_store().set(
+                _alive_key(self._node_rank),
+                _alive_value(self._incarnation, self._beats),
+            )
         except Exception as exc:
             self._record_control_error(exc)
             return

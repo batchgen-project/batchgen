@@ -117,6 +117,22 @@ def _run_watchdog(node, hooks, clock, seconds, *, poll=False, beat_every=None):
         node._check_control(hooks)
 
 
+def _beat_as(store, node, incarnation, beat):
+    """One heartbeat of ``node`` written as ``incarnation`` would write it."""
+    store.set(
+        coordinator_module._alive_key(node),
+        coordinator_module._alive_value(incarnation, beat),
+    )
+
+
+def _beats_in_store(store, node):
+    key = coordinator_module._alive_key(node)
+    value = store.snapshot().get(key)
+    if value is None:
+        return 0
+    return int(coordinator_module._parse_alive(key, value)[1])
+
+
 # --------------------------------------------------------------- heartbeats
 
 
@@ -168,7 +184,7 @@ def test_a_peer_that_never_beats_is_lost_only_after_the_join_grace():
     hooks, seen = _watch(node0)
 
     # Node 1 beats once and then stays silent; node 2 never beats at all.
-    store.add("alive/node1", 1)
+    _beat_as(store, 1, "node1-process", 1)
     node0._follow_once(hooks)
     clock.advance(coordinator_module.PEER_DEAD_S)
     node0._follow_once(hooks)
@@ -201,7 +217,7 @@ def test_the_heartbeat_runs_on_its_own_thread_and_a_closed_peer_is_lost():
         )
     names = {thread.name for thread in threading.enumerate()}
     assert {"restart-coordinator", "restart-coordinator-heartbeat"} <= names
-    assert _wait_until(lambda: int(store.snapshot().get("alive/node1", 0)) > 3)
+    assert _wait_until(lambda: _beats_in_store(store, 1) > 3)
 
     # Beating: a jump far past the limit changes nothing.
     clock.advance(10 * coordinator_module.PEER_DEAD_S)
@@ -213,6 +229,284 @@ def test_the_heartbeat_runs_on_its_own_thread_and_a_closed_peer_is_lost():
     clock.advance(coordinator_module.PEER_DEAD_S)
     assert _wait_until(lambda: lost and lost[0][0] == 1)
     node0.close()
+
+
+# ------------------------------------------- one heartbeat, one server process
+#
+# A heartbeat proves the liveness of one server process incarnation. Node 1's
+# server is killed hard below (no close(): its heartbeat simply stops) and a
+# new coordinator for node 1 -- the next server process on that node -- beats
+# into the same key. Its predecessor's cohort and its place in the world are
+# gone, so the watcher must report the loss, never read the new beats as the
+# old process carrying on.
+
+
+def _replace_peer(store, clock, node_rank=1, **kwargs):
+    """The next server process on ``node_rank``: a fresh coordinator."""
+    return _coordinator(store, clock, node_rank=node_rank, **kwargs)
+
+
+def test_a_peer_server_replaced_inside_the_loss_window_is_lost_at_once():
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    old_node1 = _coordinator(store, clock, node_rank=1)
+    hooks, seen = _watch(node0)
+    old_node1._beat()
+    node0._follow_once(hooks)
+    clock.advance(coordinator_module.HEARTBEAT_S)
+    old_node1._beat()
+    node0._follow_once(hooks)
+
+    # Killed hard, and the next server process beats 3 s later: well inside
+    # PEER_DEAD_S, so the old key never stood still long enough to time out.
+    clock.advance(3.0)
+    new_node1 = _replace_peer(store, clock)
+    new_node1._beat()
+    node0._follow_once(hooks)
+
+    assert seen.lost == [(1, pytest.approx(3.0))]
+    # The new process beating on for many windows is never a second report,
+    # and never brings the old one back.
+    for _ in range(int(10 * coordinator_module.PEER_DEAD_S)):
+        clock.advance(1.0)
+        new_node1._beat()
+        node0._follow_once(hooks)
+    assert len(seen.lost) == 1
+
+
+def test_a_replaced_peer_process_takes_node_zero_down_like_a_stopped_heartbeat(
+    monkeypatch,
+):
+    """There is no rejoin path for a fresh process -- its cohort can only
+    form through its own start-up -- so node 0 takes the action a timed-out
+    heartbeat takes: the pool goes down and, with fail-fast, the node exits."""
+    manager, store, clock, coordinator, events = _node_manager(
+        monkeypatch, node_rank=0
+    )
+    hooks = _manager_hooks(manager)
+    coordinator._watch_started_at = clock()
+    old_node1 = _coordinator(store, clock, node_rank=1)
+    old_node1._beat()
+    coordinator._follow_once(hooks)
+
+    clock.advance(4.0)
+    _replace_peer(store, clock)._beat()
+    coordinator._follow_once(hooks)
+
+    assert manager.state == "workers_down"
+    assert events == [
+        "teardown", "reconcile", "stop",
+        ("exit", 1, "peer node 1 heartbeat lost (4s)"),
+    ]
+
+
+def test_a_peer_replaced_after_the_loss_window_is_lost_once_by_its_timeout():
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    old_node1 = _coordinator(store, clock, node_rank=1)
+    hooks, seen = _watch(node0)
+    old_node1._beat()
+    node0._follow_once(hooks)
+
+    clock.advance(coordinator_module.PEER_DEAD_S)
+    node0._follow_once(hooks)
+    assert seen.lost == [(1, pytest.approx(coordinator_module.PEER_DEAD_S))]
+
+    clock.advance(30.0)
+    new_node1 = _replace_peer(store, clock)
+    for _ in range(20):
+        new_node1._beat()
+        node0._follow_once(hooks)
+        clock.advance(coordinator_module.HEARTBEAT_S)
+    assert len(seen.lost) == 1
+
+
+def test_a_follower_away_across_a_whole_peer_restart_still_finds_it_lost():
+    """A follower held in a restart for minutes misses both the death and
+    the first beats of the next process. By the time it polls the key has
+    moved -- but in another incarnation's hands, which is no proof that the
+    process it watched is alive."""
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    old_node1 = _coordinator(store, clock, node_rank=1)
+    hooks, seen = _watch(node0)
+    old_node1._beat()
+    node0._follow_once(hooks)
+
+    clock.advance(100.0)
+    new_node1 = _replace_peer(store, clock)
+    for _ in range(100):
+        new_node1._beat()
+        clock.advance(coordinator_module.HEARTBEAT_S)
+    node0._follow_once(hooks)
+
+    assert seen.lost == [(1, pytest.approx(300.0))]
+
+
+def test_every_node_watches_every_peer_by_incarnation():
+    """The rule is not node 0's alone: every watcher follows each peer's
+    incarnation, and the nodes that were not replaced stay live to all."""
+    store, clock = FakeStore(), FakeClock()
+    nodes = [_coordinator(store, clock, node_rank=r, nnodes=3) for r in range(3)]
+    watches = [_watch(node) for node in nodes[:2]]
+
+    def beat_and_poll(beaters):
+        for node in beaters:
+            node._beat()
+        for node, (hooks, _seen) in zip(nodes[:2], watches):
+            node._follow_once(hooks)
+        clock.advance(coordinator_module.HEARTBEAT_S)
+
+    for _ in range(3):
+        beat_and_poll(nodes)
+    new_node2 = _replace_peer(store, clock, node_rank=2, nnodes=3)
+    for _ in range(int(5 * coordinator_module.PEER_DEAD_S)):
+        beat_and_poll([nodes[0], nodes[1], new_node2])
+
+    for _hooks, seen in watches:
+        assert seen.lost == [(2, pytest.approx(coordinator_module.HEARTBEAT_S))]
+
+
+def test_a_restarted_node_zero_is_a_new_store_and_a_new_watch():
+    """Node 0 hosts the store in its own process, so its restart takes the
+    store with it: an old peer's client reaches nothing and reports node 0
+    lost through the control watchdog, without ever misreading node 0's
+    heartbeat. A new node 0 hosts a new, empty store, and its watch follows
+    whatever incarnation each newly started peer brings."""
+    old_store, clock = FakeStore(), FakeClock()
+    old_node0 = _coordinator(old_store, clock, node_rank=0)
+    old_node1 = _coordinator(old_store, clock, node_rank=1)
+    hooks, seen = _watch(old_node1)
+    old_node0._beat()
+    old_node1._follow_once(hooks)
+
+    old_store.error = ConnectionError("connection reset by peer")
+    _run_watchdog(old_node1, hooks, clock, coordinator_module.CONTROL_DEAD_S,
+                  poll=True)
+    assert seen.control_lost == [pytest.approx(coordinator_module.CONTROL_DEAD_S)]
+    assert seen.lost == []
+
+    new_store = FakeStore()
+    new_node0 = _coordinator(new_store, clock, node_rank=0)
+    new_node1 = _coordinator(new_store, clock, node_rank=1)
+    watches = [(new_node0, *_watch(new_node0)), (new_node1, *_watch(new_node1))]
+    for _ in range(int(5 * coordinator_module.PEER_DEAD_S)):
+        new_node0._beat()
+        new_node1._beat()
+        for node, node_hooks, _seen in watches:
+            node._follow_once(node_hooks)
+        clock.advance(1.0)
+    assert [node_seen.lost for _n, _h, node_seen in watches] == [[], []]
+
+
+def test_a_late_beat_of_the_dead_process_neither_hides_nor_repeats_the_loss():
+    """A slow store write: the old process's last beat was still in flight
+    when it died and lands after its successor's. A write of the watched
+    incarnation is proof it was alive when written, so it can postpone the
+    verdict by at most one beat of the successor, and never doubles it."""
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    old_node1 = _coordinator(store, clock, node_rank=1)
+    hooks, seen = _watch(node0)
+    old_node1._beat()
+    node0._follow_once(hooks)
+
+    # Ordering 1: the successor's beat, then the old in-flight beat, both
+    # before node 0's next poll -- the key shows the old process moving.
+    clock.advance(1.0)
+    new_node1 = _replace_peer(store, clock)
+    new_node1._beat()
+    old_node1._beat()
+    node0._follow_once(hooks)
+    assert seen.lost == []
+    # The successor's next beat settles it.
+    clock.advance(coordinator_module.HEARTBEAT_S)
+    new_node1._beat()
+    node0._follow_once(hooks)
+    assert seen.lost == [(1, pytest.approx(coordinator_module.HEARTBEAT_S))]
+
+    # Ordering 2: one more late write of the old process after the verdict.
+    old_node1._beat()
+    node0._follow_once(hooks)
+    new_node1._beat()
+    node0._follow_once(hooks)
+    assert len(seen.lost) == 1
+
+
+def test_a_slow_but_live_heartbeat_is_judged_by_peer_dead_s_alone():
+    """The same incarnation writing late is the ordinary timeout: a beat that
+    lands inside PEER_DEAD_S keeps it live, and a retried write of a value
+    already there is no movement."""
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    node1 = _coordinator(store, clock, node_rank=1)
+    hooks, seen = _watch(node0)
+    node1._beat()
+    node0._follow_once(hooks)
+
+    clock.advance(coordinator_module.PEER_DEAD_S - 0.5)
+    node0._follow_once(hooks)
+    node1._beat()
+    node0._follow_once(hooks)
+    clock.advance(coordinator_module.PEER_DEAD_S - 0.5)
+    node0._follow_once(hooks)
+    assert seen.lost == []
+
+    _beat_as(store, 1, node1.incarnation, node1._beats)
+    clock.advance(0.5)
+    node0._follow_once(hooks)
+    assert seen.lost == [(1, pytest.approx(coordinator_module.PEER_DEAD_S))]
+
+
+def test_heartbeats_carry_no_clock_and_are_judged_on_the_watchers_clock():
+    """Nodes' clocks never meet: a beat is an incarnation and a count, and
+    every age is measured on the watcher's own monotonic clock. A peer whose
+    clock is far off, or steps backwards, is neither lost nor kept alive by
+    it."""
+    store, clock0 = FakeStore(), FakeClock(1000.0)
+    clock1 = FakeClock(9.0e9)
+    node0 = _coordinator(store, clock0, node_rank=0)
+    node1 = _coordinator(store, clock1, node_rank=1)
+    hooks, seen = _watch(node0)
+
+    for beat in range(1, int(5 * coordinator_module.PEER_DEAD_S)):
+        node1._beat()
+        assert store.snapshot()["alive/node1"] == coordinator_module._alive_value(
+            node1.incarnation, beat
+        )
+        node0._follow_once(hooks)
+        clock0.advance(1.0)
+        clock1.advance(-7.0)
+    assert seen.lost == []
+
+    clock0.advance(2.0)
+    _replace_peer(store, FakeClock(-5.0))._beat()
+    node0._follow_once(hooks)
+    assert seen.lost == [(1, pytest.approx(3.0))]
+
+
+def test_a_heartbeat_that_names_no_incarnation_fails_loudly():
+    """A bare counter is what a coordinator that does not name its process
+    writes; it proves no process alive, so it is neither read as a beat nor
+    passed over: the follower names the key in its control error."""
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    hooks, seen = _watch(node0)
+    store.set("alive/node1", "7")
+
+    node0._follow_once(hooks)
+
+    assert "heartbeat alive/node1 holds '7'" in (node0.control_error or "")
+    assert seen.lost == []
+
+
+def test_each_server_process_is_its_own_incarnation():
+    store, clock = FakeStore(), FakeClock()
+    first = _coordinator(store, clock, node_rank=1)
+    second = _coordinator(store, clock, node_rank=1)
+    assert first.incarnation and second.incarnation
+    assert first.incarnation != second.incarnation
+    assert coordinator_module._ALIVE_SEP not in first.incarnation
 
 
 BINDING_PATH = ROOT / "core" / "batchgen_Binding.cpp"
@@ -548,7 +842,7 @@ def test_a_lost_peer_heartbeat_after_readiness_exits_with_the_peer_reason(
     )
     hooks = _manager_hooks(manager)
     coordinator._watch_started_at = clock()
-    store.add("alive/node0", 1)
+    _beat_as(store, 0, "node0-process", 1)
     coordinator._follow_once(hooks)
     clock.advance(coordinator_module.PEER_DEAD_S)
 
@@ -850,6 +1144,12 @@ class HangingStore(FakeStore):
             self._values[key] = str(value)
             return value
 
+    def set(self, key, value) -> None:
+        # The heartbeat writes with set(); a hung one must not hold the lock.
+        self._checkpoint("set")
+        with self._lock:
+            self._values[key] = value if isinstance(value, bytes) else str(value)
+
 
 def test_a_hung_node_zero_ends_this_node_without_touching_the_store_again(
     monkeypatch, tmp_path,
@@ -884,7 +1184,7 @@ def test_a_hung_node_zero_ends_this_node_without_touching_the_store_again(
 
     manager._start_restart_follower()
     try:
-        assert _wait_until(lambda: int(store.snapshot().get("alive/node1", 0)) >= 2)
+        assert _wait_until(lambda: _beats_in_store(store, 1) >= 2)
         store.hang.set()
         assert _wait_until(
             lambda: {name for _op, name in store.calls_while_hung} >= {
