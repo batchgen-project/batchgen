@@ -25,6 +25,7 @@ import pytest
 from batchgen import eventlog
 from batchgen.eventlog import flight_recorder
 from batchgen.worker.code_identity import CodeIdentity
+from batchgen.worker.server_config import ServerConfig
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
     delegated_method_names,
@@ -108,8 +109,10 @@ def _load_worker_manager_class():
         # Named in a method annotation, which this lifted module evaluates
         # (the real module defers annotations through __future__).
         "RestartCoordinator": restart_coordinator.RestartCoordinator,
-        # record_code_identity validates what a cohort published.
+        # record_code_identity / record_server_config validate what a cohort
+        # published.
         "CodeIdentity": CodeIdentity,
+        "ServerConfig": ServerConfig,
         # The start-up abort leaves its exit record here; a fail-fast exit
         # is never expected unless a test installs its own.
         "eventlog_process": SimpleNamespace(
@@ -3617,13 +3620,15 @@ def test_the_quiesce_holds_no_thread_and_blocks_only_after_its_probes():
     from Python on any thread, so this path may contain neither a thread nor a
     blocking wait that a non-blocking probe has not already proven finished.
     """
-    worker_source = BATCHGEN_WORKER_PATH.read_text()
-    assert "import threading" not in worker_source, (
-        "the decode teardown path must need no thread at all"
-    )
+    # The constraint binds the quiesce path, member by member.  The worker
+    # module as a whole may use threads elsewhere (the cross-communicator
+    # service thread does), so a module-wide import check says nothing about
+    # this path.
     for name in _WORKER_QUIESCE_MEMBERS:
         source = ast.unparse(_worker_method(name))
-        assert "threading" not in source, name
+        assert "threading" not in source, (
+            f"{name}: the decode teardown path must need no thread at all"
+        )
         assert "Thread" not in source, name
 
     helper = _worker_method("_quiesce_decode_for_cohort_shutdown")

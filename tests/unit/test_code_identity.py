@@ -256,6 +256,17 @@ def _transient():
              "padding_bsz": 1, "unavailable": "CUDA is unavailable"}]
 
 
+# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+SERVER_CONFIG = {
+    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
+    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "cuda_graphs": False, "graph_buckets": None,
+    "host_kv_gib": 1.0, "host_kv_pages": 8,
+    "device_kv_gib": 1.0, "device_kv_pages": 8,
+    "gpu_memory_frac": 0.9, "max_pool": 8,
+}
+
+
 def test_scheduler_records_the_identity_before_the_deployment_is_ready():
     async def run():
         recorded = []
@@ -268,16 +279,19 @@ def test_scheduler_records_the_identity_before_the_deployment_is_ready():
             recorded.append((cohort, identity))
 
         worker.record_code_identity = record
+        worker.record_server_config = lambda cohort, config: None
         await scheduler.start()
         try:
             identity = ci.CodeIdentity("git", REV, False).as_dict()
             # A publication without the identity never makes the deployment ready.
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
-                                       "startup_transient": _transient(), "cohort": 0})
+                                       "startup_transient": _transient(),
+                                       "server_config": SERVER_CONFIG, "cohort": 0})
             await asyncio.sleep(0.2)
             assert not scheduler._deployment_ready.is_set() and recorded == []
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
                                        "startup_transient": _transient(), "cohort": 3,
+                                       "server_config": SERVER_CONFIG,
                                        "code_identity": identity})
             await asyncio.wait_for(scheduler.wait_for_deployment(), timeout=5)
             assert recorded == [(3, identity)]

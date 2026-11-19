@@ -230,7 +230,9 @@ class WorkerLifecycleEngine:
         it reserves the configured fraction's slack for later allocations.
         Both lifecycles probe the startup decode transient at the per-rank cap
         right after the pool is sized (``_probe_startup_transient``); it is
-        published, not yet reserved.
+        published, not yet reserved. That same seam step ends by snapshotting
+        the [SERVER_CONFIG] values while the pool and any startup-captured
+        graphs are still live.
 
         On the default lifecycle a decode instance the strategy manager keeps
         across the switch to prefill has its decode graphs captured here,

@@ -2603,6 +2603,76 @@ class KimiLinearParallelStrategyManager:
         same NoPE-MLA pool seams, and at G == 1 the worker never asks."""
         return True
 
+    def parallel_declaration(self, decode_graph_state=None):
+        """Kimi-Linear's declared parallel layout (batchgen.parallel_declaration).
+
+        Attention: head-parallel over the attention group when G > 1 (DP
+        across groups), plain DP at G == 1; resident in decode always, and in
+        prefill unless the planner streams all modules (K3 at G == 1 — a
+        streamed prefill with G > 1 is refused at construction). MoE: the
+        planner-resolved modes map to the vocabulary — ``streamed`` and
+        ``streamed_sp8`` both run every expert replicated per rank with the
+        weights streamed from host (SP8 only changes the transport to
+        shard-and-all-gather), and ``resident_ep`` partitions the experts
+        over the world with the shard resident. An unknown mode fails by
+        name rather than declaring something untrue.
+        """
+        from batchgen.parallel_declaration import (
+            DecodeGraphDeclaration,
+            GRAPH_MODE_COMPARE,
+            GRAPH_MODE_GRAPH,
+            ModuleParallelism,
+            ParallelDeclaration,
+            ParallelDeclarationError,
+            RESIDENCY_RESIDENT,
+            RESIDENCY_STREAMED,
+            SCHEME_DP,
+            SCHEME_EP,
+            SCHEME_TP,
+        )
+
+        G = int(self._attn_tp_size)
+        attn_scheme = SCHEME_TP if G > 1 else SCHEME_DP
+        attn_group = G if G > 1 else 1
+
+        def _moe_slot(mode: str, phase: str) -> ModuleParallelism:
+            if mode in ("streamed", "streamed_sp8"):
+                return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
+            if mode == "resident_ep":
+                return ModuleParallelism(
+                    SCHEME_EP, RESIDENCY_RESIDENT, group_size=self.world_size
+                )
+            raise ParallelDeclarationError(
+                f"undeclarable {phase} MoE mode {mode!r}"
+            )
+
+        graph = getattr(self, "_decode_graph", None)
+        graph_mode = getattr(graph, "mode", "eager")
+        if graph_mode in (GRAPH_MODE_GRAPH, GRAPH_MODE_COMPARE):
+            bucketing = getattr(graph, "bucketing", None)
+            buckets = None if bucketing is None else tuple(
+                int(bucket) for bucket in bucketing.bucket_sizes
+            )
+            decode_graph = DecodeGraphDeclaration(graph_mode, buckets)
+        else:
+            decode_graph = DecodeGraphDeclaration.off()
+
+        return ParallelDeclaration(
+            prefill_attention=ModuleParallelism(
+                attn_scheme,
+                RESIDENCY_STREAMED
+                if self._stream_all_modules
+                else RESIDENCY_RESIDENT,
+                group_size=attn_group,
+            ),
+            prefill_moe=_moe_slot(self._prefill_moe_mode, "prefill"),
+            decode_attention=ModuleParallelism(
+                attn_scheme, RESIDENCY_RESIDENT, group_size=attn_group
+            ),
+            decode_moe=_moe_slot(self._decode_moe_mode(), "decode"),
+            decode_graph=decode_graph,
+        )
+
     def recurrent_state_owner(self):
         """Owner of the per-sequence KDA state the worker frees and snapshots.
 
