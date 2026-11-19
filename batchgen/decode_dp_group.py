@@ -30,7 +30,23 @@ membership / MoE-padding arithmetic is unit-testable off the GPU.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
+
+# Reasons the worker passes to its decode row-count sync, by where the sync
+# sits relative to a decode phase. ``decode_entry`` runs exactly once per
+# phase, before its first forward; the in-phase reasons are the loop's own
+# sync points; the out-of-phase reasons configure or warm the graphs before a
+# phase begins. Every reason a caller passes must be in exactly one set.
+DECODE_PHASE_ENTRY_SYNC = "decode_entry"
+DECODE_IN_PHASE_SYNCS = frozenset({
+    "page_boundary",
+    "post_pending_load_finalize",
+    "decode_step_batch_change",
+})
+DECODE_OUT_OF_PHASE_SYNCS = frozenset({
+    "pre_decode_warmup",
+    "startup_graph_capture",
+})
 
 
 def num_decode_dp_groups(world_size: int, group_size: int) -> int:
@@ -209,3 +225,105 @@ def moe_ntp_from_group_max(max_group_batch: int, group_size: int) -> int:
     if group_size <= 0:
         raise ValueError(f"group_size must be > 0, got {group_size}")
     return int(math.ceil(int(max_group_batch) / group_size))
+
+
+# ---- Observability: per-group decode rows ----------------------------------
+#
+# Two batches of the same size can decode on different graph buckets, because
+# the bucket follows the FULLEST group (through ``moe_ntp_from_group_max``),
+# not the total. The helpers below state the per-group rows, in group order,
+# at the plan stamp, at decode-phase entry and in the batch summary. They only
+# describe; nothing here feeds placement or bucket selection.
+
+
+def decode_group_rows(rank_counts: Sequence[int], group_size: int) -> List[int]:
+    """Per-group decode rows from the world-wide per-rank row counts.
+
+    Ranks ``[g*G, (g+1)*G)`` form group ``g`` and hold the same rows, so each
+    group reports the max over its ranks: the value the synchronized global
+    max, and therefore ``num_tokens_per_rank``, is derived from.
+    """
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+    counts = [int(value) for value in rank_counts]
+    if len(counts) % group_size != 0:
+        raise ValueError(
+            f"{len(counts)} rank counts not divisible by group_size {group_size}"
+        )
+    return [
+        max(counts[start:start + group_size])
+        for start in range(0, len(counts), group_size)
+    ]
+
+
+def count_rows_per_group(
+    group_ids: Iterable[Optional[int]], num_dp: int
+) -> List[int]:
+    """Rows stamped on each of ``num_dp`` groups; unstamped (None) rows skip."""
+    if num_dp <= 0:
+        raise ValueError(f"num_dp must be > 0, got {num_dp}")
+    rows = [0] * num_dp
+    for group in group_ids:
+        if group is None:
+            continue
+        group = int(group)
+        if not 0 <= group < num_dp:
+            raise ValueError(f"group id {group} outside 0..{num_dp - 1}")
+        rows[group] += 1
+    return rows
+
+
+def format_group_rows(rows: Sequence[int]) -> str:
+    """``[28,24,34,42]``: one count per group, in group order, no spaces."""
+    return "[" + ",".join(str(int(value)) for value in rows) + "]"
+
+
+def decode_groups_log_due(reason: str, ntp: int, previous_ntp: int) -> bool:
+    """Whether a decode row-count sync states the per-group rows.
+
+    Once at every phase entry; inside a phase only when the synchronized
+    per-rank unit changed at that sync (rows finished or were loaded), so a
+    phase logs at most once per unit change and never per step. Syncs outside
+    a phase never log. An unclassified reason is a caller bug and raises.
+    """
+    if reason == DECODE_PHASE_ENTRY_SYNC:
+        return True
+    if reason in DECODE_IN_PHASE_SYNCS:
+        return int(ntp) != int(previous_ntp)
+    if reason in DECODE_OUT_OF_PHASE_SYNCS:
+        return False
+    raise ValueError(f"unclassified decode row-count sync reason {reason!r}")
+
+
+def format_decode_groups_line(
+    reason: str, group_rows: Sequence[int], group_size: int, ntp: int
+) -> str:
+    """The rank-0 line a decode row-count sync logs when it is due."""
+    return (
+        f"[DECODE_GROUPS] sync={reason} rows={sum(int(v) for v in group_rows)} "
+        f"groups={format_group_rows(group_rows)} tp={int(group_size)} "
+        f"ntp={int(ntp)}"
+    )
+
+
+def format_decode_group_plan_line(
+    placement: str, admitted_rows: Sequence[int], live_rows: Sequence[int]
+) -> str:
+    """The rank-0 line the plan stamp logs: this stamp's rows and all live rows."""
+    return (
+        f"[DECODE_GROUP_PLAN] placement={placement} "
+        f"admitted={sum(int(v) for v in admitted_rows)} "
+        f"admitted_groups={format_group_rows(admitted_rows)} "
+        f"groups={format_group_rows(live_rows)}"
+    )
+
+
+def format_decode_group_summary(group_rows: Sequence[int], group_size: int) -> str:
+    """The batch summary's group line; ``ntp`` is the unit these rows decode at
+    when they decode together (the phase-entry value for a one-phase batch)."""
+    ntp = moe_ntp_from_group_max(max((int(v) for v in group_rows), default=0),
+                                 group_size)
+    return (
+        f"  Decode groups: {format_group_rows(group_rows)} "
+        f"(tp={int(group_size)}, ntp={ntp})"
+    )
