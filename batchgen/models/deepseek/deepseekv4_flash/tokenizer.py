@@ -18,7 +18,6 @@
 
 """DeepSeek-V4 tokenizer for BatchGen."""
 
-import json
 import logging
 import re
 import uuid
@@ -61,10 +60,6 @@ class DeepSeekV4Tokenizer(FastTokenizer):
     """DeepSeek-V4 tokenizer loaded from the vendored V4 Flash assets."""
 
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-    _TOOL_CALL_RE = re.compile(
-        r"<｜DSML｜invoke name=\"(?P<name>[^\"]+)\">\n(?P<args>.*?)\n</｜DSML｜invoke>",
-        re.DOTALL,
-    )
 
     def __init__(self):
         super().__init__(str(TOKENIZER_DIR))
@@ -192,33 +187,33 @@ class DeepSeekV4Tokenizer(FastTokenizer):
         return reasoning, visible
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        """Parse DSML tool calls with the vendored V4 parser.
+
+        The vendored ``parse_message_from_completion_text`` is the only
+        grammar: text it rejects is not a well-formed tool-call message, so
+        it is returned unchanged as content with no calls, the same result
+        as text without calls (``BaseTokenizer.parse_tool_calls``). It
+        rejects with ``ValueError`` (malformed DSML inside the tool-calls
+        block) and with ``assert`` (``AssertionError``: content after the
+        block, content after an end-of-sentence token, or a special token
+        such as ``</think>`` in the content); nothing else is reachable from
+        a completion string.
+        """
         try:
             parsed = parse_message_from_completion_text(
                 text if text.endswith(self.eos_token or "") else text + (self.eos_token or ""),
                 thinking_mode="chat",
             )
-            tool_calls = parsed.get("tool_calls") or []
-            if tool_calls:
-                return [
-                    _openai_tool_call(
-                        call["function"]["name"], call["function"]["arguments"],
-                    )
-                    for call in tool_calls
-                ], parsed.get("content", "").strip()
-        except ValueError as exc:
+        except (ValueError, AssertionError) as exc:
             logger.debug("DeepSeek-V4 DSML parser did not accept completion text: %s", exc)
-
-        matches = list(self._TOOL_CALL_RE.finditer(text))
-        if not matches:
             return None, text
-        tool_calls = []
-        for match in matches:
-            name = match.group("name").strip()
-            arguments = match.group("args").strip() or "{}"
-            try:
-                json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = json.dumps({"arguments": arguments}, ensure_ascii=False)
-            tool_calls.append(_openai_tool_call(name, arguments))
-        visible = self._TOOL_CALL_RE.sub("", text).strip()
-        return tool_calls, visible
+
+        tool_calls = parsed["tool_calls"]
+        if not tool_calls:
+            return None, text
+        return [
+            _openai_tool_call(
+                call["function"]["name"], call["function"]["arguments"],
+            )
+            for call in tool_calls
+        ], parsed["content"].strip()

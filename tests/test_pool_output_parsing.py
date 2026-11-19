@@ -390,6 +390,84 @@ def test_deepseek_v4_calls_in_one_response_get_distinct_ids(
     assert content == ""
 
 
+# Completion text the vendored DeepSeek-V4 parser
+# (deepseekv4_flash/assets/encoding/encoding_dsv4.py) rejects, one per
+# rejection reachable from a completion string, with the exception it raises.
+_DSML = "｜DSML｜"
+_DSV4_INVOKE = f'<{_DSML}invoke name="get_weather">\n'
+_DSV4_PARAM = (
+    f'<{_DSML}parameter name="city" string="true">Paris</{_DSML}parameter>\n'
+)
+_DSV4_BLOCK = (
+    f"\n\n<{_DSML}tool_calls>\n{_DSV4_INVOKE}{_DSV4_PARAM}"
+    f"</{_DSML}invoke>\n</{_DSML}tool_calls>"
+)
+DEEPSEEK_V4_REJECTED = {
+    # parse_tool_calls: block opener not followed by '>\n'
+    "block_opener": (
+        ValueError,
+        _DSV4_BLOCK.replace("tool_calls>\n", "tool_calls> \n", 1),
+    ),
+    # parse_tool_calls: invoke without a name="..." attribute
+    "tool_name": (ValueError, _DSV4_BLOCK.replace('name="get_weather"', 'nme="x"')),
+    # parse_tool_calls: a JSON body instead of DSML parameters is not DSML
+    "json_invoke_body": (
+        ValueError, _DSV4_BLOCK.replace(_DSV4_PARAM, '{"city": "Paris"}\n'),
+    ),
+    # parse_tool_calls: parameter without its string="..." attribute
+    "parameter": (ValueError, _DSV4_BLOCK.replace(' string="true"', "")),
+    # parse_tool_calls: the same parameter twice
+    "duplicate_parameter": (
+        ValueError, _DSV4_BLOCK.replace(_DSV4_PARAM, _DSV4_PARAM * 2),
+    ),
+    # parse_tool_calls: parameter close not followed by '>\n'
+    "parameter_separator": (
+        ValueError,
+        _DSV4_BLOCK.replace(f"parameter>\n</{_DSML}invoke", f"parameter> </{_DSML}invoke"),
+    ),
+    # 'Unexpected content after tool calls'
+    "content_after_calls": (AssertionError, _DSV4_BLOCK + "\nDone."),
+    # 'Unexpected content at end': text after an end-of-sentence token
+    "content_after_eos": (AssertionError, "It is<｜end▁of▁sentence｜> 21 C."),
+    "calls_then_content_after_eos": (
+        AssertionError, _DSV4_BLOCK + "<｜end▁of▁sentence｜>Done.",
+    ),
+    # 'Unexpected special token ... in content'
+    "think_open_in_content": (AssertionError, "<think>It is 21 C."),
+    "think_close_in_content": (AssertionError, "Warm.</think>It is 21 C."),
+    "think_close_before_calls": (AssertionError, "Warm.</think>" + _DSV4_BLOCK),
+    "bos_in_content": (AssertionError, "<｜begin▁of▁sentence｜>It is 21 C."),
+    "dsml_in_content": (AssertionError, _DSV4_BLOCK[1:]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(DEEPSEEK_V4_REJECTED))
+def test_deepseek_v4_rejected_text_is_returned_as_content(
+    case, registered_tokenizers, tmp_path,
+):
+    """``BaseTokenizer.parse_tool_calls``: text that is not a well-formed
+    tool-call message comes back as content with no calls; no parser
+    rejection escapes ``parse_tool_calls`` or the server's ``_parse_output``."""
+    from batchgen.models.deepseek.deepseekv4_flash.assets.encoding.encoding_dsv4 import (
+        eos_token,
+        parse_message_from_completion_text,
+    )
+
+    rejection, text = DEEPSEEK_V4_REJECTED[case]
+    tool_case = TOOL_CALL_CASES["deepseek_v4"]
+    tokenizer = _parser_only(registered_tokenizers["deepseek_v4"], tool_case)
+    with pytest.raises(rejection):
+        parse_message_from_completion_text(text + eos_token, thinking_mode="chat")
+
+    assert tokenizer.parse_tool_calls(text) == (None, text)
+
+    scheduler = _parsing_scheduler(tmp_path, tokenizer)
+    choice = _choice(scheduler, tmp_path, text, "stop")
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == text
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_stopped_generation_with_a_tool_call_reports_tool_calls(
     family, registered_tokenizers, tmp_path,
