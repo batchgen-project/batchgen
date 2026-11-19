@@ -3620,13 +3620,15 @@ def test_the_quiesce_holds_no_thread_and_blocks_only_after_its_probes():
     from Python on any thread, so this path may contain neither a thread nor a
     blocking wait that a non-blocking probe has not already proven finished.
     """
-    worker_source = BATCHGEN_WORKER_PATH.read_text()
-    assert "import threading" not in worker_source, (
-        "the decode teardown path must need no thread at all"
-    )
+    # The constraint binds the quiesce path, member by member.  The worker
+    # module as a whole may use threads elsewhere (the cross-communicator
+    # service thread does), so a module-wide import check says nothing about
+    # this path.
     for name in _WORKER_QUIESCE_MEMBERS:
         source = ast.unparse(_worker_method(name))
-        assert "threading" not in source, name
+        assert "threading" not in source, (
+            f"{name}: the decode teardown path must need no thread at all"
+        )
         assert "Thread" not in source, name
 
     helper = _worker_method("_quiesce_decode_for_cohort_shutdown")
