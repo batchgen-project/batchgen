@@ -438,6 +438,26 @@ under one run directory:
 When a process exits because of a fatal error, its last record is a CRITICAL
 `process.exit` event that names the reason (see [Cluster fail-fast](#cluster-fail-fast)).
 
+Every GPU worker also keeps a flight recorder: a fixed-size ring of its most
+recent JSONL records, one file per worker process, next to its JSONL log:
+
+```
+<log-dir>/<run>/node<N>/flight-recorder/rank<R>-cohort<C>-pid<P>.ring
+<log-dir>/<run>/node<N>/flight-recorder/rank<R>-cohort<C>-pid<P>-dump<K>.jsonl
+```
+
+The ring is written as records are logged and survives the process however it
+ends. Each line is a 16-digit sequence number and one JSONL record (`grep -v '^ '
+<file> | sort` lists them in order); after a native crash (`SIGSEGV`, `SIGABRT`,
+...) the Python stack of every thread follows the last line. On an unhandled
+Python exception, in the main loop or any thread, on a watchdog timeout
+(`--watchdog-timeout`, `--decode-step-timeout`) and when a worker ends itself
+because its main loop stayed wedged at teardown, the worker also writes a dump:
+a JSONL file whose first record, `eventlog.flight.dump`, carries the reason,
+the traceback and every thread's stack, followed by the ring's records, oldest
+first. A worker writes at most 4 dumps, and each run directory keeps the files
+of the 4 newest worker processes per rank.
+
 ---
 
 ## Output Parsing
@@ -469,7 +489,7 @@ storage/
 ├── uploads/       # Uploaded batch input files
 ├── batches/       # Batch job metadata
 ├── outputs/       # Inference results (when --save-result is enabled)
-└── incremental/   # Incremental JSONL results (crash-resilient, enabled by default)
+└── incremental/   # Incremental JSONL results (crash-resilient, always on)
 ```
 
 ### Incremental Result Saving
@@ -479,24 +499,14 @@ Completed sequences are written incrementally to a JSONL file on disk as they fi
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--incremental-output-dir` | `{storage_path}/incremental/` | Directory for incremental JSONL output files. Each batch produces one file named `{batch_id}.jsonl`. |
-| `--no-incremental-save` | `false` | Disable incremental saving entirely |
 
-**Enabled by default.** No extra flags are needed. To customize the output directory:
+**Always on.** This file is the only record of a batch's results: on completion it is published as the batch output file (`GET /v1/files/{output_file_id}/content`), so it cannot be disabled. To customize the output directory:
 
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --host-kv-cache-size 650 \
     --incremental-output-dir /data/incremental_results
-```
-
-To disable:
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --host-kv-cache-size 650 \
-    --no-incremental-save
 ```
 
 Each line in the JSONL file is a complete `BatchResultItem` with `custom_id`, `response` (containing `status_code`, `body` with `choices` and `usage`). Lines are written in completion order (not input order).

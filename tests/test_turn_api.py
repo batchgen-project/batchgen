@@ -144,6 +144,8 @@ class _FakeWorker:
                 "flavor": "eager", "seam": "startup-deployment-prepare",
                 "padding_bsz": 1, "unavailable": "CUDA is unavailable",
             }],
+            "code_identity": {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"},
+            "cohort": 0,
         })
         self.response_queue.put({
             "type": "trajectory_pool_capacity",
@@ -159,6 +161,9 @@ class _FakeWorker:
 
     def report_worker_fatal(self, reason, persisted=False):
         self.fatals.append(reason)
+
+    def record_code_identity(self, cohort, identity):
+        pass
 
     def _run(self):
         held = []
@@ -228,6 +233,9 @@ class _Storage:
     def update_batch_status(self, batch_id, status, **kwargs):
         self.statuses.append((batch_id, status, kwargs))
 
+    def update_request_counts(self, batch_id, counts):
+        pass
+
     def save_metadata(self, file_id, meta):
         self.metadata[file_id] = meta
 
@@ -237,7 +245,6 @@ def _scheduler(tmp_path, worker):
         model=MODEL,
         max_intake_capacity=64,
         incremental_output_dir=str(tmp_path / "incr"),
-        no_incremental_save=False,
         parse_thinking=False,
         parse_tool_call=False,
     )

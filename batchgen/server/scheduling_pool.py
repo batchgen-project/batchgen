@@ -169,66 +169,53 @@ class SchedulingPool:
                 output_path=output_path,
             )
 
-    def mark_request_completed(self, request_id: str, batch_id: str) -> bool:
-        """Mark a request as completed and update its batch tracker.
+    def record_request_result(
+        self, request_id: str, batch_id: str, *, failed: bool
+    ) -> Optional[bool]:
+        """Count one request's result, a success or a failure, on its batch.
 
-        Idempotent: duplicate completions for the same (batch_id, request_id)
-        pair are ignored. The dedup key is scoped per-batch so that
-        identical request_ids across different batches are counted separately.
+        Each (batch_id, request_id) pair is counted at most once, so a
+        request is never in both ``completed_requests`` and
+        ``failed_requests`` and the two never sum past ``total_requests``.
+        The dedup key is scoped per-batch so that identical request_ids
+        across different batches are counted separately.
 
         Returns:
-            True if this was the last request in the batch (batch is now complete).
+            None if nothing was counted (the batch is not tracked, or this
+            request was already counted); otherwise whether this was the last
+            request of the batch.
         """
         with self._lock:
-            dedup_key = (batch_id, request_id)
-            if dedup_key in self._completed_requests:
-                logger.warning(
-                    f"[SCHED] Duplicate completion for {request_id} in batch {batch_id}, ignoring"
-                )
-                return False
-            self._completed_requests.add(dedup_key)
-
             tracker = self._batch_trackers.get(batch_id)
             if tracker is None:
                 logger.warning(
-                    f"[SCHED] mark_request_completed for unknown batch {batch_id}"
+                    f"[SCHED] Result of {request_id} for unknown batch {batch_id}, ignoring"
                 )
-                return False
-            tracker.completed_requests += 1
+                return None
+            dedup_key = (batch_id, request_id)
+            if dedup_key in self._completed_requests:
+                logger.warning(
+                    f"[SCHED] Duplicate result for {request_id} in batch {batch_id}, ignoring"
+                )
+                return None
+            self._completed_requests.add(dedup_key)
+            if failed:
+                tracker.failed_requests += 1
+            else:
+                tracker.completed_requests += 1
             is_done = tracker.is_complete
             if is_done:
                 logger.info(
-                    f"[SCHED] Batch {batch_id}: ALL {tracker.total_requests} requests complete"
+                    f"[SCHED] Batch {batch_id}: ALL {tracker.total_requests} requests complete "
+                    f"({tracker.failed_requests} failed)"
                 )
             else:
                 logger.info(
-                    f"[SCHED] Batch {batch_id}: {tracker.completed_requests}/{tracker.total_requests} complete"
+                    f"[SCHED] Batch {batch_id}: "
+                    f"{tracker.completed_requests + tracker.failed_requests}/"
+                    f"{tracker.total_requests} complete ({tracker.failed_requests} failed)"
                 )
             return is_done
-
-    def mark_request_failed(self, request_id: str, batch_id: str) -> bool:
-        """Mark a request as failed and update its batch tracker.
-
-        Idempotent: duplicate failures for the same (batch_id, request_id)
-        pair are ignored.
-
-        Returns:
-            True if this was the last request in the batch.
-        """
-        with self._lock:
-            dedup_key = (batch_id, request_id)
-            if dedup_key in self._completed_requests:
-                logger.warning(
-                    f"[SCHED] Duplicate fail for {request_id} in batch {batch_id}, ignoring"
-                )
-                return False
-            self._completed_requests.add(dedup_key)
-
-            tracker = self._batch_trackers.get(batch_id)
-            if tracker is None:
-                return False
-            tracker.failed_requests += 1
-            return tracker.is_complete
 
     def get_batch_tracker(self, batch_id: str) -> Optional[BatchTracker]:
         with self._lock:

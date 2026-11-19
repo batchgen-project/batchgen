@@ -155,7 +155,7 @@ def test_batch_persisted_with_the_old_field_still_loads(tmp_path):
     assert "max_context_length" not in loaded.model_dump()
 
 
-def test_batch_carrying_the_deprecated_field_still_runs_in_pool_mode():
+def test_batch_carrying_the_deprecated_field_still_runs_in_pool_mode(tmp_path):
     """A batch created with the deprecated field reaches the intake pool, and
     the pool init message no longer carries a context bound."""
     from tests.test_pool_request_identity import _load_scheduler_module
@@ -176,8 +176,10 @@ def test_batch_carrying_the_deprecated_field_still_runs_in_pool_mode():
         size=lambda: len(submitted),
         max_capacity=10,
     )
-    scheduler.storage = SimpleNamespace()
-    scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
+    scheduler.storage = SimpleNamespace(
+        update_request_counts=lambda batch_id, counts: None,
+    )
+    scheduler.server_args = SimpleNamespace(incremental_output_dir=str(tmp_path))
     scheduler._pool_request_meta = {}
     finalized = []
 

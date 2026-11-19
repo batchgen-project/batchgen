@@ -83,6 +83,7 @@ PINS = {
                 "cancelled_at",
                 "cancelling_at",
                 "error",
+                "request_counts",
                 "metadata",
                 "max_decoding_length",
                 "temperature",
@@ -98,6 +99,14 @@ PINS = {
                     "returns": "Dict[str, Any]",
                 },
             },
+        },
+        "BatchRequestCounts": {
+            "kind": "class",
+            "bases": ["BaseModel"],
+            "fields": ["total", "completed", "failed"],
+            "members": {},
+            "public_methods": [],
+            "methods": {},
         },
         "BatchRequestItem": {
             "kind": "class",

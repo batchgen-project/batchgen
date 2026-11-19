@@ -104,7 +104,12 @@ def _snapshot(value):
 
 
 class JsonlHandler(logging.Handler):
-    """Writes envelopes to one file; buffers until the run is bound."""
+    """Writes envelopes to one file; buffers until the run is bound.
+
+    ``mirror``, when set, receives every envelope written to the file as
+    ``mirror.record(envelope, line)`` on the listener thread, right after the
+    line is written (the flight recorder's ring).
+    """
 
     def __init__(
         self,
@@ -113,6 +118,7 @@ class JsonlHandler(logging.Handler):
     ) -> None:
         super().__init__()
         self.info = info
+        self.mirror = None
         self._stream: TextIO | None = None
         self._buffer: collections.deque = collections.deque(
             maxlen=buffer_limit
@@ -134,7 +140,10 @@ class JsonlHandler(logging.Handler):
         envelope = schema.to_envelope(
             record, self.info, console.message_text(record)
         )
-        self._stream.write(schema.encode(envelope) + "\n")
+        line = schema.encode(envelope)
+        self._stream.write(line + "\n")
+        if self.mirror is not None:
+            self.mirror.record(envelope, line)
 
     def open_stream(self, stream: TextIO, run_id: str) -> None:
         """Start writing; called on the listener thread only."""
@@ -210,7 +219,18 @@ class BindRequest:
             self.stream.close()
 
 
-_CONTROL = (FlushRequest, BindRequest)
+class MirrorRequest:
+    """Control item: set (or, with ``None``, clear) the JSONL mirror."""
+
+    def __init__(self, mirror) -> None:
+        self.mirror = mirror
+
+    def run(self, listener: "EventListener") -> None:
+        if listener.jsonl is not None:
+            listener.jsonl.mirror = self.mirror
+
+
+_CONTROL = (FlushRequest, BindRequest, MirrorRequest)
 
 
 class EventListener(logging.handlers.QueueListener):

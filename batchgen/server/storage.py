@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from batchgen.server.io_struct import (
     BatchObject,
+    BatchRequestCounts,
     BatchResultItem,
     BatchStatus,
     FileObject,
@@ -129,24 +130,75 @@ class StorageManager:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
 
-    def fail_orphaned_batches(self) -> List[str]:
+    def fail_orphaned_batches(self, incremental_output_dir: str) -> List[str]:
         """Fail batches a previous server process left active.
 
         A new process holds no worker state for them, so they can never finish;
         left active they also block resubmission of the same (deduplicated)
         input file. Call once at startup, after acquire_storage_ownership and
         before any batch is accepted.
+
+        The previous process kept the batch's completed/failed counts in
+        memory only; its output items, one per counted request, are in
+        ``{incremental_output_dir}/{batch_id}.jsonl``, so the counts are
+        rebuilt from them. With no such file (nothing recorded yet) the
+        persisted counts are kept.
         """
         active = {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS, BatchStatus.CANCELLING}
         failed = []
         for batch in self.list_all_batches():
             if batch.status in active:
-                self.update_batch_status(
-                    batch.id, BatchStatus.FAILED,
-                    error="server restarted while this batch was active",
-                )
+                updates = {"error": "server restarted while this batch was active"}
+                items = Path(incremental_output_dir) / f"{batch.id}.jsonl"
+                if items.exists():
+                    updates["request_counts"] = self._recorded_request_counts(
+                        batch, items
+                    )
+                self.update_batch_status(batch.id, BatchStatus.FAILED, **updates)
                 failed.append(batch.id)
         return failed
+
+    @staticmethod
+    def _recorded_request_counts(
+        batch: BatchObject, items_path: Path
+    ) -> BatchRequestCounts:
+        """request_counts of ``batch`` from the output items written for it.
+
+        An item whose ``error`` is null is a completed request, any other a
+        failed one, as the scheduler classified it when it wrote the item. A
+        line cut short by the process death is not a recorded result.
+        """
+        completed = failed = 0
+        with items_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Batch %s: skipping a truncated output item in %s",
+                        batch.id, items_path,
+                    )
+                    continue
+                if item.get("error") is None:
+                    completed += 1
+                else:
+                    failed += 1
+        return BatchRequestCounts(
+            total=batch.request_counts.total, completed=completed, failed=failed
+        )
+
+    def update_request_counts(
+        self, batch_id: str, counts: BatchRequestCounts
+    ) -> Optional[BatchObject]:
+        """Persist ``counts`` on a batch, keeping its status."""
+        batch = self.load_batch(batch_id)
+        if not batch:
+            return None
+        updated = batch.model_copy(update={"request_counts": counts})
+        self.save_batch(updated)
+        return updated
 
     def update_batch_status(
         self, batch_id: str, status: BatchStatus, **updates

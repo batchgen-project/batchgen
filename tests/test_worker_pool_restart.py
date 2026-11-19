@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, Optional
 import pytest
 
 from batchgen import eventlog
+from batchgen.eventlog import flight_recorder
+from batchgen.worker.code_identity import CodeIdentity
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
     delegated_method_names,
@@ -106,6 +108,8 @@ def _load_worker_manager_class():
         # Named in a method annotation, which this lifted module evaluates
         # (the real module defers annotations through __future__).
         "RestartCoordinator": restart_coordinator.RestartCoordinator,
+        # record_code_identity validates what a cohort published.
+        "CodeIdentity": CodeIdentity,
         # The start-up abort leaves its exit record here; a fail-fast exit
         # is never expected unless a test installs its own.
         "eventlog_process": SimpleNamespace(
@@ -202,6 +206,7 @@ def _manager(monkeypatch):
     manager._lock = threading.Lock()
     manager._state = "serving"
     manager._generation = 3
+    manager._code_identity = None
     manager._first_ready = True
     manager._reconciled_failure = False
     manager._main_thread_dispatcher = None
@@ -267,6 +272,74 @@ def test_restart_state_and_generation(monkeypatch):
     assert result["generation"] == 4
     assert result["failed_batches"] == 2
     assert phases == ["quiesce", "teardown", "spawn", "resume"]
+
+
+def _git_identity(revision, dirty=False):
+    return {"source": "git", "revision": revision, "dirty": dirty, "reason": None}
+
+
+def test_restarted_generation_reports_the_code_its_new_cohort_published(
+    monkeypatch, caplog
+):
+    """A restart's cohort re-imports from disk, so generation 4 must carry
+    the revision ITS rank published, not generation 3's."""
+    old, new = "a" * 40, "b" * 40
+    manager = _manager(monkeypatch)
+    seen_while_restarting = []
+
+    def spawn():
+        # Local rank 0 of the new cohort publishes before the restart
+        # completes; the record names generation 4, which is not serving yet.
+        manager.record_code_identity(
+            manager._spawning_epoch, _git_identity(new, dirty=True)
+        )
+        seen_while_restarting.append(manager.code_identity)
+
+    manager._spawn_workers = spawn
+    with caplog.at_level(logging.INFO):
+        # Generation 3 is the cohort of epoch 2.
+        manager.record_code_identity(2, _git_identity(old))
+        assert manager.code_identity == _git_identity(old)
+        result = manager.restart_workers(timeout_s=1)
+
+    assert result["generation"] == manager.generation == 4
+    assert seen_while_restarting == [None]
+    assert manager.code_identity == _git_identity(new, dirty=True)
+    lines = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("[CODE_IDENTITY]")
+    ]
+    assert lines == [
+        f"[CODE_IDENTITY] generation=3 node=0 source=git revision={old} "
+        "dirty=false reason=-",
+        f"[CODE_IDENTITY] generation=4 node=0 source=git revision={new} "
+        "dirty=true reason=-",
+    ]
+
+
+def test_a_failed_restart_reports_no_code_identity(monkeypatch):
+    manager = _manager(monkeypatch)
+    manager.record_code_identity(2, _git_identity("a" * 40))
+
+    def spawn():
+        manager.record_code_identity(
+            manager._spawning_epoch, _git_identity("b" * 40)
+        )
+        raise RuntimeError("rank 0 died before readiness")
+
+    manager._spawn_workers = spawn
+    with pytest.raises(RuntimeError, match="died before readiness"):
+        manager.restart_workers(timeout_s=1)
+    assert manager.state == "workers_down" and manager.generation == 3
+    # Generation 3's cohort is gone and generation 4 never served.
+    assert manager.code_identity is None
+
+
+def test_a_malformed_code_identity_is_refused(monkeypatch):
+    manager = _manager(monkeypatch)
+    with pytest.raises(ValueError, match="exactly"):
+        manager.record_code_identity(2, {"revision": "a" * 40})
+    assert manager._code_identity is None
 
 
 def test_restart_conflict_is_rejected(monkeypatch):
@@ -1118,6 +1191,9 @@ def _load_worker_loop_helpers() -> Dict[str, Any]:
         "sys": sys,
         # flush_logs_before_exit drains the event log first.
         "eventlog": eventlog,
+        # The self-exit path leaves a flight-recorder hang dump first; with
+        # no recorder installed in the test process it writes nothing.
+        "flight_recorder": flight_recorder,
     }
     exec(
         compile(ast.Module(body=protocol, type_ignores=[]), str(EXIT_PROTOCOL_PATH), "exec"),

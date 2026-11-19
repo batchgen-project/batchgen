@@ -257,9 +257,9 @@ class ServerArgs:
     adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
     adaptive_chunk_ema_alpha: float = 0.1  # EMA smoothing factor
     adaptive_chunk_multiplier: float = 1.5  # Headroom multiplier on EMA
-    # Incremental result saving (crash-resilient output)
-    incremental_output_dir: Optional[str] = None  # Directory for incremental JSONL; None = auto
-    no_incremental_save: bool = False  # Opt-out flag to disable incremental saving
+    # Batch output items, appended per request as it finishes (crash-resilient);
+    # the only record of a batch's results. None = {storage_path}/incremental/.
+    incremental_output_dir: Optional[str] = None
     # Decode step watchdog
     decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
     # Startup timeout
@@ -303,7 +303,7 @@ class ServerArgs:
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
         # Default incremental output dir: {storage_path}/incremental/
-        if self.incremental_output_dir is None and not self.no_incremental_save:
+        if self.incremental_output_dir is None:
             self.incremental_output_dir = str(self.storage_path / "incremental")
 
     def resolve_paths(self) -> None:
@@ -768,19 +768,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.5,
         help="Headroom multiplier on EMA for adaptive chunk sizing (default: 1.5)",
     )
-    # Incremental result saving (crash-resilient)
+    # Batch output items, written per request as it finishes (crash-resilient)
     parser.add_argument(
         "--incremental-output-dir",
         type=str,
         default=None,
-        help="Directory for incremental JSONL results (crash-resilient). "
+        help="Directory for the per-batch output JSONL, appended as each "
+             "request finishes (crash-resilient). "
              "Default: {storage_path}/incremental/",
-    )
-    parser.add_argument(
-        "--no-incremental-save",
-        action="store_true",
-        default=False,
-        help="Disable incremental saving of completed sequences to disk",
     )
     add_logging_args(parser)
     return parser
@@ -1017,13 +1012,11 @@ def validate_shared_runtime_capability(args: ServerArgs) -> None:
         args.listen_port in pynccl_ports or dist_port in pynccl_ports
     ):
         raise ValueError("shared mode communication port allocations overlap")
-    incremental = args.incremental_output_dir
-    if incremental is not None:
-        incremental_path = Path(incremental).expanduser().resolve()
-        if not incremental_path.is_relative_to(storage_path):
-            raise ValueError(
-                "shared mode incremental_output_dir must be within storage_path"
-            )
+    incremental_path = Path(args.incremental_output_dir).expanduser().resolve()
+    if not incremental_path.is_relative_to(storage_path):
+        raise ValueError(
+            "shared mode incremental_output_dir must be within storage_path"
+        )
 
 
 def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
@@ -1098,7 +1091,6 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         adaptive_chunk_ema_alpha=parsed.adaptive_chunk_ema_alpha,
         adaptive_chunk_multiplier=parsed.adaptive_chunk_multiplier,
         incremental_output_dir=parsed.incremental_output_dir,
-        no_incremental_save=parsed.no_incremental_save,
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
         startup_phase_timeout_scale=parsed.startup_phase_timeout_scale,

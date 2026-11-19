@@ -17,7 +17,10 @@ from batchgen.server.storage import StorageManager
 
 
 def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
-    tracker = SimpleNamespace(is_complete=False, error={"message": "worker failed"})
+    tracker = SimpleNamespace(
+        is_complete=False, error={"message": "worker failed"},
+        total_requests=2, completed_requests=1, failed_requests=0,
+    )
     storage = StorageManager(tmp_path)
     storage.save_batch(BatchObject(
         id="batch-test",
@@ -54,13 +57,17 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     assert persisted is not None
     assert persisted.status == BatchStatus.FAILED
     assert persisted.error == str(tracker.error)
+    # The failure persists the counts the tracker had reached.
+    assert persisted.request_counts.model_dump() == {
+        "total": 2, "completed": 1, "failed": 0,
+    }
     # The failed batch holds no scheduler state afterwards.
     assert trackers == {}
     assert scheduler._pool_request_meta == {}
     assert removed == ["batch-test"]
 
 
-def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
+def test_capacity_snapshot_does_not_reset_active_scheduling_slots(tmp_path):
     """Free-page snapshots must not reinitialize an active fixed-capacity pool."""
     pool = SchedulingPool(capacity=4)
     pool.allocate_slot("request-1")
@@ -108,7 +115,8 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
     scheduler.worker = SimpleNamespace(response_queue=ResponseQueue())
     scheduler._scheduling_pool = pool
     scheduler._trajectory_pool_info = None
-    scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
+    scheduler.server_args = SimpleNamespace(incremental_output_dir=str(tmp_path))
+    scheduler._pool_request_meta = {}
     scheduler._fail_all_active_batches = lambda error: None
 
     asyncio.run(scheduler._pool_completion_listener())

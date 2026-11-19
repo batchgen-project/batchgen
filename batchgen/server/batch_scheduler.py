@@ -17,6 +17,8 @@ import numpy as np
 from batchgen.server.agent_sessions import TurnError
 from batchgen.server.io_struct import (
     BatchEndpoint,
+    BatchObject,
+    BatchRequestCounts,
     BatchRequestItem,
     BatchStatus,
     ChatCompletionRequest,
@@ -171,6 +173,15 @@ def parse_batch_file(
     if not requests:
         return False, "Batch file cannot be empty", []
     return True, None, requests
+
+
+def tracker_request_counts(tracker: Any) -> BatchRequestCounts:
+    """The Batch API request_counts of a SchedulingPool batch tracker."""
+    return BatchRequestCounts(
+        total=tracker.total_requests,
+        completed=tracker.completed_requests,
+        failed=tracker.failed_requests,
+    )
 
 
 # Worker per-request error codes that describe the request itself; any other
@@ -1398,6 +1409,13 @@ class BatchScheduler:
                 self.storage.output_dir / f"{batch_id}_output.jsonl"
             ) if hasattr(self.storage, 'output_dir') else None,
         )
+        # The validated request total is persisted once, at registration:
+        # startup recovery of a batch this process leaves active rebuilds
+        # completed/failed from its output items, but only this record keeps
+        # the total.
+        self.storage.update_request_counts(
+            batch_id, BatchRequestCounts(total=len(requests))
+        )
 
         # custom_id is unique only within one Batch, but the scheduling pool,
         # the worker's sequence uuids and completion routing span all batches:
@@ -1439,8 +1457,12 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch_status(
-                batch_id, BatchStatus.FAILED, error=f"capacity_exceeded: {error_msg}"
+            # The batch is already registered with the scheduling pool (and
+            # its total persisted), so it fails through the single exit,
+            # which releases that registration; the rejection added nothing
+            # to the intake pool (submit_batch is all-or-nothing).
+            self._discard_failed_batch(
+                batch_id, f"capacity_exceeded: {error_msg}"
             )
             return
         # Store max_tokens for init message
@@ -1458,22 +1480,19 @@ class BatchScheduler:
                 "model": req.body.model,
             }
 
-        # Ensure incremental output directory exists
-        incr_dir = self.server_args.incremental_output_dir
-        if incr_dir:
-            from pathlib import Path
-            Path(incr_dir).mkdir(parents=True, exist_ok=True)
+        # Ensure the batch output items directory exists
+        from pathlib import Path
+        Path(self.server_args.incremental_output_dir).mkdir(
+            parents=True, exist_ok=True
+        )
 
         # A request whose prompt could not be constructed fails alone, as the
         # Batch API error item a worker-side rejection also produces.
         for idx, reason in sorted(rejections.items()):
-            self._write_pool_completion(
+            self._record_pool_result(
                 batch_id,
                 request_ids[idx],
                 {"error": {"code": "invalid_prompt", "message": reason, "status_code": 400}},
-            )
-            self._scheduling_pool.mark_request_completed(
-                request_ids[idx], batch_id
             )
 
         logger.info(
@@ -1526,11 +1545,16 @@ class BatchScheduler:
 
         The one place a registered batch is failed: the worker-fatal path
         (_fail_all_active_batches), the failed or timed-out wait in
-        _wait_and_finalize_batch, and an exception after IN_PROGRESS in
+        _wait_and_finalize_batch, an intake-capacity rejection in
+        _process_batch_pool_mode, and an exception after IN_PROGRESS in
         _process_batch. It removes the queued intake entries and intake batch
         info, the batch tracker (with its completion dedup keys) and the
         per-request output metadata; absent state is skipped, so it is safe
         before the batch was registered and when called twice.
+
+        The removed tracker's request_counts are persisted with the status:
+        results that arrive later are dropped by the listener, so these are
+        final. Without a tracker the persisted counts are kept.
 
         Scheduling slots are not freed here. A slot mirrors a sequence the
         worker still holds; it returns when the worker reports that request
@@ -1539,10 +1563,14 @@ class BatchScheduler:
         """
         purged = self._intake_pool.remove_batch_entries(batch_id)
         self._intake_pool.remove_batch_info(batch_id)
-        self._scheduling_pool.remove_batch_tracker(batch_id)
+        tracker = self._scheduling_pool.remove_batch_tracker(batch_id)
         self._pool_request_meta.pop(batch_id, None)
+        counts = (
+            {} if tracker is None
+            else {"request_counts": tracker_request_counts(tracker)}
+        )
         self.storage.update_batch_status(
-            batch_id, BatchStatus.FAILED, error=error
+            batch_id, BatchStatus.FAILED, error=error, **counts
         )
         logger.error(
             "[POOL] Batch %s marked FAILED: %s (%d queued requests discarded)",
@@ -1836,12 +1864,9 @@ class BatchScheduler:
                                     request_id, batch_id,
                                 )
                                 continue
-                        # Write output JSONL line
-                        if batch_id and request_id:
-                            self._write_pool_completion(batch_id, request_id, result)
                         if batch_id:
-                            batch_done = self._scheduling_pool.mark_request_completed(
-                                request_id, batch_id
+                            batch_done = self._record_pool_result(
+                                batch_id, request_id, result
                             )
                             if batch_done:
                                 logger.info(f"[POOL] Batch {batch_id} completed")
@@ -1876,9 +1901,16 @@ class BatchScheduler:
                             StartupTransientObject.model_validate(item)
                             for item in transients
                         ]
-                        self.max_model_len = int(result["max_model_len"])
-                        if self.max_model_len < 2:
+                        max_model_len = int(result["max_model_len"])
+                        if max_model_len < 2:
                             raise ValueError("worker published invalid max_model_len")
+                        # What the generation runs is recorded (and logged)
+                        # before the deployment is ready, so it precedes every
+                        # request the generation serves.
+                        self.worker.record_code_identity(
+                            int(result["cohort"]), result["code_identity"]
+                        )
+                        self.max_model_len = max_model_len
                         self.startup_transient = transients
                         self._deployment_ready.set()
                     elif msg_type == "trajectory_pool_capacity":
@@ -1957,6 +1989,44 @@ class BatchScheduler:
         # persisting the same failure a second time.
         self.worker.report_worker_fatal(reason, persisted=True)
 
+    def _record_pool_result(
+        self, batch_id: str, request_id: str, result: dict
+    ) -> bool:
+        """Count one batch request's result and write its output item.
+
+        The one place a batch request's outcome is decided, for worker
+        completions and for requests rejected before admission alike: a
+        result carrying ``error`` is a failure, and _write_pool_completion
+        writes it as the Batch API error item; any other is a completion.
+        The count comes first, and a result that is not counted (its batch is
+        not tracked, or the request was already counted) writes nothing, so
+        the output file holds exactly one item per counted request and
+        request_counts never drift from it.
+
+        Returns whether this was the last request of the batch.
+        """
+        recorded = self._scheduling_pool.record_request_result(
+            request_id, batch_id, failed=bool(result.get("error"))
+        )
+        if recorded is None:
+            return False
+        self._write_pool_completion(batch_id, request_id, result)
+        return recorded
+
+    def with_live_request_counts(self, batch: BatchObject) -> BatchObject:
+        """``batch`` as a client sees it.
+
+        While this process tracks the batch, its request_counts are the live
+        counts of the tracker; once the batch leaves the tracker (finalized
+        or failed) the counts persisted with its status are final.
+        """
+        tracker = self._scheduling_pool.get_batch_tracker(batch.id)
+        if tracker is None:
+            return batch
+        return batch.model_copy(
+            update={"request_counts": tracker_request_counts(tracker)}
+        )
+
     def _write_pool_completion(
         self, batch_id: str, request_id: str, result: dict
     ) -> None:
@@ -1972,10 +2042,6 @@ class BatchScheduler:
         200 with empty text, which is indistinguishable from a generation that
         legitimately produced nothing.
         """
-        incr_dir = self.server_args.incremental_output_dir
-        if not incr_dir:
-            return
-
         meta = self._pool_request_meta.get(batch_id, {}).get(request_id)
         if not meta:
             logger.warning(f"[POOL] No metadata for {request_id} in batch {batch_id}")
@@ -2099,11 +2165,10 @@ class BatchScheduler:
         self, batch_id: str, request_id: str, result_item: dict
     ) -> None:
         """Append one BatchResultItem to the batch's incremental JSONL."""
-        incr_dir = self.server_args.incremental_output_dir
-        if not incr_dir:
-            return
         from pathlib import Path
-        output_path = Path(incr_dir) / f"{batch_id}.jsonl"
+        output_path = (
+            Path(self.server_args.incremental_output_dir) / f"{batch_id}.jsonl"
+        )
         try:
             with open(output_path, "a") as f:
                 f.write(json.dumps(result_item, ensure_ascii=False) + "\n")
@@ -2119,24 +2184,21 @@ class BatchScheduler:
         """Finalize batch output after all requests complete.
 
         Per-request output is written by _write_pool_completion as each request
-        completes.
-        This method writes the batch status and output file metadata.
+        completes, into {incremental_output_dir}/{batch_id}.jsonl -- the only
+        record of the batch's results, which this method publishes as the
+        batch output file.
+        This method writes the batch status, its final request_counts and
+        the output file metadata.
         """
+        tracker = self._scheduling_pool.get_batch_tracker(batch_id)
         output_file_id = f"file-{uuid.uuid4().hex}"
 
-        # Check for incremental output
-        incremental_path = None
-        incremental_output_dir = (
-            self.server_args.incremental_output_dir
-            if not self.server_args.no_incremental_save
-            else None
+        from pathlib import Path
+        incremental_path = (
+            Path(self.server_args.incremental_output_dir) / f"{batch_id}.jsonl"
         )
-        if incremental_output_dir:
-            from pathlib import Path
-            import shutil
-            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
 
-        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+        if incremental_path.exists() and incremental_path.stat().st_size > 0:
             import shutil
             api_path = self.storage.files_dir / output_file_id
             shutil.copy2(incremental_path, api_path)
@@ -2169,6 +2231,7 @@ class BatchScheduler:
             BatchStatus.COMPLETED,
             completed_at=completed_at,
             output_file_id=output_file_id,
+            request_counts=tracker_request_counts(tracker),
         )
 
         # Clean up batch tracker, intake info, and request metadata

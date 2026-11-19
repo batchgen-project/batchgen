@@ -401,8 +401,13 @@ def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget
     assert all(item["error"]["status_code"] == 400 for item in errors)
     assert all("max_model_len=16" in item["error"]["message"] for item in errors)
     tracker = scheduler._scheduling_pool.get_batch_tracker("length-batch")
-    assert tracker.completed_requests == 2 and not tracker.is_complete
+    assert (tracker.completed_requests, tracker.failed_requests) == (0, 2)
+    assert not tracker.is_complete
     assert finalized == ["length-batch"]
+
+
+# A cohort's code identity, as a tree without git metadata publishes it.
+NO_GIT_IDENTITY = {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"}
 
 
 def published_transient():
@@ -440,12 +445,14 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
     from fastapi.testclient import TestClient
 
     async def run():
-        worker = SimpleNamespace(response_queue=queue.Queue())
+        worker = SimpleNamespace(response_queue=queue.Queue(),
+                                 record_code_identity=lambda cohort, identity: None)
         scheduler = bs.BatchScheduler(SimpleNamespace(), worker, SimpleNamespace())
         await scheduler.start()
         try:
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
-                                        "startup_transient": published_transient()})
+                                        "startup_transient": published_transient(),
+                                        "code_identity": NO_GIT_IDENTITY, "cohort": 0})
             await scheduler.wait_for_deployment()
             with TestClient(_models_app(scheduler)) as client:
                 for path in ("/v1/models", "/v1/models/test-model"):
@@ -459,7 +466,8 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
                 scheduler._clear_deployment()
                 assert client.get("/v1/models").status_code == 503
                 worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 65,
-                                        "startup_transient": published_transient()})
+                                        "startup_transient": published_transient(),
+                                        "code_identity": NO_GIT_IDENTITY, "cohort": 0})
                 await scheduler.wait_for_deployment()
                 assert client.get("/v1/models/test-model").json()["max_model_len"] == 65
                 assert client.get("/v1/models/missing").status_code == 404

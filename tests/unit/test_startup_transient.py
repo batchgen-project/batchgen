@@ -299,6 +299,10 @@ def test_probe_with_cuda_names_a_manager_without_the_step():
 
 # ---- publication: same channel as max_model_len ---------------------------------
 
+# A cohort's code identity, as a tree without git metadata publishes it.
+NO_GIT_IDENTITY = {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"}
+
+
 def _published():
     return [
         st.StartupTransient.missing(flavor, st.SEAM_DEPLOYMENT_PREPARE, 8, "CUDA is unavailable").as_dict()
@@ -320,7 +324,8 @@ def test_main_loop_publishes_the_transient_in_the_capacity_message():
 
 def test_scheduler_requires_the_transient_with_the_length_and_clears_both():
     async def run():
-        worker = SimpleNamespace(response_queue=queue.Queue())
+        worker = SimpleNamespace(response_queue=queue.Queue(),
+                                 record_code_identity=lambda cohort, identity: None)
         scheduler = bs.BatchScheduler(SimpleNamespace(), worker, SimpleNamespace())
         await scheduler.start()
         try:
@@ -329,7 +334,8 @@ def test_scheduler_requires_the_transient_with_the_length_and_clears_both():
             assert not scheduler._deployment_ready.is_set()
             assert scheduler.max_model_len is None
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
-                                       "startup_transient": _published()})
+                                       "startup_transient": _published(),
+                                       "code_identity": NO_GIT_IDENTITY, "cohort": 0})
             await asyncio.wait_for(scheduler.wait_for_deployment(), timeout=5)
             assert scheduler.max_model_len == 129
             assert [t.model_dump() for t in scheduler.startup_transient] == _published()
