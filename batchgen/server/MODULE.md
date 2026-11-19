@@ -57,3 +57,18 @@ budget does not deduct it. A flavor the deployment cannot measure is published
 with an `unavailable` reason instead of a value: eager needs a model-provided
 cap-sized synthetic decode step, and capture is measured only where the
 lifecycle captures at startup.
+
+# Batch request counts
+
+`BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per
+request in one place, `BatchScheduler._record_pool_result`, which every batch
+request result passes through (worker completions and admission rejections). It counts the result
+on the `SchedulingPool` tracker (`record_request_result`, once per request;
+an `error` result is failed) and only then writes the output item, so the
+output file and the counts cannot diverge. `total` is persisted at
+registration. While the tracker exists, `with_live_request_counts` serves its
+live counts on `GET /v1/batches`, `GET /v1/batches/{id}` and cancel; the
+completed and failed transitions persist the tracker's final counts. Startup
+recovery (`StorageManager.fail_orphaned_batches`) rebuilds completed/failed of
+an orphaned batch from its incremental output items. Records written before
+the field existed load with zero counts.

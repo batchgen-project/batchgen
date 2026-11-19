@@ -17,7 +17,10 @@ from batchgen.server.storage import StorageManager
 
 
 def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
-    tracker = SimpleNamespace(is_complete=False, error={"message": "worker failed"})
+    tracker = SimpleNamespace(
+        is_complete=False, error={"message": "worker failed"},
+        total_requests=2, completed_requests=1, failed_requests=0,
+    )
     storage = StorageManager(tmp_path)
     storage.save_batch(BatchObject(
         id="batch-test",
@@ -54,6 +57,10 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     assert persisted is not None
     assert persisted.status == BatchStatus.FAILED
     assert persisted.error == str(tracker.error)
+    # The failure persists the counts the tracker had reached.
+    assert persisted.request_counts.model_dump() == {
+        "total": 2, "completed": 1, "failed": 0,
+    }
     # The failed batch holds no scheduler state afterwards.
     assert trackers == {}
     assert scheduler._pool_request_meta == {}

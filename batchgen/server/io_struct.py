@@ -249,6 +249,19 @@ class CreateBatchRequest(BaseModel):
         return None
 
 
+class BatchRequestCounts(BaseModel):
+    """Per-request outcome counts of a batch, as in the OpenAI Batch object.
+
+    ``total`` is the number of requests in the validated input file, 0 until
+    the file is validated. ``completed`` counts requests whose output item
+    carries a response and ``failed`` those whose output item carries an
+    error; each request is counted once, so ``completed + failed <= total``.
+    """
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+
+
 class BatchObject(BaseModel):
     id: str
     object: Literal["batch"] = "batch"
@@ -264,6 +277,8 @@ class BatchObject(BaseModel):
     cancelled_at: Optional[int] = None
     cancelling_at: Optional[int] = None
     error: Optional[str] = None
+    # A batch persisted before the field existed loads with zero counts.
+    request_counts: BatchRequestCounts = Field(default_factory=BatchRequestCounts)
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None

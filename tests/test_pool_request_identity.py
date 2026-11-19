@@ -93,6 +93,7 @@ def _scheduler(tmp_path, trace):
         output_dir=tmp_path,
         update_batch_status=lambda batch_id, status, **kw: trace.append(
             ("status", batch_id, status, kw.get("error"))),
+        update_request_counts=lambda batch_id, counts: None,
     )
     scheduler = bs.BatchScheduler(
         storage, None, SimpleNamespace(incremental_output_dir=str(tmp_path)))

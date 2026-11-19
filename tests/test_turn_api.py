@@ -228,6 +228,9 @@ class _Storage:
     def update_batch_status(self, batch_id, status, **kwargs):
         self.statuses.append((batch_id, status, kwargs))
 
+    def update_request_counts(self, batch_id, counts):
+        pass
+
     def save_metadata(self, file_id, meta):
         self.metadata[file_id] = meta
 

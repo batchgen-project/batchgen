@@ -71,6 +71,7 @@ def _scheduler(tmp_path, lines):
         load_metadata=lambda file_id: {"id": file_id},
         update_batch_status=lambda batch_id, status, **kw: updates.append(
             (status, kw.get("error"))),
+        update_request_counts=lambda batch_id, counts: None,
     )
     finalized = []
 
@@ -111,7 +112,8 @@ def test_an_unrenderable_conversation_fails_only_its_own_request(tmp_path):
 
     tracker = scheduler._scheduling_pool.get_batch_tracker("batch-1")
     assert tracker.total_requests == 3
-    assert tracker.completed_requests == 1
+    # The rejected request is counted as failed, not completed.
+    assert (tracker.completed_requests, tracker.failed_requests) == (0, 1)
     assert not tracker.is_complete
     assert finalized == ["batch-1"]
 

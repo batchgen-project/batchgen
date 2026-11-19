@@ -200,6 +200,7 @@ is not serving (during a worker-pool restart or after the pool went down), and
   "cancelled_at": null,
   "cancelling_at": null,
   "error": null,
+  "request_counts": {"total": 0, "completed": 0, "failed": 0},
   "metadata": null,
   "max_decoding_length": 1024,
   "temperature": null,
@@ -233,6 +234,17 @@ List batch jobs.
 Get current status of a batch job. Use this endpoint to poll for completion.
 
 **Response:** `BatchObject` (same schema as create response, with updated status and timestamps)
+
+`request_counts` follows the OpenAI Batch object. `total` is the number of
+requests in the input file, set once the file is validated (`0` before that,
+and for a batch that fails validation). Each request is counted once, when its
+result is written to the output file: `completed` if the output item has a
+`response`, `failed` if it has an `error` (for example a prompt rejected at
+admission or a request the worker failed). `completed + failed <= total`, and
+the two sum to `total` when the batch is `completed`. While the batch runs the
+counts are live; a batch that ends `failed` (including one failed by a server
+restart) keeps the counts it had reached. Failed requests stay in the single
+output file (`output_file_id`); there is no separate error file.
 
 ### POST /v1/batches/{batch_id}/cancel
 
