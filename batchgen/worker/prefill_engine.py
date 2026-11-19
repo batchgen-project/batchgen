@@ -308,14 +308,35 @@ class PrefillEngine:
         return self._prefix.next_pool_segment_sid()
 
     def _prefix_rank_packing_mode(self, worker, seqs) -> bool:
-        """True when this batch asked for the predicted-time wave packer."""
+        """True when this batch runs the predicted-time wave packer.
+
+        The packer is the default assignment for a pool-served wave: it is the
+        arm that gives a prefix family one group's pool and balances the groups
+        by predicted prefill seconds, so leaving it off by default would make
+        every ordinary wave pay for a straggler the scheduler can see coming.
+        A batch asks for the arrival-order assignment back with
+        ``batchgen_debug.prefix_rank_assignment_mode: "global_idx"``, which is
+        what the A/B arms use.
+
+        Only the two spellings are accepted; a mistyped value is refused rather
+        than read as the other arm, because a silently ignored switch would
+        make the two arms the same run.
+        """
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
         active_debug = getattr(self, "_active_batchgen_debug_for_sequences", None)
         debug = (active_debug(seqs) if active_debug is not None else None) or {}
-        return debug.get("prefix_rank_assignment_mode") == "packing_v2"
+        mode = debug.get("prefix_rank_assignment_mode")
+        if mode is None:
+            return True
+        if mode not in ("packing_v2", "global_idx"):
+            raise ValueError(
+                "batchgen_debug.prefix_rank_assignment_mode must be "
+                f"'packing_v2' or 'global_idx', got {mode!r}"
+            )
+        return mode == "packing_v2"
 
     def _prefix_rank_cost_profile_disabled(self, worker, seqs) -> bool:
         """``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
@@ -2496,6 +2517,11 @@ class PrefillEngine:
                     hidden_states = self.model.model._apply_output_attn_res(
                         hidden_states.view(-1, hidden_dim), block_residual
                     ).view(batch_sz, seq_sz, hidden_dim)
+                    # The pass is over: the buffer behind this view is model
+                    # class state and outlives the local, so it is released
+                    # here rather than left pinned until the next seed.
+                    block_residual = None
+                    self.model.model._release_block_residual()
 
                 # Final norm
                 hidden_states = self.model.model.norm(hidden_states)
@@ -2890,9 +2916,13 @@ class PrefillEngine:
                             logits=logits,
                         )
                 del hidden_states
-                # Dropped before the next chunk seeds its own buffer, so the two
-                # are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
+                # The pass is over. Dropping the local view is not enough: the
+                # buffer behind it is model class state, and left alone it
+                # stays allocated through everything the next wave does
+                # before it seeds its own (PREFILL_MEMORY_AUDIT.md fix 3).
                 block_residual = None
+                if use_attn_res:
+                    self.model.model._release_block_residual()
                 self._weight_passes.end()
                 executed += int(rows.input_ids.numel())
                 wave.executor.finish(chunk)
