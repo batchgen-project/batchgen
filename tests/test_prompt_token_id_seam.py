@@ -136,7 +136,7 @@ def _scheduler(tmp_path, worker, tokenizer, lines):
     args = SimpleNamespace(
         model=MODEL, max_intake_capacity=1024,
         incremental_output_dir=str(tmp_path / "incr"),
-        no_incremental_save=False, parse_thinking=False, parse_tool_call=False,
+        parse_thinking=False, parse_tool_call=False,
     )
     scheduler = bs.BatchScheduler(storage, worker, args)
     scheduler.max_model_len = 4096

@@ -128,7 +128,7 @@ class _Server:
         self.scheduler = bs.BatchScheduler(self.storage, None, SimpleNamespace(
             model=MODEL, max_intake_capacity=64,
             incremental_output_dir=str(self.incremental),
-            no_incremental_save=False, parse_thinking=False, parse_tool_call=False,
+            parse_thinking=False, parse_tool_call=False,
         ))
         self.scheduler.max_model_len = MAX_MODEL_LEN
         self.scheduler._get_tokenizer = lambda model: _Tokenizer()

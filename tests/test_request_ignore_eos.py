@@ -28,7 +28,7 @@ def test_request_models_accept_ignore_eos_and_default_to_false():
     assert CompletionRequest(model="m", prompt="hi", ignore_eos=True).ignore_eos is True
 
 
-def test_pool_intake_entry_carries_each_request_flag():
+def test_pool_intake_entry_carries_each_request_flag(tmp_path):
     submitted = []
     scheduler = object.__new__(BatchScheduler)
     scheduler._scheduling_pool = SimpleNamespace(register_batch=lambda **kw: None)
@@ -38,7 +38,7 @@ def test_pool_intake_entry_carries_each_request_flag():
         max_capacity=10,
     )
     scheduler.storage = SimpleNamespace()
-    scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
+    scheduler.server_args = SimpleNamespace(incremental_output_dir=str(tmp_path))
     scheduler._pool_request_meta = {}
     url = SimpleNamespace(value="/v1/chat/completions")
     requests = [

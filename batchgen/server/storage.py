@@ -130,9 +130,7 @@ class StorageManager:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
 
-    def fail_orphaned_batches(
-        self, incremental_output_dir: Optional[str]
-    ) -> List[str]:
+    def fail_orphaned_batches(self, incremental_output_dir: str) -> List[str]:
         """Fail batches a previous server process left active.
 
         A new process holds no worker state for them, so they can never finish;
@@ -143,20 +141,19 @@ class StorageManager:
         The previous process kept the batch's completed/failed counts in
         memory only; its output items, one per counted request, are in
         ``{incremental_output_dir}/{batch_id}.jsonl``, so the counts are
-        rebuilt from them. With no such file (incremental saving disabled, or
-        nothing recorded yet) the persisted counts are kept.
+        rebuilt from them. With no such file (nothing recorded yet) the
+        persisted counts are kept.
         """
         active = {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS, BatchStatus.CANCELLING}
         failed = []
         for batch in self.list_all_batches():
             if batch.status in active:
                 updates = {"error": "server restarted while this batch was active"}
-                if incremental_output_dir:
-                    items = Path(incremental_output_dir) / f"{batch.id}.jsonl"
-                    if items.exists():
-                        updates["request_counts"] = self._recorded_request_counts(
-                            batch, items
-                        )
+                items = Path(incremental_output_dir) / f"{batch.id}.jsonl"
+                if items.exists():
+                    updates["request_counts"] = self._recorded_request_counts(
+                        batch, items
+                    )
                 self.update_batch_status(batch.id, BatchStatus.FAILED, **updates)
                 failed.append(batch.id)
         return failed

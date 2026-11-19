@@ -67,7 +67,7 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     assert removed == ["batch-test"]
 
 
-def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
+def test_capacity_snapshot_does_not_reset_active_scheduling_slots(tmp_path):
     """Free-page snapshots must not reinitialize an active fixed-capacity pool."""
     pool = SchedulingPool(capacity=4)
     pool.allocate_slot("request-1")
@@ -115,7 +115,8 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
     scheduler.worker = SimpleNamespace(response_queue=ResponseQueue())
     scheduler._scheduling_pool = pool
     scheduler._trajectory_pool_info = None
-    scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
+    scheduler.server_args = SimpleNamespace(incremental_output_dir=str(tmp_path))
+    scheduler._pool_request_meta = {}
     scheduler._fail_all_active_batches = lambda error: None
 
     asyncio.run(scheduler._pool_completion_listener())

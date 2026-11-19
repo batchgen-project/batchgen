@@ -245,7 +245,6 @@ def _scheduler(tmp_path, worker):
         model=MODEL,
         max_intake_capacity=64,
         incremental_output_dir=str(tmp_path / "incr"),
-        no_incremental_save=False,
         parse_thinking=False,
         parse_tool_call=False,
     )
