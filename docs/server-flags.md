@@ -489,7 +489,7 @@ storage/
 ├── uploads/       # Uploaded batch input files
 ├── batches/       # Batch job metadata
 ├── outputs/       # Inference results (when --save-result is enabled)
-└── incremental/   # Incremental JSONL results (crash-resilient, enabled by default)
+└── incremental/   # Incremental JSONL results (crash-resilient, always on)
 ```
 
 ### Incremental Result Saving
@@ -499,24 +499,14 @@ Completed sequences are written incrementally to a JSONL file on disk as they fi
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--incremental-output-dir` | `{storage_path}/incremental/` | Directory for incremental JSONL output files. Each batch produces one file named `{batch_id}.jsonl`. |
-| `--no-incremental-save` | `false` | Disable incremental saving entirely |
 
-**Enabled by default.** No extra flags are needed. To customize the output directory:
+**Always on.** This file is the only record of a batch's results: on completion it is published as the batch output file (`GET /v1/files/{output_file_id}/content`), so it cannot be disabled. To customize the output directory:
 
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --host-kv-cache-size 650 \
     --incremental-output-dir /data/incremental_results
-```
-
-To disable:
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --host-kv-cache-size 650 \
-    --no-incremental-save
 ```
 
 Each line in the JSONL file is a complete `BatchResultItem` with `custom_id`, `response` (containing `status_code`, `body` with `choices` and `usage`). Lines are written in completion order (not input order).

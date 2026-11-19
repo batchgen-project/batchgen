@@ -47,7 +47,7 @@ def test_active_batches_are_failed_and_unblock_their_file(tmp_path):
     _save(storage, "b-done", BatchStatus.COMPLETED, "file-d")
     _save(storage, "b-cancelled", BatchStatus.CANCELLED, "file-e")
 
-    failed = storage.fail_orphaned_batches(None)
+    failed = storage.fail_orphaned_batches(str(tmp_path / "incremental"))
 
     assert sorted(failed) == ["b-cancelling", "b-progress", "b-validating"]
     for batch_id in failed:
@@ -60,7 +60,8 @@ def test_active_batches_are_failed_and_unblock_their_file(tmp_path):
 
 
 def test_clean_storage_fails_nothing(tmp_path):
-    assert StorageManager(tmp_path).fail_orphaned_batches(None) == []
+    assert StorageManager(tmp_path).fail_orphaned_batches(
+        str(tmp_path / "incremental")) == []
 
 
 def test_storage_ownership_is_exclusive_per_live_process(tmp_path):

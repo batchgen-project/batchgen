@@ -1476,11 +1476,11 @@ class BatchScheduler:
                 "model": req.body.model,
             }
 
-        # Ensure incremental output directory exists
-        incr_dir = self.server_args.incremental_output_dir
-        if incr_dir:
-            from pathlib import Path
-            Path(incr_dir).mkdir(parents=True, exist_ok=True)
+        # Ensure the batch output items directory exists
+        from pathlib import Path
+        Path(self.server_args.incremental_output_dir).mkdir(
+            parents=True, exist_ok=True
+        )
 
         # A request whose prompt could not be constructed fails alone, as the
         # Batch API error item a worker-side rejection also produces.
@@ -2037,10 +2037,6 @@ class BatchScheduler:
         200 with empty text, which is indistinguishable from a generation that
         legitimately produced nothing.
         """
-        incr_dir = self.server_args.incremental_output_dir
-        if not incr_dir:
-            return
-
         meta = self._pool_request_meta.get(batch_id, {}).get(request_id)
         if not meta:
             logger.warning(f"[POOL] No metadata for {request_id} in batch {batch_id}")
@@ -2164,11 +2160,10 @@ class BatchScheduler:
         self, batch_id: str, request_id: str, result_item: dict
     ) -> None:
         """Append one BatchResultItem to the batch's incremental JSONL."""
-        incr_dir = self.server_args.incremental_output_dir
-        if not incr_dir:
-            return
         from pathlib import Path
-        output_path = Path(incr_dir) / f"{batch_id}.jsonl"
+        output_path = (
+            Path(self.server_args.incremental_output_dir) / f"{batch_id}.jsonl"
+        )
         try:
             with open(output_path, "a") as f:
                 f.write(json.dumps(result_item, ensure_ascii=False) + "\n")
@@ -2184,26 +2179,21 @@ class BatchScheduler:
         """Finalize batch output after all requests complete.
 
         Per-request output is written by _write_pool_completion as each request
-        completes.
+        completes, into {incremental_output_dir}/{batch_id}.jsonl -- the only
+        record of the batch's results, which this method publishes as the
+        batch output file.
         This method writes the batch status, its final request_counts and
         the output file metadata.
         """
         tracker = self._scheduling_pool.get_batch_tracker(batch_id)
         output_file_id = f"file-{uuid.uuid4().hex}"
 
-        # Check for incremental output
-        incremental_path = None
-        incremental_output_dir = (
-            self.server_args.incremental_output_dir
-            if not self.server_args.no_incremental_save
-            else None
+        from pathlib import Path
+        incremental_path = (
+            Path(self.server_args.incremental_output_dir) / f"{batch_id}.jsonl"
         )
-        if incremental_output_dir:
-            from pathlib import Path
-            import shutil
-            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
 
-        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+        if incremental_path.exists() and incremental_path.stat().st_size > 0:
             import shutil
             api_path = self.storage.files_dir / output_file_id
             shutil.copy2(incremental_path, api_path)
