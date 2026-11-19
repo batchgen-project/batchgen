@@ -1337,7 +1337,7 @@ class KimiLinearModel(nn.Module):
             # (14.00 GiB at S=131,072). The carried path does the same through
             # BlockResidualCarrier.take().
             block_residual = None
-            BlockResidualBuffer.reset()
+            self._release_block_residual()
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -1364,6 +1364,20 @@ class KimiLinearModel(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+
+    def _release_block_residual(self) -> None:
+        """End one pass's ``block_residual`` scratch.
+
+        The buffer behind the views ``_new_block_residual`` hands out is class
+        state (:class:`BlockResidualBuffer`), so dropping the caller's local
+        view does not free it: the whole ``(num_tokens, num_boundaries,
+        hidden)`` allocation stays pinned until the next pass reseeds it.
+        ``forward`` ends its own pass this way; a serving loop that seeds
+        through ``_new_block_residual`` must end each pass here, after the
+        output mix, or the last pass's buffer is charged to everything that
+        runs before the next seed and to the next wave's headroom.
+        """
+        BlockResidualBuffer.reset()
 
     def _apply_output_attn_res(self, flat_hidden: torch.Tensor,
                                block_residual: torch.Tensor) -> torch.Tensor:

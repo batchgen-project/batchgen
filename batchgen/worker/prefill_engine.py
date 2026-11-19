@@ -2517,6 +2517,11 @@ class PrefillEngine:
                     hidden_states = self.model.model._apply_output_attn_res(
                         hidden_states.view(-1, hidden_dim), block_residual
                     ).view(batch_sz, seq_sz, hidden_dim)
+                    # The pass is over: the buffer behind this view is model
+                    # class state and outlives the local, so it is released
+                    # here rather than left pinned until the next seed.
+                    block_residual = None
+                    self.model.model._release_block_residual()
 
                 # Final norm
                 hidden_states = self.model.model.norm(hidden_states)
@@ -2911,9 +2916,13 @@ class PrefillEngine:
                             logits=logits,
                         )
                 del hidden_states
-                # Dropped before the next chunk seeds its own buffer, so the two
-                # are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
+                # The pass is over. Dropping the local view is not enough: the
+                # buffer behind it is model class state, and left alone it
+                # stays allocated through everything the next wave does
+                # before it seeds its own (PREFILL_MEMORY_AUDIT.md fix 3).
                 block_residual = None
+                if use_attn_res:
+                    self.model.model._release_block_residual()
                 self._weight_passes.end()
                 executed += int(rows.input_ids.numel())
                 wave.executor.finish(chunk)
