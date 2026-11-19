@@ -13,6 +13,7 @@ from batchgen import lifespan
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
 from batchgen.lifespan import SeqEvent
 from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.worker.decode_profile import DecodeProfileCapture
 from batchgen.worker.deferred_readback import (
     DeferredTokenReadbackError,
     TokenReadbackRing,
@@ -80,6 +81,8 @@ class DecoupledGpuDecode:
         past_key_states=None,
         past_value_states=None,
         scale_dict=None,
+        *,
+        profile_capture: DecodeProfileCapture,
     ):
         # The moved loop body is kept VERBATIM from batchgen_worker.py:
         # several suites pin its source text (``self._graph.cuda_graph_manager
@@ -280,6 +283,7 @@ class DecoupledGpuDecode:
                     f"[DECODE] step={self._cumulative_decode_iterations} "
                     f"active={len(decode_uuids)} finished={_hb_finished} "
                     f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
+                    f"{profile_capture.log_suffix()}"
                 )
                 # The sampling fallback count is now accumulated on device so
                 # the step path never reads it back. Drain it here, where the
@@ -1320,6 +1324,7 @@ class DecoupledGpuDecode:
             logging.info(
                 f"[DECODE] interval end: steps={int(_step_split[0])} "
                 f"{format_decode_step_split(_step_split)}{_fwd_ring.take_summary()}"
+                f"{profile_capture.log_suffix()}"
             )
         if _probe is not None:
             # The loop exits after the last step's readback, so its pair has
