@@ -9,5 +9,6 @@
 #                  http://www.apache.org/licenses/license-2.0                   #
 # ---------------------------------------------------------------------------- #
 
-"""Machine identity for the engine: one classifier from device facts to a
-machine family, which model planners key their per-machine profiles on."""
+"""Machine facts for the engine: one classifier from device facts to a
+machine family, which model planners key their per-machine profiles on, and
+the host physical memory reader (``meminfo``)."""
