@@ -191,7 +191,8 @@ def _worker_probe(*, cuda_available, cuda=None, dist=None):
 def _worker(**kwargs):
     values = dict(rank=0, local_rank=0, world_size=1, _phase="decode",
                   _decode_padding_bsz=8, parallel_manager=SimpleNamespace(),
-                  startup_transient=None)
+                  startup_transient=None,
+                  _snapshot_server_config=lambda: None)
     values.update(kwargs)
     return SimpleNamespace(**values)
 
@@ -214,6 +215,20 @@ def test_probe_without_cuda_publishes_unavailable_and_still_captures(caplog):
     lines = [r.getMessage() for r in caplog.records]
     assert any(line.startswith("[STARTUP_TRANSIENT] rank=0 ") for line in lines)
     assert any(line.startswith("[STARTUP_TRANSIENT] deployment ") for line in lines)
+
+
+def test_probe_snapshots_server_config_last_while_residency_is_live():
+    # The [SERVER_CONFIG] snapshot is this seam step's final act: it runs
+    # inside the probe, after the transient is published, so both lifecycles
+    # take it through one call path before their switch to prefill retires
+    # the decode pool.
+    probe = _worker_probe(cuda_available=False)
+    worker = _worker()
+    order = []
+    worker._snapshot_server_config = lambda: order.append(
+        worker.startup_transient is not None)
+    probe(worker, seam=st.SEAM_DEPLOYMENT_PREPARE, capture=None)
+    assert order == [True]
 
 
 def test_probe_names_a_lifecycle_without_startup_capture():
@@ -302,6 +317,16 @@ def test_probe_with_cuda_names_a_manager_without_the_step():
 # A cohort's code identity, as a tree without git metadata publishes it.
 NO_GIT_IDENTITY = {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"}
 
+# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+SERVER_CONFIG = {
+    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
+    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "cuda_graphs": False, "graph_buckets": None,
+    "host_kv_gib": 1.0, "host_kv_pages": 8,
+    "device_kv_gib": 1.0, "device_kv_pages": 8,
+    "gpu_memory_frac": 0.9, "max_pool": 8,
+}
+
 
 def _published():
     return [
@@ -325,7 +350,8 @@ def test_main_loop_publishes_the_transient_in_the_capacity_message():
 def test_scheduler_requires_the_transient_with_the_length_and_clears_both():
     async def run():
         worker = SimpleNamespace(response_queue=queue.Queue(),
-                                 record_code_identity=lambda cohort, identity: None)
+                                 record_code_identity=lambda cohort, identity: None,
+                                 record_server_config=lambda cohort, config: None)
         scheduler = bs.BatchScheduler(SimpleNamespace(), worker, SimpleNamespace())
         await scheduler.start()
         try:
@@ -335,7 +361,8 @@ def test_scheduler_requires_the_transient_with_the_length_and_clears_both():
             assert scheduler.max_model_len is None
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
                                        "startup_transient": _published(),
-                                       "code_identity": NO_GIT_IDENTITY, "cohort": 0})
+                                       "code_identity": NO_GIT_IDENTITY,
+                                       "server_config": SERVER_CONFIG, "cohort": 0})
             await asyncio.wait_for(scheduler.wait_for_deployment(), timeout=5)
             assert scheduler.max_model_len == 129
             assert [t.model_dump() for t in scheduler.startup_transient] == _published()

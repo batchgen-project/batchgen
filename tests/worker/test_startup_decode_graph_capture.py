@@ -228,6 +228,9 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
         _glm5_whole_model_graph_capture_signature=lambda bucket=None: ("page-tables", None),
         _decode_graph_bucket_sizes=lambda: list(BUCKETS),
         _max_decode_rank_bsz=lambda: 8,
+        # The [SERVER_CONFIG] snapshot (tested in tests/unit/test_server_config.py)
+        # is the real probe's final act, so the loaded probe reaches it here.
+        _snapshot_server_config=lambda: None,
     )
     return worker
 

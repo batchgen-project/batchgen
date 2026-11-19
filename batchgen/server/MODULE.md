@@ -78,6 +78,23 @@ the outgoing generation is still current, so its identity stays reported next
 to state `restarting`; after a failed restart it is null. The identity names a
 revision, never a directory.
 
+The publication also carries the cohort's `server_config`
+(`batchgen/worker/server_config.py`): the parallel layout the model's
+strategy manager declares per phase (`batchgen/parallel_declaration.py`;
+an undeclared manager reports `undeclared`, never a guessed default), the
+CUDA-graph flag with the captured bucket ladder, the host- and device-KV
+pool sizes and page counts, the GPU memory fraction and the derived
+scheduling capacity. Local rank 0 of each node snapshots it while the decode
+pool and captured graphs are live (`_snapshot_server_config`, before the
+startup switch to prefill), and `WorkerManager.record_server_config` logs one
+line per generation and node before the scheduler marks the deployment ready:
+
+    [SERVER_CONFIG] generation=<G> node=<N> prefill_attn=<slot> prefill_moe=<slot> decode_attn=<slot> decode_moe=<slot> cuda_graphs=<on|off> graph_buckets=<b1,b2,...|none> host_kv_gib=<G.GGG> host_kv_pages=<P> device_kv_gib=<G.GGG> device_kv_pages=<P> gpu_memory_frac=<F> max_pool=<N>
+
+where `<slot>` is `undeclared`, `none`, or a `scheme:residency` token whose
+sharded schemes carry their group width: `dp:streamed`, `tp8:resident`,
+`ep8:partial`.
+
 # Batch request counts
 
 `BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per

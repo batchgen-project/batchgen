@@ -852,6 +852,7 @@ def _server_worker_main_impl(
 			"max_model_len": worker.model_context_length,
 			"startup_transient": worker.startup_transient,
 			"code_identity": code_identity.as_dict(),
+			"server_config": worker.server_config,
 			"cohort": args.log_cohort,
 		})
 

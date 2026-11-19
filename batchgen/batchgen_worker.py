@@ -1506,6 +1506,10 @@ class BatchGenWorker:
 		# by _probe_startup_transient before readiness and published with the
 		# deployment capacity. Report-only: nothing sizes from it.
 		self.startup_transient: Optional[List[dict]] = None
+		# The [SERVER_CONFIG] snapshot (batchgen.worker.server_config), taken
+		# by _snapshot_server_config while the decode pool and captured graphs
+		# are live, published with the deployment capacity. Report-only.
+		self.server_config: Optional[dict] = None
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -7637,6 +7641,68 @@ class BatchGenWorker:
 		self.engine_config.Basic_Config.max_model_len = length
 		self._deployment_length_verified = True
 
+	def _snapshot_server_config(self) -> None:
+		"""Snapshot the [SERVER_CONFIG] values while their owners are live.
+
+		Runs as the final act of the startup decode-residency seam step
+		(``_probe_startup_transient``), after the decode pool is sized and
+		the startup graphs are captured, and before the lifecycle's switch
+		to prefill can retire the decode pool. Every value is read from the
+		object that owns it (parallel-strategy manager declaration, graph
+		state, host-KV view, device-KV manager, trajectory book); local rank
+		0 publishes the snapshot with the deployment capacity and the server
+		logs it once per generation and node (batchgen.worker.server_config).
+		"""
+		from batchgen.parallel_declaration import (
+			read_parallel_declaration,
+			undeclared_slots,
+		)
+		from batchgen.worker.server_config import ServerConfig
+
+		declaration = read_parallel_declaration(self.parallel_manager)
+		slots = (
+			undeclared_slots()
+			if declaration is None
+			else declaration.rendered_slots()
+		)
+		bucketing = self._graph.whole_model_bucketing
+		captured = None
+		if (
+			self._graph.whole_model_graph
+			and self._graph.cuda_graph_manager is not None
+			and bucketing is not None
+		):
+			captured = tuple(int(b) for b in bucketing.bucket_sizes)
+		gpu_manager = self.gpu_paged_kv_cache_manager
+		if gpu_manager is None:
+			raise RuntimeError(
+				"server config snapshot needs the sized device-KV pool; it "
+				"must run before the startup switch to prefill retires it"
+			)
+		if self.gpu_kv_cache_size_gb is None:
+			raise RuntimeError(
+				"server config snapshot needs the measured device-KV size"
+			)
+		book = self._traj.trajectory_book
+		if book is None:
+			raise RuntimeError("server config snapshot needs the trajectory pool")
+		self.server_config = ServerConfig(
+			prefill_attn=slots["prefill_attention"],
+			prefill_moe=slots["prefill_moe"],
+			decode_attn=slots["decode_attention"],
+			decode_moe=slots["decode_moe"],
+			cuda_graphs=bool(self.engine_config.Basic_Config.enable_cuda_graphs),
+			graph_buckets=captured,
+			host_kv_gib=float(self.global_host_kv_cache_size_gb),
+			host_kv_pages=self._get_host_kv_total_pages(),
+			device_kv_gib=float(self.gpu_kv_cache_size_gb),
+			device_kv_pages=int(gpu_manager.get_stats().num_total_pages),
+			gpu_memory_frac=float(self.gpu_memory_frac),
+			max_pool=int(
+				book.reservation_total_capacity(self.model_context_length)
+			),
+		).as_dict()
+
 	def prepare_deployment(self) -> None:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_worker_lifecycle_engine", None)
@@ -10477,7 +10543,10 @@ class BatchGenWorker:
 
 		Report-only: the result is logged and stored in
 		``self.startup_transient`` for the deployment-capacity publication;
-		nothing reads it for sizing.
+		nothing reads it for sizing. As the final act of this seam step the
+		[SERVER_CONFIG] values are snapshotted (``_snapshot_server_config``)
+		while the sized decode pool and any startup-captured graphs are
+		still live; the lifecycle's switch to prefill next may retire them.
 		"""
 		padding_bsz = getattr(self, "_decode_padding_bsz", None)
 		if getattr(self, "_phase", None) != "decode" or not padding_bsz:
@@ -10544,6 +10613,10 @@ class BatchGenWorker:
 		if self.rank == 0:
 			transient.log_ledger_line("deployment", deployment)
 		self.startup_transient = [item.as_dict() for item in deployment]
+		# Residency is complete and still live here (pool sized, startup
+		# graphs captured): snapshot [SERVER_CONFIG] before either lifecycle
+		# switches to prefill and retires the decode pool.
+		self._snapshot_server_config()
 
 	def _mark_phase_end(self, phase: str) -> None:
 		# The engine receives this worker as its sole state collaborator.
