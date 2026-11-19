@@ -215,7 +215,10 @@ def test_a_single_node_coordinator_opens_no_store_and_every_call_is_a_no_op():
 
     node.start()
     request = node.begin_restart(7.0)
-    assert request.epoch == 0
+    # The epoch names the cohort a restart brings up, so even without a store
+    # each restart claims the next one.
+    assert request.epoch == 1
+    assert node.begin_restart(7.0).epoch == 2
     assert request.timeout_s == 7.0
     # Every phase call returns immediately and raises nothing.
     node.barrier(request.epoch, PHASE_ARMED, deadline=0.0)
@@ -1392,7 +1395,6 @@ def test_a_failure_after_every_node_was_ready_is_published_as_the_new_cohort_dow
         raise RuntimeError("scheduler resume failed")
 
     manager._resume_hook = failing_resume
-    generation = manager.generation
     try:
         with pytest.raises(RuntimeError, match="scheduler resume failed"):
             manager.restart_workers(timeout_s=5)
@@ -1400,9 +1402,9 @@ def test_a_failure_after_every_node_was_ready_is_published_as_the_new_cohort_dow
         stop.set()
 
     assert manager.state == "workers_down"
-    assert store.snapshot()[f"down/{generation + 1}/node0"] == (
-        "scheduler resume failed"
-    )
+    # The peers now serve the cohort of epoch 1, generation 2 -- whatever
+    # generation this node held before -- so that is the key they read.
+    assert store.snapshot()["down/2/node0"] == "scheduler resume failed"
 
 
 def test_a_peer_down_key_survives_a_failed_read_and_is_reported_later(
@@ -1496,3 +1498,337 @@ def test_publish_run_identity_noop_single_node():
 
     node.publish_run_identity(json.dumps({"run_id": "a" * 32}))
     node.close()
+
+
+# ------------------------------------------- one cohort, one name everywhere
+#
+# A cohort is one torch.distributed world over every node, and a down key is
+# named by the generation of the cohort it reports, polled by each peer under
+# the generation it holds. So the invariant every down key relies on is: all
+# nodes serving a cohort hold the same generation for it. Two simulated nodes
+# share one control store below and are driven through each way a restart can
+# end; node 1 joins every epoch through its real follower poll.
+
+
+class _Node:
+    def __init__(self, manager, coordinator, exits):
+        self.manager = manager
+        self.coordinator = coordinator
+        self.exits = exits
+        self.hooks = coordinator_module._FollowerHooks(
+            state=lambda: manager.state,
+            generation=lambda: manager.generation,
+            ready=lambda: manager._first_ready,
+            on_peer_restart=manager._run_followed_restart,
+            on_peer_down=manager._handle_peer_cohort_down,
+            on_peer_lost=None,
+            on_control_lost=None,
+        )
+
+    def follow_once(self):
+        self.coordinator._follow_once(self.hooks)
+
+
+def _startup_generation(manager):
+    """The name start-up gives the cohort of restart epoch 0."""
+    return type(manager)._generation_of_epoch(0)
+
+
+def _two_nodes(monkeypatch, *, fail_fast=False, ready=(True, True)):
+    """Two nodes of one server over one store, both serving the start-up
+    cohort, every fail-fast exit recorded instead of ending the process."""
+    store = FakeStore()
+    nodes = []
+    for rank in (0, 1):
+        manager, _store, coordinator = _multi_node_manager(
+            monkeypatch, node_rank=rank, store=store
+        )
+        manager.set_main_thread_dispatcher(lambda fn, timeout: fn())
+        manager._worker_exit_state = _ExitState()
+        manager._reconcile = lambda reason, fail_in_flight: {"failed_batches": 0}
+        manager._cluster_fail_fast = fail_fast
+        manager._first_ready = ready[rank]
+        manager._generation = _startup_generation(manager)
+        exits = []
+        manager._exit_cluster = exits.append
+        # A start-up failure ends the server through SIGINT; never this one.
+        monkeypatch.setattr(
+            type(manager), "_request_server_shutdown",
+            staticmethod(lambda: exits.append("sigint")),
+        )
+        nodes.append(_Node(manager, coordinator, exits))
+    return store, nodes[0], nodes[1]
+
+
+def _restart_both(store, node0, node1, *, timeout_s=2.0):
+    """Node 0 claims the next epoch from its route; node 1's follower poll
+    picks it up and runs it. Returns node 0's outcome and the epoch."""
+    prior = int(store.add("epoch", 0))
+    lead, outcome = _in_thread(
+        lambda: node0.manager.restart_workers(timeout_s=timeout_s)
+    )
+    assert _wait_until(lambda: int(store.add("epoch", 0)) == prior + 1)
+    follow, _ = _in_thread(node1.follow_once)
+    lead.join(timeout_s + 5)
+    follow.join(timeout_s + 5)
+    assert not lead.is_alive() and not follow.is_alive()
+    return outcome[0], prior + 1
+
+
+def _observed_peer_down(observer, peer_rank):
+    """Whether one follower poll takes the observer down for the peer."""
+    observer.follow_once()
+    reason = observer.manager._worker_exit_state.reason or ""
+    return (
+        observer.manager.state == "workers_down"
+        and reason.startswith(f"peer node {peer_rank} worker cohort failed")
+    )
+
+
+def _fail_locally(node, rank):
+    node.manager._handle_worker_failure(
+        f"Detected worker process exit on node {rank}", None
+    )
+    assert node.manager.state == "workers_down"
+
+
+def _failing(message):
+    def hook():
+        raise RuntimeError(message)
+    return hook
+
+
+def test_a_successful_restart_names_the_new_cohort_alike_on_every_node(
+    monkeypatch,
+):
+    store, node0, node1 = _two_nodes(monkeypatch)
+
+    (ok, result), epoch = _restart_both(store, node0, node1)
+
+    assert ok is True and result["epoch"] == epoch == 1
+    assert node0.manager.state == node1.manager.state == "serving"
+    assert node0.manager.generation == node1.manager.generation
+    assert result["generation"] == node0.manager.generation
+    # Either node's later worker death reaches the other.
+    _fail_locally(node1, 1)
+    assert _observed_peer_down(node0, 1)
+
+
+@pytest.mark.parametrize("failing_rank", [0, 1])
+def test_a_restart_that_fails_after_every_node_was_ready_leaves_no_divergence(
+    monkeypatch, failing_rank,
+):
+    """Past P2 the restart succeeds on one node and fails on the other. With
+    fail-fast off both stay up in workers_down, and the next restart brings
+    both back; a per-node counter that only counted successes left the node
+    that failed one generation behind for good, so from then on a worker
+    death on either node was keyed by a generation the other never polled."""
+    store, node0, node1 = _two_nodes(monkeypatch)
+    nodes = (node0, node1)
+    failing, surviving = nodes[failing_rank], nodes[1 - failing_rank]
+    failing.manager._resume_hook = _failing("scheduler resume failed")
+
+    (ok, _value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is (failing_rank != 0)
+    assert failing.manager.state == "workers_down"
+    assert surviving.manager.state == "serving"
+    # The survivor serves the new cohort and hears of its failure there.
+    assert _observed_peer_down(surviving, failing_rank)
+
+    failing.manager._resume_hook = lambda: None
+    (ok, _value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is True
+    assert node0.manager.state == node1.manager.state == "serving"
+    assert node0.manager.generation == node1.manager.generation
+    _fail_locally(failing, failing_rank)
+    assert _observed_peer_down(surviving, failing_rank)
+
+
+def test_a_restart_that_fails_before_every_node_was_ready_leaves_no_divergence(
+    monkeypatch,
+):
+    """A failure before P2 fails the phase on every node, so no node adopts
+    the cohort and the next restart starts both from the same name."""
+    store, node0, node1 = _two_nodes(monkeypatch)
+    node1.manager._spawn_workers = _failing("rank 9 failed to spawn")
+
+    (ok, value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is False and isinstance(value, PeerRestartError)
+    assert value.node == 1 and value.phase == PHASE_READY
+    assert node0.manager.state == node1.manager.state == "workers_down"
+    assert node0.manager.generation == node1.manager.generation
+
+    node1.manager._spawn_workers = lambda: None
+    (ok, _value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is True
+    assert node0.manager.generation == node1.manager.generation
+    _fail_locally(node0, 0)
+    assert _observed_peer_down(node1, 0)
+
+
+def test_with_fail_fast_a_one_sided_restart_failure_ends_every_node(
+    monkeypatch,
+):
+    """The default for a multi-node launch: the node that failed past P2
+    exits, and the peer that succeeded reads the failure under the cohort it
+    now serves and exits too, so no node is left serving a divided world."""
+    store, node0, node1 = _two_nodes(monkeypatch, fail_fast=True)
+    node0.manager._resume_hook = _failing("scheduler resume failed")
+
+    (ok, _value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is False
+    assert node0.exits == ["restart failed: scheduler resume failed"]
+    assert node1.manager.state == "serving"
+    node1.follow_once()
+    assert node1.manager.state == "workers_down"
+    assert node1.exits and all(
+        reason == "peer node 0 fatal: scheduler resume failed"
+        for reason in node1.exits
+    )
+
+
+def test_only_node_zero_can_start_a_restart_and_a_peer_only_follows_one():
+    """No path restarts one node's workers alone: the route refuses on a
+    peer before it reaches the manager, and inside the manager the only
+    other caller is the follower, which runs node 0's epoch."""
+    tree = ast.parse(
+        (ROOT / "batchgen" / "server" / "worker_manager.py").read_text()
+    )
+    callers = sorted(
+        function.name
+        for function in ast.walk(tree)
+        if isinstance(function, ast.FunctionDef)
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "self.restart_workers"
+    )
+    assert callers == ["_run_followed_restart"]
+
+    route = _http_function("restart_workers")
+    source = ast.unparse(route)
+    assert "if server.node_rank > 0:" in source
+    assert source.index("if server.node_rank > 0:") < source.index(
+        "worker_manager.restart_workers"
+    )
+
+
+def test_an_epoch_a_still_starting_peer_skips_fails_on_every_node_alike(
+    monkeypatch,
+):
+    """A peer joins restart epochs only once its own start-up is ready; one
+    it skips fails node 0 at P0, which adopts no cohort, so the next restart
+    still names the new cohort alike on both nodes."""
+    store, node0, node1 = _two_nodes(monkeypatch, ready=(True, False))
+
+    (ok, value), _epoch = _restart_both(store, node0, node1, timeout_s=0.3)
+
+    assert ok is False and isinstance(value, PeerRestartError)
+    assert value.phase == PHASE_ARMED
+    assert node1.manager.state == "serving"
+    assert node0.manager.generation == node1.manager.generation
+
+    node1.manager._first_ready = True
+    (ok, _value), _epoch = _restart_both(store, node0, node1)
+
+    assert ok is True
+    assert node0.manager.generation == node1.manager.generation
+    _fail_locally(node1, 1)
+    assert _observed_peer_down(node0, 1)
+
+
+def test_a_fresh_server_process_on_one_node_never_rejoins_a_running_world(
+    monkeypatch,
+):
+    """A node whose server restarted connects to node 0's store again, but
+    its new cohort can only form through its own start-up, never by joining
+    an epoch: until that start-up is ready each epoch only moves its
+    baseline, so node 0's restart fails and neither node adopts a cohort the
+    other is not in."""
+    store, node0, old_node1 = _two_nodes(monkeypatch)
+    (ok, _value), _epoch = _restart_both(store, node0, old_node1)
+    assert ok is True
+    serving = node0.manager.generation
+
+    fresh, _store, coordinator = _multi_node_manager(
+        monkeypatch, node_rank=1, store=store
+    )
+    fresh._first_ready = False
+    fresh._generation = _startup_generation(fresh)
+    fresh_node = _Node(fresh, coordinator, [])
+
+    (ok, value), _epoch = _restart_both(store, node0, fresh_node, timeout_s=0.3)
+
+    assert ok is False and value.phase == PHASE_ARMED
+    assert node0.manager.generation == serving
+    assert fresh.state == "serving" and not fresh._first_ready
+    assert coordinator.epoch == int(store.add("epoch", 0))
+
+
+def test_a_startup_failure_after_a_peer_became_ready_reaches_that_peer(
+    monkeypatch,
+):
+    """Start-up names its cohort before any of it exists, so a node that is
+    still starting and a peer that is already serving the same cohort poll
+    and publish under one generation. Naming it only at readiness left a
+    failure on the slower node keyed by a generation the ready peer had
+    already left, so only the heartbeat could ever report it."""
+    store, node0, node1 = _two_nodes(monkeypatch, ready=(True, False))
+    assert node0.manager.generation == node1.manager.generation
+
+    node1.manager._handle_worker_failure("rank 12 failed its first step", None)
+
+    assert node1.exits == ["sigint"]
+    assert _observed_peer_down(node0, 1)
+
+
+def test_start_up_names_its_cohort_before_the_watch_and_the_spawn_begin():
+    """The start-up cohort is restart epoch 0's, and the name is set once,
+    before the follower polls under it and before its ranks are spawned."""
+    from tests.test_worker_pool_restart import _worker_manager_tree
+
+    start_impl = next(
+        node for node in ast.walk(_worker_manager_tree())
+        if isinstance(node, ast.FunctionDef) and node.name == "_start_impl"
+    )
+    writes = [
+        node for node in ast.walk(start_impl)
+        if isinstance(node, (ast.Assign, ast.AugAssign))
+        and any(
+            ast.unparse(target) == "self._generation"
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+        )
+    ]
+    assert [ast.unparse(node) for node in writes] == [
+        "self._generation = self._generation_of_epoch(0)"
+    ]
+    calls = {
+        ast.unparse(node.func): node.lineno
+        for node in ast.walk(start_impl)
+        if isinstance(node, ast.Call)
+    }
+    assert writes[0].lineno < calls["self._start_restart_follower"]
+    assert writes[0].lineno < calls["self._spawn_workers"]
+
+
+def test_a_cohort_generation_is_its_restart_epoch_whatever_came_before(
+    monkeypatch,
+):
+    """Generations a node held before do not matter: the cohort an epoch
+    brings up has that epoch's name on every node."""
+    store, node0, node1 = _two_nodes(monkeypatch)
+    node0.manager._generation = 7
+    node1.manager._generation = 3
+    store.set("epoch", "4")
+
+    (ok, result), epoch = _restart_both(store, node0, node1)
+
+    assert ok is True and epoch == 5
+    assert node0.manager.generation == node1.manager.generation
+    assert result["generation"] == type(node0.manager)._generation_of_epoch(5)
