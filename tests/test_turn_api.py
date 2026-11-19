@@ -16,6 +16,7 @@ import asyncio
 import importlib.util
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -81,8 +82,28 @@ def _decode(token_ids):
     return "".join(chr(t) for t in token_ids)
 
 
+TOOL_CALL_TEXT = '<call>get_weather {"city": "Paris"}</call>'
+TRUNCATED_TOOL_CALL_TEXT = '<call>get_weather {"city": "Pa'
+
+
 class _Tokenizer:
-    """Chat-template stand-in: role/content pairs verbatim, one id per char."""
+    """Chat-template stand-in: role/content pairs verbatim, one id per char.
+
+    Its tool-call syntax is ``<call>NAME ARGS</call>``; like every model
+    parser, an unterminated call stays content.
+    """
+
+    parse_thinking_default = False
+    parse_tool_call_default = False
+    _CALL_RE = re.compile(r"<call>(\w+) (.*?)</call>", re.DOTALL)
+
+    def parse_tool_calls(self, text):
+        calls = [
+            {"id": f"call_{i}", "type": "function",
+             "function": {"name": m.group(1), "arguments": m.group(2)}}
+            for i, m in enumerate(self._CALL_RE.finditer(text))
+        ]
+        return (calls or None), self._CALL_RE.sub("", text).strip()
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
         assert tokenize is True and add_generation_prompt is True
@@ -99,7 +120,9 @@ class _FakeWorker:
 
     An entry whose prompt contains HOLD is admitted but answered only after
     ``release`` is set; one containing TOO_LONG gets the worker's per-request
-    context_length_exceeded error.
+    context_length_exceeded error. One containing TRUNCATED_CALL is answered
+    with a tool call cut off by the token budget (finish ``length``), one
+    containing TOOL_CALL with a complete call (finish ``stop``).
     """
 
     def __init__(self, capacity=8):
@@ -162,14 +185,20 @@ class _FakeWorker:
                     self._answer(entry, admitted_at)
 
     def _answer(self, entry, admitted_at):
+        prompt = _decode(entry["input_ids"])
+        text, finish_reason = f"reply to {entry['request_id']}", "stop"
+        if "TRUNCATED_CALL" in prompt:
+            text, finish_reason = TRUNCATED_TOOL_CALL_TEXT, "length"
+        elif "TOOL_CALL" in prompt:
+            text = TOOL_CALL_TEXT
         item = {
             "type": "completion",
             "request_id": entry["request_id"],
             "batch_id": entry["batch_id"],
-            "text": f"reply to {entry['request_id']}",
+            "text": text,
             "prompt_length": len(entry["input_ids"]),
             "decoded_length": 3,
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
             "cached_tokens": 7,
             "computed_tokens": len(entry["input_ids"]) - 7,
             "admitted_at": admitted_at,
@@ -829,3 +858,36 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
     assert (out["state"], out["turns"]) == ("open", 0)
     assert out["at_limit"].status_code == 200, out["at_limit"].text
     assert len(admitted) == 1
+
+
+def test_e2e_turn_finish_reason_reports_parsed_tool_calls(tmp_path):
+    """A turn that stopped on a parsed tool call reports ``tool_calls``.
+
+    The turn body is the batch path's chat.completion body: no tool call
+    keeps ``stop``, and a call cut off by the budget stays content with
+    ``length``.
+    """
+    async def scenario(client, scheduler, worker, app):
+        scheduler.server_args.parse_tool_call = True
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        out = {}
+        for name, content in (("plain", "hello"), ("call", "TOOL_CALL please"),
+                              ("truncated", "TRUNCATED_CALL please")):
+            out[name] = await client.post("/v1/turns", json=_turn_body("s1", content))
+        return out
+
+    out = asyncio.run(_serve(tmp_path, scenario))
+    choices = {}
+    for name, response in out.items():
+        assert response.status_code == 200, (name, response.text)
+        choices[name] = response.json()["choices"][0]
+    assert choices["plain"]["finish_reason"] == "stop"
+    assert "tool_calls" not in choices["plain"]["message"]
+    assert choices["call"]["finish_reason"] == "tool_calls"
+    assert choices["call"]["message"] == {
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "call_0", "type": "function", "function": {
+            "name": "get_weather", "arguments": '{"city": "Paris"}'}}]}
+    assert choices["truncated"]["finish_reason"] == "length"
+    assert choices["truncated"]["message"] == {
+        "role": "assistant", "content": TRUNCATED_TOOL_CALL_TEXT}
