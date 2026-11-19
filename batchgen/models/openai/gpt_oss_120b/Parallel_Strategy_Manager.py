@@ -249,6 +249,43 @@ class GptOssParallelStrategyManager:
             and not getattr(self.model_config, "pre_dequantize_weights", False)
         )
 
+    def parallel_declaration(self):
+        """GPT-OSS's declared parallel layout (batchgen.parallel_declaration).
+
+        Prefill streams the attention weights and replicates every routed
+        expert per rank — resident unless EP offloading is enabled, which
+        streams them instead. Decode keeps attention resident per rank (pure
+        DP) and partitions the experts over the world; the shard's residency
+        comes from the same deployment-constant planner
+        ``configure_decoding`` assigns from (``_plan_local_expert_split``),
+        so the declaration and the configure can never disagree.
+        """
+        from batchgen.parallel_declaration import (
+            ModuleParallelism,
+            ParallelDeclaration,
+            RESIDENCY_PARTIAL,
+            RESIDENCY_RESIDENT,
+            RESIDENCY_STREAMED,
+            SCHEME_DP,
+            SCHEME_EP,
+        )
+
+        offloading = bool(self.engine_config.EP_Config.enable_offloading)
+        _, resident, owned = self._plan_local_expert_split()
+        return ParallelDeclaration(
+            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
+            prefill_moe=ModuleParallelism(
+                SCHEME_DP,
+                RESIDENCY_STREAMED if offloading else RESIDENCY_RESIDENT,
+            ),
+            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
+            decode_moe=ModuleParallelism(
+                SCHEME_EP,
+                RESIDENCY_RESIDENT if resident >= owned else RESIDENCY_PARTIAL,
+                group_size=self.world_size,
+            ),
+        )
+
     def _plan_local_expert_split(self) -> Tuple[bool, int, int]:
         """(EP offloading on, experts resident per layer, experts owned per layer).
 
