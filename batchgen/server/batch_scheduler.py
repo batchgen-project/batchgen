@@ -1896,9 +1896,16 @@ class BatchScheduler:
                             StartupTransientObject.model_validate(item)
                             for item in transients
                         ]
-                        self.max_model_len = int(result["max_model_len"])
-                        if self.max_model_len < 2:
+                        max_model_len = int(result["max_model_len"])
+                        if max_model_len < 2:
                             raise ValueError("worker published invalid max_model_len")
+                        # What the generation runs is recorded (and logged)
+                        # before the deployment is ready, so it precedes every
+                        # request the generation serves.
+                        self.worker.record_code_identity(
+                            int(result["cohort"]), result["code_identity"]
+                        )
+                        self.max_model_len = max_model_len
                         self.startup_transient = transients
                         self._deployment_ready.set()
                     elif msg_type == "trajectory_pool_capacity":

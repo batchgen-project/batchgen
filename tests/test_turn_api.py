@@ -144,6 +144,8 @@ class _FakeWorker:
                 "flavor": "eager", "seam": "startup-deployment-prepare",
                 "padding_bsz": 1, "unavailable": "CUDA is unavailable",
             }],
+            "code_identity": {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"},
+            "cohort": 0,
         })
         self.response_queue.put({
             "type": "trajectory_pool_capacity",
@@ -159,6 +161,9 @@ class _FakeWorker:
 
     def report_worker_fatal(self, reason, persisted=False):
         self.fatals.append(reason)
+
+    def record_code_identity(self, cohort, identity):
+        pass
 
     def _run(self):
         held = []

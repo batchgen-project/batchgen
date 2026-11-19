@@ -72,3 +72,21 @@ completed and failed transitions persist the tracker's final counts. Startup
 recovery (`StorageManager.fail_orphaned_batches`) rebuilds completed/failed of
 an orphaned batch from its incremental output items. Records written before
 the field existed load with zero counts.
+The same publication carries the cohort's `code_identity` and `cohort` (the
+restart epoch that spawned it). Local rank 0 of each node computes the
+identity at the top of its start-up, before the model build
+(`batchgen/worker/code_identity.py`), because a worker restart re-imports
+Python from disk and the server process cannot see what the new cohort
+imported. `source=git`: the commit of the work tree holding the `batchgen`
+package and whether that tree differs from it (one `git status` per cohort
+start); `source=none`: no git metadata beside the package (an installed
+package records no revision). Anything git cannot answer is revision
+`unknown` with a fixed reason. `WorkerManager.record_code_identity` logs one
+line per generation and node before the scheduler marks the deployment ready:
+
+    [CODE_IDENTITY] generation=<G> node=<N> source=<git|none> revision=<commit|unknown> dirty=<true|false|unknown> reason=<reason|->
+
+`GET /v1/workers/status` reports `code_identity` (`source`, `revision`,
+`dirty`, `reason`) for the serving generation, and null while a restart is
+bringing up the next one or after it failed. The identity names a revision,
+never a directory.
