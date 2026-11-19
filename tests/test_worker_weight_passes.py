@@ -91,6 +91,8 @@ class FakeEngine:
         self.producer_running = True
         self.calls = []
         self.open = []
+        # Passes begun with produce_only=True (the engine marks only a real pass).
+        self.produce_only = set()
         self._next = 1
 
     def stop_h2d_worker(self):
@@ -110,7 +112,7 @@ class FakeEngine:
         return {"passes": len(aborted), "pending_skips": 0, "freed": {},
                 "daemon_leases": 0, "schedule_lost": False}
 
-    def begin_weight_pass(self):
+    def begin_weight_pass(self, produce_only=False):
         if not self.installed:
             self.calls.append(("begin", 0))
             return 0
@@ -118,6 +120,8 @@ class FakeEngine:
         pass_id = self._next
         self._next += 1
         self.open.append(pass_id)
+        if produce_only:
+            self.produce_only.add(pass_id)
         self.calls.append(("begin", pass_id))
         return pass_id
 
@@ -207,6 +211,32 @@ def test_leaving_the_scope_cancels_and_ends_a_carried_pass_that_will_not_run():
     # A phase install closes again; nothing is left to close.
     passes.close()
     assert engine.calls[-1] == ("end", 2)
+
+
+def test_a_carried_pass_keeps_the_produce_only_mark_it_was_begun_with():
+    engine = FakeEngine()
+    passes = WeightPasses(engine, rank=0)
+
+    with passes.scope("prefill"):
+        for index in range(2):
+            passes.begin(carry=index + 1 < 2, produce_only=True)
+            passes.end()
+
+    # The carried pass is marked when it is begun, not when it is taken.
+    assert engine.calls == [("begin", 1), ("begin", 2), ("end", 1), ("end", 2)]
+    assert engine.produce_only == {1, 2}
+
+    for carried, taken in ((True, False), (False, True)):
+        engine = FakeEngine()
+        passes = WeightPasses(engine, rank=0)
+        with pytest.raises(RuntimeError, match="was carried as"):
+            with passes.scope("prefill"):
+                passes.begin(carry=True, produce_only=carried)
+                passes.end()
+                passes.begin(produce_only=taken)
+        # The refused begin leaves the carried pass open; the scope aborts it.
+        assert engine.calls[-2:] == ["stop", ("abort", [2])]
+        assert engine.produce_only == ({1, 2} if carried else set())
 
 
 def test_an_install_time_close_ends_a_pass_left_open():
@@ -696,22 +726,44 @@ def test_profiled_prefill_records_the_pass_counts_without_stopping_the_producer(
     assert values["weight_passes"] == "self._weight_passes.totals"
 
 
+# The two worker methods that stop the producer: the prefill install, and the
+# exit step of every phase transition (_transition_phase), which runs before a
+# decode install. They replaced the per-case decode build and persistent
+# activation stops when the worker moved to the phase-lifecycle state machine.
 INSTALL_PATHS = (
     "_install_prefill_weight_copy_pipeline",
-    "_load_decode_model",
-    "_activate_persistent_decode_instance",
+    "_prepare_phase_exit",
 )
+
+WORKER_ENGINE_MODULES = sorted(
+    (Path(__file__).resolve().parents[1] / "batchgen" / "worker").glob("*.py")
+)
+
+
+def _calls_attr(function, attr):
+    return [
+        n for n in ast.walk(function)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == attr
+    ]
+
+
+def _calls_named(function, name):
+    return [
+        n for n in ast.walk(function)
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == name
+    ]
+
+
+def _worker_methods():
+    return [n for n in WORKER_CLASS.body if isinstance(n, ast.FunctionDef)]
 
 
 def test_every_install_path_closes_the_weight_passes_before_stopping():
     for name in INSTALL_PATHS:
         function = _method(name)
         closes = [n.lineno for n in ast.walk(function) if _is_pass_call(n, "close")]
-        stops = [
-            n.lineno for n in ast.walk(function)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "stop_h2d_worker"
-        ]
+        stops = [n.lineno for n in _calls_attr(function, "stop_h2d_worker")]
         assert closes and stops, name
         assert min(closes) < min(stops), name
 
@@ -719,40 +771,104 @@ def test_every_install_path_closes_the_weight_passes_before_stopping():
     # missed. _WeightPasses._abort stops it only after a forward raised.
     stopping = {
         function.name
-        for function in WORKER_CLASS.body
-        if isinstance(function, ast.FunctionDef)
-        and any(
-            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "stop_h2d_worker"
-            for n in ast.walk(function)
-        )
+        for function in _worker_methods()
+        if _calls_attr(function, "stop_h2d_worker")
     }
     assert stopping == set(INSTALL_PATHS)
+    # Nor does any engine extracted from the worker.
+    for module in WORKER_ENGINE_MODULES:
+        tree = ast.parse(module.read_text())
+        for attr in ("stop_h2d_worker", "set_weight_copy_queue"):
+            assert not _calls_attr(tree, attr), (module.name, attr)
+
+    # Every transition out of a live phase runs the exit step before the
+    # next phase is entered.
+    transition = _method("_transition_phase")
+    exits = _calls_named(transition, "self._prepare_phase_exit")
+    enters = _calls_named(transition, "self.parallel_manager.phase_enter")
+    assert len(exits) == 1 and len(enters) == 1
+    assert exits[0].lineno < enters[0].lineno
+    parents = _parents(transition)
+    guards = [
+        ast.unparse(node.test) for node in _ancestors(exits[0], parents)
+        if isinstance(node, ast.If)
+    ]
+    assert guards == ["live is not None"]
+
+    # A decode install follows the transition that stopped the producer.
+    for function in _worker_methods():
+        installs = _calls_named(function, "self._install_decode_weight_copy_queue")
+        if not installs or function.name == "_install_decode_weight_copy_queue":
+            continue
+        transitions = _calls_named(function, "self._transition_phase")
+        assert transitions, function.name
+        for install in installs:
+            assert any(t.lineno < install.lineno for t in transitions), function.name
 
 
 def test_every_phase_installs_its_schedule_through_one_installer():
     installing = {
         function.name
-        for function in WORKER_CLASS.body
-        if isinstance(function, ast.FunctionDef)
-        and any(
-            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "set_weight_copy_queue"
-            for n in ast.walk(function)
-        )
+        for function in _worker_methods()
+        if _calls_attr(function, "set_weight_copy_queue")
     }
     assert installing == {
         "_install_prefill_weight_copy_pipeline",
         "_install_decode_weight_copy_queue",
+        # Re-orders the prefill schedule for this replica member; part of the
+        # prefill install, checked below.
+        "_install_replica_transport",
     }
-    # The persistent decode activation installs the decode schedule too, so
-    # its decode forwards never see the prefill lists.
-    activation = _method("_activate_persistent_decode_instance")
-    assert any(
-        isinstance(n, ast.Call)
-        and ast.unparse(n.func) == "self._install_decode_weight_copy_queue"
-        for n in ast.walk(activation)
-    )
+    # The replica transport only re-installs the prefill installer's own
+    # schedule, after the installer set it and before the producer starts.
+    replica_callers = {
+        function.name
+        for function in _worker_methods()
+        if _calls_named(function, "self._install_replica_transport")
+    }
+    assert replica_callers == {"_install_prefill_weight_copy_pipeline"}
+    installer = _method("_install_prefill_weight_copy_pipeline")
+    queue_sets = [n.lineno for n in _calls_attr(installer, "set_weight_copy_queue")]
+    starts = [n.lineno for n in _calls_attr(installer, "start_h2d_worker")]
+    assert len(queue_sets) == 1 and len(starts) == 1
+    for call in _calls_named(installer, "self._install_replica_transport"):
+        assert queue_sets[0] < call.lineno < starts[0]
+    replica = _method("_install_replica_transport")
+    assert not _calls_attr(replica, "start_h2d_worker")
+    assert [ast.unparse(n.args[0]) for n in _calls_attr(
+        replica, "set_weight_copy_queue")] == ["staggered"]
+
+    # Every decode entry, including the persistent-phase build, installs the
+    # decode schedule after it transitions, so its decode forwards never see
+    # the prefill lists.
+    decode_entries = {
+        function.name
+        for function in _worker_methods()
+        if any(
+            ast.unparse(call.args[0]) == "'decode'"
+            for call in _calls_named(function, "self._desired_phase_key")
+        )
+    }
+    assert decode_entries == {"_load_decode_model", "_build_persistent_phase_instances"}
+    for name in decode_entries:
+        function = _method(name)
+        resolution = next(
+            n.lineno for n in _calls_named(function, "self._desired_phase_key")
+            if ast.unparse(n.args[0]) == "'decode'"
+        )
+        transitions = sorted(
+            n.lineno for n in _calls_named(function, "self._transition_phase")
+        )
+        # The decode transition is the first one after the decode key; the
+        # decode install sits between it and any later transition.
+        into_decode = next(line for line in transitions if line > resolution)
+        out_of_decode = next(
+            (line for line in transitions if line > into_decode), float("inf")
+        )
+        assert any(
+            into_decode < n.lineno < out_of_decode
+            for n in _calls_named(function, "self._install_decode_weight_copy_queue")
+        ), name
 
 
 def test_the_weight_passes_are_bound_to_the_core_engine():
@@ -804,9 +920,33 @@ def test_weight_pass_end_delay_parses_only_this_rank():
 
 
 def test_prefill_config_installs_the_end_delay_before_the_forward():
-    method = next(
-        node for node in WORKER_CLASS.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_config_prefill_for_batch"
+    # The per-batch prefill config resolves its phase key first, and that
+    # resolution reads the batch's debug flags, the end delay among them.
+    config = _method("_config_prefill_for_batch")
+    resolutions = [
+        statement for statement in config.body
+        if _calls_named(statement, "self._desired_phase_key")
+    ]
+    assert len(resolutions) == 1
+    assert ast.unparse(resolutions[0]) == (
+        "desired_key = self._desired_phase_key('prefill')"
     )
-    source = ast.unparse(method)
-    assert "self._weight_passes.end_delay_s = self._weight_pass_end_delay(" in source
+    transitions = _calls_named(config, "self._transition_phase")
+    assert transitions
+    assert resolutions[0].lineno < min(t.lineno for t in transitions)
+
+    resolve = _method("_desired_phase_key")
+    prefill_guard = next(
+        index for index, statement in enumerate(resolve.body)
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test) == "phase != 'prefill'"
+    )
+    # Unconditional on the prefill path: a later statement of the body, not
+    # nested under another branch.
+    assert any(
+        ast.unparse(statement) == (
+            "self._weight_passes.end_delay_s = self._weight_pass_end_delay("
+            "prefill_debug.get('weight_pass_end_delay'))"
+        )
+        for statement in resolve.body[prefill_guard + 1:]
+    )
