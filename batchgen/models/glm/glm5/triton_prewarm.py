@@ -784,6 +784,27 @@ def _run_masked_act_quant(inter: int, row_stride: int, device,
     )
 
 
+def _run_ragged_act_quant(inter: int, device,
+                          fn: Optional[Callable] = None) -> None:
+    """The grouped prefill's fused SiLU*up cast, laid out as the m-grouped
+    path hands it: flat ``[m, I]`` gate, up and fp8 output from the start of
+    their buffers and row-major ``[m, I/128]`` scales. Every int the kernel
+    takes is a function of ``I`` alone, so the model has one key. One expert
+    with no live rows: the launch compiles the key and touches no row."""
+    if fn is None:
+        from .moe_ragged import silu_mul_quant_ragged as fn
+    rows = SCALE_BLOCK
+    fn(
+        _zeros((rows, inter), torch.bfloat16, device),
+        _zeros((rows, inter), torch.bfloat16, device),
+        torch.empty((rows, inter), dtype=torch.float8_e4m3fn, device=device),
+        torch.empty((rows, inter // SCALE_BLOCK), dtype=torch.float32,
+                    device=device),
+        _zeros((1,), torch.int32, device),
+        _zeros((2,), torch.int32, device),
+    )
+
+
 def _run_selected_positions(geometry: Glm5DecodeGeometry, topk: int, device,
                             fn: Optional[Callable] = None) -> None:
     """The decode graph's logical-to-physical top-k transform: slot indices
@@ -973,6 +994,12 @@ def prefill_entries(shapes: Glm5PrewarmShapes, device,
     entries.append(PrewarmEntry(
         f"silu_mul_quant/d{shapes.shared_intermediate_size}",
         partial(_run_silu_mul_quant, shapes.shared_intermediate_size, device),
+    ))
+    # The m-grouped path's default act+quant between the S1 and S3 GEMMs.
+    entries.append(PrewarmEntry(
+        f"ragged_act_quant/i{shapes.expert_intermediate_size}",
+        partial(_run_ragged_act_quant, shapes.expert_intermediate_size,
+                device),
     ))
     if shapes.sparse_prefill:
         entries.append(PrewarmEntry(

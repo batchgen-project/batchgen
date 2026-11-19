@@ -158,17 +158,18 @@ def _apply_component_overrides(component, overrides):
     return component
 
 
-def _load_kda_wrapper():
-    # Mirrors batchgen_worker._load_kda_wrapper, which production injects.
+def _kimi_recurrent_state_owner():
+    # What the Kimi-Linear PSM declares through ``recurrent_state_owner``;
+    # production reads it from the PSM, the fakes have none to ask.
     from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
     return KimiLinearKDAWrapper
 
 
 def attach_trajectory_state(fake, **overrides):
     """Attach a real ``TrajectoryStore`` to a worker fake."""
-    loader = overrides.pop("kda_wrapper_loader", _load_kda_wrapper)
+    owner = overrides.pop("recurrent_state_owner", _kimi_recurrent_state_owner)
     fake._traj = _apply_component_overrides(
-        TrajectoryStore(kda_wrapper_loader=loader), overrides
+        TrajectoryStore(recurrent_state_owner=owner), overrides
     )
     return fake
 

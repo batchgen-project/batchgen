@@ -2603,6 +2603,15 @@ class KimiLinearParallelStrategyManager:
         same NoPE-MLA pool seams, and at G == 1 the worker never asks."""
         return True
 
+    def recurrent_state_owner(self):
+        """Owner of the per-sequence KDA state the worker frees and snapshots.
+
+        The worker holds no model name: it reads ``state_manager`` and
+        ``slot_manager`` (both None until ``_build_model`` builds the pools)
+        and calls ``free_sequences(ids)`` on what this returns. The pools are
+        class-level, so the owner is the wrapper class itself."""
+        return KimiLinearKDAWrapper
+
     def prefill_pool_layout(self):
         """K3's prefill prefix-pool geometry: the EXPANDED MLA K/V, not the latent.
 

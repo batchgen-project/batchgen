@@ -165,6 +165,11 @@ setup(
             "other_kernels/**/*.cc",
             # Op builder Python files
             "op_builder/**/*.py",
+            # Vendored upstream DeepSeek-V4 chat encoder. Its directory is kept
+            # verbatim (no __init__.py), so package discovery skips it, but
+            # deepseekv4_flash/tokenizer.py imports it as a module at import
+            # time.
+            "models/deepseek/deepseekv4_flash/assets/encoding/encoding_dsv4.py",
             # Data files (tokenizers, configs, etc.)
             "**/*.json",
             "**/*.parquet",

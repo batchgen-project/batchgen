@@ -20,7 +20,6 @@
 
 import json
 import logging
-import re
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -31,6 +30,7 @@ from batchgen.config.tokenizer_registry import register_tokenizer
 from batchgen.models.deepseek.deepseekv4_flash.assets.encoding.encoding_dsv4 import (
     encode_messages,
     parse_message_from_completion_text,
+    thinking_end_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,12 +59,6 @@ def _openai_tool_call(name: str, arguments: str) -> Dict[str, object]:
 @register_tokenizer("deepseek_v4")
 class DeepSeekV4Tokenizer(FastTokenizer):
     """DeepSeek-V4 tokenizer loaded from the vendored V4 Flash assets."""
-
-    _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-    _TOOL_CALL_RE = re.compile(
-        r"<｜DSML｜invoke name=\"(?P<name>[^\"]+)\">\n(?P<args>.*?)\n</｜DSML｜invoke>",
-        re.DOTALL,
-    )
 
     def __init__(self):
         super().__init__(str(TOKENIZER_DIR))
@@ -184,41 +178,80 @@ class DeepSeekV4Tokenizer(FastTokenizer):
         return result
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
-        match = self._THINK_RE.search(text)
-        if not match:
+        """Split a completion at the ``</think>`` that ends its reasoning.
+
+        A thinking-mode prompt ends with ``<think>`` and a chat-mode one with
+        ``</think>`` (``encoding_dsv4.render_message``), so a thinking-mode
+        completion is ``reasoning</think>`` followed by exactly what a
+        chat-mode completion holds, and a chat-mode completion has no
+        ``</think>``: the vendored parser rejects one in reasoning or content
+        in either mode. Hence a completion with exactly one ``</think>`` is
+        split there. The text after it is returned unchanged, not stripped:
+        it is a chat-mode completion that ``parse_tool_calls`` parses next,
+        and the DSML tool-call block opens with ``"\\n\\n"``.
+
+        Without ``</think>`` there is no reasoning block in the text (a chat
+        completion, or reasoning cut off before the tag), and with more than
+        one the text is no V4 message; both stay content.
+        """
+        reasoning, closed, visible = text.partition(thinking_end_token)
+        if not closed:
             return None, text
-        reasoning = match.group(1).strip()
-        visible = self._THINK_RE.sub("", text, count=1).strip()
-        return reasoning, visible
+        if thinking_end_token in visible:
+            logger.debug(
+                "DeepSeek-V4 completion has more than one %s; kept as content",
+                thinking_end_token,
+            )
+            return None, text
+        return reasoning.strip() or None, visible
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        """Parse DSML tool calls with the vendored V4 parser.
+
+        The vendored ``parse_message_from_completion_text`` is the only
+        grammar, run in the one mode that can accept the text: ``thinking``
+        when it holds the ``</think>`` that ends a thinking-mode reasoning
+        block (the unparsed completion), else ``chat`` (a chat completion, or
+        the content ``parse_thinking`` returns). Text it rejects is not a
+        well-formed tool-call message, so it is returned unchanged as content
+        with no calls, the same result as text without calls
+        (``BaseTokenizer.parse_tool_calls``). It rejects with ``ValueError``
+        (malformed DSML inside the tool-calls block) and with ``assert``
+        (``AssertionError``: reasoning not ended by ``</think>``, content
+        after the block, content after an end-of-sentence token, or a special
+        token in the reasoning or content); nothing else is reachable from a
+        completion string.
+
+        The vendored parser does not check a ``string="false"`` parameter,
+        whose value must be JSON (the DSML tool prompt), and pastes it into
+        the arguments verbatim. A call whose arguments are not JSON is
+        therefore malformed DSML and rejected the same way.
+
+        With calls, the reasoning of an unparsed thinking-mode completion
+        stays in the returned content with its ``</think>``: reasoning is
+        ``parse_thinking``'s to split.
+        """
+        thinking_mode = "thinking" if thinking_end_token in text else "chat"
         try:
             parsed = parse_message_from_completion_text(
                 text if text.endswith(self.eos_token or "") else text + (self.eos_token or ""),
-                thinking_mode="chat",
+                thinking_mode=thinking_mode,
             )
-            tool_calls = parsed.get("tool_calls") or []
-            if tool_calls:
-                return [
-                    _openai_tool_call(
-                        call["function"]["name"], call["function"]["arguments"],
-                    )
-                    for call in tool_calls
-                ], parsed.get("content", "").strip()
-        except ValueError as exc:
+            for call in parsed["tool_calls"]:
+                json.loads(call["function"]["arguments"])
+        except (ValueError, AssertionError) as exc:
             logger.debug("DeepSeek-V4 DSML parser did not accept completion text: %s", exc)
-
-        matches = list(self._TOOL_CALL_RE.finditer(text))
-        if not matches:
             return None, text
-        tool_calls = []
-        for match in matches:
-            name = match.group("name").strip()
-            arguments = match.group("args").strip() or "{}"
-            try:
-                json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = json.dumps({"arguments": arguments}, ensure_ascii=False)
-            tool_calls.append(_openai_tool_call(name, arguments))
-        visible = self._TOOL_CALL_RE.sub("", text).strip()
-        return tool_calls, visible
+
+        tool_calls = parsed["tool_calls"]
+        if not tool_calls:
+            return None, text
+        content = parsed["content"]
+        if thinking_mode == "thinking":
+            content = parsed["reasoning_content"] + thinking_end_token + content
+        return [
+            _openai_tool_call(
+                call["function"]["name"], call["function"]["arguments"],
+            )
+            for call in tool_calls
+        ], content.strip()

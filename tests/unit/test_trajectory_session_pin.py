@@ -378,7 +378,10 @@ def _worker_methods(names, globals_=None):
         "List": List,
         "Optional": Optional,
         "logging": _SilentLogging(),
-        "SequenceStatus": SimpleNamespace(QUEUEING="QUEUEING", IN_PREFILL="IN_PREFILL", EVICTED="EVICTED"),
+        "SequenceStatus": SimpleNamespace(
+            QUEUEING="QUEUEING", IN_PREFILL="IN_PREFILL", EVICTED="EVICTED",
+            COMPLETED="COMPLETED",
+        ),
         **(globals_ or {}),
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
@@ -441,6 +444,8 @@ def stub_modules(monkeypatch):
         SimpleNamespace(
             host_kv_owner_rank=lambda group, size: int(group) * int(size),
             assign_decode_dp_groups=_DP_GROUP.assign_decode_dp_groups,
+            count_rows_per_group=_DP_GROUP.count_rows_per_group,
+            format_decode_group_plan_line=_DP_GROUP.format_decode_group_plan_line,
             num_decode_dp_groups=_DP_GROUP.num_decode_dp_groups,
             rank_in_decode_group=_DP_GROUP.rank_in_decode_group,
         ),

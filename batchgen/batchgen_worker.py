@@ -204,12 +204,6 @@ from batchgen.worker.step_observability_engine import StepObservabilityEngine
 from batchgen.worker.rank_sync_engine import RankSyncEngine
 
 
-def _load_kda_wrapper():
-	# The only model-package import behind TrajectoryStore: batchgen/worker/
-	# must not depend on batchgen.models, so the store receives this loader.
-	# ImportError propagates so each store call site keeps its old handling.
-	from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-	return KimiLinearKDAWrapper
 from batchgen.worker.rank_context import RankContext, node_of_rank
 from batchgen.worker.sequence_table import SequenceTable
 from batchgen.utils import config_torch_module_initializer
@@ -290,6 +284,10 @@ from batchgen.worker.kv_plan import (
 )
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
+from batchgen.worker.decode_profile import (
+	DecodeProfileCapture,
+	open_torch_decode_profiler,
+)
 from batchgen.worker.step_timing import (
 	FORWARD_EVENT_RING_SLOTS,
 	ForwardEventRing,
@@ -1081,7 +1079,7 @@ class BatchGenWorker:
 		self.local_world_size = args.local_world_size
 		# S3.5 state owners.  They are created eagerly so flag-off paths are
 		# plain field reads and the pool pseudo-sid seed is unconditional.
-		self._traj = TrajectoryStore(kda_wrapper_loader=_load_kda_wrapper)
+		self._traj = TrajectoryStore(recurrent_state_owner=self._recurrent_state_owner)
 		self._prefix = PrefixReuseState(rank=self.rank, world_size=self.world_size)
 		self.pynccl_port_base = args.pynccl_port_base
 		self.pynccl_port_span = args.pynccl_port_span
@@ -2294,6 +2292,8 @@ class BatchGenWorker:
 			return
 		from batchgen.decode_dp_group import (
 			assign_decode_dp_groups,
+			count_rows_per_group,
+			format_decode_group_plan_line,
 			num_decode_dp_groups,
 		)
 		num_dp = num_decode_dp_groups(self.world_size, G)
@@ -2328,8 +2328,10 @@ class BatchGenWorker:
 		):
 			if residency:
 				seqs.sort(key=lambda seq: seq.uuid)
+			placement = "packer"
 			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp, residency)
 		else:
+			placement = "l2"
 			# An evicted re-entry returns to the group it decoded on: its
 			# decoded suffix lives only in that group's node's trajectory book.
 			# It loads that group like any grouped sequence; the rest balance.
@@ -2348,6 +2350,19 @@ class BatchGenWorker:
 			# Grouped again: the eviction record has served its purpose, and
 			# a later eviction records the then-current group afresh.
 			seq.evicted_from_dp_group = None
+		if self.rank == 0:
+			# Rows per group after this stamp: the rows just placed and every
+			# grouped row still to decode. The fullest group sets the decode
+			# graph bucket, so equal totals can decode on different buckets.
+			logging.info(format_decode_group_plan_line(
+				placement,
+				count_rows_per_group(groups, num_dp),
+				count_rows_per_group(
+					(other.decode_dp_group for other in self.global_batch
+					 if other.status != SequenceStatus.COMPLETED),
+					num_dp,
+				),
+			))
 		for uuid in sorted(residency):
 			owner, boundary = residency[uuid]
 			seq = self.global_batch.get_sequence(uuid)
@@ -4112,6 +4127,18 @@ class BatchGenWorker:
 			self,
 			local_sequence_ids,
 		)
+
+	def _recurrent_state_owner(self):
+		"""Owner of the model's per-sequence recurrent state, or None.
+
+		Read from the PSM like the other optional model declarations, so the
+		worker names no model: a model that keeps no such state declares
+		nothing, and before the PSM is built no state pool can exist yet.
+		"""
+		declares = getattr(
+			getattr(self, "parallel_manager", None), "recurrent_state_owner", None
+		)
+		return None if declares is None else declares()
 
 	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -6111,61 +6138,28 @@ class BatchGenWorker:
 			max_rank_bsz=max_rank_bsz,
 		)
 
+	def _decode_profile_capture_state(self) -> DecodeProfileCapture:
+		# One per worker generation; see batchgen.worker.decode_profile.
+		capture = getattr(self, "_decode_profile_capture", None)
+		if capture is None:
+			capture = DecodeProfileCapture(
+				self.rank,
+				open_torch_decode_profiler,
+				lambda: torch.cuda.synchronize(self.torch_device),
+			)
+			self._decode_profile_capture = capture
+		return capture
+
 	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
-		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: after 3
-		warm-up steps, wrap the next N decode steps of rank 0 in
-		``torch.profiler`` (CUDA + CPU) and log the kernel table sorted by CUDA
-		time — a per-kernel breakdown of the GPU-bound step without a server
-		restart. One capture per server lifetime."""
-		# ``k3_decode_profile_ranks``: which ranks profile (default rank 0; the
-		# first rank of every node shows cross-node skew inside the exchange).
-		_prof_ranks = (batchgen_debug or {}).get("k3_decode_profile_ranks") or [0]
-		if self.rank not in _prof_ranks or getattr(self, "_k3_decode_profile_done", False):
-			return
-		try:
-			steps = int((batchgen_debug or {}).get("k3_decode_profile_steps", 0) or 0)
-		except (TypeError, ValueError):
-			return
-		if steps <= 0:
-			return
-		count = getattr(self, "_k3_decode_profile_count", 0) + 1
-		self._k3_decode_profile_count = count
-		warmup = 3
-		if count == warmup + 1:
-			from torch.profiler import ProfilerActivity, profile
-			self._k3_decode_profiler = profile(
-				activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-			)
-			self._k3_decode_profiler.__enter__()
-			self._k3_decode_profile_rows = batch_rows
-			logging.info("[K3_DECODE_PROFILE] capturing %d decode steps at %d rows", steps, batch_rows)
-		elif count == warmup + 1 + steps:
-			prof = getattr(self, "_k3_decode_profiler", None)
-			if prof is None:
-				return
-			torch.cuda.synchronize(self.torch_device)
-			prof.__exit__(None, None, None)
-			self._k3_decode_profiler = None
-			self._k3_decode_profile_done = True
-			table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=40)
-			logging.info(
-				"[K3_DECODE_PROFILE] %d steps at %d rows (per-step = table / %d)\n%s",
-				steps, self._k3_decode_profile_rows, steps, table,
-			)
-			# ``k3_decode_profile_trace = "<dir>"``: also dump the Chrome trace
-			# (kernel sequence per step, for per-layer node counts); the table
-			# alone loses the order.
-			trace_dir = (batchgen_debug or {}).get("k3_decode_profile_trace")
-			if trace_dir:
-				try:
-					os.makedirs(trace_dir, exist_ok=True)
-					path = os.path.join(
-						trace_dir, f"k3_decode_profile_rows{self._k3_decode_profile_rows}_rank{self.rank}.json"
-					)
-					prof.export_chrome_trace(path)
-					logging.info("[K3_DECODE_PROFILE] trace written to %s", path)
-				except Exception as exc:  # noqa: BLE001 - diagnostics only
-					logging.warning("[K3_DECODE_PROFILE] trace export failed: %s", exc)
+		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: a
+		per-kernel breakdown of N decode steps without a server restart."""
+		self._decode_profile_capture_state().step(batchgen_debug, batch_rows)
+
+	def _group_profiled_line(self) -> str:
+		"""Extra line of the batch group summary of a profiled generation."""
+		if not self._decode_profile_capture_state().profiled:
+			return ""
+		return "\n  Profiled: yes (decode timings of this worker generation are not admissible)"
 
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -6387,6 +6381,27 @@ class BatchGenWorker:
 			sum(s.decoded_length for s in group),
 		)
 
+	def _group_decode_rows_summary(self) -> str:
+		"""The batch summary's per-group rows line, with its leading newline.
+
+		Empty when decode runs pure-DP (G==1), so that summary stays
+		byte-identical; for G>1 the current batch group's rows per serve group.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return ""
+		from batchgen.decode_dp_group import (
+			count_rows_per_group,
+			format_decode_group_summary,
+			num_decode_dp_groups,
+		)
+		group = [self.global_batch.get_sequence(u) for u in self._group_uuids]
+		rows = count_rows_per_group(
+			(s.decode_dp_group for s in group if s is not None),
+			num_decode_dp_groups(self.world_size, G),
+		)
+		return "\n" + format_decode_group_summary(rows, G)
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -6470,6 +6485,8 @@ class BatchGenWorker:
 						f"  Decode: {decoding_time:.1f}s ({dc_tp:,.0f} tok/s)\n"
 						f"  Total: {gen_time:.1f}s ({ov_tp:,.0f} tok/s)\n"
 						f"  Prompt tokens: {total_prompt:,}, Decoded tokens: {total_decoded:,}"
+						f"{self._group_profiled_line()}"
+						f"{self._group_decode_rows_summary()}"
 					)
 					self._timing_logged = True
 				if self._shutdown_requested:
@@ -13095,6 +13112,8 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		# A profile window never outlives the decode round that opened it.
+		self._decode_profile_capture_state().end_round()
 		self._flush_glm5_dispatch_trace_summary("decode_end")
 		AttnWrapperBase.batchgen_debug = None
 		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
@@ -13162,6 +13181,7 @@ class BatchGenWorker:
 			past_key_states,
 			past_value_states,
 			scale_dict,
+			profile_capture=self._decode_profile_capture_state(),
 		)
 
 	def _wait_pending_kv_append_tasks(

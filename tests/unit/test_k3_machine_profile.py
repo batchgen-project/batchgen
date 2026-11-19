@@ -16,10 +16,12 @@ from batchgen.models.moonshotai.kimi_linear.machine_profile import (
     K3_PREFILL_ACTIVATION_BYTES_PER_ROW,
     K3_PROFILE_ATTENTION_GROUP_SIZE,
     K3_PROFILES,
+    K3_STREAMED_PREFILL_HEADROOM_GIB,
     UnsupportedK3TopologyError,
     k3_engine_profile,
     k3_profile_knob_names,
     solve_kda_user_slots,
+    streamed_prefill_workspace_bytes,
 )
 
 GIB = 1024 ** 3
@@ -29,7 +31,7 @@ IDS = [f"{row.family.value}-w{row.world_size}" for row in ROWS]
 
 def test_the_supported_topologies_are_exactly_these():
     assert sorted((fam.value, world) for fam, world in K3_PROFILES) == [
-        ("b300", 8), ("gb300", 8), ("h20", 32), ("h200", 16),
+        ("b300", 8), ("gb300", 8), ("h20", 32), ("h200", 16), ("h200", 32),
     ]
 
 
@@ -93,6 +95,67 @@ def test_streamed_cap_against_crossover_and_hbm(row):
         _exception(row, "prefill_micro_batch_token_cap", True, "tracked")
     if not (stream_bound or overrun):
         assert reason is None, f"stale exception on {row.family.value}: {reason}"
+
+
+def test_workspace_is_one_cap_sized_pass_plus_headroom():
+    cap = 262_144
+    need = streamed_prefill_workspace_bytes(cap)
+    assert need == int(
+        cap * K3_PREFILL_ACTIVATION_BYTES_PER_ROW
+        + K3_STREAMED_PREFILL_HEADROOM_GIB * GIB
+    )
+    # measured: a 262,144-row pass raised reserved memory by 66.0 GB
+    assert cap * K3_PREFILL_ACTIVATION_BYTES_PER_ROW == pytest.approx(66.0e9, rel=1e-9)
+    assert streamed_prefill_workspace_bytes(2 * cap) > need
+
+
+@pytest.mark.parametrize("row", ROWS, ids=IDS)
+def test_pool_workspace_holds_a_cap_sized_pass(row):
+    # The in-wave pool takes the free memory minus the workspace, so a
+    # workspace smaller than one cap-sized pass starves the first pool-served
+    # wave. A row that knowingly violates this says so.
+    if row.prefix_pool_workspace_bytes == 0:
+        assert "prefix_pool_workspace_bytes" not in row.derivation_exceptions
+        return
+    short = row.prefix_pool_workspace_bytes < streamed_prefill_workspace_bytes(
+        row.prefill_micro_batch_token_cap
+    )
+    reason = row.derivation_exceptions.get("prefix_pool_workspace_bytes")
+    if short:
+        _exception(row, "prefix_pool_workspace_bytes", True, "tracked")
+    else:
+        assert reason is None, f"stale exception on {row.family.value}: {reason}"
+
+
+@pytest.mark.parametrize("world_size", [16, 32])
+def test_h200_rows_take_the_saturated_cap_and_a_derived_workspace(world_size):
+    row = k3_engine_profile(MachineFamily.H200, world_size)
+    assert row.prefill_micro_batch_token_cap == 262_144
+    assert row.prefix_pool_workspace_bytes == streamed_prefill_workspace_bytes(262_144)
+    assert not row.derivation_exceptions
+    # several times the crossover: compute hides the weight stream
+    rates = K3_FAMILY_RATES[MachineFamily.H200]
+    crossover = rates.stream_seconds_per_layer / rates.compute_seconds_per_row
+    assert row.prefill_micro_batch_token_cap > 4 * crossover
+    # the pass and a non-empty pool both fit in what prefill leaves free
+    budget = row.decode_budget
+    free_bytes = (budget.budget_gib - budget.prefill_non_expert_gib) * GIB
+    assert row.prefix_pool_workspace_bytes < free_bytes
+
+
+def test_h200_four_node_row_states_what_is_measured_and_what_is_inherited():
+    row = k3_engine_profile(MachineFamily.H200, 32)
+    two_node = k3_engine_profile(MachineFamily.H200, 16)
+    assert row.num_nodes == 4
+    assert row.decode_budget.prefill_non_expert_gib == pytest.approx(52.73)
+    # an EP32 rank holds half the EP16 resident shard
+    assert two_node.decode_budget.non_slot_base_gib - row.decode_budget.non_slot_base_gib == (
+        pytest.approx(42.10, abs=0.01)
+    )
+    assert row.kda_slots_basis.startswith("inherited:")
+    for knob in ("kda_user_slots", "resident_ep_prefill_token_cap"):
+        assert getattr(row, knob) == getattr(two_node, knob)
+        assert "provisional" in row.sources[knob]
 
 
 @pytest.mark.parametrize("row", ROWS, ids=IDS)
