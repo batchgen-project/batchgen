@@ -259,6 +259,8 @@ def test_prefill_entries():
     assert {"silu_mul_quant/d2048", "offset_topk/k2048",
             "kv_b_dequant/28672x512", "act_quant/plain/d128",
             "act_quant/tma/d6144"} <= set(names)
+    # the grouped path's default act+quant: one key per model, both layouts
+    assert names.count("ragged_act_quant/i2048") == 1
     dense = [e.name for e in TP.prefill_entries(_shapes(False), "cpu")]
     assert not [n for n in dense if n.startswith(("offset_topk",
                                                   "kv_b_dequant"))]
@@ -547,6 +549,19 @@ def test_prefill_runners():
     assert [a[0].shape for a, _ in rec.calls] == [
         (r, 4096) for r in TP.ROW_WITNESSES]
     assert all(kw == {"scale_tma_aligned": True} for _, kw in rec.calls)
+
+    # The fused grouped-prefill cast: flat [m, I] buffers from offset 0,
+    # row-major [m, I/128] scales, one empty expert (compiles, touches no row).
+    rec = _Recorder()
+    TP._run_ragged_act_quant(2048, "cpu", fn=rec)
+    (args, _), = rec.calls
+    gate, up, out, scale, counts, cu = args
+    assert gate.shape == up.shape == out.shape == (128, 2048)
+    assert gate.dtype == up.dtype == torch.bfloat16
+    assert out.dtype == torch.float8_e4m3fn
+    assert scale.shape == (128, 16) and scale.stride() == (16, 1)
+    assert counts.tolist() == [0] and cu.tolist() == [0, 0]
+    assert counts.dtype == cu.dtype == torch.int32
 
 
 # --------------------------------------------------------------------------- #

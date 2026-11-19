@@ -41,16 +41,18 @@ def _isolated_selector(debug_value):
     return namespace["_glm5_prefill_s1_act_quant_backend"]
 
 
-def test_default_is_the_unfused_chain():
+def test_default_is_fused_behind_deepgemm_only():
     select = _isolated_selector(None)
-    assert select("deepgemm") == "unfused"
+    assert select("deepgemm") == "fused"
+    # cute_ptrs fuses S1 itself; it has no separate act+quant step
     assert select("cute_ptrs") == "unfused"
 
 
-def test_fused_arm_is_selected_and_normalized():
+def test_both_spellings_are_selectable_and_normalized():
     select = _isolated_selector({"prefill_s1_act_quant": " FuSeD "})
     assert select("deepgemm") == "fused"
-    select = _isolated_selector({"prefill_s1_act_quant": "unfused"})
+    # the chain the fused step replaced stays selectable for comparisons
+    select = _isolated_selector({"prefill_s1_act_quant": " UnFused "})
     assert select("deepgemm") == "unfused"
     assert select("cute_ptrs") == "unfused"
 

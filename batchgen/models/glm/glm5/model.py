@@ -155,26 +155,26 @@ def _glm5_prefill_grouped_gemm_backend() -> str:
 def _glm5_prefill_s1_act_quant_backend(gemm_backend: str) -> str:
     """The activation + quant step between the grouped S1 and S3 GEMMs.
 
-    Default ``unfused`` keeps the measured chain: torch SiLU and mul over
-    the two S1 outputs, then the column-major CUDA ragged quant (whose
-    scales the GEMM wrapper transposes per call). ``fused`` is the A/B arm
-    (batchgen_debug key ``prefill_s1_act_quant``, batch-level): one ragged
+    Default ``fused`` behind the ``deepgemm`` grouped backend: one ragged
     Triton kernel does SiLU*up and the FP8 group quant in a single pass and
-    writes row-major scales, so the transpose shim is not paid. The default
-    moves only after a measured ABBA on this arm; until then the fused
-    kernel also runs un-prewarmed (its first launch JIT-compiles), which
-    the measuring leg must account for.
+    writes row-major scales, which the contiguous GEMM takes as they are.
+    It is prewarmed with the other prefill kernels. ``unfused`` is the
+    three-pass chain it replaced, kept selectable for comparisons
+    (batchgen_debug key ``prefill_s1_act_quant``, batch-level): torch SiLU
+    and mul over the two S1 outputs, then the column-major CUDA ragged
+    quant, whose scales the GEMM wrapper transposes per call.
 
     Only the two spellings are accepted — a mistyped value is refused
     rather than read as the other arm, because a silently ignored switch
-    would make the two arms the same run. The fused arm exists only behind
-    the ``deepgemm`` grouped backend: the ``cute_ptrs`` arm fuses S1 itself
-    and feeds a column-major-scale S3 kernel, so the combination is refused
-    rather than half-applied.
+    would make the two arms the same run. The fused step exists only behind
+    ``deepgemm``: the ``cute_ptrs`` backend fuses S1 itself and feeds a
+    column-major-scale S3 kernel, so it has no such step (``unfused`` is
+    its only spelling) and asking it for ``fused`` is refused rather than
+    half-applied.
     """
     value = _glm5_moe_debug_dict().get("prefill_s1_act_quant")
     if value is None:
-        return "unfused"
+        return "fused" if gemm_backend == "deepgemm" else "unfused"
     if not isinstance(value, str):
         raise ValueError("prefill_s1_act_quant must be a string")
     mode = value.strip().lower()
