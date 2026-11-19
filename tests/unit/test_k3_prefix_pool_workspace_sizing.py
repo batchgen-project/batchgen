@@ -12,6 +12,7 @@ from batchgen.models.moonshotai.kimi_linear.machine_profile import (
     KL48_PREFIX_POOL_WORKSPACE_BYTES,
     UnsupportedK3TopologyError,
     k3_engine_profile,
+    streamed_prefill_workspace_bytes,
 )
 from batchgen.models.moonshotai.kimi_linear.planner import (
     kimi_prefix_pool_workspace_bytes,
@@ -29,8 +30,14 @@ def _reserve(family, *, is_k3, group=8, world=16):
     )
 
 
-def test_h200_tp8_keeps_the_k3_sized_reserve_for_both_families():
-    assert _reserve(MachineFamily.H200, is_k3=True, world=16) == 40 * GIB
+def test_h200_tp8_sizes_k3_for_a_cap_sized_pass_and_keeps_the_48b_reserve():
+    # K3: one 262,144-row pass at the measured bytes per row plus headroom,
+    # the same on both H200 topologies (machine_profile
+    # streamed_prefill_workspace_bytes). The 48B keeps its own table value.
+    k3 = streamed_prefill_workspace_bytes(262_144)
+    assert _reserve(MachineFamily.H200, is_k3=True, world=16) == k3
+    assert _reserve(MachineFamily.H200, is_k3=True, world=32) == k3
+    assert 65 * GIB < k3 < 66 * GIB
     assert _reserve(MachineFamily.H200, is_k3=False) == 40 * GIB
 
 
