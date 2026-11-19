@@ -429,8 +429,10 @@ class WorkerManager:
 
     @property
     def code_identity(self) -> Optional[Dict[str, Any]]:
-        """The serving generation's code identity; None until its cohort
-        published one (during a restart, and after a failed one)."""
+        """The current generation's code identity; None until its cohort
+        published one, and after a failed restart (no cohort serves). While a
+        restart is in flight the outgoing generation is still the current one
+        and its identity stays reported, next to state ``restarting``."""
         with self._lock:
             recorded, generation = self._code_identity, self._generation
         if recorded is None or recorded[0] != generation:

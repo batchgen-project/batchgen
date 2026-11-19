@@ -87,6 +87,7 @@ line per generation and node before the scheduler marks the deployment ready:
     [CODE_IDENTITY] generation=<G> node=<N> source=<git|none> revision=<commit|unknown> dirty=<true|false|unknown> reason=<reason|->
 
 `GET /v1/workers/status` reports `code_identity` (`source`, `revision`,
-`dirty`, `reason`) for the serving generation, and null while a restart is
-bringing up the next one or after it failed. The identity names a revision,
-never a directory.
+`dirty`, `reason`) for the current generation. While a restart is in flight
+the outgoing generation is still current, so its identity stays reported next
+to state `restarting`; after a failed restart it is null. The identity names a
+revision, never a directory.
