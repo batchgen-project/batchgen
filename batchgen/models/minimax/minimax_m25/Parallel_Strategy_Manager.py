@@ -52,6 +52,66 @@ class MiniMaxM25ParallelStrategyManager:
         self.model = None
         self.enable_ep_offloading = False
 
+    def parallel_declaration(self, decode_graph_state=None):
+        """MiniMax-M2.5's declared parallel layout (batchgen.parallel_declaration).
+
+        Prefill runs every module replicated per rank with the weights
+        streamed from host (pure DP); decode keeps attention resident per
+        rank (pure DP) and partitions the routed experts over the world
+        (EP). The decode shard's residency comes from the same
+        deployment-constant planner ``configure_decoding`` assigns from
+        (``_plan_local_expert_split``), so the declaration and the configure
+        can never disagree: a rank keeping only part of its shard resident
+        streams the remainder and declares ``partial``.
+        """
+        from batchgen.parallel_declaration import (
+            DecodeGraphDeclaration,
+            ModuleParallelism,
+            ParallelDeclaration,
+            RESIDENCY_PARTIAL,
+            RESIDENCY_RESIDENT,
+            RESIDENCY_STREAMED,
+            SCHEME_DP,
+            SCHEME_EP,
+        )
+
+        _, num_local = self._plan_local_expert_split()
+        experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
+        return ParallelDeclaration(
+            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
+            prefill_moe=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
+            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
+            decode_moe=ModuleParallelism(
+                SCHEME_EP,
+                RESIDENCY_RESIDENT
+                if num_local == experts_per_rank
+                else RESIDENCY_PARTIAL,
+                group_size=self.world_size,
+            ),
+            decode_graph=DecodeGraphDeclaration.off(),
+        )
+
+    def _plan_local_expert_split(self):
+        """(offloading enabled, routed experts this rank keeps resident).
+
+        Derived from the world size and the EP configuration only, so it is
+        the same answer before and after ``configure_decoding`` assigns it.
+        The GLM-5 planner seam (glm/glm5/Parallel_Strategy_Manager.py); model
+        families do not import one another's modules, so the helper is
+        duplicated here rather than cross-imported.
+        """
+        experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
+        if self.world_size > 8:
+            # Multi-node: every rank's shard is resident.
+            return False, experts_per_rank
+        if self.engine_config.EP_Config.enable_offloading:
+            offload_ratio = self.engine_config.EP_Config.offloading_ratio
+            return True, int(experts_per_rank * (1 - offload_ratio))
+        configured = self.engine_config.EP_Config.num_local_expert_per_layer
+        if configured is None or configured == 0:
+            return False, experts_per_rank
+        return False, configured
+
     def configure_prefill(self):
         """Configure model for prefill (pure DP).
 
@@ -115,18 +175,11 @@ class MiniMaxM25ParallelStrategyManager:
 
         NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
-        if self.world_size > 8:
-            self.enable_ep_offloading = False
-            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
-        elif self.engine_config.EP_Config.enable_offloading:
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            self.enable_ep_offloading = True
-            NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
-        else:
-            self.enable_ep_offloading = False
-            NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer
-            if NUM_LOCAL_EXPERT_PER_LAYER is None or NUM_LOCAL_EXPERT_PER_LAYER == 0:
-                NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+        # Same deployment-constant planner the parallel declaration is
+        # computed from at start-up, so the two can never disagree.
+        self.enable_ep_offloading, NUM_LOCAL_EXPERT_PER_LAYER = (
+            self._plan_local_expert_split()
+        )
 
         self.num_local_expert_per_layer = NUM_LOCAL_EXPERT_PER_LAYER
 
