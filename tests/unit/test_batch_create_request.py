@@ -176,7 +176,9 @@ def test_batch_carrying_the_deprecated_field_still_runs_in_pool_mode():
         size=lambda: len(submitted),
         max_capacity=10,
     )
-    scheduler.storage = SimpleNamespace()
+    scheduler.storage = SimpleNamespace(
+        update_request_counts=lambda batch_id, counts: None,
+    )
     scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
     scheduler._pool_request_meta = {}
     finalized = []

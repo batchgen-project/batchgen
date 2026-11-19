@@ -199,7 +199,9 @@ def create_app(
             # Exclusive cross-process ownership first: recovery must never
             # fail batches that belong to a live server sharing this path.
             storage.acquire_storage_ownership()
-            orphaned = storage.fail_orphaned_batches()
+            orphaned = storage.fail_orphaned_batches(
+                server_args.incremental_output_dir
+            )
             if orphaned:
                 logger.warning(
                     "Failed %d batch(es) left active by a previous server "
@@ -533,6 +535,7 @@ def create_app(
         request: Request, after: Optional[str] = None, limit: int = 20
     ):
         storage: StorageManager = request.app.state.storage
+        scheduler: BatchScheduler = request.app.state.scheduler
         try:
             query_params = ListBatchesRequest(after=after, limit=limit)
         except Exception as exc:
@@ -546,7 +549,10 @@ def create_app(
                     break
 
         has_more = len(all_batches) > query_params.limit
-        limited = all_batches[: query_params.limit]
+        limited = [
+            scheduler.with_live_request_counts(batch)
+            for batch in all_batches[: query_params.limit]
+        ]
         first_id = limited[0].id if limited else None
         last_id = limited[-1].id if limited else None
         return ListBatchesResponse(
@@ -556,16 +562,18 @@ def create_app(
     @app.get("/v1/batches/{batch_id}", response_model=BatchObject)
     async def retrieve_batch(request: Request, batch_id: str):
         storage: StorageManager = request.app.state.storage
+        scheduler: BatchScheduler = request.app.state.scheduler
         batch = storage.load_batch(batch_id)
         if not batch:
             raise HTTPException(
                 status_code=404, detail=f"Batch '{batch_id}' not found"
             )
-        return batch
+        return scheduler.with_live_request_counts(batch)
 
     @app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
     async def cancel_batch(request: Request, batch_id: str):
         storage: StorageManager = request.app.state.storage
+        scheduler: BatchScheduler = request.app.state.scheduler
         batch = storage.load_batch(batch_id)
         if not batch:
             raise HTTPException(
@@ -585,7 +593,7 @@ def create_app(
             batch_id, BatchStatus.CANCELLED, cancelling_at=now, cancelled_at=now
         )
         updated = storage.load_batch(batch_id)
-        return updated
+        return scheduler.with_live_request_counts(updated)
 
     # ==================== Turn and Session Endpoints ====================
 

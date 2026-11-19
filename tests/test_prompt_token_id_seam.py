@@ -131,6 +131,7 @@ def _scheduler(tmp_path, worker, tokenizer, lines):
         load_metadata=lambda file_id: {"id": file_id},
         update_batch_status=lambda batch_id, status, **kwargs: updates.append(
             (status, kwargs.get("error"))),
+        update_request_counts=lambda batch_id, counts: None,
     )
     args = SimpleNamespace(
         model=MODEL, max_intake_capacity=1024,

@@ -401,7 +401,8 @@ def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget
     assert all(item["error"]["status_code"] == 400 for item in errors)
     assert all("max_model_len=16" in item["error"]["message"] for item in errors)
     tracker = scheduler._scheduling_pool.get_batch_tracker("length-batch")
-    assert tracker.completed_requests == 2 and not tracker.is_complete
+    assert (tracker.completed_requests, tracker.failed_requests) == (0, 2)
+    assert not tracker.is_complete
     assert finalized == ["length-batch"]
 
 
