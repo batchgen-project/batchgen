@@ -82,7 +82,7 @@ The publication also carries the cohort's `server_config`
 (`batchgen/worker/server_config.py`): the parallel layout the model's
 strategy manager declares per phase (`batchgen/parallel_declaration.py`;
 an undeclared manager reports `undeclared`, never a guessed default), the
-CUDA-graph flag with the captured bucket ladder, the host- and device-KV
+CUDA-graph flag with the owning model's installed or captured bucket ladder, the host- and device-KV
 pool sizes and page counts, the GPU memory fraction and the derived
 scheduling capacity. Local rank 0 of each node snapshots it while the decode
 pool and captured graphs are live (`_snapshot_server_config`, before the

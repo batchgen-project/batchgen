@@ -20,6 +20,10 @@ def declaration(**overrides):
     return pd.ParallelDeclaration(**values)
 
 
+def graph_declaration(mode="graph", buckets=(1, 2, 4)):
+    return pd.DecodeGraphDeclaration(mode=mode, buckets=buckets)
+
+
 # -- vocabulary --------------------------------------------------------------
 
 @pytest.mark.parametrize("scheme, residency, group, rendered", [
@@ -80,11 +84,28 @@ def test_undeclared_is_reserved_and_covers_every_slot():
     assert pd.UNDECLARED not in pd.SCHEMES and pd.UNDECLARED not in pd.RESIDENCIES
 
 
+@pytest.mark.parametrize("mode", ["graph", "compare"])
+def test_decode_graph_declaration_validates_and_carries_buckets(mode):
+    assert graph_declaration(mode).buckets == (1, 2, 4)
+    assert pd.DecodeGraphDeclaration.off() == pd.DecodeGraphDeclaration()
+
+
+def test_decode_graph_declaration_rejects_invalid_values():
+    with pytest.raises(pd.ParallelDeclarationError):
+        pd.DecodeGraphDeclaration("unknown", (1,))
+    with pytest.raises(pd.ParallelDeclarationError):
+        pd.DecodeGraphDeclaration("graph", None)
+    with pytest.raises(pd.ParallelDeclarationError):
+        pd.DecodeGraphDeclaration("off", (1,))
+    with pytest.raises(pd.ParallelDeclarationError):
+        pd.DecodeGraphDeclaration("graph", (2, 1))
+
+
 # -- the worker-side read ----------------------------------------------------
 
 class _Declared:
-    def parallel_declaration(self):
-        return declaration()
+    def parallel_declaration(self, decode_graph_state=None):
+        return declaration(decode_graph=decode_graph_state or pd.DecodeGraphDeclaration.off())
 
 
 class _Undeclared:
@@ -98,6 +119,13 @@ class _WrongType:
 
 def test_read_is_optional_but_never_coerced():
     assert pd.read_parallel_declaration(_Declared()) == declaration()
+    owner = type("Owner", (), {
+        "whole_model_graph": True,
+        "cuda_graph_manager": object(),
+        "whole_model_bucketing": type("Bucketing", (), {"bucket_sizes": [1, 2, 4]})(),
+    })()
+    read = pd.read_parallel_declaration(_Declared(), owner)
+    assert read.decode_graph == graph_declaration()
     assert pd.read_parallel_declaration(_Undeclared()) is None
     with pytest.raises(pd.ParallelDeclarationError, match="_WrongType"):
         pd.read_parallel_declaration(_WrongType())

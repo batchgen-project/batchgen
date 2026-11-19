@@ -7648,8 +7648,8 @@ class BatchGenWorker:
 		(``_probe_startup_transient``), after the decode pool is sized and
 		the startup graphs are captured, and before the lifecycle's switch
 		to prefill can retire the decode pool. Every value is read from the
-		object that owns it (parallel-strategy manager declaration, graph
-		state, host-KV view, device-KV manager, trajectory book); local rank
+		object that owns it (parallel-strategy manager declaration, its graph
+		declaration, host-KV view, device-KV manager, trajectory book); local rank
 		0 publishes the snapshot with the deployment capacity and the server
 		logs it once per generation and node (batchgen.worker.server_config).
 		"""
@@ -7659,20 +7659,19 @@ class BatchGenWorker:
 		)
 		from batchgen.worker.server_config import ServerConfig
 
-		declaration = read_parallel_declaration(self.parallel_manager)
+		declaration = read_parallel_declaration(
+			self.parallel_manager, self._graph
+		)
 		slots = (
 			undeclared_slots()
 			if declaration is None
 			else declaration.rendered_slots()
 		)
-		bucketing = self._graph.whole_model_bucketing
-		captured = None
-		if (
-			self._graph.whole_model_graph
-			and self._graph.cuda_graph_manager is not None
-			and bucketing is not None
-		):
-			captured = tuple(int(b) for b in bucketing.bucket_sizes)
+		graph = (
+			None
+			if declaration is None
+			else declaration.decode_graph
+		)
 		gpu_manager = self.gpu_paged_kv_cache_manager
 		if gpu_manager is None:
 			raise RuntimeError(
@@ -7691,8 +7690,8 @@ class BatchGenWorker:
 			prefill_moe=slots["prefill_moe"],
 			decode_attn=slots["decode_attention"],
 			decode_moe=slots["decode_moe"],
-			cuda_graphs=bool(self.engine_config.Basic_Config.enable_cuda_graphs),
-			graph_buckets=captured,
+			cuda_graphs=bool(graph and graph.mode != "off"),
+			graph_buckets=None if graph is None else graph.buckets,
 			host_kv_gib=float(self.global_host_kv_cache_size_gb),
 			host_kv_pages=self._get_host_kv_total_pages(),
 			device_kv_gib=float(self.gpu_kv_cache_size_gb),

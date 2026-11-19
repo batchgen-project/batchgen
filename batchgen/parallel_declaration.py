@@ -8,7 +8,8 @@
 The attention and MoE parallelism a deployment runs is decided inside each
 model's parallel-strategy manager, so only the manager can say what it is.
 This module is the worker's typed contract for that declaration: a manager
-that implements ``parallel_declaration()`` returns a ``ParallelDeclaration``
+that implements ``parallel_declaration(decode_graph_state=None)`` returns a
+``ParallelDeclaration``
 describing each (phase, module) slot, computed from the launch configuration
 at start-up (world size, EP configuration, planner output) — never hard-coded
 where the layout depends on launch arguments.
@@ -50,7 +51,7 @@ contract and is never a value a declaration may carry.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 SCHEME_DP = "dp"
 SCHEME_TP = "tp"
@@ -65,6 +66,11 @@ RESIDENCY_RESIDENT = "resident"
 RESIDENCY_STREAMED = "streamed"
 RESIDENCY_PARTIAL = "partial"
 RESIDENCIES = (RESIDENCY_RESIDENT, RESIDENCY_STREAMED, RESIDENCY_PARTIAL)
+
+GRAPH_MODE_OFF = "off"
+GRAPH_MODE_GRAPH = "graph"
+GRAPH_MODE_COMPARE = "compare"
+GRAPH_MODES = (GRAPH_MODE_OFF, GRAPH_MODE_GRAPH, GRAPH_MODE_COMPARE)
 
 # What the [SERVER_CONFIG] line reports for every slot of a manager that has
 # not declared. Never a legal value inside a ParallelDeclaration.
@@ -81,6 +87,68 @@ DECLARATION_SLOTS = (
 
 class ParallelDeclarationError(ValueError):
     """A parallel declaration outside this module's closed vocabulary."""
+
+
+@dataclass(frozen=True)
+class DecodeGraphDeclaration:
+    """The model-owned decode CUDA-graph mode and bucket ladder.
+
+    ``buckets`` is the installed or captured ladder owned by the declaring
+    model.  A worker-owned graph owner is converted to this same record by
+    ``read_parallel_declaration`` before it reaches a strategy manager.
+    """
+
+    mode: str = GRAPH_MODE_OFF
+    buckets: Optional[Tuple[int, ...]] = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in GRAPH_MODES:
+            raise ParallelDeclarationError(
+                f"decode graph mode {self.mode!r} is not one of {GRAPH_MODES}"
+            )
+        if self.buckets is None:
+            if self.mode != GRAPH_MODE_OFF:
+                raise ParallelDeclarationError(
+                    "an enabled decode graph declaration needs buckets"
+                )
+            return
+        if (
+            not isinstance(self.buckets, tuple)
+            or not self.buckets
+            or any(
+                not isinstance(bucket, int)
+                or isinstance(bucket, bool)
+                or bucket <= 0
+                for bucket in self.buckets
+            )
+            or list(self.buckets) != sorted(set(self.buckets))
+        ):
+            raise ParallelDeclarationError(
+                "decode graph buckets must be a strictly increasing tuple of "
+                f"positive ints, got {self.buckets!r}"
+            )
+        if self.mode == GRAPH_MODE_OFF:
+            raise ParallelDeclarationError(
+                "an off decode graph declaration cannot carry buckets"
+            )
+
+    @classmethod
+    def off(cls) -> "DecodeGraphDeclaration":
+        return cls()
+
+
+def decode_graph_from_owner(owner) -> DecodeGraphDeclaration:
+    """Convert the worker graph owner into the manager-facing graph record."""
+    if not getattr(owner, "whole_model_graph", False):
+        return DecodeGraphDeclaration.off()
+    manager = getattr(owner, "cuda_graph_manager", None)
+    bucketing = getattr(owner, "whole_model_bucketing", None)
+    if manager is None or bucketing is None:
+        return DecodeGraphDeclaration.off()
+    return DecodeGraphDeclaration(
+        mode=GRAPH_MODE_GRAPH,
+        buckets=tuple(int(bucket) for bucket in bucketing.bucket_sizes),
+    )
 
 
 @dataclass(frozen=True)
@@ -136,12 +204,13 @@ class ModuleParallelism:
 
 @dataclass(frozen=True)
 class ParallelDeclaration:
-    """A model's declared layout for every (phase, module) slot."""
+    """A model's declared layout and decode-graph state."""
 
     prefill_attention: ModuleParallelism
     prefill_moe: ModuleParallelism
     decode_attention: ModuleParallelism
     decode_moe: ModuleParallelism
+    decode_graph: DecodeGraphDeclaration = DecodeGraphDeclaration()
 
     def __post_init__(self) -> None:
         for slot in DECLARATION_SLOTS:
@@ -160,6 +229,11 @@ class ParallelDeclaration:
         for slot in ("prefill_attention", "decode_attention"):
             if getattr(self, slot).scheme == SCHEME_NONE:
                 raise ParallelDeclarationError(f"{slot} cannot be 'none'")
+        if not isinstance(self.decode_graph, DecodeGraphDeclaration):
+            raise ParallelDeclarationError(
+                "declaration decode_graph must be a DecodeGraphDeclaration, "
+                f"got {self.decode_graph!r}"
+            )
 
     def rendered_slots(self) -> dict:
         """``{slot: token}`` in ``DECLARATION_SLOTS`` order."""
@@ -171,18 +245,25 @@ def undeclared_slots() -> dict:
     return {slot: UNDECLARED for slot in DECLARATION_SLOTS}
 
 
-def read_parallel_declaration(parallel_manager) -> Optional[ParallelDeclaration]:
+def read_parallel_declaration(
+    parallel_manager, decode_graph_owner=None
+) -> Optional[ParallelDeclaration]:
     """The manager's declaration, or None when it does not implement one.
 
     Read like the worker's other optional model declarations
     (``recurrent_state_owner``): absence is a legal, explicit state — the
     caller reports ``undeclared`` — but a present contract that returns the
-    wrong type is a hard error, never coerced.
+    wrong type is a hard error, never coerced.  When supplied, the one graph
+    owner argument is converted to ``DecodeGraphDeclaration`` and passed to
+    every manager through the same method parameter.
     """
     declares = getattr(parallel_manager, "parallel_declaration", None)
     if declares is None:
         return None
-    declaration = declares()
+    if decode_graph_owner is None:
+        declaration = declares()
+    else:
+        declaration = declares(decode_graph_from_owner(decode_graph_owner))
     if not isinstance(declaration, ParallelDeclaration):
         raise ParallelDeclarationError(
             f"{type(parallel_manager).__name__}.parallel_declaration() must "

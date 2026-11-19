@@ -249,7 +249,15 @@ def test_snapshot_reports_the_declaration_and_the_captured_ladder():
         decode_moe=ModuleParallelism("ep", "partial", group_size=8),
     )
     worker, snapshot = _snapshot_worker(
-        parallel_manager=SimpleNamespace(parallel_declaration=lambda: declared),
+        parallel_manager=SimpleNamespace(
+            parallel_declaration=lambda graph_state: ParallelDeclaration(
+                prefill_attention=declared.prefill_attention,
+                prefill_moe=declared.prefill_moe,
+                decode_attention=declared.decode_attention,
+                decode_moe=declared.decode_moe,
+                decode_graph=graph_state,
+            )
+        ),
         engine_config=SimpleNamespace(
             Basic_Config=SimpleNamespace(enable_cuda_graphs=True)
         ),
@@ -261,6 +269,35 @@ def test_snapshot_reports_the_declaration_and_the_captured_ladder():
     )
     snapshot(worker)
     assert sc.ServerConfig.from_dict(worker.server_config) == config()
+
+
+def test_snapshot_uses_the_manager_graph_declaration_over_worker_graph_fields():
+    from batchgen.parallel_declaration import (
+        DecodeGraphDeclaration,
+        ModuleParallelism,
+        ParallelDeclaration,
+    )
+
+    declared = ParallelDeclaration(
+        prefill_attention=ModuleParallelism("dp", "streamed"),
+        prefill_moe=ModuleParallelism("dp", "streamed"),
+        decode_attention=ModuleParallelism("dp", "resident"),
+        decode_moe=ModuleParallelism("ep", "resident", group_size=8),
+        decode_graph=DecodeGraphDeclaration.off(),
+    )
+    worker, snapshot = _snapshot_worker(
+        parallel_manager=SimpleNamespace(
+            parallel_declaration=lambda graph_state: declared
+        ),
+        _graph=_graph_state(
+            whole_model_graph=True,
+            cuda_graph_manager=object(),
+            whole_model_bucketing=SimpleNamespace(bucket_sizes=[1, 2, 4]),
+        ),
+    )
+    snapshot(worker)
+    assert worker.server_config["cuda_graphs"] is False
+    assert worker.server_config["graph_buckets"] is None
 
 
 def test_snapshot_refuses_to_run_after_the_pool_is_retired():

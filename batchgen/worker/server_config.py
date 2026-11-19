@@ -3,7 +3,7 @@
 Monitoring needs the server to say, from its own logs, what it is running:
 the attention / MoE parallelism per phase (declared by the model's
 parallel-strategy manager, see ``batchgen.parallel_declaration``), the
-CUDA-graph configuration with the captured bucket ladder, the host- and
+CUDA-graph configuration with the owning model's bucket ladder, the host- and
 device-KV pool sizes, the GPU memory fraction and the derived scheduling
 pool capacity. All of it is owned by worker-side objects, so — exactly like
 the code identity — local rank 0 of every node snapshots it at the end of
@@ -18,9 +18,8 @@ Every value is reported as its owner holds it, never re-derived:
     The model's ``ParallelDeclaration`` slots, rendered; ``undeclared`` for
     a manager without the contract (never a guessed default).
 ``cuda_graphs`` / ``graph_buckets``
-    The engine's enable flag, and the captured ladder of the live whole-model
-    graph (``bucket_sizes`` of the capture's bucketing); ``none`` when no
-    graph is captured.
+    The owning model's decode-graph declaration and its installed or captured
+    bucket ladder; ``none`` when no decode graph is declared.
 ``host_kv_gib`` / ``host_kv_pages``
     The node's configured host-KV budget and its shared region's total page
     count (per region; a dual-region DSA pool keeps equal page counts).
@@ -102,7 +101,7 @@ class ServerConfig:
     decode_attn: str
     decode_moe: str
     cuda_graphs: bool
-    # The captured whole-model decode ladder; None when no graph is captured.
+    # The owning decode-graph ladder; None when no graph is declared.
     graph_buckets: Optional[Tuple[int, ...]]
     host_kv_gib: float
     host_kv_pages: int
