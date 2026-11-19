@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,17 +87,20 @@ class _Worker:
 
 
 def _scheduler(tmp_path, trace):
-    scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
-    scheduler._intake_pool = bs.IntakePool()
-    scheduler._scheduling_pool = bs.SchedulingPool(capacity=64)
-    scheduler._pool_request_meta = {}
-    scheduler._pool_initialized = True
-    scheduler.server_args = SimpleNamespace(incremental_output_dir=str(tmp_path))
-    scheduler.storage = SimpleNamespace(
+    # The production constructor builds the scheduler, so every attribute the
+    # drain and listener read exists; each test installs its own worker.
+    storage = SimpleNamespace(
         output_dir=tmp_path,
         update_batch_status=lambda batch_id, status, **kw: trace.append(
             ("status", batch_id, status, kw.get("error"))),
     )
+    scheduler = bs.BatchScheduler(
+        storage, None, SimpleNamespace(incremental_output_dir=str(tmp_path)))
+    scheduler._scheduling_pool.set_capacity(64)
+    # The worker generation has published its deployment capacity and needs
+    # no init message.
+    scheduler._deployment_ready.set()
+    scheduler._pool_initialized = True
 
     async def no_finalizer(*args):
         pass
@@ -143,7 +147,20 @@ def test_batches_sharing_custom_ids_are_admitted_and_answered_separately(tmp_pat
         scheduler.worker = _Worker(trace, scheduler._stopped, completions=[
             {"type": "completion", "request_id": e["request_id"], "batch_id": e["batch_id"],
              "text": f"answer {e['request_id']}"} for e in admission["entries"]])
-        await scheduler._pool_completion_listener()
+        # Completions reach the listener the way start() wires them: the
+        # generation's pump thread reads the response queue into the inbox.
+        scheduler._loop = asyncio.get_running_loop()
+        scheduler._completion_inbox = asyncio.Queue()
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        trackers = [scheduler._scheduling_pool.get_batch_tracker(b)
+                    for b in ("batch_a", "batch_b")]
+        deadline = time.monotonic() + 10.0
+        while not all(t.is_complete for t in trackers):
+            assert time.monotonic() < deadline, "completions were not routed"
+            await asyncio.sleep(0.02)
+        scheduler._stopped.set()
+        await asyncio.wait_for(scheduler._completion_listener_task, timeout=5.0)
         return scheduler
 
     scheduler = asyncio.run(run())

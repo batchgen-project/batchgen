@@ -262,7 +262,7 @@ def test_the_worker_binds_the_ids_it_receives(tmp_path):
 
 
 def test_a_non_flat_template_result_fails_loudly():
-    scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler = _real_scheduler()
 
     class _Nested(_SegmentTemplateTokenizer):
         def apply_chat_template(self, messages, tokenize=False, **kwargs):
@@ -368,10 +368,11 @@ def test_a_non_value_error_during_construction_fails_the_batch(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _real_scheduler():
-    scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
-    scheduler._tokenizer = None
-    scheduler._tokenizer_model = None
-    return scheduler
+    """A scheduler built by the production constructor: only the prompt and
+    tokenizer paths run, which need no storage or worker. The output-parsing
+    flags are the server defaults (unset, so the model's default applies)."""
+    return bs.BatchScheduler(
+        None, None, SimpleNamespace(parse_thinking=None, parse_tool_call=None))
 
 
 def _load_or_skip(model):
