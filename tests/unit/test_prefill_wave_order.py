@@ -17,6 +17,7 @@ import importlib.util
 import logging
 import sys
 import types
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List
@@ -167,11 +168,26 @@ def test_stamping_groups_by_prompt_prefix_and_ties_by_global_idx():
     assert min(seq.prefill_order for seq in seqs.values()) == 10
 
 
-def test_stamping_is_skipped_outside_packing_mode():
-    for mode in (None, "legacy"):
-        seqs = _family_admission()
-        _stamping_worker(seqs, mode=mode)._stamp_prefix_prefill_order(list(seqs))
-        assert all(not hasattr(seq, "prefill_order") for seq in seqs.values())
+def test_stamping_is_skipped_only_by_the_opt_out_mode():
+    seqs = _family_admission()
+    _stamping_worker(seqs, mode="global_idx")._stamp_prefix_prefill_order(list(seqs))
+    assert all(not hasattr(seq, "prefill_order") for seq in seqs.values())
+
+
+def test_stamping_happens_on_the_default_mode():
+    # The packer is the default assignment, so a wave that says nothing is
+    # stamped: leaving it off by default would make every ordinary wave pay
+    # for a straggler the scheduler can see coming.
+    seqs = _family_admission()
+    _stamping_worker(seqs, mode=None)._stamp_prefix_prefill_order(list(seqs))
+    assert sorted(seq.prefill_order for seq in seqs.values()) == [10, 11, 12, 13, 14]
+
+
+def test_an_unknown_mode_is_refused():
+    seqs = _family_admission()
+    worker_state = _stamping_worker(seqs, mode="legacy")
+    with pytest.raises(ValueError, match="prefix_rank_assignment_mode"):
+        worker_state._stamp_prefix_prefill_order(list(seqs))
 
 
 def test_stamping_ignores_uuids_with_no_sequence():

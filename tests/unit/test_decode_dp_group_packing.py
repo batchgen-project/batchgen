@@ -126,7 +126,8 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
         engine_config=SimpleNamespace(
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=CHUNK)),
         _active_batchgen_debug_for_sequences=lambda batch_sequences: (
-            {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
+            {"prefix_rank_assignment_mode": "packing_v2" if packing
+            else "global_idx"}
         ),
         _decode_attn_tp_size=lambda: G,
         _prefill_prefix_pool_enabled=lambda: pool,

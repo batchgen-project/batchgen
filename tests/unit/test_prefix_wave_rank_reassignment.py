@@ -116,6 +116,9 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         worker_state._trajectory_tokens = (
             lambda seq, length=None, **_: prompts[seq.uuid][:length]
         )
+        worker_state._active_batchgen_debug_for_sequences = (
+            lambda batch_sequences: {"prefix_rank_assignment_mode": "global_idx"}
+        )
         worker_state._prefix_rank_packing_mode = types.MethodType(
             _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
             worker_state,
@@ -361,7 +364,7 @@ def test_receipt_packing_pins_only_sequences_that_owe_a_prefill(monkeypatch):
     assert recorder["prompts"] == [[8, 9, 10]]
 
 
-def test_default_mode_still_uses_the_legacy_assigner(monkeypatch):
+def test_opt_out_mode_still_uses_the_legacy_assigner(monkeypatch):
     calls = []
 
     def assign_ranks_for_sharing(prompts, **kwargs):
@@ -374,7 +377,9 @@ def test_default_mode_still_uses_the_legacy_assigner(monkeypatch):
                         SimpleNamespace(assign_ranks_for_sharing=assign_ranks_for_sharing))
     seqs = _mixed_wave(0)
     worker_state = _packing_worker(0, seqs, {"q0": 4})
-    worker_state._active_batchgen_debug_for_sequences = lambda batch_sequences: None
+    worker_state._active_batchgen_debug_for_sequences = (
+        lambda batch_sequences: {"prefix_rank_assignment_mode": "global_idx"}
+    )
     _assignment_method()(worker_state, ["q0", "q1"], current_wave=True)
     assert len(calls) == 1 and calls[0][0] == [[4, 5, 6], [7, 8]]
     assert calls[0][1]["initial_loads"] == [0, 0]
