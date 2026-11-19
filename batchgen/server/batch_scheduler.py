@@ -2048,10 +2048,20 @@ class BatchScheduler:
     def _chat_completion_body(
         self, model: str, result: dict, created_at: int
     ) -> dict:
-        """The chat.completion body for one worker completion item."""
+        """The chat.completion body for one worker completion item.
+
+        ``finish_reason`` is the worker's (``stop``, ``length`` or
+        ``repetition``) except that a generation which stopped on its own
+        with parsed tool calls reports ``tool_calls``, as OpenAI-compatible
+        clients expect. A truncated (``length``) or repetition-ended
+        generation keeps its reason: it did not end at a completed call,
+        and the model parsers already return an unterminated call as
+        content rather than as a tool call.
+        """
         decoded_text = result.get("text", "")
         prompt_length = result.get("prompt_length", 0)
         decoded_length = result.get("decoded_length", 0)
+        finish_reason = result.get("finish_reason", "stop")
         content, reasoning_content, tool_calls = self._parse_output(
             model, decoded_text
         )
@@ -2065,6 +2075,8 @@ class BatchScheduler:
             message["tool_calls"] = [
                 call.dict(exclude_none=True) for call in tool_calls
             ]
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -2074,7 +2086,7 @@ class BatchScheduler:
                 "index": 0,
                 "message": message,
                 "logprobs": None,
-                "finish_reason": result.get("finish_reason", "stop"),
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": prompt_length,

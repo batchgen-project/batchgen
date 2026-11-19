@@ -1047,6 +1047,186 @@ def test_lane_root_inside_worktree_is_rejected_before_creation(tmp_path):
     assert not lane_root.exists()
 
 
+def _mountinfo(tmp_path, *mounts):
+    """Write a fake mountinfo with (mount point, filesystem type) entries."""
+    lines = []
+    for index, (mount_point, fs_type) in enumerate(mounts):
+        escaped = str(mount_point).replace("\\", "\\134").replace(" ", "\\040")
+        lines.append(
+            f"{20 + index} 1 0:{30 + index} / {escaped} rw,relatime "
+            f"shared:{index + 1} - {fs_type} source rw"
+        )
+    path = tmp_path / "mountinfo"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _lane_worktree(tmp_path):
+    worktree = tmp_path / "worktree"
+    (worktree / "batchgen").mkdir(parents=True)
+    (worktree / "batchgen_kernels").mkdir()
+    return worktree
+
+
+@pytest.mark.parametrize(
+    "fs_type", ["ext4", "xfs", "btrfs", "overlay", "tmpfs", "fuseblk", "fuse.fuse-overlayfs"]
+)
+def test_lane_caches_on_a_local_filesystem_are_admitted(tmp_path, fs_type):
+    worktree = _lane_worktree(tmp_path)
+    lane_root = tmp_path / "lane"
+    mountinfo = _mountinfo(tmp_path, ("/", fs_type))
+
+    _, paths, _ = lane_runtime._prepare_paths(
+        lane_root, worktree, lane_root / "converted", mountinfo_path=mountinfo
+    )
+
+    assert Path(paths["triton"]).is_dir()
+
+
+@pytest.mark.parametrize(
+    "fs_type",
+    sorted(lane_runtime._NETWORK_FS_TYPES) + ["fuse", "fuse.sshfs", "fuse.unknown"],
+)
+def test_lane_caches_on_a_network_filesystem_are_refused_before_creation(
+    tmp_path, fs_type
+):
+    worktree = _lane_worktree(tmp_path)
+    shared = Path(os.path.realpath(tmp_path)) / "shared"
+    lane_root = shared / "lanes" / "lane-0"
+    mountinfo = _mountinfo(tmp_path, ("/", "ext4"), (shared, fs_type))
+
+    with pytest.raises(lane_runtime.LaneError) as error:
+        lane_runtime._prepare_paths(
+            lane_root, worktree, lane_root / "converted", mountinfo_path=mountinfo
+        )
+
+    message = str(error.value)
+    assert str(lane_root / "tmp") in message
+    assert f"a {fs_type} filesystem" in message
+    assert f"mounted at {shared}" in message
+    assert "--lane-root" in message
+    assert not shared.exists()
+
+
+def test_required_network_filesystem_types_are_classified():
+    for fs_type in ("nfs", "nfs4", "ceph", "cifs", "smb3", "lustre", "gpfs", "beegfs"):
+        assert lane_runtime._is_network_fs(fs_type)
+    for fs_type in ("ext4", "xfs", "tmpfs", "overlay", "nfsd", "fuseblk", "fusectl"):
+        assert not lane_runtime._is_network_fs(fs_type)
+
+
+def test_cache_filesystem_is_the_longest_mount_point_prefix(tmp_path):
+    root = Path(os.path.realpath(tmp_path))
+    mounts = [
+        ("/", "ext4"),
+        (root / "shared", "nfs4"),
+        (root / "shared" / "local", "xfs"),
+        (root / "shared-other", "ceph"),
+        (root / "with space", "lustre"),
+    ]
+    parsed = lane_runtime._read_mounts(_mountinfo(tmp_path, *mounts))
+
+    assert parsed == [(str(mount_point), fs_type) for mount_point, fs_type in mounts]
+    assert lane_runtime._mount_of(root / "shared" / "lane", parsed)[1] == "nfs4"
+    assert lane_runtime._mount_of(root / "shared" / "local" / "lane", parsed) == (
+        str(root / "shared" / "local"),
+        "xfs",
+    )
+    # A sibling whose name merely starts with a mount point is not inside it.
+    assert lane_runtime._mount_of(root / "sharedx" / "lane", parsed)[1] == "ext4"
+    assert lane_runtime._mount_of(root / "shared-other", parsed)[1] == "ceph"
+    assert lane_runtime._mount_of(root / "with space" / "lane", parsed)[1] == "lustre"
+
+
+def test_stacked_mounts_resolve_to_the_last_one_listed(tmp_path):
+    root = Path(os.path.realpath(tmp_path))
+    lanes = str(root / "lanes")
+    mounts = [("/", "ext4"), (lanes, "nfs"), (lanes, "xfs")]
+
+    assert lane_runtime._mount_of(root / "lanes" / "lane-0", mounts)[1] == "xfs"
+
+
+def test_local_mount_under_a_network_lane_root_holds_only_part_of_the_caches(tmp_path):
+    worktree = _lane_worktree(tmp_path)
+    shared = Path(os.path.realpath(tmp_path)) / "shared"
+    lane_root = shared / "lane-0"
+    mountinfo = _mountinfo(
+        tmp_path,
+        ("/", "ext4"),
+        (shared, "ceph"),
+        *((lane_root / name, "xfs") for name in ("tmp", "triton-cache")),
+    )
+
+    with pytest.raises(lane_runtime.LaneError, match="torch-extensions is on a ceph"):
+        lane_runtime._prepare_paths(
+            lane_root, worktree, lane_root / "converted", mountinfo_path=mountinfo
+        )
+
+    every_cache_local = _mountinfo(
+        tmp_path,
+        ("/", "ext4"),
+        (shared, "ceph"),
+        *((lane_root / name, "xfs") for name in lane_runtime._CACHE_DIRS.values()),
+    )
+    _, paths, log_path = lane_runtime._prepare_paths(
+        lane_root, worktree, lane_root / "converted", mountinfo_path=every_cache_local
+    )
+    assert Path(paths["cuda"]).is_dir()
+    assert log_path.parent.is_dir()
+
+
+def test_symlinked_lane_root_parent_is_classified_by_its_target(tmp_path):
+    worktree = _lane_worktree(tmp_path)
+    root = Path(os.path.realpath(tmp_path))
+    shared = root / "shared"
+    shared.mkdir()
+    (root / "local").mkdir()
+    (root / "local" / "lanes").symlink_to(shared, target_is_directory=True)
+    lane_root = root / "local" / "lanes" / "lane-0"
+    mountinfo = _mountinfo(tmp_path, ("/", "ext4"), (shared, "nfs"))
+
+    with pytest.raises(lane_runtime.LaneError, match="is on a nfs filesystem"):
+        lane_runtime._prepare_paths(
+            lane_root, worktree, lane_root / "converted", mountinfo_path=mountinfo
+        )
+
+    assert not (shared / "lane-0").exists()
+
+
+def test_cache_filesystem_check_fails_closed_on_unusable_mountinfo(tmp_path):
+    worktree = _lane_worktree(tmp_path)
+    lane_root = tmp_path / "lane"
+    malformed = tmp_path / "malformed"
+    malformed.write_text("21 1 0:31 / / rw,relatime ext4 source rw\n")
+    empty = tmp_path / "empty"
+    empty.write_text("")
+
+    for mountinfo, pattern in (
+        (malformed, "malformed"),
+        (empty, "no mount contains"),
+        (tmp_path, "cannot read"),
+    ):
+        with pytest.raises(lane_runtime.LaneError, match=pattern):
+            lane_runtime._prepare_paths(
+                lane_root, worktree, lane_root / "converted", mountinfo_path=mountinfo
+            )
+    assert not lane_root.exists()
+
+
+def test_cache_filesystem_check_is_skipped_without_mountinfo(tmp_path):
+    worktree = _lane_worktree(tmp_path)
+    lane_root = tmp_path / "lane"
+
+    lane_runtime._prepare_paths(
+        lane_root,
+        worktree,
+        lane_root / "converted",
+        mountinfo_path=tmp_path / "no-proc" / "mountinfo",
+    )
+
+    assert (lane_root / "triton-cache").is_dir()
+
+
 def test_nested_lane_root_is_rejected_before_touching_active_lane(tmp_path, monkeypatch):
     monkeypatch.setattr(lane_runtime, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path / "host-locks")

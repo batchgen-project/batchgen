@@ -42,6 +42,20 @@ DEEPSEEK_V4_EOS_TOKEN_ID = 1
 DEEPSEEK_V4_VOCAB_SIZE = 129280
 
 
+def _openai_tool_call(name: str, arguments: str) -> Dict[str, object]:
+    """One parsed call in the ``parse_tool_calls`` contract shape.
+
+    DSML carries no call id and the vendored encoder's
+    ``tool_calls_to_openai_format`` emits none, so the id is assigned here,
+    once per parsed call, in the form the other families use.
+    """
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
 @register_tokenizer("deepseek_v4")
 class DeepSeekV4Tokenizer(FastTokenizer):
     """DeepSeek-V4 tokenizer loaded from the vendored V4 Flash assets."""
@@ -185,7 +199,12 @@ class DeepSeekV4Tokenizer(FastTokenizer):
             )
             tool_calls = parsed.get("tool_calls") or []
             if tool_calls:
-                return tool_calls, parsed.get("content", "").strip()
+                return [
+                    _openai_tool_call(
+                        call["function"]["name"], call["function"]["arguments"],
+                    )
+                    for call in tool_calls
+                ], parsed.get("content", "").strip()
         except ValueError as exc:
             logger.debug("DeepSeek-V4 DSML parser did not accept completion text: %s", exc)
 
@@ -200,10 +219,6 @@ class DeepSeekV4Tokenizer(FastTokenizer):
                 json.loads(arguments)
             except json.JSONDecodeError:
                 arguments = json.dumps({"arguments": arguments}, ensure_ascii=False)
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": name, "arguments": arguments},
-            })
+            tool_calls.append(_openai_tool_call(name, arguments))
         visible = self._TOOL_CALL_RE.sub("", text).strip()
         return tool_calls, visible

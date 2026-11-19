@@ -158,10 +158,10 @@ def test_unreadable_machine_is_refused_not_defaulted():
 
 
 def test_mem_total_comes_from_the_shared_meminfo_reader(monkeypatch):
-    from batchgen.scheduler import host_mem
+    from batchgen.hardware import meminfo
 
     monkeypatch.setattr(
-        host_mem,
+        meminfo,
         "get_physical_memory_info",
         lambda: {"total_physical": 2015.0, "actually_free": 147.0},
     )
@@ -169,11 +169,11 @@ def test_mem_total_comes_from_the_shared_meminfo_reader(monkeypatch):
 
 
 def test_meminfo_reader_failure_is_a_refusal(monkeypatch):
-    from batchgen.scheduler import host_mem
+    from batchgen.hardware import meminfo
 
     # The reader reports failure by returning its message.
     monkeypatch.setattr(
-        host_mem,
+        meminfo,
         "get_physical_memory_info",
         lambda: "Error reading memory info: [Errno 2] No such file",
     )

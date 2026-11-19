@@ -1,37 +1,15 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  Copyright (c) 2025-2026 BatchGen Team                                            #
+#  Copyright (c) 2025-2026 BatchGen Team                                         #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
 #  you may not use this file except in compliance with the license.             #
-#                                                                               #
-#  you may obtain a copy of the license at                                      #
+#  see the license at                                                           #
 #                                                                               #
 #                  http://www.apache.org/licenses/license-2.0                   #
-#                                                                               #
-#  unless required by applicable law or agreed to in writing, software          #
-#  distributed under the license is distributed on an "as is" basis,            #
-#  without warranties or conditions of any kind, either express or implied.     #
-#  see the license for the specific language governing permissions and          #
-#  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-# def get_simple_memory_info():
-#     """
-#     Get basic memory information in a simple format
-#     """
-#     mem = psutil.virtual_memory()
-#     return {
-#         'total_gb': mem.total / (1024**3),
-#         'available_gb': mem.available / (1024**3),
-#         'used_percent': mem.percent
-#     }
-
-# # Usage
-# mem = get_simple_memory_info()
-# print(f"Total Memory: {mem['total_gb']:.1f} GB")
-# print(f"Available Memory: {mem['available_gb']:.1f} GB")
-# print(f"Memory Usage: {mem['used_percent']}%")
+"""Host physical memory facts, read from ``/proc/meminfo``."""
 
 
 def get_physical_memory_info():
@@ -66,11 +44,3 @@ def get_physical_memory_info():
             }
     except Exception as e:
         return f"Error reading memory info: {str(e)}"
-
-
-# Example usage
-if __name__ == "__main__":
-    mem = get_physical_memory_info()
-    if isinstance(mem, dict):
-        print(f"Total Physical Memory: {mem['total_physical']:.2f} GB")
-        print(f"Actually Free Memory: {mem['actually_free']:.2f} GB")
