@@ -21,7 +21,6 @@ Run: python -m pytest tests/test_kimi_linear_m2b_decode_dp_group.py -x -q -rA
 from __future__ import annotations
 
 import ast
-import copy
 import logging
 import math
 import types
@@ -44,18 +43,14 @@ WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 
 
 def _isolated_worker_method(function_name, globals_=None):
-    """Compile one worker method without importing the GPU/JIT-heavy module."""
-    tree = ast.parse(WORKER.read_text())
-    worker = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
-    )
-    method = copy.deepcopy(next(
-        node
-        for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
-    ))
+    """Compile one worker method without importing the GPU/JIT-heavy module.
+
+    A method moved into an engine leaves a delegator on the worker; the body
+    that runs is the engine's, so resolve it through the shared helper.
+    """
+    from tests.worker_method_source import worker_shaped_method_node
+
+    method = worker_shaped_method_node(function_name)
     module = ast.Module(
         body=[ast.ClassDef(
             name="Isolated",
