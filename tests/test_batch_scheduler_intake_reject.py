@@ -79,8 +79,8 @@ def _make_scheduler(tmp_path, max_intake_capacity):
     storage = StorageManager(tmp_path / "store")
     scheduler = bs.BatchScheduler(storage, None, SimpleNamespace(
         model=MODEL, max_intake_capacity=max_intake_capacity,
-        incremental_output_dir=None,
-        no_incremental_save=False, parse_thinking=False, parse_tool_call=False,
+        incremental_output_dir=str(tmp_path / "incremental"),
+        parse_thinking=False, parse_tool_call=False,
     ))
     scheduler.max_model_len = 32
     scheduler._get_tokenizer = lambda model: _Tokenizer()
