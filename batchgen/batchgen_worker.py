@@ -50,7 +50,6 @@ Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
 
 from .config.config import EngineConfig
-from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan

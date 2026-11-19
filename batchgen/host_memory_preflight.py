@@ -214,12 +214,12 @@ def build_plan(
 def read_mem_total_bytes() -> int:
     """MemTotal of this machine, through the shared ``/proc/meminfo`` reader.
 
-    ``host_mem.get_physical_memory_info`` reports a failure by returning its
+    ``meminfo.get_physical_memory_info`` reports a failure by returning its
     message instead of a mapping; a gate cannot continue on that, so the
     non-mapping case is a refusal rather than a default.
     """
 
-    from batchgen.scheduler.host_mem import get_physical_memory_info
+    from batchgen.hardware.meminfo import get_physical_memory_info
 
     info = get_physical_memory_info()
     if not isinstance(info, dict) or not info.get("total_physical"):
