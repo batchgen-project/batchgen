@@ -406,8 +406,9 @@ class GraphRuntime:
                     all_short,
                 )
 
-            AttnWrapperBase.gpu_paged_kv_manager = primary_manager
-            AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+            # Model-wrapper class state goes through the worker binder. The
+            # engine module does not write the wrapper classes.
+            self._bind_graph_capture_kv_managers(primary_manager, aux_manager)
             primary_k_cache, _ = primary_manager.get_kv_tensors()
             aux_k_cache, _ = aux_manager.get_kv_tensors()
             rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
@@ -826,7 +827,8 @@ class GraphRuntime:
             max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
 
         # Set gpu_paged_kv_manager so segments can access it during capture
-        AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+        # The engine module does not write the wrapper classes.
+        self._bind_graph_capture_kv_manager(gpu_manager)
 
         # K2.5: whole-model graph via the cuda-graph adapter (minimal parallel
         # path). POIS decision: serialize the shared expert inline to reclaim

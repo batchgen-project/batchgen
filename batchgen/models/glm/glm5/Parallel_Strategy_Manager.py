@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 
 from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
-from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.models.wrappers import AttnWrapperBase, phase_state
 from batchgen.phase_lifecycle import (
     AdmitContext,
     ExitMode,
@@ -1451,10 +1451,13 @@ class GLM5ParallelStrategyManager:
             # MoE: graph replays bind the worker's real page tables and
             # shared graph buffers, which this synthetic step must not touch.
             # The configured batch debug dict is restored below.
-            AttnWrapperBase.batchgen_debug = {
-                "glm5_dsa_mode": "eager",
-                "glm5_moe_mode": "eager",
-            }
+            phase_state.bind_debug(
+                AttnWrapperBase,
+                batchgen_debug={
+                    "glm5_dsa_mode": "eager",
+                    "glm5_moe_mode": "eager",
+                },
+            )
             # Every synthetic row is long, so the worker's per-step short-row
             # hint is 0 and no selector falls back to a host-side reduction.
             GLM5AttnWrapper._dsa_short_count = 0
@@ -1465,25 +1468,34 @@ class GLM5ParallelStrategyManager:
             # real, so dispatch masks nothing.
             Glm5MoE._rank_token_counts = None
 
-            AttnWrapperBase.gpu_paged_kv_manager = _SyntheticPagedKV()
-            AttnWrapperBase.gpu_paged_kv_manager_aux = _SyntheticPagedKVAux()
-            AttnWrapperBase.cache_seqlens = torch.full(
-                (plan_bsz,), probe_past + 1,
-                dtype=torch.int32,
-                device=device,
+            phase_state.bind_decode_entry(
+                AttnWrapperBase,
+                gpu_paged_kv_manager=_SyntheticPagedKV(),
+                gpu_paged_kv_manager_aux=_SyntheticPagedKVAux(),
             )
-            AttnWrapperBase.max_seqlen = probe_past + 1
-            AttnWrapperBase.cur_batch = list(synthetic_sids)
-            AttnWrapperBase.position_ids = torch.full(
-                (plan_bsz, 1), probe_past,
-                dtype=torch.long,
-                device=device,
+            phase_state.bind_step(
+                AttnWrapperBase,
+                cache_seqlens=torch.full(
+                    (plan_bsz,), probe_past + 1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                max_seqlen=probe_past + 1,
+                cur_batch=list(synthetic_sids),
+                position_ids=torch.full(
+                    (plan_bsz, 1), probe_past,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                attention_mask=None,
             )
-            AttnWrapperBase.attention_mask = None
             # Both Host-append callbacks stay None for the probe; the eager
             # selector then appends nothing host-side.
-            AttnWrapperBase.kv_append_callback = None
-            AttnWrapperBase.kv_append_callback_aux = None
+            phase_state.bind_kv_append(
+                AttnWrapperBase,
+                kv_append_callback=None,
+                kv_append_callback_aux=None,
+            )
 
             # The worker syncs this scalar before every decode step; GLM-5
             # decode is pure DP, so every rank drives its full plan_bsz rows.
@@ -1557,8 +1569,7 @@ class GLM5ParallelStrategyManager:
             Glm5MoE._rank_token_counts = saved_rank_token_counts
             for name, value in saved_glm5_wrapper_state.items():
                 setattr(GLM5AttnWrapper, name, value)
-            for name, value in saved_attention_state.items():
-                setattr(AttnWrapperBase, name, value)
+            phase_state.restore_saved_state(AttnWrapperBase, saved_attention_state)
 
     def _init_decoding_padding_bsz(self, padding_bsz):
         env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
