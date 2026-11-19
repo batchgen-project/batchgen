@@ -26,7 +26,8 @@ def test_prefill_reservation_precedes_status_and_phase_config():
         "if prefill_uuids and not self._reserve_prefill_host_kv(prefill_uuids):"
     )
     status = loop.index(
-        "self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)"
+        "self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL, "
+        "StatusEdge.PREFILL)"
     )
     config = loop.index("self._config_prefill_for_batch(prefill_uuids)")
     assert reservation < status < config

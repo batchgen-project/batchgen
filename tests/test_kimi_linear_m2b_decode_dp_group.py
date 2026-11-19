@@ -36,6 +36,12 @@ from batchgen.decode_dp_group import (
     num_decode_dp_groups,
     rank_in_decode_group,
 )
+from batchgen.worker.admission.plan import (
+    StatusEdge,
+    Transition,
+    TransitionPlan,
+    apply_or_raise,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -347,7 +353,7 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
     """A TP-group member owns local GPU KV even when assigned_rank points at a
     different rank. The local binding, not the legacy rank, controls release."""
     on_hold = object()
-    calls = types.SimpleNamespace(freed=[], barriers=0)
+    calls = types.SimpleNamespace(freed=[], barriers=0, plans=[])
 
     class _Seq:
         uuid = "u"
@@ -366,9 +372,11 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
             assert uuid == "u"
             return seq
 
-        def update_status(self, uuid, status):
-            assert uuid == "u"
-            assert status is on_hold
+        def apply(self, plan):
+            assert plan.edge is StatusEdge.CAPACITY_HOLD
+            assert [(t.uuid, t.to) for t in plan.transitions] == [("u", on_hold)]
+            calls.plans.append(plan)
+            return ()
 
     class _Manager:
         _sequences = {17: object()}
@@ -394,11 +402,16 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
             "dist": types.SimpleNamespace(
                 barrier=lambda: setattr(calls, "barriers", calls.barriers + 1)
             ),
+            "StatusEdge": StatusEdge,
+            "Transition": Transition,
+            "TransitionPlan": TransitionPlan,
+            "apply_or_raise": apply_or_raise,
         },
     ).__get__(worker)
 
     method(["u"])
 
+    assert len(calls.plans) == 1
     assert calls.freed == [[17]]
     assert worker._sequences_with_gpu_kv == set()
     assert seq.gpu_pages_allocated == 0

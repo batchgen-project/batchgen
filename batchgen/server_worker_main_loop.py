@@ -23,6 +23,7 @@ check_kernels_version()
 from batchgen.batchgen_worker import (
 	BatchGenWorker,
 	BatchGenWorkerArgs,
+	release_process_phase_state,
 	runs_startup_before_readiness,
 )
 from batchgen.deprecation import LegacyInferenceDeprecated
@@ -1080,6 +1081,8 @@ def _server_worker_main_impl(
 	# the storage mapping only after all non-owning references are gone.  The
 	# abort does not touch any of this: it only tears down communicators.
 	_shutdown_worker_runtime(worker)
+	# The worker's runtime is gone; it no longer owns the model phase state.
+	release_process_phase_state(worker)
 	# Skipped once this worker's communicators were aborted.  Its no-group form
 	# shuts groups down in the SAME reverse-name order the all-groups abort
 	# uses (torch 2.8.0 distributed_c10d.py:2183-2186, torch 2.14.1

@@ -21,7 +21,8 @@ def test_prefill_to_decode_metadata_sync_brackets_status_transition():
     pre_config_sync = block.index("self._sync_sequence_metadata(decode_uuids)")
     config_decode = block.index("self._config_decoding_for_batch")
     mark_in_decode = block.index(
-        "self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)"
+        "self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE, "
+        "StatusEdge.DECODE_ENTRY)"
     )
     post_status_sync = block.index(
         "self._sync_sequence_metadata(decode_uuids)",
