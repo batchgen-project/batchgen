@@ -236,7 +236,7 @@ def test_worker_collects_remote_host_regions_before_accepting_length(monkeypatch
             copies=2, available_pages=5,
         )]
 
-    method = load_worker_methods(["_verify_deployment_max_model_len"], {
+    method = load_worker_shaped_methods(["_verify_deployment_max_model_len"], {
         "SequenceLengthCapacity": SequenceLengthCapacity,
         "verify_max_model_len": verify_max_model_len,
         "QueryBook": SimpleNamespace(TOKEN_BYTES=4),

@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
-from batchgen.batch_order import (
+from batchgen.prefill.batch_order import (
     build_prefill_sequence_spans,
     prefill_sequence_spans_to_cu_seqlens,
     prefill_sequence_spans_to_global_seq_ids,
@@ -30,6 +30,36 @@ from batchgen.prefill.prepack import (
     get_prepack_stats,
     prepack_sequences,
 )
+from batchgen.lifespan import SeqEvent
+from batchgen.native_loader import core_engine
+from batchgen.phase_lifecycle import AdmitContext
+from batchgen.query_book import (
+    QueryBookPoolCapacityError,
+    make_query_book_entry,
+)
+from batchgen.sequence import SequenceStatus
+from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
+from batchgen.worker.prefill import (
+    PrefillAdmissionStalled,
+    PrefillAdmissionStateDivergence,
+    PrefillScheduler,
+    prefill_reclaim_target_pages,
+)
+
+
+def _reentry_history_length(
+    prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
+) -> int:
+    """Tokens a re-entering sequence already decoded, capped by its own budget.
+
+    The reconstructed prompt carries the whole history, so the history length is
+    prompt_length - original_prompt_length. Cap it by the request's absolute
+    decode budget, which also bounds its decoded_tokens row (admission grows the
+    pool to every request's max_decode_length). The worker-wide
+    max_decoding_length must not be used: in pool mode it is the budget of the
+    first batch the server saw and can be smaller than a later request's history.
+    """
+    return max(0, min(prompt_length - original_prompt_length, original_max_decode_length))
 
 
 # Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
@@ -3063,3 +3093,883 @@ class PrefillEngine:
                 seq.eos_reached = True
 
         return new_tokens
+
+    def _prepare_prefill_batch(self, worker) -> List[str]:
+        """
+        Select sequences for prefill based on HOST KV cache capacity.
+
+        Key constraint: Host KV cache is PER NODE.
+        - Each node has its own host KV capacity
+        - Sequences assigned to ranks on node N use node N's host KV
+        - Must check per-node capacity, not global
+
+        With dynamic host KV reservation, sequences only need prompt + chunk_size
+        pages initially (not the full kv_token_budget). This allows more sequences
+        to be prefilled concurrently.
+
+        EVICTED sequences get weighted priority (more decoded = higher priority)
+        and re-enter through the prefill path.
+        """
+        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
+        # depend on its original self. spellings. Rebinding self to the worker
+        # preserves those spellings; this engine instance remains stateless.
+        self = worker
+        # Collect candidates: evicted sequences first (weighted priority), then new
+        evicted_uuids = []
+        if self.enable_host_kv_eviction:
+            evicted_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)
+            # Weighted priority: more decoded tokens = higher priority (less wasted work)
+            evicted_uuids.sort(key=lambda u: (
+                -self.global_batch.get_sequence(u).total_decoded_before_eviction,
+                self.global_batch.get_sequence(u).global_idx
+            ))
+
+        queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
+        queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
+
+        all_candidates = evicted_uuids + queueing_uuids
+        self._prefill_admission_state = None
+        self._prefill_admission_selection = None
+        self._prefill_admission_totals = None
+        self._prefill_admission_live = False
+        # Reset here, not at the reservation: _prepare_prefill_batch always runs
+        # before _reserve_prefill_host_kv in the scheduler loop, so an iteration
+        # that selects nothing reports "not attempted" rather than carrying the
+        # previous iteration's verdict into the guard.
+        self._prefill_reservation_outcome = None
+        if not all_candidates:
+            return []
+
+        num_nodes = self._get_num_nodes()
+        chunk_size = self._get_effective_chunk_size()
+        sequence_limits = self._prefill_sequence_limits()
+        node_sequence_free = sequence_limits.get("max_sequences_per_node")
+        rank_sequence_free = sequence_limits.get("max_sequences_per_rank")
+        if node_sequence_free is not None and rank_sequence_free is not None:
+            raise ValueError(
+                "prefill sequence capacity must be scoped to rank or node, not both"
+            )
+        if node_sequence_free is not None:
+            limit_scope = 2
+            local_sequence_free = int(node_sequence_free)
+        elif rank_sequence_free is not None:
+            limit_scope = 1
+            local_sequence_free = int(rank_sequence_free)
+        else:
+            limit_scope = 0
+            local_sequence_free = -1
+
+        # Step 1: Get this node's host KV free pages
+        local_host_free = self._get_host_kv_free_pages()
+
+        # This iteration's live set, reported into the gather below so the
+        # reclaim branch and the scheduler loop's no-progress guard both decide
+        # on the OR across ranks. Read here because nothing between this point
+        # and the guard changes a sequence status -- selection, admission
+        # reclaim and the Host reservation do not -- while a rank-LOCAL read
+        # lets ranks raise on different iterations, i.e. diverge on the very
+        # failure path the guard exists to make clean.
+        local_live = (
+            self.global_batch.has_prefilled()
+            or self.global_batch.has_in_decode()
+            or self.global_batch.has_on_hold()
+        )
+        # Admission reclaim and the guard both branch on the candidate snapshot
+        # each rank builds from its own global_batch. Carry a digest of the
+        # fields that snapshot is derived from, so a divergence is named here
+        # instead of sending one rank into a reclaim collective the others
+        # never enter (same pattern as _check_pool_plan_identical).
+        candidate_digest = self._prefill_candidate_digest(all_candidates)
+        # Prefix-cache pressure moves while a prefix load or an attachment
+        # release is in flight -- an attachment release in particular makes
+        # pages reclaimable WITHOUT changing the free count -- which is what
+        # separates "waiting on something" from "stuck" for the guard. Reading
+        # it scans the coordinator's whole shared node table under its lock
+        # (max_nodes tracks pool pages), so it is taken only when this node has
+        # nothing live, the sole case where the guard can fire: a busy worker
+        # pays nothing. Node-leader only, like the pool stats, and every rank of
+        # the node uses the leader's gathered value, so gating on the leader's
+        # own live set keeps the component rank-uniform.
+        prefix_pressure = (
+            self._prefill_prefix_pressure()
+            if self.local_rank == 0 and not local_live
+            else (-1, -1, -1)
+        )
+        # Retained prefix pages this node can reclaim right now (resident, no
+        # attachment, no pending load). They join the admission budget below: a
+        # retained prefix either gets attached at config time, dropping the
+        # wave's demand and the evictable supply by the same page count, or
+        # stays evictable for the reserve-time reclaim to release. Either way
+        # demand <= free + reclaimable holds, so full-charge stays. Node-leader
+        # only (one shared region per node); one O(max_nodes) scan under the
+        # coordinator lock, same order as the pressure scan above, and unlike it
+        # taken on every iteration -- which is why it mutates nothing.
+        report_releasable = (
+            self.prefix_cache_coordinator.count_releasable_pages(0)
+            if (
+                self.local_rank == 0
+                and self.enable_prefix_cache
+                and self.prefix_cache_coordinator is not None
+            )
+            else -1
+        )
+
+        # Step 2: Gather host KV plus persistent sequence capacity. Host KV is
+        # one shared region per node, so only the node leader reports it --
+        # free AND total pages, because the total is what makes "this request
+        # can never fit the pool" decidable identically on every rank. KDA
+        # state is per GPU; every rank reports its free count and the scheduler
+        # uses the node minimum. This keeps every rank's selection identical
+        # even if a prior lifecycle bug left one TP group asymmetric.
+        report_node = self.rank_ctx.node_of(self.rank)
+        report_host_free = local_host_free if self.local_rank == 0 else -1
+        report_host_total = (
+            self._get_host_kv_total_pages() if self.local_rank == 0 else -1
+        )
+        # One row per rank; -1 marks "not reported by this rank":
+        #   [0] node id of this rank
+        #   [1] Host KV free pages (node leader only)
+        #   [2] sequence-slot limit scope: 0 none, 1 per rank, 2 per node
+        #   [3] free sequence slots in that scope (-1 when unlimited)
+        #   [4] Host KV total pages (node leader only): decides "can never
+        #       fit" for the per-request rejection and the stall verdict
+        #   [5] live bit: this rank has a prefilled/decoding/on-hold sequence;
+        #       OR-reduced for the reclaim stall check and the progress guard
+        #   [6] candidate digest (_prefill_candidate_digest); must be equal on
+        #       every rank or PrefillAdmissionStateDivergence is raised
+        #   [7..9] prefix-cache pressure of the node (resident nodes, active
+        #       attachments, pending loads; node leader with nothing live
+        #       only), so the guard tells an in-flight wait from a stall
+        #   [10] reclaimable retained prefix pages of the node (node leader
+        #       with the prefix cache only): joins the host admission budget
+        free_tensor = torch.tensor(
+            [
+                report_node, report_host_free, limit_scope, local_sequence_free,
+                report_host_total, int(local_live), candidate_digest,
+                prefix_pressure[0], prefix_pressure[1], prefix_pressure[2],
+                report_releasable,
+            ],
+            dtype=torch.int64,
+            device=self.torch_device,
+        )
+        gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
+        dist.all_gather(gathered, free_tensor)
+
+        gathered_digests = {int(item[6].item()) for item in gathered}
+        if len(gathered_digests) != 1:
+            raise PrefillAdmissionStateDivergence(
+                f"prefill admission candidates diverged across ranks: rank "
+                f"{self.rank} digest {candidate_digest} over "
+                f"{len(all_candidates)} candidates; gathered "
+                f"{sorted(gathered_digests)}"
+            )
+        # Rank-uniform liveness. OR, not AND: a false "live" only postpones the
+        # guard, a false "not live" fails a worker that still had work to do.
+        self._prefill_admission_live = any(
+            int(item[5].item()) != 0 for item in gathered
+        )
+
+        # Extract per-node host KV free/total pages and prefix pressure
+        reports_by_node = {}
+        totals_by_node = {}
+        pressure_by_node = {}
+        reclaimable_by_node = {}
+        for item in gathered:
+            node_id = int(item[0].item())
+            host_free = int(item[1].item())
+            if node_id >= 0 and host_free >= 0:
+                reports_by_node[node_id] = host_free
+                totals_by_node[node_id] = int(item[4].item())
+                pressure_by_node[node_id] = (
+                    int(item[7].item()), int(item[8].item()), int(item[9].item())
+                )
+                # -1 is "this leader runs no prefix cache", i.e. no reclaimable
+                # supply -- never a negative budget contribution.
+                reclaimable_by_node[node_id] = max(0, int(item[10].item()))
+        per_node_host_free = []
+        per_node_host_total = []
+        per_node_prefix_pressure = []
+        per_node_host_reclaimable = []
+        for node in range(num_nodes):
+            per_node_host_free.append(reports_by_node.get(node, 0))
+            per_node_host_reclaimable.append(reclaimable_by_node.get(node, 0))
+            # -1 means "no leader report": an unknown total must not be read as
+            # a zero-page pool that can never fit anything.
+            per_node_host_total.append(totals_by_node.get(node, -1))
+            per_node_prefix_pressure.append(
+                pressure_by_node.get(node, (-1, -1, -1))
+            )
+        # Pool sizes for the stall report. Gathered, so a multi-node stall can
+        # name "can never fit" too, where the old rank-local read could not.
+        self._prefill_admission_totals = tuple(per_node_host_total)
+
+        gathered_scopes = {int(item[2].item()) for item in gathered}
+        if len(gathered_scopes) != 1:
+            raise RuntimeError(
+                f"prefill sequence-capacity scope diverged across ranks: "
+                f"{sorted(gathered_scopes)}"
+            )
+        per_rank_sequence_free = None
+        per_node_sequence_free = None
+        gathered_scope = next(iter(gathered_scopes))
+        if gathered_scope == 1:
+            per_rank_sequence_free = [int(item[3].item()) for item in gathered]
+        elif gathered_scope == 2:
+            per_node_sequence_free = []
+            for node in range(num_nodes):
+                values = [
+                    int(item[3].item())
+                    for item in gathered
+                    if int(item[0].item()) == node
+                ]
+                if not values:
+                    raise RuntimeError(
+                        f"missing persistent sequence-capacity report for node {node}"
+                    )
+                per_node_sequence_free.append(min(values))
+        elif gathered_scope != 0:
+            raise RuntimeError(
+                f"unknown prefill sequence-capacity scope {gathered_scope}"
+            )
+
+        if self.rank == 0:
+            logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
+            if per_node_sequence_free is not None:
+                logging.info(
+                    f"[PREFILL] Persistent sequence slots free by node: "
+                    f"{per_node_sequence_free}"
+                )
+
+        # Under G>1 the selection request maps each candidate to a node via its
+        # decode_dp_group, so every candidate must already carry one. Newly
+        # queued sequences are grouped later (at the decode transition), so a
+        # wave mixing queued with evicted candidates would raise "sequence ...
+        # has no decode_dp_group before TP prefill selection". Stamp them here:
+        # _assign_decode_dp_groups is documented to run at admission/prefill
+        # config, is idempotent (re-entrant sequences keep the group their
+        # head-sharded KDA state lives on), and is deterministic across ranks.
+        self._assign_decode_dp_groups(all_candidates)
+        # The map decides this wave's node mapping (below), its bindings and
+        # its KDA state, so verify agreement BEFORE any of them is derived:
+        # _prepare_prefill_batch is already collective, and this is the first
+        # all-ranks point after the stamp.
+        self._check_decode_dp_group_plan_identical(all_candidates)
+
+        # Step 3: Select sequences considering per-node host KV capacity.
+        # The NCCL gather above and the logging below stay here; the greedy
+        # per-node admission is delegated to PrefillScheduler. Kimi-Linear
+        # additionally supplies a persistent KDA-state limit: unlike the token
+        # cap used later by prepack, a KDA slot remains occupied until the
+        # sequence completes or is evicted.
+        selection = self._make_prefill_selection_request(
+            all_candidates,
+            per_node_host_free,
+            num_nodes,
+            chunk_size,
+            per_rank_sequence_free=per_rank_sequence_free,
+            per_node_sequence_free=per_node_sequence_free,
+            per_node_host_reclaimable=per_node_host_reclaimable,
+        )
+        # One reservation per candidate, reused by the rejection below, the
+        # reclaim target and the guard state. Independent of free pages, so it
+        # survives the post-reclaim `replace(selection, ...)`.
+        required_pages = {
+            candidate.uuid: PrefillScheduler.required_host_pages(
+                candidate, selection
+            )
+            for candidate in selection.candidates
+        }
+        # A request whose initial Host reservation exceeds its node's WHOLE pool
+        # can never be admitted -- not by this wave, not by any later one, no
+        # matter how much is reclaimed. Fail that REQUEST, not the worker: the
+        # stall exceptions below leave _prepare_prefill_batch for
+        # generate_persistent(), which has no handler for them, so they reach
+        # the worker fatal boundary and take every rank down for one oversized
+        # prompt. Rank-uniform: per_node_host_total is gathered and the
+        # candidate snapshot was digest-checked above, so every rank rejects the
+        # same uuids with no further collective.
+        if self._reject_unsatisfiable_prefill_requests(
+            selection, per_node_host_total, required_pages
+        ):
+            # The candidate set changed under the snapshot. Rebuild it on the
+            # next iteration instead of selecting against removed sequences; the
+            # cleared state also resets the no-progress streak, which is correct
+            # -- this iteration did make progress.
+            self._prefill_admission_state = None
+            self._prefill_admission_selection = None
+            return []
+        prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+        # The in-wave prefix pool releases every cross-wave lookup hit and
+        # recomputes it (_plan_prefill_pool_wave), so a hit saves no Host pages
+        # there: discounting it over-admits, and the allocation fails once the
+        # retained prefixes are all pinned by live sequences. Those retained
+        # pages are reclaimable instead.
+        pool_mode = self._prefill_prefix_pool_enabled()
+        if (
+            self.enable_prefix_cache and selection.candidates and not pool_mode
+            and per_rank_sequence_free is None
+            and per_node_sequence_free is None
+        ):
+            # A cached prefix already occupies Host pages, so charging a hit its
+            # full reservation lets one full-cost prompt fill the wave while
+            # cheap hits wait (one sequence per wave under tight Host KV).
+            # Estimate on each node leader and select with the discount whenever
+            # any candidate has a hit; the actual lookup and attach still happen
+            # in _config_prefill_for_batch. EVICTED prompts are reconstructed
+            # there, so retain their existing full-page path.
+            from batchgen.prefix_reuse.prefill import (
+                estimate_prefix_cached_pages_for_prefill,
+            )
+            estimated_values = [0] * (len(selection.candidates) + 1)
+            if self.local_rank == 0:
+                try:
+                    for index, candidate in enumerate(selection.candidates):
+                        if candidate.node_id != report_node or candidate.is_evicted:
+                            continue
+                        seq = self.global_batch.get_sequence(candidate.uuid)
+                        estimated_values[index] = estimate_prefix_cached_pages_for_prefill(
+                            coordinator=self.prefix_cache_coordinator,
+                            namespace_digest=(
+                                self.prefix_cache_runtime_config.namespace_digest
+                            ),
+                            prompt_token_ids=self._trajectory_tokens(
+                                seq, length=seq.prompt_length
+                            ).tolist(),
+                            page_size_tokens=(
+                                self.prefix_cache_runtime_config.group_specs[0]
+                                .raw_page_tokens
+                            ),
+                        )
+                except Exception:
+                    logging.exception("[PREFIX_CACHE] admission estimate failed")
+                    estimated_values[-1] = 1
+            estimated = torch.tensor(
+                estimated_values, dtype=torch.int64,
+                device=self.torch_device,
+            )
+            dist.all_reduce(estimated, op=dist.ReduceOp.MAX)
+            if int(estimated[-1].item()):
+                raise RuntimeError("prefix cache admission estimate failed on a worker")
+            cached_pages = estimated[:-1].tolist()
+            if any(cached_pages):
+                estimated_selection = replace(
+                    selection,
+                    candidates=tuple(
+                        replace(candidate, cached_prefix_pages=int(cached_pages[index]))
+                        for index, candidate in enumerate(selection.candidates)
+                    ),
+                )
+                prefill_batch = PrefillScheduler.select_prefill_batch(
+                    estimated_selection
+                )
+        # Admission reclaim targets what the persistent sequence-slot limits
+        # (Kimi-K3/Kimi-Linear KDA state) would admit with a fully reclaimed
+        # Host pool. Without slot limits that is every candidate, i.e. the
+        # previous trigger. A slot-limited model used to be excluded outright,
+        # so retained prefixes filled its Host pool and every later wave
+        # selected zero sequences forever with nothing ever evicted.
+        slot_admissible = PrefillScheduler.slot_admissible_candidates(selection)
+        # Split the slot-admissible set into what this node's pool can hold at all
+        # and what it can never hold, from the GATHERED totals rather than a
+        # rank-local stats read, so every rank enters the branch below -- and
+        # raises its stall -- on one shared verdict. A node whose leader reported
+        # no total (-1) counts as "unknown", never as a zero-page pool.
+        def _fits(candidate) -> bool:
+            total = per_node_host_total[candidate.node_id]
+            return total < 0 or required_pages[candidate.uuid] <= total
+
+        # The reclaim has to buy room for the next candidate the pool CANNOT
+        # take yet, so exclude the ones this wave already admitted: in pool mode
+        # the trigger fires while part of the set is in, and targeting the head
+        # of the whole set would evict for a sequence already admitted.
+        admitted_uuids = set(prefill_batch)
+        fitting_requirements = [
+            required_pages[candidate.uuid] for candidate in slot_admissible
+            if candidate.node_id == report_node
+            and candidate.uuid not in admitted_uuids
+            and _fits(candidate)
+        ]
+        any_node_can_fit = any(_fits(c) for c in slot_admissible)
+        reclaim_outcome = (0, 0)
+        if (
+            self.enable_prefix_cache
+            and slot_admissible
+            and (
+                len(prefill_batch) < len(slot_admissible) if pool_mode
+                else not prefill_batch
+            )
+        ):
+            if not any_node_can_fit:
+                # Every slot-admissible candidate needs more than its node's whole
+                # pool. Oversized QUEUEING requests were already failed one by one
+                # above, so what is left is an EVICTED sequence that no longer fits
+                # a pool it did fit once: an engine invariant violation, not a bad
+                # request. Raised before this branch's first collective, on a
+                # verdict every rank computed from the same gathered totals.
+                self._prefill_admission_selection = selection
+                raise PrefillAdmissionStalled(
+                    "no prefix-cache request fits the total Host KV pool: "
+                    + self._describe_prefill_admission_blockers()
+                )
+            # No candidate fits even after a non-mutating prefix estimate.
+            # Reclaim against the original full-page requirement so a later lookup
+            # miss cannot make the allocation unsafe, and only as far as the head
+            # of the priority order needs (prefill_reclaim_target_pages):
+            # reclaiming for the whole admissible set evicts retained prefixes
+            # this wave will not use, and every one of them is a hot prefix a
+            # later prompt has to recompute.
+            from batchgen.prefix_reuse.eviction import (
+                EvictedPageRecorder,
+                reclaim_prefix_pages_for_host_admission,
+                retire_node_frontiers,
+            )
+            failure = 0
+            updated_local_free = -1
+            # A reclaim moves pages from reclaimable to free. Re-report BOTH, or
+            # the refreshed budget below counts the released pages twice.
+            updated_local_releasable = -1
+            local_frontier_hook = self._trajectory_frontier_eviction_hook()
+            reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
+            if self.local_rank == 0:
+                try:
+                    worker_view = self.core_engine.host_paged_kv_worker_view
+                    stats = worker_view.get_stats()
+                    updated_local_free = int(stats.num_free_pages)
+                    required, page_target = prefill_reclaim_target_pages(
+                        fitting_requirements=fitting_requirements,
+                        free_pages=updated_local_free,
+                    )
+                    if required:
+                        released = reclaim_prefix_pages_for_host_admission(
+                            core_engine_module=core_engine,
+                            coordinator=self.prefix_cache_coordinator,
+                            worker_views_by_group=self._host_views_by_group(),
+                            group_id=0,
+                            page_target=page_target,
+                            max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+                            frontier_hook=reclaimed_pages,
+                        )
+                        updated_local_free = self._get_host_kv_free_pages()
+                        updated_local_releasable = (
+                            self.prefix_cache_coordinator.count_releasable_pages(0)
+                        )
+                        logging.info(
+                            "[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
+                            "(free=%s, target=%s)",
+                            released, report_node, updated_local_free, required,
+                        )
+                        if self.prefix_cache_debug_stats:
+                            self._emit_prefix_cache_metric(
+                                "prefix_reclaim",
+                                reason="host_admission",
+                                node=int(report_node),
+                                page_target=int(page_target),
+                                released_pages=int(released),
+                                **self._prefix_host_resource_fields(),
+                            )
+                except Exception:
+                    logging.exception("[PREFIX_CACHE] admission eviction failed")
+                    failure = 1
+            failed = torch.tensor(
+                [failure, reclaimed_pages.page_count],
+                dtype=torch.int64, device=self.torch_device,
+            )
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            if int(failed[0].item()) != 0:
+                raise RuntimeError("prefix cache admission eviction failed on a worker")
+            reclaimed_page_count = int(failed[1].item())
+            reclaim_outcome = (1, reclaimed_page_count)
+            # The leader already retired its own frontiers inside the release.
+            # Any other rank of the node may own frontier records standing on
+            # the reclaimed pages (G=1, or several serve groups per node), so
+            # every rank runs its own hook on its node's reclaimed map.
+            frontier_failure = 0
+            if reclaimed_page_count != 0:
+                gathered_reclaims = [None] * self.world_size
+                dist.all_gather_object(
+                    gathered_reclaims,
+                    (
+                        report_node,
+                        reclaimed_pages.pages_by_group
+                        if self.local_rank == 0 else None,
+                    ),
+                )
+                if self.local_rank != 0:
+                    try:
+                        retire_node_frontiers(
+                            gathered=gathered_reclaims,
+                            node_id=report_node,
+                            frontier_hook=local_frontier_hook,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "[PREFIX_CACHE] frontier retirement after admission "
+                            "reclaim failed"
+                        )
+                        frontier_failure = 1
+            updated = torch.tensor(
+                [
+                    report_node, updated_local_free, frontier_failure,
+                    updated_local_releasable,
+                ],
+                dtype=torch.int64, device=self.torch_device,
+            )
+            gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
+            dist.all_gather(gathered, updated)
+            if any(int(item[2].item()) != 0 for item in gathered):
+                raise RuntimeError(
+                    "trajectory frontier retirement after admission reclaim "
+                    "failed on a worker"
+                )
+            for item in gathered:
+                node, free = int(item[0].item()), int(item[1].item())
+                if free >= 0:
+                    per_node_host_free[node] = free
+                releasable = int(item[3].item())
+                if releasable >= 0:
+                    per_node_host_reclaimable[node] = releasable
+            selection = replace(
+                selection,
+                per_node_host_free=tuple(per_node_host_free),
+                per_node_host_reclaimable=tuple(per_node_host_reclaimable),
+            )
+            prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+            if not prefill_batch and not self._prefill_admission_live:
+                # Nothing is live on ANY rank, so nothing will decode, complete, or
+                # free a page or a slot: an empty wave here would repeat forever.
+                self._prefill_admission_selection = selection
+                raise PrefillAdmissionStalled(
+                    "prefix cache prefill admission made no progress after "
+                    "eviction with no live sequence: "
+                    + self._describe_prefill_admission_blockers()
+                )
+
+        # Rank-uniform admission state for the scheduler loop's no-progress guard
+        # (PrefillProgressGuard). Every component is gathered, reduced, or derived
+        # from the digest-checked candidate snapshot, and the set is wide enough to
+        # separate a recoverable wait from a true stall: free AND total pages, the
+        # slot vectors, the candidate IDENTITIES with their required pages (a count
+        # alone cannot see one candidate swapped for another), the per-node
+        # prefix-cache pressure counters that move while a load or an attachment
+        # release is in flight, this wave's reclaim outcome, and the reduced live
+        # bit. The scheduler loop folds the Host reservation outcome in on top
+        # (_prefill_admission_guard_state).
+        self._prefill_admission_state = (
+            tuple(per_node_host_free),
+            tuple(per_node_host_total),
+            None if per_rank_sequence_free is None else tuple(per_rank_sequence_free),
+            None if per_node_sequence_free is None else tuple(per_node_sequence_free),
+            tuple(
+                (
+                    candidate.uuid,
+                    candidate.node_id,
+                    candidate.is_evicted,
+                    required_pages[candidate.uuid],
+                )
+                for candidate in selection.candidates
+            ),
+            tuple(per_node_prefix_pressure),
+            reclaim_outcome,
+            self._prefill_admission_live,
+        )
+        self._prefill_admission_selection = selection
+
+        if self.rank == 0:
+            n_evicted = sum(
+                1 for u in prefill_batch
+                if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED
+            )
+            logging.info(
+                f"[PREFILL] Selected {len(prefill_batch)} sequences "
+                f"({n_evicted} recompute from eviction)"
+            )
+
+        return prefill_batch
+
+    def _config_prefill_for_batch(self, worker, prefill_uuids: List[str]) -> None:
+        """Configure prefill phase for a batch of sequences."""
+        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
+        # depend on its original self. spellings. Rebinding self to the worker
+        # preserves those spellings; this engine instance remains stateless.
+        self = worker
+        start_time = time.perf_counter()
+        self._phase_request_uuids = tuple(prefill_uuids)
+        desired_key = self._desired_phase_key("prefill")
+        prefill_sequences = [
+            self.global_batch.get_sequence(uuid)
+            for uuid in prefill_uuids
+            if self.global_batch.get_sequence(uuid) is not None
+        ]
+        prefill_debug = self._phase_prefill_debug
+        k3_prefill_profile = self._phase_k3_prefill_profile
+        resident_handoff = self._phase_resident_handoff
+        resident_token_cap = self._phase_resident_token_cap
+        persistent = self._persistent_phase_enabled()
+        if not persistent:
+            self._request_phase_instance_reuse()
+        if self.rank == 0:
+            logging.info(
+                f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
+            )
+
+        in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+        on_hold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+        prefilling = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+        if (in_decode or on_hold) and BATCHGEN_CB_DEBUG:
+            logging.debug(
+                f"Rank {self.rank}: _config_prefill_for_batch called while "
+                f"{len(in_decode)} IN_DECODE, {len(on_hold)} ON_HOLD, {len(prefilling)} PREFILLED sequences exist. "
+                "This is a decode-to-prefill transition."
+            )
+            for uuid in (in_decode + on_hold)[:5]:
+                seq = self.global_batch.get_sequence(uuid)
+                logging.debug(
+                    f"Rank {self.rank}: Affected seq {seq.uuid[:8]}: "
+                    f"status={seq.status.name}, decoded_len={seq.decoded_length}, "
+                    f"ctx_len={seq.current_context_length}, gpu_pages={seq.gpu_pages_allocated}, "
+                    f"had_initial={seq.had_initial_gpu_reservation}"
+                )
+
+        if hasattr(self, "_pending_kv_append_tasks") and self._pending_kv_append_tasks:
+            logging.info(
+                f"Rank {self.rank}: Flushing {len(self._pending_kv_append_tasks)} pending KV append tasks before prefill config"
+            )
+            self._wait_pending_kv_append_tasks()
+            torch.cuda.synchronize(self.torch_device)
+
+        self._assign_decode_dp_groups(prefill_uuids)
+        if self._live_phase_key != desired_key:
+            self._log_prefill_entry_hbm("BEFORE")
+        phase_changed, resumed = self._transition_phase(desired_key)
+        if phase_changed:
+            self._log_prefill_entry_hbm("AFTER")
+        if phase_changed and not resumed:
+            self._log_phase_memory_ledger("after_configure_prefill")
+        if phase_changed:
+            if resident_handoff:
+                self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
+                    resident_token_cap
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.torch_device)
+            self.set_phase("prefill")
+            if self.enable_prefix_cache:
+                self._measure_prefill_prefix_kv_budget()
+            self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
+        else:
+            # phase_enter readies the instance for the first wave of a phase;
+            # admit prepares every later wave of the same live phase.
+            self.parallel_manager.admit(
+                desired_key, AdmitContext(uuids=list(prefill_uuids))
+            )
+
+        if phase_changed and not persistent and k3_prefill_profile and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.local_rank)
+
+        if (
+            not persistent
+            and hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+            and self.parallel_manager.prefill_uses_resident_ep()
+        ):
+            local_lengths = [
+                int(seq.prompt_length)
+                for seq in prefill_sequences
+                if self._owns_local_sequence(seq)
+            ]
+            token_cap = (
+                self.engine_config.Module_Batching_Config
+                .prefill_micro_batch_token_cap
+            )
+            use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+            predicted_batches, _ = build_prefill_micro_batches(
+                local_lengths,
+                token_cap,
+                l2_balance=use_l2,
+            )
+            local_max_tokens = max(
+                (
+                    sum(local_lengths[start:end])
+                    for start, end in predicted_batches
+                ),
+                default=0,
+            )
+            moe_ntp = self._sync_prefill_moe_rank_counts(
+                local_max_tokens,
+                reason="prefill_output_preallocate",
+            )
+            self.parallel_manager.prepare_resident_ep_prefill_output(
+                self.world_size * moe_ntp
+            )
+
+        # STEP 3: Prepare evicted sequences for re-entry (before host KV allocation)
+        #
+        # The phase transition and manager admission are complete above. The
+        # remaining body prepares metadata and binds this wave's local rows.
+
+        #
+        # Split into two loops:
+        #   (a) All-ranks scalar metadata update (runs on every rank using
+        #       fields already synchronized via Phase 4.C of the eviction
+        #       boundary and via _sync_sequence_metadata).
+        #   (b) Validate the retained trajectory and clear the legacy marker.
+        #
+        # The previous single-loop version ran both steps gated on
+        # evicted_token_ids — which is an owner-only tensor — so non-owning
+        # ranks silently skipped the scalar updates and held stale values
+        # for decoded_length / reentry_decoded_baseline / max_decode_length
+        # until the next _sync_sequence_metadata call.
+
+        # (a) All-ranks scalar metadata update for re-entering sequences.
+        for uuid in prefill_uuids:
+            seq = self.global_batch.get_sequence(uuid)
+            # total_decoded_before_eviction > 0 identifies sequences that have
+            # been evicted at least once and are now re-entering. This field is
+            # synced across ranks, unlike evicted_token_ids which is owner-only.
+            if seq.total_decoded_before_eviction == 0:
+                continue
+
+            # seq.prompt_length and seq.current_context_length were already
+            # updated to the new reconstructed length by Phase 4.C of the
+            # eviction boundary and synced to all ranks.
+
+            # Baseline = accumulated historical output length carried forward
+            # into decoded_tokens. With the Phase 4.C cascade fix, this is
+            # exactly (prompt_length - original_prompt_length) = sum of new
+            # decoded counts across all past cycles.
+            n_old = _reentry_history_length(
+                seq.prompt_length, seq.original_prompt_length,
+                seq.original_max_decode_length,
+            )
+            seq.decoded_length = n_old
+            seq.reentry_decoded_baseline = n_old
+
+            # decoded_length is cumulative across eviction/re-entry cycles, so
+            # max_decode_length must remain the absolute per-request completion
+            # cap. Compute remaining budget as
+            # original_max_decode_length - decoded_length at call sites instead
+            # of storing a relative value here.
+            seq.max_decode_length = seq.original_max_decode_length
+
+            # Reset completion flags — the sequence may have hit EOS in its
+            # previous decode cycle before being evicted. Without this reset,
+            # _sync_completion_status_tensor falsely detects the re-entering
+            # sequence as completed (stale eos_reached=True), calls
+            # _report_completion (popping local_map), but the PREFILLED→COMPLETED
+            # status transition fails (invalid), leaving a zombie: PREFILLED
+            # status with no local_map entry, invisible to the boundary load
+            # mechanism (which iterates local_map), stuck for the entire decode
+            # cycle until _prepare_decode_batch picks it up → CRITICAL error.
+            seq.eos_reached = False
+            if hasattr(seq, '_rep_detected'):
+                seq._rep_detected = False
+
+        # (b) The trajectory is already the source of truth. Host-KV eviction
+        # releases only KV pages; it must not reconstruct or copy a second token
+        # buffer. Validate the retained trajectory and clear the legacy handoff
+        # marker so old callers cannot accidentally reintroduce dense storage.
+        for uuid in prefill_uuids:
+            seq = self.global_batch.get_sequence(uuid)
+            if seq.total_decoded_before_eviction == 0:
+                continue
+            prev_decoded = seq.total_decoded_before_eviction
+            seq.log_event(SeqEvent.REENTRY_START, self.rank,
+                f"new_prompt_len={seq.prompt_length}, prev_decoded={prev_decoded}")
+            if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
+                raise QueryBookPoolCapacityError(
+                    f"Rank {self.rank}: re-entry of {uuid[:8]} has no trajectory slot"
+                )
+            trajectory_slot = self._trajectory_slot(seq)
+            trajectory_length = self._traj.trajectory_book.metadata(trajectory_slot).token_length
+            if trajectory_length < seq.prompt_length:
+                raise RuntimeError(
+                    f"Rank {self.rank}: trajectory for {uuid[:8]} is shorter than "
+                    f"re-entry prompt ({trajectory_length} < {seq.prompt_length})"
+                )
+            # Record the replayed prompt boundary and make the local QueryBook
+            # metadata agree with the scalar effective prompt length. No token bytes
+            # are copied: the trajectory already contains this prefix.
+            self._traj.trajectory_book.begin_reentry_turn(
+                trajectory_slot, prompt_length=seq.prompt_length
+            )
+            # Clear the legacy owner-only tensor marker. No token copy occurs.
+            seq.evicted_token_ids = None
+
+            # Recreate query_book entry for this rank's evicted sequences (Q4).
+            # G>1 binds the row on all G ranks of its serve group, and each of
+            # them decodes from its own query_book, so every holder must rebuild
+            # the entry — not just assigned_rank. The group id an evicted re-entry
+            # lost is already restored by the _assign_decode_dp_groups call at the
+            # top of this method. G==1: the same single rank as before.
+            if self._owns_local_sequence(seq) and uuid in self._uuid_to_local_map:
+                local_idx = self._uuid_to_local_map[uuid]
+                self.query_book[local_idx] = make_query_book_entry(seq)
+
+            logging.info(
+                f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
+                f"new_prompt={seq.prompt_length}, prev_decoded={prev_decoded}, "
+                f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
+            )
+
+        # STEP 3.5 (Option 1, CORE): (re)assign the serve-group before binding.
+        # Idempotent for fresh admits (already grouped at admission); RE-groups
+        # evicted re-entries (whose decode_dp_group was cleared on eviction) so
+        # the group predicate below binds them on all G ranks. No-op for G==1.
+        self._assign_decode_dp_groups(prefill_uuids)
+
+        # STEP 4: Bind local rows for sequences this rank serves.  Host-KV pages
+        # were reserved and committed before IN_PREFILL was published, so this
+        # phase must not perform another allocator mutation.
+        my_prefill_uuids = []
+        for uuid in prefill_uuids:
+            seq = self.global_batch.get_sequence(uuid)
+            if self._owns_local_sequence(seq):
+                my_prefill_uuids.append(uuid)
+                # Add to local maps if not already present (for new sequences)
+                if uuid not in self._uuid_to_local_map:
+                    new_local_idx = self._bind_local_sequence_to_query_book(uuid)
+                    logging.debug(
+                        f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
+                        f"(local_idx={new_local_idx})"
+                    )
+        if self.rank == 0:
+            logging.debug(
+                "[PREFILL] Host KV reservation already committed before phase config"
+            )
+        # The rows bound above are the rows this wave's prefill computes, and
+        # the prefill forward is what creates each row's KDA state item. Catch
+        # a binding that disagrees with the group map here, before the forward,
+        # so the error names the seam instead of the decode step that misses
+        # the state item.
+        self._check_local_binding_matches_group(prefill_uuids, "prefill config")
+
+        # Reached by EVERY rank — including ranks that serve no sequence this
+        # wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
+        # hands the leader's page tables, prefix metadata and pool segment
+        # pages to the rest of its serve group.
+        #
+        # M3 Slice 1c rides this same gather when the trajectory flag is on and
+        # the group is head-sharded: the leader's G-wide snapshot arenas and
+        # its frontier hits travel with the page tables, so no new collective
+        # is introduced. The predicate is broadcast-identical (the flag is on
+        # the batch's own sequences and the batch is replicated), so every rank
+        # reaches the gather with the same expectation.
+        self._traj.trajectory_arena_payload = {}
+        self._traj.trajectory_mirrored_restores = {}
+        mirror_trajectory = (
+            self._decode_attn_tp_size() > 1
+            and self.enable_prefix_cache
+            and self._trajectory_commit_requested(
+                [
+                    self.global_batch.get_sequence(uuid)
+                    for uuid in prefill_uuids
+                ]
+            )
+        )
+        self._mirror_group_host_kv(
+            my_prefill_uuids,
+            self._prefix.prefix_sequence_states,
+            trajectory=mirror_trajectory,
+        )
+
+        if self.rank == 0:
+            logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")

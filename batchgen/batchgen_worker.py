@@ -43,7 +43,6 @@ from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 # before capture are the ones the capture compiles.
 from batchgen.config.graph_span_policy import (
 	GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
-	graph_context_span_cap_tokens,
 )
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
@@ -171,7 +170,7 @@ from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
-from batchgen.batch_order import (
+from batchgen.prefill.batch_order import (
 	batch_matches_expected_uuid_order,
 	build_prefill_sequence_spans,
 	local_indices_to_uuid_order,
@@ -181,8 +180,8 @@ from batchgen.batch_order import (
 from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBook,
+	QueryBookPoolCapacityError,
 	bind_query_book_slot,
-	make_query_book_entry,
 	release_query_book_slot,
 )
 from batchgen.config.decode_strategy import DecodeStrategy, strategy_for
@@ -230,18 +229,12 @@ from batchgen.worker.sync import (
 	TorchDistCollectiveBackend,
 )
 from batchgen.worker.prefill import (
-	PrefillAdmissionStalled,
-	PrefillAdmissionStateDivergence,
 	PrefillCandidate,
 	PrefillProgressGuard,
-	PrefillScheduler,
 	PrefillSelectionRequest,
-	compute_prefill_host_reservation,
 	describe_prefill_blockers,
 	host_kv_eviction_enabled,
 	host_owned_pages_after_sharing,
-	prefill_host_reserve_page_deficit,
-	prefill_reclaim_target_pages,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.startup_phases import NULL_STARTUP_PHASE_REPORTER
@@ -354,27 +347,13 @@ from batchgen.continuous_batching import (
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
 # Migration data structures for KV cache migration between nodes
-from batchgen.migration import MigrationOp
+from batchgen.worker.kv_migration_types import MigrationOp
 
 # BATCHGEN_CB_DEBUG / BATCHGEN_DECODE_ASSERT / BATCHGEN_MULTI_BATCH_DIAG are
 # evaluated once, by their single owner decode_engine (imported above).
 
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
-
-def _reentry_history_length(
-	prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
-) -> int:
-	"""Tokens a re-entering sequence already decoded, capped by its own budget.
-
-	The reconstructed prompt carries the whole history, so the history length is
-	prompt_length - original_prompt_length. Cap it by the request's absolute
-	decode budget, which also bounds its decoded_tokens row (admission grows the
-	pool to every request's max_decode_length). The worker-wide
-	max_decoding_length must not be used: in pool mode it is the budget of the
-	first batch the server saw and can be smaller than a later request's history.
-	"""
-	return max(0, min(prompt_length - original_prompt_length, original_max_decode_length))
 
 
 # Decode budget the startup pass uses. max_decoding_length only sizes scheduler
@@ -600,9 +579,6 @@ class _WeightPasses:
 				self._describe(report),
 			)
 
-
-class QueryBookPoolCapacityError(RuntimeError):
-	"""A QueryBook pool request exceeded the rows/width actually allocated."""
 
 
 class NodeSharedMemfd:
@@ -4183,64 +4159,17 @@ class BatchGenWorker:
 	def _destroy_gpu_paged_kv_cache(
 		self, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
 	) -> None:
-		"""Destroy the GPU paged KV cache manager if it is present.
-
-		With ``keep_buffers`` the manager only drops every sequence; its KV
-		pools and CUDA-graph page-table storage stay at their addresses.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			return
-
-		# DIAGNOSTIC: Log state before destruction for KV corruption investigation
-		if self.global_batch is not None:
-			seqs_with_gpu_alloc = []
-			for seq in self.global_batch:
-				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
-					seqs_with_gpu_alloc.append({
-						'uuid': seq.uuid[:8],
-						'global_idx': seq.global_idx,
-						'status': seq.status.name,
-						'gpu_pages_allocated': seq.gpu_pages_allocated,
-						'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
-						'current_context_length': seq.current_context_length,
-						'decoded_length': seq.decoded_length,
-					})
-			if seqs_with_gpu_alloc and BATCHGEN_CB_DEBUG:
-				logging.debug(
-					f"Rank {self.rank}: _destroy_gpu_paged_kv_cache called with "
-					f"{len(seqs_with_gpu_alloc)} sequences having GPU allocation state. "
-					f"First 5: {seqs_with_gpu_alloc[:5]}"
-				)
-
-		if keep_buffers:
-			manager.reset_allocations()
-		else:
-			manager.destroy(empty_cuda_cache=empty_cuda_cache)
-		
-		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
-		self._sequences_with_gpu_kv.clear()
-		
-		# CRITICAL FIX: Reset GPU allocation state for ALL non-completed sequences
-		# Without this, sequences retain stale had_initial_gpu_reservation=True,
-		# causing them to get insufficient GPU buffer on resume after prefill interruption
-		if self.global_batch is not None:
-			reset_count = 0
-			for seq in self.global_batch:
-				if seq.status != SequenceStatus.COMPLETED:
-					if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
-						if BATCHGEN_CB_DEBUG:
-							logging.debug(
-								f"Rank {self.rank}: Resetting GPU state for {seq.uuid[:8]} "
-								f"(status={seq.status.name}, gpu_pages={seq.gpu_pages_allocated}, "
-								f"had_initial={seq.had_initial_gpu_reservation})"
-							)
-						seq.reset_gpu_allocation()
-						reset_count += 1
-			if reset_count > 0:
-				logging.info(
-					f"Rank {self.rank}: Reset GPU allocation state for {reset_count} sequences"
-				)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._destroy_gpu_paged_kv_cache(
+			self,
+			empty_cuda_cache=empty_cuda_cache,
+			keep_buffers=keep_buffers,
+		)
 
 	# Phase 5.1b of worker decouple (issue #175): the 3 read-only KV stat
 	# helpers below route through `KVCacheManager` when
@@ -4315,69 +4244,15 @@ class BatchGenWorker:
 		)
 
 	def _legacy_get_host_kv_utilization(self) -> Dict[str, int]:
-		"""Get host KV stats counting sequences with KV in host memory.
-
-		Valid sequences = PREFILLED, ON_HOLD, and IN_DECODE (all have KV in host).
-		- PREFILLED: KV stored in host after prefill
-		- ON_HOLD: KV retained in host when evicted from GPU
-		- IN_DECODE: KV streams to host after each attention layer
-
-		Free pages = Total - used by valid sequences.
-
-		IMPORTANT: Host KV is shared per-node, so we count sequences from ALL ranks
-		on this node, not just this rank.
-
-		Returns:
-			Dict with: rank, node_id, num_free_pages, num_total_pages, num_used_pages, free_percent
-		"""
-		stats = self.host_paged_kv_worker_view.get_stats()
-
-		# Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
-		# Host KV is shared across all GPUs on a node
-		node_id = self.rank_ctx.node_id
-		node_rank_start = node_id * self.local_world_size
-		node_rank_end = min(node_rank_start + self.local_world_size, self.world_size)
-
-		# CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
-		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
-
-		# Count sequences per status for detailed logging
-		status_counts = {status: [] for status in valid_statuses}
-		for rank_on_node in range(node_rank_start, node_rank_end):
-			for status in valid_statuses:
-				seqs = self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
-				status_counts[status].extend(seqs)
-
-		valid_sequences = []
-		for seqs in status_counts.values():
-			valid_sequences.extend(seqs)
-
-		# Use C++ ground truth for page counts — shared memory atomic counters
-		# are accurate per-node, unlike per-sequence host_pages_allocated which
-		# is stale on non-owner ranks between metadata syncs.
-		used_pages = stats.num_used_pages
-		free_pages = stats.num_free_pages
-		free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
-
-		if self.local_rank == 0:
-			logging.debug(
-				f"[HOST_KV_UTIL] C++ stats: used={used_pages}, free={free_pages}, "
-				f"total={stats.num_total_pages}, {len(valid_sequences)} valid seqs"
-			)
-
-		return {
-			'rank': self.rank,
-			'node_id': self.rank_ctx.node_id,
-			'num_free_pages': free_pages,
-			'num_total_pages': stats.num_total_pages,
-			'num_used_pages': used_pages,
-			'free_percent': free_percent,
-			# Include sequence counts for global aggregation
-			'num_in_decode': len(status_counts[SequenceStatus.IN_DECODE]),
-			'num_onhold': len(status_counts[SequenceStatus.ON_HOLD]),
-			'num_prefilled': len(status_counts[SequenceStatus.PREFILLED]),
-			'num_valid_sequences': len(valid_sequences),
-		}
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._legacy_get_host_kv_utilization(
+			self,
+		)
 
 	def _log_host_kv_health(self) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -4431,638 +4306,88 @@ class BatchGenWorker:
 		)
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
-		"""Check if any node exceeds host KV free page watermark.
-
-		Watermark = 70% FREE (underutilized).
-		Only checks if this rank is local_rank 0 (one check per node).
-
-		The aggregate+threshold decision is delegated to
-		``KVCacheManager.plan_watermark_trigger``; the NCCL gather and the
-		apply (store stats + logs) stay here.
-
-		Returns:
-			True if should interrupt decode and switch to prefill
-		"""
-		if not self.enable_decode_preemption:
-			return False
-
-		# Only local_rank 0 reports (one per node)
-		if self.local_rank == 0:
-			local_stats = self._credit_reclaimable_prefix_pages(
-				self._get_host_kv_utilization()
-			)
-		else:
-			local_stats = None
-
-		# Gather stats from all local_rank 0 representatives (NCCL side effect)
-		all_stats = [None] * self.world_size
-		dist.all_gather_object(all_stats, local_stats)
-
-		# Filter to only node representatives
-		node_stats = [s for s in all_stats if s is not None]
-
-		if not node_stats:
-			return False
-
-		# Decide: aggregate + threshold. NCCL gather + apply stay here.
-		req = self._make_watermark_trigger_request(node_stats)
-		plan = KVCacheManager.plan_watermark_trigger(req)
-
-		should_trigger = plan.should_trigger
-		max_free_percent = plan.max_free_percent
-
-		# Apply the plan: store aggregated stats + log (rank 0 only).
-		if self.rank == 0:
-			gs = plan.global_stats
-			self._host_kv_page_stats = {
-				'used': gs.used,
-				'total': gs.total,
-				'free_percent': gs.free_percent,
-				'num_nodes': gs.num_nodes,
-			}
-
-			if should_trigger:
-				logging.info(
-					f"[Host KV Cache] PREFILL TRIGGER: max_node_free={max_free_percent}% > {self.host_kv_watermark}%, "
-					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
-				)
-				for s in node_stats:
-					logging.info(
-						f"[Host KV Cache]   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
-						f"pages ({100-s['free_percent']}% used, {s['free_percent']}% free)"
-					)
-		else:
-			# Log summary even when not triggering (every 10th check to avoid spam)
-			if not hasattr(self, '_watermark_check_counter'):
-				self._watermark_check_counter = 0
-			self._watermark_check_counter += 1
-			if self._watermark_check_counter % 10 == 0:
-				logging.debug(
-					f"[Host KV Cache] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
-					f"threshold={self.host_kv_watermark}%, has_queued={req.has_queued}, trigger={should_trigger}"
-				)
-
-		return should_trigger
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._check_host_kv_watermark_trigger(
+			self,
+		)
 
 	def _make_migration_plan_request(self, node_stats: dict) -> MigrationPlanRequest:
-		"""Enumerate PREFILLED / ON_HOLD candidates the planner consumes.
-
-		Mirrors the legacy candidate pool: every PREFILLED / ON_HOLD sequence
-		across all ranks, snapshotted with the metadata the greedy planner
-		reads. Status is stable during one planning round, so this static
-		pre-gather reproduces the legacy lazy enumeration (both sort by
-		``global_idx``).
-		"""
-		candidates = []
-		for rank in range(self.world_size):
-			for status in (SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD):
-				for uuid in self.global_batch.get_sequences_for_rank_with_status(rank, status):
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is None:
-						continue
-					candidates.append(MigrationCandidate(
-						uuid=uuid,
-						assigned_rank=seq.assigned_rank,
-						global_idx=seq.global_idx,
-						kv_token_budget=seq.kv_token_budget,
-						host_pages_allocated=seq.host_pages_allocated,
-					))
-		return MigrationPlanRequest(
-			node_stats=node_stats,
-			candidates=tuple(candidates),
-			num_gpus_per_node=self.local_world_size,
-			world_size=self.world_size,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._make_migration_plan_request(
+			self,
+			node_stats,
 		)
 
 	def _plan_kv_migration(self) -> List[MigrationOp]:
-		"""Plan sequence migrations to rebalance host KV across nodes.
-
-		Gathers per-node host-KV stats (NCCL) then delegates the greedy
-		rebalance decision; the NCCL migration execution is applied by the
-		caller (``_rebalance_host_kv``).
-
-		Returns:
-			List of MigrationOp objects describing planned migrations.
-		"""
-		# Unified resident TP (G>1): a sequence is physically owned by ALL G
-		# ranks of its decode_dp_group, so the legacy planner/executor -- which
-		# keys from_rank/to_rank and the local-map update on the SINGLE
-		# ``assigned_rank`` -- targets a rank that may hold no HostKVPageTable
-		# registration at all (IndexError), and a correct move would have to
-		# carry the replicated query-book / KDA / local-map state across all G
-		# ranks, which this executor does not implement. Decode-group admission
-		# already balances host KV across groups, so fail safe: no migrations,
-		# BEFORE any Gloo group creation or NCCL execution. G==1 is unchanged.
-		G = self._decode_attn_tp_size()
-		if G > 1:
-			if not getattr(self, '_logged_migration_skip_tp', False) and self.rank == 0:
-				logging.info(
-					f"MIGRATION: attn_tp_size={G} (>1): decode-group admission owns "
-					f"host-KV balancing; skipping legacy single-rank migration"
-				)
-				self._logged_migration_skip_tp = True
-			return []
-
-		# Gather host KV stats from all local_rank 0 (NCCL side effect)
-		if self.local_rank == 0:
-			local_stats = self._get_host_kv_utilization()
-		else:
-			local_stats = None
-
-		all_stats = [None] * self.world_size
-		dist.all_gather_object(all_stats, local_stats)
-		node_stats = {s['node_id']: s for s in all_stats if s is not None}
-
-		if len(node_stats) <= 1:
-			# Only one node, no migration needed
-			if self.rank == 0:
-				logging.info("MIGRATION: Single node detected, skipping rebalancing")
-			return []
-
-		migrations = KVCacheManager.plan_kv_migration(
-			self._make_migration_plan_request(node_stats)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._plan_kv_migration(
+			self,
 		)
-		if self.rank == 0:
-			if migrations:
-				logging.info(f"MIGRATION: Planned {len(migrations)} sequence migrations")
-				for i, mig in enumerate(migrations[:5]):  # Log first 5
-					logging.info(
-						f"MIGRATION:   #{i+1}: seq {mig.uuid[:8]}... "
-						f"rank {mig.from_rank} -> {mig.to_rank} ({mig.pages} pages)"
-					)
-				if len(migrations) > 5:
-					logging.info(f"MIGRATION:   ... and {len(migrations)-5} more")
-			else:
-				logging.info("MIGRATION: No migrations needed after planning")
-		return migrations
 
 	def _execute_kv_migrations_parallel(self, migrations: List[MigrationOp]) -> None:
-		"""Execute multiple KV migrations in parallel to utilize all network cards.
-
-		Groups migrations by independent rank pairs and executes them concurrently.
-		All ranks participate - those not involved in a particular migration round
-		call barrier to stay synchronized.
-
-		Args:
-			migrations: List of MigrationOp objects describing migrations to execute.
-		"""
-		if not migrations:
-			return
-
-		# CRITICAL: Create Gloo group BEFORE migrations start.
-		# dist.new_group() is a COLLECTIVE operation - ALL ranks must call it together.
-		# We create it here so all ranks participate, not just sender/receiver.
-		self._get_or_create_gloo_group()
-		dist.barrier()  # Ensure all ranks have created the group
-
-		# Group migrations into parallel rounds
-		# Each round contains migrations that can execute concurrently (no shared ranks)
-		rounds = self._group_migrations_for_parallel_execution(migrations)
-
-		if self.rank == 0:
-			logging.info(f"MIGRATION: Executing {len(migrations)} migrations in {len(rounds)} parallel rounds")
-
-		for round_idx, round_migrations in enumerate(rounds):
-			if self.rank == 0:
-				logging.info(f"MIGRATION: Round {round_idx+1}/{len(rounds)}: {len(round_migrations)} parallel migrations")
-
-			# Execute migration if participating, otherwise just sync tensor shape info
-			my_migration = None
-			for mig in round_migrations:
-				if self.rank == mig.from_rank or self.rank == mig.to_rank:
-					my_migration = mig
-					break
-
-			if my_migration is not None:
-				# Verify sequence exists and is in expected state before migration
-				seq = self.global_batch.get_sequence(my_migration.uuid)
-				if seq is None:
-					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration.uuid[:8]}... not found!")
-				else:
-					if BATCHGEN_CB_DEBUG:
-						logging.debug(
-							f"MIGRATION: Rank {self.rank}: Executing migration for {my_migration.uuid[:8]}... "
-							f"(global_idx={seq.global_idx}, status={seq.status}, assigned_rank={seq.assigned_rank})"
-						)
-					self._execute_single_kv_migration(
-						uuid=my_migration.uuid,
-						from_rank=my_migration.from_rank,
-						to_rank=my_migration.to_rank
-					)
-
-			# Barrier after each round to ensure all transfers in this round complete
-			dist.barrier()
-
-		if self.rank == 0:
-			logging.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._execute_kv_migrations_parallel(
+			self,
+			migrations,
+		)
 
 	def _group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
-		"""Group migrations into conflict-free parallel rounds.
-
-		Delegates to ``HostKVRebalancer``; the NCCL execution of the rounds
-		stays in ``_execute_kv_migrations_parallel``.
-		"""
-		return HostKVRebalancer.group_migrations_for_parallel_execution(
-			migrations, self.local_world_size
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._group_migrations_for_parallel_execution(
+			self,
+			migrations,
 		)
 
 	def _execute_single_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
-		"""Migrate KV cache for one sequence from source to dest rank.
-
-		Migration path: Direct host-to-host copy via network (no GPU staging)
-		Uses PyTorch distributed send/recv on CPU tensors for efficient inter-node transfer.
-
-		Args:
-			uuid: Sequence UUID to migrate
-			from_rank: Source rank (current owner)
-			to_rank: Destination rank (new owner)
-		"""
-		seq = self.global_batch.get_sequence(uuid)
-		if seq is None:
-			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - sequence not found")
-			return
-
-		global_idx = seq.global_idx
-		pages_needed = seq.host_pages_allocated
-		if pages_needed <= 0:
-			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
-			return
-
-		# Migration reads/writes each cache directly because the coordinator only
-		# wraps lifecycle operations.  Registration, allocation, and release still
-		# go through that coordinator so DSA cannot split its two page tables.
-		lifecycle_view = getattr(self, "host_paged_kv_worker_view", None)
-		if lifecycle_view is None:
-			lifecycle_view = self.core_engine.host_paged_kv_worker_view
-		if isinstance(lifecycle_view, DualHostKVCoordinator):
-			worker_view = lifecycle_view.primary
-			aux_view = lifecycle_view.auxiliary
-		else:
-			worker_view = lifecycle_view
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-
-		if self.rank == from_rank:
-			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
-			# No GPU staging needed — uses C++ ReadSequenceKVToCPU (memcpy from shared memory)
-			t0 = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Send {uuid[:8]}... → rank {to_rank} "
-				f"({pages_needed} pages, direct host→CPU)"
-			)
-
-			k_cpu, v_cpu = worker_view.read_sequence_kv_to_cpu(global_idx)
-			k_cpu_aux = aux_view.read_sequence_kv_to_cpu(global_idx)[0] if aux_view is not None else None
-			t_read = time.perf_counter()
-			logging.debug(
-				f"MIGRATION: Rank {self.rank}: Host→CPU read: {(t_read-t0)*1000:.1f}ms, "
-				f"k_shape={list(k_cpu.shape)}"
-			)
-
-			# Snapshot the trajectory before releasing any source-side resources.
-			# The destination must acknowledge restoring this exact payload before
-			# the source allocator gives its pages back.
-			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
-				raise QueryBookPoolCapacityError(
-					f"Rank {self.rank}: migration source has no trajectory slot for {uuid[:8]}"
-				)
-			trajectory = self._trajectory_tokens(seq, dtype=torch.int32).contiguous()
-			trajectory_slot = self._trajectory_slot(seq)
-			turn_payload = self._traj.trajectory_book.turns_payload(trajectory_slot).contiguous()
-			header = torch.tensor(
-				[1, trajectory.numel(), seq.prompt_length, seq.decoded_length, turn_payload.shape[0]],
-				dtype=torch.int64,
-			)
-
-			# Send via Gloo backend
-			gloo_group = self._get_or_create_gloo_group()
-			dist.send(tensor=k_cpu.contiguous(), dst=to_rank, group=gloo_group)
-			if v_cpu.numel() > 0:
-				dist.send(tensor=v_cpu.contiguous(), dst=to_rank, group=gloo_group)
-			if k_cpu_aux is not None:
-				dist.send(tensor=k_cpu_aux.contiguous(), dst=to_rank, group=gloo_group)
-			t_send = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_read)*1000:.1f}ms")
-			dist.send(tensor=header, dst=to_rank, group=gloo_group)
-			dist.send(tensor=trajectory, dst=to_rank, group=gloo_group)
-			dist.send(tensor=turn_payload, dst=to_rank, group=gloo_group)
-			# Free host KV pages only after the complete source payload is sent.
-			# The destination restores the trajectory before the migration barrier
-			# permits source-slot release.
-			lifecycle_view.release_sequence_pages([global_idx])
-			self._release_prefix_cache_attachments([global_idx])
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(
-					f"MIGRATION: Rank {self.rank}: Sent trajectory for {uuid[:8]} "
-					f"({trajectory.numel()} tokens)"
-				)
-
-			t_total = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(
-					f"MIGRATION: Rank {self.rank}: Sent {uuid[:8]}... "
-					f"in {(t_total-t0)*1000:.1f}ms"
-				)
-		elif self.rank == to_rank:
-			# ===== DEST RANK: Receive via Gloo, write directly to host KV =====
-			t0 = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
-				f"({pages_needed} pages, direct CPU→host)"
-			)
-			gloo_group = self._get_or_create_gloo_group()
-
-			# Allocate host KV pages for the incoming sequence (mirror aux for DSA)
-			tokens_needed = pages_needed * SequenceEntry.PAGE_SIZE
-			lifecycle_view.register_sequences([global_idx])
-			lifecycle_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
-
-			# Read empty pages to get a tensor with correct shape/dtype for recv buffer.
-			# Both nodes have identical host KV config, so shape matches source's output.
-			k_recv, v_recv = worker_view.read_sequence_kv_to_cpu(global_idx)
-			dist.recv(tensor=k_recv, src=from_rank, group=gloo_group)
-			if v_recv.numel() > 0:
-				dist.recv(tensor=v_recv, src=from_rank, group=gloo_group)
-
-			# Write received data to host pages
-			worker_view.write_sequence_kv_from_cpu(
-				global_idx, k_recv, v_recv if v_recv.numel() > 0 else None
-			)
-
-			# Mirror aux KV: recv aux K and write into aux host pages.
-			if aux_view is not None:
-				k_recv_aux = aux_view.read_sequence_kv_to_cpu(global_idx)[0]
-				dist.recv(tensor=k_recv_aux, src=from_rank, group=gloo_group)
-				aux_view.write_sequence_kv_from_cpu(global_idx, k_recv_aux, None)
-			logging.info(
-				f"MIGRATION: Rank {self.rank}: Recv+write {uuid[:8]}... "
-				f"in {(time.perf_counter()-t0)*1000:.1f}ms"
-			)
-
-			# Receive and restore the complete trajectory into the reservation
-			# admission made for this UUID on every rank of every node. Migration
-			# moves token content only; it never binds or releases a reservation,
-			# so the allocators of all ranks sharing this node's store stay equal.
-			header = torch.empty(5, dtype=torch.int64)
-			dist.recv(tensor=header, src=from_rank, group=gloo_group)
-			version, trajectory_length, prompt_length, decoded_length, turn_count = [
-				int(value) for value in header.tolist()
-			]
-			if version != 1 or trajectory_length < 0 or turn_count < 0:
-				raise RuntimeError(
-					f"Rank {self.rank}: invalid trajectory migration header for {uuid[:8]}: "
-					f"version={version} length={trajectory_length} turns={turn_count}"
-				)
-			trajectory_recv = torch.empty(trajectory_length, dtype=torch.int32)
-			dist.recv(tensor=trajectory_recv, src=from_rank, group=gloo_group)
-			turn_payload = torch.empty((turn_count, 6), dtype=torch.int64)
-			dist.recv(tensor=turn_payload, src=from_rank, group=gloo_group)
-			turns = QueryBook.turns_from_payload(turn_payload)
-			if self._traj.trajectory_book is None:
-				raise QueryBookPoolCapacityError(
-					f"Rank {self.rank}: trajectory book is unavailable during migration"
-				)
-			if not self._traj.trajectory_book.has_sequence(uuid):
-				raise QueryBookPoolCapacityError(
-					f"Rank {self.rank}: migration destination has no admission "
-					f"reservation for {uuid[:8]}"
-				)
-			destination_slot = self._traj.trajectory_book.slot_for(uuid)
-			self._traj.trajectory_book.restore(
-				destination_slot,
-				trajectory_recv,
-				prompt_length=prompt_length,
-				decoded_length=decoded_length,
-				turns=turns,
-			)
-			seq._buffer_slot = destination_slot
-
-			if not hasattr(self, '_pending_migrated_query_book'):
-				self._pending_migrated_query_book = {}
-			if not hasattr(self, '_migrated_sequences'):
-				self._migrated_sequences = set()
-			self._migrated_sequences.add(uuid)
-			self._pending_migrated_query_book[uuid] = {
-				'trajectory': trajectory_recv,
-				'prompt_length': prompt_length,
-				'decoded_length': decoded_length,
-				'turns': turns,
-				'restored': True,
-				'slot': destination_slot,
-				'kv_token_budget': seq.kv_token_budget,
-			}
-
-			t_total = time.perf_counter()
-			logging.debug(
-				f"MIGRATION: Rank {self.rank}: Recvd {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms"
-			)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._execute_single_kv_migration(
+			self,
+			uuid,
+			from_rank,
+			to_rank,
+		)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
 	def _rebalance_host_kv(self) -> None:
-		"""Rebalance host KV cache by migrating sequences between nodes.
-
-		Called during _config_prefill_for_batch() before assigning new sequences.
-		This orchestrates the full rebalancing process:
-		1. Plan migrations (deterministic across all ranks)
-		2. Execute all migrations (NCCL transfers)
-		3. Barrier to ensure all transfers complete
-		4. Update sequence ownership metadata
-		5. Barrier to ensure metadata consistency
-		"""
-		if not self.enable_decode_preemption:
-			return
-
-		rebalance_start = time.perf_counter()
-		if self.rank == 0:
-			logging.info("REBALANCE: Starting host KV rebalancing")
-
-		# Plan migrations (all ranks compute same plan deterministically)
-		migrations = self._plan_kv_migration()
-
-		if not migrations:
-			if self.rank == 0:
-				logging.info("REBALANCE: No migrations needed, host KV already balanced")
-			return
-
-		# Log migration summary
-		if self.rank == 0:
-			total_pages = sum(m.pages for m in migrations)
-			logging.info(
-				f"REBALANCE: Executing {len(migrations)} migrations "
-				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
-			)
-
-		# STEP 1: Execute all migrations in parallel (host-to-host transfers)
-		# Parallel execution utilizes all network cards by having multiple rank pairs
-		# communicate simultaneously
-		migration_start = time.perf_counter()
-		self._execute_kv_migrations_parallel(migrations)
-		migration_end = time.perf_counter()
-		# Trajectory reservations are not touched here: every rank of every node
-		# keeps the reservation admission made until completion or rejection
-		# releases it everywhere, so re-entry finds it on every rank and the
-		# allocators sharing one node store never diverge.
-		if self.rank == 0:
-			logging.info(
-				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
-				f"({(migration_end-migration_start)*1000/len(migrations):.1f}ms per migration avg)"
-			)
-
-		# STEP 2: Update sequence ownership metadata and local mappings
-		# CRITICAL: All ranks must update global_batch consistently
-		# MUST use assign_rank() to update both seq.assigned_rank AND _rank_index
-		for mig in migrations:
-			uuid = mig.uuid
-			new_rank = mig.to_rank
-
-			# CRITICAL FIX: Use assign_rank() instead of direct assignment!
-			# Direct assignment (seq.assigned_rank = x) only updates the attribute.
-			# assign_rank() also updates the _rank_index which is used by
-			# get_sequences_for_rank_with_status() - without this, the index
-			# becomes inconsistent and causes cross-rank state divergence.
-			try:
-				seq_for_log = self.global_batch.get_sequence(uuid)
-				if seq_for_log:
-					old_rank = seq_for_log.assigned_rank
-					if old_rank == self.rank:
-						seq_for_log.log_event(SeqEvent.MIGRATE_SEND, self.rank,
-							f"to_rank={new_rank}")
-					elif new_rank == self.rank:
-						seq_for_log.log_event(SeqEvent.MIGRATE_RECV, self.rank,
-							f"from_rank={old_rank}")
-				self.global_batch.assign_rank(uuid, new_rank)
-			except KeyError:
-				logging.error(f"Rank {self.rank}: Cannot update ownership for {uuid[:8]}... - sequence not found")
-				continue
-
-			# IMPORTANT: Don't change sequence status - it remains PREFILLED or ON_HOLD
-			# The sequence is still valid, just owned by a different rank now
-
-			# Update host KV tracking to match actual allocation on dest.
-			# All ranks execute this (migration list is deterministic), keeping fields consistent.
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				seq.host_pages_allocated = mig.host_pages
-				# Dest allocates all host_pages into the sequence's own chain.
-				seq.host_owned_pages = mig.host_pages
-				seq.host_token_capacity = mig.host_pages * self.PAGE_SIZE
-
-		# Barrier to ensure all ranks have updated global_batch
-		dist.barrier()
-
-		# CRITICAL FIX: Sync sequence metadata BEFORE updating local mappings!
-		# At this point:
-		# - SEND side still has migrated sequences in _uuid_to_local_map (will report correct state)
-		# - RECV side does NOT have them in _uuid_to_local_map yet (will receive and update)
-		# If we sync AFTER updating local mappings, RECV side would skip updating because
-		# uuid would be in its _uuid_to_local_map, but its state is stale!
-		migrated_uuids = [m.uuid for m in migrations]
-		if migrated_uuids:
-			self._sync_sequence_metadata(migrated_uuids)
-			logging.info(
-				f"Rank {self.rank}: REBALANCE: Synced metadata for {len(migrated_uuids)} sequences "
-				f"BEFORE local mapping update (SEND side still owns them)"
-			)
-
-		# Barrier to ensure all ranks have synced metadata
-		dist.barrier()
-
-		# STEP 3: Update local mappings (rank-specific, after global metadata is consistent)
-		for mig in migrations:
-			old_rank = mig.from_rank
-			new_rank = mig.to_rank
-			uuid = mig.uuid
-
-			# Update local mappings on source rank (remove)
-			if self.rank == old_rank:
-				# unbind drops both directions and returns the slot to the
-				# free list for O(1) reuse.
-				local_idx = self.seq_table.unbind(uuid)
-				if local_idx is not None:
-					# A remap can leave `batch` byte-identical while changing
-					# which sequence a row resolves to, so row-keyed state must
-					# be invalidated here and not only where `batch` is rebound.
-					self._bump_decode_row_epoch()
-					self._sequences_with_gpu_kv.discard(uuid)
-					# Remove query_book entry
-					self.query_book.pop(local_idx, None)
-					logging.debug(
-						f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
-						f"{uuid[:8]} (local_idx={local_idx}, from_rank={old_rank}, "
-						f"to_rank={new_rank})"
-					)
-
-			# Update local mappings on dest rank (add)
-			if self.rank == new_rank:
-				# O(1) allocation: prefer reusing freed indices, otherwise use
-				# next available.
-				new_local_idx = self.seq_table.bind(uuid)
-				self._bump_decode_row_epoch()
-				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
-
-				# Trajectory bytes go into the reservation admission made for this
-				# UUID; slot numbers are node-local, so look it up by UUID.
-				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
-					pending = self._pending_migrated_query_book.pop(uuid)
-					seq = self.global_batch.get_sequence(uuid)
-					if self._traj.trajectory_book is None:
-						raise QueryBookPoolCapacityError(
-							f"Rank {self.rank}: trajectory book unavailable for migration receive {uuid[:8]}"
-						)
-					if not self._traj.trajectory_book.has_sequence(uuid):
-						raise QueryBookPoolCapacityError(
-							f"Rank {self.rank}: migration destination has no admission "
-							f"reservation for {uuid[:8]}"
-						)
-					destination_slot = self._traj.trajectory_book.slot_for(uuid)
-					logging.info(
-						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
-						f"restoring slot={destination_slot}, "
-						f"tokens={pending['trajectory'].numel()}"
-					)
-					if not pending.get('restored', False):
-						self._traj.trajectory_book.restore(
-							destination_slot,
-							pending['trajectory'],
-							prompt_length=pending['prompt_length'],
-							decoded_length=pending['decoded_length'],
-							turns=pending.get('turns'),
-						)
-					seq._buffer_slot = destination_slot
-					seq.prompt_length = pending['prompt_length']
-					seq.decoded_length = pending['decoded_length']
-					seq.current_context_length = (
-						seq.original_prompt_length + seq.decoded_length
-					)
-					self.query_book[new_local_idx] = make_query_book_entry(seq)
-					logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
-				else:
-					logging.error(f"Rank {self.rank}: No pending query_book data for migrated {uuid[:8]}...")
-
-				logging.debug(f"Rank {self.rank}: Added {uuid[:8]}... to local mappings (new local_idx={new_local_idx})")
-
-		# BARRIER 2: Ensure all local mapping updates are complete across all ranks
-		dist.barrier()
-
-		# NOTE: Metadata sync was already done BEFORE local mapping updates (above)
-		# At this point, all ranks have consistent metadata for migrated sequences.
-
-		rebalance_end = time.perf_counter()
-		if self.rank == 0:
-			logging.info(
-				f"[REBALANCE] Completed: {len(migrations)} sequences migrated "
-				f"in {(rebalance_end-rebalance_start)*1000:.1f}ms total"
-			)
-
-			# Log final distribution
-			if self.local_rank == 0:
-				final_stats = self._get_host_kv_utilization()
-				logging.info(
-					f"  Node {final_stats['node_id']} final state: "
-					f"{final_stats['num_used_pages']}/{final_stats['num_total_pages']} pages "
-					f"({100-final_stats['free_percent']}% utilized)"
-				)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._rebalance_host_kv(
+			self,
+		)
 
 	# ============ UUID/Index Conversion Helpers ============
 	#
@@ -5361,25 +4686,14 @@ class BatchGenWorker:
 		return self.rank_ctx.num_nodes
 
 	def _get_effective_chunk_size(self) -> int:
-		"""Return the current host KV chunk size, considering adaptive sizing.
-
-		The value is worker-wide; every consumer bounds it by the sequence's
-		own ``kv_token_budget`` (``compute_prefill_host_reservation`` for the
-		initial reservation, ``SequenceEntry.get_host_growth_pages`` for
-		growth), so a short sequence never reserves past its budget. Capping it
-		by the worker-wide ``max_decoding_length`` instead would size every
-		later pool-mode batch by the first batch's budget. The result is always
-		rounded up to a page boundary (multiple of PAGE_SIZE=64).
-		"""
-		if self.adaptive_chunk_sizer is not None:
-			chunk = self.adaptive_chunk_sizer.get_chunk_size()
-		else:
-			chunk = self.host_kv_chunk_size
-		# Clamp + page rounding: single definition in kv_plan.
-		return effective_chunk_size(
-			chunk,
-			decision_interval=self.DECISION_INTERVAL,
-			page_size=SequenceEntry.PAGE_SIZE,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._get_effective_chunk_size(
+			self,
 		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
@@ -5409,52 +4723,16 @@ class BatchGenWorker:
 	def _prefill_host_reservation_plan(
 		self, prefill_uuids: List[str]
 	) -> Tuple[Dict[str, Tuple[int, int]], List[Tuple[str, int]]]:
-		"""Build the immutable host reservation plan for a prefill wave.
-
-		The selector and allocator share this exact page formula.  The returned
-		owner list contains one entry per physical host-KV allocation: the host
-		pool is node-shared, so TP replicas must not allocate the same sequence
-		more than once.
-		"""
-		chunk_size = self._get_effective_chunk_size()
-		reservations: Dict[str, Tuple[int, int]] = {}
-		owner_requests: List[Tuple[str, int]] = []
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				raise RuntimeError(
-					f"Rank {self.rank}: prefill reservation references unknown {uuid}"
-				)
-			pages, tokens = compute_prefill_host_reservation(
-				prompt_length=seq.prompt_length,
-				kv_token_budget=seq.kv_token_budget,
-				page_size=seq.PAGE_SIZE,
-				chunk_size=chunk_size,
-				initial_gpu_page_buffer=_sequence_module.INITIAL_GPU_PAGE_BUFFER,
-			)
-			reservations[uuid] = (pages, tokens)
-			if self._owns_host_kv(seq):
-				private_tokens = tokens
-				state = (
-					self._prefix.prefix_sequence_states.get(seq.global_idx)
-					if self.enable_prefix_cache
-					else None
-				)
-				if state is not None and state.attached_tokens:
-					# Attached prefix pages already sit in the Host pool; the
-					# owner allocates only the private remainder. Metadata
-					# still commits the TOTAL capacity below. Raising here
-					# (before the capacity collective) rejects the wave on
-					# every rank.
-					private_pages = host_owned_pages_after_sharing(
-						chain_pages=pages,
-						shared_pages=state.attached_tokens // seq.PAGE_SIZE,
-						sequence_id=seq.global_idx,
-						where="prefill reservation plan",
-					)
-					private_tokens = private_pages * seq.PAGE_SIZE
-				owner_requests.append((uuid, private_tokens))
-		return reservations, owner_requests
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._prefill_host_reservation_plan(
+			self,
+			prefill_uuids,
+		)
 
 	def _collective_prefill_host_capacity_ok(
 		self,
@@ -5873,592 +5151,13 @@ class BatchGenWorker:
 		)
 
 	def _prepare_prefill_batch(self) -> List[str]:
-		"""
-		Select sequences for prefill based on HOST KV cache capacity.
-
-		Key constraint: Host KV cache is PER NODE.
-		- Each node has its own host KV capacity
-		- Sequences assigned to ranks on node N use node N's host KV
-		- Must check per-node capacity, not global
-
-		With dynamic host KV reservation, sequences only need prompt + chunk_size
-		pages initially (not the full kv_token_budget). This allows more sequences
-		to be prefilled concurrently.
-
-		EVICTED sequences get weighted priority (more decoded = higher priority)
-		and re-enter through the prefill path.
-		"""
-		# Collect candidates: evicted sequences first (weighted priority), then new
-		evicted_uuids = []
-		if self.enable_host_kv_eviction:
-			evicted_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)
-			# Weighted priority: more decoded tokens = higher priority (less wasted work)
-			evicted_uuids.sort(key=lambda u: (
-				-self.global_batch.get_sequence(u).total_decoded_before_eviction,
-				self.global_batch.get_sequence(u).global_idx
-			))
-
-		queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
-		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-
-		all_candidates = evicted_uuids + queueing_uuids
-		self._prefill_admission_state = None
-		self._prefill_admission_selection = None
-		self._prefill_admission_totals = None
-		self._prefill_admission_live = False
-		# Reset here, not at the reservation: _prepare_prefill_batch always runs
-		# before _reserve_prefill_host_kv in the scheduler loop, so an iteration
-		# that selects nothing reports "not attempted" rather than carrying the
-		# previous iteration's verdict into the guard.
-		self._prefill_reservation_outcome = None
-		if not all_candidates:
-			return []
-
-		num_nodes = self._get_num_nodes()
-		chunk_size = self._get_effective_chunk_size()
-		sequence_limits = self._prefill_sequence_limits()
-		node_sequence_free = sequence_limits.get("max_sequences_per_node")
-		rank_sequence_free = sequence_limits.get("max_sequences_per_rank")
-		if node_sequence_free is not None and rank_sequence_free is not None:
-			raise ValueError(
-				"prefill sequence capacity must be scoped to rank or node, not both"
-			)
-		if node_sequence_free is not None:
-			limit_scope = 2
-			local_sequence_free = int(node_sequence_free)
-		elif rank_sequence_free is not None:
-			limit_scope = 1
-			local_sequence_free = int(rank_sequence_free)
-		else:
-			limit_scope = 0
-			local_sequence_free = -1
-
-		# Step 1: Get this node's host KV free pages
-		local_host_free = self._get_host_kv_free_pages()
-
-		# This iteration's live set, reported into the gather below so the
-		# reclaim branch and the scheduler loop's no-progress guard both decide
-		# on the OR across ranks. Read here because nothing between this point
-		# and the guard changes a sequence status -- selection, admission
-		# reclaim and the Host reservation do not -- while a rank-LOCAL read
-		# lets ranks raise on different iterations, i.e. diverge on the very
-		# failure path the guard exists to make clean.
-		local_live = (
-			self.global_batch.has_prefilled()
-			or self.global_batch.has_in_decode()
-			or self.global_batch.has_on_hold()
-		)
-		# Admission reclaim and the guard both branch on the candidate snapshot
-		# each rank builds from its own global_batch. Carry a digest of the
-		# fields that snapshot is derived from, so a divergence is named here
-		# instead of sending one rank into a reclaim collective the others
-		# never enter (same pattern as _check_pool_plan_identical).
-		candidate_digest = self._prefill_candidate_digest(all_candidates)
-		# Prefix-cache pressure moves while a prefix load or an attachment
-		# release is in flight -- an attachment release in particular makes
-		# pages reclaimable WITHOUT changing the free count -- which is what
-		# separates "waiting on something" from "stuck" for the guard. Reading
-		# it scans the coordinator's whole shared node table under its lock
-		# (max_nodes tracks pool pages), so it is taken only when this node has
-		# nothing live, the sole case where the guard can fire: a busy worker
-		# pays nothing. Node-leader only, like the pool stats, and every rank of
-		# the node uses the leader's gathered value, so gating on the leader's
-		# own live set keeps the component rank-uniform.
-		prefix_pressure = (
-			self._prefill_prefix_pressure()
-			if self.local_rank == 0 and not local_live
-			else (-1, -1, -1)
-		)
-		# Retained prefix pages this node can reclaim right now (resident, no
-		# attachment, no pending load). They join the admission budget below: a
-		# retained prefix either gets attached at config time, dropping the
-		# wave's demand and the evictable supply by the same page count, or
-		# stays evictable for the reserve-time reclaim to release. Either way
-		# demand <= free + reclaimable holds, so full-charge stays. Node-leader
-		# only (one shared region per node); one O(max_nodes) scan under the
-		# coordinator lock, same order as the pressure scan above, and unlike it
-		# taken on every iteration -- which is why it mutates nothing.
-		report_releasable = (
-			self.prefix_cache_coordinator.count_releasable_pages(0)
-			if (
-				self.local_rank == 0
-				and self.enable_prefix_cache
-				and self.prefix_cache_coordinator is not None
-			)
-			else -1
-		)
-
-		# Step 2: Gather host KV plus persistent sequence capacity. Host KV is
-		# one shared region per node, so only the node leader reports it --
-		# free AND total pages, because the total is what makes "this request
-		# can never fit the pool" decidable identically on every rank. KDA
-		# state is per GPU; every rank reports its free count and the scheduler
-		# uses the node minimum. This keeps every rank's selection identical
-		# even if a prior lifecycle bug left one TP group asymmetric.
-		report_node = self.rank_ctx.node_of(self.rank)
-		report_host_free = local_host_free if self.local_rank == 0 else -1
-		report_host_total = (
-			self._get_host_kv_total_pages() if self.local_rank == 0 else -1
-		)
-		# One row per rank; -1 marks "not reported by this rank":
-		#   [0] node id of this rank
-		#   [1] Host KV free pages (node leader only)
-		#   [2] sequence-slot limit scope: 0 none, 1 per rank, 2 per node
-		#   [3] free sequence slots in that scope (-1 when unlimited)
-		#   [4] Host KV total pages (node leader only): decides "can never
-		#       fit" for the per-request rejection and the stall verdict
-		#   [5] live bit: this rank has a prefilled/decoding/on-hold sequence;
-		#       OR-reduced for the reclaim stall check and the progress guard
-		#   [6] candidate digest (_prefill_candidate_digest); must be equal on
-		#       every rank or PrefillAdmissionStateDivergence is raised
-		#   [7..9] prefix-cache pressure of the node (resident nodes, active
-		#       attachments, pending loads; node leader with nothing live
-		#       only), so the guard tells an in-flight wait from a stall
-		#   [10] reclaimable retained prefix pages of the node (node leader
-		#       with the prefix cache only): joins the host admission budget
-		free_tensor = torch.tensor(
-			[
-				report_node, report_host_free, limit_scope, local_sequence_free,
-				report_host_total, int(local_live), candidate_digest,
-				prefix_pressure[0], prefix_pressure[1], prefix_pressure[2],
-				report_releasable,
-			],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, free_tensor)
-
-		gathered_digests = {int(item[6].item()) for item in gathered}
-		if len(gathered_digests) != 1:
-			raise PrefillAdmissionStateDivergence(
-				f"prefill admission candidates diverged across ranks: rank "
-				f"{self.rank} digest {candidate_digest} over "
-				f"{len(all_candidates)} candidates; gathered "
-				f"{sorted(gathered_digests)}"
-			)
-		# Rank-uniform liveness. OR, not AND: a false "live" only postpones the
-		# guard, a false "not live" fails a worker that still had work to do.
-		self._prefill_admission_live = any(
-			int(item[5].item()) != 0 for item in gathered
-		)
-
-		# Extract per-node host KV free/total pages and prefix pressure
-		reports_by_node = {}
-		totals_by_node = {}
-		pressure_by_node = {}
-		reclaimable_by_node = {}
-		for item in gathered:
-			node_id = int(item[0].item())
-			host_free = int(item[1].item())
-			if node_id >= 0 and host_free >= 0:
-				reports_by_node[node_id] = host_free
-				totals_by_node[node_id] = int(item[4].item())
-				pressure_by_node[node_id] = (
-					int(item[7].item()), int(item[8].item()), int(item[9].item())
-				)
-				# -1 is "this leader runs no prefix cache", i.e. no reclaimable
-				# supply -- never a negative budget contribution.
-				reclaimable_by_node[node_id] = max(0, int(item[10].item()))
-		per_node_host_free = []
-		per_node_host_total = []
-		per_node_prefix_pressure = []
-		per_node_host_reclaimable = []
-		for node in range(num_nodes):
-			per_node_host_free.append(reports_by_node.get(node, 0))
-			per_node_host_reclaimable.append(reclaimable_by_node.get(node, 0))
-			# -1 means "no leader report": an unknown total must not be read as
-			# a zero-page pool that can never fit anything.
-			per_node_host_total.append(totals_by_node.get(node, -1))
-			per_node_prefix_pressure.append(
-				pressure_by_node.get(node, (-1, -1, -1))
-			)
-		# Pool sizes for the stall report. Gathered, so a multi-node stall can
-		# name "can never fit" too, where the old rank-local read could not.
-		self._prefill_admission_totals = tuple(per_node_host_total)
-
-		gathered_scopes = {int(item[2].item()) for item in gathered}
-		if len(gathered_scopes) != 1:
-			raise RuntimeError(
-				f"prefill sequence-capacity scope diverged across ranks: "
-				f"{sorted(gathered_scopes)}"
-			)
-		per_rank_sequence_free = None
-		per_node_sequence_free = None
-		gathered_scope = next(iter(gathered_scopes))
-		if gathered_scope == 1:
-			per_rank_sequence_free = [int(item[3].item()) for item in gathered]
-		elif gathered_scope == 2:
-			per_node_sequence_free = []
-			for node in range(num_nodes):
-				values = [
-					int(item[3].item())
-					for item in gathered
-					if int(item[0].item()) == node
-				]
-				if not values:
-					raise RuntimeError(
-						f"missing persistent sequence-capacity report for node {node}"
-					)
-				per_node_sequence_free.append(min(values))
-		elif gathered_scope != 0:
-			raise RuntimeError(
-				f"unknown prefill sequence-capacity scope {gathered_scope}"
-			)
-
-		if self.rank == 0:
-			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
-			if per_node_sequence_free is not None:
-				logging.info(
-					f"[PREFILL] Persistent sequence slots free by node: "
-					f"{per_node_sequence_free}"
-				)
-
-		# Under G>1 the selection request maps each candidate to a node via its
-		# decode_dp_group, so every candidate must already carry one. Newly
-		# queued sequences are grouped later (at the decode transition), so a
-		# wave mixing queued with evicted candidates would raise "sequence ...
-		# has no decode_dp_group before TP prefill selection". Stamp them here:
-		# _assign_decode_dp_groups is documented to run at admission/prefill
-		# config, is idempotent (re-entrant sequences keep the group their
-		# head-sharded KDA state lives on), and is deterministic across ranks.
-		self._assign_decode_dp_groups(all_candidates)
-		# The map decides this wave's node mapping (below), its bindings and
-		# its KDA state, so verify agreement BEFORE any of them is derived:
-		# _prepare_prefill_batch is already collective, and this is the first
-		# all-ranks point after the stamp.
-		self._check_decode_dp_group_plan_identical(all_candidates)
-
-		# Step 3: Select sequences considering per-node host KV capacity.
-		# The NCCL gather above and the logging below stay here; the greedy
-		# per-node admission is delegated to PrefillScheduler. Kimi-Linear
-		# additionally supplies a persistent KDA-state limit: unlike the token
-		# cap used later by prepack, a KDA slot remains occupied until the
-		# sequence completes or is evicted.
-		selection = self._make_prefill_selection_request(
-			all_candidates,
-			per_node_host_free,
-			num_nodes,
-			chunk_size,
-			per_rank_sequence_free=per_rank_sequence_free,
-			per_node_sequence_free=per_node_sequence_free,
-			per_node_host_reclaimable=per_node_host_reclaimable,
-		)
-		# One reservation per candidate, reused by the rejection below, the
-		# reclaim target and the guard state. Independent of free pages, so it
-		# survives the post-reclaim `replace(selection, ...)`.
-		required_pages = {
-			candidate.uuid: PrefillScheduler.required_host_pages(
-				candidate, selection
-			)
-			for candidate in selection.candidates
-		}
-		# A request whose initial Host reservation exceeds its node's WHOLE pool
-		# can never be admitted -- not by this wave, not by any later one, no
-		# matter how much is reclaimed. Fail that REQUEST, not the worker: the
-		# stall exceptions below leave _prepare_prefill_batch for
-		# generate_persistent(), which has no handler for them, so they reach
-		# the worker fatal boundary and take every rank down for one oversized
-		# prompt. Rank-uniform: per_node_host_total is gathered and the
-		# candidate snapshot was digest-checked above, so every rank rejects the
-		# same uuids with no further collective.
-		if self._reject_unsatisfiable_prefill_requests(
-			selection, per_node_host_total, required_pages
-		):
-			# The candidate set changed under the snapshot. Rebuild it on the
-			# next iteration instead of selecting against removed sequences; the
-			# cleared state also resets the no-progress streak, which is correct
-			# -- this iteration did make progress.
-			self._prefill_admission_state = None
-			self._prefill_admission_selection = None
-			return []
-		prefill_batch = PrefillScheduler.select_prefill_batch(selection)
-		# The in-wave prefix pool releases every cross-wave lookup hit and
-		# recomputes it (_plan_prefill_pool_wave), so a hit saves no Host pages
-		# there: discounting it over-admits, and the allocation fails once the
-		# retained prefixes are all pinned by live sequences. Those retained
-		# pages are reclaimable instead.
-		pool_mode = self._prefill_prefix_pool_enabled()
-		if (
-			self.enable_prefix_cache and selection.candidates and not pool_mode
-			and per_rank_sequence_free is None
-			and per_node_sequence_free is None
-		):
-			# A cached prefix already occupies Host pages, so charging a hit its
-			# full reservation lets one full-cost prompt fill the wave while
-			# cheap hits wait (one sequence per wave under tight Host KV).
-			# Estimate on each node leader and select with the discount whenever
-			# any candidate has a hit; the actual lookup and attach still happen
-			# in _config_prefill_for_batch. EVICTED prompts are reconstructed
-			# there, so retain their existing full-page path.
-			from batchgen.prefix_reuse.prefill import (
-				estimate_prefix_cached_pages_for_prefill,
-			)
-			estimated_values = [0] * (len(selection.candidates) + 1)
-			if self.local_rank == 0:
-				try:
-					for index, candidate in enumerate(selection.candidates):
-						if candidate.node_id != report_node or candidate.is_evicted:
-							continue
-						seq = self.global_batch.get_sequence(candidate.uuid)
-						estimated_values[index] = estimate_prefix_cached_pages_for_prefill(
-							coordinator=self.prefix_cache_coordinator,
-							namespace_digest=(
-								self.prefix_cache_runtime_config.namespace_digest
-							),
-							prompt_token_ids=self._trajectory_tokens(
-								seq, length=seq.prompt_length
-							).tolist(),
-							page_size_tokens=(
-								self.prefix_cache_runtime_config.group_specs[0]
-								.raw_page_tokens
-							),
-						)
-				except Exception:
-					logging.exception("[PREFIX_CACHE] admission estimate failed")
-					estimated_values[-1] = 1
-			estimated = torch.tensor(
-				estimated_values, dtype=torch.int64,
-				device=self.torch_device,
-			)
-			dist.all_reduce(estimated, op=dist.ReduceOp.MAX)
-			if int(estimated[-1].item()):
-				raise RuntimeError("prefix cache admission estimate failed on a worker")
-			cached_pages = estimated[:-1].tolist()
-			if any(cached_pages):
-				estimated_selection = replace(
-					selection,
-					candidates=tuple(
-						replace(candidate, cached_prefix_pages=int(cached_pages[index]))
-						for index, candidate in enumerate(selection.candidates)
-					),
-				)
-				prefill_batch = PrefillScheduler.select_prefill_batch(
-					estimated_selection
-				)
-		# Admission reclaim targets what the persistent sequence-slot limits
-		# (Kimi-K3/Kimi-Linear KDA state) would admit with a fully reclaimed
-		# Host pool. Without slot limits that is every candidate, i.e. the
-		# previous trigger. A slot-limited model used to be excluded outright,
-		# so retained prefixes filled its Host pool and every later wave
-		# selected zero sequences forever with nothing ever evicted.
-		slot_admissible = PrefillScheduler.slot_admissible_candidates(selection)
-		# Split the slot-admissible set into what this node's pool can hold at all
-		# and what it can never hold, from the GATHERED totals rather than a
-		# rank-local stats read, so every rank enters the branch below -- and
-		# raises its stall -- on one shared verdict. A node whose leader reported
-		# no total (-1) counts as "unknown", never as a zero-page pool.
-		def _fits(candidate) -> bool:
-			total = per_node_host_total[candidate.node_id]
-			return total < 0 or required_pages[candidate.uuid] <= total
-
-		# The reclaim has to buy room for the next candidate the pool CANNOT
-		# take yet, so exclude the ones this wave already admitted: in pool mode
-		# the trigger fires while part of the set is in, and targeting the head
-		# of the whole set would evict for a sequence already admitted.
-		admitted_uuids = set(prefill_batch)
-		fitting_requirements = [
-			required_pages[candidate.uuid] for candidate in slot_admissible
-			if candidate.node_id == report_node
-			and candidate.uuid not in admitted_uuids
-			and _fits(candidate)
-		]
-		any_node_can_fit = any(_fits(c) for c in slot_admissible)
-		reclaim_outcome = (0, 0)
-		if (
-			self.enable_prefix_cache
-			and slot_admissible
-			and (
-				len(prefill_batch) < len(slot_admissible) if pool_mode
-				else not prefill_batch
-			)
-		):
-			if not any_node_can_fit:
-				# Every slot-admissible candidate needs more than its node's whole
-				# pool. Oversized QUEUEING requests were already failed one by one
-				# above, so what is left is an EVICTED sequence that no longer fits
-				# a pool it did fit once: an engine invariant violation, not a bad
-				# request. Raised before this branch's first collective, on a
-				# verdict every rank computed from the same gathered totals.
-				self._prefill_admission_selection = selection
-				raise PrefillAdmissionStalled(
-					"no prefix-cache request fits the total Host KV pool: "
-					+ self._describe_prefill_admission_blockers()
-				)
-			# No candidate fits even after a non-mutating prefix estimate.
-			# Reclaim against the original full-page requirement so a later lookup
-			# miss cannot make the allocation unsafe, and only as far as the head
-			# of the priority order needs (prefill_reclaim_target_pages):
-			# reclaiming for the whole admissible set evicts retained prefixes
-			# this wave will not use, and every one of them is a hot prefix a
-			# later prompt has to recompute.
-			from batchgen.prefix_reuse.eviction import (
-				EvictedPageRecorder,
-				reclaim_prefix_pages_for_host_admission,
-				retire_node_frontiers,
-			)
-			failure = 0
-			updated_local_free = -1
-			# A reclaim moves pages from reclaimable to free. Re-report BOTH, or
-			# the refreshed budget below counts the released pages twice.
-			updated_local_releasable = -1
-			local_frontier_hook = self._trajectory_frontier_eviction_hook()
-			reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
-			if self.local_rank == 0:
-				try:
-					worker_view = self.core_engine.host_paged_kv_worker_view
-					stats = worker_view.get_stats()
-					updated_local_free = int(stats.num_free_pages)
-					required, page_target = prefill_reclaim_target_pages(
-						fitting_requirements=fitting_requirements,
-						free_pages=updated_local_free,
-					)
-					if required:
-						released = reclaim_prefix_pages_for_host_admission(
-							core_engine_module=core_engine,
-							coordinator=self.prefix_cache_coordinator,
-							worker_views_by_group=self._host_views_by_group(),
-							group_id=0,
-							page_target=page_target,
-							max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
-							frontier_hook=reclaimed_pages,
-						)
-						updated_local_free = self._get_host_kv_free_pages()
-						updated_local_releasable = (
-							self.prefix_cache_coordinator.count_releasable_pages(0)
-						)
-						logging.info(
-							"[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
-							"(free=%s, target=%s)",
-							released, report_node, updated_local_free, required,
-						)
-						if self.prefix_cache_debug_stats:
-							self._emit_prefix_cache_metric(
-								"prefix_reclaim",
-								reason="host_admission",
-								node=int(report_node),
-								page_target=int(page_target),
-								released_pages=int(released),
-								**self._prefix_host_resource_fields(),
-							)
-				except Exception:
-					logging.exception("[PREFIX_CACHE] admission eviction failed")
-					failure = 1
-			failed = torch.tensor(
-				[failure, reclaimed_pages.page_count],
-				dtype=torch.int64, device=self.torch_device,
-			)
-			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-			if int(failed[0].item()) != 0:
-				raise RuntimeError("prefix cache admission eviction failed on a worker")
-			reclaimed_page_count = int(failed[1].item())
-			reclaim_outcome = (1, reclaimed_page_count)
-			# The leader already retired its own frontiers inside the release.
-			# Any other rank of the node may own frontier records standing on
-			# the reclaimed pages (G=1, or several serve groups per node), so
-			# every rank runs its own hook on its node's reclaimed map.
-			frontier_failure = 0
-			if reclaimed_page_count != 0:
-				gathered_reclaims = [None] * self.world_size
-				dist.all_gather_object(
-					gathered_reclaims,
-					(
-						report_node,
-						reclaimed_pages.pages_by_group
-						if self.local_rank == 0 else None,
-					),
-				)
-				if self.local_rank != 0:
-					try:
-						retire_node_frontiers(
-							gathered=gathered_reclaims,
-							node_id=report_node,
-							frontier_hook=local_frontier_hook,
-						)
-					except Exception:
-						logging.exception(
-							"[PREFIX_CACHE] frontier retirement after admission "
-							"reclaim failed"
-						)
-						frontier_failure = 1
-			updated = torch.tensor(
-				[
-					report_node, updated_local_free, frontier_failure,
-					updated_local_releasable,
-				],
-				dtype=torch.int64, device=self.torch_device,
-			)
-			gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
-			dist.all_gather(gathered, updated)
-			if any(int(item[2].item()) != 0 for item in gathered):
-				raise RuntimeError(
-					"trajectory frontier retirement after admission reclaim "
-					"failed on a worker"
-				)
-			for item in gathered:
-				node, free = int(item[0].item()), int(item[1].item())
-				if free >= 0:
-					per_node_host_free[node] = free
-				releasable = int(item[3].item())
-				if releasable >= 0:
-					per_node_host_reclaimable[node] = releasable
-			selection = replace(
-				selection,
-				per_node_host_free=tuple(per_node_host_free),
-				per_node_host_reclaimable=tuple(per_node_host_reclaimable),
-			)
-			prefill_batch = PrefillScheduler.select_prefill_batch(selection)
-			if not prefill_batch and not self._prefill_admission_live:
-				# Nothing is live on ANY rank, so nothing will decode, complete, or
-				# free a page or a slot: an empty wave here would repeat forever.
-				self._prefill_admission_selection = selection
-				raise PrefillAdmissionStalled(
-					"prefix cache prefill admission made no progress after "
-					"eviction with no live sequence: "
-					+ self._describe_prefill_admission_blockers()
-				)
-
-		# Rank-uniform admission state for the scheduler loop's no-progress guard
-		# (PrefillProgressGuard). Every component is gathered, reduced, or derived
-		# from the digest-checked candidate snapshot, and the set is wide enough to
-		# separate a recoverable wait from a true stall: free AND total pages, the
-		# slot vectors, the candidate IDENTITIES with their required pages (a count
-		# alone cannot see one candidate swapped for another), the per-node
-		# prefix-cache pressure counters that move while a load or an attachment
-		# release is in flight, this wave's reclaim outcome, and the reduced live
-		# bit. The scheduler loop folds the Host reservation outcome in on top
-		# (_prefill_admission_guard_state).
-		self._prefill_admission_state = (
-			tuple(per_node_host_free),
-			tuple(per_node_host_total),
-			None if per_rank_sequence_free is None else tuple(per_rank_sequence_free),
-			None if per_node_sequence_free is None else tuple(per_node_sequence_free),
-			tuple(
-				(
-					candidate.uuid,
-					candidate.node_id,
-					candidate.is_evicted,
-					required_pages[candidate.uuid],
-				)
-				for candidate in selection.candidates
-			),
-			tuple(per_node_prefix_pressure),
-			reclaim_outcome,
-			self._prefill_admission_live,
-		)
-		self._prefill_admission_selection = selection
-
-		if self.rank == 0:
-			n_evicted = sum(
-				1 for u in prefill_batch
-				if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED
-			)
-			logging.info(
-				f"[PREFILL] Selected {len(prefill_batch)} sequences "
-				f"({n_evicted} recompute from eviction)"
-			)
-
-		return prefill_batch
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prepare_prefill_batch(self)
 
 	def _describe_prefill_admission_blockers(self) -> str:
 		"""Name the candidates the last admission left out, and why.
@@ -6854,57 +5553,16 @@ class BatchGenWorker:
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
-		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
-		if not uuids:
-			return
-
-		if self.rank == 0:
-			logging.info(
-				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
-			)
-
-		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
-		# This ensures all ranks have consistent current_context_length values
-		# which is essential for correct KV migration validation later
-		self._sync_sequence_metadata(uuids)
-
-		# Free GPU pages for these sequences
-		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
-		if hasattr(self, 'gpu_paged_kv_cache_manager') and self.gpu_paged_kv_cache_manager:
-			global_seq_ids = []
-			for uuid in uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				if uuid in self._uuid_to_local_map:
-					global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
-
-			if global_seq_ids:
-				# Filter to only sequences the GPU manager actually tracks
-				mgr = self.gpu_paged_kv_cache_manager
-				known_ids = [gid for gid in global_seq_ids if gid in mgr._sequences]
-				if known_ids:
-					mgr.free_pages_for_sequences(known_ids)
-				if len(known_ids) < len(global_seq_ids):
-					unknown = len(global_seq_ids) - len(known_ids)
-					logging.debug(
-						f"Rank {self.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
-					)
-				# Also remove from tracking set
-				for uuid in uuids:
-					if uuid in self._uuid_to_local_map:
-						self._sequences_with_gpu_kv.discard(uuid)
-
-		# Update sequence status and reset GPU allocation
-		# NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
-		# ON_HOLD sequences are continuing decode when resumed, so they should
-		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
-		for uuid in uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			seq.gpu_pages_allocated = 0
-			seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=watermark")
-			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
-
-		# Synchronize state across all ranks
-		dist.barrier()
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._put_sequences_on_hold(
+			self,
+			uuids,
+		)
 
 	def _snapshot_decode_capacity(self) -> DecodeCapacitySnapshot:
 		# The engine receives this worker as its sole state collaborator.
@@ -7349,67 +6007,17 @@ class BatchGenWorker:
 		current_decode_uuids: List[str],
 		current_local_indices: List[int]
 	) -> Tuple[List[str], List[int]]:
-		"""
-		Load PREFILLED sequences from Host KV to GPU KV if space available.
-		Maintains deterministic ordering across all ranks.
-		"""
-		# Legacy attention modes still run on a live worker, so route their
-		# boundary admission through the same collective-capacity contract as
-		# mode 3.  The old local-free/pages-required loop could desynchronize
-		# ranks and bypass TP replication or the decode row cap.
-		# DecodeScheduler needs a TP group on every candidate, so stamp all
-		# PREFILLED/ON_HOLD candidates before taking its live capacity snapshot.
-		admission_candidates = (
-			self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-			+ self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._try_load_new_sequences(
+			self,
+			current_decode_uuids,
+			current_local_indices,
 		)
-		self._assign_decode_dp_groups(admission_candidates)
-		new_uuids = [
-			uuid for uuid in self._prepare_decode_batch()
-			if uuid not in set(current_decode_uuids)
-		]
-		
-		if not new_uuids:
-			return current_decode_uuids, current_local_indices
-
-		# Get local indices for sequences belonging to THIS rank
-		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
-		
-		# M2b: assign the decode DP-group before the transition (no-op for G==1).
-		self._assign_decode_dp_groups(new_uuids)
-
-		# Every rank participates, including ranks with no local rows, before any
-		# allocator mutation.  A failed preflight is global and leaves statuses
-		# untouched, so the next caller can retry safely.
-		alloc_ok = self._allocate_gpu_kv_two_page_buffer(
-			new_local_indices,
-			load_from_host=True,
-			collective_preflight=True,
-		)
-		if not alloc_ok:
-			raise RuntimeError(
-				f"Rank {self.rank}: collective GPU KV load preflight failed for "
-				f"{len(new_uuids)} legacy-mode sequences"
-			)
-
-		# Update status AFTER load completes
-		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
-		
-		# Build updated lists
-		updated_uuids = current_decode_uuids + new_uuids
-		updated_batch = current_local_indices + new_local_indices
-		
-		# Final page table rebuild with ALL active sequences
-		if self.gpu_paged_kv_cache_manager is not None and updated_batch:
-			all_global_ids = self._local_indices_to_global_seq_ids(updated_batch)
-			self.gpu_paged_kv_cache_manager.rebuild_page_table(all_global_ids)
-		
-		logging.info(
-			f"Rank {self.rank}: Loaded {len(new_uuids)} new sequences, "
-			f"total decode batch now {len(updated_uuids)}"
-		)
-		
-		return updated_uuids, updated_batch
 
 
 
@@ -7594,52 +6202,16 @@ class BatchGenWorker:
 		)
 
 	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
-		"""Collect every region before allocating GPU pages or publishing L."""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			_resolve_profile, _resolve_indexer_profile, is_dsa_model,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._verify_deployment_max_model_len(
+			self,
+			pool_gb,
 		)
-
-		profiles = [_resolve_profile(self.huggingface_ckpt_name)]
-		if is_dsa_model(self.huggingface_ckpt_name):
-			profiles.append(_resolve_indexer_profile(self.huggingface_ckpt_name))
-		page_bytes = [p.bytes_per_page() * p.num_layers for p in profiles]
-		# This is the same split used by _initialize_gpu_kv_manager_fixed_size:
-		# all regions have equal page counts, each page spans its physical layers.
-		gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
-		node = node_of_rank(self.rank, self.local_world_size)
-		capacities = []
-		host_views = self._host_views_by_group()
-		for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
-			capacities.append(SequenceLengthCapacity(
-				"GPU KV", str(region), node, self.rank,
-				profile.page_size, size, gpu_pages,
-			))
-			if self.local_rank == 0:
-				capacities.append(SequenceLengthCapacity(
-					"host KV", str(region), node, self.rank,
-					profile.page_size, size,
-					int(host_views[region].get_stats().num_total_pages),
-					copies=self._decode_attn_tp_size(),
-				))
-		if self.local_rank == 0:
-			book = self._traj.trajectory_book
-			capacities.append(SequenceLengthCapacity(
-				"input IDs", "trajectory", node, self.rank,
-				book.page_tokens, book.page_tokens * QueryBook.TOKEN_BYTES, book.page_count,
-			))
-		all_capacities = [None] * self.world_size
-		dist.all_gather_object(all_capacities, capacities)
-		length = verify_max_model_len(
-			self.model_context_length,
-			[capacity for rank_capacities in all_capacities for capacity in rank_capacities],
-			auto_fit=(
-				getattr(self.args, "max_model_len", None) == -1
-				and not getattr(self, "_deployment_length_verified", False)
-			),
-		)
-		self.model_context_length = length
-		self.engine_config.Basic_Config.max_model_len = length
-		self._deployment_length_verified = True
 
 	def _snapshot_server_config(self) -> None:
 		"""Snapshot the [SERVER_CONFIG] values while their owners are live.
@@ -9009,390 +7581,15 @@ class BatchGenWorker:
 		self._cross_comm_thread = None
 
 	def _install_replica_transport(self) -> None:
-		"""Install the node replica weight transport for this prefill phase.
-
-		Forms the replica group from per-rank topology records, derives the
-		frame layout from the installed task's module names, and hands the
-		engine the plan, the cohort control block and every member's ring
-		segments. A rank that cannot participate (no frame grammar, daemon
-		or hierarchical source, no peer access, group of one) runs the
-		degenerate single-member group: the uninstalled engine, which is the
-		same record state machine with every record HostPrivate.
-		"""
-		from batchgen.weight_replica_group import (
-			RankRecord,
-			compute_replica_groups,
-			derive_frame_plan,
-			derive_owner_map,
-			install_record_kinds,
-			stagger_task_for_member,
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_replica_transport_engine", None)
+		if engine is None:
+			from batchgen.worker.replica_transport_engine import ReplicaTransportEngine
+			engine = ReplicaTransportEngine()
+			self._replica_transport_engine = engine
+		return engine._install_replica_transport(
+			self,
 		)
-
-		transport = getattr(
-			self.parallel_manager, "_distributed_weight_transport", None
-		)
-		seam_requested = (
-			getattr(self.parallel_manager, "cross_seam_enabled", None)
-			is not None
-			and self.parallel_manager.cross_seam_enabled()
-		)
-		cross_seam = (
-			seam_requested
-			and transport == "hierarchical_gdr"
-			and getattr(self, "_cross_node_broadcast_plan", None) is not None
-		)
-
-		def _decline(reason: str) -> None:
-			if seam_requested:
-				# Under the seam every member already holds the full
-				# schedule, so a member without the engine binding would
-				# fetch records it does not own: never run that silently.
-				raise RuntimeError(
-					f"Rank {self.rank}: cross-node replica seam requested "
-					f"but the transport cannot install: {reason}"
-				)
-			if self.rank == 0:
-				logging.info(
-					"[REPLICA] transport not installed: %s", reason
-				)
-
-		if seam_requested and not cross_seam:
-			_decline("no cross-node plan was declared for this member")
-		if not dist.is_initialized():
-			_decline("torch.distributed is not initialized")
-			return
-		if (
-			getattr(self.args, "distributed_weight_config", None)
-			and not cross_seam
-		):
-			_decline("daemon-backed weight source (spec v4, 4.1)")
-			return
-		if transport == "hierarchical_gdr" and not cross_seam:
-			_decline("hierarchical_gdr weight source (spec v4, 4.1)")
-			return
-		plan = derive_frame_plan(self.weight_copy_task)
-		if plan is None:
-			_decline("installed task does not fit the layer grammar")
-			return
-		# Install-step timing: the install runs once per prefill phase and
-		# spans collectives, shared mappings and peer imports, so each rank
-		# logs where its install time and device memory went.
-		_steps: list = []
-		_last = time.perf_counter()
-
-		def _mark(step: str) -> None:
-			nonlocal _last
-			now = time.perf_counter()
-			free_gib = torch.cuda.mem_get_info(self.local_rank)[0] / (1 << 30)
-			_steps.append((step, now - _last, free_gib))
-			_last = now
-
-		with open("/proc/sys/kernel/random/boot_id") as handle:
-			boot_id = handle.read().strip()
-		record = RankRecord(
-			node_identity=f"{boot_id}:{socket.gethostname()}",
-			device_index=self.local_rank,
-			peer_access_row=[
-				bool(torch.cuda.can_device_access_peer(self.local_rank, j))
-				if j != self.local_rank else True
-				for j in range(self.local_world_size)
-			],
-			# Canonical (order-insensitive) identity: members compare the
-			# SET of modules, because a prior install staggered this
-			# member's walk order and the stagger differs per member.
-			list_fingerprint=str(
-				self._weight_copy_task_fingerprint(
-					{
-						module_type: sorted(names)
-						for module_type, names in (
-							self.weight_copy_task or {}
-						).items()
-					}
-				)
-			),
-			weight_source_kind="local",
-			rank=self.rank,
-		)
-		gathered = [None] * self.world_size
-		dist.all_gather_object(gathered, record)
-		_mark("gather")
-		if cross_seam:
-			# Under streamed SP8 every rank of a node streams a different
-			# expert shard, so no intra-node peer shares this member's
-			# records; the members that do share them live on other nodes
-			# and cannot share memory. The engine therefore runs a
-			# single-member group: routed experts take their cross-node
-			# kind (source root: owned; others: CrossReplica, landed by the
-			# comm thread), every other record is this rank's own host copy.
-			group = [self.rank]
-			owners = {
-				name: self.rank
-				for names in self.weight_copy_task.values()
-				for name in names
-			}
-			kinds = {name: "HostPrivate" for name in owners}
-			for name, kind in self._cross_node_broadcast_plan.kinds.items():
-				if name not in kinds:
-					raise RuntimeError(
-						f"Rank {self.rank}: cross-node plan names {name}, "
-						"which is not in the installed task"
-					)
-				# The source root owns every record of its slot; with no
-				# intra peers a shared record has no reader but itself.
-				kinds[name] = (
-					"CrossReplica" if kind == "CrossReplica" else "HostShared"
-				)
-		else:
-			groups = compute_replica_groups({r.rank: r for r in gathered})
-			group = sorted(groups[self.rank])
-			if len(group) < 2:
-				_decline("replica group has one member")
-				return
-			owners = derive_owner_map(group, self.weight_copy_task, plan)
-			kinds = install_record_kinds(self.rank, group, owners)
-		member_index = group.index(self.rank)
-		# Stagger this member's within-layer walk (own block first, then
-		# the other owners round-robin) and rebuild the engine queue to
-		# match; the producer has not started. Record identity stays
-		# canonical by name, so barriers are unaffected. A single-member
-		# group has no other owner to stagger against.
-		if len(group) > 1:
-			staggered = stagger_task_for_member(
-				self.weight_copy_task, plan, owners, group, self.rank
-			)
-			if staggered != self.weight_copy_task:
-				self.weight_copy_task = staggered
-				self.core_engine.set_weight_copy_queue(staggered)
-		layers_per_pass = len(plan.layer_sequence)
-		# Record indices: one frame's records in (sorted type, in-frame
-		# position) order, identical on every member.
-		type_offsets = {}
-		offset = 0
-		for module_type in sorted(plan.frame_size):
-			type_offsets[module_type] = offset
-			offset += plan.frame_size[module_type]
-		records_per_frame = offset
-		num_types = len(type_offsets)
-		from batchgen.weight_replica_transport import in_frame_positions
-
-		# Record index = the record's position among its type's records in
-		# its frame (canonical order), never the raw expert id: a streamed
-		# SP8 slot holds a block of global expert ids, while the per-frame
-		# record table is sized by the frame's record count.
-		positions = in_frame_positions(self.weight_copy_task, plan)
-		modules = []
-		for module_type in sorted(self.weight_copy_task):
-			names = self.weight_copy_task[module_type]
-			if not names:
-				continue
-			ring_slots = int(
-				self.engine_config.GPU_Buffer_Config
-				.num_prefill_module_buffer[module_type]
-			)
-			# Only records that peers read need the two-frame rendezvous;
-			# under the seam that is the routed experts alone (every other
-			# type is each rank's own host copy).
-			if (
-				not cross_seam or module_type == "routed_expert"
-			) and ring_slots < 2 * plan.frame_size[module_type]:
-				# A ring that cannot hold the two-frame rendezvous cannot
-				# replicate; the model keeps its single-member behaviour.
-				_decline(
-					f"ring capacity for {module_type} is {ring_slots} "
-					f"slots, the two-frame rendezvous needs "
-					f"{2 * plan.frame_size[module_type]}"
-				)
-				return
-			for name in names:
-				layer_position, _expert = plan.position[name]
-				record_index = type_offsets[module_type] + positions[name]
-				owner_member = group.index(owners[name])
-				kind = {
-					"HostShared": 0,
-					"HostPrivate": 1,
-					"Replica": 2,
-					"CrossReplica": 3,
-				}[kinds[name]]
-				modules.append(
-					(
-						module_type,
-						name,
-						kind,
-						owner_member,
-						layer_position,
-						record_index,
-					)
-				)
-		_mark("plan")
-		# The control block: one shared node mapping per geometry, reused
-		# across installs of the same shape. Barrier words are per
-		# (member, type): frame completion is monotone only within a type.
-		key = (len(group), records_per_frame, num_types)
-		cached = self._replica_block_cache.get(key)
-		if cached is None and cross_seam:
-			# A single-member group shares the block with nobody: a
-			# process-private mapping replaces the node-shared one, whose
-			# creator handshake assumes every node rank joins one group.
-			nbytes = int(
-				core_engine.replica_control_block_bytes(
-					len(group), records_per_frame, num_types
-				)
-			)
-			# The block's header is cache-line aligned (alignas(64)) and the
-			# CPU allocator does not promise that alignment, so carve an
-			# aligned window out of a slightly larger buffer; the slice keeps
-			# the backing storage alive.
-			backing = torch.zeros(nbytes + 64, dtype=torch.uint8)
-			start = (-backing.data_ptr()) % 64
-			cached = (backing[start:start + nbytes], None)
-			self._replica_block_cache[key] = cached
-		if cached is None:
-			nbytes = int(
-				core_engine.replica_control_block_bytes(
-					len(group), records_per_frame, num_types
-				)
-			)
-			storage, memfd = allocate_node_shared_tensor(
-				label=(
-					f"{self._query_book_shm_prefix}replica_block_"
-					f"{len(group)}x{records_per_frame}x{num_types}"
-				),
-				rows=nbytes,
-				width=1,
-				dtype=torch.uint8,
-				is_creator=self.local_rank == 0,
-				exchange=self._exchange_node_memfd_identity,
-				barrier=dist.barrier,
-			)
-			cached = (storage.view(-1), memfd)
-			self._replica_block_cache[key] = cached
-		block_tensor = cached[0]
-		if member_index == 0:
-			core_engine.replica_control_block_initialize(
-				block_tensor, len(group), records_per_frame, num_types
-			)
-		dist.barrier()
-		_mark("block")
-		# Ring segments travel as exported VMM fds over a node-local unix
-		# socket (SCM_RIGHTS): the peer maps only the segment, so the import
-		# is milliseconds and leaves no foreign context or whole-device peer
-		# mapping behind (the torch CUDA-IPC path cost minutes and GiBs on a
-		# serving worker; slice 2c). The /proc/<pid>/fd reopen seam does not
-		# work for driver fds (VMM P1, finding C1), so the fds are sent.
-		import socket as _socket
-
-		types = sorted(plan.frame_size)
-		own_fds = {}
-		own_bytes = {}
-		field_layouts = {}
-		for module_type in types:
-			fd, mapped = self.core_engine.ring_segment_export_fd(module_type)
-			own_fds[module_type] = int(fd)
-			own_bytes[module_type] = int(mapped)
-			field_layouts[module_type] = [
-				(int(offset), int(stride), int(nbytes))
-				for offset, stride, nbytes in
-				self.core_engine.ring_field_layout(module_type)
-			]
-		_mark("export")
-		peer_fds = {t: [-1] * len(group) for t in types}
-		peer_bytes = {t: [0] * len(group) for t in types}
-		for module_type in types:
-			peer_bytes[module_type][member_index] = own_bytes[module_type]
-		listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-		sock_name = (
-			f"\0{self._query_book_shm_prefix}replica-fd-{self.rank}"
-		)
-		try:
-			listener.bind(sock_name)
-			listener.listen(len(group))
-			dist.barrier()
-			payload = repr(
-				(self.rank, types, [own_bytes[t] for t in types])
-			).encode()
-			senders = []
-			for member_rank in group:
-				if member_rank == self.rank:
-					continue
-				peer = _socket.socket(
-					_socket.AF_UNIX, _socket.SOCK_STREAM
-				)
-				peer.connect(
-					f"\0{self._query_book_shm_prefix}replica-fd-"
-					f"{member_rank}"
-				)
-				_socket.send_fds(
-					peer, [payload], [own_fds[t] for t in types]
-				)
-				senders.append(peer)
-			for _ in range(len(group) - 1):
-				conn, _addr = listener.accept()
-				with conn:
-					data, fds, _flags, _addr2 = _socket.recv_fds(
-						conn, 4096, len(types)
-					)
-					import ast as _ast
-
-					sender_rank, sender_types, sender_bytes = (
-						_ast.literal_eval(data.decode())
-					)
-					if sender_types != types or len(fds) != len(types):
-						raise RuntimeError(
-							f"Rank {self.rank}: replica fd exchange from "
-							f"rank {sender_rank} carried types "
-							f"{sender_types} ({len(fds)} fds), expected "
-							f"{types}"
-						)
-					sender_member = group.index(sender_rank)
-					for module_type, fd, nbytes in zip(
-						types, fds, sender_bytes
-					):
-						peer_fds[module_type][sender_member] = int(fd)
-						peer_bytes[module_type][sender_member] = int(nbytes)
-			# The senders may close only after every receiver imported.
-			dist.barrier()
-			for peer in senders:
-				peer.close()
-		finally:
-			listener.close()
-		_mark("handles")
-		try:
-			self.core_engine.install_replica_plan(
-				member_index,
-				len(group),
-				layers_per_pass,
-				records_per_frame,
-				modules,
-				block_tensor,
-				peer_fds,
-				peer_bytes,
-				field_layouts,
-			)
-		finally:
-			for module_type in types:
-				os.close(own_fds[module_type])
-				for fd in peer_fds[module_type]:
-					if fd >= 0:
-						os.close(fd)
-		self._replica_plan_installed = True
-		_mark("engine")
-		logging.info(
-			"[REPLICA] install steps rank=%d: %s",
-			self.rank,
-			" ".join(
-				f"{n}={d:.2f}s/free={f:.1f}G" for n, d, f in _steps
-			),
-		)
-		if self.rank == group[0]:
-			logging.info(
-				"[REPLICA] installed: group=%s member=%d records/frame=%d "
-				"layers/pass=%d fingerprint=%s",
-				group,
-				member_index,
-				records_per_frame,
-				layers_per_pass,
-				record.list_fingerprint[:16],
-			)
 
 	def _install_prefill_weight_copy_pipeline(self, k3_prefill_profile: bool) -> None:
 		"""Point the H2D copy engine at the prefill weight-copy schedule.
@@ -9709,288 +7906,13 @@ class BatchGenWorker:
 		)
 
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
-		"""Configure prefill phase for a batch of sequences."""
-		start_time = time.perf_counter()
-		self._phase_request_uuids = tuple(prefill_uuids)
-		desired_key = self._desired_phase_key("prefill")
-		prefill_sequences = [
-			self.global_batch.get_sequence(uuid)
-			for uuid in prefill_uuids
-			if self.global_batch.get_sequence(uuid) is not None
-		]
-		prefill_debug = self._phase_prefill_debug
-		k3_prefill_profile = self._phase_k3_prefill_profile
-		resident_handoff = self._phase_resident_handoff
-		resident_token_cap = self._phase_resident_token_cap
-		persistent = self._persistent_phase_enabled()
-		if not persistent:
-			self._request_phase_instance_reuse()
-		if self.rank == 0:
-			logging.info(
-				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
-			)
-
-		in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-		on_hold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		prefilling = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		if (in_decode or on_hold) and BATCHGEN_CB_DEBUG:
-			logging.debug(
-				f"Rank {self.rank}: _config_prefill_for_batch called while "
-				f"{len(in_decode)} IN_DECODE, {len(on_hold)} ON_HOLD, {len(prefilling)} PREFILLED sequences exist. "
-				"This is a decode-to-prefill transition."
-			)
-			for uuid in (in_decode + on_hold)[:5]:
-				seq = self.global_batch.get_sequence(uuid)
-				logging.debug(
-					f"Rank {self.rank}: Affected seq {seq.uuid[:8]}: "
-					f"status={seq.status.name}, decoded_len={seq.decoded_length}, "
-					f"ctx_len={seq.current_context_length}, gpu_pages={seq.gpu_pages_allocated}, "
-					f"had_initial={seq.had_initial_gpu_reservation}"
-				)
-
-		if hasattr(self, "_pending_kv_append_tasks") and self._pending_kv_append_tasks:
-			logging.info(
-				f"Rank {self.rank}: Flushing {len(self._pending_kv_append_tasks)} pending KV append tasks before prefill config"
-			)
-			self._wait_pending_kv_append_tasks()
-			torch.cuda.synchronize(self.torch_device)
-
-		self._assign_decode_dp_groups(prefill_uuids)
-		if self._live_phase_key != desired_key:
-			self._log_prefill_entry_hbm("BEFORE")
-		phase_changed, resumed = self._transition_phase(desired_key)
-		if phase_changed:
-			self._log_prefill_entry_hbm("AFTER")
-		if phase_changed and not resumed:
-			self._log_phase_memory_ledger("after_configure_prefill")
-		if phase_changed:
-			if resident_handoff:
-				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-					resident_token_cap
-				)
-				if torch.cuda.is_available():
-					torch.cuda.synchronize(self.torch_device)
-			self.set_phase("prefill")
-			if self.enable_prefix_cache:
-				self._measure_prefill_prefix_kv_budget()
-			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
-		else:
-			# phase_enter readies the instance for the first wave of a phase;
-			# admit prepares every later wave of the same live phase.
-			self.parallel_manager.admit(
-				desired_key, AdmitContext(uuids=list(prefill_uuids))
-			)
-
-		if phase_changed and not persistent and k3_prefill_profile and torch.cuda.is_available():
-			torch.cuda.reset_peak_memory_stats(self.local_rank)
-
-		if (
-			not persistent
-			and hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-			and self.parallel_manager.prefill_uses_resident_ep()
-		):
-			local_lengths = [
-				int(seq.prompt_length)
-				for seq in prefill_sequences
-				if self._owns_local_sequence(seq)
-			]
-			token_cap = (
-				self.engine_config.Module_Batching_Config
-				.prefill_micro_batch_token_cap
-			)
-			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-			predicted_batches, _ = build_prefill_micro_batches(
-				local_lengths,
-				token_cap,
-				l2_balance=use_l2,
-			)
-			local_max_tokens = max(
-				(
-					sum(local_lengths[start:end])
-					for start, end in predicted_batches
-				),
-				default=0,
-			)
-			moe_ntp = self._sync_prefill_moe_rank_counts(
-				local_max_tokens,
-				reason="prefill_output_preallocate",
-			)
-			self.parallel_manager.prepare_resident_ep_prefill_output(
-				self.world_size * moe_ntp
-			)
-
-		# STEP 3: Prepare evicted sequences for re-entry (before host KV allocation)
-		#
-		# The phase transition and manager admission are complete above. The
-		# remaining body prepares metadata and binds this wave's local rows.
-
-		#
-		# Split into two loops:
-		#   (a) All-ranks scalar metadata update (runs on every rank using
-		#       fields already synchronized via Phase 4.C of the eviction
-		#       boundary and via _sync_sequence_metadata).
-		#   (b) Validate the retained trajectory and clear the legacy marker.
-		#
-		# The previous single-loop version ran both steps gated on
-		# evicted_token_ids — which is an owner-only tensor — so non-owning
-		# ranks silently skipped the scalar updates and held stale values
-		# for decoded_length / reentry_decoded_baseline / max_decode_length
-		# until the next _sync_sequence_metadata call.
-
-		# (a) All-ranks scalar metadata update for re-entering sequences.
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			# total_decoded_before_eviction > 0 identifies sequences that have
-			# been evicted at least once and are now re-entering. This field is
-			# synced across ranks, unlike evicted_token_ids which is owner-only.
-			if seq.total_decoded_before_eviction == 0:
-				continue
-
-			# seq.prompt_length and seq.current_context_length were already
-			# updated to the new reconstructed length by Phase 4.C of the
-			# eviction boundary and synced to all ranks.
-
-			# Baseline = accumulated historical output length carried forward
-			# into decoded_tokens. With the Phase 4.C cascade fix, this is
-			# exactly (prompt_length - original_prompt_length) = sum of new
-			# decoded counts across all past cycles.
-			n_old = _reentry_history_length(
-				seq.prompt_length, seq.original_prompt_length,
-				seq.original_max_decode_length,
-			)
-			seq.decoded_length = n_old
-			seq.reentry_decoded_baseline = n_old
-
-			# decoded_length is cumulative across eviction/re-entry cycles, so
-			# max_decode_length must remain the absolute per-request completion
-			# cap. Compute remaining budget as
-			# original_max_decode_length - decoded_length at call sites instead
-			# of storing a relative value here.
-			seq.max_decode_length = seq.original_max_decode_length
-
-			# Reset completion flags — the sequence may have hit EOS in its
-			# previous decode cycle before being evicted. Without this reset,
-			# _sync_completion_status_tensor falsely detects the re-entering
-			# sequence as completed (stale eos_reached=True), calls
-			# _report_completion (popping local_map), but the PREFILLED→COMPLETED
-			# status transition fails (invalid), leaving a zombie: PREFILLED
-			# status with no local_map entry, invisible to the boundary load
-			# mechanism (which iterates local_map), stuck for the entire decode
-			# cycle until _prepare_decode_batch picks it up → CRITICAL error.
-			seq.eos_reached = False
-			if hasattr(seq, '_rep_detected'):
-				seq._rep_detected = False
-
-		# (b) The trajectory is already the source of truth. Host-KV eviction
-		# releases only KV pages; it must not reconstruct or copy a second token
-		# buffer. Validate the retained trajectory and clear the legacy handoff
-		# marker so old callers cannot accidentally reintroduce dense storage.
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq.total_decoded_before_eviction == 0:
-				continue
-			prev_decoded = seq.total_decoded_before_eviction
-			seq.log_event(SeqEvent.REENTRY_START, self.rank,
-				f"new_prompt_len={seq.prompt_length}, prev_decoded={prev_decoded}")
-			if self._traj.trajectory_book is None or not self._traj.trajectory_book.has_sequence(uuid):
-				raise QueryBookPoolCapacityError(
-					f"Rank {self.rank}: re-entry of {uuid[:8]} has no trajectory slot"
-				)
-			trajectory_slot = self._trajectory_slot(seq)
-			trajectory_length = self._traj.trajectory_book.metadata(trajectory_slot).token_length
-			if trajectory_length < seq.prompt_length:
-				raise RuntimeError(
-					f"Rank {self.rank}: trajectory for {uuid[:8]} is shorter than "
-					f"re-entry prompt ({trajectory_length} < {seq.prompt_length})"
-				)
-			# Record the replayed prompt boundary and make the local QueryBook
-			# metadata agree with the scalar effective prompt length. No token bytes
-			# are copied: the trajectory already contains this prefix.
-			self._traj.trajectory_book.begin_reentry_turn(
-				trajectory_slot, prompt_length=seq.prompt_length
-			)
-			# Clear the legacy owner-only tensor marker. No token copy occurs.
-			seq.evicted_token_ids = None
-
-			# Recreate query_book entry for this rank's evicted sequences (Q4).
-			# G>1 binds the row on all G ranks of its serve group, and each of
-			# them decodes from its own query_book, so every holder must rebuild
-			# the entry — not just assigned_rank. The group id an evicted re-entry
-			# lost is already restored by the _assign_decode_dp_groups call at the
-			# top of this method. G==1: the same single rank as before.
-			if self._owns_local_sequence(seq) and uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
-				self.query_book[local_idx] = make_query_book_entry(seq)
-
-			logging.info(
-				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
-				f"new_prompt={seq.prompt_length}, prev_decoded={prev_decoded}, "
-				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
-			)
-
-		# STEP 3.5 (Option 1, CORE): (re)assign the serve-group before binding.
-		# Idempotent for fresh admits (already grouped at admission); RE-groups
-		# evicted re-entries (whose decode_dp_group was cleared on eviction) so
-		# the group predicate below binds them on all G ranks. No-op for G==1.
-		self._assign_decode_dp_groups(prefill_uuids)
-
-		# STEP 4: Bind local rows for sequences this rank serves.  Host-KV pages
-		# were reserved and committed before IN_PREFILL was published, so this
-		# phase must not perform another allocator mutation.
-		my_prefill_uuids = []
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if self._owns_local_sequence(seq):
-				my_prefill_uuids.append(uuid)
-				# Add to local maps if not already present (for new sequences)
-				if uuid not in self._uuid_to_local_map:
-					new_local_idx = self._bind_local_sequence_to_query_book(uuid)
-					logging.debug(
-						f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
-						f"(local_idx={new_local_idx})"
-					)
-		if self.rank == 0:
-			logging.debug(
-				"[PREFILL] Host KV reservation already committed before phase config"
-			)
-		# The rows bound above are the rows this wave's prefill computes, and
-		# the prefill forward is what creates each row's KDA state item. Catch
-		# a binding that disagrees with the group map here, before the forward,
-		# so the error names the seam instead of the decode step that misses
-		# the state item.
-		self._check_local_binding_matches_group(prefill_uuids, "prefill config")
-
-		# Reached by EVERY rank — including ranks that serve no sequence this
-		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
-		# hands the leader's page tables, prefix metadata and pool segment
-		# pages to the rest of its serve group.
-		#
-		# M3 Slice 1c rides this same gather when the trajectory flag is on and
-		# the group is head-sharded: the leader's G-wide snapshot arenas and
-		# its frontier hits travel with the page tables, so no new collective
-		# is introduced. The predicate is broadcast-identical (the flag is on
-		# the batch's own sequences and the batch is replicated), so every rank
-		# reaches the gather with the same expectation.
-		self._traj.trajectory_arena_payload = {}
-		self._traj.trajectory_mirrored_restores = {}
-		mirror_trajectory = (
-			self._decode_attn_tp_size() > 1
-			and self.enable_prefix_cache
-			and self._trajectory_commit_requested(
-				[
-					self.global_batch.get_sequence(uuid)
-					for uuid in prefill_uuids
-				]
-			)
-		)
-		self._mirror_group_host_kv(
-			my_prefill_uuids,
-			self._prefix.prefix_sequence_states,
-			trajectory=mirror_trajectory,
-		)
-
-		if self.rank == 0:
-			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._config_prefill_for_batch(self, prefill_uuids)
 
 	def _load_decode_model(self, comm=None) -> None:
 		"""
@@ -12924,6 +10846,7 @@ class BatchGenWorker:
 		input dicts and the broadcast/execution of the result stay on the
 		worker (in ``_page_boundary_fast``).
 		"""
+		# STAYS on the worker: moves with the admission-policy seam (sub-project admission-policy-seam).
 		return BoundaryHandler.compute_decisions(
 			self._make_boundary_decision_request(
 				decode_uuids, global_seq_state, global_candidate_info,
@@ -12957,6 +10880,7 @@ class BatchGenWorker:
 		Returns:
 			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered)
 		"""
+		# STAYS on the worker: moves with the admission-policy seam (sub-project admission-policy-seam).
 		# Completion, eviction and load decisions read every row's stop state;
 		# a deferred step's tokens must already be consumed on this rank.
 		self._require_decode_tokens_read("_page_boundary_fast")
@@ -14072,103 +11996,28 @@ class BatchGenWorker:
 		current_batch: List[int],
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[List[str], List[int]]:
-		"""Minimal finalize without extra rebuilds - rebuild done once at end."""
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._finalize_async_load_minimal(
+			self,
+			async_task,
+			pending_uuids,
+			pending_local_indices,
+			pending_global_ids,
+			current_decode_uuids,
+			current_batch,
+			gpu_manager,
+		)
+
+	def _clear_async_kv_load_model_state(self) -> None:
+		# Binder for the async-load finalize: the engine never touches the
+		# model-layer wrapper directly (repatriation, layer ruling 2026-11-14).
 		Attn_Wrapper.async_kv_load_active = False
 		Attn_Wrapper.async_kv_load_task = None
-
-		if pending_local_indices and isinstance(gpu_manager, DualKVCacheCoordinator):
-			if not isinstance(async_task, DualAsyncKVTask):
-				raise RuntimeError(
-					"DSA async load finalize requires a completed DualAsyncKVTask"
-				)
-
-		pending_local_uuid_set = {
-			self._local_to_uuid_map[idx]
-			for idx in pending_local_indices
-			if idx in self._local_to_uuid_map
-		}
-
-		# VALIDATION: Verify all pending_uuids exist and every local rank that
-		# must hold a replica confirmed its load.  Under TP decode, the old
-		# assigned-rank-only check admitted a UUID after only one of the G ranks
-		# had GPU pages, causing the other ranks to enter decode with zero pages.
-		group_size = self._decode_attn_tp_size()
-		valid_pending_uuids = []
-		invalid_pending = []
-		for uuid in pending_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				invalid_pending.append(f"{uuid[:8]} missing from global_batch")
-				continue
-			if seq.assigned_rank is None:
-				invalid_pending.append(f"{uuid[:8]} gid={seq.global_idx} has no assigned_rank")
-				continue
-			if group_size > 1:
-				from batchgen.decode_dp_group import rank_in_decode_group
-				must_confirm_local = rank_in_decode_group(
-					seq.decode_dp_group, self.rank, group_size
-				)
-			else:
-				must_confirm_local = seq.assigned_rank == self.rank
-			if must_confirm_local and uuid not in pending_local_uuid_set:
-				invalid_pending.append(
-					f"{uuid[:8]} gid={seq.global_idx} rank {self.rank} "
-					"did not confirm local load"
-				)
-				continue
-			valid_pending_uuids.append(uuid)
-
-		if invalid_pending:
-			raise RuntimeError(
-				f"Rank {self.rank}: invalid async-load pending UUIDs; "
-				f"pending_count={len(pending_uuids)}, invalid={invalid_pending[:10]}"
-			)
-
-		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
-
-		for local_idx in pending_local_indices:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-			# Mark that this sequence has received its initial GPU reservation
-			seq.mark_initial_gpu_reservation_done()
-			self._sequences_with_gpu_kv.add(uuid)
-			seq.validate_metadata(f"rank {self.rank} _finalize_async_load_minimal")
-			seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
-				f"gpu_pages={seq.gpu_pages_allocated}")
-			logging.debug(
-				f"[LOAD_CONFIRM] Rank {self.rank}: finalized uuid={uuid[:8]} "
-				f"gid={seq.global_idx} status=IN_DECODE gpu_pages={seq.gpu_pages_allocated} "
-				f"ctx={seq.current_context_length} host_pages={seq.host_pages_allocated}"
-			)
-			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
-			if local_idx in self.query_book:
-				self.query_book[local_idx] = make_query_book_entry(seq)
-
-		if hasattr(self, '_async_load_tensors'):
-			self._async_load_tensors = None
-
-		updated_uuids = current_decode_uuids + valid_pending_uuids
-		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
-		
-		uuid_to_local = {}
-		for idx in current_batch:
-			uuid = self._local_to_uuid_map.get(idx)
-			if uuid:
-				uuid_to_local[uuid] = idx
-		for idx in pending_local_indices:
-			uuid = self._local_to_uuid_map.get(idx)
-			if uuid:
-				uuid_to_local[uuid] = idx
-		
-		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
-
-		# This returns a NEW ordered row list, so stamp it here rather than at
-		# each caller: both the page-boundary planner and the decode loop call
-		# this, and a caller that forgets would leave row-keyed state stale.
-		self._bump_decode_row_epoch()
-
-		return updated_uuids, updated_batch
 
 	def _integrate_pending_async_load(
 		self,
@@ -15038,829 +12887,11 @@ class BatchGenWorker:
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
 
-		Each graph captures the entire attention block in one shot:
-		  RMSNorm → QKV proj → split → reshape → RoPE → KV write → FA → O_proj
-		  → residual add + post-attn RMSNorm
-
-		Dynamic metadata (cache_seqlens) is passed as a static-address input buffer.
-		KV cache, page table, and cos/sin tables are at fixed GPU addresses.
+		Moved verbatim to ``GraphRuntime._setup_cuda_graphs``; this stub
+		delegates with the worker passed in as the engine's sole state
+		collaborator.
 		"""
-		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			FullAttnSegment, MoESegment, MoEComputeSegment, SharedMoEBufferPool,
-			WholeModelSegment,
-		)
-		from batchgen.models.wrappers.attention import AttnWrapperBase
-
-		# Detect K2.5 model for specialized graph segment
-		_is_k25 = is_kimi_k25_backend_model(self.model_name)
-
-		# The ladder covers the per-rank decode width: decode admission is
-		# bounded by that width, so every admitted step has a bucket to
-		# replay and a step above the top bucket is an invariant violation,
-		# not an eager fallback.
-		bucket_sizes = self._decode_graph_bucket_sizes()
-		decode_width = self._max_decode_rank_bsz()
-		check_decode_width_within_buckets(decode_width, bucket_sizes)
-		if not getattr(self, "_decode_graph_ladder_logged", False):
-			logging.info(
-				"CUDA graph bucket sizes: %s (decode_width=%d, "
-				"--cuda-graph-max-bucket-size=%d, --cuda-graph-num-buckets=%d)",
-				bucket_sizes,
-				decode_width,
-				int(self.args.cuda_graph_max_bucket_size),
-				int(self.args.cuda_graph_num_buckets),
-			)
-			self._decode_graph_ladder_logged = True
-		bucketing = self._graph.new_bucketing(bucket_sizes)
-		manager = self._graph.new_manager(bucketing, device=self.torch_device)
-
-		# Use model's max_position_embeddings (not the deployment max_model_len) so the
-		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
-		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
-		# Phase C: only the whole-model graph remains for GLM-5 (the dsa / moe /
-		# dsa_full / layer modes are retired and their branches deleted).
-		glm5_whole_graph_enabled = (
-			self._glm5_whole_model_graph_requested_for_current_batch()
-		)
-		if glm5_whole_graph_enabled:
-			# The request is the requirement: requested here means required.
-			whole_graph_required = glm5_whole_graph_enabled
-			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
-			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-			capture_attempted = bool(
-				self._graph.glm5_whole_model_graph_capture_attempted_for_batch
-			)
-			if max_bsz <= 0:
-				logging.info(
-					f"Rank {self.rank}: no global GLM-5 decode rows; skipping whole-model graph capture"
-				)
-				return
-			failed_buckets = self._graph.glm5_whole_model_graph_failed_buckets
-			capture_buckets = [
-				int(bucket)
-				for bucket in bucketing.bucket_sizes
-				if int(bucket) not in failed_buckets
-			]
-			if not capture_buckets:
-				self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
-				if whole_graph_required:
-					raise RuntimeError("GLM-5 whole-model CUDA graph required but all configured buckets failed")
-				return
-			cur_batch = getattr(AttnWrapperBase, "cur_batch", None) or []
-			if len(cur_batch) != local_bsz:
-				logging.info(
-					f"Rank {self.rank}: GLM-5 whole-model graph capture deferred until "
-					"decode wrapper state is bound"
-				)
-				return
-			existing_manager = self._graph.cuda_graph_manager
-			existing_signature = self._glm5_whole_model_graph_capture_signature()
-			if existing_manager is not None and self._graph.glm5_whole_model_graph:
-				missing_configured = any(
-					not existing_manager.has_bucket_for_all_segments(bucket)
-					for bucket in capture_buckets
-				)
-				if (
-					not missing_configured
-					and existing_signature == self._graph.glm5_whole_model_graph_signature
-				):
-					self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
-					return
-				# A recapture armed by a changed criticality probe request is
-				# the one deliberate exception: it falls through to the stale
-				# graph release below and captures in place.
-				if capture_attempted and not getattr(self, "_criticality_probe_recapture", False):
-					logging.info(
-						f"Rank {self.rank}: GLM-5 whole-model CUDA graph state changed after "
-						"configure-time capture; using eager decode instead of recapturing"
-					)
-					return
-			self._assert_decode_graph_capture_allowed()
-
-			from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
-				Glm5WholeModelSegment,
-				make_glm5_whole_model_graph_segment_name,
-			)
-			from batchgen.models.glm.glm5.cuda_graph_segments import Glm5FullDsaAttnSegment
-			from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
-				Glm5DecoderLayerGraphSegment,
-			)
-			from batchgen.models.glm.glm5.model import Glm5MoE, resolve_glm5_3d_mtp
-			from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
-				Glm5MoEGraphBufferPool,
-				Glm5MoEGraphSegment,
-			)
-
-			primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-			aux_manager = getattr(
-				gpu_manager,
-				"auxiliary",
-				getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
-			)
-			if aux_manager is None:
-				raise RuntimeError("GLM-5 whole-model CUDA graph requested but auxiliary GPU KV manager is missing")
-			active_sequence_ids = list(cur_batch)
-			primary_manager.ensure_cuda_graph_page_table(active_sequence_ids)
-			aux_manager.ensure_cuda_graph_page_table(active_sequence_ids)
-			primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
-			aux_page_table = aux_manager.get_cuda_graph_page_table_storage()
-			if primary_page_table is None or aux_page_table is None:
-				raise RuntimeError(
-					"GLM-5 whole-model CUDA graph requested but GPU page-table storage is not initialized"
-				)
-			primary_page_size = int(primary_manager.config.page_size_tokens)
-			aux_page_size = int(aux_manager.config.page_size_tokens)
-			# The span comes from the DEPLOYMENT bound, never from the batch in
-			# front of us: the first decode batch used to fix it for the life
-			# of the process, so a later, longer turn had no replayable graph.
-			# A 1-byte aux element type is the page-split FP8 layout, which
-			# decides which scorer owns the context-proportional statics.
-			aux_is_page_split = int(aux_manager.config.kv_dtype.itemsize) == 1
-			capacity_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
-				primary_page_table,
-				primary_page_size,
-				aux_page_table,
-				aux_page_size,
-				deployment_context_tokens=self._deployment_context_bound_tokens(),
-				span_cap_tokens=graph_context_span_cap_tokens(
-					bucket_sizes=bucketing.bucket_sizes,
-					aux_is_page_split=aux_is_page_split,
-				),
-			)
-			graph_max_seqlen = int(capacity_seqlen)
-			# A batch already past the span is not a capture error: capturing
-			# at the span still serves every shorter step, and this step takes
-			# the eager path (see the decode-step fallback).
-			current_capture_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-			if current_capture_max_seqlen > graph_max_seqlen:
-				self._warn_decode_graph_span_exceeded(
-					current_capture_max_seqlen, graph_max_seqlen
-				)
-			# all_short lifetime: every admissible row's final length fits in
-			# index_topk, so the DSA segments attend densely to the resident
-			# page cache and skip indexer scoring/top-k for the graph lifetime.
-			# index_topk comes from the live indexer module — the value that
-			# actually drives scoring; a local-checkpoint model_config may not
-			# carry the field at all.
-			required_seqlen = self._glm5_dsa_graph_required_tokens(
-				active_sequence_ids,
-				page_size=primary_page_size,
-			)
-			_first_indexer = next(
-				(
-					getattr(layer.self_attn.module, "indexer", None)
-					for layer in self.model.model.layers
-					if getattr(layer.self_attn.module, "indexer", None) is not None
-				),
-				None,
-			)
-			index_topk_cfg = int(getattr(_first_indexer, "index_topk", 0) or 0)
-			# ONE general graph lifetime (POIS 2026-10-13). The all_short lifetime
-			# is a second, narrower lifetime: it only serves rows whose final
-			# length fits in index_topk, so a batch that grows past that bound has
-			# to fall back to eager or force a recapture. That is why the default
-			# path recaptured every bucket on every phase switch, and why the
-			# persistent path rejected long rows outright. Pinning the selection to
-			# the general lifetime makes the decode graphs capture-once and
-			# length-agnostic (their span still comes from KV capacity via
-			# graph_max_seqlen above), at the cost of always scoring the indexer.
-			# The all_short capture code itself is left in place and never selected.
-			all_short = False
-			self._graph.glm5_whole_model_all_short = all_short
-			self._graph.glm5_whole_model_index_topk = index_topk_cfg
-			if self.rank == 0:
-				logging.info(
-					"Rank %s: GLM-5 whole-model graph attention span "
-					"required_seqlen=%s index_topk=%s all_short=%s "
-					"(general lifetime pinned)",
-					self.rank,
-					required_seqlen,
-					index_topk_cfg,
-					all_short,
-				)
-
-			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
-			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
-			primary_k_cache, _ = primary_manager.get_kv_tensors()
-			aux_k_cache, _ = aux_manager.get_kv_tensors()
-			rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
-			if rank_counts is None:
-				rank_counts = torch.full(
-					(self.world_size,),
-					local_bsz,
-					dtype=torch.int64,
-					device=self.torch_device,
-				)
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				wrapper = decoder_layer.self_attn
-				indexer = getattr(wrapper.module, "indexer", None)
-				if indexer is None and layer_idx == 0:
-					# Reuse-topk segments need a producing full layer first.
-					raise RuntimeError(
-						"Layer 0: GLM-5 whole-model graph requires a DSA "
-						"indexer on the first layer")
-				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
-					wrapper.initialize_decode_absorb()
-				if indexer is not None and (
-					getattr(wrapper, "_fused_wqb_weights", None) is None
-					or getattr(wrapper, "_indexer_cuda_module", None) is None
-				):
-					# Indexer-only kernels; GLM-5.2 skip layers have none and
-					# get Glm5ReuseTopkAttnSegment instead.
-					wrapper.initialize_fused_kernels()
-				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
-					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
-				if (
-					getattr(wrapper, "_fp8_qkv_a_proj", None) is None
-					or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
-				):
-					raise RuntimeError(
-						f"Layer {layer_idx}: GLM-5 whole-model graph requires "
-						"fused Q-A/KV-A weights"
-					)
-				if indexer is not None:
-					if getattr(wrapper, "_fused_wqb_weights", None) is None:
-						raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused WQB weights")
-					if getattr(wrapper, "_indexer_cuda_module", None) is None:
-						raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused indexer CUDA module")
-			moe_not_ready = []
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				mlp = getattr(decoder_layer, "mlp", None)
-				if hasattr(mlp, "experts_per_rank") and not getattr(mlp, "_fp8_blockwise_ready", False):
-					moe_not_ready.append(layer_idx)
-			if moe_not_ready:
-				reason = (
-					"GLM-5 whole-model CUDA graph requires all local MoE experts "
-					"to be persistent and stacked for the 3D FP8 path; unavailable "
-					f"for layers {moe_not_ready[:5]}{'...' if len(moe_not_ready) > 5 else ''}. "
-					"Single-node partial-persistent expert configs can run eager/mixed "
-					"decode, but cannot validate the real whole-model graph."
-				)
-				self._graph.glm5_whole_model_graph_unavailable_reason = reason
-				if whole_graph_required:
-					raise RuntimeError(reason)
-				logging.warning("%s Using eager decode without whole-model graph compare.", reason)
-				return
-
-			if self._graph.glm5_whole_model_graph or self._graph.whole_model_segment is not None:
-				logging.info(
-					f"Rank {self.rank}: releasing stale GLM-5 whole-model CUDA graph "
-					"before configure-time capture"
-				)
-				self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
-
-			manager = self._graph.new_manager(bucketing, device=self.torch_device)
-			moe_layers = [
-				layer.mlp for layer in self.model.model.layers
-				if isinstance(getattr(layer, "mlp", None), Glm5MoE)
-			]
-			moe_pool = None
-			if moe_layers:
-				first_moe = moe_layers[0]
-				moe_pool = Glm5MoEGraphBufferPool(
-					world_size=self.world_size,
-					hidden_size=first_moe.hidden_size,
-					num_experts_per_tok=first_moe.num_experts_per_tok,
-					num_local_experts=first_moe.experts_per_rank,
-					intermediate_size=first_moe.config.moe_intermediate_size,
-					device=self.torch_device,
-					bucket_sizes=bucket_sizes,
-					# Graph decode fan-in is bounded by the largest captured
-					# bucket across all ranks; the pool still takes
-					# max(base_mtp, round_up(world_size x max_bucket)).
-					base_mtp=resolve_glm5_3d_mtp(
-						self.world_size * max(bucket_sizes)
-					),
-				)
-			shared_dsa_buffers = {}
-			shared_reuse_buffers = {}
-			last_full_segment = None
-			last_cos_table = None
-			last_sin_table = None
-			last_index_topk = None
-			layer_segments = []
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				wrapper = decoder_layer.self_attn
-				indexer = wrapper.module.indexer
-				primary_blocked_k = primary_k_cache[layer_idx]
-				if indexer is None:
-					# GLM-5.2 skip_topk layer: no indexer module. Reuse the
-					# most recent full layer's top-k (eager semantics,
-					# glm5_decode_selector.py:443-461) via the reuse segment.
-					# Rope tables are layer-invariant; borrow the producer's.
-					if last_full_segment is None:
-						raise RuntimeError(
-							"GLM-5 whole-model graph: first layer has no DSA "
-							"indexer; layer 0 must be a full indexer layer"
-						)
-					from batchgen.models.glm.glm5.reuse_topk_segment import (
-						Glm5ReuseTopkAttnSegment,
-					)
-					dsa_segment = Glm5ReuseTopkAttnSegment(
-						wrapper=wrapper,
-						primary_blocked_k=primary_blocked_k,
-						primary_page_table=primary_page_table,
-						absorb_weights=wrapper._fp8_absorb_weights,
-						cos_table=last_cos_table,
-						sin_table=last_sin_table,
-						max_seqlen=graph_max_seqlen,
-						index_topk=last_index_topk,
-						page_size=primary_page_size,
-						topk_source=last_full_segment,
-						all_short=all_short,
-						shared_buffers=shared_reuse_buffers,
-					)
-				else:
-					# The aux pool may hold only the indexer layers (GLM-5.2):
-					# resolve the physical slot instead of indexing by engine layer.
-					aux_blocked_k = aux_k_cache[aux_manager.resolve_physical_layer(layer_idx)]
-					dummy = torch.empty(
-						1,
-						1,
-						indexer.rope_head_dim,
-						device=primary_blocked_k.device,
-						dtype=torch.bfloat16,
-					)
-					cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
-					dsa_segment = Glm5FullDsaAttnSegment(
-						wrapper=wrapper,
-						primary_blocked_k=primary_blocked_k,
-						aux_blocked_k=aux_blocked_k,
-						primary_page_table=primary_page_table,
-						aux_page_table=aux_page_table,
-						wq_b_weights=wrapper._fused_wqb_weights,
-						absorb_weights=wrapper._fp8_absorb_weights,
-						cuda_module=wrapper._indexer_cuda_module,
-						cos_table=cos_table,
-						sin_table=sin_table,
-						max_seqlen=graph_max_seqlen,
-						index_topk=indexer.index_topk,
-						page_size=primary_page_size,
-						aux_page_size=aux_page_size,
-						all_short=all_short,
-						shared_buffers=shared_dsa_buffers,
-					)
-					last_full_segment = dsa_segment
-					last_cos_table = cos_table
-					last_sin_table = sin_table
-					last_index_topk = indexer.index_topk
-				moe_segment = None
-				moe = getattr(decoder_layer, "mlp", None)
-				if isinstance(moe, Glm5MoE):
-					moe_segment = Glm5MoEGraphSegment(
-						moe,
-						moe_pool,
-						moe.comm,
-						world_size=self.world_size,
-						rank=self.rank,
-						device=self.torch_device,
-					)
-				layer_segments.append(
-					Glm5DecoderLayerGraphSegment(
-						layer=decoder_layer,
-						dsa_segment=dsa_segment,
-						moe_segment=moe_segment,
-						device=self.torch_device,
-						world_size=self.world_size,
-						capture_local_bsz=local_bsz,
-						capture_rank_token_counts=rank_counts,
-					)
-				)
-			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
-			hidden_size = self.model.config.hidden_size
-			compare_probe_layers = self._glm5_whole_model_graph_probe_layers(
-				len(self.model.model.layers)
-			)
-			whole_seg = Glm5WholeModelSegment(
-				model=self.model,
-				device=self.torch_device,
-				world_size=self.world_size,
-				max_pages_per_seq=primary_page_table.shape[1],
-				max_aux_pages_per_seq=aux_page_table.shape[1],
-				vocab_size=vocab_size,
-				hidden_size=hidden_size,
-				max_bucket_size=bucketing._max_bucket,
-				max_seqlen=graph_max_seqlen,
-				include_embedding=True,
-				include_lm_head=True,
-				compare_probe_layers=compare_probe_layers,
-				layer_segments=layer_segments,
-				# e4m3 for a page-split FP8 indexer pool, bf16 for AoS: the aux
-				# staging clone must not requantize the stream.
-				aux_kv_staging_dtype=aux_manager.config.kv_dtype,
-				stage_kv_for_offload=not self.glm5_disable_decode_host_kv_staging,
-			)
-			segment_name = make_glm5_whole_model_graph_segment_name()
-			manager.register_segment(segment_name, whole_seg)
-			first_wrapper = self.model.model.layers[0].self_attn.module
-			num_heads = int(getattr(first_wrapper, "num_heads", 64))
-			logging.info(
-				f"Rank {self.rank}: capturing GLM-5 whole-model CUDA graph "
-				f"segment={segment_name} buckets={capture_buckets}, "
-				f"context_capacity={graph_max_seqlen}"
-			)
-			# Criticality probe: installed before warmup and capture, because
-			# its spin nodes are issued by the segments' forward. Without a
-			# request the adapter is not asked and nothing is constructed.
-			self._criticality_probe = None
-			probe_request = getattr(self, "_criticality_probe_request", None)
-			if probe_request is not None:
-				self._criticality_probe = self._graph.cuda_graph_adapter.install_criticality_probe(
-					probe_request,
-					whole_model_segment=whole_seg,
-					device=self.torch_device,
-				)
-			torch.cuda.synchronize(self.torch_device)
-			dist.barrier()
-			self._graph.cuda_graph_manager = manager
-			self._graph.whole_model_graph = True
-			self._graph.glm5_whole_model_graph = True
-			self._graph.whole_model_bucketing = bucketing
-			self._graph.whole_model_segment = whole_seg
-			self._graph.glm5_whole_model_graph_capture_attempted_for_batch = True
-			try:
-				# Largest-first: the big bucket primes the shared graph pool and
-				# smaller buckets reuse its blocks instead of growing the pool.
-				for capture_bucket in sorted(capture_buckets, reverse=True):
-					torch.cuda.synchronize(self.torch_device)
-					dist.barrier()
-					whole_seg.set_capture_inputs(
-						**self._make_glm5_whole_model_capture_inputs(
-							bucket=capture_bucket,
-							num_heads=num_heads,
-						)
-					)
-					manager.warmup_and_capture_buckets([capture_bucket])
-					torch.cuda.synchronize(self.torch_device)
-					dist.barrier()
-			except torch.OutOfMemoryError as exc:
-				manager.drop_bucket(capture_bucket)
-				self._graph.glm5_whole_model_graph_failed_buckets.add(capture_bucket)
-				self._graph.cuda_graph_manager = None
-				self._graph.whole_model_segment = None
-				self._graph.glm5_whole_model_all_short = False
-				self._graph.glm5_whole_model_index_topk = 0
-				self._graph.whole_model_bucketing = None
-				self._graph.glm5_whole_model_capture_input_ids = None
-				self._graph.whole_model_graph = False
-				self._graph.glm5_whole_model_graph = False
-				self._criticality_probe = None
-				self._criticality_probe_recapture = False
-				torch.cuda.empty_cache()
-				if whole_graph_required:
-					raise
-				logging.error(
-					f"Rank {self.rank}: GLM-5 whole-model CUDA graph configure-time "
-					f"capture for bucket BS={capture_bucket} ran out of memory; using eager decode: {exc}"
-				)
-				return
-			self._graph.glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
-			self._record_decode_graph_capture()
-			self._criticality_probe_recapture = False
-			# Phase B: hand the just-captured segment to the adapter so its
-			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
-			# can run against the same captured graph the legacy path uses.
-			# Without this attach, adapter._ctx stays None and eligibility()
-			# returns EAGER/adapter_not_built every step (the worker silently
-			# falls back to the legacy path).
-			if self._graph.cuda_graph_adapter is not None:
-				try:
-					_adapter_max_seqlen = int(getattr(whole_seg, "max_seqlen", 0) or 0)
-					_adapter_gpu_mgr = gpu_manager
-					_attach = getattr(self._graph.cuda_graph_adapter, "attach_existing_segment", None)
-					if _attach is not None:
-						_attach(
-							model=self.model,
-							whole_model_segment=whole_seg,
-							bucketing=bucketing,
-							gpu_kv_manager=_adapter_gpu_mgr,
-							device=self.torch_device,
-							max_seqlen_cap=_adapter_max_seqlen,
-						)
-					for _bucket in capture_buckets:
-						_sig = self._graph.cuda_graph_adapter.capture_signature(
-							bucket=int(_bucket),
-							gpu_kv_manager=_adapter_gpu_mgr,
-							max_seqlen=_adapter_max_seqlen,
-						)
-						self._graph.cuda_graph_adapter.record_capture(
-							segment_name=segment_name,
-							bucket=int(_bucket),
-							signature=_sig,
-						)
-				except Exception as _exc:
-					logging.warning(
-						"Phase B: failed to attach/record_capture on adapter: %s", _exc,
-					)
-			# The decode graphs are captured and active, so the eager MoE
-			# buffers these layers share (one set for the whole model) are dead
-			# residency competing with the KV pool that
-			# _finalize_gpu_kv_pool_after_capture sizes from the post-capture
-			# steady usage. The eager fallback paths re-create them on demand
-			# at their own entry, so this is a residency switch only.
-			for _mlp in moe_layers[:1]:
-				_eager_moe_freed = _mlp.release_eager_decode_buffers()
-				if _eager_moe_freed and self.rank == 0:
-					logging.info(
-						"Rank %s: released the eager MoE decode buffers "
-						"(%.3f GiB) after graph capture",
-						self.rank,
-						_eager_moe_freed / (1024 ** 3),
-					)
-			stats = manager.get_capture_stats()
-			logging.info(
-				f"Rank {self.rank}: GLM-5 whole-model CUDA graph ready in "
-				f"{stats['total_capture_time_ms']:.0f}ms for buckets {capture_buckets}"
-			)
-			if self._glm5_whole_model_graph_timing_requested_for_current_batch():
-				logging.info(
-					"[GLM5_WHOLE_GRAPH_TIMING] rank=%s buckets=%s capture_ms=%.3f",
-					self.rank,
-					capture_buckets,
-					stats["total_capture_time_ms"],
-				)
-			return
-
-		# Every other decode graph path is under the same capture-once rule.
-		self._assert_decode_graph_capture_allowed()
-
-		# GPT-OSS-specific pre-warm and per-layer segment registration
-		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
-		has_moe_graph = False
-		moe_pool = None
-		if not _is_k25:
-			# Pre-warm: initialize sinks and RoPE cache before capture
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				wrapper = decoder_layer.self_attn
-				# Initialize sinks for persistent mode
-				if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
-					wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
-				elif wrapper.sinks is not None:
-					wrapper.sinks = wrapper.sinks.to(self.torch_device)
-				# Pre-warm RoPE cos/sin cache to max position embeddings
-				dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
-				wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
-
-			# Register full attention segments
-			# Use max possible pages based on max sequence length, not current state.
-			# The page_table static buffer column width is baked into the graph —
-			# if sequences grow beyond this during decode, FlashAttention reads
-			# past the buffer causing illegal memory access.
-			page_size_tokens = gpu_manager.config.page_size_tokens
-			max_seq_len = self.model.config.max_position_embeddings
-			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				attn_wrapper = decoder_layer.self_attn
-				seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
-									  max_pages, page_size_tokens)
-				manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
-
-			# Register MoE segments with shared buffer pool (EP mode)
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				moe_decode = decoder_layer.mlp
-				if (hasattr(moe_decode, 'persistent_expert_indices')
-						and len(moe_decode.persistent_expert_indices) > 0
-						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-					# Create shared pool once from first MoE layer's params
-					if moe_pool is None:
-						moe_pool = SharedMoEBufferPool(
-							world_size=self.world_size,
-							hidden_size=moe_decode.hidden_size,
-							total_experts=moe_decode.total_experts,
-							num_experts_per_tok=moe_decode.num_experts_per_tok,
-							num_local_experts=len(moe_decode.persistent_expert_indices),
-							N_intermediate=moe_decode.gate_weight_ref.shape[0],
-							device=self.torch_device,
-						)
-						moe_pool.setup(bucketing.bucket_sizes)
-					moe_seg = MoESegment(
-						moe_decode, moe_pool, moe_decode.comm,
-						self.world_size, self.rank, self.torch_device,
-					)
-					decoder_layer._moe_segment = moe_seg
-					decoder_layer._moe_bucketing = bucketing
-					# Register compute segment for graph capture.
-					# All_gather is graph-captured; all_reduce remains eager.
-					if not os.environ.get("BATCHGEN_MOE_EAGER"):
-						moe_compute_seg = MoEComputeSegment(
-							moe_decode, moe_pool, moe_decode.comm,
-							self.world_size, self.rank, self.torch_device,
-						)
-						manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
-						has_moe_graph = True
-		else:
-			# K2.5: Pre-warm RoPE cache (shared instance)
-			rotary_emb = self.model.model._shared_rotary_emb
-			dummy = torch.zeros(1, 1, 1, rotary_emb.dim, device=self.torch_device)
-			rotary_emb(dummy, seq_len=max_rope_len)
-			# Compute max_pages for K2.5
-			page_size_tokens = gpu_manager.config.page_size_tokens
-			max_seq_len = self.model.config.max_position_embeddings
-			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
-
-		# Set gpu_paged_kv_manager so segments can access it during capture
-		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
-
-		# K2.5: whole-model graph via the cuda-graph adapter (minimal parallel
-		# path). POIS decision: serialize the shared expert inline to reclaim
-		# the eager-MoE launch overhead. Self-contained; leaves the GLM-5 /
-		# GPT-OSS whole-model paths byte-for-byte untouched. Falls back to the
-		# legacy per-layer K2.5 path below if no adapter is present.
-		if _is_k25 and self._graph.cuda_graph_adapter is not None:
-			from batchgen.models.moonshotai.kimi_k25.cuda_graph_adapter import (
-				SEGMENT_NAME_WHOLE_MODEL as _K25_WM_NAME,
-			)
-			bundle = self._graph.cuda_graph_adapter.build_segments(
-				model=self.model,
-				bucketing=bucketing,
-				gpu_kv_manager=gpu_manager,
-				world_size=self.world_size,
-				rank=self.rank,
-				device=self.torch_device,
-				max_seqlen_cap=max_rope_len,
-			)
-			whole_seg = bundle.whole_model
-			manager.register_segment(_K25_WM_NAME, whole_seg)
-			if self.rank == 0:
-				logging.info(
-					f"CUDA graph capture (K2.5 whole-model): segment={_K25_WM_NAME} "
-					f"× {len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-				)
-			# NCCL collectives are baked into the graph — all ranks must capture
-			# the same buckets simultaneously.
-			torch.cuda.synchronize(self.torch_device)
-			dist.barrier()
-			manager.warmup_and_capture_all()
-			for _bucket in bucketing.bucket_sizes:
-				_sig = self._graph.cuda_graph_adapter.capture_signature(
-					bucket=_bucket, gpu_kv_manager=gpu_manager, max_seqlen=max_rope_len,
-				)
-				self._graph.cuda_graph_adapter.record_capture(
-					segment_name=_K25_WM_NAME, bucket=_bucket, signature=_sig,
-				)
-			self._graph.cuda_graph_manager = manager
-			self._graph.whole_model_graph = True
-			self._graph.k25_whole_model_graph = True
-			self._graph.whole_model_segment_name = _K25_WM_NAME
-			self._graph.whole_model_bucketing = bucketing
-			self._graph.whole_model_segment = whole_seg
-			self._record_decode_graph_capture()
-			if self.rank == 0:
-				stats = manager.get_capture_stats()
-				logging.info(
-					f"CUDA graphs ready (K2.5 whole-model): {stats['total_capture_time_ms']:.0f}ms"
-				)
-			return
-
-		# Whole-model graph is the default for GPT-OSS.
-		# K2.5 without an adapter falls back to per-layer (segmented) mode.
-		if _is_k25:
-			use_whole_model = False
-		else:
-			use_whole_model = True
-
-		if use_whole_model:
-			# Whole-model mode: single graph for entire decode pass.
-			# Discard per-layer segments, register one WholeModelSegment instead.
-			manager = self._graph.new_manager(bucketing, device=self.torch_device)
-
-			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
-			hidden_size = self.model.config.hidden_size
-
-			if _is_k25:
-				# K2.5 uses MLA attention + 3D strided MoE — different segment class
-				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25WholeModelSegment
-				whole_seg = K25WholeModelSegment(
-					model=self.model,
-					device=self.torch_device,
-					max_pages_per_seq=max_pages,
-					vocab_size=vocab_size,
-					hidden_size=hidden_size,
-					max_bucket_size=bucketing._max_bucket,
-				)
-			else:
-				# GPT-OSS: GQA attention + SharedMoEBufferPool
-				# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
-				# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
-				# inside the graph — required for single-graph whole-model capture.
-				moe_segments = {}
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					moe_decode = decoder_layer.mlp
-					if (hasattr(moe_decode, 'persistent_expert_indices')
-							and len(moe_decode.persistent_expert_indices) > 0
-							and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-						moe_segments[layer_idx] = MoESegment(
-							moe_decode, moe_pool, moe_decode.comm,
-							self.world_size, self.rank, self.torch_device,
-						)
-
-				whole_seg = WholeModelSegment(
-					model=self.model,
-					moe_pool=moe_pool,
-					moe_segments=moe_segments,
-					device=self.torch_device,
-					max_pages_per_seq=max_pages,
-					vocab_size=vocab_size,
-					hidden_size=hidden_size,
-					max_bucket_size=bucketing._max_bucket,
-				)
-
-			manager.register_segment("whole_model", whole_seg)
-
-			if self.rank == 0:
-				logging.info(
-					f"CUDA graph capture: whole-model × "
-					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-				)
-
-			# Sync all ranks — NCCL collectives require simultaneous participation
-			torch.cuda.synchronize(self.torch_device)
-			dist.barrier()
-
-			manager.warmup_and_capture_all()
-
-			# Reset capture mode flags
-			for layer in self.model.model.layers:
-				layer._graph_capture_mode = False
-
-			self._graph.cuda_graph_manager = manager
-			self._graph.whole_model_graph = True
-			self._graph.whole_model_bucketing = bucketing
-			self._graph.whole_model_segment = whole_seg
-			if self.rank == 0:
-				stats = manager.get_capture_stats()
-				logging.info(
-					f"CUDA graphs ready (whole-model): {stats['total_capture_time_ms']:.0f}ms"
-				)
-		else:
-			# Per-layer mode: capture attention graph per layer, MoE stays eager.
-			self._graph.whole_model_graph = False
-
-			if _is_k25:
-				# K2.5: Register K25AttnSegment per layer (MLA attention only, no MoE graph).
-				# MoE stays eager to preserve async shared expert overlap.
-				# Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
-				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25AttnSegment
-
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					attn_wrapper = decoder_layer.self_attn
-					seg = K25AttnSegment(
-						decoder_layer, attn_wrapper, layer_idx,
-						max_seq_len=max_rope_len,
-						max_pages_per_seq=max_pages,
-						page_size_tokens=page_size_tokens,
-					)
-					seg_name = f"layer_{layer_idx}_attn"
-					manager.register_segment(seg_name, seg)
-
-				if self.rank == 0:
-					logging.info(
-						f"CUDA graph capture (K2.5 MLA): {len(self.model.model.layers)} layers (attn only) × "
-						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-					)
-
-				manager.warmup_and_capture_all()
-
-				# Enable graph mode on each decoder layer
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					decoder_layer.enable_cuda_graph(
-						manager,
-						attn_name=f"layer_{layer_idx}_attn",
-						max_pages_per_seq=max_pages,
-					)
-			else:
-				# GPT-OSS: per-layer mode (existing behavior)
-				if self.rank == 0:
-					num_segs = "attn+moe" if has_moe_graph else "attn"
-					logging.info(
-						f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
-						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-					)
-
-				# Sync all ranks before warmup — MoE segments use NCCL collectives
-				# which require all ranks to participate simultaneously.
-				if has_moe_graph:
-					torch.cuda.synchronize(self.torch_device)
-					dist.barrier()
-
-				manager.warmup_and_capture_all()
-
-				# Enable graph mode on each decoder layer
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
-					decoder_layer.enable_cuda_graph(
-						manager,
-						full_attn_name=f"layer_{layer_idx}_full_attn",
-						moe_name=moe_name,
-					)
-
-			self._graph.cuda_graph_manager = manager
-			if self.rank == 0:
-				stats = manager.get_capture_stats()
-				logging.info(
-					f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
-				)
-		self._record_decode_graph_capture()
+		return self._graph._setup_cuda_graphs(self, gpu_manager)
 
 	def _bind_decode_entry_model_state(
 		self,

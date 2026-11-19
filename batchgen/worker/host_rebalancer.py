@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Sequence
 
 if TYPE_CHECKING:
-    from batchgen.migration import MigrationOp
+    from batchgen.worker.kv_migration_types import MigrationOp
 
 
 class HostKVRebalancer:

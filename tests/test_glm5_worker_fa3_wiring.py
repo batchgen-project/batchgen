@@ -23,7 +23,11 @@ import typing
 import pytest
 
 from batchgen.sequence import SequenceStatus
-from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+from tests.worker_method_source import (
+    delegated_method_names,
+    delegated_method_source,
+    worker_shaped_method_node,
+)
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -79,12 +83,14 @@ def _kwargs(call: ast.Call) -> dict[str, str]:
 
 
 def _function_containing_call(callee: str) -> ast.FunctionDef:
+    # The owner may be a worker method or a body delegated to an engine
+    # (worker shape); the delegator stub itself contains no such call, so
+    # scanning both sides still yields exactly one owner.
     cls = _class(_tree(_WORKER_SRC), "BatchGenWorker")
-    owners = [
-        stmt
-        for stmt in cls.body
-        if isinstance(stmt, ast.FunctionDef) and _calls_to(stmt, callee)
-    ]
+    candidates = [
+        stmt for stmt in cls.body if isinstance(stmt, ast.FunctionDef)
+    ] + [worker_shaped_method_node(name) for name in sorted(delegated_method_names())]
+    owners = [fn for fn in candidates if _calls_to(fn, callee)]
     assert len(owners) == 1, [fn.name for fn in owners]
     return owners[0]
 
@@ -356,7 +362,9 @@ def test_admission_refuses_over_budget_rows_in_an_all_short_lifetime():
 
 
 def test_guards_read_the_stored_index_topk():
-    source = _WORKER_SRC.read_text()
+    # Repatriation: the capture loop's consumers live in GraphRuntime now;
+    # the count spans the worker plus that delegated body.
+    source = _WORKER_SRC.read_text() + delegated_method_source("_setup_cuda_graphs")
     assert source.count("glm5_whole_model_index_topk", 0) >= 5
     # No guard reads index_topk off model_config any more (the step-state
     # hint helper at module level is a separate, pre-existing consumer).

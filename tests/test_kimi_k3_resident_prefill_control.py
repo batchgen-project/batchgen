@@ -3337,7 +3337,14 @@ def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile()
     assert "if streamed_sp8 or k3_prefill_profile:" in source
     assert '"streamed_sp8": (' in source
     assert '"expert_consumer": (' in source
-    assert "torch.cuda.reset_peak_memory_stats(self.local_rank)" in source
+    # R2: _config_prefill_for_batch's body now lives on PrefillEngine; read the
+    # delegated engine segment for the statement that moved with it.
+    from tests.worker_method_source import delegated_method_source
+
+    assert (
+        "torch.cuda.reset_peak_memory_stats(self.local_rank)"
+        in delegated_method_source("_config_prefill_for_batch")
+    )
     for field in (
         "current_allocated_bytes",
         "current_reserved_bytes",

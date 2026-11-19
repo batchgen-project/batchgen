@@ -88,7 +88,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Protocol, Sequen
 
 if TYPE_CHECKING:
     from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
-    from batchgen.migration import MigrationOp
+    from batchgen.worker.kv_migration_types import MigrationOp
     from batchgen.query_book import QueryBookEntry
     from batchgen.sequence import SequenceBatch
 
@@ -689,7 +689,7 @@ class KVCacheManager:
         ``global_idx``; ties broken by node id), so every rank produces the
         identical plan without communication.
         """
-        from batchgen.migration import MigrationOp
+        from batchgen.worker.kv_migration_types import MigrationOp
 
         node_stats = req.node_stats
         if len(node_stats) <= 1:

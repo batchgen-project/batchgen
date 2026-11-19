@@ -289,8 +289,10 @@ def test_missing_sequences_are_skipped_not_refused():
 
 
 def _method(name):
-    return next(node for node in _worker_class().body
-                if isinstance(node, ast.FunctionDef) and node.name == name)
+    # R2: delegated prefill bodies resolve to their engine source.
+    from tests.worker_method_source import worker_shaped_method_node
+
+    return worker_shaped_method_node(name)
 
 
 def _calls(node):

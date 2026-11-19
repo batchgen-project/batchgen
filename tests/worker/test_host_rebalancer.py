@@ -7,7 +7,7 @@ ranks 0-7 = node 0, ranks 8-15 = node 1, ranks 16-23 = node 2.
 
 from __future__ import annotations
 
-from batchgen.migration import MigrationOp
+from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 
 _GPN = 8

@@ -1,4 +1,4 @@
-from batchgen.batch_order import (
+from batchgen.prefill.batch_order import (
     batch_matches_expected_uuid_order,
     build_prefill_sequence_spans,
     local_indices_to_uuid_order,

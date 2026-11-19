@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from batchgen.migration import MigrationOp
+from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.query_book import QueryBookEntry
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import (

@@ -32,6 +32,7 @@ from batchgen.cuda_graph.buckets import generate_bucket_sizes
 from batchgen.worker.graph_runtime import GraphRuntime
 from tests.worker_method_source import (
     delegated_method_names,
+    delegated_method_source,
     load_worker_shaped_methods,
     worker_shaped_method_node,
 )
@@ -363,7 +364,9 @@ def test_a_failed_bucket_is_added_and_filters_the_capture_list():
 
 
 def test_the_capture_loop_filters_against_the_runtimes_failed_set():
-    src = _WORKER_SRC.read_text()
+    # Repatriation: the capture loop's text lives in GraphRuntime now; the
+    # pin reads the delegated engine body (verbatim worker spelling).
+    src = delegated_method_source("_setup_cuda_graphs")
     assert (
         "failed_buckets = self._graph.glm5_whole_model_graph_failed_buckets" in src
     )

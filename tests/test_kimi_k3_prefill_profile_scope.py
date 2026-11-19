@@ -66,11 +66,13 @@ def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
         for node in engine_tree.body
         if isinstance(node, ast.ClassDef) and node.name == "PrefillEngine"
     )
-    functions["prefill_prepacked"] = next(
-        node
-        for node in engine.body
-        if isinstance(node, ast.FunctionDef) and node.name == "prefill_prepacked"
-    )
+    # S5b/R2: these bodies moved verbatim to PrefillEngine.
+    for moved in ("prefill_prepacked", "_config_prefill_for_batch"):
+        functions[moved] = next(
+            node
+            for node in engine.body
+            if isinstance(node, ast.FunctionDef) and node.name == moved
+        )
 
     # The invariant is that both prefill stages see batchgen_debug resolved
     # from the admitted SequenceEntry objects, which is the only place a

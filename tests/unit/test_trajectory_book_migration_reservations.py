@@ -30,12 +30,12 @@ import pytest
 import torch
 
 from batchgen.lifespan import SeqEvent
-from batchgen.migration import MigrationOp
+from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.query_book import QueryBook, make_query_book_entry
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
-from tests.worker_method_source import load_worker_methods
+from tests.worker_method_source import load_worker_shaped_methods
 
 WORKER_METHODS = (
     "_rebalance_host_kv",
@@ -94,7 +94,7 @@ class QueryBookPoolCapacityError(RuntimeError):
 
 def _load_worker_shell(fake_dist):
     """Build a rank class from the worker's real migration methods."""
-    methods = load_worker_methods(WORKER_METHODS, {
+    methods = load_worker_shaped_methods(WORKER_METHODS, {
         "BATCHGEN_CB_DEBUG": False,
         "Dict": Dict,
         "DualHostKVCoordinator": _NoDualCoordinator,
