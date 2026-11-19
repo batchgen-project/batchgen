@@ -277,7 +277,11 @@ class WorkerManager:
         # Held LOCK_SH for this process's whole life; see hold_run_lock.
         self._run_lock = None
         self._state = "serving"
+        # The cohort this node serves, or is starting, named by the restart
+        # epoch that brought it up (_generation_of_epoch); 0 before start-up.
         self._generation = 0
+        # The epoch of the cohort being spawned, which its ranks log under.
+        self._spawning_epoch = 0
         self._first_ready = False
         self._reconciled_failure = False
         self._main_thread_dispatcher: Optional[Callable[[Callable[[], Any], float], Any]] = None
@@ -387,6 +391,21 @@ class WorkerManager:
     def generation(self) -> int:
         with self._lock:
             return self._generation
+
+    @staticmethod
+    def _generation_of_epoch(epoch: int) -> int:
+        """The generation of the cohort a restart epoch brings up.
+
+        A cohort is one ``torch.distributed`` world over every node, and a
+        peer polls cohort-down keys under the generation it holds, so every
+        node must name a cohort alike or a failure one node publishes is never
+        read by the others. The restart epoch is that shared name: node 0's
+        control store hands it to every node (a single-node coordinator
+        counts it locally), and the start-up cohort is epoch 0's. Whichever
+        epochs a node failed or never joined, the cohort it serves next is
+        named by the epoch that brought it up.
+        """
+        return int(epoch) + 1
 
     @property
     def coordinator_error(self) -> Optional[str]:
@@ -602,6 +621,13 @@ class WorkerManager:
         import time as _time
 
         startup_start = _time.monotonic()
+        # The start-up cohort is restart epoch 0's on every node, named before
+        # any of it exists: a failure this node publishes while it is still
+        # starting must carry the name a peer that is already ready polls
+        # under.
+        with self._lock:
+            self._generation = self._generation_of_epoch(0)
+        self._spawning_epoch = 0
         self._acquire_runtime_admission()
 
         self._stopping = False
@@ -716,7 +742,6 @@ class WorkerManager:
 
         self.started = True
         with self._lock:
-            self._generation += 1
             self._state = "serving"
             self._first_ready = True
             self._reconciled_failure = False
@@ -1410,7 +1435,9 @@ class WorkerManager:
         ready_everywhere = False
         phase = self._RESTART_PHASE_ARMED
         try:
-            if coordinated and not following:
+            if not following:
+                # Every restart claims an epoch, coordinated or not: the epoch
+                # names the cohort it brings up (_generation_of_epoch).
                 request = coordinator.begin_restart(timeout_s)
                 epoch = request.epoch
                 deadline = request.deadline
@@ -1520,6 +1547,7 @@ class WorkerManager:
             # cohort spawned below.
             self._worker_exit_state.clear()
             self._abort_restart_if_stopping()
+            self._spawning_epoch = epoch
             self._call_spawn_on_main_thread(self._spawn_unless_stopping, timeout_s)
             self._start_worker_monitor()
             if coordinated:
@@ -1580,12 +1608,13 @@ class WorkerManager:
                         coordinator.publish_result(
                             epoch, {"state": "workers_down", "error": reason}
                         )
-                    # Past P2 every peer is about to serve the new generation
-                    # (it bumps to generation + 1 on success), so the failure
-                    # must reach them as that cohort's down key, not as a
-                    # phase ack nobody is waiting on any more.
+                    # Past P2 every peer is about to serve this epoch's cohort,
+                    # so the failure must reach them as that cohort's down
+                    # key, not as a phase ack nobody is waiting on any more.
                     if ready_everywhere:
-                        coordinator.publish_down(self.generation + 1, reason)
+                        coordinator.publish_down(
+                            self._generation_of_epoch(epoch), reason
+                        )
                 except Exception:
                     logger.warning(
                         "Could not publish restart epoch %s failure to peers",
@@ -1601,7 +1630,7 @@ class WorkerManager:
             raise
         self._coordinated_phase = None
         with self._lock:
-            self._generation += 1
+            self._generation = self._generation_of_epoch(epoch)
             self._state = "serving"
             self._first_ready = True
             self._worker_exit_state.clear()
@@ -1861,7 +1890,9 @@ class WorkerManager:
             log_level=self.args.log_level,
             run_id=run.run_id,
             run_started_at=run.run_started_at,
-            log_cohort=self._generation,
+            # The epoch that brings this cohort up: 0 for start-up, and the
+            # same number on every node, failed restarts included.
+            log_cohort=self._spawning_epoch,
         )
         from batchgen.server_worker_main_loop import server_worker_main
         # Each worker arms PR_SET_PDEATHSIG, which the kernel delivers when the

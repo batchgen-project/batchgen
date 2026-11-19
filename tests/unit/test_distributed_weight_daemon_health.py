@@ -102,6 +102,8 @@ def _serving_manager(monkeypatch, *, on_poll=None, node_rank=1):
         enabled=False,
         epoch=0,
         control_error=None,
+        # Every restart claims the epoch that names the cohort it brings up.
+        begin_restart=lambda timeout_s: SimpleNamespace(epoch=3, deadline=None),
         publish_down=lambda generation, reason: published.append(
             (generation, reason)
         ),
