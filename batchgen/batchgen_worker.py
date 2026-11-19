@@ -297,6 +297,10 @@ from batchgen.worker.kv_plan import (
 )
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
+from batchgen.worker.decode_profile import (
+	DecodeProfileCapture,
+	open_torch_decode_profiler,
+)
 from batchgen.worker.step_timing import (
 	FORWARD_EVENT_RING_SLOTS,
 	ForwardEventRing,
@@ -7520,61 +7524,28 @@ class BatchGenWorker:
 			max_rank_bsz=max_rank_bsz,
 		)
 
+	def _decode_profile_capture_state(self) -> DecodeProfileCapture:
+		# One per worker generation; see batchgen.worker.decode_profile.
+		capture = getattr(self, "_decode_profile_capture", None)
+		if capture is None:
+			capture = DecodeProfileCapture(
+				self.rank,
+				open_torch_decode_profiler,
+				lambda: torch.cuda.synchronize(self.torch_device),
+			)
+			self._decode_profile_capture = capture
+		return capture
+
 	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
-		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: after 3
-		warm-up steps, wrap the next N decode steps of rank 0 in
-		``torch.profiler`` (CUDA + CPU) and log the kernel table sorted by CUDA
-		time — a per-kernel breakdown of the GPU-bound step without a server
-		restart. One capture per server lifetime."""
-		# ``k3_decode_profile_ranks``: which ranks profile (default rank 0; the
-		# first rank of every node shows cross-node skew inside the exchange).
-		_prof_ranks = (batchgen_debug or {}).get("k3_decode_profile_ranks") or [0]
-		if self.rank not in _prof_ranks or getattr(self, "_k3_decode_profile_done", False):
-			return
-		try:
-			steps = int((batchgen_debug or {}).get("k3_decode_profile_steps", 0) or 0)
-		except (TypeError, ValueError):
-			return
-		if steps <= 0:
-			return
-		count = getattr(self, "_k3_decode_profile_count", 0) + 1
-		self._k3_decode_profile_count = count
-		warmup = 3
-		if count == warmup + 1:
-			from torch.profiler import ProfilerActivity, profile
-			self._k3_decode_profiler = profile(
-				activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-			)
-			self._k3_decode_profiler.__enter__()
-			self._k3_decode_profile_rows = batch_rows
-			logging.info("[K3_DECODE_PROFILE] capturing %d decode steps at %d rows", steps, batch_rows)
-		elif count == warmup + 1 + steps:
-			prof = getattr(self, "_k3_decode_profiler", None)
-			if prof is None:
-				return
-			torch.cuda.synchronize(self.torch_device)
-			prof.__exit__(None, None, None)
-			self._k3_decode_profiler = None
-			self._k3_decode_profile_done = True
-			table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=40)
-			logging.info(
-				"[K3_DECODE_PROFILE] %d steps at %d rows (per-step = table / %d)\n%s",
-				steps, self._k3_decode_profile_rows, steps, table,
-			)
-			# ``k3_decode_profile_trace = "<dir>"``: also dump the Chrome trace
-			# (kernel sequence per step, for per-layer node counts); the table
-			# alone loses the order.
-			trace_dir = (batchgen_debug or {}).get("k3_decode_profile_trace")
-			if trace_dir:
-				try:
-					os.makedirs(trace_dir, exist_ok=True)
-					path = os.path.join(
-						trace_dir, f"k3_decode_profile_rows{self._k3_decode_profile_rows}_rank{self.rank}.json"
-					)
-					prof.export_chrome_trace(path)
-					logging.info("[K3_DECODE_PROFILE] trace written to %s", path)
-				except Exception as exc:  # noqa: BLE001 - diagnostics only
-					logging.warning("[K3_DECODE_PROFILE] trace export failed: %s", exc)
+		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: a
+		per-kernel breakdown of N decode steps without a server restart."""
+		self._decode_profile_capture_state().step(batchgen_debug, batch_rows)
+
+	def _group_profiled_line(self) -> str:
+		"""Extra line of the batch group summary of a profiled generation."""
+		if not self._decode_profile_capture_state().profiled:
+			return ""
+		return "\n  Profiled: yes (decode timings of this worker generation are not admissible)"
 
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -7936,6 +7907,7 @@ class BatchGenWorker:
 						f"  Decode: {decoding_time:.1f}s ({dc_tp:,.0f} tok/s)\n"
 						f"  Total: {gen_time:.1f}s ({ov_tp:,.0f} tok/s)\n"
 						f"  Prompt tokens: {total_prompt:,}, Decoded tokens: {total_decoded:,}"
+						f"{self._group_profiled_line()}"
 						f"{self._group_decode_rows_summary()}"
 					)
 					self._timing_logged = True
@@ -16103,6 +16075,8 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		# A profile window never outlives the decode round that opened it.
+		self._decode_profile_capture_state().end_round()
 		self._flush_glm5_dispatch_trace_summary("decode_end")
 		AttnWrapperBase.batchgen_debug = None
 		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
@@ -16170,6 +16144,7 @@ class BatchGenWorker:
 			past_key_states,
 			past_value_states,
 			scale_dict,
+			profile_capture=self._decode_profile_capture_state(),
 		)
 
 	def _wait_pending_kv_append_tasks(
