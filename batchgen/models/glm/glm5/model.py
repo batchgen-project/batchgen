@@ -103,29 +103,13 @@ def resolve_glm5_3d_mtp(min_rows: int) -> int:
     return max(int(env), required)
 
 
-_GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
 _GLM5_PREFILL_GROUPED_TOKEN_WINDOW = 16_384
 _GLM5_PREFILL_GROUPED_TILEM_AVG = 64
 
 
-def _debug_flag_enabled(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
 
 
-def _glm5_moe_cuda_graph_required() -> bool:
-    mode = _glm5_moe_debug_mode()
-    if mode == "eager":
-        return False
-    if mode == "graph":
-        return True
-    return os.environ.get(_GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
 
 
 def _glm5_moe_debug_dict() -> dict:
@@ -137,12 +121,6 @@ def _glm5_moe_debug_dict() -> dict:
     return debug if isinstance(debug, dict) else {}
 
 
-def _glm5_moe_debug_mode() -> Optional[str]:
-    value = _glm5_moe_debug_dict().get("glm5_moe_mode")
-    if not isinstance(value, str):
-        return None
-    mode = value.strip().lower()
-    return mode if mode in {"graph", "eager"} else None
 
 
 def _glm5_prefill_grouped_gemm_backend() -> str:
@@ -248,43 +226,10 @@ def _record_glm5_moe_dispatch(
     )
 
 
-def _glm5_moe_graph_compare_active() -> bool:
-    if _glm5_moe_debug_mode() == "eager":
-        return False
-    debug = _glm5_moe_debug_dict()
-    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
 
 
-def _glm5_moe_graph_compare_layer_enabled(layer_idx: int) -> bool:
-    if not _glm5_moe_graph_compare_active():
-        return False
-    debug = _glm5_moe_debug_dict()
-    layers = debug.get("glm5_moe_graph_compare_layers")
-    if layers is None:
-        layers = os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_LAYERS", "3")
-    if layers in ("all", "*"):
-        return True
-    if isinstance(layers, int):
-        return layer_idx == layers
-    if isinstance(layers, str):
-        return str(layer_idx) in {
-            item.strip() for item in layers.split(",") if item.strip()
-        }
-    if isinstance(layers, (list, tuple, set)):
-        try:
-            return layer_idx in {int(item) for item in layers}
-        except (TypeError, ValueError):
-            logging.warning(
-                "Ignoring invalid glm5_moe_graph_compare_layers=%r; defaulting to layer 3",
-                layers,
-            )
-            return layer_idx == 3
-    return layer_idx == 3
 
 
-def _glm5_moe_graph_compare_fail_on_mismatch() -> bool:
-    debug = _glm5_moe_debug_dict()
-    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare_fail_on_mismatch"))
 
 
 # ============================================================================
@@ -1752,11 +1697,6 @@ class Glm5MoE(nn.Module):
         # Tri-state: None until the FP8 blockwise weight stacking runs (it
         # sets True), explicit False only when the 3d path is disabled.
         self._fp8_blockwise_ready = None
-        self._moe_cuda_graph_manager = None
-        self._moe_cuda_graph_segment_name = None
-        self._moe_cuda_graph_segment = None
-        self._moe_cuda_graph_bucketing = None
-        self._moe_cuda_graph_required = False
         self._prefill_grouped_enabled = False
         self._prefill_prepared_keys = None
         self._prefill_weight_prototypes = None
@@ -2343,21 +2283,6 @@ class Glm5MoE(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
-    def enable_moe_cuda_graph(
-        self,
-        manager,
-        segment_name: str,
-        segment,
-        bucketing,
-        *,
-        graph_output_required: bool = False,
-    ) -> None:
-        self._moe_cuda_graph_manager = manager
-        self._moe_cuda_graph_segment_name = segment_name
-        self._moe_cuda_graph_segment = segment
-        self._moe_cuda_graph_bucketing = bucketing
-        self._moe_cuda_graph_required = graph_output_required
-
     # ── Forward ──
 
     @torch.inference_mode()
@@ -2371,65 +2296,15 @@ class Glm5MoE(nn.Module):
         """EP decode: AllGather → Gate → Expert Compute → AllReduce → Extract + Shared."""
         # K2.5 3D-MoE path (opt-in) — routes through validated minimax/kimi
         # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
+        # The only per-layer MoE decode implementation is the eager one;
+        # whole-model graph capture one level up captures this path.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
-            debug_mode = _glm5_moe_debug_mode()
-            compare = (
-                False if debug_mode == "eager"
-                else _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
-            )
-            graph_required = (
-                debug_mode == "graph"
-                or (
-                    debug_mode != "eager"
-                    and (
-                        _glm5_moe_cuda_graph_required()
-                        or getattr(self, "_moe_cuda_graph_required", False)
-                    )
-                )
-            )
-            if compare:
-                _record_glm5_moe_dispatch(
-                    "eager",
-                    layer_idx=self.layer_idx,
-                    bsz=hidden_states.shape[0],
-                    reason="graph compare returns eager output",
-                )
-                return self._forward_decode_3d_graph_compare(hidden_states)
-            if graph_required:
-                if self._moe_cuda_graph_exceeds_max_bucket():
-                    if not getattr(self, "_moe_cuda_graph_over_bucket_warned", False):
-                        logging.warning(
-                            "Layer %d: GLM-5 MoE CUDA graph requested but "
-                            "num_tokens_per_rank=%s exceeds max graph bucket; "
-                            "using eager MoE for this decode batch",
-                            self.layer_idx,
-                            self.num_tokens_per_rank,
-                        )
-                        self._moe_cuda_graph_over_bucket_warned = True
-                    _record_glm5_moe_dispatch(
-                        "eager",
-                        layer_idx=self.layer_idx,
-                        bsz=hidden_states.shape[0],
-                        reason="graph requested but rank bucket exceeded",
-                    )
-                    return self._forward_decode_3d(hidden_states)
-                _record_glm5_moe_dispatch(
-                    "graph",
-                    layer_idx=self.layer_idx,
-                    bsz=hidden_states.shape[0],
-                    reason="full-module graph replay",
-                )
-                return self._forward_decode_3d_graph(hidden_states)
-            if debug_mode == "eager":
-                reason = "debug mode requested eager"
-            else:
-                reason = "graph not requested"
             _record_glm5_moe_dispatch(
                 "eager",
                 layer_idx=self.layer_idx,
                 bsz=hidden_states.shape[0],
-                reason=reason,
+                reason="eager 3d MoE decode",
             )
             return self._forward_decode_3d(hidden_states)
 
@@ -2437,7 +2312,7 @@ class Glm5MoE(nn.Module):
             "eager",
             layer_idx=self.layer_idx,
             bsz=hidden_states.shape[0],
-            reason="3d MoE graph path unavailable",
+            reason="3d MoE path unavailable",
         )
         import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
@@ -2509,124 +2384,6 @@ class Glm5MoE(nn.Module):
         out = global_results[start:start + num_tokens].to(hidden_states.dtype)
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
-
-    def _moe_cuda_graph_exceeds_max_bucket(self) -> bool:
-        if self._moe_cuda_graph_bucketing is None or self.num_tokens_per_rank is None:
-            return False
-        try:
-            self._moe_cuda_graph_bucketing.get_padded_size(int(self.num_tokens_per_rank))
-        except ValueError:
-            return True
-        return False
-
-    def _moe_cuda_graph_available(self) -> bool:
-        if not (
-            self._moe_cuda_graph_manager is not None
-            and self._moe_cuda_graph_segment_name is not None
-            and self._moe_cuda_graph_segment is not None
-            and self._moe_cuda_graph_bucketing is not None
-            and self.num_tokens_per_rank is not None
-            and self.num_tokens_per_rank > 0
-        ):
-            return False
-        try:
-            return self._moe_cuda_graph_manager.has_graph(
-                self._moe_cuda_graph_segment_name,
-                self.num_tokens_per_rank,
-            )
-        except ValueError:
-            return False
-
-    @torch.inference_mode()
-    def _forward_decode_3d_graph(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self._moe_cuda_graph_available():
-            raise RuntimeError(
-                f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
-            )
-
-        orig_shape = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        num_tokens, _ = hidden_flat.shape
-        ntp = self.num_tokens_per_rank
-        if ntp is None or ntp <= 0:
-            raise RuntimeError(f"Layer {self.layer_idx}: num_tokens_per_rank is not initialized")
-        if num_tokens > ntp:
-            raise RuntimeError(
-                f"MoE graph buffer overflow: num_tokens={num_tokens} > "
-                f"num_tokens_per_rank={ntp}"
-            )
-
-        bucket = self._moe_cuda_graph_bucketing.get_padded_size(ntp)
-        bufs = self._moe_cuda_graph_segment.pool.get(bucket)
-        padded = bufs.padded
-        padded.zero_()
-        if num_tokens > 0:
-            padded[:num_tokens].copy_(hidden_flat)
-
-        rank_counts = Glm5MoE._rank_token_counts
-        if rank_counts is None:
-            if not hasattr(self, "_moe_graph_rank_counts_full"):
-                self._moe_graph_rank_counts_full = torch.empty(
-                    self.world_size,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            self._moe_graph_rank_counts_full.fill_(ntp)
-            rank_counts = self._moe_graph_rank_counts_full
-        elif rank_counts.dtype != torch.int64:
-            rank_counts = rank_counts.to(torch.int64)
-
-        graph_out = self._moe_cuda_graph_manager.replay(
-            self._moe_cuda_graph_segment_name,
-            bucket,
-            padded=padded,
-            rank_token_counts=rank_counts,
-        )
-        moe_output = graph_out.get("moe_output")
-        if moe_output is None:
-            raise RuntimeError(
-                f"Layer {self.layer_idx}: GLM-5 MoE graph replay did not return "
-                "full-module 'moe_output'"
-            )
-
-        if num_tokens == 0:
-            return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        return moe_output[:num_tokens].to(hidden_flat.dtype).view(*orig_shape)
-
-    @torch.inference_mode()
-    def _forward_decode_3d_graph_compare(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        eager_out = self._forward_decode_3d(hidden_states)
-        if not self._moe_cuda_graph_available():
-            logging.warning(
-                "[GLM5_MOE_GRAPH_COMPARE][L%d] graph unavailable; returning eager output",
-                self.layer_idx,
-            )
-            return eager_out
-
-        graph_out = self._forward_decode_3d_graph(hidden_states)
-        diff = (graph_out.to(torch.float32) - eager_out.to(torch.float32)).abs()
-        max_abs = float(diff.max().item()) if diff.numel() else 0.0
-        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
-        atol = float(os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL", "1e-2"))
-        ok = max_abs <= atol
-        logging.info(
-            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d][boundary=full_module] "
-            "%s max_abs=%.6g mean_abs=%.6g "
-            "shape=%s ntp=%s",
-            self.layer_idx,
-            self.rank,
-            "OK" if ok else "FAIL",
-            max_abs,
-            mean_abs,
-            tuple(int(x) for x in eager_out.shape),
-            self.num_tokens_per_rank,
-        )
-        if not ok and _glm5_moe_graph_compare_fail_on_mismatch():
-            raise RuntimeError(
-                f"GLM-5 MoE graph compare mismatch at layer {self.layer_idx}: "
-                f"max_abs={max_abs:.6g} > atol={atol:.6g}"
-            )
-        return eager_out
 
     # ── K2.5 3D MoE decode path (minimax/Kimi parity) ──
 

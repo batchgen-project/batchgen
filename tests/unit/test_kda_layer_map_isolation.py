@@ -18,51 +18,30 @@ CPU, because the stub cannot show that ``__init__`` actually reaches the check
 before it allocates anything.
 
 Pure CPU. ``batchgen.kv_cache`` pulls in a Triton kernel module on import, so
--- as in ``tests/test_fused_rmsnorm_rope_q_tiling_policy.py`` -- Triton is
-stubbed, but ONLY when it is genuinely absent, so CI keeps importing the real
-one.
+Triton is stubbed (the shared ``tests/triton_cpu_stub.py`` stub), but ONLY
+when it is genuinely absent, so CI keeps importing the real one.
 """
 
 from __future__ import annotations
 
 import logging
-import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.triton_cpu_stub import install_triton_cpu_stub
+
 _ROOT = Path(__file__).resolve().parents[2]
 
 
 def _import_manager():
-    """``KDAStateGPUManager`` and its config, stubbing Triton on a CPU-only box."""
-    try:
-        from batchgen.kv_cache.kda_state_gpu_manager import (
-            KDAStateGPUConfig,
-            KDAStateGPUManager,
-        )
+    """``KDAStateGPUManager`` and its config, stubbing Triton on a CPU-only box.
 
-        return KDAStateGPUManager, KDAStateGPUConfig
-    except ModuleNotFoundError as exc:
-        if exc.name != "triton":
-            raise
-    triton_stub = types.ModuleType("triton")
-    triton_stub.jit = lambda fn: fn
-    triton_stub.autotune = lambda *args, **kwargs: (lambda fn: fn)
-    triton_stub.Config = lambda *args, **kwargs: None
-    triton_stub.cdiv = lambda a, b: -(-a // b)
-    language_stub = types.ModuleType("triton.language")
-    language_stub.constexpr = object
-    triton_stub.language = language_stub
-    extra_stub = types.ModuleType("triton.language.extra")
-    extra_stub.libdevice = types.ModuleType("triton.language.extra.libdevice")
-    language_stub.extra = extra_stub
-    sys.modules["triton"] = triton_stub
-    sys.modules["triton.language"] = language_stub
-    sys.modules["triton.language.extra"] = extra_stub
-    sys.modules["triton.language.extra.libdevice"] = extra_stub.libdevice
+    The stub is the shared ``tests.triton_cpu_stub`` one: ``sys.modules``
+    outlives this file, so every test file must see the same stub.
+    """
+    install_triton_cpu_stub()
     from batchgen.kv_cache.kda_state_gpu_manager import (
         KDAStateGPUConfig,
         KDAStateGPUManager,

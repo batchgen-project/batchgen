@@ -224,6 +224,13 @@ def _fa3_and_executor(monkeypatch):
     fa3 = types.ModuleType("flash_attn_interface")
     fa3.flash_attn_varlen_func = _varlen_reference
     monkeypatch.setitem(sys.modules, "flash_attn_interface", fa3)
+    # ``varlen_dispatch`` memoises the FA3 entry point it resolved first, in a
+    # module global that outlives this file. Clear it for the test (monkeypatch
+    # restores it afterwards), so this fake is the one resolved and no fake is
+    # left cached for another file.
+    dispatch = importlib.import_module("batchgen.attention.varlen_dispatch")
+    monkeypatch.setattr(dispatch, "_BACKEND_CACHE", None)
+    monkeypatch.setattr(dispatch, "_BACKEND_CAPABILITY", None)
     _Fa3Calls.varlen = _Fa3Calls.paged = 0
     FakeAttnWrapperBase.pinned = []
     FakeAttnWrapperBase.tracked = []

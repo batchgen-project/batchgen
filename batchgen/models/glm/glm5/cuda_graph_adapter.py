@@ -192,8 +192,15 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         if aux_manager is None:
             raise RuntimeError("Glm5CudaGraphAdapter requires auxiliary GPU KV manager")
 
-        max_pages_per_seq = int(primary_manager.max_pages_per_sequence)
-        max_aux_pages_per_seq = int(aux_manager.max_pages_per_sequence)
+        # Page-table width comes from the managers' CUDA-graph storage, the
+        # same source the worker's capture path reads
+        # (GPUPagedKVCacheManager exposes no max_pages_per_sequence attribute).
+        max_pages_per_seq = int(
+            primary_manager.get_cuda_graph_page_table_storage().shape[1]
+        )
+        max_aux_pages_per_seq = int(
+            aux_manager.get_cuda_graph_page_table_storage().shape[1]
+        )
         vocab_size = int(model.config.vocab_size)
         hidden_size = int(model.config.hidden_size)
         num_heads = int(attn0.num_heads)
@@ -636,46 +643,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         self._captured_signatures.clear()
         self._capture_attempted = False
         self._state_change_logged = False
-
-    # ---- Capture-context attrs (worker wraps replay with CaptureContext) ---
-
-    def capture_context_attrs(
-        self,
-        *,
-        replay_inputs: Dict[str, torch.Tensor],
-    ) -> Dict[str, Any]:
-        """ClassVars to bind on `AttnWrapperBase` for a graph replay window.
-
-        Replaces the inline save/restore at
-        `whole_model_cuda_graph_segments.py:394-430` (audit §A finding #9).
-        """
-        self._require_ctx()
-        seg = self._ctx.whole_model_segment
-        return {
-            "cache_seqlens": replay_inputs.get("cache_seqlens"),
-            "position_ids": replay_inputs.get("position_ids"),
-            "max_seqlen": int(self._ctx.max_seqlen_cap),
-            # These two serve ONLY a segment built without layer segments,
-            # whose decode wrappers stage through the callback indirection. The
-            # production path composes layer segments, which stage by writing
-            # their host-append outputs into the whole-model staging slices and
-            # never invoke these. `stage_post_graph_kv` is unaffected either
-            # way: it runs after the capture window closes, so it reads the
-            # worker's real host-append callbacks, not these.
-            "kv_append_callback": (
-                getattr(seg, "_copy_primary_kv", None)
-                if seg is not None and getattr(seg, "stage_kv_for_offload", True)
-                else None
-            ),
-            "kv_append_callback_aux": (
-                getattr(seg, "_copy_aux_kv", None)
-                if seg is not None and getattr(seg, "stage_kv_for_offload", True)
-                else None
-            ),
-            "_dsa_short_count": getattr(seg, "_capture_dsa_short_count", None) if seg is not None else None,
-            "glm5_decode_primary_slot_indices": replay_inputs.get("primary_slot_indices"),
-            "glm5_decode_aux_slot_indices": replay_inputs.get("aux_slot_indices"),
-        }
 
     # ---- Worker hooks (Phase B): record capture / failure -----
 

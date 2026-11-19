@@ -11,6 +11,8 @@ from tests.worker.worker_fakes import attach_trajectory_state
 import pytest
 import torch
 
+from batchgen.phase_lifecycle import PhaseKey
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -42,7 +44,10 @@ def _isolated_worker_method(name):
         ],
         type_ignores=[],
     )
-    namespace = {}
+    from batchgen.phase_lifecycle import PhaseKey
+
+    # Names the extracted method resolves at call time.
+    namespace = {"PhaseKey": PhaseKey}
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
     return getattr(namespace["Worker"], name)
 
@@ -197,89 +202,69 @@ def test_persistent_phase_worker_gate_rejects_invalid_flag_on_modes():
     assert worker.parallel_manager.persistent_phase_instances is True
 
 
-def test_persistent_decode_instance_uses_runtime_rank_cap():
-    activate = _isolated_worker_method("_activate_persistent_decode_instance")
-    activate.__globals__["time"] = SimpleNamespace(perf_counter=lambda: 0.0)
-    activate.__globals__["logging"] = SimpleNamespace(info=lambda *args: None)
 
-    configured = []
-    manager = SimpleNamespace(
-        decode_instance=None,
-        decode_experts_resident=False,
-    )
-
-    def configure_decoding(*, padding_bsz, comm):
-        configured.append((padding_bsz, comm))
-        return object(), {}
-
-    manager.configure_decoding = configure_decoding
-    trace = []
-    worker = SimpleNamespace(
-        rank=1,
-        parallel_manager=manager,
-        _weight_passes=SimpleNamespace(close=lambda: trace.append("close")),
-        core_engine=SimpleNamespace(
-            stop_h2d_worker=lambda: trace.append("stop"),
-            clear_kv_copy_queue=lambda: trace.append("clear_kv"),
-            reset_decoding_buffer=lambda: trace.append("reset_decoding"),
-        ),
-        init_nvshmem=lambda: None,
-        _max_decode_rank_bsz=lambda: 128,
-        _install_decode_weight_copy_queue=lambda: trace.append("install"),
-        set_phase=lambda phase: trace.append(("set_phase", phase)),
-    )
-
-    activate(worker, "comm")
-
-    assert configured == [(128, "comm")]
-    assert worker._decode_padding_bsz == 128
-    # No weight pass is open across the switch, and the decode schedule
-    # (empty here) replaces the prefill lists before decode runs.
-    assert trace == [
-        "close",
-        "stop",
-        "clear_kv",
-        "reset_decoding",
-        "install",
-        ("set_phase", "decode"),
-    ]
-
-
-def test_persistent_startup_capture_follows_cuda_graph_enablement():
+@pytest.mark.parametrize("graph_requested", [True, False])
+def test_persistent_startup_capture_follows_cuda_graph_enablement(
+    graph_requested,
+):
     build = _isolated_worker_method("_build_persistent_phase_instances")
     build.__globals__["time"] = SimpleNamespace(perf_counter=lambda: 0.0)
     build.__globals__["logging"] = SimpleNamespace(info=lambda *args: None)
+    build.__globals__["_startup_transient"] = SimpleNamespace(
+        SEAM_PERSISTENT_BUILD="persistent_build"
+    )
 
     calls = []
     manager = SimpleNamespace(
         decode_instance=None,
         set_comm=lambda comm: calls.append(("set_comm", comm)),
         share_skeleton_on_device=lambda: calls.append("share_skeleton"),
-        configure_prefill=lambda: calls.append("configure_prefill"),
     )
+    capture_fn = object()
     worker = SimpleNamespace(
         rank=0,
         comm="comm",
         parallel_manager=manager,
-        _activate_persistent_decode_instance=lambda comm: calls.append(
-            ("activate_decode", comm)
+        _transition_phase=lambda key, **kw: (
+            calls.append(("transition", key.phase, kw)) or (True, False)
         ),
+        set_phase=lambda phase: calls.append(("set_phase", phase)),
+        _install_prefill_weight_copy_pipeline=lambda profile: calls.append(
+            ("install_prefill", profile)
+        ),
+        _desired_phase_key=lambda phase: PhaseKey(phase, None, ()),
+        _max_decode_rank_bsz=lambda: 128,
+        _check_decode_width_within_graph_buckets=lambda width: calls.append(
+            ("check_width", width)
+        ),
+        _assert_phase_switch_clean=lambda label, reused: None,
+        _install_decode_weight_copy_queue=lambda: calls.append("install_decode"),
         _init_gpu_kv_with_actual_size=lambda: calls.append("init_gpu_kv"),
-        _glm5_whole_model_graph_requested_for_current_batch=lambda: True,
-        _sync_decode_moe_rank_counts=lambda rows, reason: calls.append(
-            ("sync_counts", rows, reason)
+        _glm5_whole_model_graph_requested_for_current_batch=(
+            lambda: graph_requested
         ),
-        _bind_decode_attention_metadata_for_graph_config=lambda rows: calls.append(
-            ("bind_metadata", rows)
+        _probe_startup_transient=lambda *, seam, capture: calls.append(
+            ("probe", seam, capture)
         ),
-        _warmup_cuda_graphs=lambda: calls.append("capture_graphs"),
-        _release_persistent_decode_instance=lambda: calls.append("release_decode"),
+        _capture_startup_decode_graphs=capture_fn,
     )
 
     build(worker)
 
-    assert "capture_graphs" in calls
-    assert "release_decode" in calls
+    # The decode width is checked and plumbed through the transition.
+    assert ("check_width", 128) in calls
+    assert any(
+        entry[0] == "transition"
+        and entry[1] == "decode"
+        and entry[2].get("max_num_seq") == 128
+        for entry in calls
+    )
+    # The capture callable reaches the probe only under graph enablement.
+    probe = next(entry for entry in calls if entry[0] == "probe")
+    assert probe[1] == "persistent_build"
+    assert probe[2] is (capture_fn if graph_requested else None)
+    # The build ends back in prefill.
+    assert calls[-1][0] == "install_prefill"
 
 
 def test_worker_only_calls_worker_methods_that_exist():
@@ -290,11 +275,21 @@ def test_worker_only_calls_worker_methods_that_exist():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
+    def _own_calls(method):
+        """Calls whose ``self`` is the worker: skip nested classes, whose
+        ``self`` is the nested instance (e.g. the comm thread's planner)."""
+        stack = list(ast.iter_child_nodes(method))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.ClassDef):
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+            if isinstance(node, ast.Call):
+                yield node
+
     missing = set()
     for name, method in methods.items():
-        for node in ast.walk(method):
-            if not isinstance(node, ast.Call):
-                continue
+        for node in _own_calls(method):
             func = node.func
             if (
                 isinstance(func, ast.Attribute)

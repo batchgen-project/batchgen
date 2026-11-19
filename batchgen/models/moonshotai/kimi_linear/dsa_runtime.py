@@ -43,10 +43,11 @@ sparse attention modules              ``sparse_dispatch.site_symbols()`` for
                                       prefill on Blackwell
 ====================================  ========================================
 
-Triton kernels on the same paths (the selection transform, the scorer
-prologue, ``act_quant``) compile on first launch; the decode graph's warmup
-iterations launch them before any capture. Shape-complete prewarm of the
-DeepGEMM JIT kernels (one per aligned batch) is not done here.
+The JIT kernels on the same paths (the selection transform, the scorer
+prologue, ``act_quant``, and DeepGEMM's ``fp8_mqa_logits``, paged-MQA
+metadata and ``fp8_paged_mqa_logits``) are not loaded here: the startup
+prewarm compiles their serving keys before readiness (``dsa_prewarm``, listed
+in ``jit_coverage.K31_DSA_JIT_KERNELS``).
 """
 
 from __future__ import annotations

@@ -240,6 +240,46 @@ def test_minimax_parse_tool_calls():
     print("  PASS: MiniMax parse_tool_calls")
 
 
+def _import_io_struct():
+    """``io_struct``'s message classes without the ``batchgen`` package inits.
+
+    ``batchgen/__init__`` and ``batchgen/server/__init__`` pull in torch and
+    the server, so a package not yet imported is served as a path-only stub
+    for the import, and every stub and module it added is withdrawn again: a
+    stub left in ``sys.modules`` would shadow the real package for every later
+    test. The paths are the repository's, not ``tests/`` (this file lives in
+    ``tests/unit``).
+    """
+    import importlib
+    import sys
+    import types
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    stubbed = []
+    for name in ("batchgen", "batchgen.server"):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            stub.__path__ = [str(repo.joinpath(*name.split(".")))]
+            sys.modules[name] = stub
+            stubbed.append(name)
+    before = set(sys.modules)
+    try:
+        io_struct = importlib.import_module("batchgen.server.io_struct")
+        return (
+            io_struct.ChatCompletionChoiceMessage,
+            io_struct.ToolCall,
+            io_struct.ToolCallFunction,
+        )
+    finally:
+        if stubbed:
+            for name in set(sys.modules) - before:
+                if name == "batchgen" or name.startswith("batchgen."):
+                    del sys.modules[name]
+            for name in stubbed:
+                del sys.modules[name]
+
+
 def test_io_struct_pydantic():
     """Test that the Pydantic models serialize correctly.
 
@@ -251,27 +291,8 @@ def test_io_struct_pydantic():
         print("  SKIP: IO struct Pydantic serialization (pydantic not installed)")
         return
 
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-
-    import types
-    if "batchgen" not in sys.modules:
-        sys.modules["batchgen"] = types.ModuleType("batchgen")
-        sys.modules["batchgen"].__path__ = [
-            str(Path(__file__).parent.parent / "batchgen")
-        ]
-    for pkg in ["batchgen.server"]:
-        if pkg not in sys.modules:
-            mod = types.ModuleType(pkg)
-            mod.__path__ = [str(Path(__file__).parent.parent / pkg.replace(".", "/"))]
-            sys.modules[pkg] = mod
-
-    from batchgen.server.io_struct import (
-        ChatCompletionChoiceMessage,
-        ToolCall,
-        ToolCallFunction,
-    )
+    (ChatCompletionChoiceMessage, ToolCall,
+     ToolCallFunction) = _import_io_struct()
 
     # With reasoning_content
     msg = ChatCompletionChoiceMessage(

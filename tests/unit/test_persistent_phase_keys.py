@@ -76,6 +76,8 @@ def _worker(events):
     worker.args = SimpleNamespace(persistent_phase_instances=True)
     worker._streamed_sp8_h2d_installed = False
     worker._weight_passes = SimpleNamespace(close=lambda: None)
+    # The replica-transport seam is worker-owned; the phase tests fake it.
+    worker._uninstall_replica_transport = lambda: None
     worker.core_engine = SimpleNamespace(
         stop_h2d_worker=lambda: None,
         clear_kv_copy_queue=lambda: None,

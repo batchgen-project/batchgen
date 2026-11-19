@@ -6,12 +6,14 @@ Phase A §G no-hack rule. Tests run CPU-only and require no GPU.
 
 from __future__ import annotations
 
-import logging
-
 import pytest
 
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
-from batchgen.worker.indexing import IndexLookupRequest, IndexManager
+from batchgen.worker.indexing import (
+    IndexLookupRequest,
+    IndexManager,
+    UnmappedLocalIndexError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,15 +119,11 @@ def test_local_indices_to_global_seq_ids_empty_input(rank0_req):
     assert IndexManager.local_indices_to_global_seq_ids(rank0_req, []) == []
 
 
-def test_local_indices_to_global_seq_ids_logs_on_missing(rank0_req, caplog):
-    with caplog.at_level(logging.ERROR, logger="batchgen.worker.indexing"):
-        result = IndexManager.local_indices_to_global_seq_ids(rank0_req, [0, 99, 1])
-    # Missing index 99 dropped from output; result is the resolvable subset
-    assert result == [0, 2]
-    assert any(
-        "MISSING LOCAL INDICES" in rec.message and "Rank 0" in rec.message
-        for rec in caplog.records
-    )
+def test_local_indices_to_global_seq_ids_raises_on_missing(rank0_req):
+    # An unmapped index is fatal: a shortened result would shift every
+    # later batch position onto the wrong sequence's KV.
+    with pytest.raises(UnmappedLocalIndexError, match=r"Rank 0.*\[99\]"):
+        IndexManager.local_indices_to_global_seq_ids(rank0_req, [0, 99, 1])
 
 
 def test_local_indices_to_global_seq_ids_preserves_order(rank0_req):

@@ -55,6 +55,7 @@ MiB = 1024 * 1024
 GLM5 = "zai-org/GLM-5.3-FP8"
 GPT_OSS = "openai/gpt-oss-120b"
 K25 = "moonshotai/Kimi-K2.5"
+K3 = "moonshotai/Kimi-K3.1-Pro"
 BUCKETS = [1, 2, 4, 8]
 NO_STARTUP_CAPTURE = "this lifecycle captures no decode graph at startup"
 
@@ -73,6 +74,7 @@ _METHOD_NAMES = [
     "_record_decode_graph_capture",
     "_glm5_whole_model_graph_current_bucket_missing",
     "_whole_model_decode_graphs_requested",
+    "_manager_decode_graphs_persist",
     "_glm5_whole_model_graph_requested_for_current_batch",
 ]
 
@@ -106,8 +108,13 @@ def _load(cuda=None, dist=None):
 class Manager:
     """The strategy-manager surface the startup seam reads."""
 
-    def __init__(self, retains_decode: bool, *, probe_step=None):
+    def __init__(self, retains_decode: bool, *, probe_step=None,
+                 graphs_persist: bool = False):
         self.retains_decode = retains_decode
+        # A manager that owns its decode ladder (Kimi-K3's planner buckets)
+        # answers True; the worker then captures through the manager's prewarm
+        # instead of its own whole-model capture.
+        self.decode_graphs_persist_across_suspend = graphs_persist
         if probe_step is not None:
             self.startup_decode_probe_step = probe_step
 
@@ -142,7 +149,8 @@ def _record_capture(worker, gpu_manager):
 
 
 def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
-            capture_produces_graphs=True, probe_step=None):
+            capture_produces_graphs=True, probe_step=None,
+            manager_graphs_persist=False):
     """A worker whose startup and graph-decision methods are the real ones.
 
     ``_setup_cuda_graphs`` is a spy: its first call records what the real
@@ -188,7 +196,8 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
             cuda_graph_max_bucket_size=8, cuda_graph_num_buckets=4,
         ),
         engine_config=SimpleNamespace(Basic_Config=SimpleNamespace(enable_cuda_graphs=graphs)),
-        parallel_manager=Manager(retains_decode, probe_step=probe_step),
+        parallel_manager=Manager(retains_decode, probe_step=probe_step,
+                                 graphs_persist=manager_graphs_persist),
         torch_device="cpu", model_context_length=4096, startup_transient=None,
         _core_initialized=True, _live_phase_key=None, _phase=None,
         _prefill_moe_mode_in_effect=None, _decode_padding_bsz=None,
@@ -211,6 +220,7 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
         _sync_decode_moe_rank_counts=sync_counts,
         _bind_decode_attention_metadata_for_graph_config=(
             lambda batch: events.append(("bind_metadata", tuple(batch)))),
+        _prewarm_decode_jit=lambda: events.append("jit_prewarm"),
         _get_cuda_graph_gpu_manager=lambda: object(),
         _finalize_gpu_kv_pool_after_capture=lambda gpu_manager: events.append("pool_finalized"),
         _setup_cuda_graphs=setup,
@@ -248,6 +258,9 @@ def test_retained_instance_captures_inside_the_probe_before_the_prefill_switch()
     assert worker.events == [
         "comm", "decode_build", "pool_sized",
         ("sync_counts", "startup_graph_capture"), ("bind_metadata", ()),
+        # The decode JIT prewarm runs inside the startup capture, before
+        # the graphs bake the kernels they replay.
+        "jit_prewarm",
         "graph_setup", "pool_finalized",
         ("to_prefill", ExitMode.SUSPEND),
     ]
@@ -392,3 +405,35 @@ def test_a_rebuilt_instance_keeps_capturing_at_its_first_decode_configure(model_
     worker.prepare_deployment()
     worker._current_decode_max_rank_batch_size = 3
     assert worker._decode_graph_capture_needed_at_configure(has_queueing=False)
+
+
+def test_a_manager_owned_ladder_captures_before_readiness_without_whole_model_graphs():
+    # Kimi-K3's decode ladder comes from the planner, so the deployment
+    # requests no whole-model graph; the manager keeps the instance and its
+    # graphs across SUSPEND, so the capture still belongs before readiness.
+    # The worker reaches it through the manager's decode prewarm and runs no
+    # whole-model capture of its own.
+    worker = _worker(K3, retains_decode=True, graphs=False,
+                     manager_graphs_persist=True)
+    worker.prepare_deployment()
+    assert worker.events == [
+        "comm", "decode_build", "pool_sized",
+        ("sync_counts", "startup_graph_capture"), ("bind_metadata", ()),
+        "jit_prewarm", ("to_prefill", ExitMode.SUSPEND),
+    ]
+    # The manager's prewarm IS the capture: the worker runs no whole-model
+    # capture and its own counter stays at zero.
+    assert worker.setup_calls == 0
+    assert worker._graph.decode_graph_captures == 0
+
+
+def test_a_manager_without_persistent_graphs_captures_nothing_at_startup():
+    # Same model, streamed decode: the manager declines instance reuse, so
+    # its graphs are rebuilt per decode configure and nothing is captured
+    # before readiness.
+    worker = _worker(K3, retains_decode=True, graphs=False,
+                     manager_graphs_persist=False)
+    worker.prepare_deployment()
+    assert "jit_prewarm" not in worker.events
+    assert worker.setup_calls == 0
+    assert worker._graph.decode_graph_captures == 0

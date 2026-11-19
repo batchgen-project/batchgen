@@ -197,29 +197,87 @@ def test_glm52_fp8_reads_checkpoint_dims():
     assert _project(rich)["head_dim"] == 256
 
 
-def test_unlisted_variant_warns_and_falls_back(caplog):
-    import logging as _logging
-    with caplog.at_level(_logging.WARNING):
-        rich = BatchGenModelConfig.resolve("Some-Unknown-Model", checkpoint_path=None)
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "Some-Unknown-Model",
+        "zai/GLM-5.4",                  # an unlisted minor, never the GLM-5 base
+        "GLM-50-foo",                   # a superstring of GLM-5
+        "/staged/GLM-5.3-FP8-copy",     # a directory that names no release
+        "/staged/converted",
+        "",
+    ],
+)
+def test_a_name_that_names_no_registered_release_fails_loud(model_name):
+    # These used to log a WARNING and build a GLM5Config (GLM-5 base) engine.
+    with pytest.raises(ValueError, match="names no registered GLM-5 release"):
+        BatchGenModelConfig.resolve(model_name, checkpoint_path=None)
+    assert BatchGenModelConfig._match_variant(model_name) is None
+
+
+_FIXTURES = _REPO_ROOT / "tests" / "fixtures" / "hf_configs"
+
+
+@pytest.mark.parametrize(
+    "hub_id, local_paths",
+    [
+        (
+            "zai-org/GLM-5.3-FP8",
+            ["/staged/zai-org/GLM-5.3-FP8", "/staged/models/glm-5.3-fp8/", "GLM-5.3-FP8"],
+        ),
+        (
+            "zai-org/GLM-5.2-FP8",
+            ["/staged/zai-org/GLM-5.2-FP8", "/staged/models/glm-5.2-fp8/"],
+        ),
+        ("zai-org/GLM-5.1", ["/staged/zai-org/GLM-5.1", "/staged/glm-5.1"]),
+        ("zai-org/GLM-5-FP8", ["/staged/zai-org/GLM-5-FP8", "/staged/glm-5-fp8"]),
+    ],
+)
+def test_a_local_checkpoint_path_resolves_to_its_hub_id_contract(hub_id, local_paths):
+    expected = BatchGenModelConfig._match_variant(hub_id)
+    assert expected is not None
+    for path in local_paths:
+        assert BatchGenModelConfig._match_variant(path) == expected, path
+        assert BatchGenModelConfig._match_release(path) == (
+            BatchGenModelConfig._match_release(hub_id)
+        ), path
+
+
+@pytest.mark.parametrize("release_dir", ["GLM-5.2-FP8", "GLM-5.3-FP8"])
+def test_a_staged_checkpoint_builds_the_same_config_as_its_hub_id(release_dir):
+    ckpt = str(_FIXTURES / release_dir)
+    hub = BatchGenModelConfig.resolve(f"zai-org/{release_dir}", checkpoint_path=ckpt)
+    # The fixture directory itself is a local checkpoint named after the release.
+    local = BatchGenModelConfig.resolve(ckpt, checkpoint_path=ckpt)
+    assert type(local) is type(hub)
+    hub_values, local_values = vars(hub).copy(), vars(local).copy()
+    assert hub_values.pop("_name_or_path") == f"zai-org/{release_dir}"
+    assert local_values.pop("_name_or_path") == ckpt
+    assert local_values == hub_values
+
+
+def test_a_checkpoint_of_another_geometry_is_refused():
+    # A GLM-5.3 checkpoint (index_topk_freq=4) staged under a GLM-5 name would
+    # build an every-layer indexer engine against the 21-layer host-KV profile.
+    ckpt = str(_FIXTURES / "GLM-5.3-FP8")
+    with pytest.raises(ValueError, match="index_topk_freq"):
+        BatchGenModelConfig.resolve("/staged/zai-org/GLM-5-FP8", checkpoint_path=ckpt)
+
+
+def test_a_checkpoint_without_the_release_schedule_is_refused(tmp_path):
+    # The reverse: a GLM-5 checkpoint (no top-k reuse keys) under a GLM-5.3
+    # name used to keep GLM53Config's default schedule (freq 4) silently.
+    import json
+    data = json.loads((_FIXTURES / "GLM-5.3-FP8" / "config.json").read_text())
+    for key in ("index_topk_freq", "index_skip_topk_offset", "indexer_types",
+                "index_share_for_mtp_iteration"):
+        data.pop(key, None)
+    ckpt = _write_config(tmp_path, data)
+    with pytest.raises(ValueError, match=r"\(1, None\)"):
+        BatchGenModelConfig.resolve("/staged/zai-org/GLM-5.3-FP8", checkpoint_path=ckpt)
+    # The same config under the GLM-5 name it does describe still resolves.
+    rich = BatchGenModelConfig.resolve("/staged/zai-org/GLM-5-FP8", checkpoint_path=ckpt)
     assert type(rich).__name__ == "GLM5Config"
-    assert any("matched no supported variant" in r.message for r in caplog.records)
-
-
-def test_newly_unlisted_glm5_minor_still_warns_before_falling_back_to_base(caplog):
-    """A future GLM-5.x minor must warn loudly, not silently bind to base."""
-    import logging as _logging
-    with caplog.at_level(_logging.WARNING):
-        rich = BatchGenModelConfig.resolve("zai/GLM-5.4", checkpoint_path=None)
-    assert type(rich).__name__ == "GLM5Config"  # base fallback
-    assert any("unlisted GLM-5.4 variant" in r.message for r in caplog.records)
-
-
-def test_glm5_superstring_warns(caplog):
-    """GLM-50 is a superstring of GLM-5 and must warn, not bind silently."""
-    import logging as _logging
-    with caplog.at_level(_logging.WARNING):
-        BatchGenModelConfig.resolve("GLM-50-foo", checkpoint_path=None)
-    assert any("superstring" in r.message for r in caplog.records)
 
 
 def _write_config(tmp_path, data):

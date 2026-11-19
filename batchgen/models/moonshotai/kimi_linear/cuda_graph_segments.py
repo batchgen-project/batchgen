@@ -665,12 +665,22 @@ class KimiLinearDecodeGraph:
     (`batchgen_worker.py`); the model-side contract is otherwise the same.
 
     Lifecycle: constructed + installed by the PSM at `configure_decoding` when
-    the planner asks for it. The dedicated KDA scratch slot is reserved during
-    installation, before server readiness and sequence admission. Graphs are
-    captured lazily, on the first decode step that uses a bucket. Every step
-    that cannot be replayed (prefill phase, empty rank, bsz above the top
-    bucket, invalid/moved page table, eager mode) falls through to the
-    unmodified eager layer forward.
+    the planner asks for it, and released with the decode instance that owns
+    it (decode RETIRE, model rebuild) — never at a decode SUSPEND. The
+    dedicated KDA scratch slot is reserved during installation, before server
+    readiness and sequence admission.
+
+    Capture-once: the first ``prewarm_decode_graphs`` in a captured mode
+    captures the adapter's WHOLE ladder (every bucket a step can replay) and
+    seals it; nothing else ever captures. A kept decode instance runs that
+    prewarm in the worker's startup decode graph capture, before readiness,
+    so its graphs are captured once per process; a rebuilt instance runs it
+    at its decode configure. After the seal the KV / KDA storage the graphs
+    bake must not move (``_require_capture_signature`` raises). Every step
+    that cannot be replayed (prefill phase, eager mode, no sealed ladder, bsz
+    above the top bucket, a bucket outside the captured ladder, an
+    unavailable page table) falls through to the unmodified eager layer
+    forward.
     """
 
     def __init__(
@@ -711,6 +721,13 @@ class KimiLinearDecodeGraph:
         self._capture_stats: Dict[int, dict] = {}
         self._scratch_slot: Optional[int] = None
         self._kv_signature = None
+        # Set once ``prewarm_decode_graphs`` has captured the whole ladder;
+        # from then on nothing captures and the KV signature is fixed.
+        self._ladder_captured = False
+        # Fixed-address arenas the K3 resident MoE shards live in (empty for
+        # allocator-backed shards). A MoE graph replay reads them, so it is
+        # refused while any is unmapped.
+        self._moe_arenas: List[object] = []
         self._max_pages = 0
         self._static_pages = 0
         self._page_size_tokens = 0
@@ -800,6 +817,11 @@ class KimiLinearDecodeGraph:
 
     def set_mode(self, mode: str) -> None:
         self.mode = mode if mode in _VALID_MODES else "eager"
+
+    @property
+    def ladder_captured(self) -> bool:
+        """Whether this adapter's graph ladder has been captured (sealed)."""
+        return self._ladder_captured
 
     def install(self) -> None:
         """Patch the decode forwards (idempotent)."""
@@ -1061,6 +1083,12 @@ class KimiLinearDecodeGraph:
 
         if not moe_layers:
             return False
+        arenas = {}
+        for _, _, resident in moe_layers:
+            arena = getattr(resident.shard, "arena", None)
+            if arena is not None:
+                arenas[id(arena)] = arena
+        self._moe_arenas = list(arenas.values())
 
         tp_size = int(getattr(moe_layers[0][1], "attn_tp_size", 1))
         if tp_size <= 1:
@@ -1258,19 +1286,27 @@ class KimiLinearDecodeGraph:
         dist.barrier()
 
     def prewarm_decode_graphs(self) -> bool:
-        """Capture the first decode bucket before the decode loop starts.
+        """Capture this adapter's whole decode graph ladder, once.
 
         The worker calls this after it has allocated/bound the real GPU KV
-        manager and synchronized the decode row counts.  Capture uses only the
+        manager: for a kept decode instance first in its startup decode graph
+        capture, before readiness, then at every decode configure; for a
+        rebuilt instance at its decode configure. Capture uses only the
         dedicated KDA scratch state and zero-valued graph inputs, so it cannot
-        mutate a live request.  Keeping this operation explicit prevents the
-        first measured decode forward from paying CUDA-graph construction or
-        K3 MoE graph setup time.
+        mutate a live request.
 
-        Later bucket capture remains available as a guarded fallback in
-        ``_begin_step`` for debug/interactive workloads; the formal runner
-        prewarms the bucket it admits and therefore never includes capture in
-        its measured interval.
+        The first call in a captured mode captures every bucket a later step
+        can replay and seals the ladder; every later call only verifies that
+        the KV / KDA storage the graphs bake has not moved (a moved pool is a
+        lifecycle error, raised, never a silent recapture). Steps never
+        capture.
+
+        Collective order: everything here is independent of this rank's local
+        batch. Every rank — with rows or without — builds the K3 MoE graphs
+        (exchange pool setup + the DeepEP self-check) first and then captures
+        the same buckets of the same planner ladder in the same order, so the
+        captures' EP-world collectives match across the cohort. Returns
+        whether a captured ladder is in place.
         """
         mode = _debug_mode() or self.mode
         if mode == "eager":
@@ -1278,119 +1314,104 @@ class KimiLinearDecodeGraph:
         if AttnWrapperBase.phase != "decode":
             self._fallback("decode graph prewarm requested outside decode")
             return False
-        # Prewarm is a rehearsal of this rank's FIRST decode step and must
-        # issue the same EP-world collectives in the same order as that step
-        # (``_begin_step`` / ``_begin_empty_whole_step``); every decision
-        # below reuses theirs. The K3 MoE build (exchange pool setup + the
-        # DeepEP self-check across every rank) runs first on all ranks,
-        # before anything shaped by this rank's local batch.
-        if mode == "graph":
-            self._ensure_moe_built()
-        seq_ids = list(AttnWrapperBase.cur_batch or [])
-        bsz = len(seq_ids)
-        if bsz == 0:
-            # Empty DP rank: capture the peers' whole-model bucket exactly as
-            # its first step will replay it. Returning without it left the
-            # rowed ranks alone inside the capture's EP collectives (cohort
-            # deadlock whenever the first decode batch left a group empty).
-            if mode != "graph":
-                return False
-            whole_bucket = self._prepare_empty_whole_bucket()
-            logger.info(
-                "[KIMI_DECODE_GRAPH] rank=%s empty-rank prewarm complete: "
-                "whole_bucket=%s",
-                self.rank, whole_bucket,
-            )
-            return whole_bucket is not None
         kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         if kv_manager is None:
             self._fallback("decode graph prewarm has no gpu_paged_kv_manager")
             return False
-        try:
-            bucket = self.bucketing.get_padded_size(bsz)
-        except ValueError:
-            self._fallback(f"prewarm bsz {bsz} exceeds top bucket")
-            return False
-
-        ensure = getattr(kv_manager, "ensure_cuda_graph_page_table", None)
-        try:
-            page_table = (
-                ensure(seq_ids) if ensure is not None
-                else kv_manager.get_cuda_graph_page_table()
-            )
-            aux_page_table = self._aux_graph_page_table(seq_ids)
-        except (RuntimeError, KeyError) as exc:
-            self._fallback(f"prewarm page table unavailable ({exc})")
-            return False
-
         signature = self._signature(kv_manager)
-        if signature != self._kv_signature:
-            if self._kv_signature is not None:
-                self._drop_graphs()
-            self._kv_signature = signature
+        if self._ladder_captured:
+            self._require_capture_signature(signature)
+            return True
+
+        self._ensure_moe_built()
         if not self._ensure_built(kv_manager):
             return False
-
+        self._kv_signature = signature
+        start = time.perf_counter()
         # K3 whole-model capture is only meaningful in graph mode.  Compare
         # mode deliberately retains the proven per-layer compare path until a
         # whole-stack eager reference is wired; it must not silently compare
         # only a subset of the transformer.
-        # Same decision as ``_begin_step``: the whole-model bucket follows the
-        # synchronized post-TP count alone, with empty peers replaying it, so
-        # it does NOT wait for every EP rank to hold rows.
-        whole_bucket = (
-            self._whole_model_bucket_for_step() if mode == "graph" else None
-        )
-        if whole_bucket is not None and self._ensure_whole_built():
-            self._bucket_statics(whole_bucket)
-            statics = self._statics[whole_bucket]
-            KimiLinearKDAWrapper.state_manager.prepare_decode_step(
-                [GRAPH_SCRATCH_SEQ_ID] * whole_bucket
-            )
-            statics.arm_for_capture()
-            if whole_bucket not in self._whole_captured:
-                self._capture_whole_bucket(whole_bucket)
-            self._refresh_statics(
-                whole_bucket, bsz, seq_ids, page_table, aux_page_table
-            )
-            logger.info(
-                "[KIMI_DECODE_GRAPH] rank=%s whole-model prewarm complete: "
-                "bucket=%d captured=%s",
-                self.rank, whole_bucket, whole_bucket in self._whole_captured,
-            )
-            return True
-
-        if bucket not in self._captured:
-            self._capture_bucket(bucket)
-
-        # Same gate as ``_begin_step``: the legacy per-layer MoE graph holds
-        # EP-world collectives that an empty peer never issues, so it is
-        # captured only when every EP rank holds rows.
-        moe_ready = self._ensure_moe_built() and self._moe_all_ranks_nonempty()
-        moe_bucket = (
-            self._moe_group_bucket_for_step() if moe_ready else None
-        )
-        if moe_bucket is not None and moe_bucket not in self._moe_captured:
-            self._capture_moe_bucket(moe_bucket)
-
-        # Keep the same static metadata refresh that the first replay will
-        # consume.  This is not required by capture itself, but makes the
-        # prewarm contract observable and catches a page-table capacity/order
-        # error before the measured decode interval.
-        self._refresh_statics(bucket, bsz, seq_ids, page_table, aux_page_table)
+        if mode == "graph" and self._whole_model_ladder_available():
+            ladder = {"whole_model": self._whole_model_ladder()}
+            for bucket in ladder["whole_model"]:
+                self._capture_whole_bucket(bucket)
+        else:
+            ladder = {"attention": list(self.bucketing.bucket_sizes)}
+            for bucket in ladder["attention"]:
+                self._capture_bucket(bucket)
+            if self._moe_built:
+                ladder["moe"] = list(self.moe_bucketing.bucket_sizes)
+                for bucket in ladder["moe"]:
+                    self._capture_moe_bucket(bucket)
+        self._ladder_captured = True
         logger.info(
-            "[KIMI_DECODE_GRAPH] rank=%s prewarm complete: attention_bucket=%d "
-            "moe_bucket=%s captured_attention=%s captured_moe=%s",
-            self.rank, bucket, moe_bucket, bucket in self._captured,
-            moe_bucket in self._moe_captured if moe_bucket is not None else False,
+            "[KIMI_DECODE_GRAPH] rank=%s decode graph ladder captured once "
+            "(mode=%s %s) in %.2fs; later decode configures replay it",
+            self.rank, mode, ladder, time.perf_counter() - start,
         )
         return True
+
+    def _whole_model_ladder_available(self) -> bool:
+        """Whether the K3 whole-model graph serves this model's graph steps."""
+        return bool(
+            self._uses_block_residual
+            and self._moe_built
+            and self.moe_segments
+            and self._ensure_whole_built()
+        )
+
+    def _whole_model_ladder(self) -> List[int]:
+        """Every whole-model bucket a graph step can select.
+
+        A step's whole-model bucket is its synchronized TP-group MoE bucket
+        (``_whole_model_bucket_for_step``), so the ladder is the MoE bucket
+        ladder. Each of those must be a decode graph bucket: the planner keeps
+        the per-rank cap a TP-size multiple and a bucket. A MoE bucket outside
+        the decode ladder would leave every step padded to it with no graph,
+        so it is refused here instead of falling back to eager in steady
+        state.
+        """
+        ladder = [int(b) for b in self.moe_bucketing.bucket_sizes]
+        missing = [b for b in ladder if b not in self.bucketing.bucket_sizes]
+        if missing:
+            raise RuntimeError(
+                f"K3 whole-model graph buckets {missing} (TP-group MoE ladder "
+                f"{ladder}) are not decode graph buckets "
+                f"{list(self.bucketing.bucket_sizes)}; a step padded to them "
+                "would have no captured graph"
+            )
+        return ladder
+
+    def _require_capture_signature(self, signature) -> None:
+        """The KV / KDA storage the sealed ladder baked must not have moved."""
+        if signature == self._kv_signature:
+            return
+        raise RuntimeError(
+            f"[KIMI_DECODE_GRAPH] rank={self.rank}: the KV/KDA storage the "
+            f"captured decode graph ladder bakes changed ({self._kv_signature} "
+            f"-> {signature}); the ladder is captured once and only replayed, "
+            "so the decode instance's KV pool must be remapped at its reserved "
+            "addresses (a moved pool needs the instance retired and rebuilt)"
+        )
+
+    def _require_moe_shards_resident(self) -> None:
+        """A MoE graph replay reads the resident shards: they must be mapped."""
+        for arena in self._moe_arenas:
+            if not arena.is_mapped:
+                raise RuntimeError(
+                    f"[KIMI_DECODE_GRAPH] rank={self.rank}: a K3 MoE graph "
+                    "replay was requested while the resident EP shard's arena "
+                    "is unmapped (decode SUSPEND); replaying it is an illegal "
+                    "access, so the decode activation must map and refill it"
+                )
 
     def _begin_step(self) -> None:
         """Decide the step's path and refresh every static buffer.
 
         Everything here is eager, on the decode stream, ordered before the
-        replays that consume it.
+        replays that consume it. Nothing here builds or captures: only the
+        buckets of the sealed ladder replay, every other step runs eager.
         """
         self._step_active = False
         self._moe_step_active = False
@@ -1399,6 +1420,11 @@ class KimiLinearDecodeGraph:
             return
         mode = _debug_mode() or self.mode
         if mode == "eager":
+            return
+        if not self._ladder_captured:
+            self._fallback(
+                "decode graph ladder not captured (no prewarm in a captured mode)"
+            )
             return
 
         seq_ids = list(AttnWrapperBase.cur_batch or [])
@@ -1439,66 +1465,58 @@ class KimiLinearDecodeGraph:
             self._fallback(f"graph page table unavailable ({exc})")
             return
 
-        # Signature first: a moved page table / K cache invalidates the
-        # addresses baked into every graph, so drop before (re)building.
-        signature = self._signature(kv_manager)
-        if signature != self._kv_signature:
-            if self._kv_signature is not None:
-                logger.warning(
-                    "[KIMI_DECODE_GRAPH] rank=%s KV storage changed "
-                    "(%s -> %s); dropping captured graphs",
-                    self.rank, self._kv_signature, signature,
-                )
-                self._drop_graphs()
-            self._kv_signature = signature
-
-        if not self._ensure_built(kv_manager):
-            return
+        # A moved page table / K cache invalidates the addresses baked into
+        # every captured graph; the sealed ladder is never recaptured.
+        self._require_capture_signature(self._signature(kv_manager))
 
         # The outer graph includes the global resident-EP collectives, so its
         # bucket is derived from the synchronized post-TP count rather than
-        # this rank's local attention batch.  This branch must happen before
-        # the legacy per-layer captures: registering a whole graph should not
-        # pay for 93 inner graph replays that it will never use.
-        if mode == "graph":
-            self._ensure_moe_built()
-            # Empty peers replay the same bucket through
-            # ``_begin_empty_whole_step``, so the whole-model path no longer
-            # waits for every EP rank to hold rows (r27 tail: 150-230 ms eager
-            # steps once one node had drained, vs ~80 ms replays).
-            if self._moe_group_bucket_for_step() is not None:
-                whole_bucket = self._whole_model_bucket_for_step()
-                if whole_bucket is not None and self._ensure_whole_built():
-                    self._bucket_statics(whole_bucket)
-                    if whole_bucket not in self._whole_captured:
-                        self._capture_whole_bucket(whole_bucket)
-                    self._refresh_statics(
-                        whole_bucket, bsz, seq_ids, page_table, aux_page_table
-                    )
-                    # ``_run_whole_model`` is entered from the patched model
-                    # forward, while ``_bucket`` is also used by the legacy
-                    # layer hook.  Keep a dedicated whole-bucket field: the
-                    # outer graph bucket can be larger than this rank's local
-                    # attention batch when another DP group has more rows.
-                    self._whole_bucket = whole_bucket
-                    self._bucket = whole_bucket
-                    self._bsz = bsz
-                    self.step += 1
-                    self._step_active = True
-                    self._whole_step_active = True
-                    return
+        # this rank's local attention batch.  Empty peers replay the same
+        # bucket through ``_begin_empty_whole_step``, so the whole-model path
+        # does not wait for every EP rank to hold rows (r27 tail: 150-230 ms
+        # eager steps once one node had drained, vs ~80 ms replays).
+        if (
+            mode == "graph"
+            and self._whole_built
+            and self._moe_group_bucket_for_step() is not None
+        ):
+            whole_bucket = self._whole_model_bucket_for_step()
+            if whole_bucket is not None and whole_bucket in self._whole_captured:
+                self._require_moe_shards_resident()
+                self._refresh_statics(
+                    whole_bucket, bsz, seq_ids, page_table, aux_page_table
+                )
+                # ``_run_whole_model`` is entered from the patched model
+                # forward, while ``_bucket`` is also used by the legacy
+                # layer hook.  Keep a dedicated whole-bucket field: the
+                # outer graph bucket can be larger than this rank's local
+                # attention batch when another DP group has more rows.
+                self._whole_bucket = whole_bucket
+                self._bucket = whole_bucket
+                self._bsz = bsz
+                self.step += 1
+                self._step_active = True
+                self._whole_step_active = True
+                return
+            if whole_bucket is not None:
+                self._fallback(
+                    f"whole-model bucket {whole_bucket} is not in the captured "
+                    "ladder"
+                )
 
         if bucket not in self._captured:
-            self._capture_bucket(bucket)
+            self._fallback(
+                f"attention bucket {bucket} is not in the captured ladder"
+            )
+            return
 
         # K3's resident latent MoE uses global EP collectives.  Derive its
         # group-sized replay bucket from the worker-synchronized post-TP
         # ``ntp`` rather than from this rank's local batch size.
-        if self._ensure_moe_built() and self._moe_all_ranks_nonempty():
+        if self._moe_built and self._moe_all_ranks_nonempty():
             moe_bucket = self._moe_group_bucket_for_step()
-            if moe_bucket is not None:
-                if moe_bucket not in self._moe_captured:
-                    self._capture_moe_bucket(moe_bucket)
+            if moe_bucket is not None and moe_bucket in self._moe_captured:
+                self._require_moe_shards_resident()
                 self._moe_ntp = moe_bucket // next(
                     iter(self.moe_segments.values())
                 ).tp_size
@@ -1868,8 +1886,10 @@ class KimiLinearDecodeGraph:
 
     def _drop_graphs(self) -> None:
         """Release every captured bucket and the geometry derived from the KV
-        manager. Segments are rebuilt (and re-registered on a fresh
-        CUDAGraphManager) on the next eligible step."""
+        manager (adapter release only). Segments are rebuilt (and
+        re-registered on a fresh CUDAGraphManager) by the next prewarm."""
+        self._ladder_captured = False
+        self._kv_signature = None
         self._drop_whole_graphs()
         for bucket in list(self._captured):
             self.manager.drop_bucket(bucket)
@@ -2047,10 +2067,10 @@ class KimiLinearDecodeGraph:
 
         Mirrors the non-empty branch of ``_begin_step`` minus the local page
         table: the bucket comes from the worker-synchronized post-TP count,
-        the graph is captured collectively if this bucket is new, and the
-        statics are refreshed with ``bsz=0`` (== ``arm_for_capture``).  A
-        rank that cannot take this path returns silently to eager exactly as
-        before; its peers then fall back through the same synced decision.
+        it must be in the sealed ladder (every rank captured the same one),
+        and the statics are refreshed with ``bsz=0`` (== ``arm_for_capture``).
+        A rank that cannot take this path returns silently to eager exactly
+        as before; its peers then fall back through the same synced decision.
         """
         whole_bucket = self._prepare_empty_whole_bucket()
         if whole_bucket is None:
@@ -2065,29 +2085,22 @@ class KimiLinearDecodeGraph:
     def _prepare_empty_whole_bucket(self) -> Optional[int]:
         """The collective half of an empty DP rank's decode step.
 
-        Builds (once) and captures (if new) the peers' synchronized
-        whole-model bucket, then refreshes its statics with zero valid rows.
-        Both ``_begin_empty_whole_step`` and ``prewarm_decode_graphs`` run
-        exactly this, so an empty rank joins the same EP collectives at
-        prewarm as at steady state. Returns the bucket, or ``None`` when the
-        whole-model path is unavailable (the peers' synced decision then
-        keeps them off it as well).
+        Selects the peers' synchronized whole-model bucket from the sealed
+        ladder and refreshes its statics with zero valid rows. The rowed
+        ranks' ``_begin_step`` takes the same decision from the same synced
+        count and the same captured set (the ladder capture is identical on
+        every rank), so an empty rank replays exactly when they do. Returns
+        the bucket, or ``None`` when the whole-model path is off for this
+        step (the peers' synced decision then keeps them off it as well).
         """
         kv_manager = AttnWrapperBase.gpu_paged_kv_manager
-        if kv_manager is None or not self._ensure_built(kv_manager):
+        if kv_manager is None or not self._whole_built:
             return None
-        signature = self._signature(kv_manager)
-        if signature != self._kv_signature:
-            if self._kv_signature is not None:
-                self._drop_graphs()
-            self._kv_signature = signature
-        self._ensure_moe_built()
+        self._require_capture_signature(self._signature(kv_manager))
         whole_bucket = self._whole_model_bucket_for_step()
-        if whole_bucket is None or not self._ensure_whole_built():
+        if whole_bucket is None or whole_bucket not in self._whole_captured:
             return None
-        self._bucket_statics(whole_bucket)
-        if whole_bucket not in self._whole_captured:
-            self._capture_whole_bucket(whole_bucket)
+        self._require_moe_shards_resident()
         self._refresh_statics(whole_bucket, 0, [], None)
         return whole_bucket
 
