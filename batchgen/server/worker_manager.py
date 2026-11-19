@@ -47,6 +47,7 @@ from batchgen.server.server_args import (
     validate_shared_runtime_capability,
 )
 from batchgen.utils import config_torch_module_initializer
+from batchgen.worker.code_identity import CodeIdentity
 from batchgen.worker.startup_phases import (
     PHASE_STORE_STAGING,
     StartupPhaseRecord,
@@ -280,6 +281,9 @@ class WorkerManager:
         # The cohort this node serves, or is starting, named by the restart
         # epoch that brought it up (_generation_of_epoch); 0 before start-up.
         self._generation = 0
+        # (generation, identity) of the newest cohort that published its code
+        # identity; see record_code_identity.
+        self._code_identity: Optional[Tuple[int, CodeIdentity]] = None
         # The epoch of the cohort being spawned, which its ranks log under.
         self._spawning_epoch = 0
         self._first_ready = False
@@ -407,6 +411,34 @@ class WorkerManager:
         """
         return int(epoch) + 1
 
+    def record_code_identity(self, cohort: int, identity: Dict[str, Any]) -> None:
+        """Record what a cohort runs, as its local rank 0 published it.
+
+        ``cohort`` is the restart epoch that spawned it, so the record names
+        the generation the cohort serves even while the restart that brings
+        it up is still running. Logged as that generation's one line on this
+        node (``CodeIdentity.log_line``), which precedes every request the
+        generation serves: the scheduler records it before it marks the
+        deployment ready.
+        """
+        parsed = CodeIdentity.from_dict(identity)
+        generation = self._generation_of_epoch(cohort)
+        with self._lock:
+            self._code_identity = (generation, parsed)
+        logger.info("%s", parsed.log_line(generation, self.args.node_rank))
+
+    @property
+    def code_identity(self) -> Optional[Dict[str, Any]]:
+        """The current generation's code identity; None until its cohort
+        published one, and after a failed restart (no cohort serves). While a
+        restart is in flight the outgoing generation is still the current one
+        and its identity stays reported, next to state ``restarting``."""
+        with self._lock:
+            recorded, generation = self._code_identity, self._generation
+        if recorded is None or recorded[0] != generation:
+            return None
+        return recorded[1].as_dict()
+
     @property
     def coordinator_error(self) -> Optional[str]:
         """Why the restart control store is unreachable now, if it is."""
@@ -442,6 +474,7 @@ class WorkerManager:
         status = {
             "state": self.state,
             "generation": self.generation,
+            "code_identity": self.code_identity,
             "workers": len(getattr(self.worker_process, "processes", ()) or ()),
             "node_rank": self.args.node_rank,
             "nnodes": self.args.nnodes,

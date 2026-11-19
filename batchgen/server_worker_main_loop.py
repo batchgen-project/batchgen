@@ -43,6 +43,7 @@ from batchgen.server.process_utils import (
 from batchgen.server.runtime_locks import hold_run_lock
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
+from batchgen.worker.code_identity import compute_code_identity
 from batchgen.worker.startup_phases import (
 	NULL_STARTUP_PHASE_REPORTER,
 	PHASE_COMMUNICATOR_INIT,
@@ -690,6 +691,11 @@ def _server_worker_main_impl(
 	args.global_rank = args.local_world_size * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
+	# What this cohort runs: the revision of the tree it imports from, taken
+	# here, before the model build imports the model code, by the one rank per
+	# node that publishes it with the deployment capacity below.
+	code_identity = compute_code_identity() if args.local_rank == 0 else None
+
 	# This rank's slot in the server's shared startup-phase record.  Slot 0 is
 	# the server itself, so the local ranks take the slots after it.  Phases are
 	# entered back to back below rather than wrapped: the entries bracket code
@@ -821,12 +827,16 @@ def _server_worker_main_impl(
 	# Every node's scheduler receives its local rank-zero worker's resolved
 	# length, including after restart. Publish before the readiness signal.
 	# The startup decode transient rides the same publication; it is already
-	# reduced over every rank, and is report-only.
+	# reduced over every rank, and is report-only. So does the code identity,
+	# with the restart epoch that spawned this cohort, which names its
+	# generation.
 	if args.local_rank == 0:
 		response_queue.put({
 			"type": "deployment_capacity",
 			"max_model_len": worker.model_context_length,
 			"startup_transient": worker.startup_transient,
+			"code_identity": code_identity.as_dict(),
+			"cohort": args.log_cohort,
 		})
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister

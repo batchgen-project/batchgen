@@ -58,6 +58,26 @@ with an `unavailable` reason instead of a value: eager needs a model-provided
 cap-sized synthetic decode step, and capture is measured only where the
 lifecycle captures at startup.
 
+The same publication carries the cohort's `code_identity` and `cohort` (the
+restart epoch that spawned it). Local rank 0 of each node computes the
+identity at the top of its start-up, before the model build
+(`batchgen/worker/code_identity.py`), because a worker restart re-imports
+Python from disk and the server process cannot see what the new cohort
+imported. `source=git`: the commit of the work tree holding the `batchgen`
+package and whether that tree differs from it (one `git status` per cohort
+start); `source=none`: no git metadata beside the package (an installed
+package records no revision). Anything git cannot answer is revision
+`unknown` with a fixed reason. `WorkerManager.record_code_identity` logs one
+line per generation and node before the scheduler marks the deployment ready:
+
+    [CODE_IDENTITY] generation=<G> node=<N> source=<git|none> revision=<commit|unknown> dirty=<true|false|unknown> reason=<reason|->
+
+`GET /v1/workers/status` reports `code_identity` (`source`, `revision`,
+`dirty`, `reason`) for the current generation. While a restart is in flight
+the outgoing generation is still current, so its identity stays reported next
+to state `restarting`; after a failed restart it is null. The identity names a
+revision, never a directory.
+
 # Batch request counts
 
 `BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per
