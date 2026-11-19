@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 import pytest
 
 from batchgen import eventlog
+from batchgen.eventlog import flight_recorder
 from batchgen.worker.code_identity import CodeIdentity
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
@@ -1190,6 +1191,9 @@ def _load_worker_loop_helpers() -> Dict[str, Any]:
         "sys": sys,
         # flush_logs_before_exit drains the event log first.
         "eventlog": eventlog,
+        # The self-exit path leaves a flight-recorder hang dump first; with
+        # no recorder installed in the test process it writes nothing.
+        "flight_recorder": flight_recorder,
     }
     exec(
         compile(ast.Module(body=protocol, type_ignores=[]), str(EXIT_PROTOCOL_PATH), "exec"),

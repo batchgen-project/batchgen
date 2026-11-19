@@ -19,6 +19,7 @@ Structured events go through :func:`log_event`; per-batch context comes from
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import logging
 import os
 import queue
@@ -39,6 +40,7 @@ from .handlers import (
     EventQueueHandler,
     FlushRequest,
     JsonlHandler,
+    MirrorRequest,
     _report_internal_error,
     jsonl_file_path,
     run_dir_name,
@@ -53,8 +55,10 @@ __all__ = [
     "get_logger",
     "jsonl_path",
     "log_event",
+    "process_info",
     "register_console_renderer",
     "set_context",
+    "set_jsonl_mirror",
     "shutdown",
 ]
 
@@ -320,3 +324,27 @@ def shutdown() -> None:
 def jsonl_path() -> Path | None:
     state = _state
     return None if state is None else state.path
+
+
+def process_info() -> schema.ProcessInfo | None:
+    """The identity stamped on this process's records, run id included."""
+    state = _state
+    if state is None:
+        return None
+    return dataclasses.replace(state.info, run_id=state.run_id)
+
+
+def set_jsonl_mirror(mirror) -> None:
+    """Mirror every JSONL envelope into ``mirror.record(envelope, line)``.
+
+    The mirror runs on the listener thread for each record handled after
+    this call, after the record's line is written; ``None`` detaches it.
+    Raises ``RuntimeError`` when a mirror is set without a configured event
+    log writing JSONL.
+    """
+    state = _state
+    if state is None or state.jsonl_handler is None:
+        if mirror is None:
+            return
+        raise RuntimeError("batchgen.eventlog is not writing JSONL")
+    state.queue.put(MirrorRequest(mirror))
