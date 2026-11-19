@@ -1457,8 +1457,12 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch_status(
-                batch_id, BatchStatus.FAILED, error=f"capacity_exceeded: {error_msg}"
+            # The batch is already registered with the scheduling pool (and
+            # its total persisted), so it fails through the single exit,
+            # which releases that registration; the rejection added nothing
+            # to the intake pool (submit_batch is all-or-nothing).
+            self._discard_failed_batch(
+                batch_id, f"capacity_exceeded: {error_msg}"
             )
             return
         # Store max_tokens for init message
@@ -1541,7 +1545,8 @@ class BatchScheduler:
 
         The one place a registered batch is failed: the worker-fatal path
         (_fail_all_active_batches), the failed or timed-out wait in
-        _wait_and_finalize_batch, and an exception after IN_PROGRESS in
+        _wait_and_finalize_batch, an intake-capacity rejection in
+        _process_batch_pool_mode, and an exception after IN_PROGRESS in
         _process_batch. It removes the queued intake entries and intake batch
         info, the batch tracker (with its completion dedup keys) and the
         per-request output metadata; absent state is skipped, so it is safe
