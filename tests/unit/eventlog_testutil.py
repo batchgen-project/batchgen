@@ -44,6 +44,37 @@ def import_eventlog():
             del sys.modules["batchgen"]
 
 
+def import_under_stub_packages(name: str, packages=("batchgen",)):
+    """Import module ``name`` with stub ``packages`` for the import only.
+
+    For modules that ``from batchgen import ...`` at import time; the stubs'
+    ``__path__`` points at the source tree, as in :func:`import_eventlog`.
+    """
+    import_eventlog()
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    stubs = []
+    for package in packages:
+        if package in sys.modules:
+            continue
+        stub = types.ModuleType(package)
+        stub.__path__ = [str(REPO_ROOT.joinpath(*package.split(".")))]
+        stub.__package__ = package
+        sys.modules[package] = stub
+        stubs.append((package, stub))
+    try:
+        return importlib.import_module(name)
+    finally:
+        for package, stub in stubs:
+            if sys.modules.get(package) is stub:
+                del sys.modules[package]
+
+
+def import_flight_recorder():
+    return import_under_stub_packages("batchgen.eventlog.flight_recorder")
+
+
 @contextlib.contextmanager
 def isolated_logging(ev) -> Iterator[None]:
     """Restore root logging, context and renderers around one test."""

@@ -26,6 +26,7 @@ from batchgen.batchgen_worker import (
 	runs_startup_before_readiness,
 )
 from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.eventlog import flight_recorder
 from batchgen.eventlog import process as eventlog_process
 from batchgen.eventlog.process import (
 	EXIT_PATH_ABORT,
@@ -451,6 +452,12 @@ def _start_shutdown_abort_watchdog(
 			global_rank,
 			os.getpid(),
 		)
+		# The main loop is wedged: keep its stack and the last events before
+		# this process ends itself.  Bounded, and never raises.
+		flight_recorder.dump(
+			flight_recorder.TRIGGER_HANG,
+			"main loop did not retire after the shutdown abort",
+		)
 		# os._exit runs no handler and flushes nothing, so the marker above has
 		# to reach the log first or the exit is unattributable.
 		flush_logs_before_exit()
@@ -595,6 +602,11 @@ def server_worker_main(
 			e,
 			exc_info=True,
 		)
+		# Before the fatal leaves this process: once it is published the
+		# launcher may tear this worker down.  Bounded, and never raises.
+		flight_recorder.dump(
+			flight_recorder.TRIGGER_EXCEPTION, "unhandled worker exception", e
+		)
 		traceback_text = traceback.format_exc()
 		message = _format_worker_fatal(
 			rank_idx,
@@ -649,6 +661,9 @@ def _server_worker_main_impl(
 		log_dir=args.log_dir,
 		level=args.log_level,
 	)
+	# Every rank keeps its last events in a ring next to its JSONL file, where
+	# a fatal exception, a watchdog timeout or a native crash leaves them.
+	recorder = flight_recorder.install()
 
 	# Step 0.0: Join this run's liveness lock.  A spawned worker inherits no
 	# descriptor, so it opens the server-created file itself and never closes it;
@@ -807,6 +822,7 @@ def _server_worker_main_impl(
 		watchdog_timeout=watchdog_timeout,
 		soft=False,  # Hard mode: kill parent process on timeout
 		test_stuck_time=watchdog_test_stuck_time,
+		dump_info=recorder.watchdog_dump_info(f"worker-{args.global_rank}"),
 	)
 	if watchdog_timeout:
 		logging.info(f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s")
@@ -871,6 +887,7 @@ def _server_worker_main_impl(
 		debug_name=f"decode-{args.global_rank}",
 		watchdog_timeout=decode_step_timeout,
 		soft=False,  # Hard mode: kill parent process on timeout
+		dump_info=recorder.watchdog_dump_info(f"decode-{args.global_rank}"),
 	)
 	if decode_step_timeout:
 		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
