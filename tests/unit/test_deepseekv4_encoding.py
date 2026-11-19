@@ -1,19 +1,41 @@
 """
 Test suite for DeepSeek-V4 Encoding.
 
-Run: python test_encoding_dsv4.py
+Upstream ships this suite as ``assets/encoding/test_encoding_dsv4.py`` next to
+``encoding_dsv4.py``; it lives here so the runtime package carries no test
+modules. Both vendored copies (Flash, whose module the DeepSeek-V4 tokenizer
+imports, and Pro) are checked against the upstream golden files that stay in
+each ``assets/encoding/tests/`` directory.
+
+Run: pytest tests/unit/test_deepseekv4_encoding.py
 """
 
+import importlib
 import json
 import os
 
-from encoding_dsv4 import encode_messages, parse_message_from_completion_text
+import pytest
 
-TESTS_DIR = os.path.join(os.path.dirname(__file__), "tests")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_VARIANTS = ("deepseekv4_flash", "deepseekv4_pro")
 
 
-def test_case_1():
+@pytest.fixture(params=_VARIANTS)
+def encoding(request):
+    """(encode_messages, parse_message_from_completion_text, TESTS_DIR) per vendored copy."""
+    mod = importlib.import_module(
+        f"batchgen.models.deepseek.{request.param}.assets.encoding.encoding_dsv4"
+    )
+    tests_dir = os.path.join(
+        _REPO_ROOT, "batchgen", "models", "deepseek", request.param,
+        "assets", "encoding", "tests",
+    )
+    return mod.encode_messages, mod.parse_message_from_completion_text, tests_dir
+
+
+def test_case_1(encoding):
     """Thinking mode with tool calls (multi-turn, tool results merged into user)."""
+    encode_messages, parse_message_from_completion_text, TESTS_DIR = encoding
     with open(os.path.join(TESTS_DIR, "test_input_1.json")) as f:
         td = json.load(f)
         messages = td["messages"]
@@ -43,8 +65,9 @@ def test_case_1():
     print("  [PASS] case 1: thinking with tools (encode + parse)")
 
 
-def test_case_2():
+def test_case_2(encoding):
     """Thinking mode without tools (drop_thinking removes earlier reasoning)."""
+    encode_messages, parse_message_from_completion_text, TESTS_DIR = encoding
     messages = json.load(open(os.path.join(TESTS_DIR, "test_input_2.json")))
     gold = open(os.path.join(TESTS_DIR, "test_output_2.txt")).read()
     prompt = encode_messages(messages, thinking_mode="thinking")
@@ -64,26 +87,20 @@ def test_case_2():
     print("  [PASS] case 2: thinking without tools (encode + parse)")
 
 
-def test_case_3():
+def test_case_3(encoding):
     """Interleaved thinking + search (developer with tools, latest_reminder)."""
+    encode_messages, _, TESTS_DIR = encoding
     messages = json.load(open(os.path.join(TESTS_DIR, "test_input_3.json")))
     gold = open(os.path.join(TESTS_DIR, "test_output_3.txt")).read()
     assert encode_messages(messages, thinking_mode="thinking") == gold
     print("  [PASS] case 3: interleaved thinking + search")
 
 
-def test_case_4():
+def test_case_4(encoding):
     """Quick instruction task with latest_reminder (chat mode, action task)."""
+    encode_messages, _, TESTS_DIR = encoding
     messages = json.load(open(os.path.join(TESTS_DIR, "test_input_4.json")))
     gold = open(os.path.join(TESTS_DIR, "test_output_4.txt")).read()
     assert encode_messages(messages, thinking_mode="chat") == gold
     print("  [PASS] case 4: quick instruction task")
 
-
-if __name__ == "__main__":
-    print("Running DeepSeek-V4 Encoding Tests...\n")
-    test_case_1()
-    test_case_2()
-    test_case_3()
-    test_case_4()
-    print("\nAll 4 tests passed!")

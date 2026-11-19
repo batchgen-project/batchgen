@@ -1,11 +1,13 @@
 """Sanity check: compare FA3+sink_correction vs OpenAI reference sdpa.
 
 This test validates that the FlashAttention + sigmoid post-correction approach
-produces numerically equivalent results to the reference OpenAI implementation
-that uses inline softmax with sink concatenation.
+(``batchgen.attention.gqa.sink_correction.apply_sink_correction``) produces
+numerically equivalent results to the reference OpenAI implementation that
+uses inline softmax with sink concatenation. Pure PyTorch: runs on CPU, and on
+CUDA when available.
 
 Usage:
-    python -m batchgen.attention.gqa.test_sink_correction
+    pytest tests/unit/test_gqa_sink_correction.py
 
 Reference Implementation (gpt-oss/torch/model.py):
     S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
@@ -17,8 +19,11 @@ Reference Implementation (gpt-oss/torch/model.py):
     attn = torch.einsum("hmqk,khmd->qhmd", W, V)
 """
 
-import torch
 import math
+
+import torch
+
+from batchgen.attention.gqa.sink_correction import apply_sink_correction
 
 
 def reference_sdpa_with_sinks(
@@ -114,8 +119,6 @@ def fa_style_sdpa_with_sinks(
     Returns:
         Attention output [n_tokens, n_q_heads * head_dim]
     """
-    from .sink_correction import apply_sink_correction
-
     n_tokens, n_kv_heads, q_mult, head_dim = Q.shape
     n_q_heads = n_kv_heads * q_mult
 
@@ -229,7 +232,7 @@ def test_sink_correction_numerical_equivalence():
         print("SOME TESTS FAILED")
     print("=" * 60)
 
-    return all_passed
+    assert all_passed, "FA-style sink correction diverged from the reference"
 
 
 def test_padding_handling():
@@ -237,8 +240,6 @@ def test_padding_handling():
     print("\n" + "=" * 60)
     print("Testing padding token handling")
     print("=" * 60)
-
-    from .sink_correction import apply_sink_correction
 
     n_tokens = 32
     n_heads = 64
@@ -283,22 +284,8 @@ def test_padding_handling():
     else:
         print("FAILED")
 
-    return passed
+    assert passed, (
+        f"padding handling: nan={has_nan} inf={has_inf} "
+        f"padding_mean={padding_output_mean:.3e}"
+    )
 
-
-if __name__ == "__main__":
-    test1 = test_sink_correction_numerical_equivalence()
-    test2 = test_padding_handling()
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"Numerical equivalence: {'PASSED' if test1 else 'FAILED'}")
-    print(f"Padding handling: {'PASSED' if test2 else 'FAILED'}")
-
-    if test1 and test2:
-        print("\nAll tests passed!")
-        exit(0)
-    else:
-        print("\nSome tests failed!")
-        exit(1)
