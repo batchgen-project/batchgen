@@ -58,20 +58,6 @@ with an `unavailable` reason instead of a value: eager needs a model-provided
 cap-sized synthetic decode step, and capture is measured only where the
 lifecycle captures at startup.
 
-# Batch request counts
-
-`BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per
-request in one place, `BatchScheduler._record_pool_result`, which every batch
-request result passes through (worker completions and admission rejections). It counts the result
-on the `SchedulingPool` tracker (`record_request_result`, once per request;
-an `error` result is failed) and only then writes the output item, so the
-output file and the counts cannot diverge. `total` is persisted at
-registration. While the tracker exists, `with_live_request_counts` serves its
-live counts on `GET /v1/batches`, `GET /v1/batches/{id}` and cancel; the
-completed and failed transitions persist the tracker's final counts. Startup
-recovery (`StorageManager.fail_orphaned_batches`) rebuilds completed/failed of
-an orphaned batch from its incremental output items. Records written before
-the field existed load with zero counts.
 The same publication carries the cohort's `code_identity` and `cohort` (the
 restart epoch that spawned it). Local rank 0 of each node computes the
 identity at the top of its start-up, before the model build
@@ -91,3 +77,18 @@ line per generation and node before the scheduler marks the deployment ready:
 the outgoing generation is still current, so its identity stays reported next
 to state `restarting`; after a failed restart it is null. The identity names a
 revision, never a directory.
+
+# Batch request counts
+
+`BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per
+request in one place, `BatchScheduler._record_pool_result`, which every batch
+request result passes through (worker completions and admission rejections). It counts the result
+on the `SchedulingPool` tracker (`record_request_result`, once per request;
+an `error` result is failed) and only then writes the output item, so the
+output file and the counts cannot diverge. `total` is persisted at
+registration. While the tracker exists, `with_live_request_counts` serves its
+live counts on `GET /v1/batches`, `GET /v1/batches/{id}` and cancel; the
+completed and failed transitions persist the tracker's final counts. Startup
+recovery (`StorageManager.fail_orphaned_batches`) rebuilds completed/failed of
+an orphaned batch from its incremental output items. Records written before
+the field existed load with zero counts.
