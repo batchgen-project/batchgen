@@ -77,7 +77,7 @@ class KimiK25ParallelStrategyManager:
         self.world_size = world_size
         self.rank = global_rank
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """Kimi-K2.5's declared parallel layout (batchgen.parallel_declaration).
 
         Prefill runs every module replicated per rank with the weights
@@ -91,6 +91,7 @@ class KimiK25ParallelStrategyManager:
         """
         from batchgen.parallel_declaration import (
             ModuleParallelism,
+            DecodeGraphDeclaration,
             ParallelDeclaration,
             RESIDENCY_PARTIAL,
             RESIDENCY_RESIDENT,
@@ -111,6 +112,11 @@ class KimiK25ParallelStrategyManager:
                 if num_local == experts_per_rank
                 else RESIDENCY_PARTIAL,
                 group_size=self.world_size,
+            ),
+            decode_graph=(
+                DecodeGraphDeclaration.off()
+                if decode_graph_state is None
+                else decode_graph_state
             ),
         )
 

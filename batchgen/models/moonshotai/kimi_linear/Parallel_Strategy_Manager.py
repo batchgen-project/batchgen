@@ -2603,7 +2603,7 @@ class KimiLinearParallelStrategyManager:
         same NoPE-MLA pool seams, and at G == 1 the worker never asks."""
         return True
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """Kimi-Linear's declared parallel layout (batchgen.parallel_declaration).
 
         Attention: head-parallel over the attention group when G > 1 (DP
@@ -2618,6 +2618,9 @@ class KimiLinearParallelStrategyManager:
         name rather than declaring something untrue.
         """
         from batchgen.parallel_declaration import (
+            DecodeGraphDeclaration,
+            GRAPH_MODE_COMPARE,
+            GRAPH_MODE_GRAPH,
             ModuleParallelism,
             ParallelDeclaration,
             ParallelDeclarationError,
@@ -2643,6 +2646,17 @@ class KimiLinearParallelStrategyManager:
                 f"undeclarable {phase} MoE mode {mode!r}"
             )
 
+        graph = getattr(self, "_decode_graph", None)
+        graph_mode = getattr(graph, "mode", "eager")
+        if graph_mode in (GRAPH_MODE_GRAPH, GRAPH_MODE_COMPARE):
+            bucketing = getattr(graph, "bucketing", None)
+            buckets = None if bucketing is None else tuple(
+                int(bucket) for bucket in bucketing.bucket_sizes
+            )
+            decode_graph = DecodeGraphDeclaration(graph_mode, buckets)
+        else:
+            decode_graph = DecodeGraphDeclaration.off()
+
         return ParallelDeclaration(
             prefill_attention=ModuleParallelism(
                 attn_scheme,
@@ -2656,6 +2670,7 @@ class KimiLinearParallelStrategyManager:
                 attn_scheme, RESIDENCY_RESIDENT, group_size=attn_group
             ),
             decode_moe=_moe_slot(self._decode_moe_mode(), "decode"),
+            decode_graph=decode_graph,
         )
 
     def recurrent_state_owner(self):

@@ -56,7 +56,7 @@ class DeepSeekV4FlashParallelStrategyManager:
             model_config
         )
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """DeepSeek-V4-Flash's declared layout (batchgen.parallel_declaration).
 
         The weight contract is built once in ``__init__`` and both phases
@@ -68,6 +68,7 @@ class DeepSeekV4FlashParallelStrategyManager:
         (``configure_ep(global_rank, world_size)``), still streamed.
         """
         from batchgen.parallel_declaration import (
+            DecodeGraphDeclaration,
             ModuleParallelism,
             ParallelDeclaration,
             RESIDENCY_STREAMED,
@@ -82,6 +83,7 @@ class DeepSeekV4FlashParallelStrategyManager:
             decode_moe=ModuleParallelism(
                 SCHEME_EP, RESIDENCY_STREAMED, group_size=self.world_size
             ),
+            decode_graph=DecodeGraphDeclaration.off(),
         )
 
     def configure_prefill(self):

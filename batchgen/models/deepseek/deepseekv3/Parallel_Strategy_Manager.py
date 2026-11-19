@@ -25,7 +25,7 @@ else:
 class DeepseekV3ParallelStrategyManager:
 	NUM_TOTAL_EXPERTS = 256  # Total routed experts per MoE layer
 
-	def parallel_declaration(self):
+	def parallel_declaration(self, decode_graph_state=None):
 		"""DeepSeek-V3's declared parallel layout (batchgen.parallel_declaration).
 
 		Prefill runs every module replicated per rank with the weights
@@ -38,6 +38,7 @@ class DeepseekV3ParallelStrategyManager:
 		streams the remainder and declares ``partial``.
 		"""
 		from batchgen.parallel_declaration import (
+			DecodeGraphDeclaration,
 			ModuleParallelism,
 			ParallelDeclaration,
 			RESIDENCY_PARTIAL,
@@ -60,6 +61,7 @@ class DeepseekV3ParallelStrategyManager:
 				else RESIDENCY_PARTIAL,
 				group_size=self.world_size,
 			),
+			decode_graph=DecodeGraphDeclaration.off(),
 		)
 
 	def _plan_local_expert_split(self) -> tuple:

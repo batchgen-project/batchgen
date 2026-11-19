@@ -52,7 +52,7 @@ class MiniMaxM25ParallelStrategyManager:
         self.model = None
         self.enable_ep_offloading = False
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """MiniMax-M2.5's declared parallel layout (batchgen.parallel_declaration).
 
         Prefill runs every module replicated per rank with the weights
@@ -65,6 +65,7 @@ class MiniMaxM25ParallelStrategyManager:
         streams the remainder and declares ``partial``.
         """
         from batchgen.parallel_declaration import (
+            DecodeGraphDeclaration,
             ModuleParallelism,
             ParallelDeclaration,
             RESIDENCY_PARTIAL,
@@ -87,6 +88,7 @@ class MiniMaxM25ParallelStrategyManager:
                 else RESIDENCY_PARTIAL,
                 group_size=self.world_size,
             ),
+            decode_graph=DecodeGraphDeclaration.off(),
         )
 
     def _plan_local_expert_split(self):

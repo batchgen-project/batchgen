@@ -249,7 +249,7 @@ class GptOssParallelStrategyManager:
             and not getattr(self.model_config, "pre_dequantize_weights", False)
         )
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """GPT-OSS's declared parallel layout (batchgen.parallel_declaration).
 
         Prefill streams the attention weights and replicates every routed
@@ -262,6 +262,7 @@ class GptOssParallelStrategyManager:
         """
         from batchgen.parallel_declaration import (
             ModuleParallelism,
+            DecodeGraphDeclaration,
             ParallelDeclaration,
             RESIDENCY_PARTIAL,
             RESIDENCY_RESIDENT,
@@ -283,6 +284,11 @@ class GptOssParallelStrategyManager:
                 SCHEME_EP,
                 RESIDENCY_RESIDENT if resident >= owned else RESIDENCY_PARTIAL,
                 group_size=self.world_size,
+            ),
+            decode_graph=(
+                DecodeGraphDeclaration.off()
+                if decode_graph_state is None
+                else decode_graph_state
             ),
         )
 

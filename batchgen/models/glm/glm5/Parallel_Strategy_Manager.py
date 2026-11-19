@@ -1746,7 +1746,7 @@ class GLM5ParallelStrategyManager:
             _, resident = self._plan_local_expert_split()
         return resident == self.NUM_TOTAL_EXPERTS // self.world_size
 
-    def parallel_declaration(self):
+    def parallel_declaration(self, decode_graph_state=None):
         """GLM-5's declared parallel layout (batchgen.parallel_declaration).
 
         Prefill runs every module replicated per rank with the weights
@@ -1760,6 +1760,7 @@ class GLM5ParallelStrategyManager:
         """
         from batchgen.parallel_declaration import (
             ModuleParallelism,
+            DecodeGraphDeclaration,
             ParallelDeclaration,
             RESIDENCY_PARTIAL,
             RESIDENCY_RESIDENT,
@@ -1779,6 +1780,11 @@ class GLM5ParallelStrategyManager:
             decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
             decode_moe=ModuleParallelism(
                 SCHEME_EP, decode_moe_residency, group_size=self.world_size
+            ),
+            decode_graph=(
+                DecodeGraphDeclaration.off()
+                if decode_graph_state is None
+                else decode_graph_state
             ),
         )
 

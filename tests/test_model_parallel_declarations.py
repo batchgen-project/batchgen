@@ -132,6 +132,12 @@ def rendered(declaration):
     return declaration.rendered_slots()
 
 
+def graph_decl(mode="graph", buckets=(1, 2, 4)):
+    from batchgen.parallel_declaration import DecodeGraphDeclaration
+
+    return DecodeGraphDeclaration(mode=mode, buckets=buckets)
+
+
 # -- GLM-5 (required by the acceptance ratchet) ------------------------------
 
 def _glm5(world_size, engine_config):
@@ -147,12 +153,17 @@ def _glm5(world_size, engine_config):
 
 def test_glm5_declares_resident_ep_decode():
     pm = _glm5(8, _ep_config())
-    assert rendered(pm.parallel_declaration()) == {
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:streamed",
         "decode_attention": "dp:resident",
         "decode_moe": "ep8:resident",
     }
+    assert declared.decode_graph.mode == "off"
+
+    enabled = pm.parallel_declaration(graph_decl())
+    assert enabled.decode_graph == graph_decl()
 
 
 def test_glm5_declares_partial_residency_under_offloading():
@@ -177,12 +188,16 @@ def _gptoss(world_size, engine_config, num_local_experts=128):
 
 
 def test_gptoss_single_gpu_keeps_everything_resident_but_streams_prefill_attn():
-    assert rendered(_gptoss(1, _ep_config()).parallel_declaration()) == {
+    pm = _gptoss(1, _ep_config())
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:resident",
         "decode_attention": "dp:resident",
         "decode_moe": "ep1:resident",
     }
+    assert declared.decode_graph.mode == "off"
+    assert pm.parallel_declaration(graph_decl()).decode_graph == graph_decl()
 
 
 def test_gptoss_offloading_streams_prefill_and_splits_decode():
@@ -211,12 +226,18 @@ def _kimi_linear(world_size, G, stream_all, prefill_mode, decode_mode):
 
 def test_kimi_k3_declares_head_parallel_attention_and_resident_ep():
     pm = _kimi_linear(16, 8, False, "streamed_sp8", "resident_ep")
-    assert rendered(pm.parallel_declaration()) == {
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "tp8:resident",
         "prefill_moe": "dp:streamed",
         "decode_attention": "tp8:resident",
         "decode_moe": "ep16:resident",
     }
+    assert declared.decode_graph.mode == "off"
+    pm._decode_graph = SimpleNamespace(
+        mode="graph", bucketing=SimpleNamespace(bucket_sizes=[1, 2, 4])
+    )
+    assert pm.parallel_declaration().decode_graph == graph_decl()
 
 
 def test_kimi_48b_default_is_resident_dp_attention():
@@ -255,12 +276,16 @@ def _k25(world_size, engine_config):
 
 
 def test_k25_declares_resident_ep_decode_and_partial_under_offloading():
-    assert rendered(_k25(8, _ep_config()).parallel_declaration()) == {
+    pm = _k25(8, _ep_config())
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:streamed",
         "decode_attention": "dp:resident",
         "decode_moe": "ep8:resident",
     }
+    assert declared.decode_graph.mode == "off"
+    assert pm.parallel_declaration(graph_decl()).decode_graph == graph_decl()
     pm = _k25(8, _ep_config(offloading=True, ratio=0.25))
     assert rendered(pm.parallel_declaration())["decode_moe"] == "ep8:partial"
     assert pm._plan_local_expert_split() == (True, 36)
@@ -277,12 +302,14 @@ def test_deepseek_v4_flash_streams_every_module_in_both_phases():
         DeepSeekV4FlashParallelStrategyManager
     )
     pm.world_size = 4
-    assert rendered(pm.parallel_declaration()) == {
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:streamed",
         "decode_attention": "dp:streamed",
         "decode_moe": "ep4:streamed",
     }
+    assert declared.decode_graph.mode == "off"
 
 
 # -- DeepSeek-V3 and MiniMax-M2.5 (source-lifted; modules need real triton) --
@@ -301,12 +328,14 @@ def test_deepseek_v3_declares_resident_ep_decode():
     pm = _lifted_manager(
         "deepseek-v3", {}, 8, _ep_config(), NUM_TOTAL_EXPERTS=256
     )
-    assert rendered(pm.parallel_declaration()) == {
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:streamed",
         "decode_attention": "dp:resident",
         "decode_moe": "ep8:resident",
     }
+    assert declared.decode_graph.mode == "off"
     pm = _lifted_manager(
         "deepseek-v3", {}, 8, _ep_config(offloading=True, ratio=0.5),
         NUM_TOTAL_EXPERTS=256,
@@ -317,12 +346,14 @@ def test_deepseek_v3_declares_resident_ep_decode():
 def test_minimax_declares_resident_ep_decode():
     namespace = {"NUM_TOTAL_EXPERTS": 256}
     pm = _lifted_manager("minimax-m2.5", namespace, 8, _ep_config())
-    assert rendered(pm.parallel_declaration()) == {
+    declared = pm.parallel_declaration()
+    assert rendered(declared) == {
         "prefill_attention": "dp:streamed",
         "prefill_moe": "dp:streamed",
         "decode_attention": "dp:resident",
         "decode_moe": "ep8:resident",
     }
+    assert declared.decode_graph.mode == "off"
     pm = _lifted_manager(
         "minimax-m2.5", namespace, 8,
         _ep_config(num_local=16),
