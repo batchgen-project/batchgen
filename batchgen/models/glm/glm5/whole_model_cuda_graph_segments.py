@@ -20,7 +20,7 @@ from typing import Dict, Iterable
 import torch
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
-from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.models.wrappers import AttnWrapperBase, phase_state
 # Phase C: GLM-5-specific ClassVars (_dsa_short_count, glm5_decode_*_slot_indices)
 # moved from AttnWrapperBase to GLM5AttnWrapper per audit §A finding #8.
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
@@ -729,19 +729,25 @@ class Glm5WholeModelSegment:
         old_primary_slots = GLM5AttnWrapper.glm5_decode_primary_slot_indices
         old_aux_slots = GLM5AttnWrapper.glm5_decode_aux_slot_indices
         try:
-            AttnWrapperBase.cache_seqlens = cache_seqlens
-            AttnWrapperBase.position_ids = position_ids
-            AttnWrapperBase.max_seqlen = self.max_seqlen
+            phase_state.bind_step(
+                AttnWrapperBase,
+                cache_seqlens=cache_seqlens,
+                position_ids=position_ids,
+                max_seqlen=self.max_seqlen,
+            )
             # Serves ONLY a build with no layer segments, where the decode
             # wrappers run and stage through this callback indirection. The
             # production path composes layer segments, which stage by writing
             # their host-append outputs straight into the staging slices
             # (`_install_layer_host_kv_staging`) and never reach these.
-            AttnWrapperBase.kv_append_callback = (
-                self._copy_primary_kv if self.stage_kv_for_offload else None
-            )
-            AttnWrapperBase.kv_append_callback_aux = (
-                self._copy_aux_kv if self.stage_kv_for_offload else None
+            phase_state.bind_kv_append(
+                AttnWrapperBase,
+                kv_append_callback=(
+                    self._copy_primary_kv if self.stage_kv_for_offload else None
+                ),
+                kv_append_callback_aux=(
+                    self._copy_aux_kv if self.stage_kv_for_offload else None
+                ),
             )
             GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
             GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
@@ -761,11 +767,17 @@ class Glm5WholeModelSegment:
             if self.criticality_probe is not None:
                 self.criticality_probe.end_forward()
         finally:
-            AttnWrapperBase.cache_seqlens = old_cache_seqlens
-            AttnWrapperBase.position_ids = old_position_ids
-            AttnWrapperBase.max_seqlen = old_max_seqlen
-            AttnWrapperBase.kv_append_callback = old_kv_cb
-            AttnWrapperBase.kv_append_callback_aux = old_aux_cb
+            phase_state.bind_step(
+                AttnWrapperBase,
+                cache_seqlens=old_cache_seqlens,
+                position_ids=old_position_ids,
+                max_seqlen=old_max_seqlen,
+            )
+            phase_state.bind_kv_append(
+                AttnWrapperBase,
+                kv_append_callback=old_kv_cb,
+                kv_append_callback_aux=old_aux_cb,
+            )
             GLM5AttnWrapper._dsa_short_count = old_dsa_short_count
             GLM5AttnWrapper.glm5_decode_primary_slot_indices = old_primary_slots
             GLM5AttnWrapper.glm5_decode_aux_slot_indices = old_aux_slots

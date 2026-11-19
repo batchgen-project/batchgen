@@ -3854,9 +3854,6 @@ class KVCapacityEngine:
         # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
         # worker keeps every original self. spelling. The engine is stateless.
         self = worker
-        # Declared carve-out (repatriation): the model-layer wrapper writes go
-        # through the worker binder; everything else is verbatim.
-        self._clear_async_kv_load_model_state()
 
         if pending_local_indices and isinstance(gpu_manager, DualKVCacheCoordinator):
             if not isinstance(async_task, DualAsyncKVTask):

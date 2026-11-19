@@ -44,7 +44,7 @@ from dataclasses import dataclass
 
 import torch
 
-from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.models.wrappers import AttnWrapperBase, phase_state
 from batchgen.phase_lifecycle import (
     AdmitContext,
     ExitMode,
@@ -1455,8 +1455,8 @@ class KimiLinearParallelStrategyManager:
         self.loaded_model_config.ep_size = (
             self.world_size if self.prefill_uses_resident_ep() else 1
         )
-        AttnWrapperBase.phase = "prefill"
-        KimiLinearExpertWrapper.phase = "prefill"
+        phase_state.bind_phase(AttnWrapperBase, phase="prefill")
+        phase_state.bind_phase(KimiLinearExpertWrapper, phase="prefill")
         # block_residual never outlives one decoder pass; drop anything a
         # previous (possibly aborted) pass left parked so the first prefill of
         # this phase starts from the seeded-at-layer-0 state.
@@ -1585,8 +1585,8 @@ class KimiLinearParallelStrategyManager:
         self._release_streamed_sp8_prefill()
         _t1 = time.perf_counter()
         self._set_resident_ep_prefill_enabled(False)
-        AttnWrapperBase.phase = "decode"
-        KimiLinearExpertWrapper.phase = "decode"
+        phase_state.bind_phase(AttnWrapperBase, phase="decode")
+        phase_state.bind_phase(KimiLinearExpertWrapper, phase="decode")
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
         _t2 = time.perf_counter()
@@ -1737,11 +1737,14 @@ class KimiLinearParallelStrategyManager:
             return False
         if gpu_manager is not None:
             manager = getattr(gpu_manager, "primary", gpu_manager)
-            AttnWrapperBase.gpu_paged_kv_manager = manager
-            # Kimi-K3.1: the DSA spans also bake the auxiliary (index-key)
-            # cache; a single-region manager binds none.
-            AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(
-                gpu_manager, "auxiliary", None
+            phase_state.bind_decode_entry(
+                AttnWrapperBase,
+                gpu_paged_kv_manager=manager,
+                # Kimi-K3.1: the DSA spans also bake the auxiliary (index-key)
+                # cache; a single-region manager binds none.
+                gpu_paged_kv_manager_aux=getattr(
+                    gpu_manager, "auxiliary", None
+                ),
             )
         captured = self._decode_graph.prewarm_decode_graphs()
         if (
@@ -2152,32 +2155,41 @@ class KimiLinearParallelStrategyManager:
             # (and any batchgen_debug override) is restored below.
             if decode_graph is not None:
                 decode_graph.set_mode("eager")
-            AttnWrapperBase.batchgen_debug = None
+            phase_state.bind_debug(AttnWrapperBase, batchgen_debug=None)
 
-            AttnWrapperBase.gpu_paged_kv_manager = (
-                _SyntheticPagedKV() if mla_wrappers else None
+            phase_state.bind_decode_entry(
+                AttnWrapperBase,
+                gpu_paged_kv_manager=(
+                    _SyntheticPagedKV() if mla_wrappers else None
+                ),
+                gpu_paged_kv_manager_aux=(
+                    _SyntheticPagedKVAux() if dsa_modules else None
+                ),
             )
-            AttnWrapperBase.gpu_paged_kv_manager_aux = (
-                _SyntheticPagedKVAux() if dsa_modules else None
+            phase_state.bind_step(
+                AttnWrapperBase,
+                cache_seqlens=torch.full(
+                    (plan_bsz,), probe_past + 1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                max_seqlen=probe_past + 1,
+                cur_batch=list(synthetic_sids),
+                position_ids=torch.full(
+                    (plan_bsz, 1), probe_past,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                attention_mask=None,
             )
-            AttnWrapperBase.cache_seqlens = torch.full(
-                (plan_bsz,), probe_past + 1,
-                dtype=torch.int32,
-                device=device,
-            )
-            AttnWrapperBase.max_seqlen = probe_past + 1
-            AttnWrapperBase.cur_batch = list(synthetic_sids)
-            AttnWrapperBase.position_ids = torch.full(
-                (plan_bsz, 1), probe_past,
-                dtype=torch.long,
-                device=device,
-            )
-            AttnWrapperBase.attention_mask = None
             # Both Host-append callbacks stay None for the probe;
             # _forward_decode_dsa appends nothing in that case (it requires
             # the aux callback only when the latent one is bound).
-            AttnWrapperBase.kv_append_callback = None
-            AttnWrapperBase.kv_append_callback_aux = None
+            phase_state.bind_kv_append(
+                AttnWrapperBase,
+                kv_append_callback=None,
+                kv_append_callback_aux=None,
+            )
 
             if kda_wrappers:
                 for sid in synthetic_sids:
@@ -2262,8 +2274,7 @@ class KimiLinearParallelStrategyManager:
                 pool.cur_decode_slots = cur_slots
             if decode_graph is not None and saved_graph_mode is not None:
                 decode_graph.set_mode(saved_graph_mode)
-            for name, value in saved_attention_state.items():
-                setattr(AttnWrapperBase, name, value)
+            phase_state.restore_saved_state(AttnWrapperBase, saved_attention_state)
 
     def _make_resident_ep_arena(self, nbytes):
         """Reserve one fixed-address virtual range for the resident EP shard.
