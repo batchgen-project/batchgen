@@ -66,6 +66,10 @@ def _load_batch_scheduler_class():
         "time": time,
         "uuid": uuid,
         "BatchStatus": SimpleNamespace(FAILED="failed"),
+        # The constructor builds both pools; the intake pool is the real
+        # stdlib-only one, the scheduling pool is this file's stub.
+        "IntakePool": _load_intake_pool_module().IntakePool,
+        "SchedulingPool": lambda capacity: _SchedulingPoolStub(),
     }
     module = ast.Module(body=[node], type_ignores=[])
     exec(compile(module, str(SCHEDULER_SOURCE), "exec"), namespace)
@@ -162,25 +166,21 @@ def _completion(request_id: str, batch_id: str) -> Dict[str, Any]:
 
 
 def _scheduler(tmp_path: Path):
-    """Build a scheduler with only the completion-path collaborators.
+    """Build a scheduler with only the completion-path collaborators stubbed.
 
-    Must be called from inside a running loop: the asyncio primitives bind to
-    the loop that is current when they are constructed.
+    The production constructor builds the scheduler, so every attribute a
+    scheduler path reads exists; the stubs below replace only collaborators.
+    Must be called from inside a running loop: ``start()`` binds the loop and
+    the completion inbox, and this stands in for it.
     """
     cls = _load_batch_scheduler_class()
-    scheduler = object.__new__(cls)
+    scheduler = cls(
+        storage=_StorageStub(),
+        worker=_WorkerStub(),
+        server_args=SimpleNamespace(incremental_output_dir=str(tmp_path)),
+    )
     scheduler._loop = asyncio.get_running_loop()
-    scheduler._stopped = asyncio.Event()
     scheduler._completion_inbox = asyncio.Queue()
-    scheduler._pump_lock = threading.Lock()
-    scheduler._pump_generation = 0
-    scheduler._pump_thread = None
-    scheduler._pump_stop = None
-    scheduler._completion_listener_task = None
-    scheduler._pool_initialized = False
-    scheduler.worker = _WorkerStub()
-    scheduler.storage = _StorageStub()
-    scheduler._scheduling_pool = _SchedulingPoolStub()
     # Every completion routes to a batch the pool tracks; a test replaces this
     # tracker to model a failing or failed batch.
     scheduler._scheduling_pool._batch_trackers["batch-1"] = SimpleNamespace(
@@ -190,13 +190,6 @@ def _scheduler(tmp_path: Path):
         size=lambda: 0,
         remove_batch_entries=lambda batch_id: 0,
         remove_batch_info=lambda batch_id: None,
-    )
-    scheduler._stale_intake_batches = set()
-    scheduler._turn_waiters = {}
-    scheduler._detached_turns = set()
-    scheduler._intake_wakeup = asyncio.Event()
-    scheduler.server_args = SimpleNamespace(
-        incremental_output_dir=str(tmp_path),
     )
     scheduler._pool_request_meta = {
         "batch-1": {
@@ -878,8 +871,9 @@ def test_drain_discards_entries_of_an_inactive_batch_without_a_slot(
         scheduler._intake_pool = intake
         pool = _DrainSchedulingPoolStub()
         scheduler._scheduling_pool = pool
-        scheduler._quiesced = threading.Event()
-        scheduler._quiesce_ack = threading.Event()
+        # The live generation has published its deployment capacity; the
+        # drain admits nothing before that.
+        scheduler._deployment_ready.set()
         scheduler._pool_initialized = True
         scheduler.worker.request_queue = _RecordingRequestQueue()
         pool._batch_trackers.update({
