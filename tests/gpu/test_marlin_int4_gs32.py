@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Standalone test: Marlin gs=32 direct repack + GROUP_BLOCKS=2 kernel.
 
 Tests the full pipeline without model integration:
@@ -9,12 +8,25 @@ Tests the full pipeline without model integration:
 
 Expected: calc_diff < 1e-5 (only BF16 MMA rounding, no quantization error)
 
-Usage (on GH02 or H20):
-    python -m batchgen.moe.test_marlin_standalone
+Run on a GPU machine (single device is enough), never on the dev box:
+
+    pytest tests/gpu/test_marlin_int4_gs32.py
 """
 
+import pytest
 import torch
-import numpy as np
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Marlin grouped GEMM is a CUDA kernel"
+)
+
+
+@pytest.fixture(autouse=True)
+def _require_marlin_extension():
+    from batchgen.moe.marlin_grouped_moe import is_marlin_available
+
+    if not is_marlin_available():
+        pytest.skip("batchgen_kernels.moe._C_marlin_grouped_gemm is not built")
 
 
 def calc_diff(x, y):
@@ -169,11 +181,7 @@ def test_gs32_repack():
             all_pass = False
         print(f"  E{e} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
-    if all_pass:
-        print("gs=32 direct repack produces near-identical output to BF16 reference.")
-    else:
-        print("ERROR: gs=32 repack has unexpected error. Investigate weight permutation.")
+    assert all_pass, "gs=32 repack diverged from the BF16 reference; check the weight permutation"
 
 
 def test_gs32_3d_inplace():
@@ -271,7 +279,7 @@ def test_gs32_3d_inplace():
             all_pass = False
         print(f"  E{e:2d} cnt={cnt} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_m16_sweep():
@@ -368,7 +376,7 @@ def test_m16_sweep():
             all_pass = False
         print(f"  M={M:4d} max_m_tiles={max_m_tiles:3d} max_calc_diff={max_cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_m16_variable_experts():
@@ -470,7 +478,7 @@ def test_m16_variable_experts():
             all_pass = False
         print(f"  E{e:2d} cnt={cnt:3d} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_m16_edge_cases():
@@ -566,7 +574,7 @@ def test_m16_edge_cases():
             all_pass = False
         print(f"  E{e:2d} cnt={cnt:3d} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_m16_s1_fused():
@@ -666,7 +674,7 @@ def test_m16_s1_fused():
             all_pass = False
         print(f"  E{e:2d} cnt={cnt:3d} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_s3_down_projection():
@@ -745,7 +753,7 @@ def test_s3_down_projection():
             all_pass = False
         print(f"  M={M:4d} max_m_tiles={max_m_tiles:3d} max_calc_diff={max_cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
 
 def test_3stage_e2e():
@@ -862,36 +870,5 @@ def test_3stage_e2e():
             all_pass = False
         print(f"  E{e} calc_diff={cd:.2e} [{status}]")
 
-    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+    assert all_pass, "calc_diff >= 1e-3 on at least one expert (see the per-expert lines above)"
 
-
-def main():
-    import sys
-    test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
-
-    tests = {
-        "m8_repack": test_gs32_repack,
-        "m8_3d": test_gs32_3d_inplace,
-        "m16_sweep": test_m16_sweep,
-        "m16_variable": test_m16_variable_experts,
-        "m16_edge": test_m16_edge_cases,
-        "s1_fused": test_m16_s1_fused,
-        "s3_down": test_s3_down_projection,
-        "e2e_3stage": test_3stage_e2e,
-    }
-
-    if test_name == "all":
-        for name, fn in tests.items():
-            print(f"\n{'='*60}")
-            print(f"Running: {name}")
-            print(f"{'='*60}")
-            fn()
-    elif test_name in tests:
-        tests[test_name]()
-    else:
-        print(f"Unknown test: {test_name}")
-        print(f"Available: {', '.join(tests.keys())}, all")
-
-
-if __name__ == "__main__":
-    main()

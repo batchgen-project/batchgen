@@ -7,11 +7,12 @@ Validates gate, dispatch, and reduce kernels across varied configurations:
 - Expert configs: various E_local and expert_start values
 - Edge cases: empty experts, all-local, no-local
 
-Usage:
-    python -m batchgen.moe.routing.test_routing
+Run on a GPU machine (single device is enough), never on the dev box:
+
+    pytest tests/gpu/test_moe_routing_kernels.py
 """
 
-import sys
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -19,6 +20,10 @@ from batchgen.moe.routing import (
     gate_topk_softmax_cuda,
     dispatch_count_gather_cuda,
     reduce_weighted_scatter_cuda,
+)
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="MoE routing kernels are CUDA kernels"
 )
 
 
@@ -145,7 +150,7 @@ def test_gate(verbose=True):
         print(f"  [PASS] BF16 input auto-cast")
 
     print(f"\nGate: {total - failures}/{total} passed")
-    return failures == 0
+    assert failures == 0, f"gate: {failures}/{total} cases failed"
 
 
 def test_dispatch(verbose=True):
@@ -206,7 +211,7 @@ def test_dispatch(verbose=True):
     print(f"  [PASS] int64 input auto-cast")
 
     print(f"\nDispatch: {total - failures}/{total} passed")
-    return failures == 0
+    assert failures == 0, f"dispatch: {failures}/{total} cases failed"
 
 
 def test_reduce(verbose=True):
@@ -261,7 +266,7 @@ def test_reduce(verbose=True):
         print(f"  [FAIL] all topk_pos=-1 should produce zeros")
 
     print(f"\nReduce: {total - failures}/{total} passed")
-    return failures == 0
+    assert failures == 0, f"reduce: {failures}/{total} cases failed"
 
 
 def test_end_to_end(verbose=True):
@@ -310,34 +315,5 @@ def test_end_to_end(verbose=True):
                       f"start={expert_start:>3d}: max_err={max_err:.6f}")
 
     print(f"\nEnd-to-end: {total - failures}/{total} passed")
-    return failures == 0
+    assert failures == 0, f"end-to-end: {failures}/{total} cases failed"
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("=" * 70)
-    print("CUDA ROUTING KERNELS: COMPREHENSIVE SANITY CHECK")
-    print(f"Device: {torch.cuda.get_device_name(0)}")
-    print("=" * 70)
-
-    results = []
-    results.append(("Gate", test_gate()))
-    results.append(("Dispatch", test_dispatch()))
-    results.append(("Reduce", test_reduce()))
-    results.append(("End-to-end", test_end_to_end()))
-
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    all_pass = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  {name:>15s}: {status}")
-        all_pass &= passed
-
-    print(f"\n{'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
-    print("=" * 70)
-    sys.exit(0 if all_pass else 1)
