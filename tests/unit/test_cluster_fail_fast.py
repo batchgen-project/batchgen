@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import sys
 import threading
 import time
@@ -717,6 +718,138 @@ def test_a_down_key_is_reported_with_its_generation_before_readiness():
     assert seen.down == [(0, "rank 3 failed to load weights", 0)]
     assert seen.restarts == []
     assert node1.epoch == 1
+
+
+# ------------------------------------- reports and a failure in the same poll
+
+
+class _FailingReadStore(FakeStore):
+    """Fails every read of the keys in ``fail_keys``, as a store blip does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_keys: set = set()
+
+    def get(self, key):
+        if key in self.fail_keys:
+            self.calls.append("get")
+            raise ConnectionError(f"connection reset reading {key}")
+        return super().get(key)
+
+
+_DOWN_REASON = "rank 2 hit an illegal memory access"
+
+
+def _down_peer(store, clock):
+    """Node 0 watching node 1, whose cohort of generation 1 is down."""
+    node0 = _coordinator(store, clock, node_rank=0)
+    node1 = _coordinator(store, clock, node_rank=1)
+    node1._beat()
+    node1.publish_down(1, _DOWN_REASON)
+    return node0, node1
+
+
+@pytest.mark.parametrize("trigger", ["store error", "unparsable heartbeat"])
+def test_a_down_key_read_in_a_poll_that_then_fails_is_reported_exactly_once(
+    trigger,
+):
+    """The down key is read and marked reported first; the heartbeat read of
+    the same poll then fails. The report is still delivered in that poll,
+    the failure still surfaces as the control error, and no later poll --
+    failing or recovered -- delivers it again."""
+    store, clock = _FailingReadStore(), FakeClock()
+    node0, node1 = _down_peer(store, clock)
+    hooks, seen = _watch(node0)
+    if trigger == "store error":
+        store.fail_keys.add("alive/node1")
+    else:
+        # What a peer of a build that writes a bare beat count leaves behind.
+        store.set("alive/node1", "7")
+
+    assert node0._follow_once(hooks) == node0._error_backoff_s
+    assert seen.down == [(1, _DOWN_REASON, 1)]
+    assert "alive/node1" in (node0.control_error or "")
+
+    node0._follow_once(hooks)
+    assert seen.down == [(1, _DOWN_REASON, 1)]
+    assert node0.control_error is not None
+
+    store.fail_keys.clear()
+    node1._beat()
+    for _ in range(3):
+        assert node0._follow_once(hooks) == node0._poll_interval_s
+    assert seen.down == [(1, _DOWN_REASON, 1)]
+    assert node0.control_error is None
+    assert seen.lost == []
+
+
+def test_a_down_report_is_delivered_once_over_many_healthy_polls():
+    store, clock = FakeStore(), FakeClock()
+    node0, node1 = _down_peer(store, clock)
+    hooks, seen = _watch(node0)
+
+    for _ in range(5):
+        clock.advance(1.0)
+        node1._beat()
+        assert node0._follow_once(hooks) == node0._poll_interval_s
+
+    assert seen.down == [(1, _DOWN_REASON, 1)]
+    assert seen.lost == []
+    assert node0.control_error is None
+
+
+def test_a_report_handler_that_raises_is_neither_retried_nor_a_store_error():
+    """A handler failure is logged, once: the report is delivered, the
+    follower survives, and the store is not blamed for it."""
+    store, clock = FakeStore(), FakeClock()
+    node0, node1 = _down_peer(store, clock)
+    hooks, _seen = _watch(node0)
+    calls = []
+
+    def failing_handler(*args):
+        calls.append(args)
+        raise RuntimeError("handler failed")
+
+    hooks = dataclasses.replace(hooks, on_peer_down=failing_handler)
+    for _ in range(3):
+        node1._beat()
+        assert node0._follow_once(hooks) == node0._poll_interval_s
+
+    assert calls == [(1, _DOWN_REASON, 1)]
+    assert node0.control_error is None
+
+
+def test_a_peer_down_and_lost_in_one_poll_reach_their_handlers_down_first():
+    """Both reports of one poll are delivered in the order they were read --
+    the down key, which names the reason, before the heartbeat loss -- even
+    when the first handler raises, and neither is delivered again."""
+    store, clock = FakeStore(), FakeClock()
+    node0 = _coordinator(store, clock, node_rank=0)
+    node1 = _coordinator(store, clock, node_rank=1)
+    hooks, _seen = _watch(node0)
+    node1._beat()
+    node0._follow_once(hooks)
+    order = []
+
+    def on_down(*args):
+        order.append(("down", *args))
+        raise RuntimeError("handler failed")
+
+    hooks = dataclasses.replace(
+        hooks,
+        on_peer_down=on_down,
+        on_peer_lost=lambda *args: order.append(("lost", *args)),
+    )
+    clock.advance(coordinator_module.PEER_DEAD_S)
+    node1.publish_down(1, _DOWN_REASON)
+
+    node0._follow_once(hooks)
+    node0._follow_once(hooks)
+
+    assert order == [
+        ("down", 1, _DOWN_REASON, 1),
+        ("lost", 1, pytest.approx(coordinator_module.PEER_DEAD_S)),
+    ]
 
 
 # ------------------------------------------------------- the manager side

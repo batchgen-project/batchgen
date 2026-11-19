@@ -695,7 +695,8 @@ class RestartCoordinator:
                 continue
             reason = _text(store.get(key))
             # Only once the read succeeded: a key marked reported before a
-            # failed get would never be reported at all.
+            # failed get would never be reported at all. From here on the
+            # poll that read it owes the report (see _follow_once).
             self._reported_down.add(key)
             return node, reason
         return None
@@ -737,6 +738,8 @@ class RestartCoordinator:
                 age = 0.0 if started is None else now - started
                 limit = self._join_grace_s
             if age >= limit:
+                # Marked as it is read, like a down key: the poll that read
+                # it owes the report (see _follow_once).
                 self._reported_lost.add(node)
                 if replaced_by is not None:
                     logger.error(
@@ -860,8 +863,18 @@ class RestartCoordinator:
             self._follower_stop.wait(self._follow_once(hooks))
 
     def _follow_once(self, hooks: _FollowerHooks) -> float:
-        """One poll of the store; returns how long to wait before the next."""
+        """One poll of the store; returns how long to wait before the next.
+
+        A poll first reads, then reports. A peer's down key or loss is marked
+        reported the moment it is read, so it is never read as new again, and
+        is therefore delivered by this very poll, whatever fails after it was
+        read: a later read failing is recorded as the control error as usual,
+        and the reports already read still reach their handlers, in the order
+        they were read. A handler that raises is logged and not called again
+        for the same report.
+        """
         now = self._clock()
+        reports: list = []
         try:
             epoch = self._read_epoch()
             if self._node_rank != 0 and epoch > self._epoch and hooks.ready():
@@ -882,20 +895,21 @@ class RestartCoordinator:
             self._epoch = max(self._epoch, epoch)
             generation = hooks.generation()
             down = self._poll_peer_down(generation)
-            lost = (
-                self._poll_peer_liveness(now)
-                if hooks.on_peer_lost is not None
-                else None
-            )
+            if down is not None:
+                reports.append((hooks.on_peer_down, (*down, generation)))
+            if hooks.on_peer_lost is not None:
+                lost = self._poll_peer_liveness(now)
+                if lost is not None:
+                    reports.append((hooks.on_peer_lost, lost))
         except Exception as exc:
             self._record_control_error(exc)
-            return self._error_backoff_s
-        self._note_control_ok()
-        if down is not None:
-            self._run_callback(hooks.on_peer_down, *down, generation)
-        if lost is not None:
-            self._run_callback(hooks.on_peer_lost, *lost)
-        return self._poll_interval_s
+            wait = self._error_backoff_s
+        else:
+            self._note_control_ok()
+            wait = self._poll_interval_s
+        for callback, args in reports:
+            self._run_callback(callback, *args)
+        return wait
 
     def _watch_control(self, hooks: _FollowerHooks) -> None:
         while not self._follower_stop.is_set():
