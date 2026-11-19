@@ -1910,6 +1910,11 @@ class BatchScheduler:
                         self.worker.record_code_identity(
                             int(result["cohort"]), result["code_identity"]
                         )
+                        # So is what it serves with: the [SERVER_CONFIG] line
+                        # of this generation and node.
+                        self.worker.record_server_config(
+                            int(result["cohort"]), result["server_config"]
+                        )
                         self.max_model_len = max_model_len
                         self.startup_transient = transients
                         self._deployment_ready.set()

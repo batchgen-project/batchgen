@@ -25,6 +25,7 @@ import pytest
 from batchgen import eventlog
 from batchgen.eventlog import flight_recorder
 from batchgen.worker.code_identity import CodeIdentity
+from batchgen.worker.server_config import ServerConfig
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
     delegated_method_names,
@@ -108,8 +109,10 @@ def _load_worker_manager_class():
         # Named in a method annotation, which this lifted module evaluates
         # (the real module defers annotations through __future__).
         "RestartCoordinator": restart_coordinator.RestartCoordinator,
-        # record_code_identity validates what a cohort published.
+        # record_code_identity / record_server_config validate what a cohort
+        # published.
         "CodeIdentity": CodeIdentity,
+        "ServerConfig": ServerConfig,
         # The start-up abort leaves its exit record here; a fail-fast exit
         # is never expected unless a test installs its own.
         "eventlog_process": SimpleNamespace(

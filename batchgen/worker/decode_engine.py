@@ -46,6 +46,25 @@ BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
 BATCHGEN_MULTI_BATCH_DIAG = os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
 
 
+def format_device_memory_fields(mem_get_info) -> str:
+    """`` dev_mem_used_gib=U dev_mem_total_gib=T`` for the rank-0 heartbeat.
+
+    ``mem_get_info`` is ``torch.cuda.mem_get_info`` bound to this rank's
+    device — one driver query per throttled heartbeat, no synchronization —
+    or None when no device is present, which the fields then say explicitly
+    instead of being dropped. Appended after the heartbeat's existing
+    optional fields, so every earlier byte of the line is unchanged.
+    """
+    if mem_get_info is None:
+        return " dev_mem_used_gib=nodevice dev_mem_total_gib=nodevice"
+    free_bytes, total_bytes = mem_get_info()
+    gib = 1024 ** 3
+    return (
+        f" dev_mem_used_gib={(total_bytes - free_bytes) / gib:.2f}"
+        f" dev_mem_total_gib={total_bytes / gib:.2f}"
+    )
+
+
 class DecodeModelStateBinder(Protocol):
     def _bind_decode_entry_model_state(
         self, gpu_manager, worker_view, scale_dict, past_key_states, past_value_states, batch
@@ -199,6 +218,14 @@ class DecoupledGpuDecode:
         # Heartbeat state for the rate-limited [DECODE] progress line below
         _hb_last_time = time.perf_counter()
         _hb_tokens = 0
+        # Device-memory query for the heartbeat's dev_mem fields: one
+        # cudaMemGetInfo per throttled line, never per step, and no query at
+        # all without a device (the fields then say so).
+        _dev_mem_query = (
+            (lambda: torch.cuda.mem_get_info(self.torch_device))
+            if torch.cuda.is_available()
+            else None
+        )
         # Per-worker step counters behind the rate-limited ``step.counters``
         # event. Plain ints/floats that persist across decode rounds, so a
         # window spanning several short rounds still reports.
@@ -284,6 +311,7 @@ class DecoupledGpuDecode:
                     f"active={len(decode_uuids)} finished={_hb_finished} "
                     f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
                     f"{profile_capture.log_suffix()}"
+                    f"{format_device_memory_fields(_dev_mem_query)}"
                 )
                 # The sampling fallback count is now accumulated on device so
                 # the step path never reads it back. Drain it here, where the

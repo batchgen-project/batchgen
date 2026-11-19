@@ -289,6 +289,9 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
         _transition_phase=lambda key: events.append("prefill"),
         set_phase=lambda phase: None,
         _install_prefill_weight_copy_pipeline=lambda flag: None,
+        # The [SERVER_CONFIG] snapshot is the probe seam step's final act
+        # (tests/unit/test_startup_transient.py), so the lifecycle bodies
+        # make no separate snapshot call.
         _probe_startup_transient=lambda **kwargs: events.append(
             ("probe", kwargs["seam"], kwargs["capture"])),
         # No retained decode instance / no requested graphs: no startup capture.
@@ -314,7 +317,8 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
     assert worker._gpu_kv_sizing_provisional is False
     assert events == (["core", "comm", "verify"] if persistent else [
         "core", "comm", "decode", "verify",
-        ("probe", startup_transient.SEAM_DEPLOYMENT_PREPARE, None), "prefill"])
+        ("probe", startup_transient.SEAM_DEPLOYMENT_PREPARE, None),
+        "prefill"])
 
 
 @pytest.mark.parametrize("capture", [False, True])
@@ -370,6 +374,8 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
 
     worker._probe_startup_transient = probe
     build(worker)
+    # The [SERVER_CONFIG] snapshot happens inside the (stubbed) probe seam
+    # step, so the persistent build makes no separate snapshot call.
     assert events == ["prefill", ("width_check", 8), "decode", "verify_pool", "probe"] + (
         ["jit_prewarm", "capture"] if capture else []) + ["prefill"]
     assert worker._decode_padding_bsz == 8
@@ -409,6 +415,16 @@ def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget
 # A cohort's code identity, as a tree without git metadata publishes it.
 NO_GIT_IDENTITY = {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"}
 
+# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+SERVER_CONFIG = {
+    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
+    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "cuda_graphs": False, "graph_buckets": None,
+    "host_kv_gib": 1.0, "host_kv_pages": 8,
+    "device_kv_gib": 1.0, "device_kv_pages": 8,
+    "gpu_memory_frac": 0.9, "max_pool": 8,
+}
+
 
 def published_transient():
     """The struct the worker publishes when neither flavor is measurable."""
@@ -446,13 +462,15 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
 
     async def run():
         worker = SimpleNamespace(response_queue=queue.Queue(),
-                                 record_code_identity=lambda cohort, identity: None)
+                                 record_code_identity=lambda cohort, identity: None,
+                                 record_server_config=lambda cohort, config: None)
         scheduler = bs.BatchScheduler(SimpleNamespace(), worker, SimpleNamespace())
         await scheduler.start()
         try:
             worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 129,
                                         "startup_transient": published_transient(),
-                                        "code_identity": NO_GIT_IDENTITY, "cohort": 0})
+                                        "code_identity": NO_GIT_IDENTITY,
+                                        "server_config": SERVER_CONFIG, "cohort": 0})
             await scheduler.wait_for_deployment()
             with TestClient(_models_app(scheduler)) as client:
                 for path in ("/v1/models", "/v1/models/test-model"):
@@ -467,7 +485,8 @@ def test_real_models_endpoints_read_the_published_length_after_restart(tmp_path)
                 assert client.get("/v1/models").status_code == 503
                 worker.response_queue.put({"type": "deployment_capacity", "max_model_len": 65,
                                         "startup_transient": published_transient(),
-                                        "code_identity": NO_GIT_IDENTITY, "cohort": 0})
+                                        "code_identity": NO_GIT_IDENTITY,
+                                        "server_config": SERVER_CONFIG, "cohort": 0})
                 await scheduler.wait_for_deployment()
                 assert client.get("/v1/models/test-model").json()["max_model_len"] == 65
                 assert client.get("/v1/models/missing").status_code == 404

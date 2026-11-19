@@ -48,6 +48,7 @@ from batchgen.server.server_args import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.worker.code_identity import CodeIdentity
+from batchgen.worker.server_config import ServerConfig
 from batchgen.worker.startup_phases import (
     PHASE_STORE_STAGING,
     StartupPhaseRecord,
@@ -425,6 +426,20 @@ class WorkerManager:
         generation = self._generation_of_epoch(cohort)
         with self._lock:
             self._code_identity = (generation, parsed)
+        logger.info("%s", parsed.log_line(generation, self.args.node_rank))
+
+    def record_server_config(self, cohort: int, config: Dict[str, Any]) -> None:
+        """Log what a cohort serves with, as its local rank 0 published it.
+
+        The same seam as ``record_code_identity``: ``cohort`` is the restart
+        epoch that spawned it, the line is this generation's one
+        ``[SERVER_CONFIG]`` line on this node, and the scheduler records it
+        before it marks the deployment ready, so it precedes every request
+        the generation serves. A multi-node deployment prints one line per
+        node, each under its own ``node=`` value.
+        """
+        parsed = ServerConfig.from_dict(config)
+        generation = self._generation_of_epoch(cohort)
         logger.info("%s", parsed.log_line(generation, self.args.node_rank))
 
     @property

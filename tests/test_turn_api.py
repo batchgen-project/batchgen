@@ -73,6 +73,16 @@ TurnError = _M["agent_sessions"].TurnError
 MODEL = "gpt-oss-120b"
 CONTEXT = 4096  # the served model's context length in these tests
 
+# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+SERVER_CONFIG = {
+    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
+    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "cuda_graphs": False, "graph_buckets": None,
+    "host_kv_gib": 1.0, "host_kv_pages": 8,
+    "device_kv_gib": 1.0, "device_kv_pages": 8,
+    "gpu_memory_frac": 0.9, "max_pool": 8,
+}
+
 
 def _encode(text):
     return [ord(ch) for ch in text]
@@ -145,6 +155,7 @@ class _FakeWorker:
                 "padding_bsz": 1, "unavailable": "CUDA is unavailable",
             }],
             "code_identity": {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"},
+            "server_config": SERVER_CONFIG,
             "cohort": 0,
         })
         self.response_queue.put({
@@ -163,6 +174,9 @@ class _FakeWorker:
         self.fatals.append(reason)
 
     def record_code_identity(self, cohort, identity):
+        pass
+
+    def record_server_config(self, cohort, config):
         pass
 
     def _run(self):
