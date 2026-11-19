@@ -2318,6 +2318,8 @@ class BatchGenWorker:
 			return
 		from batchgen.decode_dp_group import (
 			assign_decode_dp_groups,
+			count_rows_per_group,
+			format_decode_group_plan_line,
 			num_decode_dp_groups,
 		)
 		num_dp = num_decode_dp_groups(self.world_size, G)
@@ -2352,8 +2354,10 @@ class BatchGenWorker:
 		):
 			if residency:
 				seqs.sort(key=lambda seq: seq.uuid)
+			placement = "packer"
 			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp, residency)
 		else:
+			placement = "l2"
 			# An evicted re-entry returns to the group it decoded on: its
 			# decoded suffix lives only in that group's node's trajectory book.
 			# It loads that group like any grouped sequence; the rest balance.
@@ -2372,6 +2376,19 @@ class BatchGenWorker:
 			# Grouped again: the eviction record has served its purpose, and
 			# a later eviction records the then-current group afresh.
 			seq.evicted_from_dp_group = None
+		if self.rank == 0:
+			# Rows per group after this stamp: the rows just placed and every
+			# grouped row still to decode. The fullest group sets the decode
+			# graph bucket, so equal totals can decode on different buckets.
+			logging.info(format_decode_group_plan_line(
+				placement,
+				count_rows_per_group(groups, num_dp),
+				count_rows_per_group(
+					(other.decode_dp_group for other in self.global_batch
+					 if other.status != SequenceStatus.COMPLETED),
+					num_dp,
+				),
+			))
 		for uuid in sorted(residency):
 			owner, boundary = residency[uuid]
 			seq = self.global_batch.get_sequence(uuid)
@@ -7815,6 +7832,27 @@ class BatchGenWorker:
 			sum(s.decoded_length for s in group),
 		)
 
+	def _group_decode_rows_summary(self) -> str:
+		"""The batch summary's per-group rows line, with its leading newline.
+
+		Empty when decode runs pure-DP (G==1), so that summary stays
+		byte-identical; for G>1 the current batch group's rows per serve group.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return ""
+		from batchgen.decode_dp_group import (
+			count_rows_per_group,
+			format_decode_group_summary,
+			num_decode_dp_groups,
+		)
+		group = [self.global_batch.get_sequence(u) for u in self._group_uuids]
+		rows = count_rows_per_group(
+			(s.decode_dp_group for s in group if s is not None),
+			num_decode_dp_groups(self.world_size, G),
+		)
+		return "\n" + format_decode_group_summary(rows, G)
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -7898,6 +7936,7 @@ class BatchGenWorker:
 						f"  Decode: {decoding_time:.1f}s ({dc_tp:,.0f} tok/s)\n"
 						f"  Total: {gen_time:.1f}s ({ov_tp:,.0f} tok/s)\n"
 						f"  Prompt tokens: {total_prompt:,}, Decoded tokens: {total_decoded:,}"
+						f"{self._group_decode_rows_summary()}"
 					)
 					self._timing_logged = True
 				if self._shutdown_requested:

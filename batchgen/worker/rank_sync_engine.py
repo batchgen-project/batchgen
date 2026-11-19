@@ -693,6 +693,11 @@ class RankSyncEngine:
         local_count_tensor.fill_(local_count)
         dist.all_gather_into_tensor(all_rank_counts, local_count_tensor)
         max_batch_size = int(all_rank_counts.max().item())
+        # The max this sync replaces: its unit is the one the phase ran at
+        # until now, so a changed unit is reported once, here, not per step.
+        previous_max_batch_size = int(
+            getattr(self, "_current_decode_max_rank_batch_size", 0) or 0
+        )
 
         self._current_decode_local_batch_size = local_count
         self._current_decode_max_rank_batch_size = max_batch_size
@@ -705,13 +710,30 @@ class RankSyncEngine:
             # before the DP-32 resident MoE, so the padded all_gather/all_reduce
             # layout is sized by the POST-scatter share ceil(B_grp/G), not B_grp.
             # G==1 -> ceil(max/1)==max, byte-identical to the pure-DP path.
-            from batchgen.decode_dp_group import moe_ntp_from_group_max
+            from batchgen.decode_dp_group import (
+                decode_group_rows,
+                decode_groups_log_due,
+                format_decode_groups_line,
+                moe_ntp_from_group_max,
+            )
             _G = getattr(self.parallel_manager, "attn_tp_size", 1)
             moe_ntp = moe_ntp_from_group_max(max_batch_size, _G)
             if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
                 self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
             if hasattr(self.parallel_manager, 'set_rank_token_counts'):
                 self.parallel_manager.set_rank_token_counts(all_rank_counts)
+            # Per-group rows behind this unit, stated by rank 0 at decode-phase
+            # entry and when an in-phase sync changes the unit. The count
+            # vector is read back only when the line is due.
+            if _G > 1 and self.rank == 0 and decode_groups_log_due(
+                reason, moe_ntp, moe_ntp_from_group_max(previous_max_batch_size, _G)
+            ):
+                logging.info(format_decode_groups_line(
+                    reason,
+                    decode_group_rows(all_rank_counts.tolist(), _G),
+                    _G,
+                    moe_ntp,
+                ))
 
         if BATCHGEN_MULTI_BATCH_DIAG:
             try:

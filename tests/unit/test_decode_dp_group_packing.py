@@ -115,6 +115,7 @@ def _reader_refusing(*uuids):
 
 def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
     worker = SimpleNamespace(
+        rank=0,
         world_size=world_size,
         global_batch=_Batch(seqs),
         # Preset: the cached lookup never reaches the CUDA device query.
