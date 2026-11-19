@@ -35,6 +35,8 @@ from batchgen.gemm.deepgemm_pdl_policy import apply_deepgemm_pdl
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+# The one module that assigns the wrappers' per-phase class attributes.
+from batchgen.models.wrappers import phase_state
 # Phase C: GLM-5-specific ClassVars (dispatch_trace_*, _dsa_short_count,
 # glm5_decode_*_slot_indices, glm5_dsa_*) live on GLM5AttnWrapper, not
 # AttnWrapperBase, per audit §A finding #8.
@@ -7065,8 +7067,11 @@ class BatchGenWorker:
 				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
-				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
-					global_decode_sequences
+				phase_state.bind_debug(
+					AttnWrapperBase,
+					batchgen_debug=self._active_batchgen_debug_for_sequences(
+						global_decode_sequences
+					),
 				)
 				self._configure_glm5_dispatch_trace(global_decode_sequences)
 
@@ -7718,7 +7723,7 @@ class BatchGenWorker:
 		self._weight_passes.end_delay_s = self._weight_pass_end_delay(
 			prefill_debug.get("weight_pass_end_delay")
 		)
-		AttnWrapperBase.batchgen_debug = prefill_debug or None
+		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=prefill_debug or None)
 		from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer
 		StreamedSP8MXFP4MoELayer.verify_bytes_enabled = self._debug_flag_enabled(
 			prefill_debug.get("k3_seam_verify_bytes")
@@ -8893,7 +8898,7 @@ class BatchGenWorker:
 
 		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
 
-		_AWB.prefill_prefix_materialization = None
+		phase_state.bind_prepack(_AWB, prefill_prefix_materialization=None)
 		if not self._prefix.active_prefix_materializations:
 			return
 		try:
@@ -9608,7 +9613,9 @@ class BatchGenWorker:
 			return
 		# Cleared before the comparison, not after: the recorder is this wave's
 		# and must not survive a failure in the verification of its own rows.
-		AttnWrapperBase.prefill_pool_offload_recorder = None
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase, prefill_pool_offload_recorder=None
+		)
 		wave = self._prefill_pool_wave
 		wave_tag = (
 			f"m{len(wave.uuids)}s{len(wave.plan.segments)}"
@@ -10533,75 +10540,110 @@ class BatchGenWorker:
 
 	def _bind_prefill_host_views(self) -> None:
 		"""Bind the host KV worker views the prefill forward offloads through."""
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		phase_state.bind_decode_entry(
+			AttnWrapperBase,
+			host_paged_kv_worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
+			host_paged_kv_worker_view_aux=getattr(self, "host_paged_kv_worker_view_aux", None),
+		)
 
 	def _bind_prefill_pool_segments(self, wave) -> None:
 		"""Bind one pool wave's views, pool, segment sids and loaded segments."""
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-		AttnWrapperBase.prefill_pool = wave.pool
-		# A recurrent layer forks a row's state from its parent segment's state
-		# slot, which is keyed by that segment's pseudo sequence id.
-		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
-		# A LOADED segment ran no row, so it left no recurrent state to fork:
-		# its reader resumes from the slot the trajectory restore bound before
-		# this wave, which the level cut verifies.
-		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
-			sorted(wave.materialized)
+		phase_state.bind_decode_entry(
+			AttnWrapperBase,
+			host_paged_kv_worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
+			host_paged_kv_worker_view_aux=getattr(self, "host_paged_kv_worker_view_aux", None),
+		)
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase,
+			prefill_pool=wave.pool,
+			# A recurrent layer forks a row's state from its parent segment's
+			# state slot, which is keyed by that segment's pseudo sequence id.
+			prefill_pool_segment_sids=wave.segment_sids,
+			# A LOADED segment ran no row, so it left no recurrent state to
+			# fork: its reader resumes from the slot the trajectory restore
+			# bound before this wave, which the level cut verifies.
+			prefill_pool_materialized_segments=tuple(
+				sorted(wave.materialized)
+			),
 		)
 
 	def _bind_prefill_pool_layer_state(self, wave, pool_layout) -> None:
 		"""Bind the wave's pool layer map and its fresh offload recorder."""
-		AttnWrapperBase.prefill_pool_layer_map = (
-			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
-		)
-		# Always reassigned, never left over: a wave that died before its
-		# verification point cannot leak its records into the next one.
-		AttnWrapperBase.prefill_pool_offload_recorder = (
-			self._new_pool_offload_check_recorder(wave)
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase,
+			prefill_pool_layer_map=(
+				tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
+			),
+			# Always reassigned, never left over: a wave that died before its
+			# verification point cannot leak its records into the next one.
+			prefill_pool_offload_recorder=(
+				self._new_pool_offload_check_recorder(wave)
+			),
 		)
 
 	def _install_prefill_pool_rows(self, rows, host_ids, host_starts) -> None:
 		"""Install one pool chunk's packed-row metadata on the attention wrappers."""
-		AttnWrapperBase.prepack_mode = True
-		AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
-		AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
-		AttnWrapperBase.prepack_num_sequences = len(rows.items)
-		AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
-		AttnWrapperBase.position_ids = rows.position_ids
-		AttnWrapperBase.cur_batch = host_ids
-		AttnWrapperBase.prefill_pool_batch = rows
-		AttnWrapperBase.prefill_pool_row_starts = host_starts
+		phase_state.bind_prepack(
+			AttnWrapperBase,
+			prepack_mode=True,
+			prepack_cu_seqlens=rows.cu_seqlens_q,
+			prepack_max_seqlen=rows.max_seqlen_q,
+			prepack_num_sequences=len(rows.items),
+			prepack_seq_lengths=[item.tokens for item in rows.items],
+		)
+		phase_state.bind_step(
+			AttnWrapperBase,
+			position_ids=rows.position_ids,
+			cur_batch=host_ids,
+		)
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase,
+			prefill_pool_batch=rows,
+			prefill_pool_row_starts=host_starts,
+		)
 
 	def _drop_prefill_pool_offload_recorder(self) -> None:
 		"""Drop the wave's offload recorder (not handed to verification)."""
-		AttnWrapperBase.prefill_pool_offload_recorder = None
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase, prefill_pool_offload_recorder=None
+		)
 
 	def _unbind_prefill_pool_segments(self) -> None:
 		"""Clear every pool-wave binding the wrappers carried for the wave."""
-		AttnWrapperBase.prefill_pool = None
-		AttnWrapperBase.prefill_pool_batch = None
-		AttnWrapperBase.prefill_pool_row_starts = None
-		AttnWrapperBase.prefill_pool_segment_sids = None
-		AttnWrapperBase.prefill_pool_materialized_segments = ()
-		AttnWrapperBase.prefill_pool_layer_map = None
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
+		phase_state.bind_prefill_pool(
+			AttnWrapperBase,
+			prefill_pool=None,
+			prefill_pool_batch=None,
+			prefill_pool_row_starts=None,
+			prefill_pool_segment_sids=None,
+			prefill_pool_materialized_segments=(),
+			prefill_pool_layer_map=None,
+		)
+		phase_state.bind_prepack(
+			AttnWrapperBase,
+			prepack_mode=False,
+			prepack_cu_seqlens=None,
+			prepack_max_seqlen=None,
+			prepack_num_sequences=None,
+			prepack_seq_lengths=None,
+		)
 
 	def _bind_prefill_step_metadata(self, attention_mask) -> None:
 		"""Bind one padded prefill micro-batch's mask and derived positions."""
-		Attn_Wrapper.attention_mask = attention_mask
-		Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
-			attention_mask
+		phase_state.bind_step(
+			Attn_Wrapper,
+			attention_mask=attention_mask,
+			position_ids=create_position_ids_from_attention_mask(
+				attention_mask
+			),
 		)
 
 	def _bind_prefill_step_batch(self, cur_batch_local) -> None:
 		"""Bind the global sequence ids of one padded prefill micro-batch."""
-		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+		phase_state.bind_step(
+			Attn_Wrapper,
+			cur_batch=self._local_indices_to_global_seq_ids(cur_batch_local),
+		)
 
 	def _install_prefill_prepack_metadata(
 		self,
@@ -10617,42 +10659,54 @@ class BatchGenWorker:
 		batch_attached_tokens,
 	) -> None:
 		"""Install one prepacked micro-batch's metadata on the wrappers."""
-		Attn_Wrapper.prepack_mode = True
-		Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
-		Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
-		Attn_Wrapper.prepack_num_sequences = batch_num_seqs
-		Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
-		Attn_Wrapper.position_ids = batch_position_ids_flat
-		Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
+		phase_state.bind_prepack(
+			Attn_Wrapper,
+			prepack_mode=True,
+			prepack_cu_seqlens=batch_cu_seqlens,
+			prepack_max_seqlen=batch_max_seqlen,
+			prepack_num_sequences=batch_num_seqs,
+			prepack_seq_lengths=batch_seq_lengths,
+		)
+		phase_state.bind_step(
+			Attn_Wrapper,
+			position_ids=batch_position_ids_flat,
+			cur_batch=prefill_sequence_spans_to_global_seq_ids(batch_spans),
+		)
 
 		# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
 		# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
 		# which does NOT offload KV to host, causing decode to read garbage.
-		AttnWrapperBase.prepack_mode = True
-		AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
-		AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
-		AttnWrapperBase.prepack_num_sequences = batch_num_seqs
-		AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
-		AttnWrapperBase.prepack_full_seq_lengths = (
-			batch_full_seq_lengths
-			if prefix_materialization is not None
-			else None
+		phase_state.bind_prepack(
+			AttnWrapperBase,
+			prepack_mode=True,
+			prepack_cu_seqlens=batch_cu_seqlens,
+			prepack_max_seqlen=batch_max_seqlen,
+			prepack_num_sequences=batch_num_seqs,
+			prepack_seq_lengths=batch_seq_lengths,
+			prepack_full_seq_lengths=(
+				batch_full_seq_lengths
+				if prefix_materialization is not None
+				else None
+			),
+			prepack_compute_cached_tokens=(
+				batch_compute_cached
+				if prefix_materialization is not None
+				else None
+			),
+			prepack_attached_tokens=(
+				batch_attached_tokens
+				if prefix_materialization is not None
+				else None
+			),
+			prefill_prefix_materialization=(
+				prefix_materialization
+			),
 		)
-		AttnWrapperBase.prepack_compute_cached_tokens = (
-			batch_compute_cached
-			if prefix_materialization is not None
-			else None
+		phase_state.bind_step(
+			AttnWrapperBase,
+			position_ids=batch_position_ids_flat,
+			cur_batch=Attn_Wrapper.cur_batch,
 		)
-		AttnWrapperBase.prepack_attached_tokens = (
-			batch_attached_tokens
-			if prefix_materialization is not None
-			else None
-		)
-		AttnWrapperBase.prefill_prefix_materialization = (
-			prefix_materialization
-		)
-		AttnWrapperBase.position_ids = batch_position_ids_flat
-		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 	def _retire_prefill_pending_offloads(self, device, reason):
 		"""Retire pending prefill KV offloads; returns the retired task count."""
@@ -10663,26 +10717,34 @@ class BatchGenWorker:
 
 	def _clear_prefill_prefix_materialization(self) -> None:
 		"""Detach the released prefix materialization from the wrappers."""
-		AttnWrapperBase.prefill_prefix_materialization = None
+		phase_state.bind_prepack(
+			AttnWrapperBase, prefill_prefix_materialization=None
+		)
 
 	def _reset_prefill_prepack_metadata(self) -> None:
 		"""Reset the prepack metadata after the prepacked forward loop."""
-		Attn_Wrapper.prepack_mode = False
-		Attn_Wrapper.prepack_cu_seqlens = None
-		Attn_Wrapper.prepack_max_seqlen = None
-		Attn_Wrapper.prepack_num_sequences = None
-		Attn_Wrapper.prepack_seq_lengths = None
+		phase_state.bind_prepack(
+			Attn_Wrapper,
+			prepack_mode=False,
+			prepack_cu_seqlens=None,
+			prepack_max_seqlen=None,
+			prepack_num_sequences=None,
+			prepack_seq_lengths=None,
+		)
 
 		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
-		AttnWrapperBase.prepack_full_seq_lengths = None
-		AttnWrapperBase.prepack_compute_cached_tokens = None
-		AttnWrapperBase.prepack_attached_tokens = None
-		AttnWrapperBase.prefill_prefix_materialization = None
+		phase_state.bind_prepack(
+			AttnWrapperBase,
+			prepack_mode=False,
+			prepack_cu_seqlens=None,
+			prepack_max_seqlen=None,
+			prepack_num_sequences=None,
+			prepack_seq_lengths=None,
+			prepack_full_seq_lengths=None,
+			prepack_compute_cached_tokens=None,
+			prepack_attached_tokens=None,
+			prefill_prefix_materialization=None,
+		)
 
 	# S5b model-name routing (spec F3): the moved prefill bodies read these
 	# model-family constants through the worker so no model-name literal enters
@@ -11982,12 +12044,6 @@ class BatchGenWorker:
 			gpu_manager,
 		)
 
-	def _clear_async_kv_load_model_state(self) -> None:
-		# Binder for the async-load finalize: the engine never touches the
-		# model-layer wrapper directly (repatriation, layer ruling 2026-11-14).
-		Attn_Wrapper.async_kv_load_active = False
-		Attn_Wrapper.async_kv_load_task = None
-
 	def _integrate_pending_async_load(
 		self,
 		pending_async_task: Optional[object],
@@ -12135,16 +12191,22 @@ class BatchGenWorker:
 			max_ctx = 0
 			cur_batch = []
 
-		Attn_Wrapper.attention_mask = None
-		Attn_Wrapper.cache_seqlens = cache_view
-		Attn_Wrapper.position_ids = position_view
-		Attn_Wrapper.max_seqlen = max_ctx
-		Attn_Wrapper.cur_batch = cur_batch
-		AttnWrapperBase.attention_mask = None
-		AttnWrapperBase.cache_seqlens = cache_view
-		AttnWrapperBase.position_ids = position_view
-		AttnWrapperBase.max_seqlen = max_ctx
-		AttnWrapperBase.cur_batch = cur_batch
+		phase_state.bind_step(
+			Attn_Wrapper,
+			attention_mask=None,
+			cache_seqlens=cache_view,
+			position_ids=position_view,
+			max_seqlen=max_ctx,
+			cur_batch=cur_batch,
+		)
+		phase_state.bind_step(
+			AttnWrapperBase,
+			attention_mask=None,
+			cache_seqlens=cache_view,
+			position_ids=position_view,
+			max_seqlen=max_ctx,
+			cur_batch=cur_batch,
+		)
 		index_topk = getattr(self.model_config, "index_topk", None)
 		if index_topk is not None and cache_view.numel() > 0:
 			GLM5AttnWrapper._dsa_short_count = int((cache_view <= int(index_topk)).sum().item())
@@ -12440,11 +12502,11 @@ class BatchGenWorker:
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
 		debug["glm5_dsa_mode"] = "eager"
 		debug["glm5_moe_mode"] = "eager"
-		AttnWrapperBase.batchgen_debug = debug
+		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=debug)
 		try:
 			yield
 		finally:
-			AttnWrapperBase.batchgen_debug = old_debug
+			phase_state.bind_debug(AttnWrapperBase, batchgen_debug=old_debug)
 
 	def _glm5_decode_model_forward(self, new_tokens: torch.Tensor):
 		def _forward():
@@ -12862,6 +12924,20 @@ class BatchGenWorker:
 		"""
 		return self._graph._setup_cuda_graphs(self, gpu_manager)
 
+	def _bind_graph_capture_kv_managers(self, primary_manager, aux_manager) -> None:
+		"""Binder for graph capture: bind the primary and aux KV managers."""
+		phase_state.bind_decode_entry(
+			AttnWrapperBase,
+			gpu_paged_kv_manager=primary_manager,
+			gpu_paged_kv_manager_aux=aux_manager,
+		)
+
+	def _bind_graph_capture_kv_manager(self, gpu_manager) -> None:
+		"""Binder for graph capture: bind the single KV manager."""
+		phase_state.bind_decode_entry(
+			AttnWrapperBase, gpu_paged_kv_manager=gpu_manager
+		)
+
 	def _bind_decode_entry_model_state(
 		self,
 		gpu_manager,
@@ -12871,23 +12947,37 @@ class BatchGenWorker:
 		past_value_states,
 		batch,
 	):
-		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
-		Attn_Wrapper.host_paged_kv_worker_view = worker_view
-		Attn_Wrapper.scale = scale_dict
-		Attn_Wrapper.past_key_states = past_key_states
-		Attn_Wrapper.past_value_states = past_value_states
-		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+		phase_state.bind_decode_entry(
+			Attn_Wrapper,
+			gpu_paged_kv_manager=gpu_manager,
+			host_paged_kv_worker_view=worker_view,
+			scale=scale_dict,
+			past_key_states=past_key_states,
+		)
+		phase_state.bind_step(
+			Attn_Wrapper,
+			cur_batch=self._local_indices_to_global_seq_ids(batch) if batch else [],
+		)
 
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 		if isinstance(gpu_manager, DualKVCacheCoordinator):
-			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager.primary
-			AttnWrapperBase.gpu_paged_kv_manager_aux = gpu_manager.auxiliary
+			phase_state.bind_decode_entry(
+				AttnWrapperBase,
+				gpu_paged_kv_manager=gpu_manager.primary,
+				gpu_paged_kv_manager_aux=gpu_manager.auxiliary,
+			)
 		else:
-			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
-			AttnWrapperBase.gpu_paged_kv_manager_aux = None
-		AttnWrapperBase.host_paged_kv_worker_view = worker_view
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+			phase_state.bind_decode_entry(
+				AttnWrapperBase,
+				gpu_paged_kv_manager=gpu_manager,
+				gpu_paged_kv_manager_aux=None,
+			)
+		phase_state.bind_decode_entry(
+			AttnWrapperBase,
+			host_paged_kv_worker_view=worker_view,
+			host_paged_kv_worker_view_aux=getattr(self, "host_paged_kv_worker_view_aux", None),
+		)
+		phase_state.bind_step(AttnWrapperBase, cur_batch=Attn_Wrapper.cur_batch)
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
@@ -12919,8 +13009,11 @@ class BatchGenWorker:
 		probe_round_request,
 		probe_mismatch_logged,
 	):
-		AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
-			global_decode_sequences
+		phase_state.bind_debug(
+			AttnWrapperBase,
+			batchgen_debug=self._active_batchgen_debug_for_sequences(
+				global_decode_sequences
+			),
 		)
 		if (
 			AttnWrapperBase.batchgen_debug is not None
@@ -12957,18 +13050,29 @@ class BatchGenWorker:
 		gpu_manager,
 	):
 		if batch:
-			Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
+			phase_state.bind_step(
+				Attn_Wrapper,
+				attention_mask=None,  # Removed: no longer used in decode
+			)
 			(
-				Attn_Wrapper.cache_seqlens,
-				Attn_Wrapper.position_ids,
+				decode_cache_seqlens_view,
+				decode_position_ids_view,
 			) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
-			Attn_Wrapper.max_seqlen = max_ctx
+			phase_state.bind_step(
+				Attn_Wrapper,
+				cache_seqlens=decode_cache_seqlens_view,
+				position_ids=decode_position_ids_view,
+				max_seqlen=max_ctx,
+			)
 
 			# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-			AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
-			AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-			AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-			AttnWrapperBase.max_seqlen = max_ctx
+			phase_state.bind_step(
+				AttnWrapperBase,
+				attention_mask=None,  # Removed: no longer used in decode
+				cache_seqlens=Attn_Wrapper.cache_seqlens,
+				position_ids=Attn_Wrapper.position_ids,
+				max_seqlen=max_ctx,
+			)
 
 			# Per-step DSA dispatch hint: count sequences whose cache is
 			# short enough to take the dense short-circuit instead of
@@ -12984,26 +13088,35 @@ class BatchGenWorker:
 			if new_tokens.shape[0] != len(batch):
 				new_tokens = self._rebuild_input_tokens(batch)
 		else:
-			Attn_Wrapper.attention_mask = None
-			Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-			Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
-			Attn_Wrapper.max_seqlen = 0
-			Attn_Wrapper.cur_batch = []
+			phase_state.bind_step(
+				Attn_Wrapper,
+				attention_mask=None,
+				position_ids=torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device),
+				cache_seqlens=torch.zeros((0,), dtype=torch.int32, device=self.torch_device),
+				max_seqlen=0,
+				cur_batch=[],
+			)
 			new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
 			# Also bind empty state to AttnWrapperBase for GPT-OSS
-			AttnWrapperBase.attention_mask = None
-			AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-			AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-			AttnWrapperBase.max_seqlen = 0
-			AttnWrapperBase.cur_batch = []
+			phase_state.bind_step(
+				AttnWrapperBase,
+				attention_mask=None,
+				position_ids=Attn_Wrapper.position_ids,
+				cache_seqlens=Attn_Wrapper.cache_seqlens,
+				max_seqlen=0,
+				cur_batch=[],
+			)
 			GLM5AttnWrapper._dsa_short_count = 0
 			GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
 			self._decode_metadata_batch_key = None
 			self._decode_metadata_cpu_seqlens = None
 
 		if batch:
-			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-			AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+			phase_state.bind_step(
+				Attn_Wrapper,
+				cur_batch=self._local_indices_to_global_seq_ids(batch),
+			)
+			phase_state.bind_step(AttnWrapperBase, cur_batch=Attn_Wrapper.cur_batch)
 
 			# OPTIMIZATION: Only check page table if not already verified this batch
 			# Between boundaries, batch doesn't change so page table stays valid
@@ -13071,9 +13184,9 @@ class BatchGenWorker:
 			def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 				self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
 
-		Attn_Wrapper.kv_append_callback = kv_append_callback
+		phase_state.bind_kv_append(Attn_Wrapper, kv_append_callback=kv_append_callback)
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-		AttnWrapperBase.kv_append_callback = kv_append_callback
+		phase_state.bind_kv_append(AttnWrapperBase, kv_append_callback=kv_append_callback)
 
 		# DSA: auxiliary KV append callback for indexer host cache.
 		# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
@@ -13106,9 +13219,11 @@ class BatchGenWorker:
 					self._deferred_kv_entries_aux.append(
 						(layer_idx, k_tensor, v_tensor, scale_tensor)
 					)
-			AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
+			phase_state.bind_kv_append(
+				AttnWrapperBase, kv_append_callback_aux=kv_append_callback_aux
+			)
 		else:
-			AttnWrapperBase.kv_append_callback_aux = None
+			phase_state.bind_kv_append(AttnWrapperBase, kv_append_callback_aux=None)
 
 	# One reader per bound decode-step term (S6 fold: the S4b binder named
 	# one reader per call site; the bodies were identical, and ``Attn_Wrapper``
@@ -13135,35 +13250,46 @@ class BatchGenWorker:
 		)
 
 	def _teardown_decode_model_state(self):
-		Attn_Wrapper.kv_append_callback = None
-		Attn_Wrapper.scale = None
-		Attn_Wrapper.past_key_states = None
-		Attn_Wrapper.past_value_states = None
-		Attn_Wrapper.gpu_paged_kv_manager = None
-		Attn_Wrapper.host_paged_kv_worker_view = None
-		Attn_Wrapper.cur_batch = None
+		phase_state.bind_kv_append(Attn_Wrapper, kv_append_callback=None)
+		phase_state.bind_decode_entry(
+			Attn_Wrapper,
+			scale=None,
+			past_key_states=None,
+			gpu_paged_kv_manager=None,
+			host_paged_kv_worker_view=None,
+		)
+		phase_state.bind_step(Attn_Wrapper, cur_batch=None)
 
 		# Also cleanup AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-		AttnWrapperBase.gpu_paged_kv_manager = None
-		AttnWrapperBase.gpu_paged_kv_manager_aux = None
-		AttnWrapperBase.host_paged_kv_worker_view = None
-		AttnWrapperBase.host_paged_kv_worker_view_aux = None
-		AttnWrapperBase.cache_seqlens = None
-		AttnWrapperBase.attention_mask = None
-		AttnWrapperBase.position_ids = None
-		AttnWrapperBase.max_seqlen = None
-		AttnWrapperBase.cur_batch = None
+		phase_state.bind_decode_entry(
+			AttnWrapperBase,
+			gpu_paged_kv_manager=None,
+			gpu_paged_kv_manager_aux=None,
+			host_paged_kv_worker_view=None,
+			host_paged_kv_worker_view_aux=None,
+		)
+		phase_state.bind_step(
+			AttnWrapperBase,
+			cache_seqlens=None,
+			attention_mask=None,
+			position_ids=None,
+			max_seqlen=None,
+			cur_batch=None,
+		)
 		# A profile window never outlives the decode round that opened it.
 		self._decode_profile_capture_state().end_round()
 		self._flush_glm5_dispatch_trace_summary("decode_end")
-		AttnWrapperBase.batchgen_debug = None
+		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=None)
 		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
 		GLM5AttnWrapper.glm5_dispatch_trace_id = None
 		GLM5AttnWrapper.glm5_dispatch_trace_context = None
 		GLM5AttnWrapper.glm5_dispatch_counts = {}
 		GLM5AttnWrapper.glm5_dispatch_seen = set()
-		AttnWrapperBase.kv_append_callback = None
-		AttnWrapperBase.kv_append_callback_aux = None
+		phase_state.bind_kv_append(
+			AttnWrapperBase,
+			kv_append_callback=None,
+			kv_append_callback_aux=None,
+		)
 		GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
 		GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 		GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
@@ -13252,12 +13378,12 @@ class BatchGenWorker:
 	) -> None:
 		"""Consolidated page table rebuild - single place to rebuild."""
 		if gpu_manager is None or not gpu_manager.is_initialized:
-			Attn_Wrapper.cur_batch = []
+			phase_state.bind_step(Attn_Wrapper, cur_batch=[])
 			return
-		
+
 		if not batch:
 			# Clear the page table to empty state when batch is empty
-			Attn_Wrapper.cur_batch = []
+			phase_state.bind_step(Attn_Wrapper, cur_batch=[])
 			gpu_manager.clear_page_table()
 			return
 		
@@ -13279,11 +13405,11 @@ class BatchGenWorker:
 				)
 				global_ids = allocated_ids
 		if not global_ids:
-			Attn_Wrapper.cur_batch = []
+			phase_state.bind_step(Attn_Wrapper, cur_batch=[])
 			gpu_manager.clear_page_table()
 			return
 		gpu_manager.rebuild_page_table(global_ids)
-		Attn_Wrapper.cur_batch = global_ids
+		phase_state.bind_step(Attn_Wrapper, cur_batch=global_ids)
 
 
 	def _rebuild_input_tokens(self, batch: List[int]) -> torch.Tensor:
@@ -13397,7 +13523,7 @@ class BatchGenWorker:
 			if strategy is DecodeStrategy.CPU_ATTN:
 				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
 				with torch.inference_mode():
-					Attn_Wrapper.cur_batch = [batch]
+					phase_state.bind_step(Attn_Wrapper, cur_batch=[batch])
 					# Build attention mask on-the-fly from sequence metadata
 					cache_seqlens = []
 					for query_idx in batch:
@@ -13413,8 +13539,11 @@ class BatchGenWorker:
 					else:
 						position_ids = create_position_ids_from_attention_mask(attention_mask)
 
-					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = position_ids
+					phase_state.bind_step(
+						Attn_Wrapper,
+						attention_mask=attention_mask,
+						position_ids=position_ids,
+					)
 					self._weight_passes.begin(carry=True)
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
@@ -13472,7 +13601,7 @@ class BatchGenWorker:
 					batch[micro_batch_idx * micro_batch_size : (micro_batch_idx + 1) * micro_batch_size]
 					for micro_batch_idx in range(num_micro_batches)
 				]
-				Attn_Wrapper.cur_batch = micro_batches
+				phase_state.bind_step(Attn_Wrapper, cur_batch=micro_batches)
 				cache_seqlens = [
 					self.global_batch.get_sequence(self._local_to_uuid_map[query_idx]).current_context_length
 					for query_idx in batch
@@ -13506,8 +13635,11 @@ class BatchGenWorker:
 					else:
 						position_ids = (seqlens_tensor - 1).unsqueeze(-1)
 
-					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = position_ids
+					phase_state.bind_step(
+						Attn_Wrapper,
+						attention_mask=attention_mask,
+						position_ids=position_ids,
+					)
 					self._weight_passes.begin(carry=True)
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
@@ -13572,9 +13704,9 @@ class BatchGenWorker:
 		self._phase = phase
 		torch.cuda.empty_cache()
 		self.core_engine.set_phase(phase)
-		Attn_Wrapper.phase = phase
-		Expert_Wrapper.phase = phase
-		BaseModuleWrapper.phase = phase
+		phase_state.bind_phase(Attn_Wrapper, phase=phase)
+		phase_state.bind_phase(Expert_Wrapper, phase=phase)
+		phase_state.bind_phase(BaseModuleWrapper, phase=phase)
 
 	def update_new_token(
 		self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int

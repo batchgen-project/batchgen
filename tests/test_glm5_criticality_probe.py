@@ -456,8 +456,11 @@ _PRE_PROBE_CALL_SNAPSHOT = {
         (18, "af3676815db3a625036c84b10c12657859235c27bc3e986f6c341352162df7c5"),
     ("moe_cuda_graph_segments.py", "Glm5MoEGraphSegment", "_forward_deepep"):
         (24, "dc71b3a5d36cca3589eedda08d8fcc47dd2084b885ac216c8e0d63bd18db3cd8"),
+    # The four per-step attribute writes of this forward go through the phase
+    # state writer module, so they appear as calls (two before the model run,
+    # two after); with those removed the sequence is the earlier 3-call one.
     ("whole_model_cuda_graph_segments.py", "Glm5WholeModelSegment", "forward"):
-        (3, "9ab482594f79ed5495d60d83cc9d641a3dc3f87af63f337cb42e1303469d68a2"),
+        (7, "301696839e0f5baf9e6e1f39daee0722d622d0d87e92c9e448d84059d7ee463b"),
     ("whole_model_cuda_graph_segments.py", "Glm5WholeModelSegment", "run_model_with_probes"):
         (15, "dfa472e1a41f3eacf5da638d7c31d13103ef1f5321259f7caa2a3de7b81990a0"),
 }
