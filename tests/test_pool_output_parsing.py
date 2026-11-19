@@ -9,6 +9,9 @@ A chat completion whose parsed message carries tool calls reports
 ``finish_reason="tool_calls"`` when the worker stopped on its own, for every
 registered model family's real tool-call parser; truncation and repetition
 keep the worker's reason.
+
+A DeepSeek-V4 completion is split into reasoning, content and tool calls as
+the vendored V4 parser reads it, in thinking and in chat mode.
 """
 
 import __future__
@@ -392,7 +395,9 @@ def test_deepseek_v4_calls_in_one_response_get_distinct_ids(
 
 # Completion text the vendored DeepSeek-V4 parser
 # (deepseekv4_flash/assets/encoding/encoding_dsv4.py) rejects, one per
-# rejection reachable from a completion string, with the exception it raises.
+# rejection reachable from a completion string, with the exception it raises
+# in the mode the wrapper parses that text in: ``thinking`` when the text holds
+# a ``</think>``, else ``chat``.
 _DSML = "｜DSML｜"
 _DSV4_INVOKE = f'<{_DSML}invoke name="get_weather">\n'
 _DSV4_PARAM = (
@@ -405,39 +410,61 @@ _DSV4_BLOCK = (
 DEEPSEEK_V4_REJECTED = {
     # parse_tool_calls: block opener not followed by '>\n'
     "block_opener": (
-        ValueError,
+        ValueError, "chat",
         _DSV4_BLOCK.replace("tool_calls>\n", "tool_calls> \n", 1),
     ),
     # parse_tool_calls: invoke without a name="..." attribute
-    "tool_name": (ValueError, _DSV4_BLOCK.replace('name="get_weather"', 'nme="x"')),
+    "tool_name": (
+        ValueError, "chat", _DSV4_BLOCK.replace('name="get_weather"', 'nme="x"'),
+    ),
     # parse_tool_calls: a JSON body instead of DSML parameters is not DSML
     "json_invoke_body": (
-        ValueError, _DSV4_BLOCK.replace(_DSV4_PARAM, '{"city": "Paris"}\n'),
+        ValueError, "chat",
+        _DSV4_BLOCK.replace(_DSV4_PARAM, '{"city": "Paris"}\n'),
     ),
     # parse_tool_calls: parameter without its string="..." attribute
-    "parameter": (ValueError, _DSV4_BLOCK.replace(' string="true"', "")),
+    "parameter": (ValueError, "chat", _DSV4_BLOCK.replace(' string="true"', "")),
     # parse_tool_calls: the same parameter twice
     "duplicate_parameter": (
-        ValueError, _DSV4_BLOCK.replace(_DSV4_PARAM, _DSV4_PARAM * 2),
+        ValueError, "chat", _DSV4_BLOCK.replace(_DSV4_PARAM, _DSV4_PARAM * 2),
     ),
     # parse_tool_calls: parameter close not followed by '>\n'
     "parameter_separator": (
-        ValueError,
+        ValueError, "chat",
         _DSV4_BLOCK.replace(f"parameter>\n</{_DSML}invoke", f"parameter> </{_DSML}invoke"),
     ),
     # 'Unexpected content after tool calls'
-    "content_after_calls": (AssertionError, _DSV4_BLOCK + "\nDone."),
+    "content_after_calls": (AssertionError, "chat", _DSV4_BLOCK + "\nDone."),
+    "thinking_content_after_calls": (
+        AssertionError, "thinking", "Warm.</think>" + _DSV4_BLOCK + "\nDone.",
+    ),
     # 'Unexpected content at end': text after an end-of-sentence token
-    "content_after_eos": (AssertionError, "It is<｜end▁of▁sentence｜> 21 C."),
+    "content_after_eos": (
+        AssertionError, "chat", "It is<｜end▁of▁sentence｜> 21 C.",
+    ),
     "calls_then_content_after_eos": (
-        AssertionError, _DSV4_BLOCK + "<｜end▁of▁sentence｜>Done.",
+        AssertionError, "chat", _DSV4_BLOCK + "<｜end▁of▁sentence｜>Done.",
+    ),
+    # 'Invalid thinking format: missing </think>': calls inside the reasoning
+    "calls_inside_reasoning": (
+        AssertionError, "thinking", "Warm." + _DSV4_BLOCK + "</think>Done.",
     ),
     # 'Unexpected special token ... in content'
-    "think_open_in_content": (AssertionError, "<think>It is 21 C."),
-    "think_close_in_content": (AssertionError, "Warm.</think>It is 21 C."),
-    "think_close_before_calls": (AssertionError, "Warm.</think>" + _DSV4_BLOCK),
-    "bos_in_content": (AssertionError, "<｜begin▁of▁sentence｜>It is 21 C."),
-    "dsml_in_content": (AssertionError, _DSV4_BLOCK[1:]),
+    "think_open_in_content": (AssertionError, "chat", "<think>It is 21 C."),
+    "think_open_in_reasoning": (
+        AssertionError, "thinking", "<think>Warm.</think>It is 21 C.",
+    ),
+    "second_think_close": (
+        AssertionError, "thinking", "Warm.</think>It is</think> 21 C.",
+    ),
+    "second_think_close_before_calls": (
+        AssertionError, "thinking", "Warm.</think>Sunny.</think>" + _DSV4_BLOCK,
+    ),
+    "bos_in_content": (AssertionError, "chat", "<｜begin▁of▁sentence｜>It is 21 C."),
+    "dsml_in_content": (AssertionError, "chat", _DSV4_BLOCK[1:]),
+    "dsml_in_thinking_content": (
+        AssertionError, "thinking", "Warm.</think>" + _DSV4_BLOCK[1:],
+    ),
 }
 
 
@@ -453,11 +480,13 @@ def test_deepseek_v4_rejected_text_is_returned_as_content(
         parse_message_from_completion_text,
     )
 
-    rejection, text = DEEPSEEK_V4_REJECTED[case]
+    rejection, thinking_mode, text = DEEPSEEK_V4_REJECTED[case]
     tool_case = TOOL_CALL_CASES["deepseek_v4"]
     tokenizer = _parser_only(registered_tokenizers["deepseek_v4"], tool_case)
     with pytest.raises(rejection):
-        parse_message_from_completion_text(text + eos_token, thinking_mode="chat")
+        parse_message_from_completion_text(
+            text + eos_token, thinking_mode=thinking_mode,
+        )
 
     assert tokenizer.parse_tool_calls(text) == (None, text)
 
@@ -466,6 +495,209 @@ def test_deepseek_v4_rejected_text_is_returned_as_content(
     assert choice["finish_reason"] == "stop"
     assert "tool_calls" not in choice["message"]
     assert choice["message"]["content"] == text
+
+    choice = _dsv4_choice(tokenizer, tmp_path, text, "stop", parse_thinking=True)
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+
+
+# ------------------------------------------- DeepSeek-V4 thinking-mode output
+
+# The V4 encoder ends a thinking-mode prompt with ``<think>`` and a chat-mode
+# one with ``</think>`` (encoding_dsv4.render_message), so a thinking-mode
+# completion is ``reasoning</think>`` + what a chat-mode completion holds
+# (content, then an optional "\n\n"-opened DSML tool-call block).
+_DSV4_EOS = "<｜end▁of▁sentence｜>"
+_DSV4_REASONING = "The user is in Paris; look up the weather."
+_DSV4_CALL = [{"city": "Paris"}]
+
+# reasoning / content: the message with parse_thinking and parse_tool_call on.
+# raw_content: the content with only parse_tool_call on (the scheduler
+# default of these tests), where the reasoning is not split out.
+# vendored_mode: the mode the vendored parser accepts the text in, as the
+# ground truth for reasoning, content and calls (None: no mode accepts it).
+DEEPSEEK_V4_OUTPUTS = {
+    # (a) thinking mode, reasoning + answer
+    "thinking_answer": dict(
+        text=f"{_DSV4_REASONING}</think>It is 21 C.",
+        reasoning=_DSV4_REASONING, content="It is 21 C.", calls=None,
+        raw_content=f"{_DSV4_REASONING}</think>It is 21 C.",
+        vendored_mode="thinking",
+    ),
+    # (b) thinking mode, reasoning + tool call, with and without content
+    "thinking_tool_call": dict(
+        text=f"{_DSV4_REASONING}</think>{_DSV4_BLOCK}",
+        reasoning=_DSV4_REASONING, content="", calls=_DSV4_CALL,
+        raw_content=f"{_DSV4_REASONING}</think>",
+        vendored_mode="thinking",
+    ),
+    "thinking_answer_tool_call": dict(
+        text=f"{_DSV4_REASONING}</think>Checking.{_DSV4_BLOCK}",
+        reasoning=_DSV4_REASONING, content="Checking.", calls=_DSV4_CALL,
+        raw_content=f"{_DSV4_REASONING}</think>Checking.",
+        vendored_mode="thinking",
+    ),
+    # (c) thinking mode cut off before </think>: the text alone cannot tell
+    # it from a chat answer (the prompt's <think> is not in it), so no
+    # reasoning block is found and the text stays content.
+    "thinking_truncated": dict(
+        text="The user is in Par",
+        reasoning=None, content="The user is in Par", calls=None,
+        raw_content="The user is in Par",
+        vendored_mode=None,
+    ),
+    # (d) chat mode
+    "chat_answer": dict(
+        text="It is 21 C.",
+        reasoning=None, content="It is 21 C.", calls=None,
+        raw_content="It is 21 C.",
+        vendored_mode="chat",
+    ),
+    "chat_tool_call": dict(
+        text=_DSV4_BLOCK,
+        reasoning=None, content="", calls=_DSV4_CALL, raw_content="",
+        vendored_mode="chat",
+    ),
+    # (e) a chat-mode completion with a stray </think>. The chat grammar
+    # rejects it; it is byte-identical to a thinking-mode completion, the only
+    # grammar that accepts it, and is parsed as one.
+    "chat_stray_think_close": dict(
+        text="Warm.</think>It is 21 C.",
+        reasoning="Warm.", content="It is 21 C.", calls=None,
+        raw_content="Warm.</think>It is 21 C.",
+        vendored_mode="thinking",
+    ),
+}
+
+
+def _dsv4_choice(tokenizer, tmp_path, text, finish_reason, parse_thinking):
+    """One chat completion through the real writer and ``_parse_output``."""
+    out_dir = tmp_path / f"parse_thinking_{parse_thinking}"
+    out_dir.mkdir(exist_ok=True)
+    scheduler = _parsing_scheduler(out_dir, tokenizer)
+    scheduler.server_args.parse_thinking = parse_thinking
+    return _choice(scheduler, out_dir, text, finish_reason)
+
+
+def _arguments(calls):
+    return [json.loads(call["function"]["arguments"]) for call in calls]
+
+
+def test_deepseek_v4_prompt_opens_the_reasoning_block_only_in_thinking_mode(
+    registered_tokenizers,
+):
+    tokenizer = _parser_only(
+        registered_tokenizers["deepseek_v4"], TOOL_CALL_CASES["deepseek_v4"],
+    )
+    messages = [{"role": "user", "content": "Weather in Paris?"}]
+
+    thinking = tokenizer.apply_chat_template(messages, enable_thinking=True)
+    chat = tokenizer.apply_chat_template(messages, enable_thinking=False)
+
+    assert thinking.endswith("<｜Assistant｜><think>")
+    assert chat.endswith("<｜Assistant｜></think>")
+
+
+@pytest.mark.parametrize("case", sorted(DEEPSEEK_V4_OUTPUTS))
+def test_deepseek_v4_output_is_split_as_the_v4_grammar_reads_it(
+    case, registered_tokenizers, tmp_path,
+):
+    """``BaseTokenizer.parse_thinking`` then ``parse_tool_calls`` (the
+    scheduler's order) recover reasoning, content and calls of every V4
+    completion shape, matching the vendored parser in the mode it accepts."""
+    from batchgen.models.deepseek.deepseekv4_flash.assets.encoding.encoding_dsv4 import (
+        parse_message_from_completion_text,
+    )
+
+    expected = DEEPSEEK_V4_OUTPUTS[case]
+    text = expected["text"]
+    tokenizer = _parser_only(
+        registered_tokenizers["deepseek_v4"], TOOL_CALL_CASES["deepseek_v4"],
+    )
+    finish_reason = "length" if case == "thinking_truncated" else "stop"
+
+    if expected["vendored_mode"] is not None:
+        truth = parse_message_from_completion_text(
+            text + _DSV4_EOS, thinking_mode=expected["vendored_mode"],
+        )
+        assert (truth["reasoning_content"] or None) == expected["reasoning"]
+        assert truth["content"] == expected["content"]
+        assert _arguments(truth["tool_calls"]) == (expected["calls"] or [])
+
+    reasoning, visible = tokenizer.parse_thinking(text)
+    assert reasoning == expected["reasoning"]
+    calls, content = tokenizer.parse_tool_calls(visible)
+    assert content == expected["content"]
+    assert (calls and _arguments(calls)) == expected["calls"]
+
+    calls, raw_content = tokenizer.parse_tool_calls(text)
+    assert raw_content == expected["raw_content"]
+    assert (calls and _arguments(calls)) == expected["calls"]
+
+    tool_reason = "tool_calls" if expected["calls"] else finish_reason
+    choice = _dsv4_choice(tokenizer, tmp_path, text, finish_reason, True)
+    message = choice["message"]
+    assert message["content"] == expected["content"]
+    assert message.get("reasoning_content") == expected["reasoning"]
+    assert _arguments(message.get("tool_calls", [])) == (expected["calls"] or [])
+    assert choice["finish_reason"] == tool_reason
+
+    choice = _dsv4_choice(tokenizer, tmp_path, text, finish_reason, False)
+    message = choice["message"]
+    assert message["content"] == expected["raw_content"]
+    assert "reasoning_content" not in message
+    assert _arguments(message.get("tool_calls", [])) == (expected["calls"] or [])
+    assert choice["finish_reason"] == tool_reason
+
+
+def test_deepseek_v4_json_non_string_parameter_is_parsed(registered_tokenizers):
+    tokenizer = _parser_only(
+        registered_tokenizers["deepseek_v4"], TOOL_CALL_CASES["deepseek_v4"],
+    )
+    days = f'<{_DSML}parameter name="days" string="false">3</{_DSML}parameter>\n'
+    text = _DSV4_BLOCK.replace(_DSV4_PARAM, _DSV4_PARAM + days)
+
+    calls, content = tokenizer.parse_tool_calls(text)
+
+    assert _arguments(calls) == [{"city": "Paris", "days": 3}]
+    assert content == ""
+
+
+@pytest.mark.parametrize("reasoning", [None, _DSV4_REASONING])
+def test_deepseek_v4_call_with_non_json_arguments_is_content(
+    reasoning, registered_tokenizers, tmp_path,
+):
+    """A ``string="false"`` value must be JSON (the DSML tool prompt); the
+    vendored parser pastes it into the arguments unchecked. Such a call is
+    malformed and stays content, as every other rejected call does."""
+    from batchgen.models.deepseek.deepseekv4_flash.assets.encoding.encoding_dsv4 import (
+        parse_message_from_completion_text,
+    )
+
+    block = _DSV4_BLOCK.replace('string="true">Paris', 'string="false">Paris')
+    text = block if reasoning is None else f"{reasoning}</think>{block}"
+    tokenizer = _parser_only(
+        registered_tokenizers["deepseek_v4"], TOOL_CALL_CASES["deepseek_v4"],
+    )
+    mode = "chat" if reasoning is None else "thinking"
+    parsed = parse_message_from_completion_text(text + _DSV4_EOS, thinking_mode=mode)
+    arguments = parsed["tool_calls"][0]["function"]["arguments"]
+    assert arguments == '{"city": Paris}'
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+
+    assert tokenizer.parse_tool_calls(text) == (None, text)
+
+    choice = _dsv4_choice(tokenizer, tmp_path, text, "stop", False)
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == text
+
+    choice = _dsv4_choice(tokenizer, tmp_path, text, "stop", True)
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == block
+    assert choice["message"].get("reasoning_content") == reasoning
 
 
 @pytest.mark.parametrize("family", FAMILIES)
