@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from batchgen.worker.admission.plan import StatusEdge
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -255,7 +257,7 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         _get_local_indices_for_uuids=lambda uuids: [0],
         _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
         _release_host_kv_pages_for_batch=lambda uuids: calls.host.append(uuids),
-        _update_batch_status=lambda uuids, status: None,
+        _update_batch_status=lambda uuids, status, edge: None,
         _report_completion=lambda uuid, gathered_text=None: calls.report.append(
             (uuid, gathered_text)
         ),
@@ -267,6 +269,7 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         {
             "List": list,
             "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+            "StatusEdge": StatusEdge,
         },
     ).__get__(worker)
 
@@ -304,7 +307,7 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         _get_local_indices_for_uuids=lambda uuids: [0],
         _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
         _release_host_kv_pages_for_batch=lambda uuids: None,
-        _update_batch_status=lambda uuids, status: None,
+        _update_batch_status=lambda uuids, status, edge: None,
         _report_completion=lambda uuid, gathered_text=None: None,
     )
     method = _isolated_method(
@@ -314,6 +317,7 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         {
             "List": list,
             "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+            "StatusEdge": StatusEdge,
         },
     ).__get__(worker)
 

@@ -128,6 +128,7 @@ class SyncCoordinator:
             sorted by ``global_idx``.
         """
         from batchgen.sequence import SequenceStatus  # local import to avoid module-load cost
+        from batchgen.worker.admission.plan import StatusEdge, Transition, TransitionPlan
 
         if not decode_uuids:
             return set(), []
@@ -162,6 +163,7 @@ class SyncCoordinator:
 
         global_completed: Set[str] = set()
         active_uuids: List[str] = []
+        to_complete: List[Transition] = []
         for global_idx in sorted(idx_to_uuid.keys()):
             uuid = idx_to_uuid[global_idx]
             if completion_tensor[global_idx].item() == 1:
@@ -170,14 +172,18 @@ class SyncCoordinator:
                 if seq is not None:
                     seq.eos_reached = True
                     if seq.status != SequenceStatus.COMPLETED:
-                        try:
-                            ctx.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
-                        except ValueError as e:
-                            logger.debug(
-                                f"Rank {ctx.rank}: Could not update {uuid[:8]} to COMPLETED: {e}"
-                            )
+                        to_complete.append(Transition(uuid, SequenceStatus.COMPLETED))
             else:
                 active_uuids.append(uuid)
+
+        rejected = ctx.global_batch.apply(
+            TransitionPlan(StatusEdge.COMPLETION, tuple(to_complete))
+        )
+        for rejection in rejected:
+            logger.debug(
+                f"Rank {ctx.rank}: Could not update {rejection.transition.uuid[:8]} "
+                f"to COMPLETED: {rejection.reason}"
+            )
 
         return global_completed, active_uuids
 

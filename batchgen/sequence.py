@@ -17,8 +17,9 @@
       Must be <= extension_gpu_page_buffer to ensure sequences don't overflow between decisions.
 """
 import itertools
-from enum import IntEnum
-from typing import Dict, List, Optional, Set
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Dict, List, Optional, Set, Tuple
 import torch
 import math
 
@@ -666,6 +667,71 @@ class SequenceEntry:
         )
 
 
+# ============ Status transition plans ============
+#
+# A sequence's status changes only through ``SequenceBatch.apply``, which
+# consumes one of these plans. They are defined here, next to the batch that
+# applies them, so this module never imports upward; the admission package
+# (``batchgen.worker.admission.plan``) re-exports them.
+
+
+class StatusEdge(str, Enum):
+    """Which decision produced a ``TransitionPlan``."""
+
+    #: A request enters the batch.
+    INTAKE = "intake"
+    #: A prefill wave starts (IN_PREFILL) or finishes (PREFILLED).
+    PREFILL = "prefill"
+    #: Sequences are admitted into decode (IN_DECODE).
+    DECODE_ENTRY = "decode_entry"
+    #: A page-boundary decision evicts sequences or puts them on hold.
+    BOUNDARY = "boundary"
+    #: The capacity watermark puts decoding sequences on hold.
+    CAPACITY_HOLD = "capacity_hold"
+    #: Sequences finish (COMPLETED).
+    COMPLETION = "completion"
+
+
+@dataclass(frozen=True)
+class Transition:
+    """Move one sequence, by uuid, to status ``to``."""
+
+    uuid: str
+    to: SequenceStatus
+
+
+@dataclass(frozen=True)
+class TransitionPlan:
+    """An ordered set of status transitions produced by one decision.
+
+    ``transitions`` is applied in order and the order is part of the contract.
+    ``payload`` is reserved for edge-specific data in later slices.
+    """
+
+    edge: StatusEdge
+    transitions: Tuple[Transition, ...]
+    payload: Optional[object] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transitions, tuple):
+            raise TypeError(
+                f"TransitionPlan.transitions must be a tuple, got "
+                f"{type(self.transitions).__name__}"
+            )
+
+    @property
+    def advances(self) -> bool:
+        return bool(self.transitions)
+
+
+@dataclass(frozen=True)
+class RejectedTransition:
+    """A transition ``SequenceBatch.apply`` did not perform, and why."""
+
+    transition: Transition
+    reason: str
+
+
 #: Process-wide monotone source for ``SequenceBatch.composition_epoch``. A
 #: per-instance counter starting at 0 would let a freshly constructed batch
 #: collide with a cached epoch taken from the batch it replaced, so the epoch is
@@ -761,17 +827,56 @@ class SequenceBatch:
         """Resolve a sequence by its immutable ``global_idx``."""
         return self._gid_index.get(global_idx, None)
 
-    def update_status(self, uuid: str, new_status: SequenceStatus) -> None:
-        if uuid not in self.sequences:
-            raise KeyError(f"Sequence with UUID {uuid} not found.")
-        
-        seq = self.sequences[uuid]
-        old_status = seq.status
-        seq.status_transition(new_status)  # Validates transition
-        
-        # Update index
-        self._status_index[old_status].discard(uuid)
-        self._status_index[new_status].add(uuid)
+    def plan_transitions(
+        self, uuids, to: SequenceStatus
+    ) -> Tuple[Tuple[Transition, ...], Tuple[str, ...]]:
+        """Plan moving ``uuids`` to ``to``, skipping no-op transitions.
+
+        Returns ``(transitions, missing)``. ``transitions`` keeps input order
+        and holds one entry per uuid that is in the batch, is not already in
+        ``to`` and is not ``COMPLETED``. A uuid repeated in ``uuids`` is
+        planned once: after its first transition is applied it is already in
+        ``to``. ``missing`` lists, in input order, the uuids not in the batch.
+        """
+        transitions: List[Transition] = []
+        missing: List[str] = []
+        planned: Set[str] = set()
+        for uuid in uuids:
+            seq = self.sequences.get(uuid)
+            if seq is None:
+                missing.append(uuid)
+                continue
+            if seq.status == to or uuid in planned:
+                continue
+            if seq.status == SequenceStatus.COMPLETED:
+                continue
+            planned.add(uuid)
+            transitions.append(Transition(uuid, to))
+        return tuple(transitions), tuple(missing)
+
+    def apply(self, plan: TransitionPlan) -> Tuple[RejectedTransition, ...]:
+        """Apply ``plan`` in order; the only place a sequence status changes.
+
+        An unknown uuid raises ``KeyError``. A transition the sequence rejects
+        (``ValueError`` from ``status_transition``) is recorded and the next
+        transition is still applied; the caller decides whether a rejection is
+        fatal.
+        """
+        rejected: List[RejectedTransition] = []
+        for transition in plan.transitions:
+            uuid = transition.uuid
+            if uuid not in self.sequences:
+                raise KeyError(f"Sequence with UUID {uuid} not found.")
+            seq = self.sequences[uuid]
+            old_status = seq.status
+            try:
+                seq.status_transition(transition.to)  # Validates transition
+            except ValueError as exc:
+                rejected.append(RejectedTransition(transition, str(exc)))
+                continue
+            self._status_index[old_status].discard(uuid)
+            self._status_index[transition.to].add(uuid)
+        return tuple(rejected)
 
     def assign_rank(self, uuid: str, rank: int) -> None:
         if uuid not in self.sequences:

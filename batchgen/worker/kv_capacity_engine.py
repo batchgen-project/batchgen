@@ -51,6 +51,12 @@ from batchgen.query_book import (
     QueryBookPoolCapacityError,
     make_query_book_entry,
 )
+from batchgen.worker.admission.plan import (
+    StatusEdge,
+    Transition,
+    TransitionPlan,
+    apply_or_raise,
+)
 from batchgen.worker.boundary import BoundaryDecisionRequest, BoundarySeqMeta
 from batchgen.worker.decode import DecodeCapacitySnapshot, reduce_decode_capacity_snapshot
 from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
@@ -3752,7 +3758,12 @@ class KVCapacityEngine:
             seq = self.global_batch.get_sequence(uuid)
             seq.gpu_pages_allocated = 0
             seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=watermark")
-            self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+        # None of the per-sequence steps above reads a status, so the
+        # transitions apply together, in loop order, after them.
+        apply_or_raise(self.global_batch, TransitionPlan(
+            StatusEdge.CAPACITY_HOLD,
+            tuple(Transition(uuid, SequenceStatus.ON_HOLD) for uuid in uuids),
+        ))
 
         # Synchronize state across all ranks
         dist.barrier()
@@ -3809,7 +3820,9 @@ class KVCapacityEngine:
             )
 
         # Update status AFTER load completes
-        self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
+        self._update_batch_status(
+            new_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY
+        )
     
         # Build updated lists
         updated_uuids = current_decode_uuids + new_uuids
@@ -3893,7 +3906,9 @@ class KVCapacityEngine:
                 f"pending_count={len(pending_uuids)}, invalid={invalid_pending[:10]}"
             )
 
-        self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
+        self._update_batch_status(
+            valid_pending_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY
+        )
 
         for local_idx in pending_local_indices:
             uuid = self._local_to_uuid_map[local_idx]

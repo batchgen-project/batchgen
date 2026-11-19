@@ -18,6 +18,7 @@ from batchgen.sequence import (
     SequenceBatch,
     configure_page_buffers,
 )
+from batchgen.worker.admission.plan import StatusEdge, Transition, TransitionPlan, apply_or_raise
 from batchgen.continuous_batching import (
     AdaptiveChunkSizer,
     EvictionStrategy,
@@ -26,6 +27,21 @@ from batchgen.continuous_batching import (
 
 
 # ============ Helper ============
+
+_EDGE_FOR = {
+    SequenceStatus.IN_PREFILL: StatusEdge.PREFILL,
+    SequenceStatus.PREFILLED: StatusEdge.PREFILL,
+    SequenceStatus.IN_DECODE: StatusEdge.DECODE_ENTRY,
+    SequenceStatus.ON_HOLD: StatusEdge.BOUNDARY,
+    SequenceStatus.EVICTED: StatusEdge.BOUNDARY,
+    SequenceStatus.COMPLETED: StatusEdge.COMPLETION,
+}
+
+
+def _move(batch, uuid, status):
+    """Move one sequence through ``SequenceBatch.apply``; a rejection raises."""
+    apply_or_raise(batch, TransitionPlan(_EDGE_FOR[status], (Transition(uuid, status),)))
+
 
 def make_seq(
     uuid: str = "test-uuid",
@@ -195,7 +211,7 @@ class TestSequenceBatchEvicted:
         batch = SequenceBatch()
         seq = make_seq(uuid="s1", status=SequenceStatus.IN_DECODE)
         batch.add_sequence(seq)
-        batch.update_status("s1", SequenceStatus.EVICTED)
+        _move(batch, "s1", SequenceStatus.EVICTED)
         assert batch.has_evicted()
 
     def test_all_completed_with_evicted(self):
@@ -205,15 +221,15 @@ class TestSequenceBatchEvicted:
         seq2 = make_seq(uuid="s2", global_idx=1, status=SequenceStatus.IN_DECODE)
         batch.add_sequence(seq1)
         batch.add_sequence(seq2)
-        batch.update_status("s1", SequenceStatus.COMPLETED)
-        batch.update_status("s2", SequenceStatus.EVICTED)
+        _move(batch, "s1", SequenceStatus.COMPLETED)
+        _move(batch, "s2", SequenceStatus.EVICTED)
         assert not batch.all_completed()
 
     def test_evicted_sequences_listed(self):
         batch = SequenceBatch()
         seq = make_seq(uuid="s1", status=SequenceStatus.IN_DECODE)
         batch.add_sequence(seq)
-        batch.update_status("s1", SequenceStatus.EVICTED)
+        _move(batch, "s1", SequenceStatus.EVICTED)
         evicted = batch.get_sequences_by_status(SequenceStatus.EVICTED)
         assert evicted == ["s1"]
 
@@ -435,7 +451,7 @@ class TestFullLifecycle:
         seq.gpu_pages_allocated = 0
         seq.host_pages_allocated = 0
         seq.host_token_capacity = 0
-        batch.update_status("s1", SequenceStatus.EVICTED)
+        _move(batch, "s1", SequenceStatus.EVICTED)
 
         assert batch.has_evicted()
         assert not batch.all_completed()
@@ -470,7 +486,7 @@ class TestFullLifecycle:
         seq.max_decode_length = remaining_decode
         # kv_token_budget stays unchanged
         seq.evicted_token_ids = None
-        batch.update_status("s1", SequenceStatus.IN_PREFILL)
+        _move(batch, "s1", SequenceStatus.IN_PREFILL)
 
         assert seq.prompt_length == 5512
         assert seq.max_decode_length == 32768 - 5000

@@ -22,6 +22,7 @@ import torch
 
 from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
+from batchgen.worker.admission.plan import StatusEdge, Transition, TransitionPlan, apply_or_raise
 from tests.worker.worker_fakes import (
     attach_identity,
     attach_prefix_state,
@@ -125,10 +126,25 @@ _TURN_ENTRY = {
 }
 
 
+_EDGE_FOR = {
+    SequenceStatus.IN_PREFILL: StatusEdge.PREFILL,
+    SequenceStatus.PREFILLED: StatusEdge.PREFILL,
+    SequenceStatus.IN_DECODE: StatusEdge.DECODE_ENTRY,
+    SequenceStatus.ON_HOLD: StatusEdge.BOUNDARY,
+    SequenceStatus.EVICTED: StatusEdge.BOUNDARY,
+    SequenceStatus.COMPLETED: StatusEdge.COMPLETION,
+}
+
+
+def _move(batch, uuid, status):
+    """Move one sequence through ``SequenceBatch.apply``; a rejection raises."""
+    apply_or_raise(batch, TransitionPlan(_EDGE_FOR[status], (Transition(uuid, status),)))
+
+
 def _complete(worker, uuid):
     for status in (SequenceStatus.IN_PREFILL, SequenceStatus.PREFILLED,
                    SequenceStatus.COMPLETED):
-        worker.global_batch.update_status(uuid, status)
+        _move(worker.global_batch, uuid, status)
 
 
 def test_admit_stores_the_identity_next_to_batch_id(caplog):
