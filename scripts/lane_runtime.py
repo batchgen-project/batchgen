@@ -31,6 +31,42 @@ _CACHE_DIRS = {
     "torchinductor": "torchinductor-cache",
     "cuda": "cuda-cache",
 }
+_MOUNTINFO_PATH = Path("/proc/self/mountinfo")
+# Filesystem types, as the kernel reports them in mountinfo, whose files are
+# resolved through a remote or cluster-wide handle. Such a handle can be
+# invalidated behind a running process (ESTALE), so a compile-cache file that
+# was written earlier can fail to load in the middle of serving.
+_NETWORK_FS_TYPES = frozenset(
+    {
+        "nfs",
+        "nfs4",
+        "ceph",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "lustre",
+        "gpfs",
+        "beegfs",
+        "glusterfs",
+        "9p",
+        "afs",
+        "coda",
+        "ncpfs",
+        "orangefs",
+        "pvfs2",
+        "panfs",
+        "wekafs",
+        "gfs",
+        "gfs2",
+        "ocfs2",
+    }
+)
+# A FUSE mount is served by a userspace daemon the kernel cannot classify, and
+# the common ones are network clients, so "fuse" and "fuse.<subtype>" are
+# refused unless the subtype is known to be backed by local storage.
+# Block-device FUSE mounts report "fuseblk" and are local.
+_LOCAL_FUSE_FS_TYPES = frozenset({"fuse.fuse-overlayfs"})
+_MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 _GIB = 1024**3
 # The shared weight and host-KV regions are memfds charged to host memory
 # (Shmem), not files under /dev/shm, so the reservation sizes shared host
@@ -461,6 +497,80 @@ def _check_gpus_free(gpu_uuids: Iterable[str]) -> None:
         raise LaneError(f"assigned GPU UUIDs have live compute processes: {conflicts}")
 
 
+def _read_mounts(mountinfo_path: Path) -> list[tuple[str, str]] | None:
+    """Return (mount point, filesystem type) pairs in mountinfo order.
+
+    None means the platform has no mountinfo, so mounts cannot be classified.
+    """
+    try:
+        text = mountinfo_path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LaneError(f"cannot read {mountinfo_path}: {exc}") from exc
+    mounts = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        # <id> <parent> <major>:<minor> <root> <mount point> <options>
+        # [optional fields...] - <filesystem type> <source> <super options>
+        head, separator, tail = line.partition(" - ")
+        head_fields = head.split()
+        tail_fields = tail.split()
+        if not separator or len(head_fields) < 6 or not tail_fields:
+            raise LaneError(f"malformed {mountinfo_path} entry: {line!r}")
+        mount_point = _MOUNTINFO_ESCAPE_RE.sub(
+            lambda match: chr(int(match.group(1), 8)), head_fields[4]
+        )
+        mounts.append((mount_point, tail_fields[0]))
+    return mounts
+
+
+def _mount_of(path: Path, mounts: Iterable[tuple[str, str]]) -> tuple[str, str]:
+    """Return the (mount point, filesystem type) that holds or will hold path.
+
+    Symlinks are resolved first, and a path that does not exist yet resolves
+    through its existing ancestors, so the answer is where the directory will
+    be created. The longest mount point that is a path prefix wins; among
+    mounts stacked on one mount point the last listed is the visible one.
+    """
+    resolved = os.path.realpath(path)
+    best: tuple[str, str] | None = None
+    for mount_point, fs_type in mounts:
+        prefix = mount_point.rstrip("/")
+        if resolved != prefix and not resolved.startswith(prefix + "/"):
+            continue
+        if best is None or len(mount_point) >= len(best[0]):
+            best = (mount_point, fs_type)
+    if best is None:
+        raise LaneError(f"no mount contains {resolved}")
+    return best
+
+
+def _is_network_fs(fs_type: str) -> bool:
+    if fs_type == "fuse" or fs_type.startswith("fuse."):
+        return fs_type not in _LOCAL_FUSE_FS_TYPES
+    return fs_type in _NETWORK_FS_TYPES
+
+
+def _check_cache_dirs_local(lane_root: Path, mountinfo_path: Path) -> None:
+    """Refuse a lane whose compile caches would live on a network filesystem."""
+    mounts = _read_mounts(mountinfo_path)
+    if mounts is None:
+        return
+    for dirname in _CACHE_DIRS.values():
+        cache_dir = lane_root / dirname
+        mount_point, fs_type = _mount_of(cache_dir, mounts)
+        if _is_network_fs(fs_type):
+            raise LaneError(
+                f"lane cache directory {os.path.realpath(cache_dir)} is on a "
+                f"{fs_type} filesystem (mounted at {mount_point}); compile-cache "
+                "files on a network or distributed filesystem can fail with a "
+                "stale file handle while serving. Put --lane-root on a local "
+                "filesystem, or mount local storage at that directory."
+            )
+
+
 def _canonical_paths(lane_root: Path, converted: Path) -> dict[str, str]:
     paths = {
         "storage": str((lane_root / "storage").resolve()),
@@ -476,10 +586,13 @@ def _prepare_paths(
     lane_root: Path,
     worktree: Path,
     converted: Path,
+    *,
+    mountinfo_path: Path = _MOUNTINFO_PATH,
 ) -> tuple[Path, dict[str, str], Path]:
     worktree = worktree.resolve(strict=True)
     if _paths_overlap(str(lane_root.resolve()), str(worktree)):
         raise LaneError("lane root overlaps worktree")
+    _check_cache_dirs_local(lane_root, mountinfo_path)
     lane_root = _ensure_private_dir(lane_root)
     converted = converted.resolve()
     if not converted.is_relative_to(lane_root):
