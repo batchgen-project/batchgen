@@ -29,6 +29,22 @@ directories. The lane root must be disjoint from the worktree and every active
 lane root, including their logs and `pyroot` directories. Checkpoints may be
 shared read-only; runtime writable paths are lane-isolated.
 
+A lane's compile caches must live on a local filesystem. The temporary,
+torch-extension, Triton, TorchInductor, and CUDA cache directories are fixed
+subdirectories of the lane root (`tmp`, `torch-extensions`, `triton-cache`,
+`torchinductor-cache`, `cuda-cache`), and the server reads them back while
+serving. On a network or distributed filesystem such a read can fail with a
+stale file handle and take the lane down mid-run. Before it creates anything,
+`start` resolves the mount that will hold each of those directories from
+`/proc/self/mountinfo` (after resolving symlinks, so a bind mount or a link
+into shared storage is classified by what backs it) and refuses `nfs`/`nfs4`,
+`ceph`, `cifs`/`smb3`, `lustre`, `gpfs`, `beegfs`, other cluster filesystems,
+and FUSE mounts, which are served by a userspace daemon that is usually a
+network client. Local block filesystems, `overlay`, and `tmpfs` are accepted.
+In practice, put `--lane-root` on local disk. Logs, storage, and the converted
+checkpoint are not subject to the rule, so a lane root on shared storage is
+admitted only when local storage is mounted at every cache directory.
+
 ```bash
 python scripts/lane_runtime.py start \
   --instance-id lane-0 \
