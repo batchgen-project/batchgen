@@ -321,6 +321,16 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
+from batchgen.worker.admission.plan import (
+	StatusEdge,
+	Transition,
+	TransitionPlan,
+	apply_or_raise,
+)
+from batchgen.models.wrappers.phase_state import (
+	claim_process_phase_state,
+	release_process_phase_state,
+)
 # The page-buffer sizes are module globals that configure_page_buffers()
 # rebinds at worker init; read them through the module at use time, never
 # import them by value (that binds the import-time defaults).
@@ -1010,6 +1020,10 @@ class BatchGenWorker:
 
 	def __init__(self, args: BatchGenWorkerArgs):
 		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		# One worker per process: the model wrappers' phase state is process
+		# wide. Claimed before any configuration, GPU or shared-memory work so
+		# a second worker fails here without side effects.
+		claim_process_phase_state(self)
 
 		# Configure page buffer settings from args (must be done before using the globals)
 		configure_page_buffers(
@@ -4415,23 +4429,26 @@ class BatchGenWorker:
 	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
 		return IndexManager.get_local_indices_for_uuids(self._make_index_lookup_req(), uuids)
 
-	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus):
-		"""Update status for sequences, skipping if already in target status."""
+	def _update_batch_status(
+		self, uuids: List[str], new_status: SequenceStatus, edge: StatusEdge
+	):
+		"""Update status for sequences, skipping if already in target status.
+
+		Missing sequences and rejected transitions are logged and skipped;
+		``SequenceBatch.plan_transitions`` drops the redundant and completed
+		ones.
+		"""
 		if isinstance(uuids, str):
 			uuids = [uuids]
-		for uuid in uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch")
-				continue
-			if seq.status == new_status:
-				continue  # Skip redundant transition
-			if seq.status == SequenceStatus.COMPLETED:
-				continue  # Don't change completed sequences
-			try:
-				self.global_batch.update_status(uuid, new_status)
-			except ValueError as e:
-				logging.warning(f"Rank {self.rank}: Invalid status transition for {uuid}: {e}")
+		transitions, missing = self.global_batch.plan_transitions(uuids, new_status)
+		for uuid in missing:
+			logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch")
+		rejected = self.global_batch.apply(TransitionPlan(edge, transitions))
+		for rejection in rejected:
+			logging.warning(
+				f"Rank {self.rank}: Invalid status transition for "
+				f"{rejection.transition.uuid}: {rejection.reason}"
+			)
 
 	def _sync_sequence_metadata(self, decode_uuids: List[str]) -> None:
 		"""
@@ -5989,7 +6006,9 @@ class BatchGenWorker:
 				seq.evicted_from_dp_group = None
 				self._sequences_with_gpu_kv.discard(uuid)
 
-		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+		self._update_batch_status(
+			completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
+		)
 
 		# Runs LAST: _report_completion pops the local-index map and frees the
 		# buffer-pool slot.
@@ -6674,7 +6693,7 @@ class BatchGenWorker:
 						is_reentry = seq.evicted_token_ids is not None
 						seq.log_event(SeqEvent.PREFILL_START, self.rank,
 							f"evicted_reentry={is_reentry}")
-					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
+					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL, StatusEdge.PREFILL)
 
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
 					config_start = time.perf_counter()
@@ -6858,7 +6877,7 @@ class BatchGenWorker:
 						seq = self.global_batch.get_sequence(uuid)
 						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
 							f"decoded_len={seq.decoded_length}")
-					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED, StatusEdge.PREFILL)
 					pool_rank_ready_s = (
 						time.perf_counter() - pool_wave_start
 						if pool_wave_start is not None else None
@@ -7060,7 +7079,7 @@ class BatchGenWorker:
 				)
 				self._bind_decode_attention_metadata_for_graph_config(local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
-				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY)
 				self._sync_sequence_metadata(decode_uuids)
 
 				# Model-owned decode prewarm/capture against the live GPU KV
@@ -11255,7 +11274,9 @@ class BatchGenWorker:
 		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
-			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+			self._update_batch_status(
+				completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
+			)
 			# Gather decoded tokens from owning ranks before reporting
 			gathered_texts = self._gather_completed_tokens(completed_uuids)
 
@@ -11439,7 +11460,15 @@ class BatchGenWorker:
 				# for G==1 (the field is always None on the validated pure-DP path).
 				from batchgen.decode_dp_group import evict_from_decode_dp_group
 				evict_from_decode_dp_group(seq)
-				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
+			# None of the per-sequence steps above reads a status, so the
+			# transitions apply together, in loop order, after them.
+			apply_or_raise(self.global_batch, TransitionPlan(
+				StatusEdge.BOUNDARY,
+				tuple(
+					Transition(uuid, SequenceStatus.EVICTED)
+					for uuid in host_evicted_uuids
+				),
+			))
 
 			evicted_set = set(host_evicted_uuids)
 			decode_uuids = [u for u in decode_uuids if u not in evicted_set]
@@ -11601,7 +11630,13 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=boundary")
-				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			apply_or_raise(self.global_batch, TransitionPlan(
+				StatusEdge.BOUNDARY,
+				tuple(
+					Transition(uuid, SequenceStatus.ON_HOLD)
+					for uuid in onhold_uuids
+				),
+			))
 
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
 			batch = self._get_local_indices_for_uuids(decode_uuids)
@@ -11688,7 +11723,13 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
-				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			apply_or_raise(self.global_batch, TransitionPlan(
+				StatusEdge.BOUNDARY,
+				tuple(
+					Transition(uuid, SequenceStatus.ON_HOLD)
+					for uuid in remaining_needing_ext
+				),
+			))
 
 			decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
 			batch = self._get_local_indices_for_uuids(decode_uuids)
@@ -13323,7 +13364,9 @@ class BatchGenWorker:
 				)
 				
 				if completed_uuids:
-					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					self._update_batch_status(
+						completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
+					)
 					# Gather decoded tokens from owning ranks before reporting
 					gathered_texts = self._gather_completed_tokens(completed_uuids)
 					# ORDERING FIX: release GPU/host KV BEFORE _report_completion

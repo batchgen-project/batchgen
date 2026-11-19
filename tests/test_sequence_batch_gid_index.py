@@ -11,6 +11,21 @@ including gid reuse after a removal and the uuid-collision path.
 import random
 
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
+from batchgen.worker.admission.plan import StatusEdge, Transition, TransitionPlan, apply_or_raise
+
+_EDGE_FOR = {
+    SequenceStatus.IN_PREFILL: StatusEdge.PREFILL,
+    SequenceStatus.PREFILLED: StatusEdge.PREFILL,
+    SequenceStatus.IN_DECODE: StatusEdge.DECODE_ENTRY,
+    SequenceStatus.ON_HOLD: StatusEdge.BOUNDARY,
+    SequenceStatus.EVICTED: StatusEdge.BOUNDARY,
+    SequenceStatus.COMPLETED: StatusEdge.COMPLETION,
+}
+
+
+def _move(batch, uuid, status):
+    """Move one sequence through ``SequenceBatch.apply``; a rejection raises."""
+    apply_or_raise(batch, TransitionPlan(_EDGE_FOR[status], (Transition(uuid, status),)))
 
 
 def _entry(uuid, global_idx, prompt_length=4, max_decode_length=8):
@@ -126,7 +141,7 @@ def test_status_and_rank_updates_do_not_disturb_the_gid_index():
     seq = _entry("a", 9)
     batch.add_sequence(seq)
     batch.assign_rank("a", 3)
-    batch.update_status("a", SequenceStatus.IN_PREFILL)
+    _move(batch, "a", SequenceStatus.IN_PREFILL)
 
     assert batch.get_sequence_by_global_idx(9) is seq
     _assert_index_matches_rebuild(batch)

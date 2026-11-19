@@ -443,6 +443,7 @@ PINS = {
             "public_methods": [
                 "add_sequence",
                 "all_completed",
+                "apply",
                 "assign_rank",
                 "composition_epoch",
                 "count_by_status",
@@ -465,9 +466,9 @@ PINS = {
                 "has_prefilled",
                 "has_queueing",
                 "has_resumable",
+                "plan_transitions",
                 "remove_sequence",
                 "reset_gpu_allocations_for_sequences",
-                "update_status",
             ],
             "methods": {
                 "composition_epoch": {
@@ -490,9 +491,15 @@ PINS = {
                     "params": ["self", "global_idx"],
                     "returns": "Optional[SequenceEntry]",
                 },
-                "update_status": {
-                    "params": ["self", "uuid", "new_status"],
-                    "returns": "None",
+                # Status changes only through apply(plan); plan_transitions
+                # builds the transitions for a "move these uuids to X" decision.
+                "plan_transitions": {
+                    "params": ["self", "uuids", "to"],
+                    "returns": "Tuple[Tuple[Transition, ...], Tuple[str, ...]]",
+                },
+                "apply": {
+                    "params": ["self", "plan"],
+                    "returns": "Tuple[RejectedTransition, ...]",
                 },
                 "assign_rank": {
                     "params": ["self", "uuid", "rank"],
@@ -712,6 +719,35 @@ PINS = {
                     "returns": "bool",
                 },
             },
+        },
+        "Transition": {
+            "kind": "class",
+            "bases": [],
+            "fields": ["uuid", "to"],
+            "members": {},
+            "public_methods": [],
+            "methods": {},
+        },
+        "TransitionPlan": {
+            "kind": "class",
+            "bases": [],
+            "fields": ["edge", "transitions", "payload"],
+            "members": {},
+            "public_methods": ["advances"],
+            "methods": {
+                "advances": {
+                    "params": ["self"],
+                    "returns": "bool",
+                },
+            },
+        },
+        "RejectedTransition": {
+            "kind": "class",
+            "bases": [],
+            "fields": ["transition", "reason"],
+            "members": {},
+            "public_methods": [],
+            "methods": {},
         },
         "SequenceStatus": {
             "kind": "class",
