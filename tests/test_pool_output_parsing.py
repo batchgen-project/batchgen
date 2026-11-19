@@ -343,21 +343,54 @@ def test_every_registered_tool_call_parser_has_a_case(registered_tokenizers):
 
 
 FAMILIES = sorted(TOOL_CALL_CASES)
-# The DeepSeek-V4 DSML parser returns calls without the ``id`` that the
-# parse_tool_calls contract (BaseTokenizer) requires, so _parse_output raises
-# KeyError on a well-formed call. Strict: the case fails once that is fixed.
-_DSV4_CALL_WITHOUT_ID = pytest.mark.xfail(
-    raises=KeyError, strict=True,
-    reason="DeepSeek-V4 DSML tool calls carry no 'id'",
-)
-FAMILIES_WITH_A_COMPLETE_CALL = [
-    pytest.param(family, marks=_DSV4_CALL_WITHOUT_ID)
-    if family == "deepseek_v4" else family
-    for family in FAMILIES
-]
 
 
-@pytest.mark.parametrize("family", FAMILIES_WITH_A_COMPLETE_CALL)
+@pytest.mark.parametrize("family", FAMILIES)
+def test_every_parser_returns_calls_in_the_contract_shape(
+    family, registered_tokenizers,
+):
+    """``BaseTokenizer.parse_tool_calls``: each call is
+    ``{id, type, function: {name, arguments}}``; the server reads every key."""
+    case = TOOL_CALL_CASES[family]
+    tokenizer = _parser_only(registered_tokenizers[family], case)
+
+    calls, _ = tokenizer.parse_tool_calls(case["complete"])
+
+    assert calls, f"{family}: a well-formed call was not parsed"
+    for call in calls:
+        assert isinstance(call["id"], str) and call["id"], family
+        assert call["type"] == "function", family
+        assert call["function"]["name"] == "get_weather", family
+        assert isinstance(call["function"]["arguments"], str), family
+        assert json.loads(call["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_deepseek_v4_calls_in_one_response_get_distinct_ids(
+    registered_tokenizers,
+):
+    case = TOOL_CALL_CASES["deepseek_v4"]
+    tokenizer = _parser_only(registered_tokenizers["deepseek_v4"], case)
+    text = (
+        "\n\n<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="get_weather">\n'
+        '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        '<｜DSML｜invoke name="get_weather">\n'
+        '<｜DSML｜parameter name="city" string="true">Rome</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+
+    calls, content = tokenizer.parse_tool_calls(text)
+
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [
+        {"city": "Paris"}, {"city": "Rome"},
+    ]
+    ids = [call["id"] for call in calls]
+    assert all(ids) and len(set(ids)) == len(ids)
+    assert content == ""
+
+
+@pytest.mark.parametrize("family", FAMILIES)
 def test_a_stopped_generation_with_a_tool_call_reports_tool_calls(
     family, registered_tokenizers, tmp_path,
 ):
@@ -371,6 +404,7 @@ def test_a_stopped_generation_with_a_tool_call_reports_tool_calls(
     calls = choice["message"]["tool_calls"]
     assert [call["function"]["name"] for call in calls] == ["get_weather"]
     assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+    assert calls[0]["id"]
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -389,7 +423,7 @@ def test_a_truncated_tool_call_stays_content_and_reports_length(
 
 
 @pytest.mark.parametrize("finish_reason", ["length", "repetition"])
-@pytest.mark.parametrize("family", FAMILIES_WITH_A_COMPLETE_CALL)
+@pytest.mark.parametrize("family", FAMILIES)
 def test_a_parsed_call_keeps_a_truncation_or_repetition_reason(
     family, finish_reason, registered_tokenizers, tmp_path,
 ):
