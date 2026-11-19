@@ -190,7 +190,7 @@ def _run_ledger(label="after_configure_decoding"):
         ),
         gpu_paged_kv_cache_manager=SimpleNamespace(pool_is_mapped=True),
     )
-    # A real TrajectoryStore with the production-equivalent KDA loader.
+    # A real TrajectoryStore with the owner the Kimi-Linear PSM declares.
     attach_trajectory_state(worker)
     MethodType(function, worker)(label)
     assert len(recorder.lines) == 1

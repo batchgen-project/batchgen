@@ -6,11 +6,15 @@ state; orchestration, collectives, allocator transactions and identity
 resolution deliberately remain on ``BatchGenWorker``.  In particular this
 module never resolves worker-owned identities.
 
-The KDA state wrapper is model-owned, so this module never imports a model
-package: the worker injects ``kda_wrapper_loader`` and every call site resolves
-it lazily inside the same ``ImportError`` handling as before (an absent model
-package is still a no-op or a raise exactly where it was).  The trajectory
-modules are imported inside the builders, matching the old lazy timing.
+The per-sequence recurrent (KDA) state is model-owned, so this module never
+imports a model package: the worker injects ``recurrent_state_owner``, a
+callable returning the owner the served model declares through its parallel
+strategy manager, or ``None`` for a model that keeps no such state.  The owner
+exposes ``state_manager`` and ``slot_manager`` (both ``None`` until the pools
+exist) and ``free_sequences(ids)``; every call site resolves it lazily, so a
+model without the state is a no-op or a raise exactly where it was.  The
+trajectory modules are imported inside the builders, matching the old lazy
+timing.
 """
 
 from __future__ import annotations
@@ -27,8 +31,8 @@ class TrajectoryStore:
     coordinator release stay separate and are ordered by the worker.
     """
 
-    def __init__(self, kda_wrapper_loader: Optional[Callable[[], Any]] = None) -> None:
-        self._kda_wrapper_loader = kda_wrapper_loader
+    def __init__(self, recurrent_state_owner: Optional[Callable[[], Any]] = None) -> None:
+        self._recurrent_state_owner = recurrent_state_owner
         # The spelling mirrors the old worker fields, minus the leading
         # underscore.  ``None`` is the eager sentinel required by S1.
         self.trajectory_book = None
@@ -97,42 +101,40 @@ class TrajectoryStore:
     def reservation_free_count(self, model_context_length: int) -> int:
         return self.trajectory_book.reservation_free_count(model_context_length)
 
-    # ------------------------------- optional KDA imports -----------------
+    # ------------------------------- optional KDA state -------------------
 
-    def _load_kda_wrapper(self):
-        """Resolve the injected KDA wrapper; ``ImportError`` when absent."""
-        if self._kda_wrapper_loader is None:
-            raise ImportError("no KDA wrapper loader was injected")
-        return self._kda_wrapper_loader()
+    def _state_owner(self):
+        """The model's recurrent-state owner, or ``None`` when it keeps none."""
+        if self._recurrent_state_owner is None:
+            return None
+        return self._recurrent_state_owner()
+
+    def _owner_state_manager(self):
+        """The owner's state manager as it is now, pools built or not."""
+        owner = self._state_owner()
+        return None if owner is None else owner.state_manager
 
     def kda_state_manager(self):
         """Return the optional KDA state manager, or ``None`` when absent."""
-        try:
-            kda_wrapper = self._load_kda_wrapper()
-        except ImportError:
+        owner = self._state_owner()
+        if owner is None or owner.slot_manager is None:
             return None
-        if kda_wrapper.slot_manager is None:
-            return None
-        return kda_wrapper.state_manager
+        return owner.state_manager
 
     def free_kda_sequences(self, global_sequence_ids: Iterable[int]) -> None:
-        """Free KDA slots while preserving the old ImportError no-op."""
+        """Free KDA slots; a no-op for a model that keeps no such state."""
         ids = list(global_sequence_ids)
         if not ids:
             return
-        try:
-            kda_wrapper = self._load_kda_wrapper()
-            if kda_wrapper.slot_manager is not None:
-                kda_wrapper.free_sequences(ids)
-        except ImportError:
-            pass
+        owner = self._state_owner()
+        if owner is not None and owner.slot_manager is not None:
+            owner.free_sequences(ids)
 
     def kda_stats(self) -> tuple[int, int]:
         """Return ``(configured_slots, live_slots)`` for memory diagnostics."""
         kda_slots = kda_live = -1
         try:
-            kda_wrapper = self._load_kda_wrapper()
-            manager = kda_wrapper.state_manager
+            manager = self._owner_state_manager()
             if manager is not None:
                 # The pools are deliberately kept across a rebuild, so their
                 # slot count must stay FLAT; a growing one would mean the
@@ -188,7 +190,6 @@ class TrajectoryStore:
         """Lazily build the frontier committer, including its optional imports."""
         if self.trajectory_frontier_committer is not None:
             return self.trajectory_frontier_committer
-        kda_wrapper = self._load_kda_wrapper()
         from batchgen.prefix_reuse.trajectory_commit import (
             HostKVSnapshotArenaAllocator,
             KDAStateSnapshotReader,
@@ -197,7 +198,7 @@ class TrajectoryStore:
             profile_from_kda_state_config,
         )
 
-        manager = kda_wrapper.state_manager
+        manager = self._owner_state_manager()
         if manager is None:
             raise TrajectoryStateUnavailable(
                 "prefix_trajectory_commit needs a live KDA state pool; this "
@@ -220,7 +221,7 @@ class TrajectoryStore:
                 next_pseudo_sid=next_pseudo_sid,
             ),
             snapshot_reader=KDAStateSnapshotReader(
-                state_manager_provider=lambda: kda_wrapper.state_manager,
+                state_manager_provider=self._owner_state_manager,
                 profile=profile_from_kda_state_config(manager.config),
             ),
         )
@@ -238,7 +239,6 @@ class TrajectoryStore:
             return None
         if self.trajectory_restorer is not None:
             return self.trajectory_restorer
-        kda_wrapper = self._load_kda_wrapper()
         from batchgen.prefix_reuse.trajectory_restore import (
             HostKVSnapshotArenaReader,
             KDAStateSnapshotWriter,
@@ -254,7 +254,7 @@ class TrajectoryStore:
                 next_pseudo_sid=next_pseudo_sid,
             ),
             state_writer=KDAStateSnapshotWriter(
-                state_manager_provider=lambda: kda_wrapper.state_manager,
+                state_manager_provider=self._owner_state_manager,
                 profile=committer.layout.profile,
             ),
             attention_group_size=committer.shard_count,
