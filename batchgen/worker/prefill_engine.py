@@ -308,14 +308,35 @@ class PrefillEngine:
         return self._prefix.next_pool_segment_sid()
 
     def _prefix_rank_packing_mode(self, worker, seqs) -> bool:
-        """True when this batch asked for the predicted-time wave packer."""
+        """True when this batch runs the predicted-time wave packer.
+
+        The packer is the default assignment for a pool-served wave: it is the
+        arm that gives a prefix family one group's pool and balances the groups
+        by predicted prefill seconds, so leaving it off by default would make
+        every ordinary wave pay for a straggler the scheduler can see coming.
+        A batch asks for the arrival-order assignment back with
+        ``batchgen_debug.prefix_rank_assignment_mode: "global_idx"``, which is
+        what the A/B arms use.
+
+        Only the two spellings are accepted; a mistyped value is refused rather
+        than read as the other arm, because a silently ignored switch would
+        make the two arms the same run.
+        """
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
         active_debug = getattr(self, "_active_batchgen_debug_for_sequences", None)
         debug = (active_debug(seqs) if active_debug is not None else None) or {}
-        return debug.get("prefix_rank_assignment_mode") == "packing_v2"
+        mode = debug.get("prefix_rank_assignment_mode")
+        if mode is None:
+            return True
+        if mode not in ("packing_v2", "global_idx"):
+            raise ValueError(
+                "batchgen_debug.prefix_rank_assignment_mode must be "
+                f"'packing_v2' or 'global_idx', got {mode!r}"
+            )
+        return mode == "packing_v2"
 
     def _prefix_rank_cost_profile_disabled(self, worker, seqs) -> bool:
         """``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
