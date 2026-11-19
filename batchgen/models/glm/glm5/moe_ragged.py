@@ -295,6 +295,38 @@ def act_quant_ragged(
     )
 
 
+def silu_mul_quant_ragged(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    output: torch.Tensor,
+    scale_rows: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """One-pass SiLU*up + FP8 group quant over the live ragged rows.
+
+    The fused sibling of the (silu, mul_, :func:`act_quant_ragged`) chain of
+    the m-grouped prefill path: one kernel reads gate and up once and writes
+    the fp8 activations plus ROW-MAJOR ``[m, I // 128]`` scales, which the
+    contiguous DeepGEMM API takes as SFA directly (no transpose shim). The
+    Triton import is deferred like the CUDA ops module above, so importing
+    this module stays triton-free.
+    """
+    from batchgen_kernels.triton.moe_masked_act_quant import (
+        silu_mul_ragged_group_quant,
+    )
+
+    silu_mul_ragged_group_quant(
+        gate,
+        up,
+        output,
+        scale_rows,
+        seqlens,
+        cu_seqlens,
+        group_size=QUANT_BLOCK,
+    )
+
+
 def deepep_ll_scale_repack(
     recv_scales: torch.Tensor,
     recv_count: torch.Tensor,
