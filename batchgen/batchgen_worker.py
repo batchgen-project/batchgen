@@ -329,6 +329,11 @@ from batchgen.worker.admission.plan import (
 	TransitionPlan,
 	apply_or_raise,
 )
+from batchgen.worker.admission.context import (
+	DecodePhaseContext,
+	RankFacts,
+	SchedulingState,
+)
 from batchgen.models.wrappers.phase_state import (
 	claim_process_phase_state,
 	release_process_phase_state,
@@ -2053,6 +2058,36 @@ class BatchGenWorker:
 		pm = getattr(self, "parallel_manager", None)
 		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
 
+	def _decode_phase_context(self) -> DecodePhaseContext:
+		return DecodePhaseContext(
+			facts=RankFacts(
+				rank=self.rank,
+				world_size=self.world_size,
+				local_rank=self.local_rank,
+				local_world_size=self.local_world_size,
+				rank_ctx=self.rank_ctx,
+				attn_tp_size=self._decode_attn_tp_size(),
+				device=self.torch_device,
+				page_size=self.PAGE_SIZE,
+				decision_interval=self.DECISION_INTERVAL,
+				enable_prefix_cache=self.enable_prefix_cache,
+				enable_host_kv_eviction=self.enable_host_kv_eviction,
+				host_kv_chunk_size=self.host_kv_chunk_size,
+			),
+			sched=SchedulingState(
+				pool=self.global_batch,
+				seq_table=self.seq_table,
+				trajectories=self._traj,
+			),
+			gpu_kv=self.gpu_paged_kv_cache_manager,
+			host_view=getattr(self, "host_paged_kv_worker_view", None),
+			core_engine=getattr(self, "core_engine", None),
+			gpu_resident=getattr(self, "_sequences_with_gpu_kv", None),
+			prefix_coordinator=getattr(self, "prefix_cache_coordinator", None),
+			prefix_runtime=getattr(self, "prefix_cache_runtime_config", None),
+			chunk_sizer=getattr(self, "adaptive_chunk_sizer", None),
+		)
+
 	def _owns_local_sequence(self, seq) -> bool:
 		"""Delegate: which ranks bind a sequence into the LOCAL table.
 
@@ -3553,7 +3588,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._collective_gpu_kv_allocation_preflight(
-			self,
+			self._decode_phase_context(),
 			required_pages,
 			free_pages,
 		)
@@ -3585,7 +3620,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._extend_gpu_kv_allocation(
-			self,
+			self._decode_phase_context(),
 			uuids,
 		)
 
@@ -3931,7 +3966,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._shared_page_identity_sources(
-			self,
+			self._decode_phase_context(),
 			manager,
 		)
 
@@ -3948,7 +3983,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._host_identity_page_keys(
-			self,
+			self._decode_phase_context(),
 			manager,
 			global_sequence_ids,
 			sequence_tokens,
@@ -3969,7 +4004,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._pool_host_identity_page_keys(
-			self,
+			self._decode_phase_context(),
 			pool_name,
 			pool_manager,
 			worker_view,
@@ -3992,7 +4027,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._assert_private_writable_page_keys(
-			self,
+			self._decode_phase_context(),
 			pool_name,
 			pool_manager,
 			global_sequence_ids,
@@ -4094,7 +4129,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._prepare_dual_kv_load_pointers(
-			self,
+			self._decode_phase_context(),
 			gpu_manager,
 			new_global_ids,
 			existing_global_ids,
@@ -4108,7 +4143,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._launch_dual_host_kv_load(
-			self,
+			self._decode_phase_context(),
 			pointers,
 		)
 
@@ -4144,7 +4179,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._release_gpu_kv_pages(
-			self,
+			self._decode_phase_context(),
 			local_sequence_ids,
 		)
 
@@ -4168,7 +4203,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._release_kda_state_slots(
-			self,
+			self._decode_phase_context(),
 			global_sequence_ids,
 		)
 
@@ -4289,7 +4324,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._gather_host_kv_stats_by_node(
-			self,
+			self._decode_phase_context(),
 			worker_view,
 		)
 
@@ -4712,7 +4747,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._get_effective_chunk_size(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
@@ -5164,7 +5199,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._collective_host_kv_growth_capacity_ok(
-			self,
+			self._decode_phase_context(),
 			host_grow_requests,
 			worker_view,
 		)
@@ -5591,7 +5626,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._snapshot_decode_capacity(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _prepare_decode_batch(self) -> List[str]:
@@ -8926,7 +8961,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._host_views_by_group(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _prefix_host_resource_fields(self) -> dict[str, int]:
@@ -10901,7 +10936,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._make_boundary_decision_request(
-			self,
+			self._decode_phase_context(),
 			decode_uuids,
 			global_seq_state,
 			global_candidate_info,
@@ -10909,6 +10944,7 @@ class BatchGenWorker:
 			per_rank_total,
 			chunk_size,
 			per_node_host_stats,
+			getattr(self, "_decode_padding_bsz", 0) or 0,
 		)
 
 	def _compute_boundary_decisions(
