@@ -2073,6 +2073,7 @@ class BatchGenWorker:
 				enable_prefix_cache=self.enable_prefix_cache,
 				enable_host_kv_eviction=self.enable_host_kv_eviction,
 				host_kv_chunk_size=self.host_kv_chunk_size,
+				prefix_cache_debug_stats=self.prefix_cache_debug_stats,
 			),
 			sched=SchedulingState(
 				pool=self.global_batch,
@@ -2086,6 +2087,7 @@ class BatchGenWorker:
 			prefix_coordinator=getattr(self, "prefix_cache_coordinator", None),
 			prefix_runtime=getattr(self, "prefix_cache_runtime_config", None),
 			chunk_sizer=getattr(self, "adaptive_chunk_sizer", None),
+			parallel_manager=getattr(self, "parallel_manager", None),
 		)
 
 	def _owns_local_sequence(self, seq) -> bool:
@@ -8948,7 +8950,7 @@ class BatchGenWorker:
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._emit_prefix_cache_metric(
-			self,
+			self._decode_phase_context(),
 			phase,
 			**fields,
 		)
@@ -8972,7 +8974,7 @@ class BatchGenWorker:
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._prefix_host_resource_fields(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _maybe_emit_prefix_drain_metric(self) -> None:
@@ -12340,11 +12342,22 @@ class BatchGenWorker:
 			from batchgen.worker.rank_sync_engine import RankSyncEngine
 			engine = RankSyncEngine()
 			self._rank_sync_engine = engine
-		return engine._sync_decode_moe_rank_counts(
-			self,
+		outcome = engine._sync_decode_moe_rank_counts(
+			self._decode_phase_context(),
 			batch,
 			reason=reason,
+			decode_local_count_tensor=self._decode_local_count_tensor,
+			decode_all_rank_counts=self._decode_all_rank_counts,
+			previous_max=int(
+				getattr(self, "_current_decode_max_rank_batch_size", 0) or 0
+			),
 		)
+		self._decode_local_count_tensor = outcome.local_count_tensor
+		self._decode_all_rank_counts = outcome.all_rank_counts
+		self._current_decode_local_batch_size = outcome.current_local_batch_size
+		self._current_decode_max_rank_batch_size = outcome.max_batch_size
+		self._current_decode_rank_token_counts = outcome.rank_token_counts
+		return outcome.max_batch_size
 
 	def _sync_prefill_moe_rank_counts(
 		self, local_token_count: int, *, reason: str
@@ -13472,12 +13485,21 @@ class BatchGenWorker:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._wait_pending_kv_append_tasks(
-			self,
+		deferred_errors = getattr(
+			self, "_deferred_kv_append_wait_errors", None
+		)
+		outcome = engine._wait_pending_kv_append_tasks(
+			self._decode_phase_context(),
 			sync_distributed_errors=sync_distributed_errors,
 			defer_errors=defer_errors,
 			device_sync=device_sync,
+			pending_tasks=getattr(self, "_pending_kv_append_tasks", None),
+			pending_tensors=getattr(self, "_pending_kv_append_tensors", None),
+			deferred_errors=deferred_errors,
 		)
+		if outcome.new_deferred_errors is not None and deferred_errors is None:
+			self._deferred_kv_append_wait_errors = list(outcome.new_deferred_errors)
+		return outcome.num_tasks
 
 	def _rebuild_page_table_for_batch(
 		self,

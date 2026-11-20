@@ -31,6 +31,7 @@ from batchgen.worker.sync import (
     SyncCoordinator,
     TorchDistCollectiveBackend,
 )
+from batchgen.worker.admission.context import DecodePhaseContext, MoeCountsOutcome
 
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
@@ -671,39 +672,43 @@ class RankSyncEngine:
 
     # ---- Rank agreement on per-step MoE token counts -----------------------
 
-    def _sync_decode_moe_rank_counts(self, worker, batch: List[int], *, reason: str) -> int:
+    def _sync_decode_moe_rank_counts(
+        self,
+        ctx: DecodePhaseContext,
+        batch: List[int],
+        *,
+        reason: str,
+        decode_local_count_tensor,
+        decode_all_rank_counts,
+        previous_max: int,
+    ) -> MoeCountsOutcome:
         """Synchronize per-rank decode row counts for 3D MoE padding masks."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         local_count = int(len(batch))
-        if self._decode_local_count_tensor is None:
-            self._decode_local_count_tensor = torch.empty(
-                (1,), dtype=torch.int64, device=self.torch_device
+        if decode_local_count_tensor is None:
+            decode_local_count_tensor = torch.empty(
+                (1,), dtype=torch.int64, device=ctx.facts.device
             )
         if (
-            self._decode_all_rank_counts is None
-            or self._decode_all_rank_counts.shape[0] != self.world_size
+            decode_all_rank_counts is None
+            or decode_all_rank_counts.shape[0] != ctx.facts.world_size
         ):
-            self._decode_all_rank_counts = torch.empty(
-                (self.world_size,), dtype=torch.int64, device=self.torch_device
+            decode_all_rank_counts = torch.empty(
+                (ctx.facts.world_size,), dtype=torch.int64, device=ctx.facts.device
             )
-        local_count_tensor = self._decode_local_count_tensor
-        all_rank_counts = self._decode_all_rank_counts
+        local_count_tensor = decode_local_count_tensor
+        all_rank_counts = decode_all_rank_counts
         local_count_tensor.fill_(local_count)
         dist.all_gather_into_tensor(all_rank_counts, local_count_tensor)
         max_batch_size = int(all_rank_counts.max().item())
         # The max this sync replaces: its unit is the one the phase ran at
         # until now, so a changed unit is reported once, here, not per step.
-        previous_max_batch_size = int(
-            getattr(self, "_current_decode_max_rank_batch_size", 0) or 0
-        )
+        previous_max_batch_size = previous_max
 
-        self._current_decode_local_batch_size = local_count
-        self._current_decode_max_rank_batch_size = max_batch_size
-        self._current_decode_rank_token_counts = all_rank_counts
+        current_local_batch_size = local_count
+        current_max_batch_size = max_batch_size
+        rank_token_counts = all_rank_counts
 
-        if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+        if max_batch_size > 0 and ctx.parallel_manager is not None:
             # M2b: under DP-(world/G) x TP-G decode the 32-way max above is the
             # per-GROUP batch B_grp (the G ranks of a group hold identical
             # sequences). Decode scatters those rows across the group's G ranks
@@ -716,16 +721,16 @@ class RankSyncEngine:
                 format_decode_groups_line,
                 moe_ntp_from_group_max,
             )
-            _G = getattr(self.parallel_manager, "attn_tp_size", 1)
+            _G = getattr(ctx.parallel_manager, "attn_tp_size", 1)
             moe_ntp = moe_ntp_from_group_max(max_batch_size, _G)
-            if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-                self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
-            if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-                self.parallel_manager.set_rank_token_counts(all_rank_counts)
+            if hasattr(ctx.parallel_manager, 'set_num_tokens_per_rank'):
+                ctx.parallel_manager.set_num_tokens_per_rank(moe_ntp)
+            if hasattr(ctx.parallel_manager, 'set_rank_token_counts'):
+                ctx.parallel_manager.set_rank_token_counts(all_rank_counts)
             # Per-group rows behind this unit, stated by rank 0 at decode-phase
             # entry and when an in-phase sync changes the unit. The count
             # vector is read back only when the line is due.
-            if _G > 1 and self.rank == 0 and decode_groups_log_due(
+            if _G > 1 and ctx.facts.rank == 0 and decode_groups_log_due(
                 reason, moe_ntp, moe_ntp_from_group_max(previous_max_batch_size, _G)
             ):
                 logging.info(format_decode_groups_line(
@@ -741,10 +746,16 @@ class RankSyncEngine:
             except RuntimeError:
                 counts_list = ["<unavailable>"]
             logging.info(
-                f"[GLM5_MOE_COUNTS] Rank {self.rank}: reason={reason} "
+                f"[GLM5_MOE_COUNTS] Rank {ctx.facts.rank}: reason={reason} "
                 f"local={local_count} max={max_batch_size} counts={counts_list}"
             )
-        return max_batch_size
+        return MoeCountsOutcome(
+            local_count_tensor=local_count_tensor,
+            all_rank_counts=all_rank_counts,
+            current_local_batch_size=current_local_batch_size,
+            max_batch_size=current_max_batch_size,
+            rank_token_counts=rank_token_counts,
+        )
 
     def _sync_prefill_moe_rank_counts(
         self, worker, local_token_count: int, *, reason: str

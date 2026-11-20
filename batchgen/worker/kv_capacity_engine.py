@@ -61,6 +61,7 @@ from batchgen.worker.boundary import BoundaryDecisionRequest, BoundarySeqMeta
 from batchgen.worker.decode import DecodeCapacitySnapshot, reduce_decode_capacity_snapshot
 from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
+from batchgen.worker.admission.context import WaitOutcome
 from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.kv_manager import (
@@ -2384,12 +2385,15 @@ class KVCapacityEngine:
             self._wait_pending_kv_append_tasks()
 
     def _wait_pending_kv_append_tasks(
-        self, worker,
+        self, ctx,
         *,
         sync_distributed_errors: bool = False,
         defer_errors: bool = False,
         device_sync: bool = True,
-    ) -> int:
+        pending_tasks,
+        pending_tensors,
+        deferred_errors,
+    ) -> WaitOutcome:
         """
         Wait for all pending KV append tasks at page boundary.
         Returns the number of tasks that were waited for.
@@ -2403,20 +2407,16 @@ class KVCapacityEngine:
         would wait for it; see _finish_deferred_decode_step for why each
         task's own copy-stream sync suffices there.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
-        if not hasattr(self, '_pending_kv_append_tasks'):
+        if pending_tasks is None:
             if sync_distributed_errors:
                 error_payload = {
-                    "rank": self.rank,
-                    "errors": list(deferred_errors),
+                    "rank": ctx.facts.rank,
+                    "errors": list(deferred_errors or []),
                 } if deferred_errors else None
-                all_errors = [None] * self.world_size
+                all_errors = [None] * ctx.facts.world_size
                 dist.all_gather_object(all_errors, error_payload)
-                if hasattr(self, "_deferred_kv_append_wait_errors"):
-                    self._deferred_kv_append_wait_errors.clear()
+                if deferred_errors is not None:
+                    deferred_errors.clear()
                 flat_errors = [e for e in all_errors if e is not None]
                 if flat_errors:
                     raise RuntimeError(
@@ -2424,15 +2424,15 @@ class KVCapacityEngine:
                     )
             elif deferred_errors and not defer_errors:
                 raise RuntimeError(
-                    f"Rank {self.rank}: KV append/offload failed: {deferred_errors[:4]}"
+                    f"Rank {ctx.facts.rank}: KV append/offload failed: {deferred_errors[:4]}"
                 )
-            return 0
+            return WaitOutcome(0)
     
-        num_tasks = len(self._pending_kv_append_tasks)
-        wait_errors = list(deferred_errors)
-        if deferred_errors and hasattr(self, "_deferred_kv_append_wait_errors"):
-            self._deferred_kv_append_wait_errors.clear()
-        for task in self._pending_kv_append_tasks:
+        num_tasks = len(pending_tasks)
+        wait_errors = list(deferred_errors or [])
+        if deferred_errors:
+            deferred_errors.clear()
+        for task in pending_tasks:
             if task is not None:
                 try:
                     task.wait()
@@ -2446,23 +2446,23 @@ class KVCapacityEngine:
         # before we allow GPU pages to be freed/reused.
         if device_sync and num_tasks > 0 and not wait_errors:
             try:
-                torch.cuda.synchronize(self.torch_device)
+                torch.cuda.synchronize(ctx.facts.device)
             except Exception as e:
                 wait_errors.append(f"{type(e).__name__}: {e}")
     
-        self._pending_kv_append_tasks.clear()
+        pending_tasks.clear()
     
         # CRITICAL: Clear tensor references AFTER tasks complete
         # Tensors can now be safely garbage collected / memory reused
-        if hasattr(self, '_pending_kv_append_tensors'):
-            self._pending_kv_append_tensors.clear()
+        if pending_tensors is not None:
+            pending_tensors.clear()
 
         if sync_distributed_errors:
             error_payload = {
-                "rank": self.rank,
+                "rank": ctx.facts.rank,
                 "errors": wait_errors,
             } if wait_errors else None
-            all_errors = [None] * self.world_size
+            all_errors = [None] * ctx.facts.world_size
             dist.all_gather_object(all_errors, error_payload)
             flat_errors = [e for e in all_errors if e is not None]
             if flat_errors:
@@ -2470,15 +2470,18 @@ class KVCapacityEngine:
                     f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
                 )
         elif wait_errors and defer_errors:
-            if not hasattr(self, "_deferred_kv_append_wait_errors"):
-                self._deferred_kv_append_wait_errors = []
-            self._deferred_kv_append_wait_errors.extend(wait_errors)
+            if deferred_errors is None:
+                deferred_errors = []
+            deferred_errors.extend(wait_errors)
         elif wait_errors:
             raise RuntimeError(
-                f"Rank {self.rank}: KV append/offload failed: {wait_errors[:4]}"
+                f"Rank {ctx.facts.rank}: KV append/offload failed: {wait_errors[:4]}"
             )
     
-        return num_tasks
+        return WaitOutcome(
+            num_tasks,
+            tuple(deferred_errors) if defer_errors and wait_errors else None,
+        )
 
     # ---- Host-to-GPU KV load -----------------------------------------------
 

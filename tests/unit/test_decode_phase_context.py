@@ -38,6 +38,7 @@ class _Worker:
     enable_prefix_cache = True
     enable_host_kv_eviction = True
     host_kv_chunk_size = 256
+    prefix_cache_debug_stats = False
     global_batch = object()
     seq_table = object()
     _traj = object()
