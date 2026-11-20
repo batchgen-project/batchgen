@@ -1,0 +1,26 @@
+{
+  "file": "batchgen/worker/kv_capacity_engine.py",
+  "class": "KVCapacityEngine",
+  "functions": [
+    "_finalize_async_load_minimal"
+  ],
+  "attribute_rewrites": {
+    "self._local_to_uuid_map": "ctx.sched.seq_table.local_to_uuid",
+    "self._decode_attn_tp_size": "ctx.facts.attn_tp_size",
+    "self.global_batch": "ctx.sched.pool",
+    "self.rank": "ctx.facts.rank",
+    "self._sequences_with_gpu_kv": "ctx.gpu_resident",
+    "self.query_book": "query_book",
+    "self._async_load_tensors": "async_load_tensors_ref[0]"
+  },
+  "call_rewrites": {
+    "self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY)": "update_batch_status(ctx.sched.pool, ctx.facts.rank, valid_pending_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY)"
+  },
+  "special_rewrites": {
+    "self._decode_attn_tp_size()": "ctx.facts.attn_tp_size",
+    "hasattr(self, '_async_load_tensors')": "async_load_tensors_ref is not None"
+  },
+  "omitted_statements": [
+    "self._bump_decode_row_epoch()"
+  ]
+}
