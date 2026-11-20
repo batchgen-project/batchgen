@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 from batchgen.config.graph_span_policy import GRAPH_CONTEXT_STATICS_BUDGET_BYTES
+from batchgen.worker.admission.context import DecodePhaseContext
 
 
 # Seconds between two "step exceeds the captured span" warnings. The condition
@@ -440,17 +441,16 @@ class StepObservabilityEngine:
 
     # ---- Prefix-cache metrics ----------------------------------------------
 
-    def _emit_prefix_cache_metric(self, worker, phase: str, **fields) -> None:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if not self.prefix_cache_debug_stats:
+    def _emit_prefix_cache_metric(
+        self, ctx: DecodePhaseContext, phase: str, **fields
+    ) -> None:
+        if not ctx.facts.prefix_cache_debug_stats:
             return
         from batchgen.prefix_reuse.metrics import emit_prefix_cache_metric
 
         emit_prefix_cache_metric(
             phase=phase,
-            rank=self.rank,
+            rank=ctx.facts.rank,
             **fields,
         )
 
@@ -484,13 +484,12 @@ class StepObservabilityEngine:
             **self._trajectory_restore_fields(),
         )
 
-    def _prefix_host_resource_fields(self, worker) -> dict[str, int]:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _prefix_host_resource_fields(
+        self, ctx: DecodePhaseContext
+    ) -> dict[str, int]:
         from batchgen.prefix_reuse.metrics import host_resource_fields
 
         return host_resource_fields(
-            coordinator=self.prefix_cache_coordinator,
-            worker_view=self.core_engine.host_paged_kv_worker_view,
+            coordinator=ctx.prefix_coordinator,
+            worker_view=ctx.core_engine.host_paged_kv_worker_view,
         )

@@ -37,6 +37,7 @@ from batchgen.decode_dp_group import (
 )
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.rank_sync_engine import RankSyncEngine
+from batchgen.worker.admission.context import DecodePhaseContext, RankFacts, SchedulingState
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -175,9 +176,49 @@ def _sync_worker(world_size, G, rank=0):
         _decode_all_rank_counts=None,
     )
     engine = RankSyncEngine()
-    worker.sync = lambda batch, reason: engine._sync_decode_moe_rank_counts(
-        worker, batch, reason=reason
+    context = DecodePhaseContext(
+        facts=RankFacts(
+            rank=rank,
+            world_size=world_size,
+            local_rank=0,
+            local_world_size=world_size,
+            rank_ctx=None,
+            attn_tp_size=G,
+            device=torch.device("cpu"),
+            page_size=1,
+            decision_interval=1,
+            enable_prefix_cache=False,
+            enable_host_kv_eviction=False,
+            host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(pool=None, seq_table=None, trajectories=None),
+        gpu_kv=None,
+        host_view=None,
+        core_engine=None,
+        gpu_resident=None,
+        prefix_coordinator=None,
+        prefix_runtime=None,
+        chunk_sizer=None,
+        parallel_manager=worker.parallel_manager,
     )
+
+    def sync(batch, reason):
+        outcome = engine._sync_decode_moe_rank_counts(
+            context,
+            batch,
+            reason=reason,
+            decode_local_count_tensor=worker._decode_local_count_tensor,
+            decode_all_rank_counts=worker._decode_all_rank_counts,
+            previous_max=worker.__dict__.get("_current_decode_max_rank_batch_size", 0),
+        )
+        worker._decode_local_count_tensor = outcome.local_count_tensor
+        worker._decode_all_rank_counts = outcome.all_rank_counts
+        worker._current_decode_local_batch_size = outcome.current_local_batch_size
+        worker._current_decode_max_rank_batch_size = outcome.max_batch_size
+        worker._current_decode_rank_token_counts = outcome.rank_token_counts
+        return outcome.max_batch_size
+
+    worker.sync = sync
     return worker
 
 

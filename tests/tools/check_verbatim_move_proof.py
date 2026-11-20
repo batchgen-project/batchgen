@@ -1,4 +1,4 @@
-"""Prove that the AS3.1 engine bodies moved by a declared context rewrite."""
+"""Prove engine-body moves declared by a generic context rewrite map."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ import json
 import pathlib
 import subprocess
 import sys
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 
-def _functions(path: pathlib.Path) -> dict[str, ast.FunctionDef]:
+def _functions(path: pathlib.Path, class_name: str) -> dict[str, ast.FunctionDef]:
     tree = ast.parse(path.read_text(), filename=str(path))
     cls = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "KVCapacityEngine"
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     )
     return {
         node.name: node
@@ -25,7 +25,9 @@ def _functions(path: pathlib.Path) -> dict[str, ast.FunctionDef]:
     }
 
 
-def _base_functions(repo: pathlib.Path, revision: str, relative: str) -> dict:
+def _base_functions(
+    repo: pathlib.Path, revision: str, relative: str, class_name: str
+) -> dict:
     source = subprocess.check_output(
         ["git", "show", f"{revision}:{relative}"],
         cwd=repo,
@@ -35,7 +37,7 @@ def _base_functions(repo: pathlib.Path, revision: str, relative: str) -> dict:
     cls = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "KVCapacityEngine"
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     )
     return {
         node.name: node
@@ -60,15 +62,22 @@ class _Rewrite(ast.NodeTransformer):
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
         old = ast.unparse(node)
-        new = self.spec["attribute_rewrites"].get(old)
+        new = self.spec.get("attribute_rewrites", {}).get(old)
         if new is None:
             return node
         self._record("attribute", old, new)
-        return ast.copy_location(_expr(new), node)
+        replacement = _expr(new)
+        if hasattr(replacement, "ctx") and hasattr(node, "ctx"):
+            replacement.ctx = node.ctx
+        return ast.copy_location(replacement, node)
 
     def visit_Call(self, node):
         old = ast.unparse(node)
-        special = self.spec["special_rewrites"].get(old)
+        replacement = self.spec.get("call_rewrites", {}).get(old)
+        if replacement is not None:
+            self._record("call", old, replacement)
+            return ast.copy_location(_expr(replacement), node)
+        special = self.spec.get("special_rewrites", {}).get(old)
         if special is not None:
             self._record("special", old, special)
             return ast.copy_location(_expr(special), node)
@@ -77,7 +86,7 @@ class _Rewrite(ast.NodeTransformer):
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "self"
-            and node.func.attr in self.spec["converted_calls"]
+            and node.func.attr in self.spec.get("converted_calls", [])
             and not (node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == "ctx")
         ):
             node.args.insert(0, ast.Name(id="ctx", ctx=ast.Load()))
@@ -86,7 +95,15 @@ class _Rewrite(ast.NodeTransformer):
 
     def visit_BoolOp(self, node):
         old = ast.unparse(node)
-        special = self.spec["special_rewrites"].get(old)
+        special = self.spec.get("special_rewrites", {}).get(old)
+        if special is not None:
+            self._record("special", old, special)
+            return ast.copy_location(_expr(special), node)
+        return self.generic_visit(node)
+
+    def visit_UnaryOp(self, node):
+        old = ast.unparse(node)
+        special = self.spec.get("special_rewrites", {}).get(old)
         if special is not None:
             self._record("special", old, special)
             return ast.copy_location(_expr(special), node)
@@ -117,36 +134,90 @@ def _has_worker_access(node: ast.AST) -> bool:
     return any(isinstance(item, ast.Name) and item.id == "worker" for item in ast.walk(node))
 
 
+def _map_entries(spec: dict) -> Iterable[dict]:
+    entries = spec.get("entries")
+    if entries is not None:
+        return entries
+    return (spec,)
+
+
+def _filtered_base_body(node: ast.FunctionDef, spec: dict) -> list[ast.stmt]:
+    omitted = set(spec.get("omitted_statements", []))
+    return [
+        statement
+        for statement in _body(node, base=True)
+        if ast.unparse(statement) not in omitted
+    ]
+
+
+def _filtered_new_body(node: ast.FunctionDef, spec: dict) -> list[ast.stmt]:
+    omitted = set(spec.get("new_omitted_statements", []))
+    return [
+        statement
+        for statement in _body(node, base=False)
+        if ast.unparse(statement) not in omitted
+    ]
+
+
+class _StatementRewrite(ast.NodeTransformer):
+    def __init__(self, rewrites: dict[str, str]):
+        self.rewrites = rewrites
+
+    def _rewrite(self, node):
+        replacement = self.rewrites.get(ast.unparse(node))
+        if replacement is None:
+            return node
+        return ast.copy_location(ast.parse(replacement).body[0], node)
+
+    def visit_Return(self, node):
+        return self._rewrite(self.generic_visit(node))
+
+    def visit_Assign(self, node):
+        return self._rewrite(self.generic_visit(node))
+
+
 def prove(repo: pathlib.Path, base_revision: str, map_path: pathlib.Path) -> None:
     spec = json.loads(map_path.read_text())
-    relative = spec["file"]
-    new = _functions(repo / relative)
-    old = _base_functions(repo, base_revision, relative)
     failures: List[str] = []
-    for name in spec["functions"]:
-        if name not in old or name not in new:
-            failures.append(f"{name}: function missing in base or working tree")
-            continue
-        old_body = _body(old[name], base=True)
-        rewritten = _Rewrite(spec, name)
-        old_body = [rewritten.visit(statement) for statement in old_body]
-        new_body = _body(new[name], base=False)
-        if _has_worker_access(new[name]):
-            failures.append(f"{name}: residual worker access")
-        if len(old_body) != len(new_body):
-            failures.append(f"{name}: statement count {len(old_body)} != {len(new_body)}")
-        else:
-            for index, (expected, actual) in enumerate(zip(old_body, new_body)):
-                if ast.dump(expected, include_attributes=False) != ast.dump(actual, include_attributes=False):
-                    failures.append(f"{name}: statement {index} differs")
-                    break
-        for kind, before, after in rewritten.used:
-            print(f"RULE {name} [{kind}] {before} -> {after}")
+    passed = 0
+    for entry in _map_entries(spec):
+        relative = entry["file"]
+        class_name = entry.get("class", "KVCapacityEngine")
+        new = _functions(repo / relative, class_name)
+        old = _base_functions(repo, base_revision, relative, class_name)
+        for name in entry["functions"]:
+            if name not in old or name not in new:
+                failures.append(f"{relative}:{name}: function missing in base or working tree")
+                continue
+            old_body = _filtered_base_body(old[name], entry)
+            rewritten = _Rewrite(entry, name)
+            old_body = [rewritten.visit(statement) for statement in old_body]
+            statement_rewrites = entry.get("statement_rewrites", {})
+            old_body = [
+                _StatementRewrite(statement_rewrites).visit(statement)
+                for statement in old_body
+            ]
+            new_body = _filtered_new_body(new[name], entry)
+            if _has_worker_access(new[name]):
+                failures.append(f"{relative}:{name}: residual worker access")
+            if len(old_body) != len(new_body):
+                failures.append(
+                    f"{relative}:{name}: statement count {len(old_body)} != {len(new_body)}"
+                )
+            else:
+                for index, (expected, actual) in enumerate(zip(old_body, new_body)):
+                    if ast.dump(expected, include_attributes=False) != ast.dump(actual, include_attributes=False):
+                        failures.append(f"{relative}:{name}: statement {index} differs")
+                        break
+            for kind, before, after in rewritten.used:
+                print(f"RULE {relative}:{name} [{kind}] {before} -> {after}")
+            if not any(f.startswith(f"{relative}:{name}:") for f in failures):
+                passed += 1
     if failures:
         for failure in failures:
             print(f"FAIL {failure}")
         raise SystemExit(1)
-    print(f"PASS {len(spec['functions'])} functions")
+    print(f"PASS {passed} functions")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

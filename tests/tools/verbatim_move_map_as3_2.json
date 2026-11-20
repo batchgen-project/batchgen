@@ -1,0 +1,74 @@
+{
+  "entries": [
+    {
+      "file": "batchgen/worker/kv_capacity_engine.py",
+      "class": "KVCapacityEngine",
+      "functions": [
+        "_wait_pending_kv_append_tasks"
+      ],
+      "attribute_rewrites": {
+        "self.rank": "ctx.facts.rank",
+        "self.world_size": "ctx.facts.world_size",
+        "self.torch_device": "ctx.facts.device",
+        "self._pending_kv_append_tasks": "pending_tasks",
+        "self._pending_kv_append_tensors": "pending_tensors",
+        "self._deferred_kv_append_wait_errors": "deferred_errors"
+      },
+      "special_rewrites": {
+        "not hasattr(self, '_pending_kv_append_tasks')": "pending_tasks is None",
+        "not hasattr(self, '_deferred_kv_append_wait_errors')": "deferred_errors is None",
+        "hasattr(self, '_deferred_kv_append_wait_errors')": "deferred_errors is not None",
+        "hasattr(self, '_pending_kv_append_tensors')": "pending_tensors is not None",
+        "deferred_errors and hasattr(self, '_deferred_kv_append_wait_errors')": "deferred_errors",
+        "list(deferred_errors)": "list(deferred_errors or [])"
+      },
+      "omitted_statements": [
+        "deferred_errors = getattr(self, '_deferred_kv_append_wait_errors', [])"
+      ],
+      "statement_rewrites": {
+        "return 0": "return WaitOutcome(0)",
+        "return num_tasks": "return WaitOutcome(num_tasks, tuple(deferred_errors) if defer_errors and wait_errors else None)"
+      }
+    },
+    {
+      "file": "batchgen/worker/rank_sync_engine.py",
+      "class": "RankSyncEngine",
+      "functions": [
+        "_sync_decode_moe_rank_counts"
+      ],
+      "attribute_rewrites": {
+        "self.torch_device": "ctx.facts.device",
+        "self.world_size": "ctx.facts.world_size",
+        "self._decode_local_count_tensor": "decode_local_count_tensor",
+        "self._decode_all_rank_counts": "decode_all_rank_counts",
+        "self._current_decode_local_batch_size": "current_local_batch_size",
+        "self._current_decode_max_rank_batch_size": "current_max_batch_size",
+        "self._current_decode_rank_token_counts": "rank_token_counts",
+        "self.parallel_manager": "ctx.parallel_manager",
+        "self.rank": "ctx.facts.rank"
+      },
+      "special_rewrites": {
+        "int(getattr(self, '_current_decode_max_rank_batch_size', 0) or 0)": "previous_max",
+        "max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None": "max_batch_size > 0 and ctx.parallel_manager is not None",
+        "max_batch_size > 0 and hasattr(self, 'parallel_manager') and (self.parallel_manager is not None)": "max_batch_size > 0 and ctx.parallel_manager is not None"
+      },
+      "statement_rewrites": {
+        "return max_batch_size": "return MoeCountsOutcome(local_count_tensor=local_count_tensor, all_rank_counts=all_rank_counts, current_local_batch_size=current_local_batch_size, max_batch_size=current_max_batch_size, rank_token_counts=rank_token_counts)"
+      }
+    },
+    {
+      "file": "batchgen/worker/step_observability_engine.py",
+      "class": "StepObservabilityEngine",
+      "functions": [
+        "_emit_prefix_cache_metric",
+        "_prefix_host_resource_fields"
+      ],
+      "attribute_rewrites": {
+        "self.prefix_cache_debug_stats": "ctx.facts.prefix_cache_debug_stats",
+        "self.rank": "ctx.facts.rank",
+        "self.prefix_cache_coordinator": "ctx.prefix_coordinator",
+        "self.core_engine": "ctx.core_engine"
+      }
+    }
+  ]
+}
