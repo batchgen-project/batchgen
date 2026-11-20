@@ -13,6 +13,8 @@ this package; they are re-exported here as the public spelling.
 
 from __future__ import annotations
 
+import logging
+
 from batchgen.sequence import (
     RejectedTransition,
     StatusEdge,
@@ -26,7 +28,23 @@ __all__ = [
     "Transition",
     "TransitionPlan",
     "apply_or_raise",
+    "update_batch_status",
 ]
+
+
+def update_batch_status(pool, rank, uuids, new_status, edge):
+    """Update status for sequences, skipping if already in target status."""
+    if isinstance(uuids, str):
+        uuids = [uuids]
+    transitions, missing = pool.plan_transitions(uuids, new_status)
+    for uuid in missing:
+        logging.warning(f"Rank {rank}: Sequence {uuid} not found in global_batch")
+    rejected = pool.apply(TransitionPlan(edge, transitions))
+    for rejection in rejected:
+        logging.warning(
+            f"Rank {rank}: Invalid status transition for "
+            f"{rejection.transition.uuid}: {rejection.reason}"
+        )
 
 
 def apply_or_raise(batch, plan: TransitionPlan) -> None:
