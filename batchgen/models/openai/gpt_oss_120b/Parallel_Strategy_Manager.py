@@ -35,6 +35,8 @@ import torch.distributed as dist
 from .model import GptOss
 from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper, log_gpu_memory
 
+from batchgen.models.wrappers import phase_state
+
 
 from batchgen.phase_lifecycle import (
     AdmitContext,
@@ -1598,18 +1600,26 @@ class GptOssParallelStrategyManager:
                 layer._moe_segment_name = None
 
             synthetic_kv = _SyntheticPagedKV()
-            AttnWrapperBase.gpu_paged_kv_manager = synthetic_kv
-            AttnWrapperBase.cache_seqlens = torch.full(
-                (plan_bsz,), plan.past_tokens + 1,
-                dtype=torch.int32,
-                device=device,
+            phase_state.bind_decode_entry(
+                AttnWrapperBase, gpu_paged_kv_manager=synthetic_kv
             )
-            AttnWrapperBase.max_seqlen = plan.past_tokens + 1
-            AttnWrapperBase.cur_batch = None
-            AttnWrapperBase.position_ids = None
-            AttnWrapperBase.attention_mask = None
-            AttnWrapperBase.kv_append_callback = None
-            AttnWrapperBase.kv_append_callback_aux = None
+            phase_state.bind_step(
+                AttnWrapperBase,
+                cache_seqlens=torch.full(
+                    (plan_bsz,), plan.past_tokens + 1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                max_seqlen=plan.past_tokens + 1,
+                cur_batch=None,
+                position_ids=None,
+                attention_mask=None,
+            )
+            phase_state.bind_kv_append(
+                AttnWrapperBase,
+                kv_append_callback=None,
+                kv_append_callback_aux=None,
+            )
 
             # Make the routed workload uniform without changing any router
             # parameters or retaining a probe-only module attribute.
@@ -1676,8 +1686,7 @@ class GptOssParallelStrategyManager:
                 layer.cuda_graph_manager = manager
                 layer._full_attn_segment_name = attn_name
                 layer._moe_segment_name = moe_name
-            for name, value in saved_attention_state.items():
-                setattr(AttnWrapperBase, name, value)
+            phase_state.restore_saved_state(AttnWrapperBase, saved_attention_state)
 
     def get_weight_copy_task(self) -> Dict[str, List[str]]:
         """Return the weight copy task mapping."""

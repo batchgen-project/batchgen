@@ -82,9 +82,8 @@ class AttnWrapperBase(BaseModuleWrapper):
                            per token next to the quantized keys and requires
                            it; a bf16 AoS region rejects it.
       KV / misc:
-        scale, past_key_states, past_value_states,
-        kv_quantization_factor, batchgen_debug,
-        async_kv_load_active / async_kv_load_task.
+        scale, past_key_states,
+        kv_quantization_factor, batchgen_debug.
 
     Distributed: model MoE-EP collectives must use the worker's
     PyNcclCommunicator (bound onto modules by the PSM), NOT torch.distributed
@@ -108,9 +107,6 @@ class AttnWrapperBase(BaseModuleWrapper):
     # (batchgen/models/glm/glm5/wrappers.py) per audit §A finding #8 — these
     # are GLM-5-specific debug instrumentation and don't belong on the
     # generic base wrapper.
-    async_kv_load_active: ClassVar[bool] = False
-    async_kv_load_task: ClassVar[Optional[object]] = None
-
     # Pending prefill-offload tasks. async_offload_layer_kv_to_host returns
     # KVAsyncTask futures; if Python discards them (fire-and-forget), the
     # CPU thread that queues cudaMemcpyAsync may not have run yet by the
@@ -271,7 +267,6 @@ class AttnWrapperBase(BaseModuleWrapper):
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None
-    past_value_states: ClassVar[Optional[List[torch.Tensor]]] = None
     scale: ClassVar[Optional[List[torch.Tensor]]] = None
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None

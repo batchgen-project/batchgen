@@ -25,6 +25,7 @@ from typing import Optional
 import pytest
 import torch
 
+from batchgen.models.wrappers import phase_state
 from batchgen.prefix_reuse.offload_check import (
     DEBUG_FLAG,
     LOG_TAG,
@@ -545,6 +546,9 @@ _NAMESPACE = {
     "logging": logging,
     "Optional": Optional,
     "_POOL_PROBE_DEBUG_KEYS": _worker_probe_keys(),
+    # The lifted bodies write wrapper phase state through the single-writer
+    # module, exactly as batchgen_worker.py does at module scope.
+    "phase_state": phase_state,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
     body=[
@@ -687,7 +691,10 @@ def test_recorder_install_precedes_the_pool_chunk_loop():
     assert install[0] < builds[0]
     binder = _worker_method("_bind_prefill_pool_layer_state")
     assert len(_call_lines(binder, "_new_pool_offload_check_recorder")) == 1
-    assert "AttnWrapperBase.prefill_pool_offload_recorder = " in ast.unparse(binder)
+    assert (
+        "prefill_pool_offload_recorder=self._new_pool_offload_check_recorder(wave)"
+        in ast.unparse(binder)
+    )
 
 
 def test_offload_issue_site_hashes_only_behind_the_flag():
@@ -801,7 +808,10 @@ def test_a_wave_that_died_drops_both_probe_recorders():
         "    self._drop_prefill_pool_offload_recorder()"
     ) in final
     drop = ast.unparse(_worker_method("_drop_prefill_pool_offload_recorder"))
-    assert "AttnWrapperBase.prefill_pool_offload_recorder = None" in drop
+    assert (
+        "phase_state.bind_prefill_pool(AttnWrapperBase, "
+        "prefill_pool_offload_recorder=None)" in drop
+    )
 
 
 def test_the_handoff_flag_is_only_set_after_the_wave_completed():
