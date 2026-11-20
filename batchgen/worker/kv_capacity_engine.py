@@ -19,10 +19,10 @@ admission-policy seam. The frozen S5
 straddlers ``_mirror_group_host_kv`` and ``_release_host_kv_pages_for_batch``
 stay on the worker.
 
-The engine is intentionally stateless, the S5/S8/S7/S9 shape: each operation
-receives the live worker as its collaborator and rebinds ``self`` to it, so the
-moved statements keep their original state access and call spellings. The
-worker keeps a same-name delegator for every moved method.
+The engine is intentionally stateless. The AS3.1 operations receive a frozen
+decode phase context, while the remaining operations retain the older worker
+delegator shape until their own conversion slice. The worker keeps a same-name
+delegator for every moved method.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from batchgen.worker.admission.plan import (
 from batchgen.worker.boundary import BoundaryDecisionRequest, BoundarySeqMeta
 from batchgen.worker.decode import DecodeCapacitySnapshot, reduce_decode_capacity_snapshot
 from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
+from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.kv_manager import (
@@ -942,7 +943,7 @@ class KVCapacityEngine:
             return _dataclasses.asdict(native_obj)
         return self._legacy_get_host_kv_utilization()
 
-    def _gather_host_kv_stats_by_node(self, worker, worker_view: Optional[object]) -> List[Dict[str, int]]:
+    def _gather_host_kv_stats_by_node(self, ctx, worker_view: Optional[object]) -> List[Dict[str, int]]:
         """Gather one host-KV pool stat record per node.
 
         Host KV is shared by ranks on the same node, not globally. Rank 0 uses
@@ -955,32 +956,29 @@ class KVCapacityEngine:
         growth phase releases them on demand before the fresh capacity
         preflight. Zero when the prefix cache is off.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        num_nodes = self.rank_ctx.num_nodes
+        num_nodes = ctx.facts.rank_ctx.num_nodes
         report_free = 0
         report_total = 0
         report_reclaimable = -1
         report_node = -1
-        if worker_view is not None and self.local_rank == 0:
+        if worker_view is not None and ctx.facts.local_rank == 0:
             try:
                 stats = worker_view.get_stats()
-                report_node = self.rank_ctx.node_of(self.rank)
+                report_node = ctx.facts.rank_ctx.node_of(ctx.facts.rank)
                 report_free = int(stats.num_free_pages)
                 report_total = int(stats.num_total_pages)
                 report_reclaimable = (
-                    max(0, int(self.prefix_cache_coordinator.count_releasable_pages(0)))
+                    max(0, int(ctx.prefix_coordinator.count_releasable_pages(0)))
                     if (
-                        self.enable_prefix_cache
-                        and self.prefix_cache_coordinator is not None
+                        ctx.facts.enable_prefix_cache
+                        and ctx.prefix_coordinator is not None
                     )
                     else 0
                 )
             except Exception:
                 # Carry a rank-local stats failure through the collective so
                 # peers do not block while this rank raises before all-gather.
-                logging.exception("Rank %s: host-KV stats snapshot failed", self.rank)
+                logging.exception("Rank %s: host-KV stats snapshot failed", ctx.facts.rank)
                 report_node = -2
                 report_free = -1
                 report_total = -1
@@ -989,9 +987,9 @@ class KVCapacityEngine:
         stats_tensor = torch.tensor(
             [report_node, report_free, report_total, report_reclaimable],
             dtype=torch.int64,
-            device=self.torch_device,
+            device=ctx.facts.device,
         )
-        gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
+        gathered = [torch.zeros_like(stats_tensor) for _ in range(ctx.facts.world_size)]
         dist.all_gather(gathered, stats_tensor)
         if any(int(item[0].item()) == -2 for item in gathered):
             raise RuntimeError(
@@ -1098,24 +1096,21 @@ class KVCapacityEngine:
                 return flag_bucket
         return _MAX_DECODE_RANK_BSZ
 
-    def _host_views_by_group(self, worker) -> dict:
+    def _host_views_by_group(self, ctx) -> dict:
         """One Host-KV worker view per prefix-cache KV group.
 
         A DSA model keeps group 0 (MLA latent) in the primary region and group 1
         (indexer keys) in the auxiliary one, so every prefix-cache Host page
         operation has to run on both. Every other model has one region.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
-            views = self.host_paged_kv_worker_view.views_by_group()
+        if isinstance(ctx.host_view, DualHostKVCoordinator):
+            views = ctx.host_view.views_by_group()
         else:
-            view = getattr(self, "host_paged_kv_worker_view", None)
+            view = ctx.host_view
             if view is None:
-                view = self.core_engine.host_paged_kv_worker_view
+                view = ctx.core_engine.host_paged_kv_worker_view
             views = {0: view}
-        runtime = self.prefix_cache_runtime_config
+        runtime = ctx.prefix_runtime
         if runtime is not None and len(runtime.group_specs) != len(views):
             raise RuntimeError(
                 "prefix cache groups do not match the Host KV regions: "
@@ -1521,7 +1516,7 @@ class KVCapacityEngine:
         )
 
     def _collective_host_kv_growth_capacity_ok(
-        self, worker,
+        self, ctx,
         host_grow_requests: List[Tuple[int, int]],
         worker_view: Optional[object] = None,
     ) -> bool:
@@ -1540,26 +1535,19 @@ class KVCapacityEngine:
         worker-view API has no page-level rollback for a successful peer, and
         continuing would make scalar metadata and shared page tables disagree.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10b); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         local_need = sum(int(pages) for _, pages in host_grow_requests)
-        node_id = self.rank_ctx.node_id
+        node_id = ctx.facts.rank_ctx.node_id
         local_free = -1
         local_total = -1
         snapshot_error = 0
         if worker_view is None:
-            worker_view = getattr(self, "host_paged_kv_worker_view", None)
+            worker_view = ctx.host_view
         if worker_view is None:
-            worker_view = getattr(
-                getattr(self, "core_engine", None),
-                "host_paged_kv_worker_view",
-                None,
-            )
+            worker_view = getattr(ctx.core_engine, "host_paged_kv_worker_view", None)
         # The host region is shared by all ranks on a node.  Use the local
         # representative for the snapshot, matching _gather_host_kv_stats_by_node
         # and _collective_prefill_host_capacity_ok.
-        if self.local_rank == 0:
+        if ctx.facts.local_rank == 0:
             try:
                 if worker_view is None:
                     raise RuntimeError("host-KV worker view is unavailable")
@@ -1569,15 +1557,15 @@ class KVCapacityEngine:
             except Exception:
                 snapshot_error = 1
                 logging.exception(
-                    "Rank %s: host-KV boundary growth snapshot failed", self.rank
+                    "Rank %s: host-KV boundary growth snapshot failed", ctx.facts.rank
                 )
 
         report = torch.tensor(
             [node_id, local_need, local_free, local_total, snapshot_error],
             dtype=torch.int64,
-            device=self.torch_device,
+            device=ctx.facts.device,
         )
-        if self.world_size == 1:
+        if ctx.facts.world_size == 1:
             if snapshot_error:
                 return False
             return 0 <= local_need <= local_free and local_need <= local_total
@@ -1585,7 +1573,7 @@ class KVCapacityEngine:
             raise RuntimeError(
                 "distributed process group is required for host-KV growth preflight"
             )
-        gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
+        gathered = [torch.zeros_like(report) for _ in range(ctx.facts.world_size)]
         dist.all_gather(gathered, report)
 
         verdict = verdict_node_capacity(
@@ -1603,7 +1591,7 @@ class KVCapacityEngine:
         )
 
         decision = torch.tensor(
-            [1 if verdict.ok else 0], dtype=torch.int32, device=self.torch_device
+            [1 if verdict.ok else 0], dtype=torch.int32, device=ctx.facts.device
         )
         dist.all_reduce(decision, op=dist.ReduceOp.MIN)
         return bool(int(decision.item()))
@@ -1611,21 +1599,18 @@ class KVCapacityEngine:
     # ---- GPU KV page allocation and release --------------------------------
 
     def _collective_gpu_kv_allocation_preflight(
-        self, worker, required_pages: int, free_pages: int
+        self, ctx, required_pages: int, free_pages: int
     ) -> bool:
         """Require every rank to approve a GPU-KV allocation before mutation."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         local_can_allocate = int(required_pages >= 0 and required_pages <= free_pages)
-        if self.world_size == 1:
+        if ctx.facts.world_size == 1:
             return bool(local_can_allocate)
         if not dist.is_initialized():
             raise RuntimeError(
                 "distributed process group is required for GPU-KV allocation preflight"
             )
         can_allocate = torch.tensor(
-            [local_can_allocate], dtype=torch.int32, device=self.torch_device
+            [local_can_allocate], dtype=torch.int32, device=ctx.facts.device
         )
         dist.all_reduce(can_allocate, op=dist.ReduceOp.MIN)
         return bool(int(can_allocate.item()))
@@ -1790,17 +1775,14 @@ class KVCapacityEngine:
         )
         return True
 
-    def _extend_gpu_kv_allocation(self, worker, uuids: List[str]) -> bool:
+    def _extend_gpu_kv_allocation(self, ctx, uuids: List[str]) -> bool:
         """
         Extend GPU KV allocation for sequences that need more pages.
     
         Returns:
             True if all extensions succeeded, False if insufficient pages
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_kv
         if manager is None:
             return False
     
@@ -1810,9 +1792,9 @@ class KVCapacityEngine:
         total_additional = 0
     
         for uuid in uuids:
-            if uuid not in self._uuid_to_local_map:
+            if uuid not in ctx.sched.seq_table.uuid_to_local:
                 continue
-            seq = self.global_batch.get_sequence(uuid)
+            seq = ctx.sched.pool.get_sequence(uuid)
             additional = seq.get_additional_gpu_pages_needed()
             if additional > 0:
                 extensions_needed.append((uuid, additional))
@@ -1820,27 +1802,27 @@ class KVCapacityEngine:
     
         if total_additional > free_pages:
             logging.warning(
-                f"Rank {self.rank}: Insufficient GPU pages for extension: "
+                f"Rank {ctx.facts.rank}: Insufficient GPU pages for extension: "
                 f"need {total_additional}, have {free_pages}"
             )
             return False
     
         # Perform extensions
         for uuid, additional in extensions_needed:
-            seq = self.global_batch.get_sequence(uuid)
-            local_idx = self._uuid_to_local_map[uuid]
+            seq = ctx.sched.pool.get_sequence(uuid)
+            local_idx = ctx.sched.seq_table.uuid_to_local[uuid]
             global_id = seq.global_idx
         
             # Extend allocation
             new_total_pages = seq.gpu_pages_allocated + additional
-            new_total_tokens = new_total_pages * self.PAGE_SIZE
+            new_total_tokens = new_total_pages * ctx.facts.page_size
         
             manager.extend_pages_for_sequence(global_id, new_total_tokens)
             seq.gpu_pages_allocated = new_total_pages
     
         return True
 
-    def _shared_page_identity_sources(self, worker, manager):
+    def _shared_page_identity_sources(self, ctx, manager):
         """The pools whose GPU pages can be deduplicated by Host page id.
 
         Returns one ``(pool name, GPU manager, Host worker view)`` triple per
@@ -1857,13 +1839,10 @@ class KVCapacityEngine:
         region (``DualHostKVCoordinator.views_by_group``), matching
         primary/auxiliary on the GPU side.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if manager is None or not self.enable_prefix_cache:
+        if manager is None or not ctx.facts.enable_prefix_cache:
             return None
         if isinstance(manager, DualKVCacheCoordinator):
-            host_view = getattr(self, "host_paged_kv_worker_view", None)
+            host_view = ctx.host_view
             if not isinstance(host_view, DualHostKVCoordinator):
                 return None
             views = host_view.views_by_group()
@@ -1876,14 +1855,14 @@ class KVCapacityEngine:
                 ("auxiliary", manager.auxiliary, auxiliary_view),
             )
         worker_view = getattr(
-            self.core_engine, "host_paged_kv_worker_view", None
+            ctx.core_engine, "host_paged_kv_worker_view", None
         )
         if worker_view is None:
             return None
         return (("primary", manager, worker_view),)
 
     def _host_identity_page_keys(
-        self, worker,
+        self, ctx,
         manager,
         global_sequence_ids: Sequence[int],
         sequence_tokens: Sequence[int],
@@ -1903,15 +1882,13 @@ class KVCapacityEngine:
         or the Host views that define the identity are not bound) and plain
         allocation is used.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        sources = self._shared_page_identity_sources(manager)
+        sources = self._shared_page_identity_sources(ctx, manager)
         if sources is None:
             return None
         rows_by_pool: Dict[str, List[List[int]]] = {}
         for pool_name, pool_manager, worker_view in sources:
             rows_by_pool[pool_name] = self._pool_host_identity_page_keys(
+                ctx,
                 pool_name,
                 pool_manager,
                 worker_view,
@@ -1925,7 +1902,7 @@ class KVCapacityEngine:
         return rows_by_pool["primary"]
 
     def _pool_host_identity_page_keys(
-        self, worker,
+        self, ctx,
         pool_name: str,
         pool_manager,
         worker_view,
@@ -1933,9 +1910,6 @@ class KVCapacityEngine:
         sequence_tokens: Sequence[int],
     ) -> List[List[int]]:
         """One pool's Host page ids behind each sequence's GPU reservation."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         host_tables = worker_view.build_page_table(global_sequence_ids)
         page_size = int(pool_manager.config.page_size_tokens)
         page_keys: List[List[int]] = []
@@ -1951,12 +1925,12 @@ class KVCapacityEngine:
                 )
             page_keys.append([int(page) for page in host_pages[:required]])
         self._assert_private_writable_page_keys(
-            pool_name, pool_manager, global_sequence_ids, page_keys, page_size
+            ctx, pool_name, pool_manager, global_sequence_ids, page_keys, page_size
         )
         return page_keys
 
     def _assert_private_writable_page_keys(
-        self, worker,
+        self, ctx,
         pool_name: str,
         pool_manager,
         global_sequence_ids: Sequence[int],
@@ -1976,12 +1950,9 @@ class KVCapacityEngine:
         instead of trusting it, because a shared key here would let two rows
         write one physical page.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         write_heads: List[int] = []
         for sequence_id in global_sequence_ids:
-            sequence = self.global_batch.get_sequence_by_global_idx(
+            sequence = ctx.sched.pool.get_sequence_by_global_idx(
                 int(sequence_id)
             )
             if sequence is None:
@@ -2062,16 +2033,21 @@ class KVCapacityEngine:
             )
         return allocations
 
-    def _release_gpu_kv_pages(self, worker, local_sequence_ids: List[int]) -> None:
+    def _release_gpu_kv_pages(self, ctx, local_sequence_ids: List[int]) -> None:
         """Return GPU KV pages associated with the provided local sequence ids."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_kv
         if manager is None or not local_sequence_ids:
             return
     
-        global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+        global_sequence_ids = IndexManager.local_indices_to_global_seq_ids(
+            IndexLookupRequest(
+                rank=ctx.facts.rank,
+                local_to_uuid=ctx.sched.seq_table.local_to_uuid,
+                uuid_to_local=ctx.sched.seq_table.uuid_to_local,
+                global_batch=ctx.sched.pool,
+            ),
+            local_sequence_ids,
+        )
     
         if not global_sequence_ids:
             return
@@ -2083,26 +2059,23 @@ class KVCapacityEngine:
         manager.free_pages_for_sequences(global_sequence_ids)
         # NOTE: No sync needed - page deallocation is synchronous to the allocator
         logging.debug(
-            f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
+            f"Rank {ctx.facts.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
         )
 
-        self._release_kda_state_slots(global_sequence_ids)
+        self._release_kda_state_slots(ctx, global_sequence_ids)
 
         # FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
         for local_idx in local_sequence_ids:
-            uuid = self._local_to_uuid_map.get(local_idx)
+            uuid = ctx.sched.seq_table.local_to_uuid.get(local_idx)
             if uuid:
-                self._sequences_with_gpu_kv.discard(uuid)
-                seq = self.global_batch.get_sequence(uuid)
+                ctx.gpu_resident.discard(uuid)
+                seq = ctx.sched.pool.get_sequence(uuid)
                 if seq is not None:
                     seq.gpu_pages_allocated = 0
 
-    def _release_kda_state_slots(self, worker, global_sequence_ids: List[int]) -> None:
+    def _release_kda_state_slots(self, ctx, global_sequence_ids: List[int]) -> None:
         """Release Kimi-Linear KDA state independently of paged GPU KV."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        self._traj.free_kda_sequences(global_sequence_ids)
+        ctx.sched.trajectories.free_kda_sequences(global_sequence_ids)
 
     # ---- Decode KV append to host ------------------------------------------
 
@@ -2510,14 +2483,11 @@ class KVCapacityEngine:
     # ---- Host-to-GPU KV load -----------------------------------------------
 
     def _prepare_dual_kv_load_pointers(
-        self, worker,
+        self, ctx,
         gpu_manager: DualKVCacheCoordinator,
         new_global_ids: List[int],
         existing_global_ids: Optional[List[int]] = None,
     ) -> _DualKVLoadPointers:
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if not isinstance(gpu_manager, DualKVCacheCoordinator):
             raise RuntimeError("DSA dual KV load requires DualKVCacheCoordinator")
         if not new_global_ids:
@@ -2560,11 +2530,8 @@ class KVCapacityEngine:
             else:
                 gpu_manager.clear_page_table()
 
-    def _launch_dual_host_kv_load(self, worker, pointers: _DualKVLoadPointers) -> DualAsyncKVTask:
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        host_view = self.host_paged_kv_worker_view
+    def _launch_dual_host_kv_load(self, ctx, pointers: _DualKVLoadPointers) -> DualAsyncKVTask:
+        host_view = ctx.host_view
         if not isinstance(host_view, DualHostKVCoordinator):
             raise RuntimeError("DSA dual KV load requires DualHostKVCoordinator")
         return host_view.async_load_layer_paged_kv_to_device_dual(
@@ -2645,7 +2612,7 @@ class KVCapacityEngine:
 
     # ---- Decode capacity snapshot ------------------------------------------
 
-    def _snapshot_decode_capacity(self, worker) -> DecodeCapacitySnapshot:
+    def _snapshot_decode_capacity(self, ctx) -> DecodeCapacitySnapshot:
         """Collect the live GPU-KV capacity before decode admission.
 
         Total pages are immutable after initialization and must match on every
@@ -2659,10 +2626,7 @@ class KVCapacityEngine:
         being taken against it: a release attempted here fails loud instead of
         producing a plan for pages that no longer exist.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_kv
         if manager is None or not manager.is_initialized:
             raise RuntimeError(
                 "GPU KV manager must be initialized before taking a decode capacity snapshot"
@@ -2672,28 +2636,28 @@ class KVCapacityEngine:
             local = torch.tensor(
                 [int(stats.num_total_pages), int(stats.num_free_pages)],
                 dtype=torch.int64,
-                device=self.torch_device,
+                device=ctx.facts.device,
             )
-            if self.world_size == 1:
+            if ctx.facts.world_size == 1:
                 rank_stats = [local]
             else:
                 if not dist.is_initialized():
                     raise RuntimeError(
                         "distributed process group is required for a multi-rank decode capacity snapshot"
                     )
-                rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
+                rank_stats = [torch.zeros_like(local) for _ in range(ctx.facts.world_size)]
                 dist.all_gather(rank_stats, local)
         return reduce_decode_capacity_snapshot(
             tuple(int(item[0].item()) for item in rank_stats),
             tuple(int(item[1].item()) for item in rank_stats),
-            world_size=self.world_size,
-            attn_tp_size=self._decode_attn_tp_size(),
+            world_size=ctx.facts.world_size,
+            attn_tp_size=ctx.facts.attn_tp_size,
         )
 
     # ---- Page-boundary decision request ------------------------------------
 
     def _make_boundary_decision_request(
-        self, worker,
+        self, ctx,
         decode_uuids: List[str],
         global_seq_state: Dict[str, Dict],
         global_candidate_info: Dict[str, Dict],
@@ -2701,6 +2665,7 @@ class KVCapacityEngine:
         per_rank_total: List[int],
         chunk_size: int,
         per_node_host_stats: Optional[List[Dict[str, int]]],
+        max_rank_bsz,
     ) -> BoundaryDecisionRequest:
         """Snapshot the boundary-decision inputs (rank 0 only).
 
@@ -2711,12 +2676,9 @@ class KVCapacityEngine:
         entry as ``global_idx = inf`` / ``priority = 0``, matching the
         legacy ``if seq is not None else ...`` fallbacks.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         seq_meta: Dict[str, BoundarySeqMeta] = {}
         for uuid in set(decode_uuids) | set(global_candidate_info.keys()):
-            seq = self.global_batch.get_sequence(uuid)
+            seq = ctx.sched.pool.get_sequence(uuid)
             if seq is None:
                 continue
             seq_meta[uuid] = BoundarySeqMeta(
@@ -2735,11 +2697,11 @@ class KVCapacityEngine:
             chunk_size=chunk_size,
             per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
             seq_meta=seq_meta,
-            world_size=self.world_size,
-            num_gpus_per_node=self.local_world_size,
-            max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
-            enable_host_kv_eviction=self.enable_host_kv_eviction,
-            attn_tp_size=self._decode_attn_tp_size(),
+            world_size=ctx.facts.world_size,
+            num_gpus_per_node=ctx.facts.local_world_size,
+            max_rank_bsz=max_rank_bsz,
+            enable_host_kv_eviction=ctx.facts.enable_host_kv_eviction,
+            attn_tp_size=ctx.facts.attn_tp_size,
         )
 
     def _integrate_pending_async_load(
@@ -3083,7 +3045,7 @@ class KVCapacityEngine:
             world_size=self.world_size,
         )
 
-    def _get_effective_chunk_size(self, worker) -> int:
+    def _get_effective_chunk_size(self, ctx) -> int:
         """Return the current host KV chunk size, considering adaptive sizing.
 
         The value is worker-wide; every consumer bounds it by the sequence's
@@ -3094,17 +3056,14 @@ class KVCapacityEngine:
         later pool-mode batch by the first batch's budget. The result is always
         rounded up to a page boundary (multiple of PAGE_SIZE=64).
         """
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self.adaptive_chunk_sizer is not None:
-            chunk = self.adaptive_chunk_sizer.get_chunk_size()
+        if ctx.chunk_sizer is not None:
+            chunk = ctx.chunk_sizer.get_chunk_size()
         else:
-            chunk = self.host_kv_chunk_size
+            chunk = ctx.facts.host_kv_chunk_size
         # Clamp + page rounding: single definition in kv_plan.
         return effective_chunk_size(
             chunk,
-            decision_interval=self.DECISION_INTERVAL,
+            decision_interval=ctx.facts.decision_interval,
             page_size=SequenceEntry.PAGE_SIZE,
         )
 
