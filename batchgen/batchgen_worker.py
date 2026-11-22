@@ -11675,16 +11675,50 @@ class BatchGenWorker:
 		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
-			# The rows in decode before any status of this boundary changes.
-			# The completion update below moves only completed rows out of
-			# decode, so the rows remaining in decode for the host page
-			# release are these minus the completed ones.
+			# The decode set BEFORE any status write of this boundary. The
+			# completion release below rebuilds the GPU page table from it;
+			# the boundary's own decode_uuids is NOT a substitute for this
+			# live index (rows can be IN_DECODE without being in this call's
+			# decode set), so the index is read first, ahead of every status
+			# write, and the release derives its remaining rows from this
+			# snapshot.
 			in_decode_before = self.global_batch.get_sequences_by_status(
 				SequenceStatus.IN_DECODE
 			)
 			self._update_batch_status(
 				completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
 			)
+		# Every PLANNED status change applies here, at one point. The decision
+		# partitions the decode set, so the three planned groups are disjoint
+		# and each row moves IN_DECODE -> {COMPLETED, EVICTED, ON_HOLD} exactly
+		# once (COMPLETED above goes through _update_batch_status because rows
+		# the per-step sync already completed must be skipped). The carry-out
+		# below (resource releases, scalar updates, event logs, collectives)
+		# reads no sequence status, so it is unaffected by the rows' statuses
+		# having already changed. On-hold rows are drawn by the planner from
+		# the post-eviction decode set, so they cannot exist when the
+		# no-decode-rows-left early return below is taken; applying ON_HOLD
+		# here is therefore equivalent to the old write point after that
+		# return. Only the extension-failure amendment below may change a
+		# status after this point, and the IN_DECODE snapshot above is
+		# deliberately taken before any of these writes.
+		if decisions.host_evicted_uuids:
+			apply_or_raise(self.global_batch, TransitionPlan(
+				StatusEdge.BOUNDARY,
+				tuple(
+					Transition(uuid, SequenceStatus.EVICTED)
+					for uuid in decisions.host_evicted_uuids
+				),
+			))
+		if decisions.onhold_uuids:
+			apply_or_raise(self.global_batch, TransitionPlan(
+				StatusEdge.BOUNDARY,
+				tuple(
+					Transition(uuid, SequenceStatus.ON_HOLD)
+					for uuid in decisions.onhold_uuids
+				),
+			))
+		if completed_uuids:
 			# Gather decoded tokens from owning ranks before reporting
 			gathered_texts = self._gather_completed_tokens(completed_uuids)
 
@@ -11699,6 +11733,14 @@ class BatchGenWorker:
 				gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
 				if gpu_allocated:
 					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+				# The remaining decode rows are the pre-write IN_DECODE
+				# snapshot minus the completed rows: exactly what a live
+				# status read returned when only the completion update had
+				# been applied (that update moves only completed rows out of
+				# IN_DECODE). Rows this decision evicts or puts on hold are
+				# still in it — their statuses changed at the single point
+				# above, but their resources are released later in this
+				# boundary.
 				completed_set = set(completed_uuids)
 				self._release_host_kv_pages_for_batch(
 					my_completed,
@@ -11874,15 +11916,8 @@ class BatchGenWorker:
 				# for G==1 (the field is always None on the validated pure-DP path).
 				from batchgen.decode_dp_group import evict_from_decode_dp_group
 				evict_from_decode_dp_group(seq)
-			# None of the per-sequence steps above reads a status, so the
-			# transitions apply together, in loop order, after them.
-			apply_or_raise(self.global_batch, TransitionPlan(
-				StatusEdge.BOUNDARY,
-				tuple(
-					Transition(uuid, SequenceStatus.EVICTED)
-					for uuid in host_evicted_uuids
-				),
-			))
+			# None of the per-sequence steps above reads a status; the rows'
+			# EVICTED transition was applied at the single planned point above.
 
 			evicted_set = set(host_evicted_uuids)
 			decode_uuids = [u for u in decode_uuids if u not in evicted_set]
@@ -12044,13 +12079,8 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=boundary")
-			apply_or_raise(self.global_batch, TransitionPlan(
-				StatusEdge.BOUNDARY,
-				tuple(
-					Transition(uuid, SequenceStatus.ON_HOLD)
-					for uuid in onhold_uuids
-				),
-			))
+			# The rows' ON_HOLD transition was applied at the single planned
+			# point above; only their resources are released here.
 
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
 			batch = self._get_local_indices_for_uuids(decode_uuids)
