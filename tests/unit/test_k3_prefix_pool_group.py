@@ -1032,6 +1032,50 @@ def test_release_frees_a_segment_before_a_later_one_fails(monkeypatch):
     assert view_builds == [1]
 
 
+def test_release_counts_the_next_segment_only_after_releasing_the_previous(monkeypatch):
+    # The counts as each segment's pages go: the segment after it must still
+    # be counted, so a release never runs with later segments already dropped.
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+    view = worker._host_views_by_group()[0]
+    view_builds.clear()
+    counts_at_release = []
+    release_pages = view.release_sequence_pages
+
+    def recording_release(ids):
+        counts_at_release.append((list(ids), dict(worker._prefix.pool_sid_members)))
+        release_pages(ids)
+
+    view.release_sequence_pages = recording_release
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert counts_at_release == [([-1], {-2: 1}), ([-2], {})]
+
+
+def test_a_failed_page_release_leaves_the_later_segments_counted(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+    view = worker._host_views_by_group()[0]
+    view_builds.clear()
+
+    def failing_release(ids):
+        raise RuntimeError("page release failed")
+
+    view.release_sequence_pages = failing_release
+
+    with pytest.raises(RuntimeError, match="page release failed"):
+        worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert worker._prefix.pool_sid_members == {-2: 1}
+    assert backend.unregistered == []
+    assert view_builds == [1]
+
+
 # --------------------------------------------------------------------------- #
 #  (vi) A pool wave runs one model pass per planned chunk
 # --------------------------------------------------------------------------- #
