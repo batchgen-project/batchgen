@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from batchgen.config.layer_truncation import unserved_layer_range
 from batchgen.models.weight_reconciler import (
     IgnoreRule,
     ReconcileSpec,
@@ -891,6 +892,7 @@ def k3_reconcile_spec(cfg,
         ignore_rules=K3_IGNORE_RULES,
         ignored_count=ignored_count,
         ignored_bytes=ignored_bytes,
+        unserved_layers=unserved_layer_range(cfg),
     )
 
 

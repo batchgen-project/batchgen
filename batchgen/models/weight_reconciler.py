@@ -52,6 +52,8 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
+from batchgen.config.layer_truncation import is_unserved_layer_tensor
+
 
 # --------------------------------------------------------------------------- #
 #  Checkpoint side                                                             #
@@ -201,6 +203,9 @@ class ReconcileSpec:
     #: pinned expectations for the ignored set; a change must fail loudly
     ignored_count: Optional[int] = None
     ignored_bytes: Optional[int] = None
+    #: half-open layer range ``(served, full)`` that is not served under
+    #: --debug-num-layers; its tensors are accounted as unserved, never loaded
+    unserved_layers: Optional[Tuple[int, int]] = None
     #: suffix pair identifying a quantized (packed, scale) couple
     quant_pair_suffixes: Tuple[str, str] = (".weight_packed", ".weight_scale")
 
@@ -241,10 +246,12 @@ class ReconcileReport:
     n_mapped: int = 0
     n_skeleton: int = 0
     n_ignored: int = 0
+    n_unserved: int = 0
     checkpoint_bytes: int = 0
     declared_bytes_by_type: Dict[str, int] = field(default_factory=dict)
     declared_skeleton_bytes: int = 0
     declared_ignored_bytes: Optional[int] = None
+    declared_unserved_bytes: Optional[int] = None
     findings: List[Finding] = field(default_factory=list)
     #: bucket -> total number of findings (the ``findings`` list is capped)
     counts: Dict[str, int] = field(default_factory=dict)
@@ -272,6 +279,7 @@ class ReconcileReport:
             sum(self.declared_bytes_by_type.values())
             + self.declared_skeleton_bytes
             + (self.declared_ignored_bytes or 0)
+            + (self.declared_unserved_bytes or 0)
         )
 
     @property
@@ -290,6 +298,7 @@ class ReconcileReport:
             f"  -> module rings      : {self.n_mapped:,}",
             f"  -> skeleton          : {self.n_skeleton:,}",
             f"  -> explicitly ignored: {self.n_ignored:,}",
+            f"  -> unserved layers   : {self.n_unserved:,}",
             f"  -> UNACCOUNTED       : {self.n_unaccounted:,}",
             "  declared bytes:",
         ]
@@ -301,6 +310,7 @@ class ReconcileReport:
         lines += [
             f"    {'skeleton':<18}: {self.declared_skeleton_bytes:>18,}",
             f"    {'ignored':<18}: {(self.declared_ignored_bytes or 0):>18,}",
+            f"    {'unserved layers':<18}: {(self.declared_unserved_bytes or 0):>18,}",
             f"    {'declared total':<18}: {self.declared_bytes:>18,}",
             f"    {'checkpoint total':<18}: {self.checkpoint_bytes:>18,}",
             f"    {'delta':<18}: "
@@ -372,6 +382,7 @@ def reconcile(checkpoint: CheckpointIndex, spec: ReconcileSpec,
     # -- 1. classify every checkpoint tensor --------------------------- #
     written: Dict[str, Set[str]] = {}   # module_key -> tensor_keys actually sourced
     bytes_incomplete = False
+    unserved_names: List[str] = []
     for name in names:
         entry = spec.name_map.get(name)
         if entry is not None:
@@ -405,6 +416,11 @@ def reconcile(checkpoint: CheckpointIndex, spec: ReconcileSpec,
 
         if _match_ignore(name, spec.ignore_rules) is not None:
             report.n_ignored += 1
+            continue
+
+        if is_unserved_layer_tensor(name, spec.unserved_layers):
+            report.n_unserved += 1
+            unserved_names.append(name)
             continue
 
         report.add(
@@ -507,6 +523,8 @@ def reconcile(checkpoint: CheckpointIndex, spec: ReconcileSpec,
         )
     else:
         report.declared_ignored_bytes = spec.ignored_bytes
+    if per_tensor is not None:
+        report.declared_unserved_bytes = sum(per_tensor[n].nbytes for n in unserved_names)
 
     # -- 6. byte reconciliation ----------------------------------------- #
     if bytes_incomplete:
@@ -520,6 +538,11 @@ def reconcile(checkpoint: CheckpointIndex, spec: ReconcileSpec,
             "byte-total check: the ignored set is non-empty and its size is "
             "unknown (pass ReconcileSpec.ignored_bytes, or use "
             "read_safetensors_headers so it can be measured)"
+        )
+    elif report.declared_unserved_bytes is None and report.n_unserved:
+        report.skip(
+            "byte-total check: layers are unserved (--debug-num-layers) and "
+            "their size is unknown without the shard headers"
         )
     elif report.declared_bytes != report.checkpoint_bytes:
         report.add(

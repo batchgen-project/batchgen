@@ -178,8 +178,23 @@ def require_layer_truncation_applied(
         )
 
 
-# Converted checkpoints name a layer's tensors ``model.layers.<i>.<rest>``.
+# Checkpoints name a layer's tensors ``<prefix>.layers.<i>.<rest>``.
 _LAYER_TENSOR = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def unserved_layer_range(config) -> Optional[Tuple[int, int]]:
+    """``(served, full)`` when the config is truncated, else None."""
+    served = int(config.num_hidden_layers)
+    full = int(getattr(config, FULL_LAYER_COUNT_FIELD, served))
+    return (served, full) if served < full else None
+
+
+def is_unserved_layer_tensor(name: str, unserved: Optional[Tuple[int, int]]) -> bool:
+    """True when ``name`` is a tensor of a layer in the half-open range."""
+    if unserved is None:
+        return False
+    match = _LAYER_TENSOR.search(name)
+    return match is not None and unserved[0] <= int(match.group(1)) < unserved[1]
 
 
 def select_weight_files(converted_ckpt_dir: str, config) -> Tuple[List[str], List[str]]:
@@ -204,10 +219,10 @@ def select_weight_files(converted_ckpt_dir: str, config) -> Tuple[List[str], Lis
         LayerTruncationError: truncation is on and no file was selected, or a
             metadata file has no ``state_dict``.
     """
-    served = int(config.num_hidden_layers)
-    full = int(getattr(config, FULL_LAYER_COUNT_FIELD, served))
-    if served == full:
+    unserved_range = unserved_layer_range(config)
+    if unserved_range is None:
         return [], []
+    served = unserved_range[0]
 
     selected: List[str] = []
     unserved: List[str] = []
@@ -222,12 +237,10 @@ def select_weight_files(converted_ckpt_dir: str, config) -> Tuple[List[str], Lis
                 f"--debug-num-layers: {name} in {converted_ckpt_dir} has no "
                 "state_dict; it is not converted-checkpoint metadata"
             )
-        file_unserved = []
-        for tensor_name in state_dict:
-            match = _LAYER_TENSOR.search(tensor_name)
-            layer = int(match.group(1)) if match else None
-            if layer is not None and served <= layer < full:
-                file_unserved.append(tensor_name)
+        file_unserved = [
+            tensor_name for tensor_name in state_dict
+            if is_unserved_layer_tensor(tensor_name, unserved_range)
+        ]
         if len(file_unserved) < len(state_dict):
             selected.append(name)
             unserved.extend(file_unserved)
