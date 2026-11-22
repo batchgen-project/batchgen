@@ -2753,11 +2753,35 @@ class BatchGenWorker:
 
 		Also frees the QueryBook buffer slot so it can be reused by new admissions.
 
+		Split by duty, keeping the original statement order: the output
+		path is the `_completion_outlet_read` / `_completion_outlet_send` pair
+		on the worker, the pure resource releases run in the KV capacity
+		engine, and the worker-side capacity publish and drain metric stay at
+		their original positions between them.
+
 		Args:
 			uuid: Sequence UUID.
 			gathered_text: Pre-gathered decoded text from _gather_completed_tokens.
 				If provided, uses this instead of reading from local decoded_tokens
 				(which may be empty on rank 0 for sequences owned by other ranks).
+		"""
+		outlet = self._completion_outlet_read(uuid, gathered_text)
+		if outlet is None:
+			return
+		seq, fallback_text, trajectory_slot = outlet
+		self._release_completed_trajectory_slot(trajectory_slot)
+		self._publish_trajectory_pool_capacity()
+		self._release_completed_slot_index(seq, uuid)
+		self._maybe_emit_prefix_drain_metric()
+		self._completion_outlet_send(uuid, seq, gathered_text, fallback_text)
+
+	def _completion_outlet_read(self, uuid: str, gathered_text: str = None):
+		"""Read side of the completion outlet: the row and its fallback text.
+
+		Returns ``None`` for an unknown uuid (the completion was already
+		reported), else ``(seq, fallback_text, trajectory_slot)``. The
+		fallback text is decoded on rank 0 only, and only when the caller did
+		not pre-gather the text.
 		"""
 		seq = self.global_batch.get_sequence(uuid)
 		if seq is None:
@@ -2778,31 +2802,38 @@ class BatchGenWorker:
 				)
 			except Exception:
 				fallback_text = ""
+		return seq, fallback_text, trajectory_slot
 
-		# Free the complete trajectory reservation on every rank. This is the
-		# only token-storage release point; multi-turn re-entry keeps the slot.
-		if trajectory_slot is not None:
-			self._traj.trajectory_book.release(trajectory_slot)
-		self._publish_trajectory_pool_capacity()
-		seq._buffer_slot = -1
+	def _release_completed_trajectory_slot(self, trajectory_slot) -> None:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_completed_trajectory_slot(
+			self._decode_phase_context(),
+			trajectory_slot,
+		)
 
-		# Free local index mapping.
-		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
-		# stray pops with downstream "Missing UUID" errors.
-		local_idx = release_query_book_slot(
+	def _release_completed_slot_index(self, seq, uuid: str) -> None:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_completed_slot_index(
+			self._decode_phase_context(),
+			seq,
 			uuid,
 			query_book=self.query_book,
-			table=self.seq_table,
 		)
-		if local_idx is not None:
-			if seq.assigned_rank == self.rank:
-				logging.debug(
-					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
-					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
-				)
 
-		self._maybe_emit_prefix_drain_metric()
-
+	def _completion_outlet_send(
+		self, uuid: str, seq, gathered_text: str, fallback_text: str
+	) -> None:
+		"""Send side of the completion outlet: session log and result put."""
 		# Cached/computed refer to the sequence's last prefill: computed is the
 		# prompt tokens that prefill ran, cached the ones it took from cache.
 		cached_tokens = int(seq.prefix_cached_tokens)

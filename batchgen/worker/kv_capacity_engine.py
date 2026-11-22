@@ -50,6 +50,7 @@ from batchgen.query_book import (
     QueryBook,
     QueryBookPoolCapacityError,
     make_query_book_entry,
+    release_query_book_slot,
 )
 from batchgen.worker.admission.plan import (
     StatusEdge,
@@ -2078,6 +2079,32 @@ class KVCapacityEngine:
     def _release_kda_state_slots(self, ctx, global_sequence_ids: List[int]) -> None:
         """Release Kimi-Linear KDA state independently of paged GPU KV."""
         ctx.sched.trajectories.free_kda_sequences(global_sequence_ids)
+
+    def _release_completed_trajectory_slot(self, ctx, trajectory_slot) -> None:
+        """Free a completed sequence's trajectory reservation."""
+        # Free the complete trajectory reservation on every rank. This is the
+        # only token-storage release point; multi-turn re-entry keeps the slot.
+        if trajectory_slot is not None:
+            ctx.sched.trajectories.trajectory_book.release(trajectory_slot)
+
+    def _release_completed_slot_index(self, ctx, seq, uuid: str, query_book) -> None:
+        """Free a completed sequence's buffer slot and local index."""
+        seq._buffer_slot = -1
+
+        # Free local index mapping.
+        # DIAGNOSTIC: log the pop on the owning rank so we can correlate
+        # stray pops with downstream "Missing UUID" errors.
+        local_idx = release_query_book_slot(
+            uuid,
+            query_book=query_book,
+            table=ctx.sched.seq_table,
+        )
+        if local_idx is not None:
+            if seq.assigned_rank == ctx.facts.rank:
+                logging.debug(
+                    f"Rank {ctx.facts.rank}: [LOCALMAP-POP] _report_completion popped "
+                    f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
+                )
 
     # ---- Decode KV append to host ------------------------------------------
 

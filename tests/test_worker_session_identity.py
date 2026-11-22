@@ -28,7 +28,11 @@ from tests.worker.worker_fakes import (
     attach_prefix_state,
     attach_trajectory_state,
 )
-from tests.worker_method_source import load_worker_functions, load_worker_methods
+from tests.worker_method_source import (
+    load_worker_functions,
+    load_worker_methods,
+    load_worker_shaped_methods,
+)
 
 # What the other rank contributes to the next all_gather_object.
 _PEER = {"payload": {}}
@@ -54,6 +58,22 @@ _METHODS = load_worker_methods(
         "dist": SimpleNamespace(all_gather_object=_all_gather_object),
     },
 )
+# Completion split: `_report_completion` orchestrates the worker outlet
+# pair and the two engine release methods; the engine bodies compile back in
+# worker shape so the fake drives the statements that actually run.
+_METHODS.update(load_worker_shaped_methods(
+    [
+        "_completion_outlet_read",
+        "_completion_outlet_send",
+        "_release_completed_trajectory_slot",
+        "_release_completed_slot_index",
+    ],
+    {
+        "logging": logging,
+        "time": time,
+        "release_query_book_slot": release_query_book_slot,
+    },
+))
 
 
 def _ids(length):
@@ -66,6 +86,10 @@ class _Worker:
     max_decoding_length = 64
     _admit_sequences_from_message = _METHODS["_admit_sequences_from_message"]
     _report_completion = _METHODS["_report_completion"]
+    _completion_outlet_read = _METHODS["_completion_outlet_read"]
+    _completion_outlet_send = _METHODS["_completion_outlet_send"]
+    _release_completed_trajectory_slot = _METHODS["_release_completed_trajectory_slot"]
+    _release_completed_slot_index = _METHODS["_release_completed_slot_index"]
     _gather_completed_tokens = _METHODS["_gather_completed_tokens"]
     _owns_host_kv = _METHODS["_owns_host_kv"]
     _decode_attn_tp_size = _METHODS["_decode_attn_tp_size"]

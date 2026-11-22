@@ -47,14 +47,22 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
     seq.status = SequenceStatus.COMPLETED
 
     response_queue = SimpleQueue()
-    worker = SimpleNamespace(
-        global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
-        query_book={},
-        _response_queue=response_queue,
-        _get_finish_reason=lambda _seq: "stop",
-        _publish_trajectory_pool_capacity=lambda: None,
-        _maybe_emit_prefix_drain_metric=lambda: None,
-    )
+    # Completion split: `_report_completion` reaches the engine release
+    # methods through the real delegators, which build a decode phase context,
+    # so the fake is a real-class skeleton carrying the context's inputs.
+    worker = object.__new__(BatchGenWorker)
+    worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
+    worker.query_book = {}
+    worker._response_queue = response_queue
+    worker._get_finish_reason = lambda _seq: "stop"
+    worker._publish_trajectory_pool_capacity = lambda: None
+    worker._maybe_emit_prefix_drain_metric = lambda: None
+    worker.torch_device = torch.device("cpu")
+    worker.enable_prefix_cache = False
+    worker.enable_host_kv_eviction = False
+    worker.host_kv_chunk_size = 0
+    worker.prefix_cache_debug_stats = False
+    worker.gpu_paged_kv_cache_manager = None
     attach_identity(worker, rank=0, world_size=1, local_world_size=1)
     attach_trajectory_state(worker, trajectory_book=_TrajectoryBook())
     attach_prefix_state(worker)

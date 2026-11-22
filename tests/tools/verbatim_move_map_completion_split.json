@@ -1,0 +1,49 @@
+{
+  "entries": [
+    {
+      "file": "batchgen/batchgen_worker.py",
+      "class": "BatchGenWorker",
+      "functions": ["_completion_outlet_read"],
+      "base": {"function": "_report_completion", "statements": [0, 6]},
+      "new_omitted_statements": [
+        "return (seq, fallback_text, trajectory_slot)"
+      ]
+    },
+    {
+      "file": "batchgen/worker/kv_capacity_engine.py",
+      "class": "KVCapacityEngine",
+      "functions": ["_release_completed_trajectory_slot"],
+      "base": {
+        "file": "batchgen/batchgen_worker.py",
+        "class": "BatchGenWorker",
+        "function": "_report_completion",
+        "statements": [6, 7]
+      },
+      "attribute_rewrites": {
+        "self._traj": "ctx.sched.trajectories"
+      }
+    },
+    {
+      "file": "batchgen/worker/kv_capacity_engine.py",
+      "class": "KVCapacityEngine",
+      "functions": ["_release_completed_slot_index"],
+      "base": {
+        "file": "batchgen/batchgen_worker.py",
+        "class": "BatchGenWorker",
+        "function": "_report_completion",
+        "statements": [8, 11]
+      },
+      "attribute_rewrites": {
+        "self.query_book": "query_book",
+        "self.seq_table": "ctx.sched.seq_table",
+        "self.rank": "ctx.facts.rank"
+      }
+    },
+    {
+      "file": "batchgen/batchgen_worker.py",
+      "class": "BatchGenWorker",
+      "functions": ["_completion_outlet_send"],
+      "base": {"function": "_report_completion", "statements": [12, 18]}
+    }
+  ]
+}

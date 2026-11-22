@@ -22,6 +22,7 @@ from batchgen.query_book import release_query_book_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.admission.plan import StatusEdge, Transition, TransitionPlan, apply_or_raise
 from tests.worker.worker_fakes import attach_identity, attach_prefix_state, attach_trajectory_state
+from tests.worker_method_source import load_worker_shaped_methods
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
@@ -55,6 +56,18 @@ exec(compile(ast.fix_missing_locations(ast.Module(
     ],
     type_ignores=[],
 )), str(WORKER), "exec"), _NAMESPACE)
+# Completion split: `_report_completion` now orchestrates the outlet pair
+# (worker) and the two engine release methods; the engine bodies compile back
+# in worker shape so the fake drives the statements that actually run.
+_NAMESPACE.update(load_worker_shaped_methods(
+    [
+        "_completion_outlet_read",
+        "_completion_outlet_send",
+        "_release_completed_trajectory_slot",
+        "_release_completed_slot_index",
+    ],
+    _NAMESPACE,
+))
 
 
 class _Worker:
@@ -65,6 +78,10 @@ class _Worker:
     _response_queue = None
 
     _report_completion = _NAMESPACE["_report_completion"]
+    _completion_outlet_read = _NAMESPACE["_completion_outlet_read"]
+    _completion_outlet_send = _NAMESPACE["_completion_outlet_send"]
+    _release_completed_trajectory_slot = _NAMESPACE["_release_completed_trajectory_slot"]
+    _release_completed_slot_index = _NAMESPACE["_release_completed_slot_index"]
     _maybe_emit_prefix_drain_metric = _NAMESPACE["_maybe_emit_prefix_drain_metric"]
     _trajectory_restore_fields = _NAMESPACE["_trajectory_restore_fields"]
     _admit_sequences_from_message = _NAMESPACE["_admit_sequences_from_message"]
