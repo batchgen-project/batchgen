@@ -155,8 +155,8 @@ class AttnWrapperBase(BaseModuleWrapper):
         context = _G.glm5_dispatch_trace_context or {}
         logging.warning(
             "[GLM5_DISPATCH_TRACE] rank=%s trace=%s kind=%s path=%s "
-            "layer=%s bsz=%s batch_ids=%s global_ids=%s debug_dsa=%s "
-            "debug_moe=%s debug_moe_router=%s reason=%s count=%s",
+            "layer=%s bsz=%s batch_ids=%s global_ids=%s "
+            "debug_moe_router=%s reason=%s count=%s",
             context.get("rank", "?"),
             trace_id,
             kind,
@@ -165,8 +165,6 @@ class AttnWrapperBase(BaseModuleWrapper):
             bsz,
             context.get("batch_ids", "-"),
             context.get("global_ids", "-"),
-            context.get("glm5_dsa_mode", "-"),
-            context.get("glm5_moe_mode", "-"),
             context.get("glm5_moe_router_mode", "-"),
             reason,
             counts[counter_key],

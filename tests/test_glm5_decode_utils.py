@@ -776,7 +776,7 @@ def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker._graph = make_graph_state()
     worker._graph.glm5_whole_model_graph_unavailable_reason = None
     worker._graph.cuda_graph_manager = None
@@ -798,8 +798,6 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         "batchgen_debug",
         {
             "glm5_dispatch_trace": True,
-            "glm5_dsa_mode": "eager",
-            "glm5_moe_mode": "graph",
         },
         raising=False,
     )
@@ -823,8 +821,6 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         "batch_ids": "batch-a",
         "global_ids": "3,7",
         "bsz": 2,
-        "glm5_dsa_mode": "eager",
-        "glm5_moe_mode": "graph",
         "glm5_moe_router_mode": "-",
     }
 
@@ -988,15 +984,13 @@ def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity():
     ) == 16889
 
 
-def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
+def test_glm5_layer_graph_compare_eager_reference_runs_on_a_copy_of_the_debug_values(
     monkeypatch,
 ):
     from batchgen.batchgen_worker import BatchGenWorker
 
     original_debug = {
         "glm5_layer_graph_compare": True,
-        "glm5_dsa_mode": "graph",
-        "glm5_moe_mode": "graph",
         "glm5_moe_router_mode": "custom",
     }
     monkeypatch.setattr(
@@ -1010,22 +1004,17 @@ def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
     with worker._glm5_force_segmented_graph_eager():
         active_debug = AttnWrapperBase.batchgen_debug
         assert active_debug is not original_debug
-        assert active_debug["glm5_layer_graph_compare"] is True
-        assert active_debug["glm5_dsa_mode"] == "eager"
-        assert active_debug["glm5_moe_mode"] == "eager"
-        assert active_debug["glm5_moe_router_mode"] == "custom"
-        assert original_debug["glm5_dsa_mode"] == "graph"
-        assert original_debug["glm5_moe_mode"] == "graph"
+        # The per-layer graph modes are retired: nothing is forced, the eager
+        # re-run only gets its own copy.
+        assert active_debug == original_debug
 
     assert AttnWrapperBase.batchgen_debug is original_debug
 
 
-def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
+def test_glm5_composite_fallback_forward_runs_on_a_copy_of_the_debug_values(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
     original_debug = {
-        "glm5_dsa_mode": "graph",
-        "glm5_moe_mode": "graph",
         "glm5_moe_router_mode": "custom",
     }
     seen_debug = {}
@@ -1052,15 +1041,12 @@ def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
     worker.model = FakeModel()
 
     out = worker._glm5_decode_model_forward(torch.zeros(2, 1, dtype=torch.long))
 
     assert out.logits.shape == (2, 1, 4)
-    assert seen_debug["glm5_dsa_mode"] == "eager"
-    assert seen_debug["glm5_moe_mode"] == "eager"
-    assert seen_debug["glm5_moe_router_mode"] == "custom"
+    assert seen_debug == {"glm5_moe_router_mode": "custom"}
     assert AttnWrapperBase.batchgen_debug is original_debug
 
 
@@ -1085,7 +1071,7 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker._current_decode_max_rank_batch_size = 1
     manager = FakeManager()
     worker._graph = make_graph_state()
@@ -1136,7 +1122,7 @@ def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
         disable_cuda_graphs=False,
         enable_cuda_graph=True,
     )
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker._graph = make_graph_state()
     worker._graph.cuda_graph_manager = FakeManager()
     worker._graph.whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
@@ -1144,7 +1130,7 @@ def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
     worker._graph.glm5_whole_model_graph_failed_buckets = set()
     worker._graph.glm5_whole_model_graph_signature = ("same",)
     worker._graph.glm5_whole_model_graph_unavailable_reason = None
-    worker._batchgen_debug = {"glm5_whole_model_graph_compare": True}
+    worker._debug_state_values = {"glm5_whole_model_graph_compare": True}
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -1173,7 +1159,7 @@ def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker._current_decode_max_rank_batch_size = 3
     manager = FakeManager()
     worker._graph = make_graph_state()
@@ -1333,7 +1319,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker.model_config = types.SimpleNamespace(max_position_embeddings=512, index_topk=8)
     worker.global_batch = None
     worker.torch_device = torch.device("cpu")
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker.model = types.SimpleNamespace(
         model=types.SimpleNamespace(
             layers=[FakeLayer(), FakeLayer(has_indexer=False)],
@@ -1531,11 +1517,11 @@ def test_glm5_graph_path_log_flag_uses_batch_debug_only(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
     worker = object.__new__(BatchGenWorker)
-    worker._batchgen_debug = {"glm5_graph_path_log": True}
+    worker._debug_state_values = {"glm5_graph_path_log": True}
 
     assert worker._glm5_graph_path_log_requested_for_current_batch()
 
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     assert not worker._glm5_graph_path_log_requested_for_current_batch()
 
     # S6c: the retired env var is not honored.
@@ -1557,7 +1543,7 @@ def test_glm5_graph_path_log_default_skips_hot_path_state(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     monkeypatch.setattr(
         worker,
         "_glm5_whole_graph_path_state",
@@ -1579,7 +1565,7 @@ def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
     worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
+    worker._debug_state_values = None
     worker._graph = make_graph_state()
     worker._graph.glm5_whole_model_graph_unavailable_reason = None
     worker._graph.cuda_graph_manager = types.SimpleNamespace(

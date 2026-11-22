@@ -1690,15 +1690,13 @@ class BatchGenWorker:
 		counts_text = ",".join(f"{key}={counts[key]}" for key in sorted(counts))
 		logging.warning(
 			"[GLM5_DISPATCH_TRACE] rank=%s summary reason=%s trace=%s "
-			"batch_ids=%s global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s counts=%s",
+			"batch_ids=%s global_ids=%s bsz=%s counts=%s",
 			context.get("rank", self.rank),
 			reason,
 			getattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None) or "unknown",
 			context.get("batch_ids", "-"),
 			context.get("global_ids", "-"),
 			context.get("bsz", "-"),
-			context.get("glm5_dsa_mode", "-"),
-			context.get("glm5_moe_mode", "-"),
 			counts_text,
 		)
 
@@ -1730,13 +1728,10 @@ class BatchGenWorker:
 			"batch_ids": ",".join(batch_ids) if batch_ids else "-",
 			"global_ids": ",".join(global_ids) if global_ids else "-",
 			"bsz": len(seqs),
-			"glm5_dsa_mode": debug.get("glm5_dsa_mode", "-"),
-			"glm5_moe_mode": debug.get("glm5_moe_mode", "-"),
 			"glm5_moe_router_mode": debug.get("glm5_moe_router_mode", "-"),
 		}
 		trace_id = (
 			f"batches={context['batch_ids']}|global_ids={context['global_ids']}|"
-			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}|"
 			f"router={context['glm5_moe_router_mode']}"
 		)
 		if (
@@ -1751,15 +1746,12 @@ class BatchGenWorker:
 			GLM5AttnWrapper.glm5_dispatch_seen = set()
 			logging.warning(
 				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
-				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s "
-				"debug_moe_router=%s",
+				"global_ids=%s bsz=%s debug_moe_router=%s",
 				self.rank,
 				trace_id,
 				context["batch_ids"],
 				context["global_ids"],
 				context["bsz"],
-				context["glm5_dsa_mode"],
-				context["glm5_moe_mode"],
 				context["glm5_moe_router_mode"],
 			)
 		else:
@@ -13005,10 +12997,11 @@ class BatchGenWorker:
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
+		# The per-layer graph modes this used to switch off are retired, so
+		# nothing is forced any more: the eager re-run only gets its own copy
+		# of the bound debug values, restored afterwards.
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
-		debug["glm5_dsa_mode"] = "eager"
-		debug["glm5_moe_mode"] = "eager"
 		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=debug)
 		try:
 			yield

@@ -49,8 +49,7 @@ def test_create_batch_request_preserves_debug_and_sampling_fields():
         top_p=1.0,
         top_k=5,
         batchgen_debug={
-            "glm5_dsa_mode": "eager",
-            "glm5_moe_mode": "graph",
+            "glm5_graph_path_log": True,
         },
     )
 
@@ -65,9 +64,9 @@ def test_create_batch_request_preserves_debug_and_sampling_fields():
     assert batch.temperature == 0.0
     assert batch.top_p == 1.0
     assert batch.top_k == 5
+    # Carried as sent so that admission can refuse it by name.
     assert batch.batchgen_debug == {
-        "glm5_dsa_mode": "eager",
-        "glm5_moe_mode": "graph",
+        "glm5_graph_path_log": True,
     }
 
 
