@@ -117,6 +117,7 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.sched.prefix": "self._prefix",
         "ctx.gpu_kv": "self.gpu_paged_kv_cache_manager",
         "ctx.host_view": "getattr(self, 'host_paged_kv_worker_view', None)",
+        "ctx.host_view_aux": "getattr(self, 'host_paged_kv_worker_view_aux', None)",
         "ctx.core_engine": "self.core_engine",
         "ctx.gpu_resident": "self._sequences_with_gpu_kv",
         "ctx.prefix_coordinator": "self.prefix_cache_coordinator",

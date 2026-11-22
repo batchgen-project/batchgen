@@ -45,6 +45,7 @@ class DecodePhaseContext:
     prefix_runtime: Optional[Any]
     chunk_sizer: Optional[Any]
     parallel_manager: Optional[Any] = None
+    host_view_aux: Optional[Any] = None
 
 
 @dataclass(frozen=True)
