@@ -11699,7 +11699,7 @@ class BatchGenWorker:
 				raise RuntimeError(
 					f"[SCHED_INVARIANT] boundary extension snapshot failed: "
 					f"{type(exc).__name__}: {exc}"
-				)
+				) from exc
 			extension_preflight_ok = self._collective_gpu_kv_allocation_preflight(
 				local_extension_pages, local_extension_free
 			)
@@ -11801,7 +11801,7 @@ class BatchGenWorker:
 				raise RuntimeError(
 					f"[SCHED_INVARIANT] boundary load snapshot failed: "
 					f"{type(exc).__name__}: {exc}"
-				)
+				) from exc
 			load_preflight_ok = self._collective_gpu_kv_allocation_preflight(
 				local_load_pages, local_load_free
 			)
