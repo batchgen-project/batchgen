@@ -11,8 +11,8 @@ BUILD_ARCH env var controls the arch suffix in wheel names:
 
 import os
 
-__version__ = "0.6.1"
-version_info = (0, 6, 1)
+__version__ = "0.6.2"
+version_info = (0, 6, 2)
 
 # Arch suffix for wheel naming (PEP 440 local version)
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")

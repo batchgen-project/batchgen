@@ -157,7 +157,8 @@ struct FusedGateContext {
     torch::Tensor weight_t;          // [E, K_dim] BF16, kept contiguous (no transpose)
     torch::Tensor router_bias;       // [E] BF16, kept alive
     CUtensorMap tma_desc_b;          // cached TMA descriptor for weight
-    CUtensorMap tma_desc_a;          // cached TMA descriptor for input (graph mode)
+    CUtensorMap tma_desc_a;          // TMA descriptor of the pinned input buffer (graph mode)
+    torch::Tensor pinned_input;      // the warmed base buffer, kept alive with its descriptor
     PFN_cuTensorMapEncodeTiled encode_func;
     int K_dim;
     int E;
@@ -165,9 +166,9 @@ struct FusedGateContext {
     int smem_bytes;
     bool has_bias;
     bool smem_attr_set;
-    bool has_cached_tma_a;           // true if tma_desc_a is valid
-    void* cached_input_ptr;          // data_ptr of cached input (for validation)
-    int cached_input_rows;           // declared rows in cached TMA desc (full buffer extent)
+    bool has_cached_tma_a;           // true once fused_gate_warmup pinned a base buffer
+    void* cached_input_ptr;          // data_ptr of the pinned base buffer
+    int cached_input_rows;           // rows of the pinned base buffer (full extent)
 };
 
 int64_t create_fused_gate_context(
@@ -233,6 +234,9 @@ void fused_gate_warmup(int64_t ctx_ptr, torch::Tensor base_buffer) {
     ctx->tma_desc_a = make_2d_tma_desc_bf16(
         reinterpret_cast<__nv_bfloat16*>(ptr),
         rows, ctx->K_dim, BLOCK_M, BLOCK_K, ctx->encode_func);
+    // The descriptor names this buffer's address and extent, so the context
+    // owns a reference: the buffer cannot be freed while it may be reused.
+    ctx->pinned_input = base_buffer;
     ctx->has_cached_tma_a = true;
     ctx->cached_input_ptr = ptr;
     ctx->cached_input_rows = rows;
@@ -261,16 +265,22 @@ torch::Tensor fused_router_forward(
 
     void* input_ptr = hidden_states.data_ptr();
     const int input_rows = hidden_states.size(0);
-    if (!ctx->has_cached_tma_a ||
-        ctx->cached_input_ptr != input_ptr ||
-        input_rows > ctx->cached_input_rows) {
-        ctx->tma_desc_a = make_2d_tma_desc_bf16(
-            reinterpret_cast<__nv_bfloat16*>(input_ptr),
-            input_rows, ctx->K_dim, BLOCK_M, BLOCK_K, ctx->encode_func);
-        ctx->has_cached_tma_a = true;
-        ctx->cached_input_ptr = input_ptr;
-        ctx->cached_input_rows = input_rows;
-    }
+    // A descriptor declares an address and an extent. Only the buffer pinned
+    // by fused_gate_warmup may be served from the stored descriptor (its views
+    // start at the same address and are no longer than it, and the context
+    // keeps it alive). Any other input gets a descriptor of exactly its own
+    // extent for this call: an input is a transient tensor, and a descriptor
+    // remembered from an earlier one would declare rows past a smaller tensor
+    // later allocated at the same address, so the tile loads would read
+    // outside the allocation.
+    const bool input_is_pinned = ctx->has_cached_tma_a &&
+                                 ctx->cached_input_ptr == input_ptr &&
+                                 input_rows <= ctx->cached_input_rows;
+    const CUtensorMap tma_desc_a = input_is_pinned
+        ? ctx->tma_desc_a
+        : make_2d_tma_desc_bf16(
+              reinterpret_cast<__nv_bfloat16*>(input_ptr),
+              input_rows, ctx->K_dim, BLOCK_M, BLOCK_K, ctx->encode_func);
 
     const __nv_bfloat16* bias_ptr = ctx->has_bias
         ? reinterpret_cast<const __nv_bfloat16*>(ctx->router_bias.data_ptr())
@@ -284,7 +294,7 @@ torch::Tensor fused_router_forward(
         TOTAL_THREADS,
         ctx->smem_bytes,
         stream>>>(
-            ctx->tma_desc_a,
+            tma_desc_a,
             ctx->tma_desc_b,
             bias_ptr,
             logits.data_ptr<float>(),
