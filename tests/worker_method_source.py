@@ -22,7 +22,7 @@ from __future__ import annotations
 import ast
 import copy
 import pathlib
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 WORKER_SOURCE = (
     pathlib.Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
@@ -87,7 +87,90 @@ DELEGATED_ENGINES = (
 
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
     args = node.args.args
-    return len(args) >= 2 and args[0].arg == "self" and args[1].arg == "worker"
+    return (
+        len(args) >= 2
+        and args[0].arg == "self"
+        and args[1].arg in {"worker", "ctx"}
+    )
+
+
+def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
+    """Map a converted engine context path back to the worker spelling."""
+    text = ast.unparse(node)
+    paths = {
+        "ctx.facts.rank": "self.rank",
+        "ctx.facts.world_size": "self.world_size",
+        "ctx.facts.local_rank": "self.local_rank",
+        "ctx.facts.local_world_size": "self.local_world_size",
+        "ctx.facts.rank_ctx": "self.rank_ctx",
+        "ctx.facts.device": "self.torch_device",
+        "ctx.facts.page_size": "self.PAGE_SIZE",
+        "ctx.facts.decision_interval": "self.DECISION_INTERVAL",
+        "ctx.facts.enable_prefix_cache": "self.enable_prefix_cache",
+        "ctx.facts.enable_host_kv_eviction": "self.enable_host_kv_eviction",
+        "ctx.facts.host_kv_chunk_size": "self.host_kv_chunk_size",
+        "ctx.sched.pool": "self.global_batch",
+        "ctx.sched.seq_table.uuid_to_local": "self._uuid_to_local_map",
+        "ctx.sched.seq_table.local_to_uuid": "self._local_to_uuid_map",
+        "ctx.sched.trajectories": "self._traj",
+        "ctx.gpu_kv": "self.gpu_paged_kv_cache_manager",
+        "ctx.host_view": "getattr(self, 'host_paged_kv_worker_view', None)",
+        "ctx.core_engine": "self.core_engine",
+        "ctx.gpu_resident": "self._sequences_with_gpu_kv",
+        "ctx.prefix_coordinator": "self.prefix_cache_coordinator",
+        "ctx.prefix_runtime": "self.prefix_cache_runtime_config",
+        "ctx.chunk_sizer": "self.adaptive_chunk_sizer",
+    }
+    if text == "ctx.facts.attn_tp_size":
+        return ast.parse("self._decode_attn_tp_size()", mode="eval").body
+    replacement = paths.get(text)
+    if replacement is None:
+        return None
+    return ast.parse(replacement, mode="eval").body
+
+
+class _ContextToWorker(ast.NodeTransformer):
+    def visit_Attribute(self, node):
+        node = self.generic_visit(node)
+        return _context_attr_worker_expr(node) or node
+
+    def visit_Name(self, node):
+        if node.id == "max_rank_bsz" and isinstance(node.ctx, ast.Load):
+            return ast.parse("getattr(self, '_decode_padding_bsz', 0) or 0", mode="eval").body
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "IndexManager"
+            and len(node.args) == 2
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+            and node.args[0].func.id == "IndexLookupRequest"
+        ):
+            # The engine builds the lookup request from the context; the worker
+            # spelling of the same lookup is its index helper of that name.
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr="_" + node.func.attr,
+                    ctx=ast.Load(),
+                ),
+                args=[node.args[1]],
+                keywords=[],
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "ctx"
+        ):
+            node.args.pop(0)
+        return node
 
 
 def load_worker_methods(
@@ -226,18 +309,22 @@ def load_prefill_engine_methods(
 
 
 def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
-    """An engine method ``(self, worker, ...)`` back in its worker shape.
+    """Convert an engine method ``(self, worker/ctx, ...)`` to worker shape.
 
-    The S5/S8 engines take the worker as an explicit collaborator and rebind
-    ``self = worker`` as the first statement after the docstring, so the moved
-    body is statement for statement the old worker method. Dropping exactly
-    that parameter and that one statement gives the original method's AST,
-    which is what a structural pin written against the worker method reads.
+    Older seam methods take the worker as an explicit collaborator and rebind
+    ``self = worker``. AS3.1 methods take a frozen context, so their context
+    paths are mapped back to the worker spelling for source-pinned tests.
     """
     method = copy.deepcopy(node)
     args = method.args.args
-    if len(args) < 2 or args[0].arg != "self" or args[1].arg != "worker":
-        raise AssertionError(f"{node.name} is not an engine method (self, worker, ...)")
+    if len(args) < 2 or args[0].arg != "self" or args[1].arg not in {"worker", "ctx"}:
+        raise AssertionError(f"{node.name} is not an engine method (self, worker/ctx, ...)")
+    if args[1].arg == "ctx":
+        del args[1]
+        if node.name == "_make_boundary_decision_request":
+            del args[-1]
+        method.body = _ContextToWorker().visit(method).body
+        return method
     del args[1]
     rebinds = [
         index for index, stmt in enumerate(method.body)
@@ -279,10 +366,9 @@ def step_observability_method_names() -> set:
 def worker_shaped_method_node(name: str) -> ast.FunctionDef:
     """The body a worker method runs, in the worker's own shape.
 
-    For a method S8/S7/S9/S10a moved into ``RankSyncEngine`` / ``StepObservabilityEngine``
-    / ``WorkerLifecycleEngine`` / ``KVCapacityEngine``
-    the worker keeps a canonical delegator; the statements that run are the
-    engine's, so this returns the engine method converted back by
+    For a method moved into one of the worker seam engines, the worker keeps a
+    canonical delegator. The statements that run are the engine's, so this
+    returns the engine method converted back by
     :func:`engine_method_as_worker_method`. Every other name resolves to the
     worker class method itself.
     """
@@ -302,8 +388,7 @@ def delegated_method_source(name: str) -> str:
     Text pins that used to slice the worker file keep their assertions
     byte-identical by reading the engine's own source segment (located by
     AST, so no indentation or delimiter assumptions). The segment is the
-    engine method as written: its ``worker`` parameter and the ``self =
-    worker`` rebinding are part of it.
+    engine method as written, including its seam parameter.
     """
     for source, class_name in DELEGATED_ENGINES:
         engine = _class_methods(source, class_name)
