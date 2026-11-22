@@ -11492,6 +11492,13 @@ class BatchGenWorker:
 		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
+			# The rows in decode before any status of this boundary changes.
+			# The completion update below moves only completed rows out of
+			# decode, so the rows remaining in decode for the host page
+			# release are these minus the completed ones.
+			in_decode_before = self.global_batch.get_sequences_by_status(
+				SequenceStatus.IN_DECODE
+			)
 			self._update_batch_status(
 				completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
 			)
@@ -11509,13 +11516,12 @@ class BatchGenWorker:
 				gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
 				if gpu_allocated:
 					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-				# decisions.active_uuids is the decode set minus the completed
-				# rows just moved to COMPLETED above; rows this decision will
-				# evict or put on hold later in this boundary are still in
-				# decode at this point.
+				completed_set = set(completed_uuids)
 				self._release_host_kv_pages_for_batch(
 					my_completed,
-					remaining_decode_uuids=decisions.active_uuids,
+					remaining_decode_uuids=[
+						u for u in in_decode_before if u not in completed_set
+					],
 				)
 
 			# All-ranks: zero scalar counters so downstream reads (e.g.
