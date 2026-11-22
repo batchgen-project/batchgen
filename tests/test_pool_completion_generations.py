@@ -100,6 +100,11 @@ def _load_create_batch_handler():
         "build_batch_object_from_create_request": (
             lambda **kwargs: SimpleNamespace(**kwargs)
         ),
+        # The real refusal of retired batchgen_debug keys (io_struct); these
+        # scenarios send none, so it answers None.
+        "retired_batchgen_debug_error": (
+            _load_io_struct_module().retired_batchgen_debug_error
+        ),
     }
     module = ast.Module(body=[node], type_ignores=[])
     exec(compile(module, str(HTTP_SOURCE), "exec"), namespace)
@@ -585,7 +590,7 @@ def test_batch_admission_is_refused_while_the_pool_is_not_serving(pool_state):
     )))
 
     with pytest.raises(_FakeHTTPException) as excinfo:
-        asyncio.run(create_batch(request, body=SimpleNamespace()))
+        asyncio.run(create_batch(request, body=SimpleNamespace(batchgen_debug=None)))
 
     assert excinfo.value.status_code == 503
     assert pool_state in str(excinfo.value.detail)
@@ -608,7 +613,8 @@ def test_batch_admission_passes_the_state_gate_while_serving():
 
     with pytest.raises(_FakeHTTPException) as excinfo:
         asyncio.run(create_batch(
-            request, body=SimpleNamespace(input_file_id="file-missing")
+            request,
+            body=SimpleNamespace(input_file_id="file-missing", batchgen_debug=None),
         ))
 
     # Past the state gate, into the pre-existing unknown-input-file rejection.

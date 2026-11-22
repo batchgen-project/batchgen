@@ -199,6 +199,16 @@ _PLAN = load_prefill_engine_methods(
     },
 )
 
+# The worker's server-mode accessors the planning seam now reads its token
+# cap through (one cap per server, fixed by the prefill MoE mode).
+_CAP = load_worker_methods(
+    ["_server_prefill_moe_mode", "_server_prefill_token_cap"],
+    {
+        "Optional": Optional,
+        "logging": SimpleNamespace(info=lambda *a, **k: None),
+    },
+)
+
 
 class _PlanWorker:
     def __init__(self, *, budget, attn_tp=1, token_cap=10**6):
@@ -209,6 +219,8 @@ class _PlanWorker:
             )
         )
         self.parallel_manager = SimpleNamespace()
+        # Startup resolved the server prefill mode: every wave is streamed.
+        self._server_prefill_moe_mode_resolved = ("streamed",)
         self._prefill_prefix_kv_budget_bytes = budget
         self._attn_tp = attn_tp
         self.kv_config_calls = 0
@@ -221,7 +233,19 @@ class _PlanWorker:
         return temporary_gpu_kv_config(PROFILE, full_seq_lengths)
 
     def _plan_prefill_micro_batches(self, *args):
-        return _PLAN["_plan_prefill_micro_batches"](self, *args)
+        # Mirror the worker's delegator: it resolves the server mode's one
+        # prefill cap and hands it to the engine explicitly.
+        return _PLAN["_plan_prefill_micro_batches"](
+            self, *args, token_cap=self._server_prefill_token_cap()
+        )
+
+    # The real once-per-process mode read and its token-cap accessor: the
+    # fake resolves the mode at construction, so no manager is consulted.
+    def _server_prefill_moe_mode(self):
+        return _CAP["_server_prefill_moe_mode"](self)
+
+    def _server_prefill_token_cap(self):
+        return _CAP["_server_prefill_token_cap"](self)
 
 
 PAGE_BYTES = gpu_kv_page_bytes(temporary_gpu_kv_config(PROFILE, [1]))

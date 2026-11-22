@@ -41,6 +41,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from batchgen.models.skeleton_sharing import share_state_dict_on_device
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PSM = ROOT / "batchgen" / "models" / "glm" / "glm5" / "Parallel_Strategy_Manager.py"
@@ -268,6 +270,8 @@ def _psm(*, reuse=True, resident_split=None):
         Glm5MoE=_Glm5MoEStub,
         Glm5ForCausalLM=_CausalLM,
         _synchronize_prefill_preloads=lambda: None,
+        # The lifted generic upload core (batchgen.models.skeleton_sharing).
+        share_state_dict_on_device=share_state_dict_on_device,
     )
     for name in _METHODS:
         member = getattr(cls, name)

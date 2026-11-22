@@ -131,7 +131,16 @@ def _worker_methods(names, globals_=None):
         scope = dict(namespace)
         exec(compile(module, str(source), "exec"), scope)
         function = scope[name]
-        if name in _MOVED:
+        if name == "_plan_prefill_pool_wave":
+            # Mirror the worker's delegator: it resolves the server mode's
+            # one prefill cap and hands it to the engine explicitly.
+            def worker_method(worker, *args, _function=function, **kwargs):
+                kwargs.setdefault(
+                    "token_cap", worker._server_prefill_token_cap()
+                )
+                return _function(None, worker, *args, **kwargs)
+            function = worker_method
+        elif name in _MOVED:
             def worker_method(worker, *args, _function=function, **kwargs):
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
@@ -385,6 +394,9 @@ def _plan_worker(
             "_trajectory_commit_requested",
             "_owns_host_kv",
             "_debug_flag_enabled",
+            # The server's prefill token cap, fixed by its prefill MoE mode.
+            "_server_prefill_token_cap",
+            "_server_prefill_moe_mode",
             # The plan-time restore decision every return path settles; with
             # no attachment it has nothing to decline.
             "_settle_trajectory_restore_plan",
@@ -430,6 +442,9 @@ def _plan_worker(
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
+        # The wave _begin_prefill_wave resolved, on a streamed server.
+        _prefill_wave_uuids=("wave",),
+        _server_prefill_moe_mode_resolved=("streamed",),
     )
     attach_identity(
         worker,

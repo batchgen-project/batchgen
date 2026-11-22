@@ -283,6 +283,8 @@ def test_pre_readiness_sizing_freezes_the_pool_in_every_mode(persistent):
         Init=lambda *args: events.append("core"),
         _ensure_pynccl_communicator=lambda: events.append("comm"),
         _persistent_phase_enabled=lambda: persistent,
+        # Startup resolves the empty wave's debug flags before the key.
+        _begin_prefill_wave=lambda uuids: None,
         _desired_phase_key=lambda phase: SimpleNamespace(prefill_moe_mode="streamed"),
         _max_decode_rank_bsz=lambda: 8,
         _load_decode_model=lambda *args, **kwargs: events.append("decode"),
@@ -344,6 +346,8 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         _transition_phase=lambda key, **kwargs: (events.append(key.phase) or True, False),
         set_phase=lambda phase: None, _install_prefill_weight_copy_pipeline=lambda _: None,
         _desired_phase_key=lambda phase: PhaseKey(phase, "streamed", ()),
+        # The server prefill mode the builder's one key path derives from.
+        _server_prefill_moe_mode=lambda: "streamed",
         _max_decode_rank_bsz=lambda: 8,
         _check_decode_width_within_graph_buckets=lambda width: events.append(
             ("width_check", width)),

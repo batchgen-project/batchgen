@@ -98,6 +98,7 @@ def _scheduler(tmp_path, lines, max_decoding_length=None):
             temperature=None,
             top_p=None,
             top_k=None,
+            batchgen_debug=None,
         ),
         load_metadata=lambda file_id: {"id": file_id},
         update_batch_status=lambda batch_id, status, **kw: updates.append(

@@ -158,7 +158,8 @@ def test_scheduler_fails_the_batch_before_rendering(tmp_path):
     scheduler.storage = SimpleNamespace(
         files_dir=tmp_path,
         load_batch=lambda batch_id: SimpleNamespace(
-            status=bs.BatchStatus.VALIDATING, input_file_id=input_id),
+            status=bs.BatchStatus.VALIDATING, input_file_id=input_id,
+            batchgen_debug=None),
         load_metadata=lambda file_id: {"id": file_id},
         update_batch_status=lambda batch_id, status, **kw: updates.append(
             (status, kw.get("error"))),

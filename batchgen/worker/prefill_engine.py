@@ -138,6 +138,8 @@ class PrefillEngine:
         seq_lengths: List[int],
         full_seq_lengths: List[int],
         compute_cached_tokens: List[int],
+        *,
+        token_cap: int,
     ) -> Tuple[List[Tuple[int, int]], int, bool]:
         """Build the one authoritative prepacked-forward plan for local rows.
 
@@ -152,10 +154,8 @@ class PrefillEngine:
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
-        token_cap = (
-            self.engine_config.Module_Batching_Config
-            .prefill_micro_batch_token_cap
-        )
+        # token_cap: the server mode's one prefill cap, resolved by the
+        # worker's delegator and handed over explicitly.
         use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
         single_sequence_only = (
             token_cap > 0
@@ -654,7 +654,7 @@ class PrefillEngine:
             return "serving_group_is_not_the_owning_group"
         return None
 
-    def _plan_prefill_pool_wave(self, worker, uuids, prefix_states):
+    def _plan_prefill_pool_wave(self, worker, uuids, prefix_states, *, token_cap):
         """Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
         the prefill phase (`_construct_prefill_pool`), after configure_prefill
         settles the device layout.
@@ -718,8 +718,11 @@ class PrefillEngine:
         page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
         geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
         with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-        batching = self.engine_config.Module_Batching_Config
-        chunk_tokens = int(batching.prefill_micro_batch_token_cap)
+        # Planned before this wave's phase transition (the live phase may still
+        # be decode) and on this group's subset of the wave: the cap is the
+        # server's, the one every wave and every group runs under, resolved by
+        # the worker's delegator and handed over explicitly.
+        chunk_tokens = token_cap
         state_slots = self._prefill_pool_free_state_slots()
         # M3 Slice 3: the wave's trajectory re-entry hits, derived from
         # replicated data so every rank of the group has the same set, plus
@@ -2086,7 +2089,7 @@ class PrefillEngine:
 
         return new_tokens
 
-    def prefill_prepacked(self, worker, batch: list[int]):
+    def prefill_prepacked(self, worker, batch: list[int], *, token_cap: int):
         """
         Handle prefill for a batch using prepack optimization.
 
@@ -2223,8 +2226,9 @@ class PrefillEngine:
 
         # Split sequences into micro-batches based on TOKEN count (not sequence count)
         # This prevents OOM when sequences have varying lengths
-        # Token cap is set by planner in config, worker reads from config (no hardcoded values)
-        MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+        # The planner sets the cap per prefill mode; the server's mode picks
+        # it, and the worker's delegator hands it over explicitly.
+        MAX_TOKENS_PER_MICRO_BATCH = token_cap
         num_sequences = prepack_meta.num_original_sequences
         seq_lengths_list = prepack_meta.original_seq_lengths
 
@@ -3686,7 +3690,9 @@ class PrefillEngine:
 
         return prefill_batch
 
-    def _config_prefill_for_batch(self, worker, prefill_uuids: List[str]) -> None:
+    def _config_prefill_for_batch(
+        self, worker, prefill_uuids: List[str], *, token_cap: int
+    ) -> None:
         """Configure prefill phase for a batch of sequences."""
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
@@ -3702,8 +3708,6 @@ class PrefillEngine:
         ]
         prefill_debug = self._phase_prefill_debug
         k3_prefill_profile = self._phase_k3_prefill_profile
-        resident_handoff = self._phase_resident_handoff
-        resident_token_cap = self._phase_resident_token_cap
         persistent = self._persistent_phase_enabled()
         if not persistent:
             self._request_phase_instance_reuse()
@@ -3746,12 +3750,6 @@ class PrefillEngine:
         if phase_changed and not resumed:
             self._log_phase_memory_ledger("after_configure_prefill")
         if phase_changed:
-            if resident_handoff:
-                self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-                    resident_token_cap
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(self.torch_device)
             self.set_phase("prefill")
             if self.enable_prefix_cache:
                 self._measure_prefill_prefix_kv_budget()
@@ -3776,10 +3774,6 @@ class PrefillEngine:
                 for seq in prefill_sequences
                 if self._owns_local_sequence(seq)
             ]
-            token_cap = (
-                self.engine_config.Module_Batching_Config
-                .prefill_micro_batch_token_cap
-            )
             use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
             predicted_batches, _ = build_prefill_micro_batches(
                 local_lengths,

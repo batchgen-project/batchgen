@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from batchgen.models.glm.glm5.releases import SPARSE_PREFILL_MODEL_TYPES
+from batchgen.models.skeleton_sharing import share_state_dict_on_device
 from batchgen.models.wrappers import AttnWrapperBase, phase_state
 from batchgen.phase_lifecycle import (
     AdmitContext,
@@ -198,8 +199,6 @@ class GLM5ParallelStrategyManager:
         self.reuse_phase_instances = False
         self.prefill_instance = None
         self.decode_instance = None
-        self._prefill_moe_mode = None
-        self._pending_prefill_moe_mode = None
         self._expert_arena = None
         self._expert_copy_pairs = []
         # Device copies of the skeleton's FP8 dequant scales. The scales never
@@ -246,11 +245,6 @@ class GLM5ParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
-        pending_prefill_moe_mode = getattr(
-            self, "_pending_prefill_moe_mode", None
-        )
-        if pending_prefill_moe_mode is not None:
-            self._prefill_moe_mode = pending_prefill_moe_mode
         self.loaded_model_config.phase = "prefill"
         Glm5MoE.reset_prefill_grouped_state()
 
@@ -628,9 +622,15 @@ class GLM5ParallelStrategyManager:
         A prefill micro-batch holds at most the token cap, except a prompt
         longer than the cap, which is a micro-batch of its own. Eager decode
         rows are assumed to stay below it. See ``deepgemm_prewarm``.
+
+        The cap comes through the one mode-aware reader; GLM-5 declares no
+        prefill MoE modes, so its mode is None (the streamed cap).
         """
-        cap = int(self.engine_config.Module_Batching_Config
-                  .prefill_micro_batch_token_cap)
+        from batchgen.config.config import prefill_token_cap_for_mode
+
+        cap = prefill_token_cap_for_mode(
+            self.engine_config.Module_Batching_Config, None
+        )
         prompt = self.engine_config.Basic_Config.get_max_prompt_length()
         return max(cap, int(prompt or 0))
 
@@ -644,10 +644,6 @@ class GLM5ParallelStrategyManager:
 
         check_late_compiles(self.global_rank, where,
                             strict=strict_requested(_batch_debug()))
-
-    def set_prefill_moe_mode(self, mode):
-        """Record the worker-selected prefill MoE mode for reuse checks."""
-        self._pending_prefill_moe_mode = mode
 
     def _prepare_prefill_activation(self, instance=None):
         Glm5MoE.reset_prefill_grouped_state()
@@ -709,8 +705,7 @@ class GLM5ParallelStrategyManager:
         """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
 
         Resumes the instance this process keeps for the phase, otherwise
-        builds it. A prefill build uses the mode recorded by
-        set_prefill_moe_mode.
+        builds it. GLM-5 has no prefill MoE modes, so its keys carry None.
         """
         if key.phase == "prefill":
             if self.prefill_instance is not None:
@@ -841,20 +836,18 @@ class GLM5ParallelStrategyManager:
         }
         device = self.engine_config.Basic_Config.device_torch
         start = time.perf_counter()
+        # The upload loop is the generic shared-skeleton core
+        # (batchgen.models.skeleton_sharing); the GLM-specific parts — the
+        # bind-key rule, the FP8 scale set and the bucketed log — stay here.
+        shared, uploaded, kept = share_state_dict_on_device(
+            self.skeleton_state_dict, upload, device
+        )
         buckets = {}
-        kept_count, kept_bytes = 0, 0
-        shared = {}
-        for key, tensor in self.skeleton_state_dict.items():
-            nbytes = tensor.numel() * tensor.element_size()
-            if key not in upload:
-                kept_count += 1
-                kept_bytes += nbytes
-                shared[key] = tensor
-                continue
+        for key, nbytes in uploaded.items():
             bucket = self._skeleton_bucket(key)
             count, total = buckets.get(bucket, (0, 0))
             buckets[bucket] = (count + 1, total + nbytes)
-            shared[key] = tensor.to(device)
+        kept_count, kept_bytes = len(kept), sum(kept.values())
         self.skeleton_state_dict = shared
         self._skeleton_uploaded_keys = frozenset(upload)
         self._skeleton_on_device = True

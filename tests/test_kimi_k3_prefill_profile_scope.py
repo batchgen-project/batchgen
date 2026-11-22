@@ -93,16 +93,31 @@ def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
         "SequenceEntry objects used by persistent pool admissions"
     )
 
-    key_calls = [
+    # One resolution per wave: _begin_prefill_wave resolves the flags from
+    # ALL of the wave's sequences and _desired_phase_key reads that resolved
+    # view (refusing a wave that was not resolved), so a group serving only
+    # part of the wave never re-derives different flags from its subset.
+    wave_calls = [
         node
-        for node in ast.walk(functions["_desired_phase_key"])
+        for node in ast.walk(functions["_begin_prefill_wave"])
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_active_batchgen_debug_for_sequences"
     ]
-    assert key_calls, (
-        "_desired_phase_key must resolve batchgen_debug from the active "
-        "SequenceEntry objects before it publishes the phase debug view"
+    assert wave_calls, (
+        "_begin_prefill_wave must resolve batchgen_debug from the active "
+        "SequenceEntry objects before any planner reads it"
+    )
+    key_reads = [
+        node
+        for node in ast.walk(functions["_desired_phase_key"])
+        if isinstance(node, ast.Attribute)
+        and node.attr == "_prefill_wave_debug"
+        and isinstance(node.ctx, ast.Load)
+    ]
+    assert key_reads, (
+        "_desired_phase_key must read the wave view _begin_prefill_wave "
+        "resolved before it publishes the phase debug view"
     )
 
     published = [

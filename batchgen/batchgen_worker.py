@@ -298,6 +298,7 @@ from batchgen.worker.step_timing import (
 	new_decode_step_split,
 )
 from batchgen.phase_lifecycle import (
+	PHASES,
 	AdmitContext,
 	ExitMode,
 	PhaseEnterContext,
@@ -846,6 +847,7 @@ class InputArguments:
 	pre_dequantize_weights: bool = False
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
+	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
 
 	def __post_init__(self):
 		if self.max_prompt_length is None and self.padding_length is not None:
@@ -932,6 +934,7 @@ class BatchGenWorkerArgs:
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
+	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -1171,6 +1174,14 @@ class BatchGenWorker:
 		# flag makes that pass idempotent; the second hands the prepared prefill
 		# phase to the first real admission so it is not torn down and rebuilt.
 		self._k3_startup_completed = False
+		# The prefill MoE mode of every wave of this server, as a resolved
+		# 1-tuple (None = unresolved; see _server_prefill_moe_mode). Nothing
+		# changes it for the server's lifetime.
+		self._server_prefill_moe_mode_resolved = None
+		# The wave _begin_prefill_wave resolved last: its sequences and
+		# merged batch debug flags.
+		self._prefill_wave_uuids = None
+		self._prefill_wave_debug = {}
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -1431,9 +1442,9 @@ class BatchGenWorker:
 		# Compatibility key for the currently entered manager phase.
 		self._phase = None
 		self._live_phase_key = None
-		# Prefill MoE mode of the most recent prefill entry; see
-		# _desired_phase_key("decode").
-		self._prefill_moe_mode_in_effect = None
+		# PhaseKey each instance the manager keeps was entered with, by phase;
+		# the live phase's entry included. See _transition_phase.
+		self._kept_phase_keys: dict[str, PhaseKey] = {}
 		# Node replica weight transport (spec v4 slice 2): True while a plan
 		# is installed in the core engine for the live prefill phase.
 		self._replica_plan_installed = False
@@ -2465,9 +2476,7 @@ class BatchGenWorker:
 			self._prefix_rank_cost_profile_disabled(seqs)
 		)
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		chunk_tokens = int(
-			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-		)
+		chunk_tokens = self._server_prefill_token_cap()
 
 		def pinned_load(seq):
 			# Length-only: a re-entry's tokens are readable on one node only.
@@ -3794,6 +3803,7 @@ class BatchGenWorker:
 			"pre_dequantize_weights": self.args.pre_dequantize_weights,
 			"distributed_weight_config": self.args.distributed_weight_config,
 			"enable_deepep": getattr(self.args, "enable_deepep", False),
+			"prefill_moe_mode": getattr(self.args, "prefill_moe_mode", None),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -5437,11 +5447,14 @@ class BatchGenWorker:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		# The engine never reaches into the worker for the cap: the delegator
+		# resolves the server mode's one cap and hands it over explicitly.
 		return engine._plan_prefill_micro_batches(
 			self,
 			seq_lengths,
 			full_seq_lengths,
 			compute_cached_tokens,
+			token_cap=self._server_prefill_token_cap(),
 		)
 
 	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
@@ -6370,6 +6383,12 @@ class BatchGenWorker:
 			from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
 			engine = WorkerLifecycleEngine()
 			self._worker_lifecycle_engine = engine
+		# Startup precedes any admission wave: resolve the empty wave's debug
+		# flags once, here on the worker, so the engine derives the prefill
+		# key without reaching back for the resolver. On the persistent branch
+		# the two wave fields this sets are read by nothing until the first
+		# real wave overwrites them.
+		self._begin_prefill_wave([])
 		return engine.prepare_deployment(
 			self,
 		)
@@ -6427,19 +6446,17 @@ class BatchGenWorker:
 		# the per-rank decode width (_max_decode_rank_bsz), the same width the
 		# runtime decode configure and the decode admission cap use, so the
 		# padded MoE buffers are already sized for the largest admitted batch.
-		# This decode entry precedes any prefill entry, so the worker's record
-		# of the prefill mode these instances are built for must be primed
-		# here: the decode phase key carries it, and a None here against the
-		# startup mode below would turn the resumable decode exit into RETIRE,
-		# which leaves the resident shard mapped and OOMs the prefill build.
-		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
-		self._prefill_moe_mode_in_effect = startup_prefill_mode
+		# This decode entry precedes any prefill entry, and that order needs
+		# no priming: the decode phase key derives its mode from the one
+		# server constant, so the later resumable decode exit compares equal
+		# whatever entry order the startup used.
+		startup_prefill_mode = self._server_prefill_moe_mode()
 		with self._startup_phase("decode-shard-build"):
 			self._load_decode_model(comm=self.comm)
 
-		# Then hand the built model to the prefill mode this weight topology
-		# will actually use, so the first admission inherits this phase directly
-		# instead of rebuilding the streamed-SP8 buffers itself.
+		# Then hand the built model to the server prefill mode every wave uses,
+		# so the first admission inherits this phase directly instead of
+		# rebuilding the streamed-SP8 buffers itself.
 		with self._startup_phase("prefill-configure"):
 			self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
 			prefill_key = PhaseKey("prefill", startup_prefill_mode, ())
@@ -6771,6 +6788,7 @@ class BatchGenWorker:
 						)
 
 				prefill_uuids = self._prepare_prefill_batch()
+				self._begin_prefill_wave(prefill_uuids)
 				pool_wave_start = (
 					time.perf_counter()
 					if prefill_uuids and self._prefill_prefix_pool_enabled()
@@ -7837,29 +7855,36 @@ class BatchGenWorker:
 		raise ValueError(f"unknown phase-switch direction {direction!r}")
 
 	def _desired_phase_key(self, phase: str) -> PhaseKey:
-		"""Resolve the compatibility key for the next phase entry."""
+		"""Resolve the compatibility key for the next phase entry.
+
+		Every key carries the server's prefill MoE mode; only the profile
+		overrides a wave's batch debug flags select differ between waves.
+		"""
 		if phase == "decode":
-			# The decode key carries the prefill MoE mode of the instance it
-			# follows. The worker records that mode on every prefill entry
-			# (_transition_phase), so the decode key and the live prefill key
-			# compare the same value; a manager attribute committed only on a
-			# rebuild would read None after a resumed or builder-made entry.
+			# The decode key carries the server's prefill MoE mode, the same
+			# value every prefill key carries, so the decode key and the live
+			# prefill key always compare equal on the mode field. Deriving it
+			# from the one server constant (not a per-entry record, not a
+			# manager attribute committed only on a rebuild) means no entry
+			# order — builder-made, resumed, or decode-first startup — can
+			# read None and turn a resumable exit into RETIRE.
 			return PhaseKey(
 				"decode",
-				self._prefill_moe_mode_in_effect,
+				self._server_prefill_moe_mode(),
 				getattr(self, "_phase_profile_overrides", ()),
 			)
 		if phase != "prefill":
 			raise ValueError(f"unsupported phase {phase!r}")
 
-		prefill_sequences = []
-		for uuid in getattr(self, "_phase_request_uuids", ()):
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				prefill_sequences.append(seq)
-		prefill_debug = (
-			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
-		)
+		wave_uuids = tuple(getattr(self, "_phase_request_uuids", ()))
+		if wave_uuids != getattr(self, "_prefill_wave_uuids", None):
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill phase key requested for "
+				f"{len(wave_uuids)} sequences that _begin_prefill_wave did not "
+				"resolve; a wave's debug flags are resolved once, from all of "
+				"its sequences, before any planner reads them"
+			)
+		prefill_debug = self._prefill_wave_debug
 		k3_prefill_profile = self._debug_flag_enabled(
 			prefill_debug.get("k3_prefill_profile")
 		)
@@ -7871,40 +7896,115 @@ class BatchGenWorker:
 		StreamedSP8MXFP4MoELayer.verify_bytes_enabled = self._debug_flag_enabled(
 			prefill_debug.get("k3_seam_verify_bytes")
 		)
-		_default_k3_prefill_mode = "streamed"
-		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
-			_default_k3_prefill_mode = (
-				self.parallel_manager.default_prefill_moe_mode()
-			)
-		k3_prefill_moe_mode = prefill_debug.get(
-			"k3_prefill_moe_mode", _default_k3_prefill_mode
-		)
-		resident_token_cap = int(getattr(
-			self.engine_config.Module_Batching_Config,
-			"k3_resident_prefill_token_cap", 0,
-		) or 0)
-		resident_handoff = (
-			"k3_prefill_moe_mode" not in prefill_debug
-			and resident_token_cap > 0
-			and hasattr(self.parallel_manager, "resident_ep_prefill_available")
-			and self.parallel_manager.resident_ep_prefill_available()
-		)
-		if resident_handoff:
-			k3_prefill_moe_mode = "resident_ep"
-		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
-			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)
 		self._phase_prefill_debug = prefill_debug
 		self._phase_k3_prefill_profile = k3_prefill_profile
-		self._phase_resident_handoff = resident_handoff
-		self._phase_resident_token_cap = resident_token_cap
 		self._phase_profile_overrides = (
 			(("k3_prefill_profile", k3_prefill_profile),)
 			if "k3_prefill_profile" in prefill_debug
 			else ()
 		)
 		return PhaseKey(
-			"prefill", k3_prefill_moe_mode, self._phase_profile_overrides
+			"prefill", self._server_prefill_moe_mode(), self._phase_profile_overrides
 		)
+
+	def _begin_prefill_wave(self, prefill_uuids: List[str]) -> None:
+		"""Resolve a prefill wave's batch debug flags, once.
+
+		Resolved from ALL of the wave's sequences on every rank, before rank
+		placement, the prefix-pool plan and the phase key read them, so a
+		group that serves only some of the wave never re-derives different
+		flags from its subset. ``_desired_phase_key`` refuses a wave that was
+		not resolved here.
+		"""
+		sequences = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				sequences.append(seq)
+		debug = self._active_batchgen_debug_for_sequences(sequences) or {}
+		self._prefill_wave_uuids = tuple(prefill_uuids)
+		self._prefill_wave_debug = debug
+
+	def _server_prefill_moe_mode(self) -> Optional[str]:
+		"""The prefill MoE mode every wave of this server runs in.
+
+		Read once from the parallel manager and kept for the process: prefill
+		parallelism never changes inside a server, and no batch or debug flag
+		changes it (admission refuses the retired per-batch key). The server
+		chooses it at start with ``--prefill-moe-mode``, else the model's
+		default. Prefill MoE modes are a manager capability declared by the
+		pair ``default_prefill_moe_mode`` / ``set_prefill_moe_mode``; a manager
+		without it has no mode (None) and one that declares half of it is
+		refused by name.
+		"""
+		resolved = getattr(self, "_server_prefill_moe_mode_resolved", None)
+		if resolved is None:
+			manager = self.parallel_manager
+			declares = (
+				hasattr(manager, "default_prefill_moe_mode"),
+				hasattr(manager, "set_prefill_moe_mode"),
+			)
+			if declares[0] != declares[1]:
+				raise RuntimeError(
+					f"{type(manager).__name__} declares only one of "
+					"default_prefill_moe_mode / set_prefill_moe_mode; the "
+					"prefill MoE mode capability needs both"
+				)
+			requested = getattr(
+				getattr(self, "args", None), "prefill_moe_mode", None
+			)
+			if requested is not None and not declares[0]:
+				raise ValueError(
+					f"--prefill-moe-mode {requested} is set but "
+					f"{type(manager).__name__} has no prefill MoE modes"
+				)
+			# The manager reads the server option from its engine config
+			# and returns it as its default when one was given.
+			mode = manager.default_prefill_moe_mode() if declares[0] else None
+			if requested is not None and mode != requested:
+				raise RuntimeError(
+					f"{type(manager).__name__} resolved prefill MoE mode "
+					f"{mode!r}, but the server was started with "
+					f"--prefill-moe-mode {requested}"
+				)
+			resolved = (mode,)
+			self._server_prefill_moe_mode_resolved = resolved
+			logging.info(
+				"Rank %s: server prefill MoE mode is %s for every wave",
+				self.rank,
+				mode,
+			)
+		return resolved[0]
+
+	def _server_prefill_token_cap(self) -> int:
+		"""Per-micro-batch prefill token cap of every wave of this server.
+
+		One value for the server's lifetime, because the prefill MoE mode is:
+		receipt-time placement, the wave's prefix-pool plan and the live
+		prefill all read it and so score and split a sequence identically.
+		"""
+		from batchgen.config.config import prefill_token_cap_for_mode
+
+		return prefill_token_cap_for_mode(
+			self.engine_config.Module_Batching_Config,
+			self._server_prefill_moe_mode(),
+		)
+
+	def _require_server_prefill_moe_mode(self, desired: PhaseKey) -> None:
+		"""Every phase entry carries the server's prefill MoE mode.
+
+		The mode is chosen once at server start and is part of every PhaseKey
+		only so that keys compare whole; a key carrying another mode would
+		enter an instance this server was not started to run.
+		"""
+		server_mode = self._server_prefill_moe_mode()
+		if desired.prefill_moe_mode != server_mode:
+			raise RuntimeError(
+				f"Rank {self.rank}: phase_enter({desired!r}) carries prefill MoE "
+				f"mode {desired.prefill_moe_mode!r}, but this server runs "
+				f"{server_mode!r} for its lifetime; the mode is chosen once at "
+				"start (--prefill-moe-mode) and no wave changes it"
+			)
 
 	def _verify_manager_phase_contract(self) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -7918,17 +8018,71 @@ class BatchGenWorker:
 		)
 
 	def _phase_exit_mode(self, live: PhaseKey, desired: PhaseKey) -> ExitMode:
-		"""Select suspend only when the outgoing instance can resume safely."""
+		"""SUSPEND only when the outgoing instance can be resumed as is.
+
+		The outgoing instance is resumable only when its key fields equal the
+		incoming key's (the next entry of its phase derives its key from this
+		wave). Otherwise the transition RETIREs, and
+		``_retire_kept_phase_instances`` retires every kept instance with it,
+		so every instance a SUSPEND leaves kept shares the live key's fields;
+		``_require_resumable_instance`` refuses any other by name.
+		"""
 		key_fields_unchanged = (
 			live.prefill_moe_mode == desired.prefill_moe_mode
 			and live.profile_overrides == desired.profile_overrides
 		)
-		if (
-			key_fields_unchanged
-			and self.parallel_manager.holds_instance(live.phase)
-		):
+		if key_fields_unchanged and self.parallel_manager.holds_instance(live.phase):
 			return ExitMode.SUSPEND
 		return ExitMode.RETIRE
+
+	def _retire_kept_phase_instances(self, live: PhaseKey) -> None:
+		"""After ``phase_exit(live, RETIRE)``, retire every other kept instance.
+
+		RETIRE is followed by ``deep_free_model_memory``: an instance kept past
+		it would reference a model the worker freed (Kimi-K3 serves both phases
+		from one model) or carry state built for a key no later entry asks for.
+		Each kept instance is retired under the key it was entered with.
+		"""
+		manager = self.parallel_manager
+		self._kept_phase_keys.pop(live.phase, None)
+		if manager.holds_instance(live.phase):
+			raise RuntimeError(
+				f"Rank {self.rank}: {type(manager).__name__}.phase_exit"
+				f"({live!r}, RETIRE) still holds a {live.phase} instance"
+			)
+		for phase in PHASES:
+			kept = self._kept_phase_keys.get(phase)
+			if not manager.holds_instance(phase):
+				self._kept_phase_keys.pop(phase, None)
+				continue
+			if kept is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: {type(manager).__name__} holds a {phase} "
+					"instance the worker never entered"
+				)
+			# The record goes only after the exit succeeded: an exit that
+			# raises leaves the manager holding the instance, and the worker
+			# must still know under which key.
+			manager.phase_exit(kept, ExitMode.RETIRE)
+			if manager.holds_instance(phase):
+				raise RuntimeError(
+					f"Rank {self.rank}: {type(manager).__name__}.phase_exit"
+					f"({kept!r}, RETIRE) still holds a {phase} instance"
+				)
+			self._kept_phase_keys.pop(phase, None)
+
+	def _require_resumable_instance(self, desired: PhaseKey) -> None:
+		"""A kept instance is resumed only under the key it was entered with."""
+		manager = self.parallel_manager
+		if not manager.holds_instance(desired.phase):
+			return
+		kept = self._kept_phase_keys.get(desired.phase)
+		if kept != desired:
+			raise RuntimeError(
+				f"Rank {self.rank}: entering {desired!r} would resume the "
+				f"{desired.phase} instance kept under {kept!r}; an instance is "
+				"resumed only under its own key and is retired otherwise"
+			)
 
 	def _prepare_phase_exit(self, live: PhaseKey, desired: PhaseKey) -> None:
 		"""Stop worker-owned consumers before the manager exit hook."""
@@ -7954,10 +8108,22 @@ class BatchGenWorker:
 	def _transition_phase(
 		self, desired: PhaseKey, *, comm=None, max_num_seq: int | None = None
 	) -> tuple[bool, bool]:
-		"""Run one worker phase transition and return (changed, resumed)."""
+		"""Run one worker phase transition and return (changed, resumed).
+
+		Invariants: every entered key carries the server's prefill MoE mode,
+		checked before the live phase is left, so only profile overrides can
+		change the key between waves. A kept phase instance is resumed only
+		under the PhaseKey it was entered with, and a RETIRE leaves no kept
+		instance behind, so no instance outlives the model
+		``deep_free_model_memory`` drops. Once the outgoing phase has exited
+		nothing is live, so a failed entry leaves ``_live_phase_key`` None and
+		the next transition only enters.
+		"""
 		live = self._live_phase_key
 		if live == desired:
 			return False, False
+		self._require_server_prefill_moe_mode(desired)
+		manager = self.parallel_manager
 		if live is not None:
 			exit_mode = self._phase_exit_mode(live, desired)
 			self._prepare_phase_exit(live, desired)
@@ -7967,32 +8133,45 @@ class BatchGenWorker:
 				elif self._persistent_phase_enabled():
 					self._destroy_gpu_paged_kv_cache(keep_buffers=True)
 				else:
+					# KV pages go before the manager's exit, and that order is
+					# safe: _release_fixed_address_pool synchronizes the device
+					# before unmapping, so no replay is in flight, and between
+					# here and phase_exit nothing launches GPU work. What phase_exit
+					# then drops (K3: the decode graph and resident shard via
+					# _retire_resident_ep_decode; GLM: the expert arena) is host
+					# bookkeeping, graph-exec destruction or an unmap, none of
+					# which reads the pool. A kept graph replays only after
+					# _remap_reused_kv_pool maps the pool back.
 					self._release_suspended_decode_kv_pool()
-			self.parallel_manager.phase_exit(live, exit_mode)
+			manager.phase_exit(live, exit_mode)
 			if exit_mode is ExitMode.RETIRE:
+				self._retire_kept_phase_instances(live)
 				if live.phase != "decode":
 					self._destroy_gpu_paged_kv_cache()
 				self.deep_free_model_memory()
+			self._live_phase_key = None
+		self._require_resumable_instance(desired)
 		# A decode entry resumes exactly when the manager still holds a decode
-		# instance after the outgoing phase has exited: that is the instance
-		# phase_enter activates. It does not depend on how the outgoing phase
-		# left — a manager that keeps no prefill instance retires prefill and
-		# still resumes its kept decode instance.
+		# instance after the outgoing phase has exited (a RETIRE retires every
+		# kept instance, so after one nothing is held): that is the instance
+		# phase_enter activates.
 		resumed = (
 			desired.phase == "decode"
-			and self.parallel_manager.holds_instance("decode")
+			and manager.holds_instance("decode")
 		)
 		if desired.phase == "decode":
 			self.init_nvshmem()
-		elif hasattr(self.parallel_manager, "set_comm"):
-			self.parallel_manager.set_comm(self.comm)
-		self.model, self.weight_copy_task = self.parallel_manager.phase_enter(
+		elif hasattr(manager, "set_comm"):
+			manager.set_comm(self.comm)
+		self.model, self.weight_copy_task = manager.phase_enter(
 			desired,
 			PhaseEnterContext(comm=comm, max_num_seq=max_num_seq),
 		)
 		self._live_phase_key = desired
-		if desired.phase == "prefill":
-			self._prefill_moe_mode_in_effect = desired.prefill_moe_mode
+		if manager.holds_instance(desired.phase):
+			self._kept_phase_keys[desired.phase] = desired
+		else:
+			self._kept_phase_keys.pop(desired.phase, None)
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:
@@ -8014,7 +8193,11 @@ class BatchGenWorker:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._config_prefill_for_batch(self, prefill_uuids)
+		# The engine never reaches into the worker for the cap: the delegator
+		# resolves the server mode's one cap and hands it over explicitly.
+		return engine._config_prefill_for_batch(
+			self, prefill_uuids, token_cap=self._server_prefill_token_cap()
+		)
 
 	def _load_decode_model(self, comm=None) -> None:
 		"""
@@ -8387,11 +8570,7 @@ class BatchGenWorker:
 			pm.set_comm(self.comm)
 		if hasattr(pm, "share_skeleton_on_device"):
 			pm.share_skeleton_on_device()
-		prefill_mode = (
-			pm.default_prefill_moe_mode()
-			if hasattr(pm, "default_prefill_moe_mode")
-			else "streamed"
-		)
+		prefill_mode = self._server_prefill_moe_mode()
 		prefill_key = PhaseKey("prefill", prefill_mode, ())
 		self._phase_profile_overrides = ()
 		if hasattr(pm, "set_prefill_moe_mode"):
@@ -9241,9 +9420,7 @@ class BatchGenWorker:
 				self._prefix_rank_cost_profile_disabled(seqs)
 			)
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-			chunk_tokens = int(
-				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-			)
+			chunk_tokens = self._server_prefill_token_cap()
 
 			def pinned_load(seq):
 				# Length-only on purpose: a pinned sequence's token storage may
@@ -9433,10 +9610,13 @@ class BatchGenWorker:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		# The engine never reaches into the worker for the cap: the delegator
+		# resolves the server mode's one cap and hands it over explicitly.
 		return engine._plan_prefill_pool_wave(
 			self,
 			uuids,
 			prefix_states,
+			token_cap=self._server_prefill_token_cap(),
 		)
 
 	def _prefill_pool_psm_layout(self):
@@ -10668,9 +10848,12 @@ class BatchGenWorker:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		# The engine never reaches into the worker for the cap: the delegator
+		# resolves the server mode's one cap and hands it over explicitly.
 		return engine.prefill_prepacked(
 			self,
 			batch,
+			token_cap=self._server_prefill_token_cap(),
 		)
 
 	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
