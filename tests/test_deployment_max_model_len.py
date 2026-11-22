@@ -330,7 +330,7 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
     events = []
     methods = load_worker_methods([
         "_build_persistent_phase_instances", "_capture_startup_decode_graphs",
-        "_decode_graph_state_present",
+        "_decode_graph_state_present", "_prewarm_startup_decode_jit",
     ], {
         "PhaseKey": PhaseKey, "logging": logging, "_startup_transient": startup_transient,
         "time": SimpleNamespace(perf_counter=lambda: 0),
@@ -359,6 +359,9 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         # startup capture runs _warmup_cuda_graphs; a manager-owned ladder
         # returns after the JIT prewarm instead.
         _whole_model_decode_graphs_requested=lambda: capture,
+        # No kernel-compiling decode prewarm declared: without graphs the
+        # builder runs no startup work.
+        _manager_decode_prewarm_compiles_kernels=lambda: False,
         _sync_decode_moe_rank_counts=lambda *args, **kwargs: None,
         _bind_decode_attention_metadata_for_graph_config=lambda _: None,
         _prewarm_decode_jit=lambda: events.append("jit_prewarm"),
@@ -369,6 +372,8 @@ def test_persistent_builder_checks_the_provisional_pool_before_capture(capture):
         lambda: methods["_capture_startup_decode_graphs"](worker))
     worker._decode_graph_state_present = (
         lambda: methods["_decode_graph_state_present"](worker))
+    worker._prewarm_startup_decode_jit = (
+        lambda: methods["_prewarm_startup_decode_jit"](worker))
 
     def probe(*, seam, capture):
         assert seam == startup_transient.SEAM_PERSISTENT_BUILD

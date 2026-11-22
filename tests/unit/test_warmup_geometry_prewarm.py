@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from batchgen_kernels import post_readiness
 from tests.worker_method_source import load_worker_methods
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -57,9 +58,9 @@ def load_class_methods(path, class_name, names, namespace):
 
 def _worker_methods():
     return load_worker_methods(
-        ["_capture_startup_decode_graphs", "_prewarm_decode_jit",
-         "arm_late_compile_guard_at_readiness"],
-        {},
+        ["_capture_startup_decode_graphs", "_prewarm_startup_decode_jit",
+         "_prewarm_decode_jit", "arm_late_compile_guard_at_readiness"],
+        {"post_readiness": post_readiness},
     )
 
 
@@ -84,6 +85,8 @@ def _capture_worker(methods, events, manager):
     worker._warmup_cuda_graphs = warmed
     worker._prewarm_decode_jit = (
         lambda: methods["_prewarm_decode_jit"](worker))
+    worker._prewarm_startup_decode_jit = (
+        lambda: methods["_prewarm_startup_decode_jit"](worker))
     return worker
 
 
@@ -141,13 +144,21 @@ def test_prewarm_jit_passes_buckets_only_for_whole_model_graphs():
 def test_arm_at_readiness_delegates_to_manager_hook():
     methods = _worker_methods()
     events = []
-    worker = SimpleNamespace(parallel_manager=SimpleNamespace(
-        arm_late_compile_guard=lambda: events.append("armed")))
-    methods["arm_late_compile_guard_at_readiness"](worker)
-    assert events == ["armed"]
+    post_readiness._reset_for_tests()
+    try:
+        worker = SimpleNamespace(rank=2, parallel_manager=SimpleNamespace(
+            arm_late_compile_guard=lambda: events.append("armed")))
+        methods["arm_late_compile_guard_at_readiness"](worker)
+        assert events == ["armed"]
+        # Every model arms the post-readiness event record, hook or not.
+        assert post_readiness.armed()
 
-    bare = SimpleNamespace(parallel_manager=SimpleNamespace())
-    methods["arm_late_compile_guard_at_readiness"](bare)  # no hook: no-op
+        post_readiness._reset_for_tests()
+        bare = SimpleNamespace(rank=0, parallel_manager=SimpleNamespace())
+        methods["arm_late_compile_guard_at_readiness"](bare)  # no manager hook
+        assert post_readiness.armed()
+    finally:
+        post_readiness._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
