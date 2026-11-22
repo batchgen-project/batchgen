@@ -230,7 +230,7 @@ def _create_batch_app(storage, scheduler, worker):
         BatchObject=io_struct.BatchObject,
         FilePurpose=io_struct.FilePurpose,
         build_batch_object_from_create_request=io_struct.build_batch_object_from_create_request,
-        retired_batchgen_debug_error=io_struct.retired_batchgen_debug_error,
+        batchgen_debug_refusal=io_struct.batchgen_debug_refusal,
         uuid=uuid, time=time,
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), "http_server.py", "exec"), scope)

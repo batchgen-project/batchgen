@@ -44,7 +44,6 @@ from batchgen.server.io_struct import (
 MAX_TURN_BODY_BYTES = 32 * 1024 * 1024
 MAX_TURN_MESSAGES = 8192
 MAX_TURN_TOOLS = 1024
-MAX_TURN_DEBUG_BYTES = 64 * 1024
 
 
 async def _read_body_capped(request: Request, limit: int) -> bytes:
