@@ -2097,9 +2097,11 @@ class BatchGenWorker:
 				pool=self.global_batch,
 				seq_table=self.seq_table,
 				trajectories=self._traj,
+				prefix=self._prefix,
 			),
 			gpu_kv=self.gpu_paged_kv_cache_manager,
 			host_view=getattr(self, "host_paged_kv_worker_view", None),
+			host_view_aux=getattr(self, "host_paged_kv_worker_view_aux", None),
 			core_engine=getattr(self, "core_engine", None),
 			gpu_resident=getattr(self, "_sequences_with_gpu_kv", None),
 			prefix_coordinator=getattr(self, "prefix_cache_coordinator", None),
@@ -9082,116 +9084,16 @@ class BatchGenWorker:
 	def _release_host_kv_pages_for_batch(
 		self, uuids: List[str], *, remaining_decode_uuids: List[str]
 	) -> None:
-		"""Release host KV pages for completed sequences owned by this rank.
-
-		NOTE: This function only releases HOST KV pages. GPU KV pages should be
-		released separately by calling _release_gpu_kv_pages() BEFORE this function.
-
-		``remaining_decode_uuids`` is the caller's statement of which sequences
-		remain in decode after this release, in any order. The caller provides
-		it so this function never reads sequence status (a boundary can then
-		apply all of its status changes at one point). Rows not held locally
-		and rows being released here are filtered out below before the GPU
-		page-table rebuild.
-		"""
-		if not uuids:
-			return
-		
-		# Keep lifecycle mutations on the worker-owned view.  For DSA this is the
-		# DualHostKVCoordinator; the engine keeps only its primary view for the
-		# attention wrapper and must not be used to release a sequence by itself.
-		worker_view = getattr(self, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			logging.warning("Host paged KV worker view is unavailable")
-			return
-		
-		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
-
-		# Host KV is ONE run-namespaced per-node SHARED shm region keyed
-		# by global_idx. Under Option 1 (G>1) all G ranks of a group hold the uuid
-		# in _uuid_to_local_map, so releasing on every rank double-frees the single
-		# shared entry -- the first releaser tombstones it and the rest raise
-		# "Sequence ID ... not found during release". Release the shared entry on
-		# EXACTLY the group leader (_owns_host_kv). G==1: host_release_uuids ==
-		# my_uuids, so the validated single-owner path is byte-identical.
-		host_release_uuids = [
-			uuid for uuid in my_uuids
-			if self._owns_host_kv(self.global_batch.get_sequence(uuid))
-		]
-
-		if host_release_uuids:
-			global_sequence_ids = [
-				self.global_batch.get_sequence(uuid).global_idx
-				for uuid in host_release_uuids
-			]
-
-			logging.debug(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
-
-			# NOTE: GPU KV pages should already be released by caller
-			# Do NOT call _release_gpu_kv_pages here to avoid double-free
-
-			# Release host KV pages through the mirrored coordinator when DSA is
-			# active.  It owns both primary and auxiliary page tables.
-			worker_view.release_sequence_pages(global_sequence_ids)
-			# A model with an aux region OUTSIDE the coordinator (K3 keeps its
-			# indexer keys there) releases it explicitly; the dual coordinator
-			# already mirrored its own aux above.
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-			if aux_view is not None and not isinstance(
-				worker_view, DualHostKVCoordinator
-			):
-				aux_view.release_sequence_pages(global_sequence_ids)
-			self._release_prefix_cache_attachments(global_sequence_ids)
-
-		# The G-1 followers of a serve group never touched the shared pages, but
-		# they do hold the leader's page table MIRRORED into their own view plus
-		# a mirrored prefix state. Drop those rank-local records too, or the next
-		# register of the same global_idx finds a stale row. unregister_sequences
-		# only edits the view's own HostKVPageTable; the pages themselves were
-		# freed exactly once, by the leader above. A mirrored prefix state has
-		# lookup_result=None (no attachment handle, so no coordinator call) and a
-		# follower owns no pool segment refs, so the shared release path inside
-		# _release_prefix_cache_attachments is a no-op here. G==1: the local-map
-		# owner IS the host-KV owner, so this list is always empty.
-		mirror_release_uuids = [
-			uuid for uuid in my_uuids
-			if not self._owns_host_kv(self.global_batch.get_sequence(uuid))
-		]
-		if mirror_release_uuids:
-			mirror_global_ids = [
-				self.global_batch.get_sequence(uuid).global_idx
-				for uuid in mirror_release_uuids
-			]
-			for view in self._host_views_by_group().values():
-				view.unregister_sequences(mirror_global_ids)
-			# An aux region OUTSIDE the prefix groups (K3 indexer keys) holds
-			# follower rows too; dropping only the group views would leave
-			# stale aux rows behind for the next use of the same global id.
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-			if aux_view is not None and not isinstance(
-				getattr(self, "host_paged_kv_worker_view", None),
-				DualHostKVCoordinator,
-			):
-				aux_view.unregister_sequences(mirror_global_ids)
-			self._release_prefix_cache_attachments(mirror_global_ids)
-
-		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
-		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
-		# its own remaining page table -- keyed on my_uuids, not the leader subset.
-		if my_uuids:
-			manager = self.gpu_paged_kv_cache_manager
-			if manager is not None and manager.is_initialized:
-				remaining_global_ids = []
-				for uuid in remaining_decode_uuids:
-					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
-						seq = self.global_batch.get_sequence(uuid)
-						remaining_global_ids.append(seq.global_idx)
-
-				if remaining_global_ids:
-					remaining_global_ids.sort()
-					manager.rebuild_page_table(remaining_global_ids)
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_host_kv_pages_for_batch(
+			self._decode_phase_context(), uuids,
+			remaining_decode_uuids=remaining_decode_uuids,
+		)
 
 	def _emit_prefix_cache_metric(self, phase: str, **fields) -> None:
 		# The engine receives this worker as its sole state collaborator.
@@ -10004,42 +9906,27 @@ class BatchGenWorker:
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
 		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_prefill_engine", None)
+		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
-			from batchgen.worker.prefill_engine import PrefillEngine
-			engine = PrefillEngine()
-			self._prefill_engine = engine
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
 		return engine._release_pool_segment_refs(
-			self,
-			global_id,
+			self._decode_phase_context(), global_id,
 		)
 
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
 	) -> None:
-		if not self.enable_prefix_cache:
-			return
-		# M3 Slice 2: a trajectory attachment that never reached its restore
-		# leaves through the SAME seam, so a rejected wave, a rolled back
-		# allocation and a completed row all return the live count to zero.
-		self._release_trajectory_attachments(
-			[int(sequence_id) for sequence_id in global_sequence_ids]
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_prefix_cache_attachments(
+			self._decode_phase_context(), global_sequence_ids,
 		)
-		# A pass that died between the config-time arena reservation and the
-		# post-barrier finalize never installed a record, so its arena is
-		# holding Host pages nothing names. This is the teardown seam every
-		# such path already goes through.
-		self._rollback_trajectory_reservations(
-			[int(sequence_id) for sequence_id in global_sequence_ids]
-		)
-		for sequence_id in global_sequence_ids:
-			self._release_pool_segment_refs(int(sequence_id))
-			state = self._prefix.pop_state(int(sequence_id))
-			if state is None:
-				continue
-			for handle in (*state.commit_attachment_handles, state.attachment_handle):
-				if handle:
-					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _trajectory_commit_requested(self, batch_sequences) -> bool:
 		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
@@ -10505,19 +10392,6 @@ class BatchGenWorker:
 					int(state.compute_cached_tokens) if state is not None else 0
 				),
 			)
-
-	def _release_trajectory_attachments(self, global_sequence_ids) -> None:
-		"""Drop every un-consumed attachment for these rows.
-
-		Joins the prefix-attachment release seam, so a rejected wave, a rolled
-		back allocation and a completed sequence all return the live count to
-		zero through the same call.
-		"""
-		self._traj.release_attachments(global_sequence_ids, rank=self.rank)
-
-	def _rollback_trajectory_reservations(self, global_sequence_ids) -> None:
-		"""Give back any snapshot arena these rows reserved and never used."""
-		self._traj.rollback_reservations(global_sequence_ids, rank=self.rank)
 
 	def _trajectory_restore_fields(self) -> dict:
 		"""Drain-counter fields, or empty when the path never ran."""

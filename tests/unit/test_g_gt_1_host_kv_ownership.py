@@ -681,11 +681,6 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator,
         [
             "_release_host_kv_pages_for_batch",
             "_release_prefix_cache_attachments",
-            "_release_trajectory_attachments",
-            # M3 Slice 1c joined the same teardown seam: a config-time
-            # snapshot arena that never reached the post-barrier finalize
-            # gives its Host pages back here.
-            "_rollback_trajectory_reservations",
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",

@@ -1940,16 +1940,6 @@ class PrefillEngine:
             # unregisters every pseudo-sid.
             self._prefill_pool_wave = None
 
-    def _release_pool_segment_refs(self, worker, global_id: int) -> None:
-        """Release pool pseudo-sids through the PrefixReuseState owner."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        self._prefix.release_pool_segment_refs(
-            int(global_id), host_views_provider=self._host_views_by_group
-        )
-
 
     def prefill(self, worker, batch: list[int]):
         """

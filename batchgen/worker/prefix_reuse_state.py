@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from typing import Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -171,18 +171,35 @@ class PrefixReuseState:
         for sid in chain:
             self.pool_sid_members[sid] = self.pool_sid_members.get(sid, 0) + 1
 
-    def release_pool_segment_refs(
-        self,
-        global_id: int,
-        *,
-        host_views_provider: Callable[[], Mapping[int, object]],
-    ) -> None:
+    def release_pool_segment_refs(self, global_id: int) -> Iterator[int]:
+        """Drop one member's segment references, one segment at a time.
+
+        Yields, in the member's chain order, each pseudo sequence id that no
+        member references any more. The caller releases that segment's Host
+        pages (``release_pool_segments``) before asking for the next one, so a
+        segment is released as soon as its count is gone and a failure on a
+        later segment cannot strand it. This component only keeps the counts.
+
+        It is an iterator: nothing happens until it is consumed.
+        """
         for sid in self.pool_member_sids.pop(int(global_id), ()):
             left = self.pool_sid_members[sid] - 1
             if left:
                 self.pool_sid_members[sid] = left
                 continue
             del self.pool_sid_members[sid]
-            for view in host_views_provider().values():
-                view.release_sequence_pages([sid])
-                view.unregister_sequences([sid])
+            yield sid
+
+
+def release_pool_segments(
+    host_views: Mapping[int, object], sids: Iterable[int]
+) -> None:
+    """Release and unregister freed pool segments on every Host view.
+
+    One segment at a time, and for each segment one view at a time: release its
+    pages, then unregister it.
+    """
+    for sid in sids:
+        for view in host_views.values():
+            view.release_sequence_pages([sid])
+            view.unregister_sequences([sid])
