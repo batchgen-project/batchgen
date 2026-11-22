@@ -233,15 +233,17 @@ def test_status_is_written_four_times_in_this_order():
     ]
 
 
-def test_only_one_step_between_the_status_writes_acts_on_a_status():
+def test_no_step_between_the_status_writes_acts_on_a_status():
     """What stands between today's four writes and one write.
 
     Between the first and the last status write, the boundary and everything
-    it calls read a status in exactly three places. Two cannot be affected by
-    moving the EVICTED and ON_HOLD writes earlier: one counts COMPLETED rows,
-    one prints a status in a log line. The third rebuilds the GPU page table
-    from the rows still IN_DECODE while releasing completed rows; evicted and
-    on-hold rows are still IN_DECODE at that moment.
+    it calls read a status in exactly two places, and neither would be
+    affected by moving the EVICTED and ON_HOLD writes earlier: one counts
+    COMPLETED rows, one prints a status in a log line. The third reader this
+    test used to pin — `_release_host_kv_pages_for_batch` rebuilding the GPU
+    page table from the rows still IN_DECODE — is gone: the caller now states
+    those rows itself (`remaining_decode_uuids=decisions.active_uuids`), so
+    the release makes no status read at all.
     """
     writes = _status_writes()
     lo, hi = writes[0][0], writes[-1][0]
@@ -285,7 +287,6 @@ def test_only_one_step_between_the_status_writes_acts_on_a_status():
     assert readers == {
         "_page_boundary_fast": {("COMPLETED", "logic")},
         "_release_completed_slot_index": {("seq.status", "log")},
-        "_release_host_kv_pages_for_batch": {("IN_DECODE", "logic")},
     }
 
 

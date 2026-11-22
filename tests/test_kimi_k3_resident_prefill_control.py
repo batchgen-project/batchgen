@@ -243,7 +243,10 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         host_pages_allocated=1,
         host_token_capacity=64,
     )
-    batch = SimpleNamespace(get_sequence=lambda uuid: seq if uuid == "u" else None)
+    batch = SimpleNamespace(
+        get_sequence=lambda uuid: seq if uuid == "u" else None,
+        get_sequences_by_status=lambda status: [],
+    )
     calls = SimpleNamespace(kda=[], gpu=[], host=[], report=[])
     worker = SimpleNamespace(
         rank=1,
@@ -256,7 +259,9 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         _release_gpu_kv_pages=lambda local_ids: calls.gpu.append(local_ids),
         _get_local_indices_for_uuids=lambda uuids: [0],
         _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
-        _release_host_kv_pages_for_batch=lambda uuids: calls.host.append(uuids),
+        _release_host_kv_pages_for_batch=(
+            lambda uuids, *, remaining_decode_uuids: calls.host.append(uuids)
+        ),
         _update_batch_status=lambda uuids, status, edge: None,
         _report_completion=lambda uuid, gathered_text=None: calls.report.append(
             (uuid, gathered_text)
@@ -268,7 +273,9 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         "_finish_prefill_completed_sequences",
         {
             "List": list,
-            "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+            "SequenceStatus": SimpleNamespace(
+                PREFILLED=prefilled, COMPLETED=object(), IN_DECODE=object()
+            ),
             "StatusEdge": StatusEdge,
         },
     ).__get__(worker)
@@ -293,7 +300,10 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         host_pages_allocated=1,
         host_token_capacity=64,
     )
-    batch = SimpleNamespace(get_sequence=lambda uuid: seq if uuid == "u" else None)
+    batch = SimpleNamespace(
+        get_sequence=lambda uuid: seq if uuid == "u" else None,
+        get_sequences_by_status=lambda status: [],
+    )
     calls = SimpleNamespace(kda=[], gpu=[])
     worker = SimpleNamespace(
         rank=1,
@@ -306,7 +316,9 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         _release_gpu_kv_pages=lambda local_ids: calls.gpu.append(local_ids),
         _get_local_indices_for_uuids=lambda uuids: [0],
         _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
-        _release_host_kv_pages_for_batch=lambda uuids: None,
+        _release_host_kv_pages_for_batch=(
+            lambda uuids, *, remaining_decode_uuids: None
+        ),
         _update_batch_status=lambda uuids, status, edge: None,
         _report_completion=lambda uuid, gathered_text=None: None,
     )
@@ -316,7 +328,9 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         "_finish_prefill_completed_sequences",
         {
             "List": list,
-            "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+            "SequenceStatus": SimpleNamespace(
+                PREFILLED=prefilled, COMPLETED=object(), IN_DECODE=object()
+            ),
             "StatusEdge": StatusEdge,
         },
     ).__get__(worker)
