@@ -44,6 +44,7 @@ class _Worker:
     global_batch = object()
     seq_table = object()
     _traj = object()
+    _prefix = object()
     gpu_paged_kv_cache_manager = object()
     host_paged_kv_worker_view = object()
     core_engine = object()
@@ -84,6 +85,13 @@ def test_context_is_frozen_and_does_not_capture_worker_or_bound_methods():
     for value in _all_field_values(context):
         assert value is not worker
         assert not (inspect.ismethod(value) and value.__self__ is worker)
+
+
+def test_context_carries_the_prefix_state_object():
+    """The pool-segment release reads the prefix-reuse state from the context."""
+    worker = _Worker()
+    context = _build_context(worker)
+    assert context.sched.prefix is worker._prefix
 
 
 def test_context_carries_the_kv_stats_flags_as_plain_facts():

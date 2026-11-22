@@ -2097,6 +2097,7 @@ class BatchGenWorker:
 				pool=self.global_batch,
 				seq_table=self.seq_table,
 				trajectories=self._traj,
+				prefix=self._prefix,
 			),
 			gpu_kv=self.gpu_paged_kv_cache_manager,
 			host_view=getattr(self, "host_paged_kv_worker_view", None),
@@ -10005,14 +10006,13 @@ class BatchGenWorker:
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
 		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_prefill_engine", None)
+		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
-			from batchgen.worker.prefill_engine import PrefillEngine
-			engine = PrefillEngine()
-			self._prefill_engine = engine
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
 		return engine._release_pool_segment_refs(
-			self,
-			global_id,
+			self._decode_phase_context(), global_id,
 		)
 
 	def _release_prefix_cache_attachments(

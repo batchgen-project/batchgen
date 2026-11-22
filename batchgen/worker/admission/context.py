@@ -30,6 +30,7 @@ class SchedulingState:
     pool: Any
     seq_table: Any
     trajectories: Any
+    prefix: Any = None
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,7 @@ from typing import List, Optional, Sequence
 
 import pytest
 
+from tests.worker_method_source import worker_shaped_method_node
 from tests.worker.worker_fakes import (
     attach_identity,
     attach_prefix_state,
@@ -91,8 +92,12 @@ _MOVED = {
     "_pool_probe_debug", "_new_pool_epilogue_tracer",
     "_record_unsharded_epilogue_gather", "_new_pool_kernel_dump_recorder",
     "_pool_pad_poison_enabled", "_new_pool_offload_check_recorder",
-    "_finish_prefill_pool_wave", "_release_pool_segment_refs",
+    "_finish_prefill_pool_wave",
 }
+
+# Bodies that live in another engine and take the decode context: they compile
+# from that engine in the worker's shape.
+_CONTEXT_MOVED = {"_release_pool_segment_refs"}
 
 
 def _worker_class():
@@ -124,9 +129,13 @@ def _worker_methods(names, globals_=None):
     loaded = {}
     for name in names:
         source = ENGINE if name in _MOVED else WORKER
-        node = copy.deepcopy(
-            _engine_method_node(name) if name in _MOVED else _worker_method_node(name)
-        )
+        if name in _CONTEXT_MOVED:
+            node = worker_shaped_method_node(name)
+        else:
+            node = copy.deepcopy(
+                _engine_method_node(name) if name in _MOVED
+                else _worker_method_node(name)
+            )
         module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
         scope = dict(namespace)
         exec(compile(module, str(source), "exec"), scope)
@@ -971,6 +980,24 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     worker._release_pool_segment_refs(GLOBAL_IDS[1])
     assert backend.released == [(0, [-1])]
     assert view_builds == [1]
+
+
+def test_pool_segment_release_takes_the_decode_context_not_the_worker():
+    """The release body reads the prefix state and the Host views from the
+    context; it has no worker parameter and no rebinding to one."""
+    source = (Path(__file__).resolve().parents[2]
+              / "batchgen" / "worker" / "kv_capacity_engine.py").read_text()
+    engine = next(node for node in ast.parse(source).body
+                  if isinstance(node, ast.ClassDef) and node.name == "KVCapacityEngine")
+    method = next(node for node in engine.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_release_pool_segment_refs")
+    assert [arg.arg for arg in method.args.args] == ["self", "ctx", "global_id"]
+    names = {node.id for node in ast.walk(method) if isinstance(node, ast.Name)}
+    assert "worker" not in names
+    body = ast.unparse(method)
+    assert "ctx.sched.prefix.release_pool_segment_refs" in body
+    assert "self._host_views_by_group(ctx)" in body
 
 
 def _release_worker(monkeypatch, *, member_sids, sid_members):
