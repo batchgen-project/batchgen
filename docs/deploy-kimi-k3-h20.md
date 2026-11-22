@@ -127,7 +127,7 @@ H20-specific notes (the rest matches the H200 guide):
   budget" in §6 of the [H200 guide](deploy-kimi-k3-h200.md).
 - **Triton prewarm.** Before the server reports ready, every worker compiles K3's serving Triton
   kernels and then arms a late-compile guard; the first startup on an empty Triton cache takes
-  longer. The log lines and the strict `batchgen_debug.k3_triton_strict` check are described in
+  longer. The log lines and the strict `k3_triton_strict` debug-state check are described in
   §7 of the [H200 guide](deploy-kimi-k3-h200.md).
 
 See [Server Flags](server-flags.md) and [Troubleshooting](troubleshooting.md) for details.

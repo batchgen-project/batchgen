@@ -1613,10 +1613,10 @@ class PrefillEngine:
         return armed
 
     def _new_pool_epilogue_tracer(self, worker, wave):
-        """Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
+        """Server-level ``debug_state.prefix_pool_epilogue_trace``.
 
         Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
-        flag rides on the wave's own sequences. Traces the only stretch of the
+        key is read from the debug state the wave adopted. Traces the only stretch of the
         pooled path the local oracles and the GPU replays never reached - the
         tail-row gather, the streamed-SP8 shard reassembly and the row ->
         wave index -> uuid -> sequence pairing that carries a hidden state to
@@ -1692,10 +1692,10 @@ class PrefillEngine:
         )
 
     def _new_pool_kernel_dump_recorder(self, worker, wave):
-        """Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
+        """Server-level ``debug_state.prefix_pool_dump_kernel_args``.
 
-        Same seam as ``prefix_pool_offload_check``: the flag rides on the
-        wave's own sequences. The value is the mode, ``"sync"`` or
+        Same seam as ``prefix_pool_offload_check``: the key is read from the
+        debug state the wave adopted. The value is the mode, ``"sync"`` or
         ``"nosync"`` - with ``sync`` the probe synchronizes before reading the
         pool back, so a corruption that only survives ``nosync`` is a
         write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
@@ -1758,11 +1758,11 @@ class PrefillEngine:
         )
 
     def _pool_pad_poison_enabled(self, worker, wave) -> bool:
-        """Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
+        """Server-level ``debug_state.prefix_pool_pad_poison``.
 
-        Read through the same seam as ``prefix_pool_offload_check``: the flag
-        rides on the wave's own sequences, so a batch arms the probe against a
-        server that is already up. False when the batch did not ask, which
+        Read through the same seam as ``prefix_pool_offload_check``: the key
+        is part of the debug state the wave adopted, so an operator arms the
+        probe against a server that is already up. False when it is not set, which
         leaves the packed page table byte-identical to the default.
 
         The flag check comes BEFORE the import: on a production wave
@@ -1789,11 +1789,11 @@ class PrefillEngine:
         return True
 
     def _new_pool_offload_check_recorder(self, worker, wave):
-        """Batch-level ``batchgen_debug.prefix_pool_offload_check``.
+        """Server-level ``debug_state.prefix_pool_offload_check``.
 
-        Read through the same seam as ``prefix_rank_assignment_mode``: the flag
-        rides on the wave's own sequences, so a batch arms the check against a
-        server that is already up and no env var exists for it. Returns None
+        The key is part of the debug state the wave adopted, so an operator
+        arms the check against a server that is already up and no env var
+        exists for it. Returns None
         when the batch did not ask, which is what keeps the check free.
 
         The flag check comes BEFORE the import: on a production wave
@@ -2235,7 +2235,7 @@ class PrefillEngine:
             prefill_debug.get(self._k3_prefill_profile_flag_name())
         )
         _k3_profile_logits = []
-        # Batch-level ``batchgen_debug.glm5_lmhead_fp32``: read once here,
+        # Server-level ``debug_state.glm5_lmhead_fp32``: read once here,
         # like ``k3_prefill_profile`` above, so the per-micro-batch lm_head
         # epilogue below costs one local bool test.
         _lmhead_fp32 = self._debug_flag_enabled(
@@ -2552,8 +2552,8 @@ class PrefillEngine:
                     )
 
                 # lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-                # Opt into FP32-cast via batchgen_debug.glm5_lmhead_fp32 for
-                # debugging (batch-level only; no env guard).
+                # Opt into FP32-cast via debug_state.glm5_lmhead_fp32 for
+                # debugging (a debug-state key; no env guard).
                 if getattr(self.model.lm_head, "tp_size", 1) > 1:
                     # vocab-parallel head (K3 TP8): the module all_gathers the
                     # full logits; the raw shard weight must not be used here.

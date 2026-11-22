@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------- #
 
 """GLM-5 Triton prewarm: compile every reachable serving key before it is
-needed, then log (or, under ``batchgen_debug.glm5_triton_strict``, refuse)
+needed, then log (or, under ``debug_state.glm5_triton_strict``, refuse)
 any later compilation. Each phase also carries the DeepGEMM entries of
 ``deepgemm_prewarm``, which documents their site table.
 
@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 LOG_TAG = "[GLM5_TRITON_WARMUP]"
 
-# Batch-level ``batchgen_debug`` key that turns a late compile into an error.
+# Server debug-state key that turns a late compile into an error.
 STRICT_DEBUG_KEY = "glm5_triton_strict"
 
 # Row counts that reach every (rows, align4(rows)) class pair a blocked FP8
@@ -557,7 +557,7 @@ def strict_requested(debug) -> bool:
 
 def _batch_debug() -> dict:
     """The served batch's ``batchgen_debug``: the dict the GLM-5 wrappers
-    read their batch-level flags from (``wrappers._glm5_dsa_debug_dict``)."""
+    read their debug-state keys from (``wrappers._glm5_dsa_debug_dict``)."""
     try:
         from batchgen.models.wrappers.attention import AttnWrapperBase
     except ImportError:
@@ -1394,7 +1394,7 @@ def _run_phase(phase: str, entries, *, part_index: int, part_count: int,
     if arm_after and active is not None:
         logger.info(
             "%s rank=%s late-compile guard armed: later compiles log at "
-            "WARNING; batchgen_debug.%s makes them raise",
+            "WARNING; debug_state.%s makes them raise",
             LOG_TAG, rank, STRICT_DEBUG_KEY,
         )
 

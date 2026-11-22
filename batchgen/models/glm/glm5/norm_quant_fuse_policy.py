@@ -43,7 +43,7 @@ and the older one is not edited. ``add_rmsnorm_bf16_6144_kernel`` and
 Why a module-level constant
 ---------------------------
   * The decode graphs are captured once per server lifetime, so the choice has
-    to be fixed before capture -- a batch-level ``batchgen_debug`` flag cannot
+    to be fixed before capture -- a debug-state key, adopted at a phase entry, cannot
     express it.
   * Repo policy forbids a ``BATCHGEN_*`` env guard for model behaviour.
 

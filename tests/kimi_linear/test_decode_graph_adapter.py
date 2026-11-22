@@ -18,7 +18,7 @@ What this exercises (plan M5 item 4/5, task M5.2):
 
 Eager reference = the real serving path (KimiLinearKDAWrapper /
 KimiLinearAttnWrapper -> serving_modules), reached by flipping the batch-level
-`batchgen_debug.kimi_decode_graph_mode` to "eager" on the SAME installed
+`debug_state.kimi_decode_graph_mode` to "eager" on the SAME installed
 adapter — so the fallback path is covered too.
 
 Gates: logits/output bf16 <= 1e-2, KDA state <= 2e-2 (plan M5.5); bitwise

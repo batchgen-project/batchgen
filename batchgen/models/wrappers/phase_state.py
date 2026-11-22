@@ -110,7 +110,7 @@ class PhaseFlag:
 
 @dataclasses.dataclass
 class DebugState:
-    """The batch-level debug dict active for the running step."""
+    """The server's debug values in force for the running step."""
 
     batchgen_debug: Optional[dict] = None
 

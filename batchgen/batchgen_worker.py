@@ -438,7 +438,7 @@ class _WeightPasses:
 		self._current = None
 		self._carried = None
 		self._carried_produce_only = False
-		# Batch-level debug skew (batchgen_debug.weight_pass_end_delay): this
+		# Debug skew (debug_state.weight_pass_end_delay): this
 		# rank sleeps before closing each prefill pass, so its siblings run
 		# ahead exactly where a per-rank stop used to strand the node daemon.
 		self.end_delay_s = 0.0
@@ -5000,7 +5000,7 @@ class BatchGenWorker:
 				)
 				self._prefix.prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
-		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# M3 Slice 2, SAME debug-state key as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
 		# commits are off. With it off nothing here runs and no attachment is
 		# taken, so the restore seam stays empty and this wave is
@@ -7974,7 +7974,7 @@ class BatchGenWorker:
 
 		Read once from the parallel manager and kept for the process: prefill
 		parallelism never changes inside a server, and no batch or debug flag
-		changes it (admission refuses the retired per-batch key). The server
+		changes it (a request cannot carry debug switches at all). The server
 		chooses it at start with ``--prefill-moe-mode``, else the model's
 		default. Prefill MoE modes are a manager capability declared by the
 		pair ``default_prefill_moe_mode`` / ``set_prefill_moe_mode``; a manager
@@ -10107,10 +10107,10 @@ class BatchGenWorker:
 					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _trajectory_commit_requested(self, batch_sequences) -> bool:
-		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
+		"""Server-level ``debug_state.prefix_trajectory_commit`` (M3 1b).
 
-		Same seam as ``prefix_pool_offload_check``: the flag rides on the
-		batch's own sequences, so it can be turned on against a server that is
+		Same seam as ``prefix_pool_offload_check``: the key is part of the
+		server's debug state, so it can be turned on against a server that is
 		already up. A value other than ``"on"``/``"off"`` is refused by name
 		rather than read as off -- a mistyped flag would look like a clean run
 		with no frontier committed.
@@ -12888,7 +12888,7 @@ class BatchGenWorker:
 	def _weight_pass_end_delay(self, value) -> float:
 		"""Seconds this rank sleeps before closing each prefill weight pass.
 
-		``value`` is the batch-level ``weight_pass_end_delay`` debug entry,
+		``value`` is the ``weight_pass_end_delay`` debug-state entry,
 		``{"rank": <global rank>, "seconds": <float>}``; any other rank, or no
 		entry, gets 0.
 		"""
@@ -12901,7 +12901,7 @@ class BatchGenWorker:
 			or not 0 < value["seconds"] <= 60
 		):
 			raise ValueError(
-				"batchgen_debug.weight_pass_end_delay must be "
+				"debug_state.weight_pass_end_delay must be "
 				'{"rank": <int>, "seconds": <0 < s <= 60>}, '
 				f"got {value!r}"
 			)
@@ -12966,11 +12966,11 @@ class BatchGenWorker:
 		if value is None:
 			return 1e-2
 		if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}")
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}")
 		try:
 			return float(value)
 		except ValueError as exc:
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}") from exc
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}") from exc
 
 	def _glm5_whole_model_graph_probe_layers(self, num_layers: int) -> tuple:
 		"""``glm5_whole_model_graph_probe_layers``: decoder layers to probe.
@@ -12991,7 +12991,7 @@ class BatchGenWorker:
 		):
 			return tuple(value)
 		raise ValueError(
-			"batchgen_debug.glm5_whole_model_graph_probe_layers must be \"all\", a "
+			"debug_state.glm5_whole_model_graph_probe_layers must be \"all\", a "
 			f"comma-separated index string or a list of ints, got {value!r}"
 		)
 

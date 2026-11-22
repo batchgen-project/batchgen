@@ -640,7 +640,7 @@ class GLM5ParallelStrategyManager:
 
     def _check_late_deepgemm_compiles(self, where):
         """Log the DeepGEMM kernels compiled since the last geometry
-        prewarm; ``batchgen_debug.glm5_triton_strict`` makes it raise."""
+        prewarm; ``debug_state.glm5_triton_strict`` makes it raise."""
         if not torch.cuda.is_available():
             return
         from .deepgemm_prewarm import check_late_compiles

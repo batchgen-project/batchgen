@@ -1466,7 +1466,7 @@ class KimiLinearParallelStrategyManager:
 
     def _check_late_deepgemm_compiles(self, where):
         """Log the DeepGEMM kernels compiled since readiness;
-        ``batchgen_debug.k3_triton_strict`` makes it raise."""
+        ``debug_state.k3_triton_strict`` makes it raise."""
         if not torch.cuda.is_available():
             return
         from .triton_prewarm import check_late_deepgemm_compiles
@@ -1662,7 +1662,7 @@ class KimiLinearParallelStrategyManager:
             return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
-        # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
+        # debug_state.kimi_decode_graph_mode can switch graph/compare/eager
         # on a live server — the project's debug-flag policy (cf.
         # glm5_moe_mode), instead of a cold restart per experiment. The
         # ladder is captured by the first prewarm in a captured mode, so

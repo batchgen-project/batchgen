@@ -255,7 +255,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
     def criticality_probe_request(
         self, batchgen_debug: Any, *, graph_enabled: bool
     ) -> Optional[Hashable]:
-        """``batchgen_debug.glm5_criticality_probe`` as a request, or None.
+        """``debug_state.glm5_criticality_probe`` as a request, or None.
 
         Raises ``ValueError`` for a malformed request and for any request
         without the whole-model decode graph it instruments.
@@ -265,7 +265,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             return None
         if not graph_enabled:
             raise ValueError(
-                "batchgen_debug.glm5_criticality_probe instruments the GLM-5 "
+                "debug_state.glm5_criticality_probe instruments the GLM-5 "
                 "whole-model decode CUDA graph; start the server with "
                 "--enable-cuda-graph to use it"
             )

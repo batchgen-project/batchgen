@@ -98,7 +98,7 @@ static outputs the driver appends to the auxiliary Host region after replay.
 
 Mode is planner/config-driven (`Basic_Config.decode_graph_mode`, default
 "eager") with a batch-level override through
-`batchgen_debug.kimi_decode_graph_mode` = "graph" | "eager" | "compare"
+`debug_state.kimi_decode_graph_mode` = "graph" | "eager" | "compare"
 (glm5_moe_mode precedent). No env vars, new or old.
 """
 

@@ -743,7 +743,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         sequence_ids = list(AttnWrapperBase.cur_batch or [])
         if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
             raise RuntimeError("Kimi-K3 prefix-pool row metadata size mismatch")
-        # Batch-level batchgen_debug.prefix_pool_offload_check. None unless the
+        # Server-level debug_state.prefix_pool_offload_check. None unless the
         # worker installed a recorder, and the check precedes every copy and
         # hash below, so the flag being off costs one attribute read per layer
         # per chunk and nothing else.

@@ -212,7 +212,7 @@ class ServerArgs:
     # DIAGNOSTIC (glm52 memcpy32_post A/B): capture GLM-5 whole-model decode
     # graphs without per-layer host-KV staging; decode tokens are then never
     # appended to host KV. Launch-scoped because graphs are captured once per
-    # server lifetime, so a batch-level batchgen_debug flag cannot express it.
+    # server lifetime, so a debug-state key cannot express it.
     glm5_disable_decode_host_kv_staging: bool = False
     # INTERNAL (model bring-up): serve only the first N transformer layers.
     # Startup loads a fraction of the weights and outputs are meaningless;

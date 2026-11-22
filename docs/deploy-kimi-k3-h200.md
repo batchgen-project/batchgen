@@ -201,8 +201,7 @@ python -m batchgen.launch_http_server \
 > releases the resident decode experts, prefills streamed, and the experts are rebuilt when
 > decode resumes. `--prefill-moe-mode resident_ep` runs every wave, the first included, against
 > the resident EP shard; it cannot be combined with `--enable-prefix-cache`. To run another
-> mode, start a server in that mode: no batch can change it, and a batch or turn that still
-> sends `batchgen_debug.k3_prefill_moe_mode` is refused with HTTP 400.
+> mode, start a server in that mode: no batch and no debug switch can change it.
 
 Start node 0 first or together with node 1: node 1 waits a bounded time for node 0's control
 store. On two nodes `--cluster-fail-fast` is on by default, so a fatal worker error on either
@@ -397,7 +396,8 @@ Any Triton compilation after that is logged at WARNING with the kernel and its f
 
 A late-compile line means the shape table missed a class; add an entry for it. `source=load`
 means the key came from the on-disk cache (fast) but was still missed by the prewarm. To make a
-late compile raise instead (for acceptance runs only, never in production), submit the batch with
-`"batchgen_debug": {"k3_triton_strict": true}`. The error is raised inside the model forward, so
+late compile raise instead (for acceptance runs only, never in production), set the server
+debug-state key `k3_triton_strict` before submitting (see
+[Debug state](server-flags.md#debug-state)). The error is raised inside the model forward, so
 it stops the worker pool, not only that batch, and it applies to every sequence decoded in the
 same step. Per-kernel variant counts are logged at DEBUG.

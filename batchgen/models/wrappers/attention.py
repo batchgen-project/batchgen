@@ -255,7 +255,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     # The pool holds one row per attention layer it caches, which is NOT the
     # Host cache's physical layer unless that cache compresses the same axis.
     prefill_pool_layer_map: ClassVar[Optional[tuple]] = None
-    # Batch-level ``batchgen_debug.prefix_pool_offload_check``: when the worker
+    # Server-level ``debug_state.prefix_pool_offload_check``: when the worker
     # installs a PoolOffloadCheckRecorder here, every pooled row the rank
     # offloads has its SOURCE bytes digested at offload-issue time, and the
     # worker compares them against the destination Host pages once the wave's

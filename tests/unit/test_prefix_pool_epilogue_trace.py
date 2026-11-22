@@ -1,4 +1,4 @@
-"""``batchgen_debug.prefix_pool_epilogue_trace``: the flag, the shard
+"""``debug_state.prefix_pool_epilogue_trace``: the flag, the shard
 arithmetic and the formatted line.
 
 The pooled prefill's epilogue - the tail-row gather, the streamed-SP8 shard

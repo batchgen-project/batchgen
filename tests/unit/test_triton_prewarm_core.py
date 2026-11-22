@@ -140,7 +140,7 @@ def test_guard_states(keys):
         for value in (True, 1, "1", "true", "on"):
             debug[key] = value
             assert guard.state() == TP.STRICT
-            assert guard.strict_reason() == f"batchgen_debug.{key}"
+            assert guard.strict_reason() == f"debug_state.{key}"
         for value in (False, 0, "false", None):
             debug[key] = value
             assert guard.state() == TP.LOG
@@ -230,7 +230,7 @@ def test_strict_raises_before_compiling(caplog, strict_by, tag, keys):
     debug = {key: True} if strict_by == "batch_flag" else {}
     recorder, runtime = _recorder(debug=debug, log_tag=tag, strict_keys=keys)
     recorder.guard.arm(strict=strict_by == "arm")
-    reason = (f"batchgen_debug.{key}" if strict_by == "batch_flag"
+    reason = (f"debug_state.{key}" if strict_by == "batch_flag"
               else "a guard armed strict")
     with caplog.at_level(logging.WARNING):
         with pytest.raises(TP.LateTritonCompileError) as info:
@@ -309,7 +309,7 @@ def test_get_recorder_wires_the_first_callers_debug_source(monkeypatch):
     assert recorder.guard.state() == TP.LOG
     debug["model_triton_strict"] = True
     assert recorder.guard.state() == TP.STRICT
-    assert recorder.guard.strict_reason() == "batchgen_debug.model_triton_strict"
+    assert recorder.guard.strict_reason() == "debug_state.model_triton_strict"
     # A later caller's wiring is ignored, like its tag.
     assert TP.get_recorder(strict_keys=("other",)) is recorder
 

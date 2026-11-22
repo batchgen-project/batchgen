@@ -123,6 +123,47 @@ so start node 0 first or together with the others. The control store
 lives as long as node 0's server: if node 0 is relaunched, relaunch every node
 (a fresh node 0 cannot form a cohort with the old peers' workers anyway).
 
+### Debug state
+
+Debug switches belong to the server. The server holds one debug state (a
+generation number and the keys that are set); every rank of every node runs
+under the same generation.
+
+| Request | Effect |
+|---------|--------|
+| `GET /v1/admin/debug-state` | Returns `{"generation": N, "values": {...}}`. |
+| `POST /v1/admin/debug-state` with `{"set": {"key": value}, "clear": ["key"]}` | Validates every key and value, then installs the next generation. An unknown key, a retired key or a refused value answers `400` naming the key, and nothing changes. |
+
+When a change takes effect depends on the key:
+
+- **Next phase entry** (most keys): the workers adopt the new generation at
+  the start of the next prefill wave or at the next decode entry, never inside
+  a wave or a decode step.
+- **Re-warm** (`k3_prefill_profile`, `kimi_decode_graph_mode`,
+  `glm5_moe_tilem_avg`, `glm52_recv_count_hist`,
+  `glm5_whole_model_graph_probe_layers`, `glm5_criticality_probe`): the value
+  is baked into captured decode graphs or into a phase instance. The request
+  is refused with `409` naming these keys unless it also carries
+  `"rewarm": true`; then the server restarts its worker pool under the new
+  state (a [worker-pool restart](#worker-pool-restart): host weights and host
+  KV stay loaded) and answers when the new pool is ready. `"timeout"` (seconds,
+  default 600) bounds that restart.
+
+No key needs a cold start. The endpoint is accepted only on node 0 (any other
+node answers `409` naming node 0) and has no access check of its own, like
+`POST /v1/workers/restart`: protect it the way the rest of the server's port
+is protected.
+
+Every adoption logs one line on each node,
+`[DEBUG_STATE] generation=N node=K keys=<key=value,...|none> phase=<prefill|decode>`.
+A serving window that ran under a non-empty debug state is a diagnostic run,
+not an official result.
+
+The keys are declared in `batchgen/debug_state.py` (core keys) and in each
+model family's `debug_keys.py`, each with its owner, the phase that reads it
+and its tier. A request (`/v1/batches`, `/v1/turns`) that carries
+`batchgen_debug` is refused with `400`.
+
 ### Cluster fail-fast
 
 From the moment it reaches node 0's control store, every node beats a heartbeat
@@ -347,7 +388,9 @@ This allows serving more concurrent sequences than the host KV cache can hold at
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable-prepack` | `true` | Enable prepack optimization for efficient prefill batching (always on) |
-| `--prefill-moe-mode` | model default | Prefill MoE mode of every prefill wave of this server: `streamed`, `streamed_sp8` or `resident_ep`, on models that declare prefill MoE modes (Kimi-K3). Unset, the model picks its streaming mode for the weight topology. The mode is fixed for the server's lifetime: no batch can change it, and a batch or turn that sends the retired `batchgen_debug.k3_prefill_moe_mode` is refused with HTTP 400. The model refuses a mode its topology cannot run at startup; a model without prefill MoE modes refuses the flag. `resident_ep` cannot be combined with `--enable-prefix-cache`. |
+| `--prefix-rank-assignment-mode` | `packing_v2` | Rank assignment of a pool-served prefill wave, for every wave of this server: `packing_v2` gives a prefix family one group's pool and balances the groups by predicted prefill time; `global_idx` assigns in arrival order. |
+| `--prefix-rank-cost-profile` | `on` | Whether the wave packer scores its targets by predicted prefill seconds (`on`) or balances computed tokens (`off`), for every wave of this server. |
+| `--prefill-moe-mode` | model default | Prefill MoE mode of every prefill wave of this server: `streamed`, `streamed_sp8` or `resident_ep`, on models that declare prefill MoE modes (Kimi-K3). Unset, the model picks its streaming mode for the weight topology. The mode is fixed for the server's lifetime: no batch and no debug switch can change it. The model refuses a mode its topology cannot run at startup; a model without prefill MoE modes refuses the flag. `resident_ep` cannot be combined with `--enable-prefix-cache`. |
 
 Prepack optimization packs multiple sequences into a single batch for efficient prefill. This is always enabled.
 
@@ -392,7 +435,7 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-cuda-graph` | `false` | Explicitly enable the decode CUDA graph (alias: `--enable-cuda-graphs`). Supported: GPT-OSS-120B, Kimi K2.5/K2.6, GLM-5 FP8 family. For any other model the server refuses to start (`UnsupportedCudaGraphFlagError`); Kimi-Linear/K3 graphs are chosen by the planner and `batchgen_debug.kimi_decode_graph_mode`. Mutually exclusive with `--disable-cuda-graphs`. |
+| `--enable-cuda-graph` | `false` | Explicitly enable the decode CUDA graph (alias: `--enable-cuda-graphs`). Supported: GPT-OSS-120B, Kimi K2.5/K2.6, GLM-5 FP8 family. For any other model the server refuses to start (`UnsupportedCudaGraphFlagError`); Kimi-Linear/K3 graphs are chosen by the planner and the debug-state key `kimi_decode_graph_mode` (see [Debug state](#debug-state)). Mutually exclusive with `--disable-cuda-graphs`. |
 | `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. Mutually exclusive with `--enable-cuda-graph`. |
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |

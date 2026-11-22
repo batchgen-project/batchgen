@@ -624,7 +624,7 @@ def test_glm5_whole_model_graph_policy_is_cli_only_and_glm5_fp8_only():
 def test_glm5_graph_routing_is_decided_by_the_cli_flag_alone():
     """S6c: the server-level graph mode comes only from the CLI. The
     whole-model compare is a per-batch choice inside that mode
-    (``batchgen_debug.glm5_whole_model_graph_compare``) and no longer feeds
+    (``debug_state.glm5_whole_model_graph_compare``) and no longer feeds
     the routing predicates; the retired compare env var is not read."""
     model_name = "zai-org/GLM-5-FP8"
 

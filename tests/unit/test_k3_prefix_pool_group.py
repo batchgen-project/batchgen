@@ -487,7 +487,7 @@ def test_the_executor_is_built_without_the_pad_poison_probe(monkeypatch):
 
 
 def test_a_batch_can_arm_the_pad_poison_probe(monkeypatch):
-    """``batchgen_debug.prefix_pool_pad_poison`` reaches the chunk executor."""
+    """``debug_state.prefix_pool_pad_poison`` reaches the chunk executor."""
     wave = _pool_with_debug(monkeypatch, {"prefix_pool_pad_poison": True})
 
     assert wave.executor.pad_poison is True

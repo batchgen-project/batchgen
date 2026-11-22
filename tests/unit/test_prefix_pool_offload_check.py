@@ -1,6 +1,6 @@
 """The pooled-wave offload byte-equality check.
 
-Flag `batchgen_debug.prefix_pool_offload_check` arms a recorder for the wave;
+Flag `debug_state.prefix_pool_offload_check` arms a recorder for the wave;
 every pooled row the rank offloads has its SOURCE bytes digested at
 offload-issue time, and after the wave's D2H retires the worker re-reads the
 DESTINATION Host pages and compares. The check has to be exact about
