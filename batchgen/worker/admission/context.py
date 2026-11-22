@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ class RankFacts:
     enable_prefix_cache: bool
     enable_host_kv_eviction: bool
     host_kv_chunk_size: int
+    prefix_cache_debug_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,3 +41,19 @@ class DecodePhaseContext:
     prefix_coordinator: Optional[Any]
     prefix_runtime: Optional[Any]
     chunk_sizer: Optional[Any]
+    parallel_manager: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class WaitOutcome:
+    num_tasks: int
+    new_deferred_errors: Optional[Tuple[str, ...]] = None
+
+
+@dataclass(frozen=True)
+class MoeCountsOutcome:
+    local_count_tensor: Any
+    all_rank_counts: Any
+    current_local_batch_size: int
+    max_batch_size: int
+    rank_token_counts: Any

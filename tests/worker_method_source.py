@@ -120,6 +120,8 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.prefix_coordinator": "self.prefix_cache_coordinator",
         "ctx.prefix_runtime": "self.prefix_cache_runtime_config",
         "ctx.chunk_sizer": "self.adaptive_chunk_sizer",
+        "ctx.facts.prefix_cache_debug_stats": "self.prefix_cache_debug_stats",
+        "ctx.parallel_manager": "self.parallel_manager",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -135,8 +137,19 @@ class _ContextToWorker(ast.NodeTransformer):
         return _context_attr_worker_expr(node) or node
 
     def visit_Name(self, node):
-        if node.id == "max_rank_bsz" and isinstance(node.ctx, ast.Load):
-            return ast.parse("getattr(self, '_decode_padding_bsz', 0) or 0", mode="eval").body
+        if isinstance(node.ctx, ast.Load):
+            replacements = {
+                "max_rank_bsz": "getattr(self, '_decode_padding_bsz', 0) or 0",
+                "pending_tasks": "self._pending_kv_append_tasks",
+                "pending_tensors": "getattr(self, '_pending_kv_append_tensors', None)",
+                "deferred_errors": "getattr(self, '_deferred_kv_append_wait_errors', [])",
+                "decode_local_count_tensor": "self._decode_local_count_tensor",
+                "decode_all_rank_counts": "self._decode_all_rank_counts",
+                "previous_max": "getattr(self, '_current_decode_max_rank_batch_size', 0) or 0",
+            }
+            replacement = replacements.get(node.id)
+            if replacement is not None:
+                return ast.parse(replacement, mode="eval").body
         return node
 
     def visit_Call(self, node):
@@ -324,6 +337,9 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         if node.name == "_make_boundary_decision_request":
             del args[-1]
         method.body = _ContextToWorker().visit(method).body
+        worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
+        if worker_method is not None:
+            method.args = copy.deepcopy(worker_method.args)
         return method
     del args[1]
     rebinds = [
