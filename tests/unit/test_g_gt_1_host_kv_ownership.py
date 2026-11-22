@@ -658,7 +658,15 @@ class RecordingCoordinator:
         self.released.append(int(handle))
 
 
-def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
+def _forbidden_status_read(status):
+    raise AssertionError(
+        "_release_host_kv_pages_for_batch must not read sequence status; "
+        "the caller states remaining_decode_uuids"
+    )
+
+
+def _release_worker(rank, *, attn_tp_size, views, states, coordinator,
+                    seqs=None, bound=None, gpu_manager=None):
     """A fake worker holding only what the real release path reads."""
     methods = _worker_methods(
         [
@@ -676,18 +684,19 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         {
             "logging": logging,
             "Sequence": Sequence,
-            "SequenceStatus": SimpleNamespace(IN_DECODE="IN_DECODE"),
+            # No SequenceStatus in the namespace: the release no longer reads
+            # any status, so a reintroduced read fails here with a NameError.
             # The aux release is guarded on the dual coordinator type; these
             # single-coordinator fakes are never instances of it.
             "DualHostKVCoordinator": type("DualHostKVCoordinator", (), {}),
         },
     )
-    seqs = _seqs(group=0)
+    seqs = seqs if seqs is not None else _seqs(group=0)
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
         global_batch=SimpleNamespace(
             get_sequence=seqs.get,
-            get_sequences_by_status=lambda status: [],
+            get_sequences_by_status=_forbidden_status_read,
         ),
         core_engine=SimpleNamespace(host_paged_kv_worker_view=views[0]),
         host_paged_kv_worker_view_aux=views[1],
@@ -699,7 +708,7 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         # arena to give back -- which is exactly what the release seam must
         # tolerate on a run that never turned the trajectory flag on.
         prefix_cache_coordinator=coordinator,
-        gpu_paged_kv_cache_manager=None,
+        gpu_paged_kv_cache_manager=gpu_manager,
         # K3 semantics: ONE prefix group (primary); the indexer-key aux region
         # lives outside the groups and is handled by the explicit aux path.
         _host_views_by_group=lambda: {0: views[0]},
@@ -707,7 +716,8 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
     attach_identity(
         worker,
         rank=rank, world_size=8, local_world_size=8,
-        decode_group_size=attn_tp_size, bound={"a": 0, "b": 1},
+        decode_group_size=attn_tp_size,
+        bound=bound if bound is not None else {"a": 0, "b": 1},
     )
     attach_prefix_state(
         worker,
@@ -761,7 +771,9 @@ def test_g2_follower_release_drops_its_mirror_without_freeing_shared_pages(
             rank, attn_tp_size=2, views=views_by_rank[rank],
             states=states[rank], coordinator=coordinators[rank],
         )
-        worker._release_host_kv_pages_for_batch(["a", "b"])
+        worker._release_host_kv_pages_for_batch(
+            ["a", "b"], remaining_decode_uuids=[]
+        )
 
     for group, backend in backends.items():
         # The shared pages are freed exactly once, by the group leader, and the
@@ -779,6 +791,75 @@ def test_g2_follower_release_drops_its_mirror_without_freeing_shared_pages(
     # coordinator; a follower call would double-release the shared node.
     assert coordinators[0].released == [7]
     assert coordinators[1].released == []
+
+
+# --------------------------------------------------------------------------- #
+#  (vi-b) Release: the caller states the rows remaining in decode
+# --------------------------------------------------------------------------- #
+
+
+class FakeGPUManager:
+    """Only what the release's rebuild block reads: a flag and the calls."""
+
+    is_initialized = True
+
+    def __init__(self):
+        self.rebuilds = []
+
+    def rebuild_page_table(self, global_ids):
+        self.rebuilds.append(list(global_ids))
+
+
+def _rebuild_release_worker(monkeypatch, gpu_manager):
+    """Rank 0 leader holding rows a/b/c; ``x`` exists only on another rank."""
+    _stub_prefix_modules(monkeypatch)
+    backends = {0: FakeBackend(1000), 1: FakeBackend(2000)}
+    views = _two_group_views(backends, 0)
+    seqs = _seqs(group=0)
+    seqs["c"] = SimpleNamespace(uuid="c", global_idx=99, assigned_rank=0,
+                                decode_dp_group=0)
+    return _release_worker(
+        0, attn_tp_size=2, views=views, states={},
+        coordinator=RecordingCoordinator(),
+        seqs=seqs, bound={"a": 0, "b": 1, "c": 2}, gpu_manager=gpu_manager,
+    )
+
+
+def test_rebuild_covers_exactly_the_held_remaining_rows_sorted_by_global_id(
+    monkeypatch,
+):
+    manager = FakeGPUManager()
+    worker = _rebuild_release_worker(monkeypatch, manager)
+    # ``x`` is held by another rank and ``a`` is the row being released here;
+    # neither may reach the rebuild. The surviving rows come out sorted by
+    # global id (c=99 before b=101), whatever order the caller stated.
+    worker._release_host_kv_pages_for_batch(
+        ["a"], remaining_decode_uuids=["b", "x", "a", "c"]
+    )
+    assert manager.rebuilds == [[99, 101]]
+
+
+def test_no_rebuild_when_no_held_remaining_rows(monkeypatch):
+    manager = FakeGPUManager()
+    worker = _rebuild_release_worker(monkeypatch, manager)
+    worker._release_host_kv_pages_for_batch(["a"], remaining_decode_uuids=["x"])
+    worker._release_host_kv_pages_for_batch(["b"], remaining_decode_uuids=[])
+    assert manager.rebuilds == []
+
+
+def test_release_reads_no_sequence_status():
+    """The remaining-in-decode rows are the caller's statement, not a status
+    read. Source pin: the method makes no ``get_sequences_by_status`` call and
+    reads no ``status`` attribute. (At runtime the fakes in this file raise on
+    a status read, and the compile namespace has no ``SequenceStatus``.)"""
+    node = _worker_method_node("_release_host_kv_pages_for_batch")
+    reads = [
+        n for n in ast.walk(node)
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get_sequences_by_status")
+        or (isinstance(n, ast.Attribute) and n.attr == "status")
+    ]
+    assert reads == []
 
 
 # --------------------------------------------------------------------------- #

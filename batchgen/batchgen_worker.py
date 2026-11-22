@@ -6061,7 +6061,15 @@ class BatchGenWorker:
 					self.global_batch.get_sequence(uuid).global_idx
 					for uuid in kda_only
 				])
-			self._release_host_kv_pages_for_batch(my_completed)
+			# These rows complete out of PREFILLED, so this release removes
+			# nothing from decode: the rows remaining in decode are exactly
+			# the ones in decode right now.
+			self._release_host_kv_pages_for_batch(
+				my_completed,
+				remaining_decode_uuids=self.global_batch.get_sequences_by_status(
+					SequenceStatus.IN_DECODE
+				),
+			)
 		for uuid in completed_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is not None:
@@ -7131,7 +7139,17 @@ class BatchGenWorker:
 						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
 						if gpu_allocated:
 							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-						self._release_host_kv_pages_for_batch(my_completed)
+						# The rows remaining in decode are the ones read into
+						# current_decoding above minus the rows the completion
+						# sync just moved to COMPLETED; no other status write
+						# runs between that read and this call.
+						self._release_host_kv_pages_for_batch(
+							my_completed,
+							remaining_decode_uuids=[
+								u for u in current_decoding
+								if u not in global_completed
+							],
+						)
 					# All-ranks scalar cleanup
 					for uuid in completed_list:
 						seq = self.global_batch.get_sequence(uuid)
@@ -8859,11 +8877,20 @@ class BatchGenWorker:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
 
 
-	def _release_host_kv_pages_for_batch(self, uuids: List[str]) -> None:
+	def _release_host_kv_pages_for_batch(
+		self, uuids: List[str], *, remaining_decode_uuids: List[str]
+	) -> None:
 		"""Release host KV pages for completed sequences owned by this rank.
-		
+
 		NOTE: This function only releases HOST KV pages. GPU KV pages should be
 		released separately by calling _release_gpu_kv_pages() BEFORE this function.
+
+		``remaining_decode_uuids`` is the caller's statement of which sequences
+		remain in decode after this release, in any order. The caller provides
+		it so this function never reads sequence status (a boundary can then
+		apply all of its status changes at one point). Rows not held locally
+		and rows being released here are filtered out below before the GPU
+		page-table rebuild.
 		"""
 		if not uuids:
 			return
@@ -8954,9 +8981,8 @@ class BatchGenWorker:
 		if my_uuids:
 			manager = self.gpu_paged_kv_cache_manager
 			if manager is not None and manager.is_initialized:
-				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 				remaining_global_ids = []
-				for uuid in remaining_in_decode:
+				for uuid in remaining_decode_uuids:
 					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
 						seq = self.global_batch.get_sequence(uuid)
 						remaining_global_ids.append(seq.global_idx)
@@ -11483,7 +11509,14 @@ class BatchGenWorker:
 				gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
 				if gpu_allocated:
 					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-				self._release_host_kv_pages_for_batch(my_completed)
+				# decisions.active_uuids is the decode set minus the completed
+				# rows just moved to COMPLETED above; rows this decision will
+				# evict or put on hold later in this boundary are still in
+				# decode at this point.
+				self._release_host_kv_pages_for_batch(
+					my_completed,
+					remaining_decode_uuids=decisions.active_uuids,
+				)
 
 			# All-ranks: zero scalar counters so downstream reads (e.g.
 			# migration planning iterating all sequences) never see a stale
@@ -13674,7 +13707,13 @@ class BatchGenWorker:
 						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
 						if gpu_allocated:
 							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-					self._release_host_kv_pages_for_batch(completed_uuids)
+					# decode_uuids was just rebuilt as the decode set minus
+					# completed_uuids, which were moved to COMPLETED above, so
+					# it names exactly the rows remaining in decode.
+					self._release_host_kv_pages_for_batch(
+						completed_uuids,
+						remaining_decode_uuids=decode_uuids,
+					)
 					# Report completions (this pops local_map; must run LAST).
 					for uuid in completed_uuids:
 						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
