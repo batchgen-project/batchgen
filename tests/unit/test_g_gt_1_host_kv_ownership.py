@@ -389,7 +389,9 @@ def _gate_names(method):
 
 def _reads_gate(test, names):
     for node in ast.walk(test):
-        if isinstance(node, ast.Attribute) and node.attr == "_owns_host_kv":
+        # The worker spells the rule self._owns_host_kv, the context-taking
+        # code ctx.facts.rank_ctx.owns_host_kv.
+        if isinstance(node, ast.Attribute) and node.attr in ("_owns_host_kv", "owns_host_kv"):
             return True
         if isinstance(node, ast.Name) and node.id in names:
             return True
@@ -962,8 +964,18 @@ def _parents(method):
     return parents
 
 
+def _boundary_carry_out_node():
+    """The page boundary's carry-out: ``BoundaryExecutor.apply``."""
+    path = (Path(__file__).resolve().parents[2]
+            / "batchgen" / "worker" / "admission" / "boundary_executor.py")
+    executor = next(node for node in ast.parse(path.read_text()).body
+                    if isinstance(node, ast.ClassDef) and node.name == "BoundaryExecutor")
+    return next(node for node in executor.body
+                if isinstance(node, ast.FunctionDef) and node.name == "apply")
+
+
 def test_boundary_host_growth_is_gated_on_owns_host_kv():
-    method = _worker_method_node("_apply_boundary_decisions")
+    method = _boundary_carry_out_node()
     parents = _parents(method)
 
     appends = [
@@ -998,7 +1010,7 @@ def test_boundary_host_growth_is_gated_on_owns_host_kv():
 
 
 def test_boundary_growth_mirror_is_reached_under_a_rank_uniform_condition():
-    method = _worker_method_node("_apply_boundary_decisions")
+    method = _boundary_carry_out_node()
     parents = _parents(method)
     calls = [
         node for node in ast.walk(method)
@@ -1012,7 +1024,7 @@ def test_boundary_growth_mirror_is_reached_under_a_rank_uniform_condition():
         node = parents[node]
         if isinstance(node, ast.If):
             test = ast.unparse(node.test)
-            for rank_dependent in ("_owns_host_kv", "self.rank", "_uuid_to_local_map"):
+            for rank_dependent in ("owns_host_kv", "facts.rank", "uuid_to_local"):
                 assert rank_dependent not in test, (
                     f"the growth mirror's gather sits under {test!r}"
                 )

@@ -683,15 +683,22 @@ def test_boundary_candidate_without_seq_meta_fails_loud():
 
 def test_growth_phase_reclaims_before_the_fresh_preflight():
     """Wiring guard: the worker's boundary is not unit-instantiable."""
-    source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
-    boundary_source = source[source.index("def _apply_boundary_decisions"):]
+    # The boundary's carry-out is BoundaryExecutor.apply.
+    boundary_source = (
+        Path(__file__).parents[2]
+        / "batchgen" / "worker" / "admission" / "boundary_executor.py"
+    ).read_text()
     growth = boundary_source[
-        boundary_source.index("if decisions.growth_feasible and decisions.host_growth_uuids:\n\t\t\thost_grow_requests"):
+        boundary_source.index(
+            "if decisions.growth_feasible and decisions.host_growth_uuids:\n"
+            "            host_grow_requests"
+        ):
     ]
     reclaim = growth.index(
-        "if self.enable_prefix_cache:\n\t\t\t\tself._reclaim_host_prefix_pages_for_growth("
+        "if ctx.facts.enable_prefix_cache:\n"
+        "                kv._reclaim_host_prefix_pages_for_growth("
     )
-    preflight = growth.index("self._collective_host_kv_growth_capacity_ok(")
+    preflight = growth.index("kv._collective_host_kv_growth_capacity_ok(")
     allocate = growth.index("worker_view.grow_pages_for_sequences(")
     assert reclaim < preflight < allocate
     # The planner's stats come from the gather that reports reclaimable pages.

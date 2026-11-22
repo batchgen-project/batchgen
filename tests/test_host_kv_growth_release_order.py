@@ -15,14 +15,18 @@ every rank takes the same branch.
 import ast
 from pathlib import Path
 
-WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+EXECUTOR = (
+    Path(__file__).resolve().parents[1]
+    / "batchgen" / "worker" / "admission" / "boundary_executor.py"
+)
 
 
 def _page_boundary_method():
-    tree = ast.parse(WORKER.read_text())
+    # The boundary's carry-out is BoundaryExecutor.apply.
+    tree = ast.parse(EXECUTOR.read_text())
     return next(
         node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_apply_boundary_decisions"
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
     )
 
 

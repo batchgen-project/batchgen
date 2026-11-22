@@ -268,7 +268,6 @@ def test_every_completion_site_releases_before_reporting():
     assert set(callers) == {
         "_finish_prefill_completed_sequences",
         "generate",
-        "_apply_boundary_decisions",
         "_decoding_legacy_modes",
     }
     for name, node in callers.items():
@@ -279,6 +278,35 @@ def test_every_completion_site_releases_before_reporting():
                 name, report,
             )
             previous_report = report
+
+    # The fourth site is the page boundary. Its carry-out is
+    # BoundaryExecutor.apply, which reports through the completion outlet the
+    # worker hands it (completion.report_completion is _report_completion).
+    executor = ast.parse(
+        (WORKER.parent / "worker" / "admission" / "boundary_executor.py").read_text()
+    )
+    apply = next(
+        node for node in ast.walk(executor)
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
+    )
+    # Only the outlet's calls: the chunk sizer has a method of the same name.
+    reports = sorted(
+        call.lineno for call in ast.walk(apply)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "report_completion"
+        and isinstance(call.func.value, ast.Name) and call.func.value.id == "completion"
+    )
+    releases = _calls(apply, "_release_host_kv_pages_for_batch")
+    assert reports and releases
+    previous_report = 0
+    for report in reports:
+        assert any(previous_report < line < report for line in releases), report
+        previous_report = report
+    wiring = next(
+        node for node in ast.walk(TREE)
+        if isinstance(node, ast.FunctionDef) and node.name == "_apply_boundary_decisions"
+    )
+    assert "report_completion=self._report_completion" in ast.unparse(wiring)
 
 
 def test_the_drain_row_carries_the_trajectory_attachment_counter():

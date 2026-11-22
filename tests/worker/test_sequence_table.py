@@ -317,9 +317,11 @@ def test_a_release_filter_keyed_on_membership_sees_nothing_after_unbind():
     assert mine_after == []
 
 
-# The three sites carrying the ORDERING FIX comment. Each releases GPU/host KV
-# and only then calls `_report_completion`, which unbinds.
-_ORDERED_METHODS = ("generate", "_apply_boundary_decisions", "_decoding_legacy_modes")
+# The sites carrying the ORDERING FIX comment. Each releases GPU/host KV and
+# only then calls `_report_completion`, which unbinds. Two are worker methods;
+# the third, the page boundary's carry-out, is BoundaryExecutor.apply and is
+# checked on its own below.
+_ORDERED_METHODS = ("generate", "_decoding_legacy_modes")
 
 
 def _worker_method(name):
@@ -389,3 +391,26 @@ def test_report_completion_is_the_only_worker_unbind_on_the_completion_path():
     assert _release_calls(
         worker_shaped_method_node("_release_completed_trajectory_slot")
     ) == []
+
+
+def test_kv_release_precedes_report_completion_in_the_boundary_executor():
+    path = WORKER.parent / "worker" / "admission" / "boundary_executor.py"
+    apply = next(
+        node for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
+    )
+
+    def lines(owner, called):
+        return [
+            node.lineno for node in ast.walk(apply)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == called
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == owner
+        ]
+
+    report = lines("completion", "report_completion")
+    releases = lines("kv", "_release_gpu_kv_pages") + lines("kv", "_release_host_kv_pages_for_batch")
+    assert report, "the boundary executor no longer reports completions"
+    assert releases, "the boundary executor no longer releases KV before reporting"
+    assert min(releases) < max(report)
+

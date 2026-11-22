@@ -420,10 +420,18 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
 
 def _assignment_targets(method_name, value_name):
     """Names read by every assignment to `value_name` inside `method_name`."""
-    tree = ast.parse(WORKER.read_text())
+    if method_name == "BoundaryExecutor.apply":
+        # The page boundary's carry-out lives in the boundary executor.
+        tree = ast.parse(
+            (WORKER.parent / "worker" / "admission" / "boundary_executor.py").read_text()
+        )
+        owner_name, method_name = "BoundaryExecutor", "apply"
+    else:
+        tree = ast.parse(WORKER.read_text())
+        owner_name = "BatchGenWorker"
     worker = next(
         node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        if isinstance(node, ast.ClassDef) and node.name == owner_name
     )
     method = next(
         node for node in worker.body
@@ -452,10 +460,11 @@ def test_page_boundary_eviction_releases_host_kv_on_owner_only():
     path must too. Only reachable once GPU-KV pressure makes eviction routine
     (a high decode admission cap), which is why 32-slot runs never hit it.
     """
-    assignments = _assignment_targets("_apply_boundary_decisions", "evicted_global_ids")
+    assignments = _assignment_targets("BoundaryExecutor.apply", "evicted_global_ids")
     assert assignments, "evicted_global_ids assignment not found"
     for attrs in assignments:
-        assert "_owns_host_kv" in attrs, (
+        # In the executor the rule is spelled ctx.facts.rank_ctx.owns_host_kv.
+        assert "owns_host_kv" in attrs, (
             "evicted_global_ids feeds release_sequence_pages/unregister_sequences "
             "on the SHARED per-node host-KV region; it must be filtered by "
             "_owns_host_kv or G>1 ranks double-release"
