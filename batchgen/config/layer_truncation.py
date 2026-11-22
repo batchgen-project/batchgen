@@ -89,7 +89,20 @@ def apply_layer_truncation(config, debug_num_layers: Optional[int]):
     Raises:
         LayerTruncationError: N is not in ``[1, num_hidden_layers]``.
     """
-    full = int(config.num_hidden_layers)
+    current = int(config.num_hidden_layers)
+    stamped = getattr(config, FULL_LAYER_COUNT_FIELD, None)
+    if stamped is not None:
+        # Already resolved on this object. The same request is a no-op; a
+        # different one cannot be honoured (the per-layer tables were already
+        # sliced) and must not silently rewrite the checkpoint's depth.
+        requested = int(stamped) if debug_num_layers is None else int(debug_num_layers)
+        if requested != current:
+            raise LayerTruncationError(
+                f"--debug-num-layers: this config already serves {current} of "
+                f"{int(stamped)} layers and cannot be re-resolved to {requested}"
+            )
+        return config
+    full = current
     setattr(config, FULL_LAYER_COUNT_FIELD, full)
     if debug_num_layers is None:
         return config
@@ -282,10 +295,12 @@ def weight_reservation_bytes(
         with open(os.path.join(converted_ckpt_dir, name)) as handle:
             size = int(json.load(handle)["total_byte_size"])
         total = -(-total // _WEIGHT_FILE_ALIGNMENT) * _WEIGHT_FILE_ALIGNMENT + size
-    total = -(-total // _RESERVATION_ALIGNMENT) * _RESERVATION_ALIGNMENT
     if total > int(full_byte_size):
         raise LayerTruncationError(
             f"--debug-num-layers: the selected weight files need {total} bytes, "
             f"more than the model's full reservation of {int(full_byte_size)}"
         )
-    return total
+    # The footprint fits; the 2 MiB round-up is only an allocation nicety and
+    # never pushes the reservation past the model's own.
+    aligned = -(-total // _RESERVATION_ALIGNMENT) * _RESERVATION_ALIGNMENT
+    return min(aligned, int(full_byte_size))

@@ -277,4 +277,34 @@ def test_reservation_follows_the_selected_files(tmp_path):
     # a at 0 (5000 B), b on the next 4 KiB boundary (8192) -> ends at 12288; 2 MiB round-up.
     assert weight_reservation_bytes(7 * mib, ckpt, ["a.json", "b.json"]) == 2 * mib
     with pytest.raises(LayerTruncationError, match="more than the model's full reservation"):
-        weight_reservation_bytes(mib, ckpt, ["a.json", "b.json"])
+        weight_reservation_bytes(12287, ckpt, ["a.json", "b.json"])
+    # The footprint (12288 B) fits a full reservation that is not 2 MiB-aligned:
+    # the round-up must not turn that into a refusal or exceed the reservation.
+    assert weight_reservation_bytes(12288, ckpt, ["a.json", "b.json"]) == 12288
+    assert weight_reservation_bytes(mib, ckpt, ["a.json", "b.json"]) == mib
+
+
+def test_resolving_twice_keeps_the_checkpoint_depth():
+    from types import SimpleNamespace
+
+    import pytest
+
+    from batchgen.config.layer_truncation import (
+        LayerTruncationError,
+        apply_layer_truncation,
+        unserved_layer_range,
+    )
+
+    config = SimpleNamespace(num_hidden_layers=12, model_type="t")
+    apply_layer_truncation(config, 4)
+    apply_layer_truncation(config, 4)            # same request: no-op
+    assert (config.num_hidden_layers, config.num_hidden_layers_full) == (4, 12)
+    assert unserved_layer_range(config) == (4, 12)
+    with pytest.raises(LayerTruncationError, match="cannot be re-resolved"):
+        apply_layer_truncation(config, 6)
+    with pytest.raises(LayerTruncationError, match="cannot be re-resolved"):
+        apply_layer_truncation(config, None)
+    full = SimpleNamespace(num_hidden_layers=12, model_type="t")
+    apply_layer_truncation(full, None)
+    apply_layer_truncation(full, None)           # production path twice: no-op
+    assert (full.num_hidden_layers, full.num_hidden_layers_full) == (12, 12)

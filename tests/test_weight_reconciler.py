@@ -390,3 +390,17 @@ def test_tensor_of_a_served_layer_stays_unaccounted_under_truncation():
     report = wr.reconcile(checkpoint, spec)
     assert report.n_unserved == 0
     assert report.counts["unaccounted"] == 1
+
+
+def test_declared_tensor_of_an_unserved_layer_is_reported():
+    import dataclasses
+
+    checkpoint, spec = _fixture()
+    declared = next(name for name in spec.name_map if ".layers.0." in name)
+    # Layer 0 declared in the name map while the spec says layers [0, 9) are unserved.
+    spec = dataclasses.replace(spec, unserved_layers=(0, 9))
+    report = wr.reconcile(checkpoint, spec)
+    assert report.counts["declared_unserved"] >= 1
+    assert any(f.key == declared for f in report.findings)
+    with pytest.raises(wr.WeightReconcileError):
+        report.raise_for_status()

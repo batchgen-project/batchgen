@@ -384,6 +384,16 @@ def reconcile(checkpoint: CheckpointIndex, spec: ReconcileSpec,
     bytes_incomplete = False
     unserved_names: List[str] = []
     for name in names:
+        if is_unserved_layer_tensor(name, spec.unserved_layers) and (
+            name in spec.name_map or name in spec.skeleton
+        ):
+            report.add(
+                "declared_unserved", name,
+                "declared as a module weight or skeleton tensor, but it "
+                "belongs to a layer that is not served; the loader does not "
+                "publish tensors of unserved layers, so the declared weight "
+                "would never arrive",
+            )
         entry = spec.name_map.get(name)
         if entry is not None:
             report.n_mapped += 1
