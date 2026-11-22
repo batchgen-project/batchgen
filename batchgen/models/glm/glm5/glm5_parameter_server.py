@@ -41,6 +41,7 @@ from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
 from .shm_reservation import converted_checkpoint_byte_size
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
+from batchgen.config.layer_truncation import apply_layer_truncation, select_weight_files
 from batchgen.eventlog.process import native_log_level
 _diag("model_registry done")
 
@@ -55,7 +56,8 @@ except ImportError:
 
 
 class GLM5_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False,
+                 debug_num_layers=None):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
@@ -67,6 +69,8 @@ class GLM5_Parameter_Server:
         # Used both for metadata reads and to build the model graph — GLM-5 no
         # longer uses an HF transformers.PretrainedConfig.
         self.model_config = BatchGenModelConfig.resolve(huggingface_ckpt_name, cache_dir)
+        # The host side serves the same layer prefix as the workers.
+        apply_layer_truncation(self.model_config, debug_num_layers)
         self.hf_config = self.model_config
         self.hf_config._name_or_path = huggingface_ckpt_name
 
@@ -116,6 +120,7 @@ class GLM5_Parameter_Server:
             byte_size,
             self.converted_ckpt_dir,
             self.state_dict_name_map,
+            select_weight_files(str(self.converted_ckpt_dir), self.model_config),
         )
         return self.shm_name, self.tensor_meta_shm_name
 

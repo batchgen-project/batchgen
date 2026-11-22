@@ -48,6 +48,7 @@ import torch
 from tqdm import trange
 
 from batchgen.config.model_registry import load_config
+from batchgen.config.layer_truncation import apply_layer_truncation, select_weight_files
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 from .config import is_k3_model_type, require_num_routed_experts
@@ -153,7 +154,7 @@ class KimiLinear_Parameter_Server:
     """Parameter server for Kimi-Linear (BF16) and Kimi-K3 (MXFP4 experts)."""
 
     def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir,
-                 enable_hugetlbfs, enable_thp=False):
+                 enable_hugetlbfs, enable_thp=False, debug_num_layers=None):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
@@ -187,6 +188,8 @@ class KimiLinear_Parameter_Server:
                 "stamps the wrapper's model_type ('kimi_k3' / 'kimi_k31'); the "
                 "48B defaults were loaded instead."
             )
+        # The host side serves the same layer prefix as the workers.
+        apply_layer_truncation(self.model_config, debug_num_layers)
         self.num_layers = self.model_config.num_hidden_layers  # 27
         self.num_experts = require_num_routed_experts(self.model_config)
         self.first_k_dense_replace = self.model_config.first_k_dense_replace  # 1
@@ -253,6 +256,7 @@ class KimiLinear_Parameter_Server:
             byte_size,
             str(self.converted_ckpt_dir),
             self.state_dict_name_map,
+            select_weight_files(str(self.converted_ckpt_dir), self.model_config),
         )
         return self.shm_name, self.tensor_meta_shm_name
 

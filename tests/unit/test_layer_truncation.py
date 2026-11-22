@@ -196,3 +196,62 @@ def test_kimi_production_path_keeps_the_full_split():
     # The synthetic 1-in-4 split over 27 layers: 6 MLA (4,8,...,24), 21 KDA.
     assert config.num_kda_layers == 21
     assert config.num_mla_layers == 6
+
+
+def _write_ckpt(tmp_path, files):
+    import json
+
+    for name, tensors in files.items():
+        (tmp_path / name).write_text(
+            json.dumps({"file_name": name[:-5] + ".bin", "total_byte_size": 0,
+                        "state_dict": {t: {} for t in tensors}})
+        )
+    (tmp_path / "config.txt").write_text("not metadata")
+    return str(tmp_path)
+
+
+def _served(n, full):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(num_hidden_layers=n, num_hidden_layers_full=full)
+
+
+def test_all_layers_served_selects_nothing_so_every_file_is_read(tmp_path):
+    from batchgen.config.layer_truncation import select_weight_files
+
+    ckpt = _write_ckpt(tmp_path, {"layer_0.json": ["model.layers.0.a"]})
+    assert select_weight_files(ckpt, _served(4, 4)) == []
+
+
+def test_truncation_selects_files_holding_a_served_or_non_layer_tensor(tmp_path):
+    from batchgen.config.layer_truncation import select_weight_files
+
+    ckpt = _write_ckpt(tmp_path, {
+        "a.json": ["model.layers.0.x", "model.layers.1.x"],
+        "b.json": ["model.layers.1.y", "model.layers.2.y"],   # mixed: layer 1 is served
+        "c.json": ["model.layers.2.z", "model.layers.3.z"],   # only layers that are not served
+        "d.json": ["model.embed_tokens.weight"],              # not a layer tensor
+        "e.json": ["model.layers.10.x"],                      # beyond the checkpoint's depth: kept
+        "f.json": ["model.layers.12.mlp.experts.3.w"],        # expert index is not a layer index
+    })
+    assert select_weight_files(ckpt, _served(2, 4)) == [
+        "a.json", "b.json", "d.json", "e.json", "f.json",
+    ]
+
+
+def test_truncation_refuses_an_empty_selection_and_foreign_metadata(tmp_path):
+    import json
+
+    import pytest
+
+    from batchgen.config.layer_truncation import (
+        LayerTruncationError,
+        select_weight_files,
+    )
+
+    ckpt = _write_ckpt(tmp_path, {"c.json": ["model.layers.3.z"]})
+    with pytest.raises(LayerTruncationError, match="no converted-checkpoint file"):
+        select_weight_files(ckpt, _served(2, 4))
+    (tmp_path / "x.json").write_text(json.dumps({"other": 1}))
+    with pytest.raises(LayerTruncationError, match="no state_dict"):
+        select_weight_files(ckpt, _served(2, 4))

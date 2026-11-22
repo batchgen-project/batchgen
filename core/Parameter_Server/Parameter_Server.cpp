@@ -91,9 +91,13 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
     const std::string& model_weights_path,
     void* weight_ptr,
     int64_t buffer_bytes,
-    std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map)
+    std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map,
+    const std::vector<std::string>& weight_json_files)
 {
     /*
+        The load set is weight_json_files (names inside model_weights_path)
+        when the caller selected one, otherwise every .json file of the
+        directory. A file that is not selected is never opened.
         First get a list of all .json file.
         Parse every .json file and plan the whole load against buffer_bytes
         before any read: a file that would end past the buffer fails here.
@@ -103,8 +107,15 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
     */
     // Step 1: Get all .json file paths in the model_weights_path directory
     std::vector<std::string> json_paths;
-    DIR* dir = opendir(model_weights_path.c_str());
-    if (dir != nullptr) {
+    DIR* dir = weight_json_files.empty() ? opendir(model_weights_path.c_str()) : nullptr;
+    if (!weight_json_files.empty()) {
+        json_paths.reserve(weight_json_files.size());
+        for (const auto& name : weight_json_files) {
+            json_paths.push_back(model_weights_path + "/" + name);
+        }
+        this->logger->info("Weight load set: {} selected files of {}",
+                           json_paths.size(), model_weights_path);
+    } else if (dir != nullptr) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
             // Skip the "." and ".." directory entries
@@ -471,7 +482,8 @@ void Parameter_Server::Init(
     int64_t byte_size, std::string& model_weights_path,
     std::unordered_map<std::string,
                        std::unordered_map<std::string, std::string>>&
-        state_dict_name_map) {
+        state_dict_name_map,
+    const std::vector<std::string>& weight_json_files) {
     this->logger->info("Parameter Server Initializing...");
 
     size_t free_memory = 0;
@@ -500,7 +512,8 @@ void Parameter_Server::Init(
     this->weight_ptr_ = weight_ptr;
 
     // Load weights from the model_weights_path
-    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, byte_size, state_dict_name_map);
+    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, byte_size, state_dict_name_map,
+                                      weight_json_files);
 
     // Serialize the module weights storage into an anonymous memfd. Workers
     // read it once through /proc/<this pid>/fd/<tensor_meta_memfd_fd_>.

@@ -60,8 +60,11 @@ tested headlessly, like ``batchgen_model_config``.
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Optional
+import os
+import re
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -173,3 +176,61 @@ def require_layer_truncation_applied(
             f"(num_hidden_layers={effective!r}, "
             f"{FULL_LAYER_COUNT_FIELD}={stamped!r})"
         )
+
+
+# Converted checkpoints name a layer's tensors ``model.layers.<i>.<rest>``.
+_LAYER_TENSOR = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def select_weight_files(converted_ckpt_dir: str, config) -> List[str]:
+    """The converted-checkpoint files the host weight load must read.
+
+    ``config`` is the rich config after ``apply_layer_truncation``. With all
+    layers served the result is empty, which the native loader reads as "every
+    file of the directory". Under truncation a file is selected when it holds
+    at least one tensor the served prefix needs: a tensor of a layer below the
+    served count, or a tensor that is not a layer tensor of the checkpoint
+    (embeddings, final norm, head). A file whose tensors all belong to layers
+    that are not served is never opened.
+
+    Returns:
+        ``<name>.json`` file names inside ``converted_ckpt_dir``, sorted.
+
+    Raises:
+        LayerTruncationError: truncation is on and no file was selected, or a
+            metadata file has no ``state_dict``.
+    """
+    served = int(config.num_hidden_layers)
+    full = int(getattr(config, FULL_LAYER_COUNT_FIELD, served))
+    if served == full:
+        return []
+
+    selected = []
+    names = sorted(
+        name for name in os.listdir(converted_ckpt_dir) if name.endswith(".json")
+    )
+    for name in names:
+        with open(os.path.join(converted_ckpt_dir, name)) as handle:
+            state_dict = json.load(handle).get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise LayerTruncationError(
+                f"--debug-num-layers: {name} in {converted_ckpt_dir} has no "
+                "state_dict; it is not converted-checkpoint metadata"
+            )
+        for tensor_name in state_dict:
+            match = _LAYER_TENSOR.search(tensor_name)
+            layer = int(match.group(1)) if match else None
+            if layer is None or layer < served or layer >= full:
+                selected.append(name)
+                break
+    if not selected:
+        raise LayerTruncationError(
+            f"--debug-num-layers {served}: no converted-checkpoint file in "
+            f"{converted_ckpt_dir} holds a tensor of the served layers"
+        )
+    logger.warning(
+        "[LAYER_TRUNCATION] host weight load reads %d of %d converted files",
+        len(selected),
+        len(names),
+    )
+    return selected

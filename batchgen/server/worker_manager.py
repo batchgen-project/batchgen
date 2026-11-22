@@ -2651,6 +2651,7 @@ class WorkerManager:
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
                 enable_thp=self.args.fast_init,
+                debug_num_layers=getattr(self.args, "debug_num_layers", None),
             )
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
@@ -2663,6 +2664,7 @@ class WorkerManager:
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
                 enable_thp=self.args.fast_init,
+                debug_num_layers=getattr(self.args, "debug_num_layers", None),
             )
         elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
@@ -2704,6 +2706,7 @@ class WorkerManager:
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
                 enable_thp=self.args.fast_init,
+                debug_num_layers=getattr(self.args, "debug_num_layers", None),
             )
             _diag("    glm5: GLM5_Parameter_Server constructed")
         else:

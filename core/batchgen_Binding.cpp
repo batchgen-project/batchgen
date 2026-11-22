@@ -1233,6 +1233,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // and a 2-node startup kills itself at PEER_DEAD_S while both nodes
         // load concurrently.
         .def("Init", &Parameter_Server::Init,
+             py::arg("shm_name"), py::arg("tensor_meta_shm_name"),
+             py::arg("byte_size"), py::arg("model_weights_path"),
+             py::arg("state_dict_name_map"),
+             py::arg("weight_json_files") = std::vector<std::string>{},
              py::call_guard<py::gil_scoped_release>())
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
