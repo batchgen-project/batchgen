@@ -325,6 +325,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
+from batchgen_kernels import post_readiness
 from batchgen.worker.admission.plan import (
 	StatusEdge,
 	Transition,
@@ -8539,6 +8540,10 @@ class BatchGenWorker:
 	def _record_decode_graph_capture(self) -> None:
 		"""Count one completed decode graph capture for the live decode owner."""
 		self._graph.decode_graph_captures = self._graph.decode_graph_captures + 1
+		post_readiness.record(
+			post_readiness.GRAPH_CAPTURE,
+			f"decode graph capture #{self._graph.decode_graph_captures}",
+		)
 
 	def _assert_decode_attention_weights_registered(self) -> None:
 		"""A reused decode instance keeps its resident attention weights.
@@ -8741,11 +8746,14 @@ class BatchGenWorker:
 		"""Arm the strategy manager's late-compile guard as this worker's rank
 		reports ready: every kernel compile after this point is a defect the
 		guard reports. A manager without the hook (no prewarm registry yet)
-		is a no-op.
+		arms nothing of its own. Every model arms the post-readiness event
+		record: a later compile or graph capture is logged as one
+		``[POST_READINESS]`` line and counted.
 		"""
 		arm = getattr(self.parallel_manager, "arm_late_compile_guard", None)
 		if arm is not None:
 			arm()
+		post_readiness.arm(self.rank)
 
 	def _probe_startup_transient(
 		self, *, seam: str, capture: Optional[Callable[[], None]]

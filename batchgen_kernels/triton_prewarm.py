@@ -40,6 +40,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from batchgen_kernels import post_readiness
+
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +389,7 @@ class TritonCompileRecorder:
             self._log.warning(
                 "%s late compile (strict) %s", self.log_tag, event.describe()
             )
+            post_readiness.record(post_readiness.TRITON_COMPILE, event.describe())
             raise LateTritonCompileError(
                 f"Triton kernel compiled after the prewarm under "
                 f"{self.guard.strict_reason()}: {event.describe()}"
@@ -414,6 +417,7 @@ class TritonCompileRecorder:
             self._log.warning(
                 "%s late compile %s", self.log_tag, event.describe()
             )
+            post_readiness.record(post_readiness.TRITON_COMPILE, event.describe())
         else:
             self._log.debug("%s %s", self.log_tag, event.describe())
         if self._previous_post_hook is not None:
