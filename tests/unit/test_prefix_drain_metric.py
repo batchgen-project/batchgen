@@ -268,7 +268,7 @@ def test_every_completion_site_releases_before_reporting():
     assert set(callers) == {
         "_finish_prefill_completed_sequences",
         "generate",
-        "_page_boundary_fast",
+        "_apply_boundary_decisions",
         "_decoding_legacy_modes",
     }
     for name, node in callers.items():

@@ -22,7 +22,7 @@ def _page_boundary_method():
     tree = ast.parse(WORKER.read_text())
     return next(
         node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_page_boundary_fast"
+        if isinstance(node, ast.FunctionDef) and node.name == "_apply_boundary_decisions"
     )
 
 

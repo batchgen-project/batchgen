@@ -24,6 +24,7 @@ reader the carry-out can reach.
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
 from typing import Dict, List, Set, Tuple
 
@@ -173,10 +174,50 @@ def _functions() -> Dict[str, List[Tuple[str, ast.FunctionDef]]]:
 
 
 _INDEX = _functions()
-_BOUNDARY = next(
-    node for name, node in _INDEX["_page_boundary_fast"]
-    if name == "batchgen_worker.py"
-)
+def _worker_function(name: str) -> ast.FunctionDef:
+    return next(
+        node for file_name, node in _INDEX[name] if file_name == "batchgen_worker.py"
+    )
+
+
+def _boundary_with_carry_out_inlined() -> ast.FunctionDef:
+    """The page boundary as one function again, in execution order.
+
+    The worker keeps the carry-out of the decisions in its own method,
+    ``_apply_boundary_decisions``, which the boundary calls once. The facts
+    below are about the order of statements across the whole boundary, so the
+    carry-out's statements are put back where the call is, with line numbers
+    shifted so that source order equals execution order: everything before
+    the call, then the carry-out, then everything after it.
+    """
+    boundary = copy.deepcopy(_worker_function("_page_boundary_fast"))
+    carry_out = copy.deepcopy(_worker_function("_apply_boundary_decisions"))
+    calls = [
+        index for index, statement in enumerate(boundary.body)
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_apply_boundary_decisions"
+            for node in ast.walk(statement)
+        )
+    ]
+    assert len(calls) == 1, "the boundary calls its carry-out exactly once"
+    at = calls[0]
+    # The statement after the call returns early when no decode row is left;
+    # in the carry-out that is its own early return, so it is dropped here.
+    after = boundary.body[at + 2:]
+    for offset, statements in ((1_000_000, carry_out.body), (2_000_000, after)):
+        for statement in statements:
+            for node in ast.walk(statement):
+                if hasattr(node, "lineno"):
+                    node.lineno += offset
+                if getattr(node, "end_lineno", None) is not None:
+                    node.end_lineno += offset
+    boundary.body = boundary.body[:at] + carry_out.body + after
+    return boundary
+
+
+_BOUNDARY = _boundary_with_carry_out_inlined()
 
 
 def _calls(node: ast.AST, name: str) -> List[ast.Call]:
@@ -585,3 +626,38 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
         # name-collision artifact: LaunchReadinessReport's own field
         "to_json": {"status"},
     }
+
+
+def test_the_carry_out_is_one_method_with_a_declared_result():
+    """The boundary hands the decisions to one method and takes back a tuple.
+
+    The method ends in exactly two places: early, when no decode row is left
+    after the releases and host growth, and at the end. Both return the same
+    seven values, the last one telling the boundary which of the two it was.
+    """
+    carry_out = _worker_function("_apply_boundary_decisions")
+    assert [arg.arg for arg in carry_out.args.args] == [
+        "self", "decisions", "decode_uuids", "batch", "gpu_manager",
+        "worker_view", "global_seq_state", "chunk_size", "timing",
+        "boundary_start", "t0",
+    ]
+    returns = [node for node in ast.walk(carry_out) if isinstance(node, ast.Return)]
+    assert len(returns) == 2
+    for node in returns:
+        assert isinstance(node.value, ast.Tuple) and len(node.value.elts) == 7
+    flags = sorted(ast.unparse(node.value.elts[-1]) for node in returns)
+    assert flags == ["False", "True"]
+
+    boundary = _worker_function("_page_boundary_fast")
+    calls = [
+        node for node in ast.walk(boundary)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_apply_boundary_decisions"
+    ]
+    assert len(calls) == 1
+    assert [ast.unparse(arg) for arg in calls[0].args] == [
+        "decisions", "decode_uuids", "batch", "gpu_manager", "worker_view",
+        "global_seq_state", "chunk_size", "timing", "boundary_start", "t0",
+    ]
+

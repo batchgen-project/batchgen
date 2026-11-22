@@ -319,7 +319,7 @@ def test_a_release_filter_keyed_on_membership_sees_nothing_after_unbind():
 
 # The three sites carrying the ORDERING FIX comment. Each releases GPU/host KV
 # and only then calls `_report_completion`, which unbinds.
-_ORDERED_METHODS = ("generate", "_page_boundary_fast", "_decoding_legacy_modes")
+_ORDERED_METHODS = ("generate", "_apply_boundary_decisions", "_decoding_legacy_modes")
 
 
 def _worker_method(name):

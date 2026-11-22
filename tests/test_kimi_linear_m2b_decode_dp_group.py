@@ -452,7 +452,7 @@ def test_page_boundary_eviction_releases_host_kv_on_owner_only():
     path must too. Only reachable once GPU-KV pressure makes eviction routine
     (a high decode admission cap), which is why 32-slot runs never hit it.
     """
-    assignments = _assignment_targets("_page_boundary_fast", "evicted_global_ids")
+    assignments = _assignment_targets("_apply_boundary_decisions", "evicted_global_ids")
     assert assignments, "evicted_global_ids assignment not found"
     for attrs in assignments:
         assert "_owns_host_kv" in attrs, (

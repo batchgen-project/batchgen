@@ -968,7 +968,7 @@ def _parents(method):
 
 
 def test_boundary_host_growth_is_gated_on_owns_host_kv():
-    method = _worker_method_node("_page_boundary_fast")
+    method = _worker_method_node("_apply_boundary_decisions")
     parents = _parents(method)
 
     appends = [
@@ -1003,7 +1003,7 @@ def test_boundary_host_growth_is_gated_on_owns_host_kv():
 
 
 def test_boundary_growth_mirror_is_reached_under_a_rank_uniform_condition():
-    method = _worker_method_node("_page_boundary_fast")
+    method = _worker_method_node("_apply_boundary_decisions")
     parents = _parents(method)
     calls = [
         node for node in ast.walk(method)

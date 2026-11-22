@@ -684,7 +684,7 @@ def test_boundary_candidate_without_seq_meta_fails_loud():
 def test_growth_phase_reclaims_before_the_fresh_preflight():
     """Wiring guard: the worker's boundary is not unit-instantiable."""
     source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
-    boundary_source = source[source.index("def _page_boundary_fast"):]
+    boundary_source = source[source.index("def _apply_boundary_decisions"):]
     growth = boundary_source[
         boundary_source.index("if decisions.growth_feasible and decisions.host_growth_uuids:\n\t\t\thost_grow_requests"):
     ]
