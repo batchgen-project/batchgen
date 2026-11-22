@@ -362,11 +362,30 @@ def test_kv_release_precedes_report_completion_at_every_ordering_fix_site(name):
 
 def test_report_completion_is_the_only_worker_unbind_on_the_completion_path():
     """``_report_completion`` releases the query slot (hence unbinds) exactly
-    once, so the ordering above is the whole contract for that path."""
+    once, so the ordering above is the whole contract for that path.
+
+    Completion split: the release statement now lives in the engine's
+    ``_release_completed_slot_index``; ``_report_completion`` reaches it
+    through the same-name delegator exactly once, and no other piece of the
+    split path unbinds."""
+    from tests.worker_method_source import worker_shaped_method_node
+
+    def _release_calls(node):
+        return [
+            call for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == "release_query_book_slot"
+        ]
+
     method = _worker_method("_report_completion")
-    calls = [
-        node for node in ast.walk(method)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        and node.func.id == "release_query_book_slot"
-    ]
-    assert len(calls) == 1
+    assert len(_self_call_lines(method, "_release_completed_slot_index")) == 1
+    assert _release_calls(method) == []
+
+    release = worker_shaped_method_node("_release_completed_slot_index")
+    assert len(_release_calls(release)) == 1
+
+    for name in ("_completion_outlet_read", "_completion_outlet_send"):
+        assert _release_calls(_worker_method(name)) == []
+    assert _release_calls(
+        worker_shaped_method_node("_release_completed_trajectory_slot")
+    ) == []

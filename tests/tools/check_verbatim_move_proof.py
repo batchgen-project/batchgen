@@ -142,10 +142,17 @@ def _map_entries(spec: dict) -> Iterable[dict]:
 
 
 def _filtered_base_body(node: ast.FunctionDef, spec: dict) -> list[ast.stmt]:
+    body = _body(node, base=True)
+    statements = (spec.get("base") or {}).get("statements")
+    if statements is not None:
+        # A split step moves a slice of the base body: indices are into the
+        # docstring-stripped (and `self = worker`-stripped) base body, before
+        # any omission filter, so they stay stable and auditable.
+        body = body[statements[0]:statements[1]]
     omitted = set(spec.get("omitted_statements", []))
     return [
         statement
-        for statement in _body(node, base=True)
+        for statement in body
         if ast.unparse(statement) not in omitted
     ]
 
@@ -184,12 +191,19 @@ def prove(repo: pathlib.Path, base_revision: str, map_path: pathlib.Path) -> Non
         relative = entry["file"]
         class_name = entry.get("class", "KVCapacityEngine")
         new = _functions(repo / relative, class_name)
-        old = _base_functions(repo, base_revision, relative, class_name)
+        # A cross-file (or split) move declares where its base body lives:
+        # `base` names the file/class/function the statements came from, and
+        # optionally the statement slice. Default: same file/class/name.
+        base_spec = entry.get("base") or {}
+        base_relative = base_spec.get("file", relative)
+        base_class = base_spec.get("class", class_name)
+        old = _base_functions(repo, base_revision, base_relative, base_class)
         for name in entry["functions"]:
-            if name not in old or name not in new:
+            base_name = base_spec.get("function", name)
+            if base_name not in old or name not in new:
                 failures.append(f"{relative}:{name}: function missing in base or working tree")
                 continue
-            old_body = _filtered_base_body(old[name], entry)
+            old_body = _filtered_base_body(old[base_name], entry)
             rewritten = _Rewrite(entry, name)
             old_body = [rewritten.visit(statement) for statement in old_body]
             statement_rewrites = entry.get("statement_rewrites", {})

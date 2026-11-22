@@ -110,6 +110,7 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.facts.enable_host_kv_eviction": "self.enable_host_kv_eviction",
         "ctx.facts.host_kv_chunk_size": "self.host_kv_chunk_size",
         "ctx.sched.pool": "self.global_batch",
+        "ctx.sched.seq_table": "self.seq_table",
         "ctx.sched.seq_table.uuid_to_local": "self._uuid_to_local_map",
         "ctx.sched.seq_table.local_to_uuid": "self._local_to_uuid_map",
         "ctx.sched.trajectories": "self._traj",
@@ -133,12 +134,19 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
 
 class _ContextToWorker(ast.NodeTransformer):
     def visit_Attribute(self, node):
+        # Longest match first: a full context path (`ctx.sched.seq_table
+        # .uuid_to_local`) must map as a whole before its inner attribute
+        # (`ctx.sched.seq_table`) is rewritten out from under it.
+        replacement = _context_attr_worker_expr(node)
+        if replacement is not None:
+            return replacement
         node = self.generic_visit(node)
         return _context_attr_worker_expr(node) or node
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Load):
             replacements = {
+                "query_book": "self.query_book",
                 "max_rank_bsz": "getattr(self, '_decode_padding_bsz', 0) or 0",
                 "pending_tasks": "self._pending_kv_append_tasks",
                 "pending_tensors": "getattr(self, '_pending_kv_append_tensors', None)",
