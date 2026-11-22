@@ -327,9 +327,6 @@ from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHost
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
 from batchgen.worker.admission.plan import (
 	StatusEdge,
-	Transition,
-	TransitionPlan,
-	apply_or_raise,
 	update_batch_status,
 )
 from batchgen.worker.admission.context import (
