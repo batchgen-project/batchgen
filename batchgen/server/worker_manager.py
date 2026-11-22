@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.debug_state import DebugState
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.native_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
@@ -226,6 +227,8 @@ class WorkerManager:
         self,
         server_args: ServerArgs,
         worker_exit_state: Optional[WorkerExitState] = None,
+        *,
+        debug_state: DebugState,
     ):
         self.args = server_args
         try:
@@ -241,6 +244,10 @@ class WorkerManager:
         self._create_worker_channels()
         self.worker_process = None
         self.started = False
+        # The server's debug state (node 0 owns it). Every pool start carries
+        # it in the init message; a change on a running pool is published on
+        # the admission queue and adopted by the workers at a phase entry.
+        self.debug_state: DebugState = debug_state
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
@@ -1430,6 +1437,19 @@ class WorkerManager:
             logger.exception("Teardown before the cluster fail-fast exit failed")
         eventlog_process.exit_process(1, reason, logger=logger)
 
+    def publish_debug_state(self, state: DebugState) -> None:
+        """Make ``state`` the server's debug state and send it to the workers.
+
+        The message travels on the admission queue, so rank 0 broadcasts it to
+        every rank exactly like an admission; a pool that has not been
+        initialised yet takes it before its init message.
+        """
+        with self._lock:
+            self.debug_state = state
+            queue = self.request_queue
+        if queue is not None:
+            queue.put({"type": "debug_state", "state": state.to_wire()})
+
     def restart_workers(
         self,
         timeout_s: Optional[float] = None,
@@ -1619,6 +1639,7 @@ class WorkerManager:
             self.request_queue.put({
                 "type": "init",
                 "max_output_len": init_params.get("max_output_len", 4096),
+                "debug_state": self.debug_state.to_wire(),
             })
             spawn_to_ready_s = time.monotonic() - spawn_start
             if coordinated:
@@ -1896,6 +1917,8 @@ class WorkerManager:
             pre_dequantize_weights=self.args.pre_dequantize_weights,
             enable_deepep=getattr(self.args, "enable_deepep", False),
             prefill_moe_mode=getattr(self.args, "prefill_moe_mode", None),
+            prefix_rank_assignment_mode=self.args.prefix_rank_assignment_mode,
+            prefix_rank_cost_profile=self.args.prefix_rank_cost_profile,
             debug_num_layers=getattr(self.args, "debug_num_layers", None),
             enable_cuda_graph=self.args.enable_cuda_graph,
             disable_cuda_graphs=self.args.disable_cuda_graphs,

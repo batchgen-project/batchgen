@@ -998,11 +998,19 @@ def _server_worker_main_impl(
 				logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
 				break
 
+			# --- STEP 3.5: a debug state published before the pool's init ---
+			if isinstance(task_data, dict) and task_data.get("type") == "debug_state":
+				worker.receive_debug_state(task_data.get("state"), at_start=True)
+				continue
+
 			# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
 			if isinstance(task_data, dict) and task_data.get("type") == "init":
 				logging.info(f"Rank {global_rank}: Pool mode init received")
 				try:
 					current_max_output = task_data.get("max_output_len", 4096)
+					# The pool starts under the server's current debug state, so
+					# keys baked into captured graphs are in force before warm-up.
+					worker.receive_debug_state(task_data.get("debug_state"), at_start=True)
 
 					# Initialize worker with pool capacity (no sequences yet)
 					worker.Init(None, current_max_output, 0)

@@ -189,6 +189,12 @@ class ServerArgs:
     # modes. None = the model's default, which is streaming; every prefill
     # wave of the server runs the one mode chosen here.
     prefill_moe_mode: Optional[str] = None
+    # How a pool-served prefill wave assigns its sequences to ranks, and
+    # whether the packer scores its targets by predicted seconds. Both shape
+    # the workload of the whole server, so they are launch parameters and a
+    # run under either value is an ordinary (official) run.
+    prefix_rank_assignment_mode: str = "packing_v2"
+    prefix_rank_cost_profile: str = "on"
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
@@ -386,6 +392,27 @@ def _build_parser() -> argparse.ArgumentParser:
             "build; fails fast at startup if it is unavailable (no silent NCCL "
             "fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 "
             "and the K3 DeepEP build."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-rank-assignment-mode",
+        choices=("packing_v2", "global_idx"),
+        default="packing_v2",
+        help=(
+            "Rank assignment of a pool-served prefill wave, for every wave of "
+            "this server. packing_v2 (default): the predicted-time packer, "
+            "which gives a prefix family one group's pool and balances the "
+            "groups. global_idx: arrival order."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-rank-cost-profile",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "Whether the prefill wave packer scores its targets by predicted "
+            "prefill seconds (on, default) or balances computed tokens (off), "
+            "for every wave of this server."
         ),
     )
     parser.add_argument(
@@ -1154,6 +1181,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
         prefill_moe_mode=parsed.prefill_moe_mode,
+        prefix_rank_assignment_mode=parsed.prefix_rank_assignment_mode,
+        prefix_rank_cost_profile=parsed.prefix_rank_cost_profile,
         debug_num_layers=parsed.debug_num_layers,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,

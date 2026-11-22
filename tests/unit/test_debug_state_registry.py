@@ -4,7 +4,9 @@ import json
 import pytest
 
 from batchgen import debug_state as ds
-from batchgen.models.debug_keys import EMPTY, REGISTRY
+from batchgen.config.model_registry import DEBUG_KEY_REGISTRY as REGISTRY
+
+EMPTY = REGISTRY.empty
 
 
 def test_every_key_declares_owner_phase_tier_and_summary():

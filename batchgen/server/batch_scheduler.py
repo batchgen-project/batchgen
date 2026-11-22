@@ -29,7 +29,7 @@ from batchgen.server.io_struct import (
     StartupTransientObject,
     ToolCall,
     ToolCallFunction,
-    retired_batchgen_debug_error,
+    batchgen_debug_refusal,
 )
 from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.scheduling_pool import SchedulingPool
@@ -626,14 +626,14 @@ class BatchScheduler:
             )
             return
 
-        # POST /v1/batches refuses these keys; a batch stored before the
-        # refusal existed (the store survives restarts) fails here, before
-        # any of its requests reaches a worker.
-        retired_debug = retired_batchgen_debug_error(batch.batchgen_debug)
-        if retired_debug is not None:
-            logger.error("Batch %s: %s", batch_id, retired_debug)
+        # POST /v1/batches refuses debug switches on a request; a batch stored
+        # before the refusal existed (the store survives restarts) fails
+        # here, before any of its requests reaches a worker.
+        debug_refusal = batchgen_debug_refusal(batch.batchgen_debug)
+        if debug_refusal is not None:
+            logger.error("Batch %s: %s", batch_id, debug_refusal)
             self.storage.update_batch_status(
-                batch_id, BatchStatus.FAILED, error=retired_debug
+                batch_id, BatchStatus.FAILED, error=debug_refusal
             )
             return
 
@@ -1193,7 +1193,6 @@ class BatchScheduler:
                 "priority": 0,
                 "sampling_params": sampling_params[0],
                 "ignore_eos": bool(body.ignore_eos),
-                "batchgen_debug": body.batchgen_debug or {},
                 "traj_id": session.traj_id,
                 "session_id": session.session_id,
                 "parent_session_id": session.parent_session_id,
@@ -1453,7 +1452,6 @@ class BatchScheduler:
                     "sampling_params": sampling_params[idx] if sampling_params else {},
                     # Per-request vendor extension, as in vLLM/SGLang.
                     "ignore_eos": bool(getattr(req.body, "ignore_eos", False)),
-                    "batchgen_debug": batch.batchgen_debug or {},
                 },
                 priority=Priority.NORMAL,
             ))
@@ -1631,7 +1629,11 @@ class BatchScheduler:
 
             # First drain: send init message to worker
             if not self._pool_initialized:
-                init_msg = {"type": "init", **self.pool_init_params()}
+                init_msg = {
+                    "type": "init",
+                    **self.pool_init_params(),
+                    "debug_state": self.worker.debug_state.to_wire(),
+                }
                 self.worker.request_queue.put(init_msg)
                 self._pool_initialized = True
                 logger.info("[POOL] Init message sent to worker")
@@ -1679,7 +1681,6 @@ class BatchScheduler:
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
                     "ignore_eos": entry.raw_request.get("ignore_eos", False),
-                    "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
                     # Agent-session identity; None for batch requests.
                     "traj_id": entry.raw_request.get("traj_id"),
                     "session_id": entry.raw_request.get("session_id"),

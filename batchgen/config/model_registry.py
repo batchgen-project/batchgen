@@ -353,3 +353,24 @@ def _import_model_configs():
 
 # Auto-import on module load
 _import_model_configs()
+
+
+# ---------------------------------------------------------------------------
+# Server-level debug keys (batchgen/debug_state.py): core keys plus the keys
+# each model family declares in its own package. Assembled here, once, so the
+# server validates a change against the full set.
+# ---------------------------------------------------------------------------
+from batchgen.debug_state import CORE_KEYS, CORE_RETIRED, Registry  # noqa: E402
+from batchgen.models.glm.glm5 import debug_keys as _glm5_debug_keys  # noqa: E402
+from batchgen.models.moonshotai.kimi_linear import (  # noqa: E402
+    debug_keys as _kimi_linear_debug_keys,
+)
+
+DEBUG_KEY_REGISTRY = Registry(
+    CORE_KEYS + _glm5_debug_keys.DEBUG_KEYS + _kimi_linear_debug_keys.DEBUG_KEYS,
+    retired={
+        **CORE_RETIRED,
+        **_glm5_debug_keys.RETIRED_DEBUG_KEYS,
+        **_kimi_linear_debug_keys.RETIRED_DEBUG_KEYS,
+    },
+)

@@ -62,7 +62,7 @@ def _reentry_history_length(
     return max(0, min(prompt_length - original_prompt_length, original_max_decode_length))
 
 
-# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
+# Server debug-state keys of the pooled-prefill DIAGNOSTIC probes.
 # Spelled out here, instead of imported from the four probe modules, so that
 # deciding "is any probe armed on this prefill" is a membership test on a dict
 # the engine already holds: a production prefill must not import a probe module
@@ -337,74 +337,45 @@ class PrefillEngine:
         self = worker
         return self._prefix.next_pool_segment_sid()
 
-    def _prefix_rank_packing_mode(self, worker, seqs) -> bool:
+    def _prefix_rank_packing_mode(self, worker, seqs, *, mode: str) -> bool:
         """True when this batch runs the predicted-time wave packer.
 
         The packer is the default assignment for a pool-served wave: it is the
         arm that gives a prefix family one group's pool and balances the groups
         by predicted prefill seconds, so leaving it off by default would make
         every ordinary wave pay for a straggler the scheduler can see coming.
-        A batch asks for the arrival-order assignment back with
-        ``batchgen_debug.prefix_rank_assignment_mode: "global_idx"``, which is
-        what the A/B arms use.
-
-        Only the two spellings are accepted; a mistyped value is refused rather
-        than read as the other arm, because a silently ignored switch would
-        make the two arms the same run.
+        A server asks for the arrival-order assignment back with the launch
+        parameter ``--prefix-rank-assignment-mode global_idx``, which is what
+        the A/B arms use; it holds for every wave of the server.
         """
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
-        active_debug = getattr(self, "_active_batchgen_debug_for_sequences", None)
-        debug = (active_debug(seqs) if active_debug is not None else None) or {}
-        mode = debug.get("prefix_rank_assignment_mode")
-        if mode is None:
-            return True
         if mode not in ("packing_v2", "global_idx"):
             raise ValueError(
-                "batchgen_debug.prefix_rank_assignment_mode must be "
+                "--prefix-rank-assignment-mode must be "
                 f"'packing_v2' or 'global_idx', got {mode!r}"
             )
         return mode == "packing_v2"
 
-    def _prefix_rank_cost_profile_disabled(self, worker, seqs) -> bool:
-        """``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
+    def _prefix_rank_cost_profile_disabled(self, worker, seqs, *, value: str) -> bool:
+        """The launch parameter ``--prefix-rank-cost-profile off``.
 
         Scoring the packer's targets by predicted seconds and balancing their
-        computed tokens are the two arms of the packing comparison, and the
-        difference between them is a wall time: measuring it across two servers
-        would confound it with cold-start, allocator and JIT state, so the arm
-        has to be switchable inside one process. Batch level and nothing else:
-        the key rides the same admitted-batch broadcast as
-        ``prefix_rank_assignment_mode``, so every rank of every group resolves
-        the same value and the packing stays replicated. Set it on EVERY
-        request of a corpus — ``_active_batchgen_debug_for_sequences`` merges
-        per-sequence dicts first-non-None-wins, exactly as the mode key does.
-
-        Only the two spellings are accepted; a mistyped value is refused rather
-        than read as "on", because a silently ignored arm switch would make the
-        two arms the same run.
+        computed tokens are the two arms of the packing comparison. The arm is
+        a property of the server: every rank of every group reads the same
+        launch value, so the packing stays replicated.
         """
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
-        active = getattr(self, "_active_batchgen_debug_for_sequences", None)
-        debug = (active(seqs) if active is not None else None) or {}
-        value = debug.get("prefix_rank_cost_profile")
-        if value is None:
-            return False
-        if isinstance(value, str):
-            text = value.strip().lower()
-            if text == "off":
-                return True
-            if text == "on":
-                return False
-        raise ValueError(
-            "batchgen_debug.prefix_rank_cost_profile must be 'on' or 'off', "
-            f"got {value!r}"
-        )
+        if value not in ("on", "off"):
+            raise ValueError(
+                f"--prefix-rank-cost-profile must be 'on' or 'off', got {value!r}"
+            )
+        return value == "off"
 
     def _cached_prefix_rank_cost_profile(self, worker, disabled: bool = False):
         """This deployment's prefill executor cost profile, looked up once.
@@ -1611,16 +1582,15 @@ class PrefillEngine:
         """The probe keys this wave armed, or None. Read ONCE per wave.
 
         The four pooled probes (epilogue trace, offload byte check, kernel dump,
-        pad poison) are armed through the same batch-level seam as
-        ``prefix_rank_assignment_mode``: the flag rides on the wave's own
-        sequences, so a batch arms a probe against a server that is already up.
+        pad poison) are armed through the server's debug state, which the wave
+        adopted at its start, so an operator arms a probe against a server
+        that is already up.
 
-        Off is the production path and has to cost nothing measurable, so this
-        is the ONLY place that walks the wave's sequences, the answer is cached
-        on the wave, and the walk itself allocates nothing: a member whose
-        ``batchgen_debug`` is absent costs one attribute read, and the result
-        dict is not created until a probe key is actually found. Each probe's
-        own setup then imports its module only after this returned non-None.
+        Off is the production path and has to cost nothing measurable: an
+        empty debug state costs one attribute read, the answer is cached on
+        the wave, and the result dict is not created until a probe key is
+        actually found. Each probe's own setup then imports its module only
+        after this returned non-None.
         """
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
@@ -1630,29 +1600,11 @@ class PrefillEngine:
         if wave.probe_debug_read:
             return wave.probe_debug
         armed = None
-        server_debug = self._batchgen_debug
+        server_debug = self._phase_prefill_debug
         if server_debug:
-            # Server-level ``--batchgen-debug`` wins outright, exactly as
-            # _active_batchgen_debug_for_sequences has it.
             for key in _POOL_PROBE_DEBUG_KEYS:
                 value = server_debug.get(key)
                 if value is not None:
-                    if armed is None:
-                        armed = {}
-                    armed[key] = value
-        else:
-            for uuid in wave.uuids:
-                seq_debug = getattr(
-                    self.global_batch.get_sequence(uuid), "batchgen_debug", None
-                )
-                if not isinstance(seq_debug, dict):
-                    continue
-                for key in _POOL_PROBE_DEBUG_KEYS:
-                    value = seq_debug.get(key)
-                    # First member that names a key wins, as the merge in
-                    # _active_batchgen_debug_for_sequences does.
-                    if value is None or (armed is not None and key in armed):
-                        continue
                     if armed is None:
                         armed = {}
                     armed[key] = value
@@ -2278,9 +2230,7 @@ class PrefillEngine:
             self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
             for local_idx in batch
         ]
-        prefill_debug = (
-            self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
-        )
+        prefill_debug = self._phase_prefill_debug
         _k3_profile_enabled = self._debug_flag_enabled(
             prefill_debug.get(self._k3_prefill_profile_flag_name())
         )

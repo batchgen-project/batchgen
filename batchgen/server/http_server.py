@@ -23,6 +23,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from batchgen.server.batch_scheduler import BatchScheduler, parse_batch_file
 from batchgen.config.model_registry import (
     CONFIG_REGISTRY,
+    DEBUG_KEY_REGISTRY,
     _detect_model_type_from_identifier,
 )
 from batchgen.server.io_struct import (
@@ -40,8 +41,9 @@ from batchgen.server.io_struct import (
     ListModelsResponse,
     ModelObject,
     build_batch_object_from_create_request,
-    retired_batchgen_debug_error,
+    batchgen_debug_refusal,
 )
+from batchgen.debug_state import ADMIN_ENDPOINT as DEBUG_STATE_ENDPOINT, DebugStateError
 from batchgen.deprecation import (
     LEGACY_INFERENCE_ERROR_CODE,
     LEGACY_INFERENCE_MESSAGE,
@@ -209,7 +211,11 @@ def create_app(
                     "process: %s",
                     len(orphaned), orphaned,
                 )
-        worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
+        worker = WorkerManager(
+            server_args,
+            worker_exit_state=worker_exit_state,
+            debug_state=DEBUG_KEY_REGISTRY.empty,
+        )
         app.state.server_args = server_args
         app.state.worker = worker
         scheduler = None
@@ -474,9 +480,9 @@ def create_app(
 
         # A request error, refused whatever the pool state: it would be
         # refused again on retry.
-        retired_debug = retired_batchgen_debug_error(body.batchgen_debug)
-        if retired_debug is not None:
-            raise HTTPException(status_code=400, detail=retired_debug)
+        debug_refusal = batchgen_debug_refusal(body.batchgen_debug)
+        if debug_refusal is not None:
+            raise HTTPException(status_code=400, detail=debug_refusal)
 
         # Admission control: a batch may only be created while the worker pool
         # is serving. Accepting one during a restart or while the pool is down
@@ -630,6 +636,79 @@ def create_app(
                 "use_instead": "/v1/batches",
             },
         )
+
+    @app.get(DEBUG_STATE_ENDPOINT)
+    async def get_debug_state(request: Request):
+        worker_manager: WorkerManager = request.app.state.worker
+        return worker_manager.debug_state.to_wire()
+
+    @app.post(DEBUG_STATE_ENDPOINT)
+    async def change_debug_state(request: Request):
+        """Set or clear server-level debug switches: ``{set: {...}, clear: [...]}``.
+
+        A switch of the phase-entry tier takes effect at the next prefill wave
+        or decode entry. A switch baked into captured graphs or into a phase
+        instance needs ``rewarm: true``: the worker pool is restarted under
+        the new state while host weights and host KV stay loaded. A serving
+        window under a non-empty state is not an official result.
+        """
+        worker_manager: WorkerManager = request.app.state.worker
+        server: ServerArgs = request.app.state.server_args
+        if server.node_rank > 0:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "the debug state is owned by node 0; send it there",
+                    "coordinator_node": 0,
+                },
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or set(body) - {"set", "clear", "rewarm", "timeout"}:
+            raise HTTPException(
+                status_code=400,
+                detail="body must be an object with set, clear, rewarm and timeout only",
+            )
+        current = worker_manager.debug_state
+        try:
+            changed = current.changed(set=body.get("set") or {}, clear=body.get("clear") or ())
+        except DebugStateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        baked = current.rewarm_keys_changed(changed)
+        if baked and body.get("rewarm") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "these keys are baked into captured decode graphs or into a "
+                        "phase instance; resend with rewarm: true to restart the "
+                        "worker pool under the new state (host weights and host KV "
+                        "stay loaded)"
+                    ),
+                    "rewarm_keys": list(baked),
+                },
+            )
+        if not baked:
+            worker_manager.publish_debug_state(changed)
+            return {**changed.to_wire(), "applied": "next_phase_entry"}
+        timeout = float(body.get("timeout", 600.0))
+        worker_manager.set_main_thread_dispatcher(
+            make_main_thread_dispatcher(asyncio.get_running_loop())
+        )
+        worker_manager.debug_state = changed
+        try:
+            restart = await asyncio.wait_for(
+                asyncio.to_thread(worker_manager.restart_workers, timeout_s=timeout),
+                timeout=timeout,
+            )
+        except Exception:
+            # The pool did not come back under the new state: keep the state
+            # the running (or last) pool was started with.
+            worker_manager.debug_state = current
+            raise
+        return {**changed.to_wire(), "applied": "rewarm", "restart": restart}
 
     @app.post("/v1/workers/restart")
     async def restart_workers(request: Request):
