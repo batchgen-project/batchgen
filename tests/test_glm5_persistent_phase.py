@@ -203,9 +203,11 @@ def test_persistent_phase_worker_gate_rejects_invalid_flag_on_modes():
 
 
 
-@pytest.mark.parametrize("graph_requested", [True, False])
+@pytest.mark.parametrize("graph_requested, compiles_kernels", [
+    (True, True), (True, False), (False, True), (False, False),
+])
 def test_persistent_startup_capture_follows_cuda_graph_enablement(
-    graph_requested,
+    graph_requested, compiles_kernels,
 ):
     build = _isolated_worker_method("_build_persistent_phase_instances")
     build.__globals__["time"] = SimpleNamespace(perf_counter=lambda: 0.0)
@@ -221,6 +223,7 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement(
         share_skeleton_on_device=lambda: calls.append("share_skeleton"),
     )
     capture_fn = object()
+    prewarm_fn = object()
     worker = SimpleNamespace(
         rank=0,
         comm="comm",
@@ -249,6 +252,8 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement(
             ("probe", seam, capture)
         ),
         _capture_startup_decode_graphs=capture_fn,
+        _manager_decode_prewarm_compiles_kernels=lambda: compiles_kernels,
+        _prewarm_startup_decode_jit=prewarm_fn,
     )
 
     build(worker)
@@ -261,10 +266,13 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement(
         and entry[2].get("max_num_seq") == 128
         for entry in calls
     )
-    # The capture callable reaches the probe only under graph enablement.
+    # The capture callable reaches the probe only under graph enablement;
+    # without graphs, a manager whose decode prewarm compiles kernels still
+    # gets that prewarm before readiness.
     probe = next(entry for entry in calls if entry[0] == "probe")
     assert probe[1] == "persistent_build"
-    assert probe[2] is (capture_fn if graph_requested else None)
+    expected = capture_fn if graph_requested else (prewarm_fn if compiles_kernels else None)
+    assert probe[2] is expected
     # The build ends back in prefill.
     assert calls[-1][0] == "install_prefill"
 
