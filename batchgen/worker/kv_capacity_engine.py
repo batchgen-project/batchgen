@@ -56,6 +56,7 @@ from batchgen.worker.admission.plan import (
     Transition,
     TransitionPlan,
     apply_or_raise,
+    update_batch_status,
 )
 from batchgen.worker.boundary import BoundaryDecisionRequest, BoundarySeqMeta
 from batchgen.worker.decode import DecodeCapacitySnapshot, reduce_decode_capacity_snapshot
@@ -3803,19 +3804,18 @@ class KVCapacityEngine:
         return updated_uuids, updated_batch
 
     def _finalize_async_load_minimal(
-        self, worker,
+        self, ctx,
         async_task: object,
         pending_uuids: List[str],
         pending_local_indices: List[int],
         pending_global_ids: List[int],
         current_decode_uuids: List[str],
         current_batch: List[int],
-        gpu_manager: GPUPagedKVCacheManager
+        gpu_manager: GPUPagedKVCacheManager,
+        query_book,
+        async_load_tensors_ref,
     ) -> Tuple[List[str], List[int]]:
         """Minimal finalize without extra rebuilds - rebuild done once at end."""
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
 
         if pending_local_indices and isinstance(gpu_manager, DualKVCacheCoordinator):
             if not isinstance(async_task, DualAsyncKVTask):
@@ -3824,20 +3824,20 @@ class KVCapacityEngine:
                 )
 
         pending_local_uuid_set = {
-            self._local_to_uuid_map[idx]
+            ctx.sched.seq_table.local_to_uuid[idx]
             for idx in pending_local_indices
-            if idx in self._local_to_uuid_map
+            if idx in ctx.sched.seq_table.local_to_uuid
         }
 
         # VALIDATION: Verify all pending_uuids exist and every local rank that
         # must hold a replica confirmed its load.  Under TP decode, the old
         # assigned-rank-only check admitted a UUID after only one of the G ranks
         # had GPU pages, causing the other ranks to enter decode with zero pages.
-        group_size = self._decode_attn_tp_size()
+        group_size = ctx.facts.attn_tp_size
         valid_pending_uuids = []
         invalid_pending = []
         for uuid in pending_uuids:
-            seq = self.global_batch.get_sequence(uuid)
+            seq = ctx.sched.pool.get_sequence(uuid)
             if seq is None:
                 invalid_pending.append(f"{uuid[:8]} missing from global_batch")
                 continue
@@ -3847,13 +3847,13 @@ class KVCapacityEngine:
             if group_size > 1:
                 from batchgen.decode_dp_group import rank_in_decode_group
                 must_confirm_local = rank_in_decode_group(
-                    seq.decode_dp_group, self.rank, group_size
+                    seq.decode_dp_group, ctx.facts.rank, group_size
                 )
             else:
-                must_confirm_local = seq.assigned_rank == self.rank
+                must_confirm_local = seq.assigned_rank == ctx.facts.rank
             if must_confirm_local and uuid not in pending_local_uuid_set:
                 invalid_pending.append(
-                    f"{uuid[:8]} gid={seq.global_idx} rank {self.rank} "
+                    f"{uuid[:8]} gid={seq.global_idx} rank {ctx.facts.rank} "
                     "did not confirm local load"
                 )
                 continue
@@ -3861,54 +3861,53 @@ class KVCapacityEngine:
 
         if invalid_pending:
             raise RuntimeError(
-                f"Rank {self.rank}: invalid async-load pending UUIDs; "
+                f"Rank {ctx.facts.rank}: invalid async-load pending UUIDs; "
                 f"pending_count={len(pending_uuids)}, invalid={invalid_pending[:10]}"
             )
 
-        self._update_batch_status(
-            valid_pending_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY
+        update_batch_status(
+            ctx.sched.pool,
+            ctx.facts.rank,
+            valid_pending_uuids,
+            SequenceStatus.IN_DECODE,
+            StatusEdge.DECODE_ENTRY,
         )
 
         for local_idx in pending_local_indices:
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
+            seq = ctx.sched.pool.get_sequence(uuid)
             seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
             # Mark that this sequence has received its initial GPU reservation
             seq.mark_initial_gpu_reservation_done()
-            self._sequences_with_gpu_kv.add(uuid)
-            seq.validate_metadata(f"rank {self.rank} _finalize_async_load_minimal")
-            seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
+            ctx.gpu_resident.add(uuid)
+            seq.validate_metadata(f"rank {ctx.facts.rank} _finalize_async_load_minimal")
+            seq.log_event(SeqEvent.KV_LOAD_DONE, ctx.facts.rank,
                 f"gpu_pages={seq.gpu_pages_allocated}")
             logging.debug(
-                f"[LOAD_CONFIRM] Rank {self.rank}: finalized uuid={uuid[:8]} "
+                f"[LOAD_CONFIRM] Rank {ctx.facts.rank}: finalized uuid={uuid[:8]} "
                 f"gid={seq.global_idx} status=IN_DECODE gpu_pages={seq.gpu_pages_allocated} "
                 f"ctx={seq.current_context_length} host_pages={seq.host_pages_allocated}"
             )
             # Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
-            if local_idx in self.query_book:
-                self.query_book[local_idx] = make_query_book_entry(seq)
+            if local_idx in query_book:
+                query_book[local_idx] = make_query_book_entry(seq)
 
-        if hasattr(self, '_async_load_tensors'):
-            self._async_load_tensors = None
+        if async_load_tensors_ref is not None:
+            async_load_tensors_ref[0] = None
 
         updated_uuids = current_decode_uuids + valid_pending_uuids
-        updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+        updated_uuids.sort(key=lambda u: ctx.sched.pool.get_sequence(u).global_idx)
     
         uuid_to_local = {}
         for idx in current_batch:
-            uuid = self._local_to_uuid_map.get(idx)
+            uuid = ctx.sched.seq_table.local_to_uuid.get(idx)
             if uuid:
                 uuid_to_local[uuid] = idx
         for idx in pending_local_indices:
-            uuid = self._local_to_uuid_map.get(idx)
+            uuid = ctx.sched.seq_table.local_to_uuid.get(idx)
             if uuid:
                 uuid_to_local[uuid] = idx
     
         updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
-
-        # This returns a NEW ordered row list, so stamp it here rather than at
-        # each caller: both the page-boundary planner and the decode loop call
-        # this, and a caller that forgets would leave row-keyed state stale.
-        self._bump_decode_row_epoch()
 
         return updated_uuids, updated_batch

@@ -101,6 +101,13 @@ class TrajectoryStore:
     def reservation_free_count(self, model_context_length: int) -> int:
         return self.trajectory_book.reservation_free_count(model_context_length)
 
+    def trajectory_frontier_eviction_hook(self):
+        """The frontier eviction seam, or None when no frontier is committed."""
+        committer = self.trajectory_frontier_committer
+        if committer is None:
+            return None
+        return committer.on_prefix_pages_released
+
     # ------------------------------- optional KDA state -------------------
 
     def _state_owner(self):

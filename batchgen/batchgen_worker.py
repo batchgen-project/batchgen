@@ -328,6 +328,7 @@ from batchgen.worker.admission.plan import (
 	Transition,
 	TransitionPlan,
 	apply_or_raise,
+	update_batch_status,
 )
 from batchgen.worker.admission.context import (
 	DecodePhaseContext,
@@ -4481,17 +4482,7 @@ class BatchGenWorker:
 		``SequenceBatch.plan_transitions`` drops the redundant and completed
 		ones.
 		"""
-		if isinstance(uuids, str):
-			uuids = [uuids]
-		transitions, missing = self.global_batch.plan_transitions(uuids, new_status)
-		for uuid in missing:
-			logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch")
-		rejected = self.global_batch.apply(TransitionPlan(edge, transitions))
-		for rejection in rejected:
-			logging.warning(
-				f"Rank {self.rank}: Invalid status transition for "
-				f"{rejection.transition.uuid}: {rejection.reason}"
-			)
+		return update_batch_status(self.global_batch, self.rank, uuids, new_status, edge)
 
 	def _sync_sequence_metadata(self, decode_uuids: List[str]) -> None:
 		"""
@@ -9841,10 +9832,7 @@ class BatchGenWorker:
 		prefix eviction path keeps its exact previous behavior on every run
 		that never turned the flag on.
 		"""
-		committer = self._traj.trajectory_frontier_committer
-		if committer is None:
-			return None
-		return committer.on_prefix_pages_released
+		return self._traj.trajectory_frontier_eviction_hook()
 
 	def _get_trajectory_restorer(self):
 		"""M3 Slice 2 restorer, or None when no frontier has been committed.
@@ -12143,16 +12131,34 @@ class BatchGenWorker:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._finalize_async_load_minimal(
-			self,
-			async_task,
-			pending_uuids,
-			pending_local_indices,
-			pending_global_ids,
-			current_decode_uuids,
-			current_batch,
-			gpu_manager,
+		# The engine drops the load tensors part-way through, before a step
+		# that can raise; the one-slot holder carries that back on either exit.
+		async_load_tensors_ref = (
+			[self._async_load_tensors]
+			if hasattr(self, "_async_load_tensors")
+			else None
 		)
+		try:
+			updated_uuids, updated_batch = engine._finalize_async_load_minimal(
+				self._decode_phase_context(),
+				async_task,
+				pending_uuids,
+				pending_local_indices,
+				pending_global_ids,
+				current_decode_uuids,
+				current_batch,
+				gpu_manager,
+				query_book=self.query_book,
+				async_load_tensors_ref=async_load_tensors_ref,
+			)
+		finally:
+			if async_load_tensors_ref is not None:
+				self._async_load_tensors = async_load_tensors_ref[0]
+		# This returns a NEW ordered row list, so stamp it here rather than at
+		# each caller: both the page-boundary planner and the decode loop call
+		# this, and a caller that forgets would leave row-keyed state stale.
+		self._bump_decode_row_epoch()
+		return updated_uuids, updated_batch
 
 	def _integrate_pending_async_load(
 		self,
