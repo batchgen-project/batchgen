@@ -1076,6 +1076,38 @@ def test_a_failed_page_release_leaves_the_later_segments_counted(monkeypatch):
     assert view_builds == [1]
 
 
+def test_every_host_view_releases_a_segment_before_the_next_is_counted(monkeypatch):
+    # Two Host regions: both must release and unregister a freed segment while
+    # the segment after it is still counted.
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    views = {0: FakeView(FakeBackend(1000), 0), 1: FakeView(FakeBackend(2000), 0)}
+    worker = _finish_worker(
+        0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
+    )
+    worker._prefix.pool_member_sids = {GLOBAL_IDS[0]: (-1, -2)}
+    worker._prefix.pool_sid_members = {-1: 1, -2: 1}
+    events = []
+
+    def record(group, kind, call):
+        def wrapped(ids):
+            events.append((group, kind, list(ids), dict(worker._prefix.pool_sid_members)))
+            call(ids)
+        return wrapped
+
+    for group, view in views.items():
+        view.release_sequence_pages = record(group, "release", view.release_sequence_pages)
+        view.unregister_sequences = record(group, "unregister", view.unregister_sequences)
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert events == [
+        (0, "release", [-1], {-2: 1}), (0, "unregister", [-1], {-2: 1}),
+        (1, "release", [-1], {-2: 1}), (1, "unregister", [-1], {-2: 1}),
+        (0, "release", [-2], {}), (0, "unregister", [-2], {}),
+        (1, "release", [-2], {}), (1, "unregister", [-2], {}),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 #  (vi) A pool wave runs one model pass per planned chunk
 # --------------------------------------------------------------------------- #
