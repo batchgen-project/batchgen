@@ -64,7 +64,7 @@ import json
 import logging
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -182,19 +182,23 @@ def require_layer_truncation_applied(
 _LAYER_TENSOR = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
-def select_weight_files(converted_ckpt_dir: str, config) -> List[str]:
+def select_weight_files(converted_ckpt_dir: str, config) -> Tuple[List[str], List[str]]:
     """The converted-checkpoint files the host weight load must read.
 
     ``config`` is the rich config after ``apply_layer_truncation``. With all
-    layers served the result is empty, which the native loader reads as "every
-    file of the directory". Under truncation a file is selected when it holds
-    at least one tensor the served prefix needs: a tensor of a layer below the
-    served count, or a tensor that is not a layer tensor of the checkpoint
-    (embeddings, final norm, head). A file whose tensors all belong to layers
-    that are not served is never opened.
+    layers served both results are empty, which the native loader reads as
+    "every file of the directory, every tensor". Under truncation a file is
+    selected when it holds at least one tensor the served prefix needs: a
+    tensor of a layer below the served count, or a tensor that is not a layer
+    tensor of the checkpoint (embeddings, final norm, head). A file whose
+    tensors all belong to layers that are not served is never opened. A
+    selected file may also hold tensors of layers that are not served; those
+    are named in the second result so the loader does not publish them.
 
     Returns:
-        ``<name>.json`` file names inside ``converted_ckpt_dir``, sorted.
+        ``(files, unserved_tensor_names)``: ``<name>.json`` file names inside
+        ``converted_ckpt_dir``, sorted, and the tensors of those files that
+        belong to layers that are not served.
 
     Raises:
         LayerTruncationError: truncation is on and no file was selected, or a
@@ -203,9 +207,10 @@ def select_weight_files(converted_ckpt_dir: str, config) -> List[str]:
     served = int(config.num_hidden_layers)
     full = int(getattr(config, FULL_LAYER_COUNT_FIELD, served))
     if served == full:
-        return []
+        return [], []
 
-    selected = []
+    selected: List[str] = []
+    unserved: List[str] = []
     names = sorted(
         name for name in os.listdir(converted_ckpt_dir) if name.endswith(".json")
     )
@@ -217,23 +222,28 @@ def select_weight_files(converted_ckpt_dir: str, config) -> List[str]:
                 f"--debug-num-layers: {name} in {converted_ckpt_dir} has no "
                 "state_dict; it is not converted-checkpoint metadata"
             )
+        file_unserved = []
         for tensor_name in state_dict:
             match = _LAYER_TENSOR.search(tensor_name)
             layer = int(match.group(1)) if match else None
-            if layer is None or layer < served or layer >= full:
-                selected.append(name)
-                break
+            if layer is not None and served <= layer < full:
+                file_unserved.append(tensor_name)
+        if len(file_unserved) < len(state_dict):
+            selected.append(name)
+            unserved.extend(file_unserved)
     if not selected:
         raise LayerTruncationError(
             f"--debug-num-layers {served}: no converted-checkpoint file in "
             f"{converted_ckpt_dir} holds a tensor of the served layers"
         )
     logger.warning(
-        "[LAYER_TRUNCATION] host weight load reads %d of %d converted files",
+        "[LAYER_TRUNCATION] host weight load reads %d of %d converted files "
+        "and leaves %d tensors of unserved layers unpublished",
         len(selected),
         len(names),
+        len(unserved),
     )
-    return selected
+    return selected, unserved
 
 
 _WEIGHT_FILE_ALIGNMENT = 4096          # the native loader starts each file on 4 KiB

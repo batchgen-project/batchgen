@@ -220,7 +220,7 @@ def test_all_layers_served_selects_nothing_so_every_file_is_read(tmp_path):
     from batchgen.config.layer_truncation import select_weight_files
 
     ckpt = _write_ckpt(tmp_path, {"layer_0.json": ["model.layers.0.a"]})
-    assert select_weight_files(ckpt, _served(4, 4)) == []
+    assert select_weight_files(ckpt, _served(4, 4)) == ([], [])
 
 
 def test_truncation_selects_files_holding_a_served_or_non_layer_tensor(tmp_path):
@@ -234,9 +234,10 @@ def test_truncation_selects_files_holding_a_served_or_non_layer_tensor(tmp_path)
         "e.json": ["model.layers.10.x"],                      # beyond the checkpoint's depth: kept
         "f.json": ["model.layers.12.mlp.experts.3.w"],        # expert index is not a layer index
     })
-    assert select_weight_files(ckpt, _served(2, 4)) == [
-        "a.json", "b.json", "d.json", "e.json", "f.json",
-    ]
+    files, unserved = select_weight_files(ckpt, _served(2, 4))
+    assert files == ["a.json", "b.json", "d.json", "e.json", "f.json"]
+    # b.json is read for its layer-1 tensor; its layer-2 tensor is not published.
+    assert unserved == ["model.layers.2.y"]
 
 
 def test_truncation_refuses_an_empty_selection_and_foreign_metadata(tmp_path):

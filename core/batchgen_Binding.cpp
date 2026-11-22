@@ -1237,6 +1237,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("byte_size"), py::arg("model_weights_path"),
              py::arg("state_dict_name_map"),
              py::arg("weight_json_files") = std::vector<std::string>{},
+             py::arg("unserved_tensor_names") = std::vector<std::string>{},
              py::call_guard<py::gil_scoped_release>())
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)

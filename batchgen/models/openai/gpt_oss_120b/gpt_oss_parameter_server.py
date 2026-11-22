@@ -162,7 +162,7 @@ class GptOss_Parameter_Server:
         load_plan = plan_converted_ckpt_load(self.converted_ckpt_dir, byte_size, self.num_layers_full)
         logging.info(f"Weight load plan: {len(load_plan)} files fit the {byte_size}-byte buffer")
 
-        weight_files = select_weight_files(str(self.converted_ckpt_dir), self.hf_config)
+        weight_files, unserved_tensors = select_weight_files(str(self.converted_ckpt_dir), self.hf_config)
         byte_size = weight_reservation_bytes(byte_size, str(self.converted_ckpt_dir), weight_files)
         self.parameter_server.Init(
             self.shm_name,
@@ -171,6 +171,7 @@ class GptOss_Parameter_Server:
             str(self.converted_ckpt_dir),  # Convert Path to string for C++ binding
             self.state_dict_name_map,
             weight_files,
+            unserved_tensors,
         )
 
         # Debug: Log what skeleton_state_dict the C++ parameter server returns

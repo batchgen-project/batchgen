@@ -254,7 +254,7 @@ class KimiLinear_Parameter_Server:
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
-        weight_files = select_weight_files(str(self.converted_ckpt_dir), self.model_config)
+        weight_files, unserved_tensors = select_weight_files(str(self.converted_ckpt_dir), self.model_config)
         byte_size = weight_reservation_bytes(byte_size, str(self.converted_ckpt_dir), weight_files)
         self.parameter_server.Init(
             self.shm_name,
@@ -263,6 +263,7 @@ class KimiLinear_Parameter_Server:
             str(self.converted_ckpt_dir),
             self.state_dict_name_map,
             weight_files,
+            unserved_tensors,
         )
         return self.shm_name, self.tensor_meta_shm_name
 
