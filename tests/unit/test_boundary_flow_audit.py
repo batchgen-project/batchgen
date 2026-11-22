@@ -15,8 +15,10 @@ Two kinds of evidence, both CPU-only:
   those writes, and where the worker-only calls sit.
 
 Part B covers `batchgen_worker.py`, `batchgen/worker/*_engine.py` and
-`admission/plan.py`, following calls by method name. Helper classes outside
-those files are not followed.
+`admission/plan.py`, following calls by method name. The whole-package
+closure test at the end widens that to every module under `batchgen/`,
+resolving calls by name (an over-approximation) and pinning every status
+reader the carry-out can reach.
 """
 
 from __future__ import annotations
@@ -227,23 +229,86 @@ def _status_writes() -> List[Tuple[int, str]]:
     return sorted(writes)
 
 
-def test_status_is_written_four_times_in_this_order():
-    assert [s for _, s in _status_writes()] == [
+def test_planned_statuses_apply_at_one_point_then_at_most_the_amendment():
+    """All PLANNED status changes apply at one point; one amendment later.
+
+    The decision is a partition (Part A), so the three planned groups are
+    known when the decision arrives: COMPLETED through `_update_batch_status`
+    (rows the per-step sync already completed must be skipped), then EVICTED
+    and ON_HOLD through `apply_or_raise` with the boundary edge, with no other
+    call between them. The only later status write is the ON_HOLD amendment
+    for rows whose GPU page extension failed.
+    """
+    writes = _status_writes()
+    assert [s for _, s in writes] == [
         "COMPLETED", "EVICTED", "ON_HOLD", "ON_HOLD",
     ]
 
+    # One point: between the first and third write, the only calls are the
+    # write mechanism itself.
+    lo, hi = writes[0][0], writes[2][0]
+    mechanism = {"_update_batch_status", "apply_or_raise",
+                 "TransitionPlan", "Transition", "tuple"}
+    for node in ast.walk(_BOUNDARY):
+        if (isinstance(node, ast.Call)
+                and getattr(node, "lineno", None) is not None
+                and lo <= node.lineno <= hi):
+            name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                    else node.func.id if isinstance(node.func, ast.Name)
+                    else ast.unparse(node.func))
+            assert name in mechanism, (node.lineno, name)
+
+    # The fourth write is the extension-failure amendment: it sits under the
+    # branch taken when the collective extension did not succeed.
+    parent = {c: p for p in ast.walk(_BOUNDARY) for c in ast.iter_child_nodes(p)}
+    amendment = _calls(_BOUNDARY, "apply_or_raise")[-1]
+    assert amendment.lineno == writes[3][0]
+    guards = []
+    node = amendment
+    while node in parent:
+        node = parent[node]
+        if isinstance(node, ast.If):
+            guards.append(ast.unparse(node.test))
+    assert any("local_extension_success" in g for g in guards), guards
+
+
+def test_the_decode_index_snapshot_precedes_every_status_write():
+    """The completion release depends on the live IN_DECODE index.
+
+    Rows can be IN_DECODE without being in this call's decode set, so the
+    release's remaining rows must come from the index — read BEFORE any of
+    the boundary's status writes (the planned writes move evicted and
+    on-hold rows out of IN_DECODE) and narrowed only by the completed rows,
+    which is exactly what a live read returned when only the completion
+    update had been applied.
+    """
+    writes = _status_writes()
+    snapshots = [
+        c for c in _calls(_BOUNDARY, "get_sequences_by_status")
+        if "IN_DECODE" in ast.unparse(c)
+    ]
+    assert len(snapshots) == 1
+    assert snapshots[0].lineno < writes[0][0]
+
+    release = _calls(_BOUNDARY, "_release_host_kv_pages_for_batch")[0]
+    remaining = next(
+        k.value for k in release.keywords if k.arg == "remaining_decode_uuids"
+    )
+    assert "in_decode_before" in ast.unparse(remaining)
+    assert "completed_set" in ast.unparse(remaining)
+
 
 def test_no_step_between_the_status_writes_acts_on_a_status():
-    """What stands between today's four writes and one write.
+    """Between the first write and the amendment, status is read twice.
 
-    Between the first and the last status write, the boundary and everything
-    it calls read a status in exactly two places, and neither would be
-    affected by moving the EVICTED and ON_HOLD writes earlier: one counts
-    COMPLETED rows, one prints a status in a log line. The third reader this
-    test used to pin — `_release_host_kv_pages_for_batch` rebuilding the GPU
-    page table from the rows still IN_DECODE — is gone: the caller now states
-    those rows itself (`remaining_decode_uuids=decisions.active_uuids`), so
-    the release makes no status read at all.
+    Between the first status write and the last (the amendment), the boundary
+    and everything it calls read a status in exactly two places, and neither
+    is affected by the planned EVICTED and ON_HOLD writes applying at the
+    front: one counts COMPLETED rows, one prints a status in a log line. The
+    release's GPU page-table rebuild depends on the live IN_DECODE index, so
+    the boundary snapshots that index BEFORE its first status write and the
+    release takes the remaining rows as an argument instead of reading status
+    itself (pinned by test_the_decode_index_snapshot_precedes_every_status_write).
     """
     writes = _status_writes()
     lo, hi = writes[0][0], writes[-1][0]
@@ -366,3 +431,179 @@ def test_on_hold_frees_precede_extension_and_extension_precedes_load():
     load = _line("_allocate_gpu_pages_with_host_identity")
     assert free_calls[0] < extend            # planned on-hold rows
     assert extend < free_calls[1] < load     # rows whose extension failed
+
+
+# ------------------------------------------- Part B: whole-package closure
+
+_PKG = _ROOT / "batchgen"
+
+#: Names never defined in `batchgen/` (builtins, stdlib, torch, logging).
+#: Kept small on purpose: a name NOT listed here that happens to match a
+#: `batchgen` def is walked anyway (the closure over-approximates).
+_SKIP = set("""append items keys values get set list dict len sorted sum max
+min int str bool float tuple zip enumerate isinstance getattr setattr hasattr
+range add discard pop update join split format warning info debug error
+exception perf_counter tensor item barrier all_reduce all_gather_object
+broadcast_object_list synchronize RuntimeError ValueError KeyError TypeError
+Transition TransitionPlan BoundaryDecisions next iter startswith endswith copy
+extend remove clear count wait print type repr abs any all ceil""".split())
+
+#: Known name collisions: the carry-out's call resolves to exactly this file.
+#: `update_batch_status` is imported into `batchgen_worker.py` from the
+#: admission package; the server-process `BatchStorage` method of the same
+#: name is a different object on a different process.
+_PINNED = {"update_batch_status": "batchgen/worker/admission/plan.py"}
+
+#: Status-keyed accessors and status-dependent methods of
+#: `SequenceEntry`/`SequenceBatch`; a call to one is a status read.
+_STATUS_METHODS = {
+    "get_sequences_by_status", "status_transition", "plan_transitions",
+    "count_by_status", "get_sequences_for_rank_with_status",
+    "get_resumable_sequences", "get_resumable_sequences_for_rank",
+    "has_queueing", "has_prefilled", "has_in_decode", "has_on_hold",
+    "has_resumable", "has_evicted", "all_completed", "is_finished",
+    "is_active_in_decode", "is_resumable", "validate_metadata",
+    "get_my_sequences_by_status",
+}
+
+
+def _package_index() -> Dict[str, List[Tuple[str, ast.AST]]]:
+    index: Dict[str, List[Tuple[str, ast.AST]]] = {}
+    for path in sorted(_PKG.rglob("*.py")):
+        rel = str(path.relative_to(_ROOT))
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                index.setdefault(node.name, []).append((rel, node))
+    return index
+
+
+def _package_defs(index, name):
+    defs = index.get(name, [])
+    if name in _PINNED:
+        defs = [(rel, node) for rel, node in defs if rel == _PINNED[name]]
+    return defs
+
+
+def _called_names(fn_node) -> List[str]:
+    """Called names in ``fn_node``, skipping the group mirror's
+    trajectory-guarded calls: the boundary calls the mirror with the
+    trajectory flag off (pinned by
+    test_the_boundary_mirror_call_uses_none_of_the_trajectory_work), so that
+    branch cannot run in the carry-out."""
+    prune = fn_node.name == "_mirror_group_host_kv"
+    parent = ({c: p for p in ast.walk(fn_node) for c in ast.iter_child_nodes(p)}
+              if prune else {})
+
+    def guarded(node) -> bool:
+        p = node
+        while p in parent:
+            p = parent[p]
+            test = getattr(p, "test", None)
+            if test is not None and "trajectory" in ast.unparse(test):
+                return True
+        return False
+
+    names = []
+    for call in ast.walk(fn_node):
+        if not isinstance(call, ast.Call) or (prune and guarded(call)):
+            continue
+        if isinstance(call.func, ast.Attribute):
+            names.append(call.func.attr)
+        elif isinstance(call.func, ast.Name):
+            names.append(call.func.id)
+    return names
+
+
+def _package_status_reads(node) -> Set[str]:
+    reads = set()
+    for n in ast.walk(node):
+        if (isinstance(n, ast.Attribute) and n.attr in ("status", "_status_index")
+                and isinstance(n.ctx, ast.Load)):
+            reads.add(n.attr)
+        elif isinstance(n, ast.Call):
+            name = (n.func.attr if isinstance(n.func, ast.Attribute)
+                    else n.func.id if isinstance(n.func, ast.Name) else None)
+            if name in _STATUS_METHODS:
+                reads.add(f"call:{name}")
+    return reads
+
+
+def test_whole_package_closure_reads_status_only_in_pinned_places():
+    """Every status read reachable from the carry-out, package-wide.
+
+    From the single planned write point to the amendment, the boundary's
+    carry-out and everything it can reach across all of `batchgen/` —
+    following calls by NAME, so helper classes (`SequenceEntry`,
+    `SequenceBatch`, the index helpers, `decode_dp_group`, the trajectory
+    book, the host/GPU KV managers, prefix-reuse releases, the group mirror)
+    are all included, and unrelated same-named defs over-approximate the
+    closure — reads a sequence status only through the write mechanism
+    itself, two COMPLETED-count checks, and one debug log line. None of
+    these can change when the planned EVICTED and ON_HOLD rows already carry
+    their new status, because none distinguishes IN_DECODE from EVICTED or
+    ON_HOLD:
+
+    * the mechanism reads the status of its own target rows at apply time;
+    * `get_sequences_by_status(COMPLETED)` and `all_completed()` count only
+      COMPLETED rows, and the planned rows are non-COMPLETED under either
+      ordering;
+    * the `[LOCALMAP-POP]` debug line prints the status of a row the same
+      carry-out just completed.
+
+    `to_json` is an over-approximation artifact: the generic name matches
+    `LaunchReadinessReport.to_json`, which reads that report's own `status`
+    field, not a sequence's.
+    """
+    index = _package_index()
+    writes = _status_writes()
+    lo, hi = writes[0][0], writes[-1][0]
+
+    seen: Set[str] = set()
+    queue: List[str] = []
+    for node in ast.walk(_BOUNDARY):
+        if (isinstance(node, ast.Call)
+                and getattr(node, "lineno", None) is not None
+                and lo <= node.lineno <= hi):
+            name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                    else node.func.id if isinstance(node.func, ast.Name)
+                    else None)
+            if name and name not in _SKIP and name not in seen:
+                seen.add(name)
+                queue.append(name)
+
+    while queue:
+        name = queue.pop()
+        if name == "_page_boundary_fast":   # the carry-out is the root
+            continue
+        for _, node in _package_defs(index, name):
+            for called in _called_names(node):
+                if called not in _SKIP and called not in seen:
+                    seen.add(called)
+                    queue.append(called)
+
+    # The closure must actually cover the package, not fizzle at the seeds.
+    files = {rel for name in seen for rel, _ in _package_defs(index, name)}
+    assert len(files) > 50, sorted(files)
+
+    readers: Dict[str, Set[str]] = {}
+    for name in sorted(seen):
+        for _, node in _package_defs(index, name):
+            reads = _package_status_reads(node)
+            if reads:
+                readers.setdefault(name, set()).update(reads)
+
+    assert readers == {
+        # the write mechanism itself
+        "update_batch_status": {"call:plan_transitions"},
+        "plan_transitions": {"status"},
+        "apply": {"_status_index", "call:status_transition", "status"},
+        "status_transition": {"status"},
+        # COMPLETED-count checks (planned rows are non-COMPLETED either way)
+        "get_sequences_by_status": {"_status_index"},
+        "all_completed": {"_status_index"},
+        "_maybe_emit_prefix_drain_metric": {"call:all_completed"},
+        # one debug log line on a just-completed row
+        "_release_completed_slot_index": {"status"},
+        # name-collision artifact: LaunchReadinessReport's own field
+        "to_json": {"status"},
+    }
