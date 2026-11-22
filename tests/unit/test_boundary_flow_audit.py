@@ -272,10 +272,19 @@ def _status_reads(node: ast.AST) -> Set[Tuple[str, str]]:
     return found
 
 
+# The executor reaches the completion outlet through its CompletionIO argument;
+# these are the worker methods the caller binds to its two fields.
+_COMPLETION_OUTLET = {
+    "gather_completed_tokens": "_gather_completed_tokens",
+    "report_completion": "_report_completion",
+}
+
+
 def _status_writes() -> List[Tuple[int, str]]:
     writes = []
-    for call in _calls(_BOUNDARY, "_update_batch_status"):
-        writes.append((call.lineno, ast.unparse(call.args[1]).split(".")[-1]))
+    # update_batch_status(pool, rank, uuids, status, edge)
+    for call in _calls(_BOUNDARY, "update_batch_status"):
+        writes.append((call.lineno, ast.unparse(call.args[3]).split(".")[-1]))
     for call in _calls(_BOUNDARY, "apply_or_raise"):
         status = next(
             n.attr for n in ast.walk(call)
@@ -290,7 +299,7 @@ def test_planned_statuses_apply_at_one_point_then_at_most_the_amendment():
     """All PLANNED status changes apply at one point; one amendment later.
 
     The decision is a partition (Part A), so the three planned groups are
-    known when the decision arrives: COMPLETED through `_update_batch_status`
+    known when the decision arrives: COMPLETED through `update_batch_status`
     (rows the per-step sync already completed must be skipped), then EVICTED
     and ON_HOLD through `apply_or_raise` with the boundary edge, with no other
     call between them. The only later status write is the ON_HOLD amendment
@@ -304,7 +313,7 @@ def test_planned_statuses_apply_at_one_point_then_at_most_the_amendment():
     # One point: between the first and third write, the only calls are the
     # write mechanism itself.
     lo, hi = writes[0][0], writes[2][0]
-    mechanism = {"_update_batch_status", "apply_or_raise",
+    mechanism = {"update_batch_status", "apply_or_raise",
                  "TransitionPlan", "Transition", "tuple"}
     for node in ast.walk(_BOUNDARY):
         if (isinstance(node, ast.Call)
@@ -397,10 +406,13 @@ def test_no_step_between_the_status_writes_acts_on_a_status():
                     follow(call.func.attr)
 
     for n in span:
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr.startswith("_")
-                and n.func.attr != "_update_batch_status"):
-            follow(n.func.attr)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr.startswith("_"):
+                follow(n.func.attr)
+            elif n.func.attr in _COMPLETION_OUTLET:
+                # completion.report_completion(...) is the worker's
+                # _report_completion, handed to the executor by the caller.
+                follow(_COMPLETION_OUTLET[n.func.attr])
 
     # B2 completion split: the LOCALMAP-POP log line (the one status read on
     # the completion report path) moved with the slot/index release into
@@ -443,7 +455,8 @@ def test_the_boundary_mirror_copies_page_tables_and_nothing_else():
     """
     assert _calls(_BOUNDARY, "_mirror_group_host_kv") == []
     call = _calls(_BOUNDARY, "_mirror_group_host_page_tables")[0]
-    assert len(call.args) == 1 and not call.keywords
+    assert len(call.args) == 2 and not call.keywords
+    assert ast.unparse(call.args[0]) == "ctx"
 
     mirror = next(node for name, node in _INDEX["_mirror_group_host_page_tables"]
                   if name == "kv_capacity_engine.py")
@@ -530,7 +543,12 @@ def _package_index() -> Dict[str, List[Tuple[str, ast.AST]]]:
 
 
 def _package_defs(index, name):
-    defs = index.get(name, [])
+    # BoundaryExecutor.apply is the carry-out itself (the root of the closure),
+    # not a callee: `apply` by name means SequenceBatch.apply here.
+    defs = [
+        (rel, node) for rel, node in index.get(name, [])
+        if not (name == "apply" and rel.endswith("admission/boundary_executor.py"))
+    ]
     if name in _PINNED:
         defs = [(rel, node) for rel, node in defs if rel == _PINNED[name]]
     return defs
@@ -602,6 +620,9 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
             name = (node.func.attr if isinstance(node.func, ast.Attribute)
                     else node.func.id if isinstance(node.func, ast.Name)
                     else None)
+            # The completion outlet is reached through the CompletionIO
+            # argument; follow the worker methods bound to it.
+            name = _COMPLETION_OUTLET.get(name, name)
             if name and name not in _SKIP and name not in seen:
                 seen.add(name)
                 queue.append(name)
@@ -645,35 +666,48 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
 
 
 def test_the_carry_out_is_one_method_with_a_declared_result():
-    """The boundary hands the decisions to one method and takes back a tuple.
+    """The carry-out is ``BoundaryExecutor.apply``; the worker only wires it.
 
-    The method ends in exactly two places: early, when no decode row is left
+    ``apply`` takes the decode context and the completion outlet, never the
+    worker. It ends in exactly two places: early, when no decode row is left
     after the releases and host growth, and at the end. Both return the same
-    seven values, the last one telling the boundary which of the two it was.
+    eight values; the seventh tells the boundary which of the two it was and
+    the eighth is the pointer bundle of a load launched here, or None.
     """
-    carry_out = _worker_function("_apply_boundary_decisions")
+    carry_out = _executor_apply()
     assert [arg.arg for arg in carry_out.args.args] == [
-        "self", "decisions", "decode_uuids", "batch", "gpu_manager",
-        "worker_view", "global_seq_state", "chunk_size", "timing",
-        "boundary_start", "t0",
+        "self", "ctx", "completion", "decisions", "decode_uuids", "batch",
+        "gpu_manager", "worker_view", "global_seq_state", "chunk_size",
+        "timing", "boundary_start", "t0",
     ]
+    names = {node.id for node in ast.walk(carry_out) if isinstance(node, ast.Name)}
+    assert "worker" not in names
+    assert not any(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        for node in ast.walk(carry_out)
+    ), "the executor is stateless and holds no worker"
     returns = [node for node in ast.walk(carry_out) if isinstance(node, ast.Return)]
     assert len(returns) == 2
     for node in returns:
-        assert isinstance(node.value, ast.Tuple) and len(node.value.elts) == 7
-    flags = sorted(ast.unparse(node.value.elts[-1]) for node in returns)
-    assert flags == ["False", "True"]
+        assert isinstance(node.value, ast.Tuple) and len(node.value.elts) == 8
+    assert sorted(ast.unparse(node.value.elts[6]) for node in returns) == ["False", "True"]
+    assert sorted(ast.unparse(node.value.elts[7]) for node in returns) == [
+        "None", "async_load_tensors",
+    ]
+
+    # The worker's method builds the context and the outlet, calls apply once,
+    # and keeps the pointer bundle.
+    wiring = _worker_function("_apply_boundary_decisions")
+    applies = _calls(wiring, "apply")
+    assert len(applies) == 1
+    assert ast.unparse(applies[0].args[0]) == "self._decode_phase_context()"
+    outlet = applies[0].args[1]
+    assert {kw.arg: ast.unparse(kw.value) for kw in outlet.keywords} == {
+        "gather_completed_tokens": "self._gather_completed_tokens",
+        "report_completion": "self._report_completion",
+    }
+    assert "self._async_load_tensors = async_load_tensors" in ast.unparse(wiring)
 
     boundary = _worker_function("_page_boundary_fast")
-    calls = [
-        node for node in ast.walk(boundary)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_apply_boundary_decisions"
-    ]
-    assert len(calls) == 1
-    assert [ast.unparse(arg) for arg in calls[0].args] == [
-        "decisions", "decode_uuids", "batch", "gpu_manager", "worker_view",
-        "global_seq_state", "chunk_size", "timing", "boundary_start", "t0",
-    ]
-
+    assert len(_calls(boundary, "_apply_boundary_decisions")) == 1
