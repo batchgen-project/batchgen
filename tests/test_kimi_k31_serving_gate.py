@@ -73,8 +73,10 @@ def _build_initializer(config, model_id):
     from batchgen.models.moonshotai.kimi_linear.dsa_runtime import (
         require_servable_indexer,
     )
+    from batchgen.config.layer_truncation import apply_layer_truncation
 
     namespace = {
+        "apply_layer_truncation": apply_layer_truncation,
         "load_config": lambda _name: config,
         "KimiLinearConfig": KimiLinearConfig,
         "is_k3_model_type": is_k3_model_type,

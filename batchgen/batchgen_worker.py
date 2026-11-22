@@ -27,6 +27,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
+from batchgen.config.layer_truncation import require_layer_truncation_applied
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
@@ -848,6 +849,8 @@ class InputArguments:
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
+	debug_num_layers: Optional[int] = None
 
 	def __post_init__(self):
 		if self.max_prompt_length is None and self.padding_length is not None:
@@ -935,6 +938,8 @@ class BatchGenWorkerArgs:
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
+	debug_num_layers: Optional[int] = None
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -3804,6 +3809,7 @@ class BatchGenWorker:
 			"distributed_weight_config": self.args.distributed_weight_config,
 			"enable_deepep": getattr(self.args, "enable_deepep", False),
 			"prefill_moe_mode": getattr(self.args, "prefill_moe_mode", None),
+			"debug_num_layers": getattr(self.args, "debug_num_layers", None),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -3812,6 +3818,14 @@ class BatchGenWorker:
 		self.initializer = self.initializer(self.input_arguments)
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
+		)
+		# --debug-num-layers must have been resolved by the initializer's
+		# config parse (apply_layer_truncation); a model that ignored it would
+		# silently serve all layers. Refuse by name instead.
+		require_layer_truncation_applied(
+			self.huggingface_ckpt_name,
+			self.loaded_model_config,
+			getattr(self.args, "debug_num_layers", None),
 		)
 		self.engine_config.Basic_Config.max_model_len = self.model_context_length
 		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
@@ -6374,6 +6388,16 @@ class BatchGenWorker:
 			max_pool=int(
 				book.reservation_total_capacity(self.model_context_length)
 			),
+			# The engine's resolved layer count, and the checkpoint's full
+			# count stamped by apply_layer_truncation at config parse. A model
+			# whose initializer predates the stamp serves all layers, so its
+			# full count IS its effective count.
+			num_layers=int(self.model_config.num_hidden_layers),
+			num_layers_full=int(getattr(
+				self.loaded_model_config,
+				"num_hidden_layers_full",
+				self.model_config.num_hidden_layers,
+			)),
 		).as_dict()
 
 	def prepare_deployment(self) -> None:

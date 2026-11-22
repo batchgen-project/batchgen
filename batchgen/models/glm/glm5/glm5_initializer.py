@@ -23,6 +23,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
+from batchgen.config.layer_truncation import apply_layer_truncation
 from .config import assert_indexer_schedule_consistent
 from .set_basic_config import set_basic_config
 from .planner import GLM5Planner
@@ -51,6 +52,14 @@ class GLM5Initializer:
         )
         self.loaded_model_config._name_or_path = self.model_name
         self.loaded_model_config.architectures = ["GlmMoeDsaForCausalLM"]
+        # Effective layer count (--debug-num-layers) is resolved HERE, once,
+        # before any consumer reads the rich config; it also slices the
+        # per-layer indexer_types list, so the schedule consistency check
+        # below validates the served prefix.
+        apply_layer_truncation(
+            self.loaded_model_config,
+            getattr(input_arguments, "debug_num_layers", None),
+        )
         # Fail loud at build if the DSA indexer schedule (freq/offset) disagrees
         # with the checkpoint's per-layer indexer_types (no-op for GLM-5).
         assert_indexer_schedule_consistent(self.loaded_model_config)
