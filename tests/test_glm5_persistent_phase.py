@@ -233,6 +233,8 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement(
             ("install_prefill", profile)
         ),
         _desired_phase_key=lambda phase: PhaseKey(phase, None, ()),
+        # GLM-5 declares no prefill MoE modes: the server mode is None.
+        _server_prefill_moe_mode=lambda: None,
         _max_decode_rank_bsz=lambda: 128,
         _check_decode_width_within_graph_buckets=lambda width: calls.append(
             ("check_width", width)

@@ -703,6 +703,9 @@ def _assign_worker(
             "_trajectory_restore_fields",
             "_pack_decode_dp_groups_for_sharing",
             "_prefix_rank_packing_mode",
+            # Placement scores with the server mode's prefill token cap.
+            "_server_prefill_token_cap",
+            "_server_prefill_moe_mode",
         ]
     )
     worker = SimpleNamespace(
@@ -719,6 +722,8 @@ def _assign_worker(
         engine_config=SimpleNamespace(Module_Batching_Config=SimpleNamespace(
             prefill_micro_batch_token_cap=1024,
         )),
+        # Startup resolved the server prefill mode: every wave is streamed.
+        _server_prefill_moe_mode_resolved=("streamed",),
         _cached_prefix_rank_cost_profile=lambda disabled: None,
         _prefix_rank_cost_profile_disabled=lambda seqs: False,
         _batchgen_debug=debug,

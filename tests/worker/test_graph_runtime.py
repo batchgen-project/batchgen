@@ -29,6 +29,7 @@ import pytest
 
 from batchgen.cuda_graph.adapter import GraphMode, ModelCudaGraphAdapter
 from batchgen.cuda_graph.buckets import generate_bucket_sizes
+from batchgen.phase_lifecycle import PHASES
 from batchgen.worker.graph_runtime import GraphRuntime
 from tests.worker_method_source import (
     delegated_method_names,
@@ -201,20 +202,19 @@ def _release_decode_graph_state():
 def test_the_capture_counter_is_reset_when_the_decode_instance_is_released():
     """The counter is the capture-once guard of a reused decode instance.
 
-    The deep free does not touch graph state itself: it calls
-    ``_release_decode_graph_state`` only when the decode instance is NOT held,
-    and that release resets the counter together with the captured graphs
-    (a later decode instance is a new owner and captures its own).
+    The deep free does not touch graph state itself: it refuses to run under
+    any held instance (a hold never outlives the model it references) and
+    otherwise calls ``_release_decode_graph_state`` unconditionally; that
+    release resets the counter together with the captured graphs (a later
+    decode instance is a new owner and captures its own).
     """
     deep_free = _worker_method("deep_free_model_memory")
     assert not _graph_fields_assigned_in(deep_free)
     deep_free_src = ast.unparse(deep_free)
-    guard = 'if not self.parallel_manager.holds_instance(\'decode\'):'
-    assert guard in deep_free_src
+    # The ex-#649 silent preserve is gone: no hold survives the deep free.
+    assert "if not self.parallel_manager.holds_instance" not in deep_free_src
+    assert "a hold never outlives the model" in deep_free_src
     assert deep_free_src.count("self._release_decode_graph_state()") == 1
-    assert deep_free_src.index(guard) < deep_free_src.index(
-        "self._release_decode_graph_state()"
-    )
 
     reset = _graph_fields_assigned_in(_worker_method("_release_decode_graph_state"))
     assert "decode_graph_captures" in reset
@@ -247,6 +247,7 @@ def _deep_free_worker(*, held: bool):
             "time": time,
             "gc": gc,
             "logging": logging,
+            "PHASES": PHASES,
         },
     )
     graph = GraphRuntime()
@@ -271,24 +272,30 @@ def _deep_free_worker(*, held: bool):
     worker._release_decode_graph_state = (
         lambda: methods["_release_decode_graph_state"](worker)
     )
-    methods["deep_free_model_memory"](worker)
+    worker._deep_free = lambda: methods["deep_free_model_memory"](worker)
     return worker
 
 
 @pytest.mark.parametrize("held", [False, True])
-def test_the_deep_free_releases_graph_state_only_for_an_unheld_instance(held):
+def test_the_deep_free_refuses_a_held_instance_and_releases_otherwise(held):
+    # Deep free is the model's retirement: a hold never outlives the model it
+    # references, so a held instance refuses the deep free by name (the
+    # RETIRE path retires every kept instance first); an unheld one releases
+    # the graph state unconditionally.
     worker = _deep_free_worker(held=held)
     graph = worker._graph
-    assert worker.model is None
     if held:
-        # A held instance replays its graphs on its next activation.
+        original_model = worker.model
+        with pytest.raises(RuntimeError, match="a hold never outlives the model"):
+            worker._deep_free()
+        # Refused at the top, before anything was freed: the model and the
+        # graph state are exactly as they were.
+        assert worker.model is original_model
         assert graph.decode_graph_captures == 1
         assert graph.cuda_graph_manager is not None
-        assert graph.whole_model_segment is not None
-        assert graph.whole_model_graph is True
-        assert graph.k25_whole_model_graph is True
-        assert graph.whole_model_segment_name == "k25_whole_model"
     else:
+        worker._deep_free()
+        assert worker.model is None
         assert graph.decode_graph_captures == 0
         assert graph.cuda_graph_manager is None
         assert graph.whole_model_segment is None

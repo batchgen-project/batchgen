@@ -33,7 +33,9 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import (
     GptOssParallelStrategyManager,
 )
-from batchgen.phase_lifecycle import ExitMode, PhaseEnterContext, PhaseKey
+from typing import Optional
+
+from batchgen.phase_lifecycle import PHASES, ExitMode, PhaseEnterContext, PhaseKey
 from tests.worker.worker_fakes import attach_graph_state
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -120,6 +122,7 @@ class _Layer(nn.Module):
         super().__init__()
         self.self_attn = nn.Linear(2, 2)
         self.mlp = nn.Module()
+        self.mlp.router = nn.Linear(2, NUM_EXPERTS)
         self.mlp.experts = nn.ModuleList(nn.Module() for _ in range(NUM_EXPERTS))
 
 
@@ -180,6 +183,11 @@ def _manager(monkeypatch, *, world_size=2, global_rank=1, offloading=False,
                  "_config_attn_module", "_config_expert_module",
                  "_config_lm_head_hook", "_swap_to_prefill_moe"):
         setattr(m, name, lambda: None)
+    # The prefill expert release/reload walk GptOssMoEPrefill layers the
+    # stubbed swap never creates; the real bodies run in the dedicated
+    # suspended-prefill tests below.
+    m._release_prefill_expert_weights = lambda: 0
+    m._reload_prefill_expert_weights = lambda: 0
     m.pointer_tables = []
 
     def setup_decode_moe(ep_enabled, weight_format):
@@ -383,6 +391,10 @@ _WORKER_METHODS = (
     "_phase_exit_mode",
     "_prepare_phase_exit",
     "_transition_phase",
+    "_server_prefill_moe_mode",
+    "_require_server_prefill_moe_mode",
+    "_retire_kept_phase_instances",
+    "_require_resumable_instance",
     "_finish_decode_interval",
     "_assert_decode_graph_capture_allowed",
     "_record_decode_graph_capture",
@@ -410,7 +422,8 @@ def _isolated_worker_class():
     )
     namespace = {
         "ExitMode": ExitMode, "PhaseEnterContext": PhaseEnterContext,
-        "PhaseKey": PhaseKey, "torch": torch, "sys": sys, "time": time,
+        "PhaseKey": PhaseKey, "PHASES": PHASES, "Optional": Optional,
+        "torch": torch, "sys": sys, "time": time,
         "gc": gc, "logging": logging,
     }
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
@@ -421,6 +434,9 @@ def _worker(manager, events):
     worker = _isolated_worker_class()()
     worker.rank = 0
     worker._live_phase_key = None
+    # GPT-OSS declares no prefill MoE modes: the server mode is None.
+    worker._server_prefill_moe_mode_resolved = (None,)
+    worker._kept_phase_keys = {}
     worker.parallel_manager = manager
     worker.comm = object()
     worker.args = SimpleNamespace(persistent_phase_instances=False)
@@ -482,8 +498,9 @@ def test_two_decode_intervals_capture_exactly_once(monkeypatch):
     second = _decode_interval(worker, events)
 
     assert first == (True, False)
-    # The prefill instance is never kept, so prefill exits RETIRE; the decode
-    # entry still resumes the kept decode instance.
+    # Both instances are kept (both-or-neither): prefill SUSPENDs on every
+    # switch, so no RETIRE runs and the decode entry resumes the kept decode
+    # instance.
     assert second == (True, True)
     assert events.count("capture") == 1
     assert worker._graph.decode_graph_captures == 1
@@ -516,3 +533,135 @@ def test_build_always_rank_recaptures_every_interval(monkeypatch):
     _decode_interval(worker, events)
     assert events.count("capture") == 2
     assert worker._graph.decode_graph_captures == 0  # released with the instance
+
+
+# --------------------------------------------------------------------------
+# the kept prefill instance: shared skeleton, no resident expert copy
+# --------------------------------------------------------------------------
+
+
+def test_phase_models_share_the_skeleton_tensors(monkeypatch):
+    # One device copy of the skeleton, aliased by BOTH phase models
+    # (identity of storage, not equality of values): the suspended prefill
+    # instance then pins no second skeleton through decode, which is what
+    # keeps the decode KV pool byte-identical to the rebuild lifecycle
+    # (bug_log 2026-10-15: a kept prefill instance's private skeleton copy
+    # at the sizing point shrank the GPU KV pool).
+    m = _manager(monkeypatch)
+    delattr(m, "_load_model_skeleton")  # run the real one
+    m.skeleton_state_dict = {
+        "embed.weight": torch.randn(4, 3),
+        "final_norm.weight": torch.ones(3),
+    }
+    m.state_dict_name_map = {}
+
+    class _Skeleton(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Module()
+            self.embed.weight = nn.Parameter(torch.zeros(1))
+            self.final_norm = nn.Module()
+            self.final_norm.weight = nn.Parameter(torch.zeros(1))
+
+    decode_model, prefill_model = _Skeleton(), _Skeleton()
+    m.model = decode_model
+    m._load_model_skeleton()
+    m.model = prefill_model
+    m._load_model_skeleton()
+
+    assert m._skeleton_uploaded_keys == {"embed.weight", "final_norm.weight"}
+    for name in ("embed", "final_norm"):
+        shared = m.skeleton_state_dict[f"{name}.weight"]
+        for model in (decode_model, prefill_model):
+            bound = getattr(model, name).weight.data
+            assert bound.data_ptr() == shared.data_ptr()
+            assert bound.shape == shared.shape
+    # Aliasing, not a copy: a write through the shared tensor is visible
+    # through both phase models' parameters.
+    m.skeleton_state_dict["final_norm.weight"].add_(41.0)
+    assert float(decode_model.final_norm.weight.data[0]) == 42.0
+    assert float(prefill_model.final_norm.weight.data[0]) == 42.0
+
+
+def _prefill_moe_fields(mlp):
+    return {
+        field: getattr(mlp, field, None)
+        for field in GptOssParallelStrategyManager._PREFILL_EXPERT_FIELDS
+    }
+
+
+def test_a_suspended_prefill_instance_holds_no_expert_tensors(monkeypatch):
+    # The kept prefill instance's replicated MXFP4 expert tensors and the
+    # pointer tables built from their addresses are released at the exit and
+    # rebuilt from the host store on the next activation; while suspended it
+    # holds no expert tensor at all.
+    m = _manager(monkeypatch, world_size=1, global_rank=0)
+    m.reuse_phase_instances = True
+    for name in ("_swap_to_prefill_moe", "_load_expert_module",
+                 "_release_prefill_expert_weights",
+                 "_reload_prefill_expert_weights"):
+        delattr(m, name)  # run the real ones
+    m.model_config.hidden_size = 4
+    m.model_config.intermediate_size = 4
+    m.model_config.num_experts_per_tok = 2
+
+    model, _ = m.phase_enter(PREFILL, PhaseEnterContext())
+    assert m.holds_instance("prefill")
+    from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill
+    layers = [layer.mlp for layer in model.model.layers]
+    assert all(isinstance(mlp, GptOssMoEPrefill) for mlp in layers)
+    assert all(len(mlp.gate_weights) == NUM_EXPERTS for mlp in layers)
+
+    m.phase_exit(PREFILL, ExitMode.SUSPEND)
+    assert m.holds_instance("prefill")
+    for mlp in layers:
+        for field, value in _prefill_moe_fields(mlp).items():
+            assert value is None, field
+
+    reactivated, _ = m.phase_enter(PREFILL, PhaseEnterContext())
+    assert reactivated is model  # the kept instance, not a rebuild
+    for layer_idx, mlp in enumerate(layers):
+        host = m.store[f"routed_expert_{layer_idx}_0"]
+        assert torch.equal(mlp.gate_weights[0], host["gate_proj.weight"])
+        assert torch.equal(mlp.down_scales[0], host["down_proj.weight_scales"])
+        assert torch.equal(mlp.gate_biases[0], host["gate_proj.bias"])
+    assert _FakeGptOss.built >= 1  # activation never constructed a model
+
+
+def test_a_prefill_suspend_without_a_kept_instance_is_refused(monkeypatch):
+    m = _manager(monkeypatch, offloading=True, ratio=0.5)
+    m.reuse_phase_instances = True  # declined: experts not fully resident
+    m.phase_enter(PREFILL, PhaseEnterContext())
+    assert not m.holds_instance("prefill")
+    with pytest.raises(RuntimeError, match="must RETIRE"):
+        m.phase_exit(PREFILL, ExitMode.SUSPEND)
+
+
+def test_every_bound_prefill_field_is_listed_for_release():
+    # The release walks _PREFILL_EXPERT_FIELDS; a field the binder assigns
+    # but the list misses would silently survive the suspend. Derive the
+    # bound set from the binder's AST so a new binding cannot dodge the list.
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    tree = _ast.parse(_Path(psm_module.__file__).read_text())
+    binder = next(
+        node
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.FunctionDef)
+        and node.name == "_bind_prefill_expert_tensors"
+    )
+    bound = {
+        node.attr
+        for node in _ast.walk(binder)
+        if isinstance(node, _ast.Attribute)
+        and isinstance(node.ctx, _ast.Store)
+        and isinstance(node.value, _ast.Name)
+        and node.value.id == "prefill_moe"
+    }
+    assert bound, "the binder assigns nothing? AST extraction broke"
+    listed = set(GptOssParallelStrategyManager._PREFILL_EXPERT_FIELDS)
+    assert bound <= listed, (
+        "bound by _bind_prefill_expert_tensors but missing from "
+        f"_PREFILL_EXPERT_FIELDS: {sorted(bound - listed)}"
+    )

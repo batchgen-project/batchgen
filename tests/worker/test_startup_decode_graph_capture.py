@@ -174,8 +174,10 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
 
     def load_decode_model(comm=None):
         events.append("decode_build")
-        worker._live_phase_key = PhaseKey(
-            "decode", worker._prefill_moe_mode_in_effect, ())
+        # The decode key derives its mode from the one server constant, the
+        # same value every prefill key carries: no per-entry priming exists,
+        # so no entry order can turn the resumable exit into RETIRE.
+        worker._live_phase_key = worker._desired_phase_key("decode")
         worker._phase = "decode"
         worker._decode_padding_bsz = 8
 
@@ -200,7 +202,7 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
                                  graphs_persist=manager_graphs_persist),
         torch_device="cpu", model_context_length=4096, startup_transient=None,
         _core_initialized=True, _live_phase_key=None, _phase=None,
-        _prefill_moe_mode_in_effect=None, _decode_padding_bsz=None,
+        _decode_padding_bsz=None,
         _decode_graph_ladder_logged=True,
         # S2: the decode-graph state is GraphRuntime's (its defaults are the
         # former None/False/0/set() fixtures).
@@ -211,6 +213,8 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
         _startup_phase=lambda name: nullcontext(),
         _ensure_pynccl_communicator=lambda: events.append("comm"),
         _persistent_phase_enabled=lambda: False,
+        # Startup resolves the empty wave's debug flags before the key.
+        _begin_prefill_wave=lambda uuids: None,
         _desired_phase_key=lambda phase: PhaseKey(phase, "streamed", ()),
         _load_decode_model=load_decode_model,
         _init_gpu_kv_with_actual_size=lambda: events.append("pool_sized"),

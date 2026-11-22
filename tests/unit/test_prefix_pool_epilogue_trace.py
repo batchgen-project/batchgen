@@ -479,7 +479,9 @@ def test_every_line_says_which_prefill_wrote_it():
 def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
     source = _ROOT.joinpath("batchgen", "worker", "prefill_engine.py").read_text()
-    body = source.split("    def prefill_prepacked(self, worker, batch: list[int]):")[1]
+    body = source.split(
+        "    def prefill_prepacked(self, worker, batch: list[int], *, token_cap: int):"
+    )[1]
     body = body.split("\n    def ")[0]
 
     # Armed from the debug dict this path already resolves, and only after
