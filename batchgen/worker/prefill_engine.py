@@ -1942,13 +1942,16 @@ class PrefillEngine:
 
     def _release_pool_segment_refs(self, worker, global_id: int) -> None:
         """Release pool pseudo-sids through the PrefixReuseState owner."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
+        # Rebinding self to the worker keeps the body's original self.
+        # spellings; this engine instance remains stateless.
         self = worker
-        self._prefix.release_pool_segment_refs(
-            int(global_id), host_views_provider=self._host_views_by_group
-        )
+        freed = self._prefix.release_pool_segment_refs(int(global_id))
+        # Host views are built only when a segment lost its last member, so a
+        # sequence without pool segments never touches them.
+        if freed:
+            from batchgen.worker.prefix_reuse_state import release_pool_segments
+
+            release_pool_segments(self._host_views_by_group(), freed)
 
 
     def prefill(self, worker, batch: list[int]):

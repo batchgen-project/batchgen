@@ -171,18 +171,33 @@ class PrefixReuseState:
         for sid in chain:
             self.pool_sid_members[sid] = self.pool_sid_members.get(sid, 0) + 1
 
-    def release_pool_segment_refs(
-        self,
-        global_id: int,
-        *,
-        host_views_provider: Callable[[], Mapping[int, object]],
-    ) -> None:
+    def release_pool_segment_refs(self, global_id: int) -> List[int]:
+        """Drop one member's segment references.
+
+        Returns the pseudo sequence ids that no member references any more, in
+        the member's chain order. Their Host pages are the caller's to release
+        (``release_pool_segments``); this component only keeps the counts.
+        """
+        freed = []
         for sid in self.pool_member_sids.pop(int(global_id), ()):
             left = self.pool_sid_members[sid] - 1
             if left:
                 self.pool_sid_members[sid] = left
                 continue
             del self.pool_sid_members[sid]
-            for view in host_views_provider().values():
-                view.release_sequence_pages([sid])
-                view.unregister_sequences([sid])
+            freed.append(sid)
+        return freed
+
+
+def release_pool_segments(
+    host_views: Mapping[int, object], sids: Iterable[int]
+) -> None:
+    """Release and unregister freed pool segments on every Host view.
+
+    One segment at a time, and for each segment one view at a time: release its
+    pages, then unregister it.
+    """
+    for sid in sids:
+        for view in host_views.values():
+            view.release_sequence_pages([sid])
+            view.unregister_sequences([sid])

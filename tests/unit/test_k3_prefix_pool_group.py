@@ -959,12 +959,18 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     )
     worker._prefix.pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
     worker._prefix.pool_sid_members = {-1: 2}
+    view_builds = []
+    build_views = worker._host_views_by_group
+    worker._host_views_by_group = lambda: view_builds.append(1) or build_views()
 
     worker._release_pool_segment_refs(GLOBAL_IDS[0])
     assert backend.released == []  # one member still reads the segment
+    # Nothing was freed, so the Host views were not even built.
+    assert view_builds == []
 
     worker._release_pool_segment_refs(GLOBAL_IDS[1])
     assert backend.released == [(0, [-1])]
+    assert view_builds == [1]
 
 
 # --------------------------------------------------------------------------- #
