@@ -1113,6 +1113,29 @@ class KVCapacityEngine:
                 return flag_bucket
         return _MAX_DECODE_RANK_BSZ
 
+    def _release_prefix_cache_attachments(
+        self, ctx, global_sequence_ids: Sequence[int]
+    ) -> None:
+        if not ctx.facts.enable_prefix_cache:
+            return
+        sequence_ids = [int(sequence_id) for sequence_id in global_sequence_ids]
+        # A trajectory attachment that never reached its restore leaves
+        # through the same seam, so a rejected wave, a rolled back allocation
+        # and a completed row all return the live count to zero.
+        ctx.sched.trajectories.release_attachments(sequence_ids, rank=ctx.facts.rank)
+        # A pass that died between the config-time arena reservation and the
+        # post-barrier finalize never installed a record, so its arena is
+        # holding Host pages nothing names. Every such path goes through here.
+        ctx.sched.trajectories.rollback_reservations(sequence_ids, rank=ctx.facts.rank)
+        for sequence_id in sequence_ids:
+            self._release_pool_segment_refs(ctx, sequence_id)
+            state = ctx.sched.prefix.pop_state(sequence_id)
+            if state is None:
+                continue
+            for handle in (*state.commit_attachment_handles, state.attachment_handle):
+                if handle:
+                    ctx.prefix_coordinator.release_attachment(handle)
+
     def _release_pool_segment_refs(self, ctx, global_id: int) -> None:
         """Release pool pseudo-sids through the PrefixReuseState owner."""
         from batchgen.worker.prefix_reuse_state import release_pool_segments

@@ -10018,29 +10018,15 @@ class BatchGenWorker:
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
 	) -> None:
-		if not self.enable_prefix_cache:
-			return
-		# M3 Slice 2: a trajectory attachment that never reached its restore
-		# leaves through the SAME seam, so a rejected wave, a rolled back
-		# allocation and a completed row all return the live count to zero.
-		self._release_trajectory_attachments(
-			[int(sequence_id) for sequence_id in global_sequence_ids]
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._release_prefix_cache_attachments(
+			self._decode_phase_context(), global_sequence_ids,
 		)
-		# A pass that died between the config-time arena reservation and the
-		# post-barrier finalize never installed a record, so its arena is
-		# holding Host pages nothing names. This is the teardown seam every
-		# such path already goes through.
-		self._rollback_trajectory_reservations(
-			[int(sequence_id) for sequence_id in global_sequence_ids]
-		)
-		for sequence_id in global_sequence_ids:
-			self._release_pool_segment_refs(int(sequence_id))
-			state = self._prefix.pop_state(int(sequence_id))
-			if state is None:
-				continue
-			for handle in (*state.commit_attachment_handles, state.attachment_handle):
-				if handle:
-					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _trajectory_commit_requested(self, batch_sequences) -> bool:
 		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
@@ -10506,19 +10492,6 @@ class BatchGenWorker:
 					int(state.compute_cached_tokens) if state is not None else 0
 				),
 			)
-
-	def _release_trajectory_attachments(self, global_sequence_ids) -> None:
-		"""Drop every un-consumed attachment for these rows.
-
-		Joins the prefix-attachment release seam, so a rejected wave, a rolled
-		back allocation and a completed sequence all return the live count to
-		zero through the same call.
-		"""
-		self._traj.release_attachments(global_sequence_ids, rank=self.rank)
-
-	def _rollback_trajectory_reservations(self, global_sequence_ids) -> None:
-		"""Give back any snapshot arena these rows reserved and never used."""
-		self._traj.rollback_reservations(global_sequence_ids, rank=self.rank)
 
 	def _trajectory_restore_fields(self) -> dict:
 		"""Drain-counter fields, or empty when the path never ran."""
