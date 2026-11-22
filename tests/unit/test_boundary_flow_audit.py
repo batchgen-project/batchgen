@@ -370,42 +370,37 @@ def test_only_the_group_mirror_sits_inside_the_carry_out_step():
     def inside(name: str) -> List[bool]:
         return [start < c.lineno < end for c in _calls(_BOUNDARY, name)]
 
-    assert inside("_mirror_group_host_kv") == [True]
+    assert inside("_mirror_group_host_page_tables") == [True]
     assert inside("_rebuild_page_table_for_batch") == [False, False, False]
     assert inside("_check_host_kv_watermark_trigger") == [False]
 
 
-def test_the_boundary_mirror_call_uses_none_of_the_trajectory_work():
-    """Why the mirror is worker-only today, and why that is not inherent.
+def test_the_boundary_mirror_copies_page_tables_and_nothing_else():
+    """The boundary's mirror is its own function, limited to page tables.
 
-    `_mirror_group_host_kv` serves prefill and the boundary. Every use of the
-    trajectory machinery in it is guarded by its `trajectory` flag, and the
-    boundary calls it without the flag and with no prefix states.
+    Prefill keeps `_mirror_group_host_kv` (prefix states, pool segments,
+    trajectory arenas). After a decode-time host growth the followers only
+    need the leader's grown page tables, so the boundary calls
+    `_mirror_group_host_page_tables`: one collective, built from the decode
+    context, with no prefix, pool-wave or trajectory state in it.
     """
-    call = _calls(_BOUNDARY, "_mirror_group_host_kv")[0]
-    assert not call.keywords                      # trajectory stays False
-    assert ast.unparse(call.args[1]) == "{}"      # no prefix states
+    assert _calls(_BOUNDARY, "_mirror_group_host_kv") == []
+    call = _calls(_BOUNDARY, "_mirror_group_host_page_tables")[0]
+    assert len(call.args) == 1 and not call.keywords
 
-    mirror = next(node for name, node in _INDEX["_mirror_group_host_kv"]
-                  if name == "batchgen_worker.py")
-    parent = {c: p for p in ast.walk(mirror) for c in ast.iter_child_nodes(p)}
-
-    def guarded(node: ast.AST) -> bool:
-        p = node
-        while p in parent:
-            p = parent[p]
-            test = getattr(p, "test", None)
-            if test is not None and "trajectory" in ast.unparse(test):
-                return True
-        return False
-
-    trajectory_calls = [
+    mirror = next(node for name, node in _INDEX["_mirror_group_host_page_tables"]
+                  if name == "kv_capacity_engine.py")
+    assert [a.arg for a in mirror.args.args] == ["self", "ctx", "uuids"]
+    collectives = [
         n for n in ast.walk(mirror)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and "trajectory" in n.func.attr
+        and n.func.attr in {"all_gather_object", "broadcast_object_list",
+                            "all_reduce", "all_gather", "broadcast"}
     ]
-    assert len(trajectory_calls) == 8
-    assert all(guarded(n) for n in trajectory_calls)
+    assert [c.func.attr for c in collectives] == ["all_gather_object"]
+    body = ast.unparse(ast.Module(body=mirror.body[1:], type_ignores=[]))
+    for foreign in ("prefix", "trajectory", "_traj", "segment", "wave"):
+        assert foreign not in body, foreign
 
 
 def test_releases_finish_on_every_rank_before_host_growth():
@@ -485,27 +480,10 @@ def _package_defs(index, name):
 
 
 def _called_names(fn_node) -> List[str]:
-    """Called names in ``fn_node``, skipping the group mirror's
-    trajectory-guarded calls: the boundary calls the mirror with the
-    trajectory flag off (pinned by
-    test_the_boundary_mirror_call_uses_none_of_the_trajectory_work), so that
-    branch cannot run in the carry-out."""
-    prune = fn_node.name == "_mirror_group_host_kv"
-    parent = ({c: p for p in ast.walk(fn_node) for c in ast.iter_child_nodes(p)}
-              if prune else {})
-
-    def guarded(node) -> bool:
-        p = node
-        while p in parent:
-            p = parent[p]
-            test = getattr(p, "test", None)
-            if test is not None and "trajectory" in ast.unparse(test):
-                return True
-        return False
-
+    """Called names in ``fn_node``."""
     names = []
     for call in ast.walk(fn_node):
-        if not isinstance(call, ast.Call) or (prune and guarded(call)):
+        if not isinstance(call, ast.Call):
             continue
         if isinstance(call.func, ast.Attribute):
             names.append(call.func.attr)

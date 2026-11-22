@@ -1113,6 +1113,54 @@ class KVCapacityEngine:
                 return flag_bucket
         return _MAX_DECODE_RANK_BSZ
 
+    def _mirror_group_host_page_tables(self, ctx, uuids: List[str]) -> None:
+        """Re-install the serve-group leader's host page tables on its followers.
+
+        Every rank reads and writes host KV through its own worker-view page
+        table, but only the group leader grows a sequence's chain in the
+        shared host region. After a decode-time growth the followers copy the
+        leader's tables for the grown rows; nothing else is mirrored (prefix
+        attachments, pool segments and trajectory state belong to prefill).
+
+        No-op for G==1. For G>1 every rank reaches the one collective: the
+        growth decision is identical on all ranks while ``uuids`` is not.
+        """
+        group_size = ctx.facts.attn_tp_size
+        if group_size <= 1:
+            return
+        from batchgen.decode_dp_group import (
+            host_kv_owner_rank,
+            host_page_table_payload,
+            install_host_page_tables,
+            require_serve_group_within_node,
+        )
+
+        require_serve_group_within_node(group_size, ctx.facts.local_world_size)
+
+        host_views = self._host_views_by_group(ctx)
+        payload = None
+        if uuids and all(
+            ctx.facts.rank_ctx.owns_host_kv(ctx.sched.pool.get_sequence(uuid))
+            for uuid in uuids
+        ):
+            payload = host_page_table_payload(ctx.sched.pool, host_views, uuids)
+
+        gathered = [None] * ctx.facts.world_size
+        dist.all_gather_object(gathered, payload)
+
+        leader = host_kv_owner_rank(ctx.facts.rank // group_size, group_size)
+        if leader == ctx.facts.rank:
+            return
+        entry = gathered[leader]
+        if entry is None:
+            if uuids:
+                raise RuntimeError(
+                    f"Rank {ctx.facts.rank}: serve-group leader {leader} mirrored "
+                    f"no host KV for the {len(uuids)} sequences this rank serves"
+                )
+            return
+        install_host_page_tables(host_views, entry)
+
     def _host_views_by_group(self, ctx) -> dict:
         """One Host-KV worker view per prefix-cache KV group.
 

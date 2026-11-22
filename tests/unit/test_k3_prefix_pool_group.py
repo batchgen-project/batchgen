@@ -22,6 +22,8 @@ import hashlib
 import logging
 import math
 import sys
+
+import batchgen.decode_dp_group as _dp_group
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -343,7 +345,15 @@ def _stub_heavy_modules(monkeypatch, *, free_state_slots):
     )
     monkeypatch.setitem(
         sys.modules, "batchgen.decode_dp_group",
-        SimpleNamespace(host_kv_owner_rank=lambda group, size: int(group) * size),
+        SimpleNamespace(
+            host_kv_owner_rank=lambda group, size: int(group) * size,
+            # The mirror's page-table halves are the real shared helpers.
+            host_page_table_payload=_dp_group.host_page_table_payload,
+            install_host_page_tables=_dp_group.install_host_page_tables,
+            require_serve_group_within_node=(
+                _dp_group.require_serve_group_within_node
+            ),
+        ),
     )
     state_manager = (
         None if free_state_slots is None else SimpleNamespace(

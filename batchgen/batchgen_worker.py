@@ -2149,16 +2149,15 @@ class BatchGenWorker:
 		G = self._decode_attn_tp_size()
 		if G <= 1:
 			return
-		# The mirrored page ids index the leader's per-node host region, so a
-		# serve group must not straddle a node boundary.
-		if self.local_world_size % G:
-			raise RuntimeError(
-				f"attn_tp_size={G} must divide local_world_size="
-				f"{self.local_world_size}: a serve group spanning nodes would "
-				f"read another node's host-KV page ids"
-			)
-		from batchgen.decode_dp_group import host_kv_owner_rank
+		from batchgen.decode_dp_group import (
+			host_kv_owner_rank,
+			host_page_table_payload,
+			install_host_page_tables,
+			require_serve_group_within_node,
+		)
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+
+		require_serve_group_within_node(G, self.local_world_size)
 
 		host_views = self._host_views_by_group()
 		wave = getattr(self, "_prefill_pool_wave", None)
@@ -2183,10 +2182,10 @@ class BatchGenWorker:
 				from batchgen.prefix_reuse.wave_runtime import segment_mirror_payload
 
 				segments = segment_mirror_payload(wave)
-			global_ids = [
-				int(self.global_batch.get_sequence(uuid).global_idx)
-				for uuid in uuids
-			]
+			page_tables = host_page_table_payload(
+				self.global_batch, host_views, uuids
+			)
+			global_ids = page_tables["global_ids"]
 			prefix = {}
 			for global_id in global_ids:
 				state = prefix_states.get(global_id)
@@ -2207,14 +2206,7 @@ class BatchGenWorker:
 					int(state.trajectory_restore_boundary),
 				)
 			payload = {
-				"global_ids": global_ids,
-				"page_tables": {
-					group_id: [
-						[int(page) for page in pages]
-						for pages in view.build_page_table(global_ids)
-					]
-					for group_id, view in host_views.items()
-				},
+				**page_tables,
 				"prefix": prefix,
 				# A pooled segment's Host pages are the leader's too, but every
 				# rank of the group offloads the segment rows it computed, so the
@@ -2277,11 +2269,7 @@ class BatchGenWorker:
 					f"host KV for the {len(uuids)} sequences this rank serves"
 				)
 			return
-		for group_id, view in host_views.items():
-			for global_id, pages in zip(
-				entry["global_ids"], entry["page_tables"][group_id]
-			):
-				view.set_sequence_pages(global_id, pages)
+		install_host_page_tables(host_views, entry)
 		segments = entry.get("segments")
 		if (segments is None) != (wave is None):
 			raise RuntimeError(
@@ -2332,6 +2320,17 @@ class BatchGenWorker:
 					len(self._traj.trajectory_mirrored_restores),
 					leader,
 				)
+
+	def _mirror_group_host_page_tables(self, uuids: List[str]) -> None:
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_kv_capacity_engine", None)
+		if engine is None:
+			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+			engine = KVCapacityEngine()
+			self._kv_capacity_engine = engine
+		return engine._mirror_group_host_page_tables(
+			self._decode_phase_context(), uuids,
+		)
 
 	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
 		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
@@ -12040,9 +12039,8 @@ class BatchGenWorker:
 			# tables only — the prefix attachment stays the leader's). Reached
 			# by every rank under the broadcast growth condition, so the
 			# gather inside stays aligned; no-op for G==1.
-			self._mirror_group_host_kv(
-				[u for u in decisions.host_growth_uuids if u in self._uuid_to_local_map],
-				{},
+			self._mirror_group_host_page_tables(
+				[u for u in decisions.host_growth_uuids if u in self._uuid_to_local_map]
 			)
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
