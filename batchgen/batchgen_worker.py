@@ -1138,7 +1138,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		self._kv_cache_manager: Optional[KVCacheManager] = None
 		# Decode criticality probe. The model's graph adapter parses the request
 		# from batchgen_debug and builds the probe; the worker only holds the
 		# round's request (set at decode configure), the probe installed in the
@@ -2075,6 +2074,8 @@ class BatchGenWorker:
 				enable_host_kv_eviction=self.enable_host_kv_eviction,
 				host_kv_chunk_size=self.host_kv_chunk_size,
 				prefix_cache_debug_stats=self.prefix_cache_debug_stats,
+				kv_stats_native=self._kv_stats_native,
+				kv_stats_compare=self._kv_stats_compare,
 			),
 			sched=SchedulingState(
 				pool=self.global_batch,
@@ -4082,7 +4083,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._allocate_gpu_pages_with_host_identity(
-			self,
+			self._decode_phase_context(),
 			manager,
 			global_sequence_ids,
 			sequence_tokens,
@@ -4270,7 +4271,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._make_kv_cache_manager(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _make_kv_utilization_request(self) -> KVUtilizationRequest:
@@ -4292,7 +4293,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._get_host_kv_free_pages(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _legacy_get_host_kv_free_pages(self) -> int:
@@ -4303,7 +4304,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._legacy_get_host_kv_free_pages(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _get_or_create_gloo_group(self):
@@ -4842,7 +4843,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._reclaim_host_prefix_pages_collective(
-			self,
+			self._decode_phase_context(),
 			page_target,
 			reason=reason,
 		)
@@ -4876,7 +4877,7 @@ class BatchGenWorker:
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._reclaim_host_prefix_pages_for_growth(
-			self,
+			self._decode_phase_context(),
 			growth_entries,
 			worker_view,
 		)

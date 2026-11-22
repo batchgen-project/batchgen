@@ -122,6 +122,8 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.prefix_runtime": "self.prefix_cache_runtime_config",
         "ctx.chunk_sizer": "self.adaptive_chunk_sizer",
         "ctx.facts.prefix_cache_debug_stats": "self.prefix_cache_debug_stats",
+        "ctx.facts.kv_stats_native": "self._kv_stats_native",
+        "ctx.facts.kv_stats_compare": "self._kv_stats_compare",
         "ctx.parallel_manager": "self.parallel_manager",
     }
     if text == "ctx.facts.attn_tp_size":
@@ -181,6 +183,26 @@ class _ContextToWorker(ast.NodeTransformer):
                 ),
                 args=[node.args[1]],
                 keywords=[],
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "StepObservabilityEngine"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "ctx"
+        ):
+            # A cross-engine observability call made with the same context;
+            # the worker spelling is the worker's same-name delegator.
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=node.func.attr,
+                    ctx=ast.Load(),
+                ),
+                args=node.args[1:],
+                keywords=node.keywords,
             )
         if (
             isinstance(node.func, ast.Attribute)

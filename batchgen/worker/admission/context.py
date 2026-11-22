@@ -21,6 +21,8 @@ class RankFacts:
     enable_host_kv_eviction: bool
     host_kv_chunk_size: int
     prefix_cache_debug_stats: bool = False
+    kv_stats_native: bool = False
+    kv_stats_compare: bool = False
 
 
 @dataclass(frozen=True)
