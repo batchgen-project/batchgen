@@ -1154,6 +1154,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
         prefill_moe_mode=parsed.prefill_moe_mode,
+        debug_num_layers=parsed.debug_num_layers,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
