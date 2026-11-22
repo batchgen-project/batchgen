@@ -89,11 +89,25 @@ pool and captured graphs are live (`_snapshot_server_config`, before the
 startup switch to prefill), and `WorkerManager.record_server_config` logs one
 line per generation and node before the scheduler marks the deployment ready:
 
-    [SERVER_CONFIG] generation=<G> node=<N> prefill_attn=<slot> prefill_moe=<slot> decode_attn=<slot> decode_moe=<slot> cuda_graphs=<on|off> graph_buckets=<b1,b2,...|none> host_kv_gib=<G.GGG> host_kv_pages=<P> device_kv_gib=<G.GGG> device_kv_pages=<P> gpu_memory_frac=<F> max_pool=<N>
+    [SERVER_CONFIG] generation=<G> node=<N> prefill_attn=<slot> prefill_moe=<slot> decode_attn=<slot> decode_moe=<slot> cuda_graphs=<on|off> graph_buckets=<b1,b2,...|none> host_kv_gib=<G.GGG> host_kv_pages=<P> device_kv_gib=<G.GGG> device_kv_pages=<P> gpu_memory_frac=<F> max_pool=<N> num_layers=<L> num_layers_full=<L>
 
 where `<slot>` is `undeclared`, `none`, or a `scheme:residency` token whose
 sharded schemes carry their group width: `dp:streamed`, `tp8:resident`,
-`ep8:partial`.
+`ep8:partial`. `num_layers` is the layer count the engine serves and
+`num_layers_full` the checkpoint's; they differ only under
+`--debug-num-layers`.
+
+# Layer truncation (`--debug-num-layers`)
+
+`--debug-num-layers N` is an internal bring-up option: the server loads and
+serves only the first N transformer layers, and its outputs are meaningless.
+The effective layer count is resolved once, where the model's config is parsed
+(`batchgen/config/layer_truncation.py::apply_layer_truncation`), and every
+consumer reads it from that config. `validate_server_args` refuses the flag by
+name with `--distributed-weight-config` and with `--enable-prefix-cache`; a
+model whose initializer did not resolve it refuses it at worker start. A run
+whose `[SERVER_CONFIG]` line has `num_layers` below `num_layers_full` is not a
+valid result of the model.
 
 # Prefill MoE mode (`--prefill-moe-mode`)
 

@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 from batchgen.config.config import EngineConfig, ModelConfig
+from batchgen.config.layer_truncation import apply_layer_truncation
 from batchgen.config.model_registry import load_config
 from .configuration_gpt_oss import GptOssConfig
 from .planner import GptOssPlanner
@@ -75,6 +76,12 @@ class GptOssInitializer:
         self.loaded_model_config = GptOssConfig()
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.loaded_model_config.architectures = ["GptOss"]
+        # Effective layer count (--debug-num-layers) is resolved HERE, once,
+        # before any consumer reads the rich config.
+        apply_layer_truncation(
+            self.loaded_model_config,
+            getattr(input_arguments, "debug_num_layers", None),
+        )
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -241,19 +248,26 @@ class GptOssInitializer:
         }
 
     def _parse_model_config(self) -> ModelConfig:
-        """Parse GPT-OSS model configuration."""
+        """Project the rich GPT-OSS config into the minimal engine ModelConfig.
+
+        Every value comes from ``self.loaded_model_config`` (GptOssConfig
+        defaults, layer-truncation applied): the layer count in particular
+        must be the ONE resolved value, not a literal, so --debug-num-layers
+        reaches the engine, KV sizing and the planner.
+        """
+        rich = self.loaded_model_config
         model_config = ModelConfig()
 
-        model_config.model_type = "gpt_oss"
-        model_config.num_hidden_layers = 36
-        model_config.num_local_experts = 128
-        model_config.num_attention_heads = 64
-        model_config.num_key_value_heads = 8
-        model_config.head_dim = 64
-        model_config.hidden_size = 2880
-        model_config.intermediate_size = 2880
-        model_config.num_experts_per_tok = 4
-        model_config.sliding_window = 128
+        model_config.model_type = rich.model_type
+        model_config.num_hidden_layers = rich.num_hidden_layers
+        model_config.num_local_experts = rich.num_local_experts
+        model_config.num_attention_heads = rich.num_attention_heads
+        model_config.num_key_value_heads = rich.num_key_value_heads
+        model_config.head_dim = rich.head_dim
+        model_config.hidden_size = rich.hidden_size
+        model_config.intermediate_size = rich.intermediate_size
+        model_config.num_experts_per_tok = rich.num_experts_per_tok
+        model_config.sliding_window = rich.sliding_window
 
         return model_config
 

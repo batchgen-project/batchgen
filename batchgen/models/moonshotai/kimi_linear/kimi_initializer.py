@@ -20,6 +20,7 @@ from typing import Tuple
 import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
+from batchgen.config.layer_truncation import apply_layer_truncation
 from batchgen.config.model_registry import load_config
 from batchgen.hardware.machine_family import detect_device_facts
 
@@ -88,6 +89,16 @@ class KimiLinearInitializer:
             # instantiated for the released indexer geometry; anything else is
             # refused here, before any weight is mapped.
             require_servable_indexer(self.batchgen_config.dsa())
+
+        # Effective layer count (--debug-num-layers) is resolved HERE, once,
+        # while the rich config is final and before any consumer reads it:
+        # the engine ModelConfig projection, the K3 tensor map, the KDA/MLA
+        # layer split, KV sizing and the planner all read num_hidden_layers
+        # (and the sliced kda_layers/full_attn_layers) off this one object.
+        apply_layer_truncation(
+            self.batchgen_config,
+            getattr(input_arguments, "debug_num_layers", None),
+        )
 
         # Model instantiation config (same class; structure from config.json).
         self.loaded_model_config = self.batchgen_config

@@ -28,6 +28,8 @@ def config(**overrides):
         device_kv_pages=3440,
         gpu_memory_frac=0.9,
         max_pool=3200,
+        num_layers=78,
+        num_layers_full=78,
     )
     values.update(overrides)
     return sc.ServerConfig(**values)
@@ -42,7 +44,7 @@ def test_log_line_format_is_pinned():
         "cuda_graphs=on graph_buckets=1,2,4,8 "
         "host_kv_gib=860.000 host_kv_pages=56320 "
         "device_kv_gib=52.500 device_kv_pages=3440 "
-        "gpu_memory_frac=0.9 max_pool=3200"
+        "gpu_memory_frac=0.9 max_pool=3200 num_layers=78 num_layers_full=78"
     )
     eager = config(cuda_graphs=False, graph_buckets=None, decode_moe="undeclared")
     assert eager.log_line(2, 3) == (
@@ -51,7 +53,7 @@ def test_log_line_format_is_pinned():
         "cuda_graphs=off graph_buckets=none "
         "host_kv_gib=860.000 host_kv_pages=56320 "
         "device_kv_gib=52.500 device_kv_pages=3440 "
-        "gpu_memory_frac=0.9 max_pool=3200"
+        "gpu_memory_frac=0.9 max_pool=3200 num_layers=78 num_layers_full=78"
     )
     for line in (config().log_line(1, 0), eager.log_line(2, 3)):
         for pair in line.split()[1:]:
@@ -89,10 +91,21 @@ def test_round_trip_and_refusals():
     dict(gpu_memory_frac=0.0),
     dict(gpu_memory_frac=1.5),
     dict(max_pool=True),
+    dict(num_layers=0),                    # a served model has layers
+    dict(num_layers_full=0),
+    dict(num_layers=2.5),
+    dict(num_layers=True),
+    dict(num_layers=79),                   # truncation only serves a prefix
 ])
 def test_invalid_values_are_refused(overrides):
     with pytest.raises(sc.ServerConfigError):
         config(**overrides)
+
+
+def test_truncated_layer_counts_are_legal_and_in_the_line():
+    truncated = config(num_layers=12)
+    assert truncated.log_line(1, 0).endswith("num_layers=12 num_layers_full=78")
+    assert sc.ServerConfig.from_dict(truncated.as_dict()) == truncated
 
 
 def test_undeclared_slots_are_legal_but_unknown_tokens_are_not():
@@ -216,6 +229,8 @@ def _snapshot_worker(**overrides):
         gpu_memory_frac=0.9,
         model_context_length=1024,
         _traj=SimpleNamespace(trajectory_book=_Book()),
+        model_config=SimpleNamespace(num_hidden_layers=78),
+        loaded_model_config=SimpleNamespace(num_hidden_layers_full=78),
         server_config=None,
     )
     for name, value in overrides.items():
@@ -298,6 +313,30 @@ def test_snapshot_uses_the_manager_graph_declaration_over_worker_graph_fields():
     snapshot(worker)
     assert worker.server_config["cuda_graphs"] is False
     assert worker.server_config["graph_buckets"] is None
+
+
+def test_snapshot_reports_truncated_and_full_layer_counts():
+    # Under --debug-num-layers the engine ModelConfig holds the served count
+    # and the rich config carries the checkpoint's stamped full count.
+    worker, snapshot = _snapshot_worker(
+        model_config=SimpleNamespace(num_hidden_layers=12),
+        loaded_model_config=SimpleNamespace(num_hidden_layers_full=78),
+    )
+    snapshot(worker)
+    assert worker.server_config["num_layers"] == 12
+    assert worker.server_config["num_layers_full"] == 78
+
+
+def test_snapshot_defaults_full_count_for_models_without_the_stamp():
+    # An initializer that predates apply_layer_truncation never stamps the
+    # rich config; it serves all layers, so full == effective.
+    worker, snapshot = _snapshot_worker(
+        model_config=SimpleNamespace(num_hidden_layers=36),
+        loaded_model_config=SimpleNamespace(),
+    )
+    snapshot(worker)
+    assert worker.server_config["num_layers"] == 36
+    assert worker.server_config["num_layers_full"] == 36
 
 
 def test_snapshot_refuses_to_run_after_the_pool_is_retired():

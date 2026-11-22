@@ -31,6 +31,12 @@ Every value is reported as its owner holds it, never re-derived:
 ``max_pool``
     The scheduling capacity the trajectory pool derived: the same number the
     worker publishes as ``total_capacity``.
+``num_layers`` / ``num_layers_full``
+    The transformer layer count the engine serves, and the checkpoint's full
+    count. They differ only under the internal ``--debug-num-layers``
+    truncation (``batchgen.config.layer_truncation``), whose outputs are
+    meaningless: a result extractor must refuse any run whose line has
+    ``num_layers`` < ``num_layers_full``.
 """
 
 from __future__ import annotations
@@ -63,6 +69,8 @@ _FIELDS = (
     "device_kv_pages",
     "gpu_memory_frac",
     "max_pool",
+    "num_layers",
+    "num_layers_full",
 )
 
 
@@ -109,6 +117,11 @@ class ServerConfig:
     device_kv_pages: int
     gpu_memory_frac: float
     max_pool: int
+    # The layer count the engine serves, and the checkpoint's full count.
+    # Unequal only under --debug-num-layers (outputs meaningless); a result
+    # extractor must refuse a line with num_layers < num_layers_full.
+    num_layers: int
+    num_layers_full: int
 
     def __post_init__(self) -> None:
         for name in ("prefill_attn", "prefill_moe", "decode_attn", "decode_moe"):
@@ -139,6 +152,18 @@ class ServerConfig:
                 )
         for name in ("host_kv_pages", "device_kv_pages", "max_pool"):
             _check_count(name, getattr(self, name))
+        for name in ("num_layers", "num_layers_full"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ServerConfigError(
+                    f"server config {name} must be a positive int, got {value!r}"
+                )
+        if self.num_layers > self.num_layers_full:
+            raise ServerConfigError(
+                f"server config num_layers={self.num_layers} cannot exceed "
+                f"num_layers_full={self.num_layers_full}: layer truncation "
+                "only serves a prefix"
+            )
         for name in ("host_kv_gib", "device_kv_gib"):
             _check_gib(name, getattr(self, name))
         frac = self.gpu_memory_frac
@@ -187,5 +212,6 @@ class ServerConfig:
             f"host_kv_gib={self.host_kv_gib:.3f} host_kv_pages={self.host_kv_pages} "
             f"device_kv_gib={self.device_kv_gib:.3f} "
             f"device_kv_pages={self.device_kv_pages} "
-            f"gpu_memory_frac={self.gpu_memory_frac:g} max_pool={self.max_pool}"
+            f"gpu_memory_frac={self.gpu_memory_frac:g} max_pool={self.max_pool} "
+            f"num_layers={self.num_layers} num_layers_full={self.num_layers_full}"
         )

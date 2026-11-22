@@ -58,6 +58,11 @@ from .model import GptOss
 from .configuration_gpt_oss import GptOssConfig
 from .converted_ckpt_plan import check_converted_ckpt_format, plan_converted_ckpt_load
 from batchgen.config.model_registry import load_config
+from batchgen.config.layer_truncation import (
+    apply_layer_truncation,
+    select_weight_files,
+    weight_reservation_bytes,
+)
 from batchgen.eventlog.process import native_log_level
 
 try:
@@ -77,7 +82,8 @@ class GptOss_Parameter_Server:
     - Mapping checkpoint names to BatchGen format
     """
 
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False,
+                 debug_num_layers=None):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
@@ -95,8 +101,12 @@ class GptOss_Parameter_Server:
         self.hf_config = GptOssConfig()
         self.hf_config._name_or_path = huggingface_ckpt_name
 
-        # GPT-OSS model parameters
-        self.num_layers = 36
+        # GPT-OSS model parameters. num_layers_full is the checkpoint's depth
+        # (file format, conversion, load plan); num_layers is the served
+        # prefix, the same one the workers resolve.
+        self.num_layers_full = self.hf_config.num_hidden_layers
+        apply_layer_truncation(self.hf_config, debug_num_layers)
+        self.num_layers = self.hf_config.num_hidden_layers
         self.num_experts = 128
         self.intermediate_size = 2880
         self.hidden_size = 2880
@@ -116,7 +126,7 @@ class GptOss_Parameter_Server:
         """Initialize parameter server and load weights."""
         # Fail before converting into, or reading from, a directory that holds
         # files outside the GPT-OSS server set (e.g. convert_checkpoint shards).
-        check_converted_ckpt_format(self.converted_ckpt_dir, self.num_layers)
+        check_converted_ckpt_format(self.converted_ckpt_dir, self.num_layers_full)
 
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
@@ -149,15 +159,19 @@ class GptOss_Parameter_Server:
         self._convert_checkpoint()
 
         # Every file must fit the buffer before the C++ loader reads any of them.
-        load_plan = plan_converted_ckpt_load(self.converted_ckpt_dir, byte_size, self.num_layers)
+        load_plan = plan_converted_ckpt_load(self.converted_ckpt_dir, byte_size, self.num_layers_full)
         logging.info(f"Weight load plan: {len(load_plan)} files fit the {byte_size}-byte buffer")
 
+        weight_files, unserved_tensors = select_weight_files(str(self.converted_ckpt_dir), self.hf_config)
+        byte_size = weight_reservation_bytes(byte_size, str(self.converted_ckpt_dir), weight_files)
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
             str(self.converted_ckpt_dir),  # Convert Path to string for C++ binding
             self.state_dict_name_map,
+            weight_files,
+            unserved_tensors,
         )
 
         # Debug: Log what skeleton_state_dict the C++ parameter server returns
@@ -414,7 +428,7 @@ class GptOss_Parameter_Server:
         logging.info(f"Non-block checkpoint tensors: {non_block_tensors}")
 
         # Process each layer
-        for layer_idx in trange(self.num_layers, desc="Converting layers"):
+        for layer_idx in trange(self.num_layers_full, desc="Converting layers"):
             self._convert_layer(layer_idx, tensor_to_file)
 
         # Convert non-layer tensors (embeddings, final norm, lm_head)

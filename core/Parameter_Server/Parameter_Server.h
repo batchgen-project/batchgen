@@ -70,7 +70,9 @@ class Parameter_Server {
               int64_t byte_size, std::string& model_weights_path,
               std::unordered_map<std::string,
                                  std::unordered_map<std::string, std::string>>&
-                  state_dict_name_map);
+                  state_dict_name_map,
+              const std::vector<std::string>& weight_json_files = {},
+              const std::vector<std::string>& unserved_tensor_names = {});
     std::unordered_map<std::string, torch::Tensor> get_skeleton_state_dict();
     int64_t byte_size();
     int weights_memfd_fd() const { return weights_memfd_fd_; }
@@ -104,5 +106,7 @@ class Parameter_Server {
         const std::string& model_weights_path,
         void* weight_ptr,
         int64_t buffer_bytes,
-        std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map);
+        std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map,
+        const std::vector<std::string>& weight_json_files,
+        const std::vector<std::string>& unserved_tensor_names);
 };
