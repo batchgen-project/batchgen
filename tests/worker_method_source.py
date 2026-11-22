@@ -299,6 +299,19 @@ def load_worker_functions(
     return loaded
 
 
+# What the worker's delegators pass to the engine besides their own arguments:
+# launch parameters, which the engine takes as values instead of reading the
+# worker's args. A fake sets ``worker.args`` the way a server's launch does.
+PREFILL_ENGINE_DELEGATOR_KWARGS = {
+    "_prefix_rank_packing_mode": lambda worker: {
+        "mode": worker.args.prefix_rank_assignment_mode
+    },
+    "_prefix_rank_cost_profile_disabled": lambda worker: {
+        "value": worker.args.prefix_rank_cost_profile
+    },
+}
+
+
 def load_prefill_engine_methods(
     names: Iterable[str],
     namespace: Dict[str, Any],
@@ -337,7 +350,12 @@ def load_prefill_engine_methods(
         exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
         engine_method = scope[node.name]
 
-        def worker_method(worker, *args, _engine_method=engine_method, **kwargs):
+        def worker_method(
+            worker, *args, _engine_method=engine_method, _name=node.name, **kwargs
+        ):
+            extra = PREFILL_ENGINE_DELEGATOR_KWARGS.get(_name)
+            if extra is not None:
+                kwargs = {**extra(worker), **kwargs}
             return _engine_method(None, worker, *args, **kwargs)
 
         loaded[node.name] = worker_method

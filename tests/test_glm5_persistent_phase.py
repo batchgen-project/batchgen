@@ -313,13 +313,12 @@ def test_worker_only_calls_worker_methods_that_exist():
     assert not missing
 
 
-def test_prefill_nsys_profile_is_inert_without_batch_debug():
+def test_prefill_nsys_profile_is_inert_under_an_empty_debug_state():
     begin = _isolated_worker_method("_nsys_prefill_profile_begin")
     end = _isolated_worker_method("_nsys_prefill_profile_end")
     worker = SimpleNamespace(
-        _batchgen_debug={},
         _debug_flag_enabled=lambda value: False,
-        _active_batchgen_debug_for_sequences=lambda sequences: None,
+        _debug_values=lambda: None,
     )
 
     active = begin(worker, local_bsz=42, global_bsz=336)
@@ -328,10 +327,9 @@ def test_prefill_nsys_profile_is_inert_without_batch_debug():
     assert active is False
 
 
-def test_prefill_nsys_profile_reads_the_admitted_sequences_debug():
-    # A pool-served wave never populates the worker-level debug dict: the
-    # batch flag lives on the admitted sequences, and the capture window must
-    # open from there or the pool path cannot be profiled at all.
+def test_prefill_nsys_profile_reads_the_server_debug_state():
+    # The capture window opens from the server's debug state as the worker
+    # adopted it, the same for a pool-served wave and any other.
     begin = _isolated_worker_method("_nsys_prefill_profile_begin")
     seen = {}
 
@@ -340,21 +338,12 @@ def test_prefill_nsys_profile_reads_the_admitted_sequences_debug():
             seen.update(kwargs)
             return True
 
-    sequences = [object(), object()]
-    lookups = []
-
-    def _debug_for(seqs):
-        lookups.append(seqs)
-        return {"glm5_prefill_nsys_profile": True}
-
     worker = SimpleNamespace(
-        _batchgen_debug={},
         _step_observability_engine=_Engine(),
-        _active_batchgen_debug_for_sequences=_debug_for,
+        _debug_values=lambda: {"glm5_prefill_nsys_profile": True},
     )
 
-    assert begin(worker, local_bsz=3, global_bsz=24, sequences=sequences) is True
-    assert lookups == [sequences]
+    assert begin(worker, local_bsz=3, global_bsz=24) is True
     assert seen == {
         "local_bsz": 3,
         "global_bsz": 24,

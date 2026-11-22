@@ -6249,7 +6249,6 @@ class BatchGenWorker:
 		*,
 		local_bsz: int,
 		global_bsz: int,
-		sequences=None,
 	) -> bool:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_step_observability_engine", None)
@@ -6308,8 +6307,8 @@ class BatchGenWorker:
 			self._decode_profile_capture = capture
 		return capture
 
-	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
-		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: a
+	def _decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
+		"""Server debug state ``decode_profile_steps = N``: a
 		per-kernel breakdown of N decode steps without a server restart."""
 		self._decode_profile_capture_state().step(batchgen_debug, batch_rows)
 
@@ -6929,12 +6928,6 @@ class BatchGenWorker:
 					_prefill_profile_active = self._nsys_prefill_profile_begin(
 						local_bsz=len(local_prefill_indices),
 						global_bsz=len(prefill_uuids),
-						sequences=[
-							seq for seq in (
-								self.global_batch.get_sequence(uuid)
-								for uuid in prefill_uuids
-							) if seq is not None
-						],
 					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
@@ -13547,7 +13540,7 @@ class BatchGenWorker:
 					self.rank,
 					_step_probe_request,
 				)
-		self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+		self._decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
 		self._configure_glm5_dispatch_trace(global_decode_sequences)
 		return probe_mismatch_logged
 
