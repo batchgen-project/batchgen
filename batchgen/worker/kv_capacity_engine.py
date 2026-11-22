@@ -66,6 +66,7 @@ from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.admission.context import WaitOutcome
 from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.worker.host_rebalancer import HostKVRebalancer
+from batchgen.worker.step_observability_engine import StepObservabilityEngine
 from batchgen.worker.kv_manager import (
     GPU_KV_POOL_HEADROOM_GB,
     KVCacheManager,
@@ -126,6 +127,38 @@ def _normalize_aux_kv_entry(entry) -> tuple:
         "deferred aux KV entry must be (layer_idx, k_tensor, v_tensor) or "
         f"(layer_idx, k_tensor, v_tensor, scale_tensor); got {len(entry)} fields"
     )
+
+
+class _TorchKVStatsBackend:
+    """KV stats over two plain references; it never holds the worker.
+
+    Constructed per ``_make_kv_cache_manager`` call from the frozen context's
+    ``host_view`` and ``gpu_kv``, so each stats read sees exactly the objects
+    the context snapshot carried.
+    """
+
+    def __init__(self, host_view, gpu_kv) -> None:
+        self._host_view = host_view
+        self._gpu_kv = gpu_kv
+
+    def get_host_stats(self) -> KVStats:
+        s = self._host_view.get_stats()
+        return KVStats(
+            num_free_pages=s.num_free_pages,
+            num_used_pages=s.num_used_pages,
+            num_total_pages=s.num_total_pages,
+        )
+
+    def get_gpu_stats(self) -> "Optional[KVStats]":
+        m = self._gpu_kv
+        if m is None:
+            return None
+        s = m.get_stats()
+        return KVStats(
+            num_free_pages=s.num_free_pages,
+            num_used_pages=s.num_used_pages,
+            num_total_pages=s.num_total_pages,
+        )
 
 
 @dataclass
@@ -870,33 +903,20 @@ class KVCapacityEngine:
 
     # ---- KV stats ----------------------------------------------------------
 
-    def _make_kv_cache_manager(self, worker) -> KVCacheManager:
-        """Lazy-construct: KV managers may not be bound at __init__ time."""
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self._kv_cache_manager is None:
-            worker = self
-            class _TorchKVStatsBackend:
-                def get_host_stats(self) -> KVStats:
-                    s = worker.host_paged_kv_worker_view.get_stats()
-                    return KVStats(
-                        num_free_pages=s.num_free_pages,
-                        num_used_pages=s.num_used_pages,
-                        num_total_pages=s.num_total_pages,
-                    )
-                def get_gpu_stats(self) -> "Optional[KVStats]":
-                    m = worker.gpu_paged_kv_cache_manager
-                    if m is None:
-                        return None
-                    s = m.get_stats()
-                    return KVStats(
-                        num_free_pages=s.num_free_pages,
-                        num_used_pages=s.num_used_pages,
-                        num_total_pages=s.num_total_pages,
-                    )
-            self._kv_cache_manager = KVCacheManager(backend=_TorchKVStatsBackend())
-        return self._kv_cache_manager
+    def _make_kv_cache_manager(self, ctx) -> KVCacheManager:
+        """Build a fresh manager from the context's two KV handles.
+
+        NOT a verbatim move: the former body cached one ``KVCacheManager`` on
+        the worker behind a backend that closed over the worker and read
+        ``host_paged_kv_worker_view`` and ``gpu_paged_kv_cache_manager`` at
+        call time. The frozen context carries exactly those two references,
+        snapshotted by the delegator on every call, so a fresh manager per
+        call reads the same objects at the same moments without ever holding
+        the worker.
+        """
+        return KVCacheManager(
+            backend=_TorchKVStatsBackend(ctx.host_view, ctx.gpu_kv)
+        )
 
     def _make_kv_utilization_request(self, worker) -> KVUtilizationRequest:
         # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
@@ -910,25 +930,19 @@ class KVCapacityEngine:
             global_batch=self.global_batch,
         )
 
-    def _get_host_kv_free_pages(self, worker) -> int:
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self._kv_stats_compare:
-            legacy = self._legacy_get_host_kv_free_pages()
-            native = self._make_kv_cache_manager().get_host_free_pages()
+    def _get_host_kv_free_pages(self, ctx) -> int:
+        if ctx.facts.kv_stats_compare:
+            legacy = self._legacy_get_host_kv_free_pages(ctx)
+            native = self._make_kv_cache_manager(ctx).get_host_free_pages()
             assert legacy == native, f"kv_stats compare mismatch: get_host_kv_free_pages legacy={legacy} native={native}"
-            return native if self._kv_stats_native else legacy
-        if self._kv_stats_native:
-            return self._make_kv_cache_manager().get_host_free_pages()
-        return self._legacy_get_host_kv_free_pages()
+            return native if ctx.facts.kv_stats_native else legacy
+        if ctx.facts.kv_stats_native:
+            return self._make_kv_cache_manager(ctx).get_host_free_pages()
+        return self._legacy_get_host_kv_free_pages(ctx)
 
-    def _legacy_get_host_kv_free_pages(self, worker) -> int:
+    def _legacy_get_host_kv_free_pages(self, ctx) -> int:
         """Get current free pages from host KV cache."""
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        stats = self.host_paged_kv_worker_view.get_stats()
+        stats = ctx.host_view.get_stats()
         return stats.num_free_pages
 
     def _get_host_kv_utilization(self, worker) -> Dict[str, int]:
@@ -1321,7 +1335,7 @@ class KVCapacityEngine:
         return bool(int(decision[0].item())), verdict.rows
 
     def _reclaim_host_prefix_pages_collective(
-        self, worker,
+        self, ctx,
         page_target: Callable[[], int],
         *,
         reason: str,
@@ -1340,54 +1354,52 @@ class KVCapacityEngine:
         the caller in logs, the ``prefix_reclaim`` metric and errors. Returns
         the largest page count any leader reclaimed.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10b); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         from batchgen.prefix_reuse.eviction import (
             EvictedPageRecorder,
             reclaim_prefix_pages_for_host_admission,
             retire_node_frontiers,
         )
-        node_id = self.rank_ctx.node_id
+        node_id = ctx.facts.rank_ctx.node_id
         failure = 0
-        local_frontier_hook = self._trajectory_frontier_eviction_hook()
+        local_frontier_hook = ctx.sched.trajectories.trajectory_frontier_eviction_hook()
         reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
-        if self.local_rank == 0:
+        if ctx.facts.local_rank == 0:
             try:
                 target = int(page_target())
                 if target:
                     released = reclaim_prefix_pages_for_host_admission(
                         core_engine_module=core_engine,
-                        coordinator=self.prefix_cache_coordinator,
-                        worker_views_by_group=self._host_views_by_group(),
+                        coordinator=ctx.prefix_coordinator,
+                        worker_views_by_group=self._host_views_by_group(ctx),
                         group_id=0,
                         page_target=target,
-                        max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+                        max_scan_nodes=ctx.prefix_runtime.max_nodes,
                         frontier_hook=reclaimed_pages,
                     )
                     logging.info(
                         "[PREFIX_CACHE] %s reclaimed %s Host pages on node %s "
                         "(free=%s, target=%s)",
-                        reason, released, node_id, self._get_host_kv_free_pages(),
+                        reason, released, node_id, self._get_host_kv_free_pages(ctx),
                         target,
                     )
-                    if self.prefix_cache_debug_stats:
-                        self._emit_prefix_cache_metric(
+                    if ctx.facts.prefix_cache_debug_stats:
+                        StepObservabilityEngine()._emit_prefix_cache_metric(
+                            ctx,
                             "prefix_reclaim",
                             reason=reason,
                             node=int(node_id),
                             page_target=int(target),
                             released_pages=int(released),
-                            **self._prefix_host_resource_fields(),
+                            **StepObservabilityEngine()._prefix_host_resource_fields(ctx),
                         )
             except Exception:
                 logging.exception("[PREFIX_CACHE] %s eviction failed", reason)
                 failure = 1
         reclaimed_page_count = reclaimed_pages.page_count
-        if self.world_size > 1:
+        if ctx.facts.world_size > 1:
             failed = torch.tensor(
                 [failure, reclaimed_page_count],
-                dtype=torch.int64, device=self.torch_device,
+                dtype=torch.int64, device=ctx.facts.device,
             )
             dist.all_reduce(failed, op=dist.ReduceOp.MAX)
             failure = int(failed[0].item())
@@ -1398,18 +1410,18 @@ class KVCapacityEngine:
         # other rank of the node may own frontier records standing on the
         # reclaimed pages (G=1, or several serve groups per node), so every rank
         # runs its own hook on its node's reclaimed map.
-        if self.world_size > 1 and reclaimed_page_count != 0:
+        if ctx.facts.world_size > 1 and reclaimed_page_count != 0:
             frontier_failure = 0
-            gathered_reclaims = [None] * self.world_size
+            gathered_reclaims = [None] * ctx.facts.world_size
             dist.all_gather_object(
                 gathered_reclaims,
                 (
                     node_id,
                     reclaimed_pages.pages_by_group
-                    if self.local_rank == 0 else None,
+                    if ctx.facts.local_rank == 0 else None,
                 ),
             )
-            if self.local_rank != 0:
+            if ctx.facts.local_rank != 0:
                 try:
                     retire_node_frontiers(
                         gathered=gathered_reclaims,
@@ -1423,7 +1435,7 @@ class KVCapacityEngine:
                     )
                     frontier_failure = 1
             retired = torch.tensor(
-                [frontier_failure], dtype=torch.int64, device=self.torch_device
+                [frontier_failure], dtype=torch.int64, device=ctx.facts.device
             )
             dist.all_reduce(retired, op=dist.ReduceOp.MAX)
             if int(retired.item()) != 0:
@@ -1467,7 +1479,7 @@ class KVCapacityEngine:
         return capacity_ok
 
     def _reclaim_host_prefix_pages_for_growth(
-        self, worker,
+        self, ctx,
         growth_entries: List[Tuple[str, int, object]],
         worker_view: Optional[object],
     ) -> int:
@@ -1483,11 +1495,8 @@ class KVCapacityEngine:
         fails loud. ``growth_entries`` is the broadcast ``(uuid, pages, seq)``
         list, identical on every rank.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10b); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        node_id = node_of_rank(self.rank, self.local_world_size)
-        group_size = self._decode_attn_tp_size()
+        node_id = node_of_rank(ctx.facts.rank, ctx.facts.local_world_size)
+        group_size = ctx.facts.attn_tp_size
 
         def node_growth_deficit() -> int:
             from batchgen.decode_dp_group import host_kv_owner_rank
@@ -1505,7 +1514,7 @@ class KVCapacityEngine:
                     owner = host_kv_owner_rank(seq.decode_dp_group, group_size)
                 else:
                     owner = seq.assigned_rank
-                if node_of_rank(int(owner), self.local_world_size) == node_id:
+                if node_of_rank(int(owner), ctx.facts.local_world_size) == node_id:
                     node_growth_pages += int(growth_pages)
             if node_growth_pages == 0:
                 return 0
@@ -1515,7 +1524,7 @@ class KVCapacityEngine:
             return max(0, node_growth_pages - free_after_releases)
 
         return self._reclaim_host_prefix_pages_collective(
-            node_growth_deficit, reason="host_growth",
+            ctx, node_growth_deficit, reason="host_growth",
         )
 
     def _collective_host_kv_growth_capacity_ok(
@@ -1987,18 +1996,15 @@ class KVCapacityEngine:
                     )
 
     def _allocate_gpu_pages_with_host_identity(
-        self, worker,
+        self, ctx,
         manager,
         global_sequence_ids: Sequence[int],
         sequence_tokens: Sequence[int],
     ):
         """Share GPU pages when sequences reference the same Host page ids."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
 
         page_keys = self._host_identity_page_keys(
-            manager, global_sequence_ids, sequence_tokens
+            ctx, manager, global_sequence_ids, sequence_tokens
         )
         if page_keys is None:
             return manager.allocate_pages_for_sequences(
@@ -2009,7 +2015,7 @@ class KVCapacityEngine:
             sequence_tokens,
             page_keys,
         )
-        if self.prefix_cache_debug_stats:
+        if ctx.facts.prefix_cache_debug_stats:
             sharing = manager.get_prefix_gpu_share_stats()
             new_physical_pages = {
                 int(page)
@@ -2023,7 +2029,8 @@ class KVCapacityEngine:
                 if isinstance(page_keys, DualPoolPageKeys)
                 else page_keys
             )
-            self._emit_prefix_cache_metric(
+            StepObservabilityEngine()._emit_prefix_cache_metric(
+                ctx,
                 "prefix_gpu_share",
                 sequences=len(global_sequence_ids),
                 requested_logical_pages=sum(len(row) for row in primary_rows),
