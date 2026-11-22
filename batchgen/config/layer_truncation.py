@@ -234,3 +234,35 @@ def select_weight_files(converted_ckpt_dir: str, config) -> List[str]:
         len(names),
     )
     return selected
+
+
+_WEIGHT_FILE_ALIGNMENT = 4096          # the native loader starts each file on 4 KiB
+_RESERVATION_ALIGNMENT = 2 * 1024 * 1024
+
+
+def weight_reservation_bytes(
+    full_byte_size: int, converted_ckpt_dir: str, selected: List[str]
+) -> int:
+    """Host weight reservation for the files ``select_weight_files`` chose.
+
+    With no selection (all layers served) the model's own reservation stands.
+    Under truncation the reservation is the footprint of the selected files,
+    laid out as the native loader lays them out (each file on a 4 KiB
+    boundary), rounded up to 2 MiB: every worker registers the whole
+    reservation with its device, so reserving the full checkpoint for a
+    truncated load would keep that start-up cost at the full model's.
+    """
+    if not selected:
+        return int(full_byte_size)
+    total = 0
+    for name in selected:
+        with open(os.path.join(converted_ckpt_dir, name)) as handle:
+            size = int(json.load(handle)["total_byte_size"])
+        total = -(-total // _WEIGHT_FILE_ALIGNMENT) * _WEIGHT_FILE_ALIGNMENT + size
+    total = -(-total // _RESERVATION_ALIGNMENT) * _RESERVATION_ALIGNMENT
+    if total > int(full_byte_size):
+        raise LayerTruncationError(
+            f"--debug-num-layers: the selected weight files need {total} bytes, "
+            f"more than the model's full reservation of {int(full_byte_size)}"
+        )
+    return total

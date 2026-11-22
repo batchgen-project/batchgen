@@ -48,7 +48,11 @@ import torch
 from tqdm import trange
 
 from batchgen.config.model_registry import load_config
-from batchgen.config.layer_truncation import apply_layer_truncation, select_weight_files
+from batchgen.config.layer_truncation import (
+    apply_layer_truncation,
+    select_weight_files,
+    weight_reservation_bytes,
+)
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 from .config import is_k3_model_type, require_num_routed_experts
@@ -250,13 +254,15 @@ class KimiLinear_Parameter_Server:
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
+        weight_files = select_weight_files(str(self.converted_ckpt_dir), self.model_config)
+        byte_size = weight_reservation_bytes(byte_size, str(self.converted_ckpt_dir), weight_files)
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
             str(self.converted_ckpt_dir),
             self.state_dict_name_map,
-            select_weight_files(str(self.converted_ckpt_dir), self.model_config),
+            weight_files,
         )
         return self.shm_name, self.tensor_meta_shm_name
 

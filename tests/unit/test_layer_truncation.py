@@ -255,3 +255,25 @@ def test_truncation_refuses_an_empty_selection_and_foreign_metadata(tmp_path):
     (tmp_path / "x.json").write_text(json.dumps({"other": 1}))
     with pytest.raises(LayerTruncationError, match="no state_dict"):
         select_weight_files(ckpt, _served(2, 4))
+
+
+def test_reservation_follows_the_selected_files(tmp_path):
+    import json
+
+    import pytest
+
+    from batchgen.config.layer_truncation import (
+        LayerTruncationError,
+        weight_reservation_bytes,
+    )
+
+    for name, size in (("a.json", 5000), ("b.json", 4096), ("c.json", 10)):
+        (tmp_path / name).write_text(json.dumps({"total_byte_size": size, "state_dict": {}}))
+    ckpt = str(tmp_path)
+    mib = 1024 * 1024
+    # No selection: the model's own reservation stands.
+    assert weight_reservation_bytes(7 * mib, ckpt, []) == 7 * mib
+    # a at 0 (5000 B), b on the next 4 KiB boundary (8192) -> ends at 12288; 2 MiB round-up.
+    assert weight_reservation_bytes(7 * mib, ckpt, ["a.json", "b.json"]) == 2 * mib
+    with pytest.raises(LayerTruncationError, match="more than the model's full reservation"):
+        weight_reservation_bytes(mib, ckpt, ["a.json", "b.json"])

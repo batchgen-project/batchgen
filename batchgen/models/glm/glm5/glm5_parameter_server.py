@@ -41,7 +41,11 @@ from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
 from .shm_reservation import converted_checkpoint_byte_size
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
-from batchgen.config.layer_truncation import apply_layer_truncation, select_weight_files
+from batchgen.config.layer_truncation import (
+    apply_layer_truncation,
+    select_weight_files,
+    weight_reservation_bytes,
+)
 from batchgen.eventlog.process import native_log_level
 _diag("model_registry done")
 
@@ -106,6 +110,8 @@ class GLM5_Parameter_Server:
         # Size the reservation from the converted metadata instead of a fixed
         # per-dtype constant.
         byte_size = converted_checkpoint_byte_size(self.converted_ckpt_dir)
+        weight_files = select_weight_files(str(self.converted_ckpt_dir), self.model_config)
+        byte_size = weight_reservation_bytes(byte_size, str(self.converted_ckpt_dir), weight_files)
 
         import uuid
         self.shm_name = "/shm_" + str(uuid.uuid4())
@@ -120,7 +126,7 @@ class GLM5_Parameter_Server:
             byte_size,
             self.converted_ckpt_dir,
             self.state_dict_name_map,
-            select_weight_files(str(self.converted_ckpt_dir), self.model_config),
+            weight_files,
         )
         return self.shm_name, self.tensor_meta_shm_name
 
