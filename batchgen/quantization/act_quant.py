@@ -143,7 +143,14 @@ def act_quant(
         scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     
     # 3. Launch Kernel - chunk if needed for long sequences
-    if M <= ACT_QUANT_MAX_ROWS:
+    if M == 0:
+        # No rows: the outputs above are already the (empty) result. Launching
+        # the kernel over an empty grid computes nothing but still makes Triton
+        # specialise and load it, and a bf16 input reaches this fallback ONLY
+        # when it has no rows - a specialisation no warm-up exercises, so it
+        # would be loaded after readiness by the first rank with an empty batch.
+        pass
+    elif M <= ACT_QUANT_MAX_ROWS:
         # Single kernel launch for short sequences
         grid = (M, num_blocks)
         act_quant_kernel_2d[grid](

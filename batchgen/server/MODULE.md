@@ -97,6 +97,24 @@ sharded schemes carry their group width: `dp:streamed`, `tp8:resident`,
 `num_layers_full` the checkpoint's; they differ only under
 `--debug-num-layers`.
 
+# Events after readiness
+
+A rank reports ready once every deliberate kernel compile and CUDA-graph
+capture has run. As it does, the worker arms the post-readiness record
+(`batchgen_kernels/post_readiness.py`, armed in
+`arm_late_compile_guard_at_readiness` for every model) and logs
+
+    [POST_READINESS] rank=<R> armed: ...
+
+From then on each Triton compile, each DeepGEMM compile reported by the
+late-compile check and each completed decode graph capture logs one line and
+is counted per process:
+
+    [POST_READINESS] rank=<R> kind=<triton_compile|deepgemm_compile|graph_capture> count=<N> total=<T> where=<text>
+
+A log without a `kind=` line had none of these after readiness. The record
+only reports; whether an event raises is the reporting site's own policy.
+
 # Layer truncation (`--debug-num-layers`)
 
 `--debug-num-layers N` is an internal bring-up option: the server loads and

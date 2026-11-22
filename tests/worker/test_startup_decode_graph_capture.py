@@ -75,6 +75,8 @@ _METHOD_NAMES = [
     "_glm5_whole_model_graph_current_bucket_missing",
     "_whole_model_decode_graphs_requested",
     "_manager_decode_graphs_persist",
+    "_manager_decode_prewarm_compiles_kernels",
+    "_prewarm_startup_decode_jit",
     "_glm5_whole_model_graph_requested_for_current_batch",
 ]
 
@@ -444,3 +446,57 @@ def test_a_manager_without_persistent_graphs_captures_nothing_at_startup():
     assert "jit_prewarm" not in worker.events
     assert worker.setup_calls == 0
     assert worker._graph.decode_graph_captures == 0
+
+
+# ---- kernel compilation before readiness, with or without graphs ---------------
+
+@pytest.mark.parametrize(
+    "retains_decode, graphs, exit_mode",
+    [
+        # Eager deployment that keeps its decode instance.
+        (True, False, ExitMode.SUSPEND),
+        # Eager deployment that rebuilds it.
+        (False, False, ExitMode.RETIRE),
+        # Graphs requested, but the instance is rebuilt: no graph is captured
+        # at startup, the kernels still compile there.
+        (False, True, ExitMode.RETIRE),
+    ],
+)
+def test_a_manager_whose_decode_prewarm_compiles_kernels_prewarms_before_readiness(
+    retains_decode, graphs, exit_mode,
+):
+    worker = _worker(GLM5, retains_decode=retains_decode, graphs=graphs)
+    worker.parallel_manager.decode_prewarm_compiles_kernels = True
+    worker.prepare_deployment()
+    assert worker.events == [
+        "comm", "decode_build", "pool_sized",
+        ("sync_counts", "startup_graph_capture"), ("bind_metadata", ()), "jit_prewarm",
+        ("to_prefill", exit_mode),
+    ]
+    # Compiling kernels captures no graph.
+    assert worker.setup_calls == 0
+    assert worker._graph.decode_graph_captures == 0
+
+
+def test_a_manager_without_the_declaration_still_prewarms_nothing_at_startup():
+    worker = _worker(GLM5, retains_decode=True, graphs=False)
+    assert not worker._manager_decode_prewarm_compiles_kernels()
+    worker.prepare_deployment()
+    assert "jit_prewarm" not in worker.events
+
+
+def test_the_glm5_manager_declares_that_its_decode_prewarm_compiles_kernels():
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / (
+        "batchgen/models/glm/glm5/Parallel_Strategy_Manager.py")
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    manager = next(node for node in tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "GLM5ParallelStrategyManager")
+    declared = {
+        target.id: ast.literal_eval(node.value)
+        for node in manager.body if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+    }
+    assert declared.get("decode_prewarm_compiles_kernels") is True

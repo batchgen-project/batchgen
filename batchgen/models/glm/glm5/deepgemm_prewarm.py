@@ -105,6 +105,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from batchgen_kernels import deepgemm_sm90_configs as _dg
+from batchgen_kernels import post_readiness
 from batchgen_kernels.triton_prewarm import PrewarmEntry
 
 
@@ -831,6 +832,7 @@ def check_late_compiles(rank, where: str, strict: bool = False,
     )
     _BASELINE = _BASELINE | names
     logger.warning("%s rank=%s %s", log_tag, rank, message)
+    post_readiness.record(post_readiness.DEEPGEMM_COMPILE, where, count=len(late))
     if strict:
         raise LateDeepGemmCompileError(message)
     return late

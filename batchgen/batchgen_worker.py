@@ -325,6 +325,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
+from batchgen_kernels import post_readiness
 from batchgen.worker.admission.plan import (
 	StatusEdge,
 	update_batch_status,
@@ -8537,6 +8538,10 @@ class BatchGenWorker:
 	def _record_decode_graph_capture(self) -> None:
 		"""Count one completed decode graph capture for the live decode owner."""
 		self._graph.decode_graph_captures = self._graph.decode_graph_captures + 1
+		post_readiness.record(
+			post_readiness.GRAPH_CAPTURE,
+			f"decode graph capture #{self._graph.decode_graph_captures}",
+		)
 
 	def _assert_decode_attention_weights_registered(self) -> None:
 		"""A reused decode instance keeps its resident attention weights.
@@ -8617,10 +8622,18 @@ class BatchGenWorker:
 		self._init_gpu_kv_with_actual_size()
 		capture = self._glm5_whole_model_graph_requested_for_current_batch()
 		# The probe runs the capture exactly once whether or not it can
-		# measure it, so capture behavior is unchanged by the probe.
+		# measure it, so capture behavior is unchanged by the probe. With no
+		# graph to capture, a manager whose decode prewarm compiles kernels
+		# still runs that prewarm here, before readiness.
+		if capture:
+			startup_work = self._capture_startup_decode_graphs
+		elif self._manager_decode_prewarm_compiles_kernels():
+			startup_work = self._prewarm_startup_decode_jit
+		else:
+			startup_work = None
 		self._probe_startup_transient(
 			seam=_startup_transient.SEAM_PERSISTENT_BUILD,
-			capture=self._capture_startup_decode_graphs if capture else None,
+			capture=startup_work,
 		)
 		self._transition_phase(prefill_key)
 		self.set_phase("prefill")
@@ -8650,13 +8663,23 @@ class BatchGenWorker:
 
 		Two kinds of deployment capture here, by who owns the graphs: the
 		worker's whole-model graphs, and a manager-owned ladder that persists
-		across SUSPEND (``_manager_decode_graphs_persist``). A deployment that
-		owns neither captures nothing before readiness.
+		across SUSPEND (``_manager_decode_graphs_persist``).
+
+		Kernel compilation is a separate matter from graphs. A manager whose
+		decode prewarm compiles kernels keyed on the KV geometry
+		(``_manager_decode_prewarm_compiles_kernels``) needs that prewarm
+		before readiness in EVERY lifecycle - graphs or not, instance kept or
+		rebuilt - because the compiled kernels live in the process, not in
+		the decode instance. When no graph is captured here, the prewarm
+		alone is returned (``_prewarm_startup_decode_jit``); deferring it to
+		the first decode configure would compile after readiness.
 		"""
-		if not (
+		graphs = (
 			self._whole_model_decode_graphs_requested()
 			or self._manager_decode_graphs_persist()
-		):
+		)
+		compiles = self._manager_decode_prewarm_compiles_kernels()
+		if not (graphs or compiles):
 			return None
 		live = self._live_phase_key
 		if live is None or live.phase != "decode":
@@ -8665,9 +8688,29 @@ class BatchGenWorker:
 				f"the startup decode configure, which requires a live decode "
 				f"phase; live phase key={live!r}"
 			)
-		if self._phase_exit_mode(live, next_key) is not ExitMode.SUSPEND:
-			return None
-		return self._capture_startup_decode_graphs
+		if graphs and self._phase_exit_mode(live, next_key) is ExitMode.SUSPEND:
+			return self._capture_startup_decode_graphs
+		return self._prewarm_startup_decode_jit if compiles else None
+
+	def _manager_decode_prewarm_compiles_kernels(self) -> bool:
+		"""Whether the strategy manager's decode prewarm compiles kernels
+		keyed on the KV geometry (GLM-5's geometry-keyed JIT), as opposed to
+		capturing graphs. Declared by the manager; a manager without the
+		property answers False.
+		"""
+		return bool(getattr(
+			self.parallel_manager, "decode_prewarm_compiles_kernels", False
+		))
+
+	def _prewarm_startup_decode_jit(self) -> None:
+		"""Run the manager's decode prewarm before readiness, with no decode
+		row: every rank binds an empty local batch and the global maximum is
+		pinned to one row, exactly as the startup graph capture does.
+		"""
+		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
+		self._current_decode_max_rank_batch_size = 1
+		self._bind_decode_attention_metadata_for_graph_config([])
+		self._prewarm_decode_jit()
 
 	def _capture_startup_decode_graphs(self) -> None:
 		"""Capture the whole decode graph bucket ladder before readiness.
@@ -8692,10 +8735,7 @@ class BatchGenWorker:
 		only for the graphs the worker owns.
 		"""
 		captures = self._graph.decode_graph_captures
-		self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
-		self._current_decode_max_rank_batch_size = 1
-		self._bind_decode_attention_metadata_for_graph_config([])
-		self._prewarm_decode_jit()
+		self._prewarm_startup_decode_jit()
 		if not self._whole_model_decode_graphs_requested():
 			return
 		self._warmup_cuda_graphs()
@@ -8739,11 +8779,14 @@ class BatchGenWorker:
 		"""Arm the strategy manager's late-compile guard as this worker's rank
 		reports ready: every kernel compile after this point is a defect the
 		guard reports. A manager without the hook (no prewarm registry yet)
-		is a no-op.
+		arms nothing of its own. Every model arms the post-readiness event
+		record: a later compile or graph capture is logged as one
+		``[POST_READINESS]`` line and counted.
 		"""
 		arm = getattr(self.parallel_manager, "arm_late_compile_guard", None)
 		if arm is not None:
 			arm()
+		post_readiness.arm(self.rank)
 
 	def _probe_startup_transient(
 		self, *, seam: str, capture: Optional[Callable[[], None]]
