@@ -180,18 +180,34 @@ def _worker_function(name: str) -> ast.FunctionDef:
     )
 
 
+_EXECUTOR = _ROOT / "batchgen" / "worker" / "admission" / "boundary_executor.py"
+
+
+def _executor_apply() -> ast.FunctionDef:
+    tree = ast.parse(_EXECUTOR.read_text(), filename=str(_EXECUTOR))
+    executor = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BoundaryExecutor"
+    )
+    return next(
+        node for node in executor.body
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
+    )
+
+
 def _boundary_with_carry_out_inlined() -> ast.FunctionDef:
     """The page boundary as one function again, in execution order.
 
-    The worker keeps the carry-out of the decisions in its own method,
-    ``_apply_boundary_decisions``, which the boundary calls once. The facts
+    The carry-out of the decisions is ``BoundaryExecutor.apply``; the boundary
+    reaches it through the worker's ``_apply_boundary_decisions``, which it
+    calls once. The facts
     below are about the order of statements across the whole boundary, so the
     carry-out's statements are put back where the call is, with line numbers
     shifted so that source order equals execution order: everything before
     the call, then the carry-out, then everything after it.
     """
     boundary = copy.deepcopy(_worker_function("_page_boundary_fast"))
-    carry_out = copy.deepcopy(_worker_function("_apply_boundary_decisions"))
+    carry_out = copy.deepcopy(_executor_apply())
     calls = [
         index for index, statement in enumerate(boundary.body)
         if any(
