@@ -208,6 +208,13 @@ class ServerArgs:
     # appended to host KV. Launch-scoped because graphs are captured once per
     # server lifetime, so a batch-level batchgen_debug flag cannot express it.
     glm5_disable_decode_host_kv_staging: bool = False
+    # INTERNAL (model bring-up): serve only the first N transformer layers.
+    # Startup loads a fraction of the weights and outputs are meaningless;
+    # the run is marked in [SERVER_CONFIG] (num_layers < num_layers_full) so the
+    # benchmark ledger refuses it as an official result.
+    # Launch-scoped because every layer-count consumer (weight maps, KV pools,
+    # planners, graphs) is sized at startup. None = all layers (production).
+    debug_num_layers: Optional[int] = None
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
     # Shared-prefix-aware capacity accounting is the default: a prefix several
@@ -699,6 +706,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "A/B use only.",
     )
     parser.add_argument(
+        "--debug-num-layers",
+        type=int,
+        default=None,
+        help="INTERNAL: serve only the first N transformer layers for model "
+        "bring-up iteration. Outputs are meaningless; the effective and full "
+        "layer counts are reported in [SERVER_CONFIG] so the run cannot be "
+        "recorded as an official result. Default: all "
+        "layers.",
+    )
+    parser.add_argument(
         "--cuda-graph-max-bucket-size",
         type=int,
         default=128,
@@ -819,6 +836,33 @@ def validate_server_args(args: ServerArgs) -> None:
             "contradictory: pick either the distributed host-weight store or "
             "the replicated parameter server, not both"
         )
+    # --debug-num-layers contradictions are checked before any deeper
+    # validation of the named options: the combination is wrong whatever
+    # their own contents are.
+    if args.debug_num_layers is not None:
+        if args.debug_num_layers < 1:
+            raise ValueError(
+                "--debug-num-layers must be a positive layer count; the "
+                "model's own limit is enforced where its config is parsed "
+                "(batchgen.config.layer_truncation)"
+            )
+        if args.distributed_weight_config is not None:
+            raise ValueError(
+                "--debug-num-layers cannot run with "
+                "--distributed-weight-config: the distributed host-weight "
+                "store is built and served at the checkpoint's full depth "
+                "(store_builder K3_LAYERS, distributed_weight_daemon.cpp "
+                "kLayers), so a truncated engine would disagree with the "
+                "store's ingress schedule"
+            )
+        if args.enable_prefix_cache:
+            raise ValueError(
+                "--debug-num-layers cannot run with --enable-prefix-cache: "
+                "the prefix pool checks the model depth against the "
+                "release's full host-KV profile depth "
+                "(prefill_engine._prefill_pool_layout), which a truncated "
+                "model no longer matches"
+            )
     if args.max_pool_size <= 0:
         raise ValueError("legacy non-pool mode was removed; --max-pool-size must be positive")
     if args.input_ids_pool_size_gb <= 0:
@@ -1110,6 +1154,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
         prefill_moe_mode=parsed.prefill_moe_mode,
+        debug_num_layers=parsed.debug_num_layers,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,

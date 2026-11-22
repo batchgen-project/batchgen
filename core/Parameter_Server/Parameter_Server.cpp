@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <unordered_set>
 #include "spdlog/spdlog.h"
 #include <cerrno>
 #include <chrono>
@@ -91,9 +92,17 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
     const std::string& model_weights_path,
     void* weight_ptr,
     int64_t buffer_bytes,
-    std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map)
+    std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map,
+    const std::vector<std::string>& weight_json_files,
+    const std::vector<std::string>& unserved_tensor_names)
 {
     /*
+        The load set is weight_json_files (names inside model_weights_path)
+        when the caller selected one, otherwise every .json file of the
+        directory. A file that is not selected is never opened.
+        A tensor named in unserved_tensor_names shares a selected file with
+        tensors that are served; its bytes are read with the file but it is
+        published neither as a module weight nor in the skeleton state dict.
         First get a list of all .json file.
         Parse every .json file and plan the whole load against buffer_bytes
         before any read: a file that would end past the buffer fails here.
@@ -101,10 +110,19 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         Update this->module_weights_storage_ and this->skeleton_state_dict_.
         A file's offset is the end of the previous file rounded up to 4 KiB.
     */
+    const std::unordered_set<std::string> unserved(unserved_tensor_names.begin(),
+                                                   unserved_tensor_names.end());
     // Step 1: Get all .json file paths in the model_weights_path directory
     std::vector<std::string> json_paths;
-    DIR* dir = opendir(model_weights_path.c_str());
-    if (dir != nullptr) {
+    DIR* dir = weight_json_files.empty() ? opendir(model_weights_path.c_str()) : nullptr;
+    if (!weight_json_files.empty()) {
+        json_paths.reserve(weight_json_files.size());
+        for (const auto& name : weight_json_files) {
+            json_paths.push_back(model_weights_path + "/" + name);
+        }
+        this->logger->info("Weight load set: {} selected files of {}",
+                           json_paths.size(), model_weights_path);
+    } else if (dir != nullptr) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
             // Skip the "." and ".." directory entries
@@ -414,6 +432,9 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
         // Step 4: Update this->module_weights_storage_ and this->skeleton_state_dict_
         start_time = std::chrono::high_resolution_clock::now();
         for (const auto& [tensor_name, tensor_info] : metadata.state_dict) {
+            if (unserved.count(tensor_name) != 0) {
+                continue;
+            }
             // Check if the tensor_name exists in state_dict_name_map
             if (state_dict_name_map.find(tensor_name) != state_dict_name_map.end()) {
                 // If it exists, update module_weights_storage_
@@ -471,7 +492,9 @@ void Parameter_Server::Init(
     int64_t byte_size, std::string& model_weights_path,
     std::unordered_map<std::string,
                        std::unordered_map<std::string, std::string>>&
-        state_dict_name_map) {
+        state_dict_name_map,
+    const std::vector<std::string>& weight_json_files,
+    const std::vector<std::string>& unserved_tensor_names) {
     this->logger->info("Parameter Server Initializing...");
 
     size_t free_memory = 0;
@@ -500,7 +523,8 @@ void Parameter_Server::Init(
     this->weight_ptr_ = weight_ptr;
 
     // Load weights from the model_weights_path
-    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, byte_size, state_dict_name_map);
+    _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, byte_size, state_dict_name_map,
+                                      weight_json_files, unserved_tensor_names);
 
     // Serialize the module weights storage into an anonymous memfd. Workers
     // read it once through /proc/<this pid>/fd/<tensor_meta_memfd_fd_>.

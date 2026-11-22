@@ -194,6 +194,7 @@ def _bare_ps(module, converted_ckpt_dir, cache_dir):
     ps.converted_ckpt_dir = converted_ckpt_dir
     ps.cache_dir = cache_dir
     ps.num_layers = NUM_LAYERS
+    ps.num_layers_full = NUM_LAYERS
     ps.enable_hugetlbfs = False
     ps.enable_thp = False
     ps.state_dict_name_map = {}

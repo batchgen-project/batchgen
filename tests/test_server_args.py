@@ -131,6 +131,75 @@ def test_prefill_moe_mode_flag_parses_to_server_args():
         parser.parse_args(base + ["--prefill-moe-mode", "resident"])
 
 
+def test_debug_num_layers_flag_parses_and_defaults_to_all_layers():
+    parser = server_args_module._build_parser()
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    assert parser.parse_args(base + ["--debug-num-layers", "4"]).debug_num_layers == 4
+    assert parser.parse_args(base).debug_num_layers is None
+    assert ServerArgs(model="m").debug_num_layers is None
+
+
+def test_every_parsed_flag_reaches_server_args():
+    """A flag the parser accepts but the conversion drops is silently ignored."""
+    import ast
+    import dataclasses
+
+    source = (ROOT / "batchgen" / "server" / "server_args.py").read_text()
+    prepare = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "prepare_server_args"
+    )
+    forwarded = {
+        keyword.arg
+        for call in ast.walk(prepare)
+        if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "ServerArgs"
+        for keyword in call.keywords
+    }
+    fields = {field.name for field in dataclasses.fields(ServerArgs)}
+    parsed = {action.dest for action in server_args_module._build_parser()._actions}
+    assert sorted((fields & parsed) - forwarded) == []
+
+
+@pytest.mark.parametrize("bad", [0, -3])
+def test_debug_num_layers_must_be_positive(tmp_path, bad):
+    with pytest.raises(ValueError, match="--debug-num-layers"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=8,
+                debug_num_layers=bad,
+            )
+        )
+
+
+def test_debug_num_layers_refuses_the_distributed_weight_store(tmp_path):
+    # The K3 distributed store is built and served at full depth
+    # (store_builder K3_LAYERS / distributed_weight_daemon.cpp kLayers).
+    with pytest.raises(ValueError, match="--distributed-weight-config"):
+        validate_server_args(_args(tmp_path, debug_num_layers=4))
+
+
+def test_debug_num_layers_refuses_the_prefix_cache(tmp_path, monkeypatch):
+    import batchgen.prefix_reuse.config as prefix_config
+
+    monkeypatch.setattr(
+        prefix_config, "require_prefix_cache_model_support", lambda model: None
+    )
+    with pytest.raises(ValueError, match="--enable-prefix-cache"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=8,
+                enable_prefix_cache=True,
+                debug_num_layers=4,
+            )
+        )
+
+
 def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):
     # Off the distributed store any positive world_size stands. Kimi-K3
     # multi-node now defaults to that store, so the replicated path this case
