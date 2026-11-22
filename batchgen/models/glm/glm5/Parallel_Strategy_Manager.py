@@ -155,6 +155,10 @@ def uniform_expert_assignment(
 
 
 class GLM5ParallelStrategyManager:
+    # ``prewarm_decode_graphs`` compiles the decode kernels keyed on the KV
+    # page-table geometry; it captures no graph. The worker therefore runs it
+    # before readiness in every lifecycle, with or without decode graphs.
+    decode_prewarm_compiles_kernels = True
     NUM_TOTAL_EXPERTS = 256
     NUM_LAYERS = 78
     FIRST_K_DENSE = 3
