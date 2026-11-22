@@ -144,6 +144,11 @@ def _engine_config(**basic):
             kda_state_slots=POOL_SLOTS,
             kda_prefix_segment_slots=0,
         ),
+        # The planner flag the server prefill mode is chosen from at
+        # construction; these tests never build sharded latent projections.
+        Module_Batching_Config=SimpleNamespace(
+            k3_shard_latent_projections=False,
+        ),
     )
 
 

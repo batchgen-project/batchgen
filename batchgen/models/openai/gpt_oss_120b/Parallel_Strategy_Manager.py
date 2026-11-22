@@ -35,6 +35,8 @@ import torch.distributed as dist
 from .model import GptOss
 from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper, log_gpu_memory
 
+from batchgen.models.skeleton_sharing import share_state_dict_on_device
+
 from batchgen.models.wrappers import phase_state
 
 
@@ -150,12 +152,17 @@ class GptOssParallelStrategyManager:
 
     Phase instances follow the worker's reusable-instance lifecycle: when the
     worker asks for reuse (``reuse_phase_instances``) and this rank keeps
-    every one of its routed experts resident, the decode instance is built
-    once and kept. Its routed experts live in a fixed-address VMM arena whose
-    physical memory is released while prefill runs (SUSPEND) and refilled
-    from the host copy at the same addresses on activation, so the captured
-    decode graphs survive every phase switch. The prefill instance is never
-    kept: it replicates all routed experts on every rank.
+    every one of its routed experts resident, BOTH phase instances are built
+    once and kept (both-or-neither, the same shape as the Kimi and GLM
+    managers). The decode instance's routed experts live in a fixed-address
+    VMM arena whose physical memory is released while prefill runs (SUSPEND)
+    and refilled from the host copy at the same addresses on activation, so
+    the captured decode graphs survive every phase switch. The kept prefill
+    instance holds only the shared skeleton (one device copy aliased by both
+    phase models; batchgen.models.skeleton_sharing) and its module tree: its
+    replicated expert tensors and the pointer tables built from their
+    addresses are released on every exit and rebuilt from the host store on
+    the next activation, exactly as the per-phase rebuild did.
     """
 
     NUM_TOTAL_EXPERTS = 128
@@ -203,11 +210,17 @@ class GptOssParallelStrategyManager:
         # whether this rank honours it. A kept decode instance owns no expert
         # memory of its own: its routed experts are views into the arena,
         # which with its carved rows and host copy pairs lives for the process.
+        # A kept prefill instance owns none either while suspended: its
+        # expert tensors are released on exit and rebuilt on activation.
         self.reuse_phase_instances = False
+        self.prefill_instance = None
         self.decode_instance = None
         self._expert_arena = None
         self._expert_rows = {}
         self._expert_copy_pairs = []
+        # Skeleton entries both phase models bind, uploaded to the device
+        # once (share_state_dict_on_device) so every build aliases one copy.
+        self._skeleton_uploaded_keys = set()
 
     # ------------------------------------------------------------------ #
     #  Phase-instance reuse protocol                                     #
@@ -235,15 +248,17 @@ class GptOssParallelStrategyManager:
 
     @property
     def _instances_are_reused(self) -> bool:
-        """True when this rank keeps its decode instance across phase switches.
+        """True when this rank keeps BOTH instances across phase switches.
 
         The worker's request is honoured only when every local routed expert
         is resident in the checkpoint's MXFP4 layout: that is what lets the
-        experts live in the arena as fixed-address rows refilled by a plain
-        host-to-device copy. A rank that streams part of its experts, or that
-        pre-dequantizes them to BF16 (resident bytes no longer the host
-        bytes), keeps ``decode_instance`` None, which is how the worker learns
-        to rebuild that phase on every switch exactly as before.
+        decode experts live in the arena as fixed-address rows refilled by a
+        plain host-to-device copy, and the prefill experts be rebuilt from
+        the same host store on every activation. A rank that streams part of
+        its experts, or that pre-dequantizes them to BF16 (resident bytes no
+        longer the host bytes), keeps both instance slots None, which is how
+        the worker learns to rebuild each phase on every switch exactly as
+        before.
         """
         return bool(
             self.reuse_phase_instances
@@ -357,6 +372,154 @@ class GptOssParallelStrategyManager:
             nbytes / max(done - mapped, 1e-9) / 1e9,
         )
         return self.model, self.weight_copy_task
+
+    # Every field _bind_prefill_expert_tensors sets on a GptOssMoEPrefill
+    # layer: the MXFP4 lists, the stacked biases, the WGMMA pointer arrays
+    # built from their data_ptr()s, the keep-alive references, and the
+    # forward-allocated dequant buffer.
+    _PREFILL_EXPERT_FIELDS = (
+        "gate_weights", "gate_scales", "up_weights", "up_scales",
+        "down_weights", "down_scales",
+        "gate_biases", "up_biases", "down_biases",
+        "gate_ptrs", "gate_scale_ptrs", "up_ptrs", "up_scale_ptrs",
+        "down_ptrs", "down_scale_ptrs",
+        "gate_weight_ref", "gate_scale_ref",
+        "down_weight_ref", "down_scale_ref",
+        "_persistent_gate_weights", "_persistent_gate_scales",
+        "_persistent_up_weights", "_persistent_up_scales",
+        "_persistent_down_weights", "_persistent_down_scales",
+        "gate_bias_ptrs", "up_bias_ptrs", "down_bias_ptrs",
+        "_persistent_gate_biases", "_persistent_up_biases",
+        "_persistent_down_biases",
+        "_bf16_buffer", "_buffer_shape",
+    )
+
+    def activate_prefill(self):
+        """Switch the kept prefill instance in and rebuild its expert weights.
+
+        The suspended instance held only the shared skeleton (one device
+        copy aliased by both phase models) and its module tree; its
+        replicated MXFP4 expert tensors and the pointer tables built from
+        their addresses were released at the exit
+        (``_release_prefill_expert_weights``). Rebuilding them here is
+        host-to-device copies and pointer-tensor construction only — no
+        kernel compile, no autotune, no CUDA-graph capture (prefill
+        captures none) — so a kept instance activates after readiness
+        without violating the warm-up-only compile rule.
+        """
+        if self.prefill_instance is None:
+            raise RuntimeError(
+                f"rank {self.rank}: activate_prefill needs a kept prefill "
+                "instance; a rank without one rebuilds through "
+                "configure_prefill"
+            )
+        prep_start = time.perf_counter()
+        # The decode instance's transient blocks go back to the driver
+        # first; its expert arena was already unmapped by the decode SUSPEND.
+        torch.cuda.empty_cache()
+        self.loaded_model_config.phase = "prefill"
+        self.model, self.weight_copy_task = self.prefill_instance
+        start = time.perf_counter()
+        reloaded = self._reload_prefill_expert_weights()
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d prefill prep=%.3fs expert_reload=%.3fs"
+            " (%.2f GiB)",
+            self.rank,
+            start - prep_start,
+            time.perf_counter() - start,
+            reloaded / (1024 ** 3),
+        )
+        return self.model, self.weight_copy_task
+
+    def _prefill_moe_layers(self, model):
+        """The ``GptOssMoEPrefill`` layers of ``model`` (none on a model the
+        swap never reached, e.g. the offloading path that keeps no instance)."""
+        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill
+
+        if model is None:
+            return
+        for layer in model.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, GptOssMoEPrefill):
+                yield mlp
+
+    def _release_prefill_expert_weights(self) -> int:
+        """Drop the prefill instance's replicated expert tensors.
+
+        Everything ``_bind_prefill_expert_tensors`` set goes back to the
+        allocator; the suspended instance then holds no expert tensor at
+        all. The next activation rebuilds all of it from the host store at
+        whatever addresses the allocator hands out — prefill has no
+        captured graphs, so nothing bakes these addresses. Returns the
+        primary weight/scale/bias bytes released. A no-op on a model whose
+        layers were never swapped.
+        """
+        model = (
+            self.prefill_instance[0]
+            if self.prefill_instance is not None
+            else self.model
+        )
+        released = 0
+        for mlp in self._prefill_moe_layers(model):
+            for field in ("gate_weights", "gate_scales", "up_weights",
+                          "up_scales", "down_weights", "down_scales"):
+                tensors = getattr(mlp, field, None) or ()
+                released += sum(t.numel() * t.element_size() for t in tensors)
+            for field in ("gate_biases", "up_biases", "down_biases"):
+                stacked = getattr(mlp, field, None)
+                if stacked is not None:
+                    released += stacked.numel() * stacked.element_size()
+            for field in self._PREFILL_EXPERT_FIELDS:
+                setattr(mlp, field, None)
+        return released
+
+    def _reload_prefill_expert_weights(self) -> int:
+        """Rebuild the kept prefill instance's expert tensors from the host.
+
+        The same bytes ``configure_prefill`` loaded, read straight from
+        Weights_Storage, bound through the one binding implementation
+        (``_bind_prefill_expert_tensors``). Returns the bytes uploaded.
+        """
+        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill
+
+        device = self.engine_config.Basic_Config.device_torch
+        model = self.prefill_instance[0]
+        total = 0
+        for layer_idx, layer in enumerate(model.model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if not isinstance(mlp, GptOssMoEPrefill):
+                raise RuntimeError(
+                    f"rank {self.rank}: layer {layer_idx} of the kept prefill "
+                    "instance is not a GptOssMoEPrefill; the kept instance is "
+                    "published only after the prefill MoE swap"
+                )
+            if mlp.gate_weights is not None:
+                continue  # still bound (nothing was released)
+            per_expert = []
+            for expert_idx in range(self.model_config.num_local_experts):
+                tensors = self.core_engine.get_tensor(
+                    f"routed_expert_{layer_idx}_{expert_idx}"
+                )
+                entry = {
+                    "gate_weight": tensors["gate_proj.weight"].to(device).contiguous(),
+                    "gate_scale": tensors["gate_proj.weight_scales"].to(device).contiguous(),
+                    "up_weight": tensors["up_proj.weight"].to(device).contiguous(),
+                    "up_scale": tensors["up_proj.weight_scales"].to(device).contiguous(),
+                    "down_weight": tensors["down_proj.weight"].to(device).contiguous(),
+                    "down_scale": tensors["down_proj.weight_scales"].to(device).contiguous(),
+                }
+                if "gate_proj.bias" in tensors:
+                    entry["gate_bias"] = tensors["gate_proj.bias"].to(device).contiguous()
+                    entry["up_bias"] = tensors["up_proj.bias"].to(device).contiguous()
+                    entry["down_bias"] = tensors["down_proj.bias"].to(device).contiguous()
+                per_expert.append(entry)
+            self._bind_prefill_expert_tensors(mlp, per_expert)
+            total += sum(
+                t.numel() * t.element_size()
+                for e in per_expert
+                for t in e.values()
+            )
+        return total
 
     def release_decode_routed_experts(self):
         """Return the decode routed experts' HBM; their addresses stay reserved."""
@@ -617,6 +780,8 @@ class GptOssParallelStrategyManager:
         logging.info(f"Timings: {timings}")
         log_gpu_memory("configure_prefill: END")
 
+        if self._instances_are_reused:
+            self.prefill_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
     def _load_model_skeleton(self):
@@ -639,6 +804,33 @@ class GptOssParallelStrategyManager:
         missing_count = 0
         skipped_module_weights = 0
 
+        # One device copy for both phase instances: upload the entries this
+        # model binds to the device ONCE (share_state_dict_on_device, the
+        # same core GLM-5's share_skeleton_on_device uses); every later
+        # build's ``.to(device)`` then aliases the uploaded tensor, so the
+        # kept prefill and decode models share one skeleton instead of
+        # holding one each.
+        device = self.engine_config.Basic_Config.device_torch
+        bind_keys = {
+            name
+            for name, _ in self.model.named_parameters()
+            if "experts" not in name
+            and name not in self.state_dict_name_map
+            and name in self.skeleton_state_dict
+        }
+        missing_upload = bind_keys - self._skeleton_uploaded_keys
+        if missing_upload:
+            self.skeleton_state_dict, uploaded, _ = share_state_dict_on_device(
+                self.skeleton_state_dict, missing_upload, device
+            )
+            self._skeleton_uploaded_keys |= set(uploaded)
+            logging.info(
+                "[SKELETON] shared %d entries on device (%.3f GiB); both "
+                "phase instances alias this one copy",
+                len(uploaded),
+                sum(uploaded.values()) / (1024 ** 3),
+            )
+
         # Load only skeleton weights (NOT in state_dict_name_map)
         # Weights in state_dict_name_map are loaded dynamically via wrappers
         for name, param in self.model.named_parameters():
@@ -654,8 +846,10 @@ class GptOssParallelStrategyManager:
                 skeleton_tensor = self.skeleton_state_dict[name]
                 # Use direct assignment instead of copy_() because model params
                 # are created with placeholder shape [1] due to memory optimization
-                # in config_torch_module_initializer()
-                param.data = skeleton_tensor.to(param.device)
+                # in config_torch_module_initializer(). Binding to the shared
+                # device tensor (not ``.to(param.device)``) keeps every phase
+                # model aliasing the one uploaded copy.
+                param.data = skeleton_tensor.to(device)
                 loaded_count += 1
                 logging.debug(f"Loaded skeleton weight: {name} shape={skeleton_tensor.shape}")
             else:
@@ -1052,6 +1246,81 @@ class GptOssParallelStrategyManager:
             f"persistent={len(persistent_indices)}, non-persistent={len(non_persistent_indices)})"
         )
 
+    def _bind_prefill_expert_tensors(self, prefill_moe, per_expert) -> None:
+        """Attach one layer's expert tensors and the pointer tables over them.
+
+        ``per_expert`` is one dict per local expert of device-resident
+        gate/up/down packed weights and scales, plus optional biases. The one
+        binding implementation, shared by the first build
+        (``_swap_to_prefill_moe``, reading the wrapper modules) and every
+        later activation (``_reload_prefill_expert_weights``, reading the
+        host store). Pure tensor bookkeeping — lists, ``torch.stack`` and
+        ``data_ptr()`` pointer tensors; nothing here compiles, autotunes or
+        captures.
+        """
+        from batchgen.models.openai.gpt_oss_120b.model import _HAS_WGMMA_GROUPED
+
+        device = self.engine_config.Basic_Config.device_torch
+        gate_weights = [e["gate_weight"] for e in per_expert]
+        gate_scales = [e["gate_scale"] for e in per_expert]
+        up_weights = [e["up_weight"] for e in per_expert]
+        up_scales = [e["up_scale"] for e in per_expert]
+        down_weights = [e["down_weight"] for e in per_expert]
+        down_scales = [e["down_scale"] for e in per_expert]
+        gate_biases = [e["gate_bias"] for e in per_expert if "gate_bias" in e]
+        up_biases = [e["up_bias"] for e in per_expert if "up_bias" in e]
+        down_biases = [e["down_bias"] for e in per_expert if "down_bias" in e]
+        has_biases = bool(gate_biases)
+
+        # Store weight lists (needed for per-expert fallback path)
+        prefill_moe.gate_weights = gate_weights
+        prefill_moe.gate_scales = gate_scales
+        prefill_moe.up_weights = up_weights
+        prefill_moe.up_scales = up_scales
+        prefill_moe.down_weights = down_weights
+        prefill_moe.down_scales = down_scales
+
+        if has_biases:
+            prefill_moe.gate_biases = torch.stack(gate_biases)
+            prefill_moe.up_biases = torch.stack(up_biases)
+            prefill_moe.down_biases = torch.stack(down_biases)
+
+        # Set up grouped WGMMA pointer arrays for persistent experts
+        if _HAS_WGMMA_GROUPED:
+            # Import only where the kernels exist: the module imports triton.
+            from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+
+            prefill_moe.gate_ptrs, prefill_moe.gate_scale_ptrs = setup_expert_weight_pointers(
+                gate_weights, gate_scales)
+            prefill_moe.up_ptrs, prefill_moe.up_scale_ptrs = setup_expert_weight_pointers(
+                up_weights, up_scales)
+            prefill_moe.down_ptrs, prefill_moe.down_scale_ptrs = setup_expert_weight_pointers(
+                down_weights, down_scales)
+
+            prefill_moe.gate_weight_ref = gate_weights[0]
+            prefill_moe.gate_scale_ref = gate_scales[0]
+            prefill_moe.down_weight_ref = down_weights[0]
+            prefill_moe.down_scale_ref = down_scales[0]
+
+            # Keep references alive so pointer arrays don't dangle
+            prefill_moe._persistent_gate_weights = gate_weights
+            prefill_moe._persistent_gate_scales = gate_scales
+            prefill_moe._persistent_up_weights = up_weights
+            prefill_moe._persistent_up_scales = up_scales
+            prefill_moe._persistent_down_weights = down_weights
+            prefill_moe._persistent_down_scales = down_scales
+
+            if has_biases:
+                prefill_moe.gate_bias_ptrs = torch.tensor(
+                    [b.data_ptr() for b in gate_biases], dtype=torch.int64, device=device)
+                prefill_moe.up_bias_ptrs = torch.tensor(
+                    [b.data_ptr() for b in up_biases], dtype=torch.int64, device=device)
+                prefill_moe.down_bias_ptrs = torch.tensor(
+                    [b.data_ptr() for b in down_biases], dtype=torch.int64, device=device)
+                prefill_moe._persistent_gate_biases = gate_biases
+                prefill_moe._persistent_up_biases = up_biases
+                prefill_moe._persistent_down_biases = down_biases
+
     def _swap_to_prefill_moe(self):
         """Swap GptOssMoE to GptOssMoEPrefill.
 
@@ -1060,7 +1329,6 @@ class GptOssParallelStrategyManager:
         persistent (experts_need_offloading=False).
         """
         from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill, _HAS_WGMMA_GROUPED
-        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
 
         device = self.engine_config.Basic_Config.device_torch
         num_experts = self.model_config.num_local_experts
@@ -1079,75 +1347,26 @@ class GptOssParallelStrategyManager:
             prefill_moe.persistent_expert_indices = persistent_indices
             prefill_moe.non_persistent_expert_indices = non_persistent_indices
 
-            # Collect MXFP4 weights from wrapped experts
-            gate_weights, gate_scales = [], []
-            up_weights, up_scales = [], []
-            down_weights, down_scales = [], []
-            gate_biases, up_biases, down_biases = [], [], []
-            has_biases = False
-
+            # Collect MXFP4 weights from the wrapped experts and bind them
+            # through the one binding implementation.
+            per_expert = []
             for expert_idx in range(num_experts):
                 wrapper = old_moe.experts[expert_idx]
-
-                gate_weights.append(wrapper.mxfp4_gate_packed.contiguous())
-                gate_scales.append(wrapper.mxfp4_gate_scales.contiguous())
-                up_weights.append(wrapper.mxfp4_up_packed.contiguous())
-                up_scales.append(wrapper.mxfp4_up_scales.contiguous())
-                down_weights.append(wrapper.mxfp4_down_packed.contiguous())
-                down_scales.append(wrapper.mxfp4_down_scales.contiguous())
-
+                entry = {
+                    "gate_weight": wrapper.mxfp4_gate_packed.contiguous(),
+                    "gate_scale": wrapper.mxfp4_gate_scales.contiguous(),
+                    "up_weight": wrapper.mxfp4_up_packed.contiguous(),
+                    "up_scale": wrapper.mxfp4_up_scales.contiguous(),
+                    "down_weight": wrapper.mxfp4_down_packed.contiguous(),
+                    "down_scale": wrapper.mxfp4_down_scales.contiguous(),
+                }
                 gb = getattr(wrapper, 'mxfp4_gate_bias', None)
                 if gb is not None:
-                    has_biases = True
-                    gate_biases.append(gb.contiguous())
-                    up_biases.append(getattr(wrapper, 'mxfp4_up_bias').contiguous())
-                    down_biases.append(getattr(wrapper, 'mxfp4_down_bias').contiguous())
-
-            # Store weight lists (needed for per-expert fallback path)
-            prefill_moe.gate_weights = gate_weights
-            prefill_moe.gate_scales = gate_scales
-            prefill_moe.up_weights = up_weights
-            prefill_moe.up_scales = up_scales
-            prefill_moe.down_weights = down_weights
-            prefill_moe.down_scales = down_scales
-
-            if has_biases:
-                prefill_moe.gate_biases = torch.stack(gate_biases)
-                prefill_moe.up_biases = torch.stack(up_biases)
-                prefill_moe.down_biases = torch.stack(down_biases)
-
-            # Set up grouped WGMMA pointer arrays for persistent experts
-            if _HAS_WGMMA_GROUPED:
-                prefill_moe.gate_ptrs, prefill_moe.gate_scale_ptrs = setup_expert_weight_pointers(
-                    gate_weights, gate_scales)
-                prefill_moe.up_ptrs, prefill_moe.up_scale_ptrs = setup_expert_weight_pointers(
-                    up_weights, up_scales)
-                prefill_moe.down_ptrs, prefill_moe.down_scale_ptrs = setup_expert_weight_pointers(
-                    down_weights, down_scales)
-
-                prefill_moe.gate_weight_ref = gate_weights[0]
-                prefill_moe.gate_scale_ref = gate_scales[0]
-                prefill_moe.down_weight_ref = down_weights[0]
-                prefill_moe.down_scale_ref = down_scales[0]
-
-                # Keep references alive so pointer arrays don't dangle
-                prefill_moe._persistent_gate_weights = gate_weights
-                prefill_moe._persistent_gate_scales = gate_scales
-                prefill_moe._persistent_up_weights = up_weights
-                prefill_moe._persistent_up_scales = up_scales
-                prefill_moe._persistent_down_weights = down_weights
-                prefill_moe._persistent_down_scales = down_scales
-
-                if has_biases:
-                    prefill_moe.gate_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in gate_biases], dtype=torch.int64, device=device)
-                    prefill_moe.up_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in up_biases], dtype=torch.int64, device=device)
-                    prefill_moe.down_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in down_biases], dtype=torch.int64, device=device)
-                    prefill_moe._persistent_gate_biases = gate_biases
-                    prefill_moe._persistent_up_biases = up_biases
-                    prefill_moe._persistent_down_biases = down_biases
+                    entry["gate_bias"] = gb.contiguous()
+                    entry["up_bias"] = getattr(wrapper, 'mxfp4_up_bias').contiguous()
+                    entry["down_bias"] = getattr(wrapper, 'mxfp4_down_bias').contiguous()
+                per_expert.append(entry)
+            self._bind_prefill_expert_tensors(prefill_moe, per_expert)
 
             self.model.model.layers[layer_idx].mlp = prefill_moe
 
@@ -1790,10 +2009,12 @@ class GptOssParallelStrategyManager:
     def phase_enter(self, key: PhaseKey, ctx: PhaseEnterContext):
         """Enter ``key.phase``; return its ``(model, weight_copy_task)``.
 
-        Decode resumes the kept decode instance when there is one, otherwise
-        builds it. Prefill always builds: its instance is never kept.
+        Either phase resumes its kept instance when there is one, otherwise
+        builds it (both-or-neither: the reuse gate publishes both).
         """
         if key.phase == "prefill":
+            if self.prefill_instance is not None:
+                return self.activate_prefill()
             return self.configure_prefill()
         if key.phase == "decode":
             if ctx.comm is None:
@@ -1833,25 +2054,34 @@ class GptOssParallelStrategyManager:
 
         SUSPEND of decode releases the routed experts' physical memory and
         keeps the instance, its graphs' addresses and the arena reservation.
-        RETIRE drops the instance; the worker's retire mechanics
-        (deep_free_model_memory, GPU KV destroy) free the rest, and the arena
-        is unmapped here because dropping the model's references does not
-        return VMM memory.
+        SUSPEND of prefill releases the replicated expert tensors and the
+        pointer tables built from their addresses and keeps the instance
+        (only the shared skeleton and the module tree stay resident).
+        RETIRE of either phase retires BOTH kept instances — no hold may
+        outlive the model the worker's deep free then drops — releasing the
+        prefill expert tensors and unmapping the arena here, because
+        dropping the model's references does not return VMM memory.
         """
         if key.phase not in ("prefill", "decode"):
             raise ValueError(f"phase_exit: unsupported phase {key.phase!r}")
         if mode is ExitMode.RETIRE:
-            if key.phase == "decode":
-                self.decode_instance = None
-                if self.decode_experts_resident:
-                    self.release_decode_routed_experts()
+            self._release_prefill_expert_weights()
+            if self.decode_experts_resident:
+                self.release_decode_routed_experts()
+            self.prefill_instance = None
+            self.decode_instance = None
             self.model = None
             self.weight_copy_task = {}
             return
         if mode is not ExitMode.SUSPEND:
             raise ValueError(f"phase_exit: unsupported mode {mode!r}")
         if key.phase == "prefill":
-            # No prefill instance is kept; nothing manager-owned to suspend.
+            if self.prefill_instance is None:
+                raise RuntimeError(
+                    f"rank {self.rank}: prefill SUSPEND needs a kept prefill "
+                    "instance; a rank without one must RETIRE"
+                )
+            self._release_prefill_expert_weights()
             return
         if self.decode_instance is None or not self.decode_experts_resident:
             raise RuntimeError(
@@ -1861,12 +2091,9 @@ class GptOssParallelStrategyManager:
         self.release_decode_routed_experts()
 
     def holds_instance(self, phase: str) -> bool:
-        """Return whether a resumable instance is retained for ``phase``.
-
-        Prefill never is: its instance replicates every routed expert.
-        """
+        """Return whether a resumable instance is retained for ``phase``."""
         if phase == "prefill":
-            return False
+            return self.prefill_instance is not None
         if phase == "decode":
             return self.decode_instance is not None
         raise ValueError(f"holds_instance: unsupported phase {phase!r}")

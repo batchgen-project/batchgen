@@ -28,7 +28,7 @@ import time
 
 import torch
 
-from batchgen.phase_lifecycle import verify_phase_contract
+from batchgen.phase_lifecycle import PHASES, verify_phase_contract
 from batchgen.worker import startup_transient as _startup_transient
 from batchgen.worker.rank_context import RankContext
 
@@ -253,8 +253,12 @@ class WorkerLifecycleEngine:
             if self._persistent_phase_enabled():
                 self._build_persistent_phase_instances()
             else:
+                # The worker's delegator resolved the empty startup wave's
+                # debug flags (_begin_prefill_wave) before delegating, so the
+                # prefill key is derived the same way as every later wave's.
+                # The key's mode is the server constant; nothing needs
+                # priming for the decode-first build below.
                 prefill_key = self._desired_phase_key("prefill")
-                self._prefill_moe_mode_in_effect = prefill_key.prefill_moe_mode
                 self._load_decode_model(comm=self.comm)
                 self._init_gpu_kv_with_actual_size()
                 self._probe_startup_transient(
@@ -346,6 +350,23 @@ class WorkerLifecycleEngine:
         if not hasattr(self, 'model') or self.model is None:
             return
 
+        # Checked before anything is freed, so a refusal leaves the model and
+        # its buffers exactly as they were.
+        # Deep free is the model's retirement, and no held instance may pin
+        # memory past it: a SUSPEND never reaches here, and the RETIRE path
+        # retires every kept instance first (_retire_kept_phase_instances).
+        # A decode hold still present would keep captured graphs and the
+        # resident shard mapped under the next model build and OOM it (the
+        # K3.1 4-node H20 startup failure), so it is refused by name, not
+        # silently preserved.
+        for held_phase in PHASES:
+            if self.parallel_manager.holds_instance(held_phase):
+                raise RuntimeError(
+                    f"Rank {self.rank}: deep_free_model_memory with a held "
+                    f"{held_phase} instance; a hold never outlives the model "
+                    "it references — retire it before the deep free"
+                )
+
         self._phase_mem_switch_index = (
             getattr(self, "_phase_mem_switch_index", 0) + 1
         )
@@ -376,13 +397,7 @@ class WorkerLifecycleEngine:
         # Delete model directly without CPU transfer
         del self.model
         self.model = None
-        # Decode graph state belongs to the decode instance that captured it.
-        # A held decode instance replays those graphs on its next activation
-        # (capture-once), so freeing the live prefill model must not drop
-        # them; they go when the decode instance itself is retired, whose
-        # phase_exit clears the manager's hold before this runs.
-        if not self.parallel_manager.holds_instance("decode"):
-            self._release_decode_graph_state()
+        self._release_decode_graph_state()
 
         # Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
         # (INT4 contiguous weight buffers, MoE class-level buffers)

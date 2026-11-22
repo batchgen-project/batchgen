@@ -1,10 +1,11 @@
 """Phase-lifecycle hook contract of the GPT-OSS strategy manager.
 
-GPT-OSS follows the reusable-instance lifecycle: a kept decode instance is
-resumed by ``activate_decoding``, decode SUSPEND releases its routed experts,
-RETIRE drops it, and the prefill instance is never kept (it replicates every
-routed expert). The production manager is used with its build and
-activation delegates recorded, so the dispatch itself is what is tested.
+GPT-OSS follows the reusable-instance lifecycle, keeping BOTH instances
+(both-or-neither): a kept instance is resumed by its activate hook, decode
+SUSPEND releases the routed experts' arena memory, prefill SUSPEND releases
+the replicated expert tensors, and RETIRE of either phase retires both kept
+instances. The production manager is used with its build and activation
+delegates recorded, so the dispatch itself is what is tested.
 """
 
 from types import SimpleNamespace
@@ -29,7 +30,7 @@ class _Arena:
 
 
 class _Recorder(GptOssParallelStrategyManager):
-    def __init__(self, *, kept=False, mapped=False):
+    def __init__(self, *, kept=False, mapped=False, kept_prefill=False):
         self.rank = 0
         self.calls = []
         self.comm = object()
@@ -39,6 +40,7 @@ class _Recorder(GptOssParallelStrategyManager):
         self._prefill_result = (object(), {"p": ["t"]})
         self._decode_result = (object(), {"d": ["t"]})
         self.decode_instance = self._decode_result if kept else None
+        self.prefill_instance = self._prefill_result if kept_prefill else None
         self._expert_arena = _Arena(mapped) if (kept or mapped) else None
 
     def configure_prefill(self):
@@ -49,9 +51,17 @@ class _Recorder(GptOssParallelStrategyManager):
         self.calls.append(("configure_decoding", padding_bsz, comm))
         return self._decode_result
 
+    def activate_prefill(self):
+        self.calls.append(("activate_prefill",))
+        return self.prefill_instance
+
     def activate_decoding(self):
         self.calls.append(("activate_decoding",))
         return self.decode_instance
+
+    def _release_prefill_expert_weights(self):
+        self.calls.append(("release_prefill",))
+        return 0
 
     def release_decode_routed_experts(self):
         self.calls.append(("release",))
@@ -63,12 +73,20 @@ def test_production_manager_satisfies_the_phase_contract():
     assert verify_phase_contract(manager) == []
 
 
-def test_prefill_enter_always_builds_and_is_never_held():
+def test_prefill_enter_builds_without_a_kept_instance_and_resumes_with_one():
     m = _Recorder(kept=True, mapped=False)
     out = m.phase_enter(PhaseKey("prefill", None), PhaseEnterContext())
     assert out is m._prefill_result
     assert m.calls == [("configure_prefill",)]
+    # The production configure publishes under the reuse gate; this recorder
+    # does not, so the build path reports no kept prefill instance.
     assert m.holds_instance("prefill") is False
+
+    m = _Recorder(kept=True, kept_prefill=True)
+    out = m.phase_enter(PhaseKey("prefill", None), PhaseEnterContext())
+    assert out is m.prefill_instance
+    assert m.calls == [("activate_prefill",)]
+    assert m.holds_instance("prefill") is True
 
 
 @pytest.mark.parametrize("kept", [False, True])
@@ -135,28 +153,48 @@ def test_decode_suspend_without_a_resident_kept_instance_fails_loud(kept, mapped
     assert m.calls == []
 
 
-def test_decode_retire_drops_the_instance_and_unmaps_the_arena():
-    m = _Recorder(kept=True, mapped=True)
+def test_decode_retire_drops_both_instances_and_unmaps_the_arena():
+    m = _Recorder(kept=True, mapped=True, kept_prefill=True)
     m.phase_exit(PhaseKey("decode", None), ExitMode.RETIRE)
-    assert m.calls == [("release",)]
+    assert m.calls == [("release_prefill",), ("release",)]
     assert m.holds_instance("decode") is False
+    assert m.holds_instance("prefill") is False
     assert m.model is None and m.weight_copy_task == {}
 
 
-def test_retire_of_an_unmapped_or_unkept_phase_releases_nothing():
-    m = _Recorder(kept=True, mapped=False)
+def test_retire_of_either_phase_retires_both_kept_instances():
+    # Unmapped arena: nothing to unmap, but the prefill release still runs
+    # (a no-op without a swapped model) and both holds are dropped.
+    m = _Recorder(kept=True, mapped=False, kept_prefill=True)
     m.phase_exit(PhaseKey("decode", None), ExitMode.RETIRE)
-    assert m.calls == [] and m.decode_instance is None
-    m = _Recorder(kept=True, mapped=True)
+    assert m.calls == [("release_prefill",)]
+    assert m.decode_instance is None and m.prefill_instance is None
+    # Retiring prefill retires the kept decode instance with it: no hold
+    # outlives the model the worker's deep free then drops.
+    m = _Recorder(kept=True, mapped=True, kept_prefill=True)
     m.phase_exit(PhaseKey("prefill", None), ExitMode.RETIRE)
-    # Retiring prefill leaves the kept decode instance and its experts alone.
-    assert m.calls == [] and m.holds_instance("decode") is True
+    assert m.calls == [("release_prefill",), ("release",)]
+    assert m.holds_instance("decode") is False
+    assert m.holds_instance("prefill") is False
     assert m.model is None
 
 
-def test_prefill_suspend_and_admit_make_no_delegate_call():
-    m = _Recorder(kept=True, mapped=True)
+def test_prefill_suspend_releases_the_experts_and_keeps_the_instance():
+    m = _Recorder(kept=True, mapped=True, kept_prefill=True)
     m.phase_exit(PhaseKey("prefill", None), ExitMode.SUSPEND)
+    assert m.calls == [("release_prefill",)]
+    assert m.holds_instance("prefill") is True
+
+
+def test_prefill_suspend_without_a_kept_instance_fails_loud():
+    m = _Recorder(kept=True, mapped=True)
+    with pytest.raises(RuntimeError, match="must RETIRE"):
+        m.phase_exit(PhaseKey("prefill", None), ExitMode.SUSPEND)
+    assert m.calls == []
+
+
+def test_admit_makes_no_delegate_call():
+    m = _Recorder(kept=True, mapped=True, kept_prefill=True)
     for phase in ("prefill", "decode"):
         m.admit(PhaseKey(phase, None), AdmitContext(uuids=["u"]))
     assert m.calls == []

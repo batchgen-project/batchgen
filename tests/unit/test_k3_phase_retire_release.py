@@ -98,13 +98,18 @@ def _exit_psm(model):
     psm._retire_resident_ep_decode = (
         lambda: psm._release_calls.append("retire")
     )
+    # RETIRE also closes the streamed-SP8 prefill buffer while the model is
+    # reachable (one model serves both phases).
+    psm._release_streamed_sp8_prefill = (
+        lambda: psm._release_calls.append("release_sp8")
+    )
     return psm
 
 
 def test_decode_retire_releases_resident_shard():
     psm = _exit_psm(object())
     psm.phase_exit(DECODE, ExitMode.RETIRE)
-    assert psm._release_calls == ["retire"]
+    assert psm._release_calls == ["release_sp8", "retire"]
     assert psm.model is None
     assert psm.decode_instance is None
     assert psm.weight_copy_task == {}
@@ -115,23 +120,25 @@ def test_decode_retire_after_worker_dropped_model_still_releases():
     # shard is still mapped and must go back here.
     psm = _exit_psm(None)
     psm.phase_exit(DECODE, ExitMode.RETIRE)
-    assert psm._release_calls == ["retire"]
+    assert psm._release_calls == ["release_sp8", "retire"]
     assert psm.model is None
 
 
 def test_prefill_retire_releases_a_resident_prefill_shard():
-    # Under the resident-EP prefill handoff the prefill instance builds the
-    # shard itself; retiring it must hand the shard back before the decode
-    # build, which otherwise finds it still recorded.
+    # A prefill wave of a resident-EP server runs against the resident
+    # shard; retiring the instance must hand the shard back before the
+    # decode build, which otherwise finds it still recorded.
     model = object()
     psm = _exit_psm(model)
     psm.prefill_instance = (model, {})
     psm.phase_exit(PREFILL, ExitMode.RETIRE)
-    assert psm._release_calls == ["retire"]
+    assert psm._release_calls == ["release_sp8", "retire"]
     assert psm.prefill_instance is None
     assert psm.model is None
-    # A prefill retire leaves the decode instance tuple to its own exit.
-    assert psm.decode_instance == (model, {})
+    # One model serves both phases: retiring either phase retires the
+    # model, and both instance tuples go with it (holds never outlive the
+    # model they reference).
+    assert psm.decode_instance is None
 
 
 def test_decode_suspend_still_releases_resident_shard():

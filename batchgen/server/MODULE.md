@@ -95,6 +95,22 @@ where `<slot>` is `undeclared`, `none`, or a `scheme:residency` token whose
 sharded schemes carry their group width: `dp:streamed`, `tp8:resident`,
 `ep8:partial`.
 
+# Prefill MoE mode (`--prefill-moe-mode`)
+
+The prefill MoE mode is a prefill-phase parameter chosen once per server:
+`--prefill-moe-mode {streamed,streamed_sp8,resident_ep}` on models that
+declare prefill MoE modes (Kimi-K3), else the model's streaming default for
+its weight topology. Every prefill wave of the server runs that one mode; no
+batch or debug flag changes it. The model's strategy manager validates the
+mode against its topology at construction and refuses an impossible one by
+name at startup; a model without prefill MoE modes refuses the flag.
+`resident_ep` cannot be combined with `--enable-prefix-cache`
+(`validate_server_args` refuses the pair by name). A batch or turn that still
+sends the retired per-batch key `batchgen_debug.k3_prefill_moe_mode` is
+refused with HTTP 400 (`io_struct.RETIRED_BATCHGEN_DEBUG_KEYS`); a batch
+stored before the refusal existed fails in `BatchScheduler._process_batch`
+before any request reaches a worker.
+
 # Batch request counts
 
 `BatchObject.request_counts` (`total`, `completed`, `failed`) is decided per
