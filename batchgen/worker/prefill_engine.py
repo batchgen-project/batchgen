@@ -1945,13 +1945,13 @@ class PrefillEngine:
         # Rebinding self to the worker keeps the body's original self.
         # spellings; this engine instance remains stateless.
         self = worker
-        freed = self._prefix.release_pool_segment_refs(int(global_id))
-        # Host views are built only when a segment lost its last member, so a
-        # sequence without pool segments never touches them.
-        if freed:
-            from batchgen.worker.prefix_reuse_state import release_pool_segments
+        from batchgen.worker.prefix_reuse_state import release_pool_segments
 
-            release_pool_segments(self._host_views_by_group(), freed)
+        # One freed segment at a time: its Host pages go before the next
+        # segment is counted down. Host views are fetched per freed segment,
+        # so a sequence that frees nothing never touches them.
+        for sid in self._prefix.release_pool_segment_refs(int(global_id)):
+            release_pool_segments(self._host_views_by_group(), [sid])
 
 
     def prefill(self, worker, batch: list[int]):

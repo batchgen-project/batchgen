@@ -973,6 +973,65 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     assert view_builds == [1]
 
 
+def _release_worker(monkeypatch, *, member_sids, sid_members):
+    """A leader holding the given pool bookkeeping, counting Host-view fetches."""
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    backend = FakeBackend(1000)
+    views = {0: FakeView(backend, 0)}
+    worker = _finish_worker(
+        0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
+    )
+    worker._prefix.pool_member_sids = dict(member_sids)
+    worker._prefix.pool_sid_members = dict(sid_members)
+    view_builds = []
+    build_views = worker._host_views_by_group
+    worker._host_views_by_group = lambda: view_builds.append(1) or build_views()
+    return worker, backend, view_builds
+
+
+def test_release_of_a_sequence_without_pool_segments_touches_no_host_view(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch, member_sids={}, sid_members={-1: 1},
+    )
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert view_builds == []
+    assert backend.released == [] and backend.unregistered == []
+    assert worker._prefix.pool_sid_members == {-1: 1}
+
+
+def test_release_frees_several_segments_one_at_a_time(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert backend.released == [(0, [-1]), (0, [-2])]
+    assert backend.unregistered == [(0, [-1]), (0, [-2])]
+    # The Host views are fetched once per freed segment.
+    assert view_builds == [1, 1]
+    assert worker._prefix.pool_sid_members == {}
+
+
+def test_release_frees_a_segment_before_a_later_one_fails(monkeypatch):
+    # The chain names a segment that has no count. The segment before it has
+    # lost its last member and its pages must not be stranded by the failure.
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1},
+    )
+
+    with pytest.raises(KeyError):
+        worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert backend.released == [(0, [-1])]
+    assert backend.unregistered == [(0, [-1])]
+    assert view_builds == [1]
+
+
 # --------------------------------------------------------------------------- #
 #  (vi) A pool wave runs one model pass per planned chunk
 # --------------------------------------------------------------------------- #

@@ -204,7 +204,7 @@ def test_pool_refcounts_release_last_member():
             self.released.append(("unregister", ids))
 
     view = View()
-    freed = store.release_pool_segment_refs(9)
+    freed = list(store.release_pool_segment_refs(9))
     assert freed == [-1]
     release_pool_segments({0: view}, freed)
     assert view.released == [("release", [-1]), ("unregister", [-1])]
@@ -308,12 +308,12 @@ def test_refcount_add_release_paths():
 			self.calls.append(("unregister", list(ids)))
 
 	view = View()
-	freed = store.release_pool_segment_refs(1)
+	freed = list(store.release_pool_segment_refs(1))
 	assert freed == [-4]
 	release_pool_segments({0: view}, freed)
 	assert store.pool_sid_members == {-3: 1}
 	assert view.calls == [("release", [-4]), ("unregister", [-4])]
-	freed = store.release_pool_segment_refs(2)
+	freed = list(store.release_pool_segment_refs(2))
 	assert freed == [-3]
 	release_pool_segments({0: view}, freed)
 	assert store.pool_sid_members == {}
@@ -326,11 +326,40 @@ def test_release_returns_nothing_while_a_segment_has_members():
 	store = PrefixReuseState()
 	store.add_pool_member_refs(1, [-3])
 	store.add_pool_member_refs(2, [-3])
-	assert store.release_pool_segment_refs(1) == []
+	assert list(store.release_pool_segment_refs(1)) == []
 	assert store.pool_sid_members == {-3: 1}
-	assert store.release_pool_segment_refs(77) == []
+	assert list(store.release_pool_segment_refs(77)) == []
 	assert store.pool_sid_members == {-3: 1}
-	assert store.release_pool_segment_refs(2) == [-3]
+	assert list(store.release_pool_segment_refs(2)) == [-3]
+
+
+# Freed segments come out in the member's chain order, one at a time, and
+# nothing is counted down until the iterator is consumed.
+def test_release_yields_freed_segments_in_chain_order_when_consumed():
+	store = PrefixReuseState()
+	store.add_pool_member_refs(1, [-5, -6, -7])
+	store.add_pool_member_refs(2, [-6])
+	pending = store.release_pool_segment_refs(1)
+	assert store.pool_member_sids == {1: (-5, -6, -7), 2: (-6,)}
+	assert next(pending) == -5
+	assert store.pool_sid_members == {-6: 2, -7: 1}
+	assert list(pending) == [-7]
+	assert store.pool_sid_members == {-6: 1}
+	assert store.pool_member_sids == {2: (-6,)}
+
+
+# A chain that names a segment without a count fails on that segment only:
+# the segment freed before it has already been handed out for release.
+def test_release_hands_out_a_freed_segment_before_a_later_one_fails():
+	store = PrefixReuseState()
+	store.pool_member_sids[9] = (-1, -2)
+	store.pool_sid_members[-1] = 1
+	released = []
+	with pytest.raises(KeyError):
+		for sid in store.release_pool_segment_refs(9):
+			released.append(sid)
+	assert released == [-1]
+	assert store.pool_sid_members == {}
 
 
 # One segment at a time; for each segment every view releases, then unregisters.
