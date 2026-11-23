@@ -28,7 +28,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
 from batchgen.config.layer_truncation import require_layer_truncation_applied
-from batchgen.config.model_registry import load_config
+from batchgen.config.model_registry import DEBUG_KEY_REGISTRY, load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
 from batchgen.config.config import detect_gpu_arch
@@ -249,10 +249,7 @@ from batchgen.worker.boundary import (
 )
 from batchgen.worker.decode import (
 	DecodeBatchRequest,
-	DecodeCandidate,
-	DecodeScheduler,
 	DecodeCapacitySnapshot,
-	reduce_decode_capacity_snapshot,
 )
 from batchgen.cuda_graph.buckets import (
 	DecodeWidthExceedsGraphBucketError,
@@ -261,7 +258,6 @@ from batchgen.cuda_graph.buckets import (
 )
 from batchgen.worker.shared_prefix_charge import (
 	SharedPrefixLedger,
-	plan_shared_runs,
 )
 from batchgen.config.max_model_len import (
 	SequenceLengthCapacity, resolve_max_model_len, verify_max_model_len,
@@ -324,6 +320,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 	DualPoolPageKeys,
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
+from batchgen.server_debug_state import DebugState, format_log_line as format_debug_state_log_line
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
 from batchgen_kernels import post_readiness
 from batchgen.worker.admission.plan import (
@@ -363,7 +360,6 @@ from batchgen.continuous_batching import (
 	BoundaryDecisions,
 	FastBoundaryTimingStats,
 	host_kv_owner_reports,
-	validate_boundary_payload_alignment,
 )
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
@@ -437,7 +433,7 @@ class _WeightPasses:
 		self._current = None
 		self._carried = None
 		self._carried_produce_only = False
-		# Batch-level debug skew (batchgen_debug.weight_pass_end_delay): this
+		# Debug skew (debug_state.weight_pass_end_delay): this
 		# rank sleeps before closing each prefill pass, so its siblings run
 		# ahead exactly where a per-rank stop used to strand the node daemon.
 		self.end_delay_s = 0.0
@@ -850,6 +846,8 @@ class InputArguments:
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
+	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
 	debug_num_layers: Optional[int] = None
 
@@ -939,6 +937,12 @@ class BatchGenWorkerArgs:
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
+	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
+	# The server's debug state this worker pool starts under (wire form; None
+	# = empty). Rank 0 carries it from the server; every other rank takes rank
+	# 0's value before it builds its worker.
+	debug_state: Optional[dict] = None
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
 	debug_num_layers: Optional[int] = None
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
@@ -1488,12 +1492,15 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
-		self._batchgen_debug: Optional[dict] = None
-		# Sticky: set once an admitted sequence carries per-request debug
-		# flags. Only gates the per-row scan in
-		# _active_batchgen_debug_for_sequences, whose result is None while no
-		# sequence carries any, so a sticky True merely restores the scan.
-		self._any_sequence_batchgen_debug: bool = False
+		# The server's debug state. ``_debug_state`` is the generation this
+		# worker runs under; a newer one received from the server waits in
+		# ``_pending_debug_state`` until the next phase entry adopts it.
+		self._debug_state: DebugState = DEBUG_KEY_REGISTRY.from_wire(args.debug_state)
+		self._pending_debug_state: Optional[DebugState] = None
+		self._debug_state_values: Optional[dict] = (
+			self._debug_state.to_wire()["values"] or None
+		)
+		self._debug_state_logged_generation: Optional[int] = None
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -1618,22 +1625,65 @@ class BatchGenWorker:
 			self,
 		)
 		
-	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
-		if self._batchgen_debug:
-			return self._batchgen_debug
-		if not self._any_sequence_batchgen_debug:
-			# No sequence admitted on this worker ever carried per-request
-			# debug flags, so the merge below can only return None. Decode
-			# calls this every step, once per row.
-			return None
-		merged = {}
-		for seq in batch_sequences or []:
-			seq_debug = getattr(seq, "batchgen_debug", None)
-			if isinstance(seq_debug, dict):
-				for key, value in seq_debug.items():
-					if value is not None and key not in merged:
-						merged[key] = value
-		return merged or None
+	def _debug_values(self) -> Optional[dict]:
+		"""The adopted server debug state as a dict (None when it is empty).
+
+		The same object for every sequence, wave and step until the next phase
+		entry adopts a newer generation; readers must not modify it.
+		"""
+		return self._debug_state_values
+
+	def receive_debug_state(self, wire: Optional[dict], *, at_start: bool = False) -> None:
+		"""Take a debug state published by the server.
+
+		``at_start``: a state published before the pool was initialised (no
+		phase has run yet), taken at once. Otherwise it waits for the next
+		phase entry. The state a pool STARTS under comes with its launch
+		arguments, so that it is in force before the start-up warm-up.
+		"""
+		state = DEBUG_KEY_REGISTRY.from_wire(wire)
+		if at_start:
+			self._debug_state = state
+			self._debug_state_values = state.to_wire()["values"] or None
+			self._pending_debug_state = None
+		else:
+			self._pending_debug_state = state
+
+	def _adopt_debug_state(self, phase: str) -> None:
+		"""Phase entry: make the newest received debug state the running one.
+
+		Called at the start of a prefill wave and at decode entry, on every
+		rank, never inside a wave or a decode step. A change of a re-warm key
+		cannot arrive here: its value is baked into captured graphs or into a
+		phase instance, so the server applies it by re-warming the worker
+		pool, and the new pool starts with it.
+		"""
+		pending = self._pending_debug_state
+		if pending is not None and pending.generation != self._debug_state.generation:
+			baked = self._debug_state.rewarm_keys_changed(pending)
+			if baked:
+				raise RuntimeError(
+					f"Rank {self.rank}: debug state generation {pending.generation} changes "
+					f"{', '.join(baked)} on a running worker pool; these keys take effect "
+					"only through a re-warm of the pool"
+				)
+			self._debug_state = pending
+			self._debug_state_values = pending.to_wire()["values"] or None
+		self._pending_debug_state = None
+		# One line per new generation, and one per phase entry for as long as
+		# the state is non-empty: any slice of the log that contains a phase
+		# served under debug switches then says so by itself.
+		if (
+			self._debug_state_logged_generation != self._debug_state.generation
+			or self._debug_state.values
+		):
+			self._debug_state_logged_generation = self._debug_state.generation
+			if self.local_rank == 0:
+				logging.info(
+					"%s phase=%s",
+					format_debug_state_log_line(self._debug_state, node=self.args.nnode_rank),
+					phase,
+				)
 
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
 		return isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace"))
@@ -1648,15 +1698,13 @@ class BatchGenWorker:
 		counts_text = ",".join(f"{key}={counts[key]}" for key in sorted(counts))
 		logging.warning(
 			"[GLM5_DISPATCH_TRACE] rank=%s summary reason=%s trace=%s "
-			"batch_ids=%s global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s counts=%s",
+			"batch_ids=%s global_ids=%s bsz=%s counts=%s",
 			context.get("rank", self.rank),
 			reason,
 			getattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None) or "unknown",
 			context.get("batch_ids", "-"),
 			context.get("global_ids", "-"),
 			context.get("bsz", "-"),
-			context.get("glm5_dsa_mode", "-"),
-			context.get("glm5_moe_mode", "-"),
 			counts_text,
 		)
 
@@ -1688,13 +1736,10 @@ class BatchGenWorker:
 			"batch_ids": ",".join(batch_ids) if batch_ids else "-",
 			"global_ids": ",".join(global_ids) if global_ids else "-",
 			"bsz": len(seqs),
-			"glm5_dsa_mode": debug.get("glm5_dsa_mode", "-"),
-			"glm5_moe_mode": debug.get("glm5_moe_mode", "-"),
 			"glm5_moe_router_mode": debug.get("glm5_moe_router_mode", "-"),
 		}
 		trace_id = (
 			f"batches={context['batch_ids']}|global_ids={context['global_ids']}|"
-			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}|"
 			f"router={context['glm5_moe_router_mode']}"
 		)
 		if (
@@ -1709,15 +1754,12 @@ class BatchGenWorker:
 			GLM5AttnWrapper.glm5_dispatch_seen = set()
 			logging.warning(
 				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
-				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s "
-				"debug_moe_router=%s",
+				"global_ids=%s bsz=%s debug_moe_router=%s",
 				self.rank,
 				trace_id,
 				context["batch_ids"],
 				context["global_ids"],
 				context["bsz"],
-				context["glm5_dsa_mode"],
-				context["glm5_moe_mode"],
 				context["glm5_moe_router_mode"],
 			)
 		else:
@@ -1762,7 +1804,7 @@ class BatchGenWorker:
 				msg = self._admission_queue.get_nowait()
 				if msg is None:
 					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") == "admit":
+				elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
 					msg_data = msg
 					has_new = True
 				elif isinstance(msg, dict) and "prompts" in msg:
@@ -1775,6 +1817,10 @@ class BatchGenWorker:
 					# queue: fail loudly rather than park. Deliberately NOT a
 					# Unknown messages must fail loudly rather than being swallowed.
 					raise LegacyInferenceDeprecated()
+				else:
+					raise RuntimeError(
+						f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+					)
 			except queue_mod.Empty:
 				pass
 
@@ -1791,9 +1837,26 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			self._admit_sequences_from_message(msg_data)
+			return self._take_queue_message(msg_data)
 
 		return has_new
+
+	# What rank 0 may take off the admission queue and broadcast.
+	_QUEUE_MESSAGE_TYPES = ("admit", "debug_state")
+
+	def _take_queue_message(self, msg: dict) -> bool:
+		"""Act on a broadcast admission-queue message; True if it admitted sequences.
+
+		The one place a message from the server is interpreted, on every rank
+		and for both readers of the queue (the poll and the idle wait).
+		"""
+		if msg.get("type") == "debug_state":
+			# Not an admission: every rank keeps the new state until its next
+			# phase entry adopts it.
+			self.receive_debug_state(msg.get("state"))
+			return False
+		self._admit_sequences_from_message(msg)
+		return True
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -1848,9 +1911,6 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 			)
 			seq.batch_id = entry.get("batch_id")
-			seq.batchgen_debug = entry.get("batchgen_debug")
-			if isinstance(seq.batchgen_debug, dict) and seq.batchgen_debug:
-				self._any_sequence_batchgen_debug = True
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
 			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
@@ -2093,6 +2153,7 @@ class BatchGenWorker:
 				prefix_cache_debug_stats=self.prefix_cache_debug_stats,
 				kv_stats_native=self._kv_stats_native,
 				kv_stats_compare=self._kv_stats_compare,
+				shared_prefix_admission=self.shared_prefix_admission,
 			),
 			sched=SchedulingState(
 				pool=self.global_batch,
@@ -4964,7 +5025,7 @@ class BatchGenWorker:
 				)
 				self._prefix.prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
-		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# M3 Slice 2, SAME debug-state key as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
 		# commits are off. With it off nothing here runs and no attachment is
 		# taken, so the restore seam stays empty and this wave is
@@ -5683,37 +5744,16 @@ class BatchGenWorker:
 		)
 
 	def _prepare_decode_batch(self) -> List[str]:
-		"""
-		Select sequences for decode phase from PREFILLED sequences.
-		Greedily fill the current physical GPU-KV free capacity.
-		"""
-		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		onhold_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		
-		# Combine and sort for deterministic ordering
-		all_candidates = prefilled_uuids + onhold_uuids
-		all_candidates.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-		
-		# Get a collective live capacity snapshot.  The old implementation used
-		# only one rank's total_pages and a metadata-derived resident count, which
-		# could admit against stale state or strand a candidate at the 90% guard.
-		capacity = self._snapshot_decode_capacity()
-		if not all_candidates:
-			return []
+		"""Select the decode entry batch; the selection lives in ``DecodeEntry``.
 
-		# Candidate enumeration and logging stay here; pure physical-capacity
-		# selection is delegated.
-		# Owner-reported shared GPU prefixes, gathered before the pure
-		# selection so every rank charges the same marginal cost: rows that
-		# reference one Host page get ONE physical GPU page, so charging each
-		# row its whole context would bound decode by the logical page sum.
-		shared_segments = self._gather_decode_shared_prefix_segments(
-			all_candidates
-		)
-		decode_batch = DecodeScheduler.select_decode_batch(
-			self._make_decode_batch_request(
-				all_candidates, capacity, shared_segments=shared_segments
-			)
+		``DecodeEntry.select`` runs from the decode context. The worker keeps
+		the model-specific admission guard below and the rank-0 summary log,
+		in that original order: the guard raises before the log line.
+		"""
+		from batchgen.worker.admission.decode_entry import DecodeEntry
+		decode_batch = DecodeEntry().select(
+			self._decode_phase_context(),
+			getattr(self, "_decode_padding_bsz", 0) or 0,
 		)
 
 		# An all_short whole-model capture never runs indexer scoring, so a
@@ -5744,172 +5784,40 @@ class BatchGenWorker:
 		return decode_batch
 
 	def _decode_shared_prefix_credit_enabled(self) -> bool:
-		"""Whether decode admission may charge a shared GPU prefix once.
-
-		The credit is only honest where the ALLOCATOR shares: GPU pages are
-		deduplicated by Host page id inside
-		``allocate_pages_for_sequences_with_page_keys``, which
-		``_allocate_gpu_pages_with_host_identity`` reaches exactly when
-		``_shared_page_identity_sources`` names the pools to key. A DSA dual
-		coordinator is now one of those: both of its pools deduplicate, each
-		on its own Host region's page ids. Everywhere else each row really
-		does load its own copy, so each row must pay for it -- the same
-		condition ``_host_identity_page_keys`` tests before returning page
-		keys at all.
-		"""
-		if not self.shared_prefix_admission:
-			return False
-		if not self.enable_prefix_cache:
-			return False
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None or not manager.is_initialized:
-			return False
-		return self._shared_page_identity_sources(manager) is not None
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._decode_shared_prefix_credit_enabled(
+			self._decode_phase_context()
+		)
 
 	def _local_decode_shared_prefix_runs(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Shared leading page runs among the candidates THIS rank owns.
-
-		Grouped per owner because sharing only pays inside one GPU pool: the
-		pool belongs to one DP rank (or one replicated TP group whose Host-KV
-		leader owns every row), so two rows loading onto different pools each
-		need their own physical copy.
-
-		The identity is the HOST page id, which is what the allocator dedups
-		on, so a run here means those rows provably reference one physical
-		copy -- not merely equal tokens, which two distinct Host copies can
-		also have.
-
-		The view comes from ``_shared_page_identity_sources``, so the runs are
-		read from exactly the key space the allocator will dedup on. On a DSA
-		dual coordinator that is the PRIMARY pool (the MLA latent region): the
-		auxiliary pool shares the same rows page for page, and the charge is
-		counted in primary-pool pages, so one pool's identity describes the
-		credit for both.
-		"""
-		sources = self._shared_page_identity_sources(
-			self.gpu_paged_kv_cache_manager
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._local_decode_shared_prefix_runs(
+			self._decode_phase_context(), all_candidates
 		)
-		if not sources:
-			return {}
-		worker_view = sources[0][2]
-		mine = []
-		for uuid in all_candidates:
-			if uuid not in self._uuid_to_local_map:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			req_pages = int(seq.get_gpu_pages_for_two_page_buffer())
-			if req_pages <= 1:
-				continue
-			mine.append((uuid, seq, req_pages))
-		if len(mine) < 2:
-			return {}
-		host_tables = worker_view.build_page_table(
-			[int(seq.global_idx) for _, seq, _ in mine]
-		)
-		tables: Dict[int, List[int]] = {}
-		for (_uuid, seq, req_pages), host_pages in zip(mine, host_tables):
-			# Credit only pages that exist, and never the row's whole
-			# reservation: one page stays private so no row is charged zero.
-			# A Host table shorter than the reservation is named loudly by
-			# _host_identity_page_keys at allocation time; admission must not
-			# credit pages it cannot see.
-			usable = min(req_pages - 1, len(host_pages))
-			if usable <= 0:
-				continue
-			tables[int(seq.global_idx)] = [
-				int(page) for page in host_pages[:usable]
-			]
-		runs = plan_shared_runs(tables)
-		local: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for uuid, seq, _req_pages in mine:
-			run = runs.get(int(seq.global_idx))
-			if run is None:
-				continue
-			local[uuid] = ((int(run[0]), int(run[1])),)
-		return local
 
 	def _gather_decode_shared_prefix_segments(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Collect every rank's shared runs so selection stays rank-identical.
-
-		``select_decode_batch`` is pure and runs on every rank; a rank that
-		credited a run its peers did not would admit a different batch and the
-		next collective would deadlock. Only an owner can read its rows' Host
-		page tables, so the ground truth is gathered rather than re-derived.
-		``all_candidates`` is already rank-uniform (it comes from replicated
-		sequence status), so every rank reaches this gather together.
-		"""
-		if not self._decode_shared_prefix_credit_enabled():
-			return {}
-		local = self._local_decode_shared_prefix_runs(all_candidates)
-		if self.world_size == 1:
-			return local
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required to gather decode "
-				"shared-prefix runs"
-			)
-		gathered: List[Optional[Dict[str, Tuple[Tuple[int, int], ...]]]] = (
-			[None] * self.world_size
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._gather_decode_shared_prefix_segments(
+			self._decode_phase_context(), all_candidates
 		)
-		dist.all_gather_object(gathered, local)
-		merged: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for part in gathered:
-			if part:
-				merged.update(part)
-		return merged
 
 	def _make_decode_batch_request(
 		self, all_candidates: List[str], capacity: DecodeCapacitySnapshot,
 		shared_segments: Optional[Dict[str, Tuple[Tuple[int, int], ...]]] = None,
 	) -> DecodeBatchRequest:
-		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
-		shared_segments = shared_segments or {}
-		attn_tp_size = self._decode_attn_tp_size()
-		num_capacity_groups = self.world_size // attn_tp_size
-		existing_pages = [0] * num_capacity_groups
-		existing_sequence_counts = [0] * num_capacity_groups
-		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
-			seq = self.global_batch.get_sequence(uuid)
-			if attn_tp_size > 1:
-				r = seq.decode_dp_group
-				if r is None:
-					raise ValueError(
-						f"sequence {uuid[:8]} has no decode_dp_group for "
-						f"attn_tp_size={attn_tp_size}"
-					)
-			else:
-				r = seq.assigned_rank
-			if not 0 <= r < num_capacity_groups:
-				raise ValueError(
-					f"sequence {uuid[:8]} has invalid decode capacity group {r}"
-				)
-			existing_pages[r] += max(0, seq.gpu_pages_allocated)
-			existing_sequence_counts[r] += 1
-
-		candidates = []
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			candidates.append(DecodeCandidate(
-				uuid=uuid,
-				assigned_rank=seq.assigned_rank,
-				global_idx=seq.global_idx,
-				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
-				decode_dp_group=seq.decode_dp_group,
-				shared_prefix_segments=shared_segments.get(uuid, ()),
-			))
-		return DecodeBatchRequest(
-			candidates=tuple(candidates),
-			total_pages=capacity.total_pages,
-			world_size=self.world_size,
-			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
-			attn_tp_size=attn_tp_size,
-			existing_pages=tuple(existing_pages),
-			free_pages=capacity.free_pages,
-			existing_sequence_counts=tuple(existing_sequence_counts),
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._make_decode_batch_request(
+			self._decode_phase_context(), all_candidates, capacity,
+			getattr(self, "_decode_padding_bsz", 0) or 0,
+			shared_segments=shared_segments,
 		)
 
 	def _check_and_handle_completions(
@@ -6205,7 +6113,6 @@ class BatchGenWorker:
 		*,
 		local_bsz: int,
 		global_bsz: int,
-		sequences=None,
 	) -> bool:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_step_observability_engine", None)
@@ -6213,18 +6120,11 @@ class BatchGenWorker:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
-		# Batch-level debug flags live on the admitted sequences
-		# (self._batchgen_debug is never populated on the pool path), and the
-		# worker owns that lookup, so the merged view is resolved here.
 		return engine._nsys_prefill_profile_begin(
 			self,
 			local_bsz=local_bsz,
 			global_bsz=global_bsz,
-			debug=(
-				self._active_batchgen_debug_for_sequences(sequences)
-				or self._batchgen_debug
-				or {}
-			),
+			debug=self._debug_values() or {},
 		)
 
 	def _nsys_prefill_profile_end(self, active: bool) -> None:
@@ -6271,8 +6171,8 @@ class BatchGenWorker:
 			self._decode_profile_capture = capture
 		return capture
 
-	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
-		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: a
+	def _decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
+		"""Server debug state ``decode_profile_steps = N``: a
 		per-kernel breakdown of N decode steps without a server restart."""
 		self._decode_profile_capture_state().step(batchgen_debug, batch_rows)
 
@@ -6697,21 +6597,24 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
-						elif isinstance(msg, dict) and msg.get("type") == "admit":
-							# Broadcast that we got new work
+						elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
+							# Broadcast that a message arrived
 							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							self._group_uuids = set()
-							self._admit_sequences_from_message(msg)
-							# Reset per-batch-group timing so each admission cycle
-							# emits its own "Pool batch group completed" summary.
-							prefill_time = 0.0
-							decoding_time = 0.0
-							generation_start_time = time.perf_counter()
-							self._timing_logged = False
-							# Continue loop — new sequences will be picked up
+							# A new batch group starts BEFORE its sequences are
+							# admitted into it.
+							if msg.get("type") == "admit":
+								self._group_uuids = set()
+							if self._take_queue_message(msg):
+								# Reset per-batch-group timing so each admission cycle
+								# emits its own "Pool batch group completed" summary.
+								prefill_time = 0.0
+								decoding_time = 0.0
+								generation_start_time = time.perf_counter()
+								self._timing_logged = False
+								# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
 							# guard in _poll_admissions. The `else` below would
@@ -6719,8 +6622,11 @@ class BatchGenWorker:
 							# completion off the shared response queue.
 							raise LegacyInferenceDeprecated()
 						else:
-							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
-							dist.broadcast(status, src=0)
+							# An unknown message must fail loudly: dropping it
+							# here would lose it without a trace.
+							raise RuntimeError(
+								f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+							)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
 						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
@@ -6735,13 +6641,14 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._group_uuids = set()
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						if container[0].get("type") == "admit":
+							self._group_uuids = set()
+						if self._take_queue_message(container[0]):
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
@@ -6892,12 +6799,6 @@ class BatchGenWorker:
 					_prefill_profile_active = self._nsys_prefill_profile_begin(
 						local_bsz=len(local_prefill_indices),
 						global_bsz=len(prefill_uuids),
-						sequences=[
-							seq for seq in (
-								self.global_batch.get_sequence(uuid)
-								for uuid in prefill_uuids
-							) if seq is not None
-						],
 					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
@@ -7253,11 +7154,10 @@ class BatchGenWorker:
 				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
+				self._adopt_debug_state("decode")
 				phase_state.bind_debug(
 					AttnWrapperBase,
-					batchgen_debug=self._active_batchgen_debug_for_sequences(
-						global_decode_sequences
-					),
+					batchgen_debug=self._debug_values(),
 				)
 				self._configure_glm5_dispatch_trace(global_decode_sequences)
 
@@ -7285,7 +7185,7 @@ class BatchGenWorker:
 				# from the probe in the resident decode graph (none is a value)
 				# arms a recapture, which the warmup below then runs.
 				self._configure_criticality_probe(
-					self._active_batchgen_debug_for_sequences(global_decode_sequences)
+					self._debug_values()
 				)
 
 				# CUDA Graph Warmup (configure-time). A decode instance kept
@@ -7941,21 +7841,19 @@ class BatchGenWorker:
 		flags from its subset. ``_desired_phase_key`` refuses a wave that was
 		not resolved here.
 		"""
-		sequences = []
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				sequences.append(seq)
-		debug = self._active_batchgen_debug_for_sequences(sequences) or {}
+		self._adopt_debug_state("prefill")
 		self._prefill_wave_uuids = tuple(prefill_uuids)
-		self._prefill_wave_debug = debug
+		self._prefill_wave_debug = self._debug_values() or {}
+		# What the wave's planners and probes read; the phase key re-binds the
+		# same value when it is resolved.
+		self._phase_prefill_debug = self._prefill_wave_debug
 
 	def _server_prefill_moe_mode(self) -> Optional[str]:
 		"""The prefill MoE mode every wave of this server runs in.
 
 		Read once from the parallel manager and kept for the process: prefill
 		parallelism never changes inside a server, and no batch or debug flag
-		changes it (admission refuses the retired per-batch key). The server
+		changes it (a request cannot carry debug switches at all). The server
 		chooses it at start with ``--prefill-moe-mode``, else the model's
 		default. Prefill MoE modes are a manager capability declared by the
 		pair ``default_prefill_moe_mode`` / ``set_prefill_moe_mode``; a manager
@@ -9395,6 +9293,7 @@ class BatchGenWorker:
 		return engine._prefix_rank_packing_mode(
 			self,
 			seqs,
+			mode=self.args.prefix_rank_assignment_mode,
 		)
 
 	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
@@ -9407,6 +9306,7 @@ class BatchGenWorker:
 		return engine._prefix_rank_cost_profile_disabled(
 			self,
 			seqs,
+			value=self.args.prefix_rank_cost_profile,
 		)
 
 	def _cached_prefix_rank_cost_profile(self, disabled: bool=False):
@@ -10086,16 +9986,16 @@ class BatchGenWorker:
 					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _trajectory_commit_requested(self, batch_sequences) -> bool:
-		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
+		"""Server-level ``debug_state.prefix_trajectory_commit`` (M3 1b).
 
-		Same seam as ``prefix_pool_offload_check``: the flag rides on the
-		batch's own sequences, so it can be turned on against a server that is
+		Same seam as ``prefix_pool_offload_check``: the key is part of the
+		server's debug state, so it can be turned on against a server that is
 		already up. A value other than ``"on"``/``"off"`` is refused by name
 		rather than read as off -- a mistyped flag would look like a clean run
 		with no frontier committed.
 		"""
 		return self._traj.commit_requested(
-			self._active_batchgen_debug_for_sequences(batch_sequences)
+			self._debug_values()
 		)
 
 	def _trajectory_group_geometry(self) -> tuple:
@@ -11269,6 +11169,21 @@ class BatchGenWorker:
 			)
 		)
 
+	def _plan_boundary(self, decode_uuids: List[str], gpu_manager, timing, t0: float):
+		"""Gather, decide on rank 0 and broadcast the page-boundary decisions.
+
+		The work lives in ``BoundaryPlanner.plan`` and runs from the decode
+		context. The worker supplies its completion rule and the decode
+		padding batch size.
+		"""
+		from batchgen.worker.admission.boundary_planner import BoundaryPlanner
+		return BoundaryPlanner().plan(
+			self._decode_phase_context(),
+			self._is_sequence_completed,
+			getattr(self, "_decode_padding_bsz", 0) or 0,
+			decode_uuids, gpu_manager, timing, t0,
+		)
+
 	def _page_boundary_fast(
 		self,
 		decode_uuids: List[str],
@@ -11373,356 +11288,9 @@ class BatchGenWorker:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing, False
 		
-		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
-		t0 = time.perf_counter()
-		
-		local_payload_error = None
-		try:
-			if gpu_manager is not None and gpu_manager.is_initialized:
-				gpu_stats = gpu_manager.get_stats()
-				local_free_pages = int(gpu_stats.num_free_pages)
-				local_total_pages = int(gpu_stats.num_total_pages)
-			else:
-				local_free_pages = 0
-				local_total_pages = 0
-		except Exception as exc:
-			# Carry allocator stats failures through the payload gather so
-			# peers do not block while this rank raises before all-gather.
-			local_free_pages = 0
-			local_total_pages = 0
-			local_payload_error = (
-				f"GPU-KV stats: {type(exc).__name__}: {exc}"
-			)
-		
-		# DEBUG: Log decode_uuids and which ones this rank owns
-		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
-		if self.rank == 0:
-			logging.debug(
-				f"Rank {self.rank}: State gathering - decode_uuids_len={len(decode_uuids)}, "
-				f"my_owned_count={len(my_owned)}"
-			)
-		
-		# Build local state for sequences owned by this rank
-		try:
-			chunk_size = self._get_effective_chunk_size()
-		except Exception as exc:
-			chunk_size = 0
-			local_payload_error = (
-				f"chunk size: {type(exc).__name__}: {exc}"
-			)
-		local_seq_state = {}
-		for uuid in decode_uuids:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				try:
-					is_completed = self._is_sequence_completed(seq)
-					seq.validate_metadata(
-						f"rank {self.rank} _page_boundary_fast/decode_state",
-						allow_terminal_capacity_gap=is_completed,
-					)
-				except Exception as exc:
-					local_payload_error = (
-						f"decode {uuid}: {type(exc).__name__}: {exc}"
-					)
-					continue
-				local_seq_state[uuid] = {
-					'decoded_length': seq.decoded_length,
-					'current_context_length': seq.current_context_length,
-					'gpu_pages_allocated': seq.gpu_pages_allocated,
-					'eos_reached': seq.eos_reached,
-					'rep_detected': getattr(seq, '_rep_detected', False),
-					'completed': is_completed,
-					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
-					'assigned_rank': seq.assigned_rank,  # Include for consistency
-					# Option 1 (G>1): the serve-group id. The boundary validator keys
-					# group ownership on this (a uuid is reported by exactly its G
-					# contiguous ranks [g*G,(g+1)*G)), not on a single assigned_rank.
-					'decode_dp_group': seq.decode_dp_group,
-					# Host KV growth fields
-					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
-					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
-					'host_pages_allocated': seq.host_pages_allocated,
-					'host_owned_pages': seq.host_owned_pages,
-					'host_token_capacity': seq.host_token_capacity,
-					# prompt_length: required so Phase 4.C can compute the
-					# re-entry reconstruction length on ALL ranks deterministically,
-					# not just the owner. Without this, non-owning ranks have a
-					# stale prompt_length for re-evicted sequences (where the
-					# owner has already rewritten prompt_length in a prior
-					# eviction). See Phase 4.C.
-					'prompt_length': seq.prompt_length,
-					'reentry_decoded_baseline': seq.reentry_decoded_baseline,
-					'max_decode_length': seq.max_decode_length,
-					'original_max_decode_length': seq.original_max_decode_length,
-					# QueryBook metadata is process-local even though its token
-					# pages are node-shared. Publish the owner's lengths so
-					# non-owning ranks can repair their mirror before re-entry.
-					'trajectory_token_length': (
-						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).token_length
-						if self._traj.trajectory_book is not None
-						and self._traj.trajectory_book.has_sequence(uuid)
-						else None
-					),
-					'trajectory_decoded_length': (
-						self._traj.trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
-						if self._traj.trajectory_book is not None
-						and self._traj.trajectory_book.has_sequence(uuid)
-						else None
-					),
-					# total_decoded_before_eviction: propagated here so the
-					# next _prepare_prefill_batch's eviction priority sort is
-					# consistent across ranks.
-					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
-				}
-		
-		# Get candidates for loading - report PREFILLED/ON_HOLD sequences that could be loaded
-		# CRITICAL FIX: Only report PREFILLED or ON_HOLD sequences as load candidates.
-		# QUEUEING sequences have NOT been registered with host KV yet (registration
-		# happens during _config_prefill_for_batch), so trying to load them would fail
-		# with "Sequence X is not registered" error from the host KV backend.
-		decode_uuids_set = set(decode_uuids)
-		local_candidate_state = {}
-		valid_load_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
-		for uuid in self._uuid_to_local_map.keys():
-			if uuid in decode_uuids_set:
-				continue  # Already in decode batch
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			if seq.status == SequenceStatus.COMPLETED:
-				continue  # Don't load completed sequences
-			if seq.status not in valid_load_statuses:
-				continue  # Only load PREFILLED/ON_HOLD (not QUEUEING/IN_PREFILL)
-			try:
-				seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/load_candidate")
-			except Exception as exc:
-				local_payload_error = (
-					f"load candidate {uuid}: {type(exc).__name__}: {exc}"
-				)
-				continue
-			try:
-				pages_needed = seq.get_gpu_pages_for_two_page_buffer()
-			except Exception as exc:
-				local_payload_error = (
-					f"load candidate {uuid} page count: {type(exc).__name__}: {exc}"
-				)
-				continue
-			# Report this as a potential load candidate
-			local_candidate_state[uuid] = {
-				'pages_needed': pages_needed,
-				'assigned_rank': seq.assigned_rank,
-				'decode_dp_group': seq.decode_dp_group,  # Option 1 group-ownership key
-				'status': seq.status.name,  # Include status for debugging
-				'decoded_length': seq.decoded_length,  # For prioritized loading
-			}
-		
-		# Pack everything into one dict for single all_gather
-		local_payload = {
-			'free_pages': local_free_pages,
-			'total_pages': local_total_pages,
-			'error': local_payload_error,
-			'seq_state': local_seq_state,
-			'candidate_state': local_candidate_state,
-		}
-		
-		all_payloads = [None] * self.world_size
-		dist.all_gather_object(all_payloads, local_payload)
-		payload_errors = [
-			f"rank {rank_idx}: {payload.get('error')}"
-			for rank_idx, payload in enumerate(all_payloads)
-			if isinstance(payload, dict) and payload.get('error')
-		]
-		if payload_errors:
-			raise RuntimeError(
-				"[SCHED_INVARIANT] boundary payload validation failed: "
-				+ " | ".join(payload_errors)
-			)
-		validate_boundary_payload_alignment(
-			decode_uuids, all_payloads, group_size=self._decode_attn_tp_size()
+		decisions, global_seq_state, worker_view, chunk_size, t0 = self._plan_boundary(
+			decode_uuids, gpu_manager, timing, t0,
 		)
-		
-		timing.gather_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== PHASE 2: MERGE GATHERED DATA + RANK-0 DECISIONS ==========
-		t0 = time.perf_counter()
-
-		# Extract per-rank live capacity.  Total pages are immutable after GPU-KV
-		# initialization; rank 0 validates that invariant before planning any
-		# extension or load.
-		per_rank_free = [p['free_pages'] for p in all_payloads]
-		per_rank_total = [p['total_pages'] for p in all_payloads]
-		# Validate the live allocator snapshot on EVERY rank before rank 0
-		# computes or broadcasts decisions.  Keeping this check inside the
-		# rank-0 planner would strand peers in broadcast when one total differs.
-		reduce_decode_capacity_snapshot(
-			tuple(per_rank_total),
-			tuple(per_rank_free),
-			world_size=self.world_size,
-			attn_tp_size=self._decode_attn_tp_size(),
-		)
-
-		# Merge sequence state. G==1: each uuid appears exactly once (single owner).
-		# G>1 (Option 1): the uuid is reported by all G ranks of its group, so pin a
-		# CANONICAL owning_rank = decode_dp_group*G (the group leader) instead of
-		# last-writer-wins (which would arbitrarily land on the highest group rank).
-		_G_merge = self._decode_attn_tp_size()
-		global_seq_state = {}
-		for rank_idx, payload in enumerate(all_payloads):
-			if payload and payload['seq_state']:
-				for uuid, state in payload['seq_state'].items():
-					global_seq_state[uuid] = state
-					if _G_merge > 1:
-						_g = state.get('decode_dp_group')
-						global_seq_state[uuid]['owning_rank'] = (
-							_g * _G_merge if _g is not None else rank_idx
-						)
-					else:
-						global_seq_state[uuid]['owning_rank'] = rank_idx
-
-		# Merge candidate state
-		global_candidate_info = {}
-		for payload in all_payloads:
-			if payload and payload['candidate_state']:
-				global_candidate_info.update(payload['candidate_state'])
-
-		# VALIDATION: Check that all decode_uuids have state reported
-		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
-		if missing_uuids:
-			missing_details = []
-			for missing_uuid in missing_uuids[:10]:
-				seq = self.global_batch.get_sequence(missing_uuid)
-				expected_rank = seq.assigned_rank if seq else "N/A"
-				in_local_map = missing_uuid in self._uuid_to_local_map
-				seq_status = seq.status.name if seq else "NOT_FOUND"
-				rank_reported = [r for r, p in enumerate(all_payloads)
-								if p and p.get('seq_state', {}).get(missing_uuid)]
-				missing_details.append(
-					f"{missing_uuid}(assigned_rank={expected_rank}, in_local_map={in_local_map}, "
-					f"status={seq_status}, reported_by_ranks={rank_reported})"
-				)
-			raise RuntimeError(
-				f"Rank {self.rank}: [SCHED_INVARIANT] {len(missing_uuids)} active decode "
-				f"UUIDs missing from gathered seq_state; decode_uuids_len={len(decode_uuids)}, "
-				f"global_seq_state_len={len(global_seq_state)}, details={missing_details}"
-			)
-
-		# Update local SequenceEntry with gathered info (for sequences on other ranks)
-		post_gather_errors = []
-		for uuid, state in global_seq_state.items():
-			if uuid not in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None:
-					seq.decoded_length = state['decoded_length']
-					seq.current_context_length = state['current_context_length']
-					seq.gpu_pages_allocated = state['gpu_pages_allocated']
-					seq.eos_reached = state['eos_reached']
-					if state.get('rep_detected', False):
-						seq._rep_detected = True
-					# Sync host KV fields to keep all ranks consistent for migration planning
-					seq.host_pages_allocated = state['host_pages_allocated']
-					seq.host_owned_pages = state['host_owned_pages']
-					seq.host_token_capacity = state['host_token_capacity']
-					# Sync prompt_length (may have been rewritten by a prior
-					# eviction on the owner) and total_decoded_before_eviction
-					# so Phase 4 mutations can be computed deterministically on
-					# all ranks, and the next _prepare_prefill_batch selection
-					# priority sort is consistent.
-					if 'prompt_length' in state:
-						seq.prompt_length = state['prompt_length']
-					if 'reentry_decoded_baseline' in state:
-						seq.reentry_decoded_baseline = state['reentry_decoded_baseline']
-					if 'max_decode_length' in state:
-						seq.max_decode_length = state['max_decode_length']
-					if 'original_max_decode_length' in state:
-						seq.original_max_decode_length = state['original_max_decode_length']
-					if 'total_decoded_before_eviction' in state:
-						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
-					# Validate gathered ctx_len
-					expected_ctx = seq.original_prompt_length + seq.decoded_length
-					if seq.current_context_length != expected_ctx:
-						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-							f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
-						seq.current_context_length = expected_ctx
-					try:
-						seq.validate_metadata(
-							f"rank {self.rank} _page_boundary_fast/gathered_state",
-							require_owner_tensors=False,
-							allow_terminal_capacity_gap=bool(state.get('completed', False)),
-						)
-					except Exception as exc:
-						post_gather_errors.append(
-							f"gathered {uuid}: {type(exc).__name__}: {exc}"
-						)
-			# The token pages are shared, but the QueryBook metadata is not.
-			# Repair every local mirror from the canonical owner state before
-			# Phase 4 can call begin_reentry_turn on all ranks.
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				try:
-					self._sync_trajectory_metadata(seq, state)
-				except Exception as exc:
-					post_gather_errors.append(
-						f"trajectory {uuid}: {type(exc).__name__}: {exc}"
-					)
-
-		post_gather_reports = [None] * self.world_size
-		dist.all_gather_object(post_gather_reports, post_gather_errors)
-		post_gather_failures = [
-			f"rank {rank_idx}: {error}"
-			for rank_idx, errors in enumerate(post_gather_reports)
-			for error in (errors or [])
-		]
-		if post_gather_failures:
-			raise RuntimeError(
-				"[SCHED_INVARIANT] gathered boundary state validation failed: "
-				+ " | ".join(post_gather_failures)
-			)
-
-		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
-		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
-		# This eliminates desync from independent decision-making.
-		# The worker owns the mirrored coordinator for DSA.  Using the engine's
-		# primary view here would let a partial primary/aux growth split escape the
-		# coordinator's transaction guard.
-		worker_view = getattr(self, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		per_node_host_stats = self._gather_host_kv_stats_by_node(worker_view)
-
-		if self.rank == 0:
-			try:
-				decisions = self._compute_boundary_decisions(
-					decode_uuids, global_seq_state, global_candidate_info,
-					per_rank_free, per_rank_total, chunk_size, per_node_host_stats,
-				)
-			except Exception as exc:
-				# Rank 0 owns the pure planner, but a malformed gathered state
-				# must become a broadcast scheduler error rather than strand peers
-				# waiting in the decision broadcast.
-				logging.exception("Rank 0 boundary planner failed")
-				decisions = BoundaryDecisions(
-					completed_uuids=[], active_uuids=[], host_growth_uuids=[],
-					host_growth_pages=[], growth_feasible=False,
-					host_evicted_uuids=[], onhold_uuids=[],
-					seqs_needing_extension=[], new_load_uuids=[],
-					decode_uuids_final=[],
-					scheduler_error=(
-						"[SCHED_INVARIANT] rank-0 boundary planner failed: "
-						f"{type(exc).__name__}: {exc}"
-					),
-				)
-		else:
-			decisions = None
-
-		# ========== PHASE 3: BROADCAST DECISIONS ==========
-		decisions_list = [decisions]
-		dist.broadcast_object_list(decisions_list, src=0)
-		decisions = decisions_list[0]
-		if decisions.scheduler_error:
-			raise RuntimeError(f"Rank {self.rank}: {decisions.scheduler_error}")
-
-		timing.num_completed = len(decisions.completed_uuids)
-		timing.num_onhold = len(decisions.onhold_uuids)
 
 		# ========== PHASE 4: EXECUTE DECISIONS LOCALLY ==========
 		# All ranks execute the same decisions, but only operate on locally-owned sequences
@@ -12867,7 +12435,7 @@ class BatchGenWorker:
 	def _weight_pass_end_delay(self, value) -> float:
 		"""Seconds this rank sleeps before closing each prefill weight pass.
 
-		``value`` is the batch-level ``weight_pass_end_delay`` debug entry,
+		``value`` is the ``weight_pass_end_delay`` debug-state entry,
 		``{"rank": <global rank>, "seconds": <float>}``; any other rank, or no
 		entry, gets 0.
 		"""
@@ -12880,14 +12448,14 @@ class BatchGenWorker:
 			or not 0 < value["seconds"] <= 60
 		):
 			raise ValueError(
-				"batchgen_debug.weight_pass_end_delay must be "
+				"debug_state.weight_pass_end_delay must be "
 				'{"rank": <int>, "seconds": <0 < s <= 60>}, '
 				f"got {value!r}"
 			)
 		return float(value["seconds"]) if value["rank"] == self.rank else 0.0
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
@@ -12911,26 +12479,26 @@ class BatchGenWorker:
 		)
 
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 
 	def _glm5_whole_model_graph_timing_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_whole_model_graph_timing")):
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
 	def _glm5_whole_model_graph_debug_value(self, key: str):
 		"""The current batch's ``batchgen_debug[key]`` (None when absent)."""
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return None
 		return debug.get(key)
@@ -12945,11 +12513,11 @@ class BatchGenWorker:
 		if value is None:
 			return 1e-2
 		if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}")
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}")
 		try:
 			return float(value)
 		except ValueError as exc:
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}") from exc
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}") from exc
 
 	def _glm5_whole_model_graph_probe_layers(self, num_layers: int) -> tuple:
 		"""``glm5_whole_model_graph_probe_layers``: decoder layers to probe.
@@ -12970,16 +12538,17 @@ class BatchGenWorker:
 		):
 			return tuple(value)
 		raise ValueError(
-			"batchgen_debug.glm5_whole_model_graph_probe_layers must be \"all\", a "
+			"debug_state.glm5_whole_model_graph_probe_layers must be \"all\", a "
 			f"comma-separated index string or a list of ints, got {value!r}"
 		)
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
+		# The per-layer graph modes this used to switch off are retired, so
+		# nothing is forced any more: the eager re-run only gets its own copy
+		# of the bound debug values, restored afterwards.
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
-		debug["glm5_dsa_mode"] = "eager"
-		debug["glm5_moe_mode"] = "eager"
 		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=debug)
 		try:
 			yield
@@ -13489,9 +13058,7 @@ class BatchGenWorker:
 	):
 		phase_state.bind_debug(
 			AttnWrapperBase,
-			batchgen_debug=self._active_batchgen_debug_for_sequences(
-				global_decode_sequences
-			),
+			batchgen_debug=self._debug_values(),
 		)
 		if (
 			AttnWrapperBase.batchgen_debug is not None
@@ -13513,7 +13080,7 @@ class BatchGenWorker:
 					self.rank,
 					_step_probe_request,
 				)
-		self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+		self._decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
 		self._configure_glm5_dispatch_trace(global_decode_sequences)
 		return probe_mismatch_logged
 

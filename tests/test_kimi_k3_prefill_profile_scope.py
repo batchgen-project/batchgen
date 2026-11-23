@@ -74,39 +74,38 @@ def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
             if isinstance(node, ast.FunctionDef) and node.name == moved
         )
 
-    # The invariant is that both prefill stages see batchgen_debug resolved
-    # from the admitted SequenceEntry objects, which is the only place a
-    # persistent pool admission carries it. prefill_prepacked resolves it
-    # itself. _config_prefill_for_batch no longer calls the resolver inline:
-    # the phase key owns the resolution and publishes it, and the config stage
-    # reads that published view. Pin the chain, not one call site, so the pin
-    # keeps guarding the invariant wherever the resolution lives.
-    prepacked_calls = [
-        node
-        for node in ast.walk(functions["prefill_prepacked"])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_active_batchgen_debug_for_sequences"
-    ]
-    assert prepacked_calls, (
-        "prefill_prepacked must resolve batchgen_debug from the active "
-        "SequenceEntry objects used by persistent pool admissions"
+    # The invariant is that both prefill stages see ONE debug view for the
+    # wave: the server's debug state as the wave adopted it. The wave adopts
+    # the state at its start and publishes it; prefill_prepacked and the
+    # config stage both read that published view, and neither re-derives it.
+    # Pin the chain, not one call site, so the pin keeps guarding the
+    # invariant wherever the adoption lives.
+    def _reads(function, attr):
+        return [
+            node
+            for node in ast.walk(functions[function])
+            if isinstance(node, ast.Attribute)
+            and node.attr == attr
+            and isinstance(node.ctx, ast.Load)
+        ]
+
+    assert _reads("prefill_prepacked", "_phase_prefill_debug"), (
+        "prefill_prepacked must read the debug view the wave published"
     )
 
-    # One resolution per wave: _begin_prefill_wave resolves the flags from
-    # ALL of the wave's sequences and _desired_phase_key reads that resolved
-    # view (refusing a wave that was not resolved), so a group serving only
-    # part of the wave never re-derives different flags from its subset.
+    # One adoption per wave: _begin_prefill_wave adopts the server state on
+    # every rank before any planner reads it, and _desired_phase_key reads
+    # that view (refusing a wave that was not begun).
     wave_calls = [
         node
         for node in ast.walk(functions["_begin_prefill_wave"])
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_active_batchgen_debug_for_sequences"
+        and node.func.attr == "_adopt_debug_state"
     ]
     assert wave_calls, (
-        "_begin_prefill_wave must resolve batchgen_debug from the active "
-        "SequenceEntry objects before any planner reads it"
+        "_begin_prefill_wave must adopt the server debug state before any "
+        "planner reads it"
     )
     key_reads = [
         node

@@ -128,8 +128,10 @@ def _stamping_worker(seqs, *, mode):
     worker_state = SimpleNamespace(
         rank=0,
         global_batch=SimpleNamespace(get_sequence=seqs.get),
-        _active_batchgen_debug_for_sequences=lambda batch_sequences: (
-            {"prefix_rank_assignment_mode": mode} if mode else None
+        # The launch parameter the worker's delegator hands to the engine.
+        args=SimpleNamespace(
+            prefix_rank_assignment_mode=mode or "packing_v2",
+            prefix_rank_cost_profile="on",
         ),
     )
     worker_state._prefix_rank_packing_mode = types.MethodType(
@@ -186,7 +188,7 @@ def test_stamping_happens_on_the_default_mode():
 def test_an_unknown_mode_is_refused():
     seqs = _family_admission()
     worker_state = _stamping_worker(seqs, mode="legacy")
-    with pytest.raises(ValueError, match="prefix_rank_assignment_mode"):
+    with pytest.raises(ValueError, match="--prefix-rank-assignment-mode"):
         worker_state._stamp_prefix_prefill_order(list(seqs))
 
 

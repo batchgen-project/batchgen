@@ -49,8 +49,7 @@ def test_create_batch_request_preserves_debug_and_sampling_fields():
         top_p=1.0,
         top_k=5,
         batchgen_debug={
-            "glm5_dsa_mode": "eager",
-            "glm5_moe_mode": "graph",
+            "glm5_graph_path_log": True,
         },
     )
 
@@ -65,9 +64,9 @@ def test_create_batch_request_preserves_debug_and_sampling_fields():
     assert batch.temperature == 0.0
     assert batch.top_p == 1.0
     assert batch.top_k == 5
+    # Carried as sent so that admission can refuse it by name.
     assert batch.batchgen_debug == {
-        "glm5_dsa_mode": "eager",
-        "glm5_moe_mode": "graph",
+        "glm5_graph_path_log": True,
     }
 
 
@@ -230,7 +229,7 @@ def _create_batch_app(storage, scheduler, worker):
         BatchObject=io_struct.BatchObject,
         FilePurpose=io_struct.FilePurpose,
         build_batch_object_from_create_request=io_struct.build_batch_object_from_create_request,
-        retired_batchgen_debug_error=io_struct.retired_batchgen_debug_error,
+        batchgen_debug_refusal=io_struct.batchgen_debug_refusal,
         uuid=uuid, time=time,
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), "http_server.py", "exec"), scope)

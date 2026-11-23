@@ -52,10 +52,11 @@ Two modes, because the sync is itself a hypothesis:
 
 Off by default and nothing in this module runs.
 
-Arming (batch level, no env var, no cold restart)::
+Arming (server debug state, no env var, no cold restart)::
 
-    {"batchgen_debug": {"prefix_pool_dump_kernel_args": "sync",
-                        "prefix_pool_dump_dir": "/dev/shm"}}
+    POST /v1/admin/debug-state
+    {"set": {"prefix_pool_dump_kernel_args": "sync",
+             "prefix_pool_dump_dir": "/dev/shm"}}
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ from batchgen.prefix_reuse.probe_guard import probe_safe
 
 import torch
 
-# Batch-level ``batchgen_debug`` keys.
+# Server debug-state keys.
 DEBUG_FLAG = "prefix_pool_dump_kernel_args"
 DUMP_DIR_FLAG = "prefix_pool_dump_dir"
 

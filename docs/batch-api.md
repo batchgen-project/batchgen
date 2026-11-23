@@ -22,6 +22,8 @@ OpenAI-compatible REST API for batch inference. Base URL: `http://<host>:<port>`
 | POST | `/v1/sessions/{session_id}/abort` | Abort a session and its in-flight turn |
 | POST | `/v1/turns` | Run one chat-completions turn of a session |
 | POST | `/v1/workers/restart` | Restart the GPU worker pool (see [Server Flags](server-flags.md#worker-pool-restart)) |
+| GET | `/v1/admin/debug-state` | The server's current debug state (see [Server Flags](server-flags.md#debug-state)) |
+| POST | `/v1/admin/debug-state` | Set or clear server-level debug switches |
 | GET | `/v1/workers/status` | Worker-pool state and restart status |
 | GET | `/health` | Health check |
 
@@ -176,7 +178,7 @@ Create a batch job from an uploaded input file.
 | `temperature` | float | No | None | Default sampling temperature. Per-request values override. |
 | `top_p` | float | No | None | Default nucleus sampling threshold. Per-request values override. |
 | `top_k` | int | No | None | Default top-k filtering. Per-request values override. |
-| `batchgen_debug` | object | No | None | Batch-level debug flags, applied to every request of the batch and echoed in the `BatchObject`. Intended for diagnostics and acceptance runs, for example `{"k3_triton_strict": true}` (Kimi-K3) or `{"glm5_triton_strict": true}` (GLM-5 family), which make a Triton compile after the startup prewarm raise. A batch that carries the retired key `k3_prefill_moe_mode` is refused with `400`: the prefill MoE mode is chosen per server with `--prefill-moe-mode`. |
+| `batchgen_debug` | object | No | None | **Not accepted.** Debug switches belong to the server, not to a batch: set them with [`POST /v1/admin/debug-state`](server-flags.md#debug-state) before submitting. A batch that carries a non-empty `batchgen_debug` is refused with `400`. |
 
 `POST /v1/batches` answers `503` with `Retry-After: 30` while the worker pool
 is not serving (during a worker-pool restart or after the pool went down), and
@@ -342,7 +344,8 @@ session.
 
 An OpenAI chat-completions body (`model`, `messages`, `tools`, `max_tokens` or
 `max_completion_tokens` (required), sampling parameters, `reasoning_effort`, …)
-plus a `session` object and an optional per-turn `batchgen_debug`. The prompt is
+plus a `session` object. Debug switches are not accepted on a turn (see
+[Debug state](server-flags.md#debug-state)). The prompt is
 rendered exactly as for a `/v1/batches` chat request. `n` must be 1.
 
 ```json
@@ -402,8 +405,7 @@ worker rank that owns the sequence.
 | `max_tokens`, `max_completion_tokens` | the model context length (`max_context_length` of `GET /v1/models`) | `400 max_tokens_exceeds_context` |
 | `messages` | 8192 entries | `400 too_many_messages` |
 | `tools` | 1024 entries | `400 too_many_tools` |
-| `batchgen_debug` | 64 KiB as JSON | `413 batchgen_debug_too_large` |
-| `batchgen_debug` keys | no retired key (`k3_prefill_moe_mode`: the prefill MoE mode is chosen per server with `--prefill-moe-mode`) | `400 retired_batchgen_debug_key` |
+| `batchgen_debug` | absent or empty; debug switches are set on the server | `400 batchgen_debug_not_accepted` |
 
 The batch path has no request-size limit of its own; prompt plus output
 beyond the context is still rejected per request by the worker

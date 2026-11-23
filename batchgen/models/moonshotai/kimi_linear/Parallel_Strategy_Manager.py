@@ -460,10 +460,12 @@ class KimiLinearParallelStrategyManager:
         they bake lives at fixed addresses (``_resident_ep_arena``), and the
         KV pool is remapped at its reserved addresses by the worker.
         """
-        return bool(
-            self._instances_are_reused
-            and self._decode_graph_mode() in ("graph", "compare")
-        )
+        graph = getattr(self, "_decode_graph", None)
+        # The mode in force, not only the planner's: under the server debug
+        # state ``kimi_decode_graph_mode: eager`` nothing is captured, so the
+        # kept instance owns no graphs and the startup capture expects none.
+        mode = self._decode_graph_mode() if graph is None else graph.capture_mode()
+        return bool(self._instances_are_reused and mode in ("graph", "compare"))
 
     def release_decode_routed_experts(self):
         """Return the resident EP shard's HBM; its addresses stay reserved.
@@ -1466,7 +1468,7 @@ class KimiLinearParallelStrategyManager:
 
     def _check_late_deepgemm_compiles(self, where):
         """Log the DeepGEMM kernels compiled since readiness;
-        ``batchgen_debug.k3_triton_strict`` makes it raise."""
+        ``debug_state.k3_triton_strict`` makes it raise."""
         if not torch.cuda.is_available():
             return
         from .triton_prewarm import check_late_deepgemm_compiles
@@ -1662,7 +1664,7 @@ class KimiLinearParallelStrategyManager:
             return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
-        # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
+        # debug_state.kimi_decode_graph_mode can switch graph/compare/eager
         # on a live server — the project's debug-flag policy (cf.
         # glm5_moe_mode), instead of a cold restart per experiment. The
         # ladder is captured by the first prewarm in a captured mode, so

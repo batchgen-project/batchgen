@@ -1,9 +1,8 @@
-"""Batch-level one-shot decode profile capture.
+"""One-shot decode profile capture, armed through the server debug state.
 
-``batchgen_debug.k3_decode_profile_steps = N`` asks the ranks listed in
-``k3_decode_profile_ranks`` (default rank 0) to wrap N decode steps in a
-profiler and log the per-kernel table; ``k3_decode_profile_trace = "<dir>"``
-also writes the Chrome trace there.
+``decode_profile_steps = N`` asks the ranks listed in ``decode_profile_ranks``
+(default rank 0) to wrap N decode steps in a profiler and log the per-kernel
+table; ``decode_profile_trace = "<dir>"`` also writes the Chrome trace there.
 
 The capture window belongs to the decode steps that carry the request. It
 opens after ``DECODE_PROFILE_WARMUP_STEPS`` requesting steps and ends at the
@@ -47,7 +46,7 @@ def open_torch_decode_profiler() -> Any:
 
 def _requested_steps(batchgen_debug: Optional[dict]) -> int:
     try:
-        return int((batchgen_debug or {}).get("k3_decode_profile_steps", 0) or 0)
+        return int((batchgen_debug or {}).get("decode_profile_steps", 0) or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -109,10 +108,10 @@ class DecodeProfileCapture:
         self._target_steps = steps
         self._captured_steps = 0
         self._rows = batch_rows
-        ranks = batchgen_debug.get("k3_decode_profile_ranks") or [0]
+        ranks = batchgen_debug.get("decode_profile_ranks") or [0]
         if self._rank not in ranks:
             return
-        self._trace_dir = batchgen_debug.get("k3_decode_profile_trace")
+        self._trace_dir = batchgen_debug.get("decode_profile_trace")
         try:
             self._profiler = self._open_profiler()
         except Exception as exc:  # noqa: BLE001 - diagnostics only

@@ -178,7 +178,7 @@ persistent instances, the `geometry` phase runs when the first batch enters
 decode, and its end arms a late-compile guard. The same phases compile its
 DeepGEMM kernels. The first start on empty Triton and DeepGEMM caches takes
 longer. The `[GLM5_TRITON_WARMUP]` and `[GLM5_DEEPGEMM_WARMUP]` log lines and the
-strict `batchgen_debug.glm5_triton_strict` check are described under "Startup
+strict `glm5_triton_strict` debug-state check are described under "Startup
 Triton prewarm" and "Startup Kernel Prewarm" in
 [the GLM-5.2 H200 guide](deploy-glm-5.2-h200.md#startup-triton-prewarm).
 

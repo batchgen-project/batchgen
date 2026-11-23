@@ -75,7 +75,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
 )
 
 
-# Slice 2 shares Slice 1b's batch-level flag: ONE flag governs the whole
+# Slice 2 shares Slice 1b's debug-state key: ONE flag governs the whole
 # trajectory path, so an operator cannot turn commits on and lookups off and
 # get a half-wired mechanism. Re-exported so the worker has one import site.
 from batchgen.prefix_reuse.trajectory_commit import (  # noqa: E402

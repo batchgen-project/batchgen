@@ -1,11 +1,11 @@
-"""GLM-5 debug behaviors are reachable only through ``batchgen_debug`` keys.
+"""GLM-5 debug behaviors are reachable only through server debug-state keys.
 
 The ``BATCHGEN_GLM5_*`` env-var entry points (dispatch trace, graph-path log,
 whole-model graph compare / timing / compare-fail / probe layers / compare
 atol / compare rtol, and the per-layer DSA/MoE graph modes deleted with that
 subsystem) are retired: the server-level graph mode is decided by the CLI at
-startup, and a batch-level key only selects compare / trace behavior within
-it. Each behavior is pinned here through its key, and each retired env var is
+startup, and a key of the server's debug state only selects compare / trace
+behavior within it. Each behavior is pinned here through its key, and each retired env var is
 pinned as not honored.
 
 The worker methods are compiled from source (``load_worker_methods``) and the
@@ -63,10 +63,12 @@ _METHODS = (
 
 
 class _Worker:
-    """Carries the compiled worker methods and the batch debug state."""
+    """Carries the compiled worker methods and the adopted debug state."""
 
 
 def _worker(debug: Optional[dict], *, wrapper_debug=None):
+    # ``wrapper_debug`` is what the attention wrappers were last bound to; the
+    # worker's own readers must not consult it.
     wrapper = SimpleNamespace(batchgen_debug=wrapper_debug)
     methods = load_worker_methods(
         _METHODS, {"AttnWrapperBase": wrapper, "Optional": Optional}
@@ -74,7 +76,7 @@ def _worker(debug: Optional[dict], *, wrapper_debug=None):
     worker = _Worker()
     for name, fn in methods.items():
         setattr(worker, name, fn.__get__(worker))
-    worker._batchgen_debug = debug
+    worker._debug_values = lambda: debug or None
     return worker
 
 
@@ -104,8 +106,8 @@ def test_each_flag_follows_its_key_and_ignores_the_retired_env(
 ):
     assert getattr(_worker({key: True}), method)()
     assert not getattr(_worker({}), method)()
-    # The wrapper-level batch debug is the same channel (decode installs it).
-    assert getattr(_worker(None, wrapper_debug={key: "1"}), method)()
+    # One source: what the wrappers were last bound to is not a second channel.
+    assert not getattr(_worker(None, wrapper_debug={key: True}), method)()
 
 
 def test_timing_also_follows_the_compare_key():

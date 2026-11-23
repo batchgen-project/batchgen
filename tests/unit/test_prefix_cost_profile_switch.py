@@ -1,14 +1,11 @@
-"""The cost-profile arm is a batch-level switch, and the cache follows it.
+"""The cost-profile arm is a launch parameter, and the cache follows it.
 
 Scoring the packer's targets by predicted seconds (profile) and balancing their
-computed tokens (no profile) are the two arms of the packing comparison, and
-the difference between them is a wall time — so both arms have to run inside
-ONE process, or the measurement is confounded with cold-start, allocator and
-JIT state. That makes two things load-bearing: the arm is resolved from the
-batch's ``batchgen_debug`` (replicated through the admitted-batch broadcast,
-like ``prefix_rank_assignment_mode``), and the deployment's profile lookup is
-cached PER ARM, because a single cached attribute would pin the whole process
-to whichever arm arrived first.
+computed tokens (no profile) are the two arms of the packing comparison. The
+arm is a property of the server (``--prefix-rank-cost-profile``): the worker
+passes its launch value to the engine, so every rank resolves the same arm.
+The deployment's profile lookup is cached PER ARM, so the cache can never
+answer for the other arm.
 
 Worker methods are compiled out of the module's AST onto fakes, as in
 ``test_decode_dp_group_packing.py``; the profile table and the lookup are real.
@@ -79,16 +76,21 @@ class _Props:
     total_memory = MEM_141G
 
 
-def _worker(*, model=K3_MODEL, world=WORLD, group=G, debug=None,
+def _worker(*, model=K3_MODEL, world=WORLD, group=G, cost_profile="on",
             device_properties=_Props):
     worker = SimpleNamespace(rank=0, world_size=world, model_name=model)
     worker._decode_attn_tp_size = lambda: group
-    worker._active_batchgen_debug_for_sequences = lambda seqs: debug
-    for name, function in _methods((
+    methods = _methods((
         "_cached_prefix_rank_cost_profile",
         "_prefix_rank_cost_profile_disabled",
-    )).items():
-        setattr(worker, name, MethodType(function, worker))
+    ))
+    worker._cached_prefix_rank_cost_profile = MethodType(
+        methods["_cached_prefix_rank_cost_profile"], worker
+    )
+    # The worker's delegator: it hands the engine the launch value.
+    worker._prefix_rank_cost_profile_disabled = lambda seqs: methods[
+        "_prefix_rank_cost_profile_disabled"
+    ](worker, seqs, value=cost_profile)
     worker._test_properties = device_properties
     return worker
 
@@ -150,22 +152,14 @@ def test_the_gpt_oss_entry_is_untouched():
 # ------------------------------------------------------------- the arm --- #
 
 
-@pytest.mark.parametrize("debug,expected", [
-    (None, False),
-    ({}, False),
-    ({"prefix_rank_assignment_mode": "packing_v2"}, False),
-    ({"prefix_rank_cost_profile": "on"}, False),
-    ({"prefix_rank_cost_profile": "off"}, True),
-    ({"prefix_rank_cost_profile": "OFF"}, True),
-    ({"prefix_rank_cost_profile": " off "}, True),
-])
-def test_the_arm_is_read_from_the_batch(debug, expected):
-    assert _worker(debug=debug)._prefix_rank_cost_profile_disabled([]) is expected
+@pytest.mark.parametrize("value,expected", [("on", False), ("off", True)])
+def test_the_arm_is_the_launch_value(value, expected):
+    assert _worker(cost_profile=value)._prefix_rank_cost_profile_disabled([]) is expected
 
 
-@pytest.mark.parametrize("value", ["", "0", "false", "no", True, 1, "disabled"])
-def test_a_mistyped_arm_is_refused_not_read_as_on(value):
-    worker = _worker(debug={"prefix_rank_cost_profile": value})
+@pytest.mark.parametrize("value", ["", "0", "OFF", " off ", None, True, 1, "disabled"])
+def test_a_value_the_launcher_cannot_produce_is_refused_not_read_as_on(value):
+    worker = _worker(cost_profile=value)
     with pytest.raises(ValueError, match="must be 'on' or 'off'"):
         worker._prefix_rank_cost_profile_disabled([])
 
@@ -225,7 +219,7 @@ def test_a_deployment_without_an_entry_falls_back_on_both_arms():
     "_pack_decode_dp_groups_for_sharing",
     "_assign_ranks_for_prefix_sharing",
 ])
-def test_both_packer_call_sites_pass_the_batch_arm(method):
+def test_both_packer_call_sites_pass_the_server_arm(method):
     body = ast.unparse(_method_ast(method))
     assert ("self._cached_prefix_rank_cost_profile("
             "self._prefix_rank_cost_profile_disabled(seqs))") in body

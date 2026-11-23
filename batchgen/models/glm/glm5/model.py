@@ -128,8 +128,8 @@ def _glm5_prefill_grouped_gemm_backend() -> str:
 
     Default ``deepgemm`` runs the adopted m-grouped contiguous backend over
     dense field-major ring views; ``cute_ptrs`` keeps the incumbent pointer
-    kernels for A/B comparisons (batchgen_debug key ``prefill_grouped_gemm``,
-    batch-level like every other debug key). A mistyped value is refused
+    kernels for A/B comparisons (debug-state key ``prefill_grouped_gemm``,
+    server-level like every other debug key). A mistyped value is refused
     rather than read as a default, because a silently ignored arm switch
     would make the two arms the same run.
     """
@@ -160,7 +160,7 @@ def _glm5_prefill_s1_act_quant_backend(gemm_backend: str) -> str:
     writes row-major scales, which the contiguous GEMM takes as they are.
     It is prewarmed with the other prefill kernels. ``unfused`` is the
     three-pass chain it replaced, kept selectable for comparisons
-    (batchgen_debug key ``prefill_s1_act_quant``, batch-level): torch SiLU
+    (debug-state key ``prefill_s1_act_quant``): torch SiLU
     and mul over the two S1 outputs, then the column-major CUDA ragged
     quant, whose scales the GEMM wrapper transposes per call.
 

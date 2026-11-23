@@ -308,7 +308,7 @@ class KimiLinearPlanner(BasePlanner):
         #   "graph":   replay the captured spans;
         #   "compare": replay AND run the eager span, logging max|delta|.
         # A batch can override per request with
-        # batchgen_debug.kimi_decode_graph_mode.
+        # debug_state.kimi_decode_graph_mode.
         self.config.Basic_Config.decode_graph_mode = "eager"
         # Per-rank decode buckets; the top bucket must cover
         # MoE_decoding_micro_batch_size (16 rows/rank above).
@@ -393,7 +393,7 @@ class KimiLinearPlanner(BasePlanner):
         # of launches + per-layer NCCL), so the long-generation tail of a
         # 512x4096 run cost r20 ~20 min at 72/192 occupancy. Falls back to
         # eager per step when any EP rank is empty. Batch-level override:
-        # batchgen_debug.kimi_decode_graph_mode. Every TP8 profile row takes
+        # debug_state.kimi_decode_graph_mode. Every TP8 profile row takes
         # it; the non-TP8 four-slot plan keeps its validated eager path.
         # The captured path also needs a graph-capturable dense MLA decode
         # kernel (paged_decode.graph_capturable: Hopper today).

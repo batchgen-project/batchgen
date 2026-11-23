@@ -380,13 +380,13 @@ def _plan_worker(
             "_decode_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
-            # The executor and the pool are built with the batch-level probes,
-            # read ONCE per wave through the shared batchgen_debug seam.
+            # The executor and the pool are built with the probes of the
+            # server's debug state, read ONCE per wave.
             "_pool_pad_poison_enabled",
             "_new_pool_kernel_dump_recorder",
             "_pool_probe_debug",
-            # The per-sequence flag merge _trajectory_commit_requested reads.
-            "_active_batchgen_debug_for_sequences",
+            # The adopted debug state _trajectory_commit_requested reads.
+            "_debug_values",
             # M3 Slice 3 plan input: with the trajectory flag off these
             # return "no hits" and the plan is the pre-Slice-3 one.
             "_materialized_prefix_hits",
@@ -433,12 +433,10 @@ def _plan_worker(
         prefix_cache_coordinator=RecordingCoordinator(),
         _prefill_pool_base=(0, 0, 0),
         # No trajectory frontier in play: no attachment, no mirrored index.
-        # No worker-wide batchgen_debug: the batch-level flags are the only
-        # source, and none of these sequences sets one.
-        _batchgen_debug=None,
-        # Request-level flags ARE the source here, so the per-sequence merge
-        # must stay reachable (the worker latches this at admission).
-        _any_sequence_batchgen_debug=True,
+        # The server's debug state as the wave adopted it: empty, unless a
+        # test arms a probe (``_pool_with_debug``).
+        _debug_state_values=None,
+        _phase_prefill_debug={},
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
@@ -469,21 +467,12 @@ def _plan_worker(
 # --------------------------------------------------------------------------- #
 
 
-def _seqs_with_debug(debug):
-    """The wave's sequences, each carrying one batch-level debug dict."""
-    seqs = _seqs()
-    for seq in seqs.values():
-        seq.batchgen_debug = dict(debug)
-    return seqs
-
-
 def _pool_with_debug(monkeypatch, debug):
     _stub_heavy_modules(monkeypatch, free_state_slots=32)
     worker = _plan_worker(free_pages=20, fake_dist=FakeDist(peer_budget=[16, 32]))
     if debug is not None:
-        worker.global_batch = SimpleNamespace(
-            get_sequence=_seqs_with_debug(debug).get
-        )
+        worker._debug_state_values = dict(debug)
+        worker._phase_prefill_debug = dict(debug)
     wave = worker._plan_prefill_pool_wave(UUIDS, {})
     assert wave is not None
     worker._construct_prefill_pool(wave)
@@ -498,7 +487,7 @@ def test_the_executor_is_built_without_the_pad_poison_probe(monkeypatch):
 
 
 def test_a_batch_can_arm_the_pad_poison_probe(monkeypatch):
-    """``batchgen_debug.prefix_pool_pad_poison`` reaches the chunk executor."""
+    """``debug_state.prefix_pool_pad_poison`` reaches the chunk executor."""
     wave = _pool_with_debug(monkeypatch, {"prefix_pool_pad_poison": True})
 
     assert wave.executor.pad_poison is True

@@ -8,7 +8,7 @@ has never been asserted. The failure is silent by construction -- the wave
 plan stays identical across ranks and runs, and only the DATA moves -- so a
 wrong destination start or a wrong page stride reads as a model bug.
 
-This module is that assertion, driven by the batch-level debug flag
+This module is that assertion, driven by the server debug-state key
 ``prefix_pool_offload_check``. At offload-issue time the recorder digests the
 SOURCE bytes of every row (the whole row, plus one digest per destination Host
 page). Once the wave's D2H has retired, the worker re-reads the DESTINATION
@@ -47,9 +47,9 @@ from typing import Callable, Optional, Sequence
 
 from batchgen.prefix_reuse.probe_guard import probe_error, probe_safe
 
-# Batch-level ``batchgen_debug`` key. Batch-level only, by project debug
-# policy: a per-sequence offload check would mix checked and unchecked rows
-# inside one pooled chunk, and the chunk is the unit that gets offloaded.
+# Server debug-state key. One value for the whole wave: a per-sequence
+# offload check would mix checked and unchecked rows inside one pooled chunk,
+# and the chunk is the unit that gets offloaded.
 DEBUG_FLAG = "prefix_pool_offload_check"
 
 LOG_TAG = "[PREFIX_POOL_OFFLOAD_CHECK]"

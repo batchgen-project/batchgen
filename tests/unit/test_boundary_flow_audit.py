@@ -24,6 +24,7 @@ reader the carry-out can reach.
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
 from typing import Dict, List, Set, Tuple
 
@@ -173,10 +174,60 @@ def _functions() -> Dict[str, List[Tuple[str, ast.FunctionDef]]]:
 
 
 _INDEX = _functions()
-_BOUNDARY = next(
-    node for name, node in _INDEX["_page_boundary_fast"]
-    if name == "batchgen_worker.py"
-)
+_PLANNER = _ROOT / "batchgen" / "worker" / "admission" / "boundary_planner.py"
+
+
+def _planner_plan() -> ast.FunctionDef:
+    tree = ast.parse(_PLANNER.read_text(), filename=str(_PLANNER))
+    planner = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BoundaryPlanner"
+    )
+    return next(
+        node for node in planner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "plan"
+    )
+
+
+def _boundary_with_plan_inlined() -> ast.FunctionDef:
+    """The page boundary as one function, in execution order.
+
+    The gather, the rank-0 decision and the broadcast are
+    ``BoundaryPlanner.plan``; the worker's boundary reaches it through
+    ``_plan_boundary``, which it calls once. The facts below are about the
+    order of statements across the whole boundary, so the plan's statements
+    are put back where the call is, with line numbers shifted so that source
+    order equals execution order: before the plan, the plan, the rest.
+    """
+    boundary = copy.deepcopy(next(
+        node for name, node in _INDEX["_page_boundary_fast"]
+        if name == "batchgen_worker.py"
+    ))
+    plan = copy.deepcopy(_planner_plan())
+    calls = [
+        index for index, statement in enumerate(boundary.body)
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_plan_boundary"
+            for node in ast.walk(statement)
+        )
+    ]
+    assert len(calls) == 1, "the boundary calls its plan step exactly once"
+    at = calls[0]
+    after = boundary.body[at + 1:]
+    for offset, statements in ((1_000_000, plan.body), (2_000_000, after)):
+        for statement in statements:
+            for node in ast.walk(statement):
+                if hasattr(node, "lineno"):
+                    node.lineno += offset
+                if getattr(node, "end_lineno", None) is not None:
+                    node.end_lineno += offset
+    boundary.body = boundary.body[:at] + plan.body + after
+    return boundary
+
+
+_BOUNDARY = _boundary_with_plan_inlined()
 
 
 def _calls(node: ast.AST, name: str) -> List[ast.Call]:
@@ -607,3 +658,45 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
         # name-collision artifact: LaunchReadinessReport's own field
         "to_json": {"status"},
     }
+
+
+def test_the_plan_step_takes_the_context_and_returns_what_the_carry_out_reads():
+    """``BoundaryPlanner.plan`` is the gather, the rank-0 decision and the broadcast.
+
+    It takes the decode context, never the worker. The completion rule and
+    the decode padding batch size are the caller's and arrive as arguments.
+    It returns in one place, with the five values the carry-out reads.
+    """
+    plan = _planner_plan()
+    assert [arg.arg for arg in plan.args.args] == [
+        "self", "ctx", "is_sequence_completed", "max_rank_bsz", "decode_uuids",
+        "gpu_manager", "timing", "t0",
+    ]
+    assert "worker" not in {n.id for n in ast.walk(plan) if isinstance(n, ast.Name)}
+    assert not any(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        for node in ast.walk(plan)
+    ), "the planner is stateless and holds no worker"
+    returns = [node for node in ast.walk(plan) if isinstance(node, ast.Return)]
+    assert [ast.unparse(node.value) for node in returns] == [
+        "(decisions, global_seq_state, worker_view, chunk_size, t0)"
+    ]
+    gather = _calls(plan, "all_gather_object")
+    decide = _calls(plan, "_compute_decisions")
+    broadcast = _calls(plan, "broadcast_object_list")
+    assert len(decide) == 1 and len(broadcast) == 1 and gather
+    assert gather[0].lineno < decide[0].lineno < broadcast[0].lineno
+
+    wiring = next(
+        node for name, node in _INDEX["_plan_boundary"]
+        if name == "batchgen_worker.py"
+    )
+    plans = _calls(wiring, "plan")
+    assert len(plans) == 1
+    assert [ast.unparse(arg) for arg in plans[0].args[:3]] == [
+        "self._decode_phase_context()",
+        "self._is_sequence_completed",
+        "getattr(self, '_decode_padding_bsz', 0) or 0",
+    ]
+
