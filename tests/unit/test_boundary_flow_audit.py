@@ -195,41 +195,71 @@ def _executor_apply() -> ast.FunctionDef:
     )
 
 
-def _boundary_with_carry_out_inlined() -> ast.FunctionDef:
-    """The page boundary as one function again, in execution order.
+_PLANNER = _ROOT / "batchgen" / "worker" / "admission" / "boundary_planner.py"
 
-    The carry-out of the decisions is ``BoundaryExecutor.apply``; the boundary
-    reaches it through the worker's ``_apply_boundary_decisions``, which it
-    calls once. The facts
-    below are about the order of statements across the whole boundary, so the
-    carry-out's statements are put back where the call is, with line numbers
-    shifted so that source order equals execution order: everything before
-    the call, then the carry-out, then everything after it.
-    """
-    boundary = copy.deepcopy(_worker_function("_page_boundary_fast"))
-    carry_out = copy.deepcopy(_executor_apply())
-    calls = [
-        index for index, statement in enumerate(boundary.body)
+
+def _planner_plan() -> ast.FunctionDef:
+    tree = ast.parse(_PLANNER.read_text(), filename=str(_PLANNER))
+    planner = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BoundaryPlanner"
+    )
+    return next(
+        node for node in planner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "plan"
+    )
+
+
+def _statement_calling(body, name: str) -> int:
+    found = [
+        index for index, statement in enumerate(body)
         if any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_apply_boundary_decisions"
+            and node.func.attr == name
             for node in ast.walk(statement)
         )
     ]
-    assert len(calls) == 1, "the boundary calls its carry-out exactly once"
-    at = calls[0]
-    # The statement after the call returns early when no decode row is left;
-    # in the carry-out that is its own early return, so it is dropped here.
-    after = boundary.body[at + 2:]
-    for offset, statements in ((1_000_000, carry_out.body), (2_000_000, after)):
-        for statement in statements:
-            for node in ast.walk(statement):
-                if hasattr(node, "lineno"):
-                    node.lineno += offset
-                if getattr(node, "end_lineno", None) is not None:
-                    node.end_lineno += offset
-    boundary.body = boundary.body[:at] + carry_out.body + after
+    assert len(found) == 1, f"the boundary calls {name} exactly once"
+    return found[0]
+
+
+def _shift(statements, offset: int) -> None:
+    for statement in statements:
+        for node in ast.walk(statement):
+            if hasattr(node, "lineno"):
+                node.lineno += offset
+            if getattr(node, "end_lineno", None) is not None:
+                node.end_lineno += offset
+
+
+def _boundary_with_carry_out_inlined() -> ast.FunctionDef:
+    """The page boundary as one function again, in execution order.
+
+    The worker's boundary keeps the wait for pending work and the closing
+    page-table rebuild and checks. In between it calls two steps once each:
+    ``_plan_boundary`` (``BoundaryPlanner.plan``: gather, rank-0 decision,
+    broadcast) and ``_apply_boundary_decisions`` (``BoundaryExecutor.apply``:
+    the carry-out). The facts below are about the order of statements across
+    the whole boundary, so both steps' statements are put back where their
+    calls are, with line numbers shifted so that source order equals
+    execution order: before the plan, the plan, the carry-out, the rest.
+    """
+    boundary = copy.deepcopy(_worker_function("_page_boundary_fast"))
+    plan = copy.deepcopy(_planner_plan())
+    carry_out = copy.deepcopy(_executor_apply())
+    plan_at = _statement_calling(boundary.body, "_plan_boundary")
+    apply_at = _statement_calling(boundary.body, "_apply_boundary_decisions")
+    assert plan_at < apply_at
+    between = boundary.body[plan_at + 1:apply_at]
+    # The statement after the carry-out call returns early when no decode row
+    # is left; in the carry-out that is its own early return, so it is dropped.
+    after = boundary.body[apply_at + 2:]
+    _shift(plan.body, 1_000_000)
+    _shift(between, 2_000_000)
+    _shift(carry_out.body, 3_000_000)
+    _shift(after, 4_000_000)
+    boundary.body = boundary.body[:plan_at] + plan.body + between + carry_out.body + after
     return boundary
 
 
@@ -711,3 +741,46 @@ def test_the_carry_out_is_one_method_with_a_declared_result():
 
     boundary = _worker_function("_page_boundary_fast")
     assert len(_calls(boundary, "_apply_boundary_decisions")) == 1
+
+
+def test_the_plan_step_takes_the_context_and_returns_what_the_carry_out_reads():
+    """``BoundaryPlanner.plan`` is the gather, the rank-0 decision and the broadcast.
+
+    It takes the decode context, never the worker. The completion rule and
+    the decode padding batch size are the caller's and arrive as arguments.
+    It returns in one place, with the five values the carry-out is called with.
+    """
+    plan = _planner_plan()
+    assert [arg.arg for arg in plan.args.args] == [
+        "self", "ctx", "is_sequence_completed", "max_rank_bsz", "decode_uuids",
+        "gpu_manager", "timing", "t0",
+    ]
+    assert "worker" not in {n.id for n in ast.walk(plan) if isinstance(n, ast.Name)}
+    assert not any(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        for node in ast.walk(plan)
+    ), "the planner is stateless and holds no worker"
+    returns = [node for node in ast.walk(plan) if isinstance(node, ast.Return)]
+    assert [ast.unparse(node.value) for node in returns] == [
+        "(decisions, global_seq_state, worker_view, chunk_size, t0)"
+    ]
+    # One gather of per-rank payloads and one broadcast of the decisions, in
+    # that order, with the rank-0 decision between them.
+    gather = _calls(plan, "all_gather_object")
+    decide = _calls(plan, "_compute_decisions")
+    broadcast = _calls(plan, "broadcast_object_list")
+    assert len(decide) == 1 and len(broadcast) == 1 and gather
+    assert gather[0].lineno < decide[0].lineno < broadcast[0].lineno
+
+    wiring = _worker_function("_plan_boundary")
+    plans = _calls(wiring, "plan")
+    assert len(plans) == 1
+    assert [ast.unparse(arg) for arg in plans[0].args[:3]] == [
+        "self._decode_phase_context()",
+        "self._is_sequence_completed",
+        "getattr(self, '_decode_padding_bsz', 0) or 0",
+    ]
+    boundary = _worker_function("_page_boundary_fast")
+    assert len(_calls(boundary, "_plan_boundary")) == 1
+

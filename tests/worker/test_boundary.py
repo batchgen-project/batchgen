@@ -283,12 +283,20 @@ def test_tp_new_load_rejects_one_rank_group_shortfall():
 
 
 def test_boundary_capacity_validation_precedes_rank0_broadcast():
-    source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
+    package = Path(__file__).parents[2] / "batchgen"
+    source = (package / "batchgen_worker.py").read_text()
     boundary_source = source[source.index("def _page_boundary_fast"):]
     uuid_guard = boundary_source.index("all_gather_object(all_decode_sets")
     empty_return = boundary_source.index("if not decode_uuids:")
-    snapshot_check = boundary_source.index("reduce_decode_capacity_snapshot(\n\t\t\ttuple(per_rank_total)")
-    rank0_planner = boundary_source.index("if self.rank == 0:\n\t\t\ttry:\n\t\t\t\tdecisions = self._compute_boundary_decisions")
+    # The gather and the rank-0 decision live in BoundaryPlanner.plan.
+    planner_source = (package / "worker" / "admission" / "boundary_planner.py").read_text()
+    snapshot_check = planner_source.index(
+        "reduce_decode_capacity_snapshot(\n            tuple(per_rank_total)"
+    )
+    rank0_planner = planner_source.index(
+        "if ctx.facts.rank == 0:\n            try:\n"
+        "                decisions = _compute_decisions("
+    )
     assert uuid_guard < empty_return
     assert snapshot_check < rank0_planner
 
