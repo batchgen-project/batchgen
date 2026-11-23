@@ -201,7 +201,7 @@ def _context(monkeypatch, gpu, *, world_size=1, attn_tp_size=1):
         host_kv_chunk_size=PAGE,
     )
     sched = SchedulingState(
-        pool=pool, seq_table=table, trajectories=TrajectoryStore(), prefix=None
+        pool=pool, seq_table=table, trajectories=TrajectoryStore()
     )
     ctx = DecodePhaseContext(
         facts=facts,
