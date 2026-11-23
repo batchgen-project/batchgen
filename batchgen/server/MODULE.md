@@ -147,8 +147,10 @@ owns the current `DebugState` on node 0. `GET/POST /v1/admin/debug-state`
 (`http_server.py`) reads and changes it: a phase-entry key is published on
 the admission queue (`WorkerManager.publish_debug_state`) and adopted by the
 workers at the next prefill wave or decode entry; a re-warm key needs
-`rewarm: true` and goes through `restart_workers`, whose init message carries
-the state, as does the first init message (`BatchScheduler`). A batch or turn
+`rewarm: true` and goes through `restart_workers`. Every pool start carries
+the state in the workers' launch arguments (`_spawn_workers`); rank 0
+broadcasts it to every rank before the worker is built, so it is in force for
+the start-up warm-up on every node. A batch or turn
 that carries `batchgen_debug` is refused with HTTP 400
 (`io_struct.batchgen_debug_refusal`); a batch stored before the refusal
 existed fails in `BatchScheduler._process_batch` before any request reaches a

@@ -169,7 +169,7 @@ def test_a_rewarm_restarts_the_pool_under_the_new_state_and_publishes_nothing():
     new = {"generation": 1, "values": {"kimi_decode_graph_mode": "eager"}}
     assert answer == {**new, "applied": "rewarm",
                       "restart": {"state": "serving", "generation": 4}}
-    # The new pool's init message carries the state; the old pool is not told.
+    # The new pool's launch arguments carry the state; the old pool is not told.
     assert manager.restarts == [(30.0, new)]
     assert manager.published == []
     assert manager.dispatcher is not None
@@ -253,11 +253,21 @@ def test_publishing_without_worker_channels_only_installs_the_state():
     assert manager.debug_state is state
 
 
-def test_both_pool_init_messages_carry_the_debug_state():
-    scheduler = (SERVER / "batch_scheduler.py").read_text()
-    manager = (SERVER / "worker_manager.py").read_text()
-    assert '"debug_state": self.worker.debug_state.to_wire()' in scheduler
-    assert '"debug_state": self.debug_state.to_wire()' in manager
+def test_every_pool_start_carries_the_debug_state_in_the_workers_launch_arguments():
+    # Not in the init message: that arrives after the start-up warm-up, too
+    # late for a key that is baked into captured graphs (seen on a real
+    # server: a restarted pool warmed up under the empty state).
+    tree = ast.parse((SERVER / "worker_manager.py").read_text())
+    spawn = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef) and node.name == "_spawn_workers")
+    keywords = [
+        ast.unparse(keyword.value) for node in ast.walk(spawn)
+        if isinstance(node, ast.Call) for keyword in node.keywords
+        if keyword.arg == "debug_state"
+    ]
+    assert keywords == ["self.debug_state.to_wire()"]
+    assert '"debug_state"' not in (SERVER / "batch_scheduler.py").read_text()
+    assert '"debug_state":' not in (SERVER / "worker_manager.py").read_text()
 
 
 def test_no_request_entry_carries_debug_switches_to_a_worker():

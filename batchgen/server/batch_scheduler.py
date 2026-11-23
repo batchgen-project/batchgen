@@ -1629,11 +1629,7 @@ class BatchScheduler:
 
             # First drain: send init message to worker
             if not self._pool_initialized:
-                init_msg = {
-                    "type": "init",
-                    **self.pool_init_params(),
-                    "debug_state": self.worker.debug_state.to_wire(),
-                }
+                init_msg = {"type": "init", **self.pool_init_params()}
                 self.worker.request_queue.put(init_msg)
                 self._pool_initialized = True
                 logger.info("[POOL] Init message sent to worker")

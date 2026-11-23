@@ -100,11 +100,10 @@ def test_clearing_every_key_returns_the_worker_to_no_debug_values():
     assert worker._debug_values() is None and worker._debug_state.generation == 2
 
 
-def test_the_pool_starts_under_the_state_of_its_init_message():
+def test_a_state_published_before_the_pool_is_initialised_is_taken_at_once():
     worker = _worker()
     worker.receive_debug_state(_wire(3, kimi_decode_graph_mode="eager"), at_start=True)
-    # In force before anything is captured: no phase entry is needed, and a
-    # re-warm key is legal here.
+    # No phase has run: no phase entry is needed.
     assert worker._debug_state.generation == 3
     assert worker._debug_values() == {"kimi_decode_graph_mode": "eager"}
     assert worker._pending_debug_state is None
@@ -252,11 +251,28 @@ def test_no_worker_code_reads_debug_flags_from_a_sequence():
     assert "batchgen_debug" not in sequence
 
 
-def test_the_main_loop_takes_a_state_published_before_init_and_the_init_state():
+def test_the_main_loop_takes_a_state_published_before_the_pool_is_initialised():
     source = MAIN_LOOP_SOURCE.read_text()
     assert 'task_data.get("type") == "debug_state"' in source
     assert 'worker.receive_debug_state(task_data.get("state"), at_start=True)' in source
-    assert 'worker.receive_debug_state(task_data.get("debug_state"), at_start=True)' in source
     early = source.index('task_data.get("type") == "debug_state"')
     init = source.index('task_data.get("type") == "init"')
     assert early < init
+
+
+def test_every_rank_starts_under_rank_zeros_state_before_its_worker_is_built():
+    # The start-up warm-up (compiles, graph captures) runs inside the worker's
+    # construction and start-up pass, before any message from the server; a
+    # key baked into captured graphs must already be in force there, on every
+    # node, although only node 0's server owns the state.
+    source = MAIN_LOOP_SOURCE.read_text()
+    broadcast = source.index(
+        "start_debug_state = [args.debug_state if args.global_rank == 0 else None]"
+    )
+    taken = source.index("args.debug_state = start_debug_state[0]")
+    built = source.index("worker = BatchGenWorker(args)")
+    assert broadcast < source.index(
+        "dist.broadcast_object_list(start_debug_state, src=0)"
+    ) < taken < built
+    worker_source = WORKER_SOURCE.read_text()
+    assert "DEBUG_KEY_REGISTRY.from_wire(args.debug_state)" in worker_source

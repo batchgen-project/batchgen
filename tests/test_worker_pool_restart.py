@@ -14,7 +14,6 @@ import queue
 import signal
 import sys
 import threading
-import types
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,10 +218,6 @@ def _manager(monkeypatch):
     manager._fail_in_flight_hook = lambda reason: 2
     manager._scheduler_generation_hook = lambda: None
     manager._pool_init_params_hook = lambda: {"max_output_len": 8192}
-    # The restarted pool starts under the server's debug state.
-    manager.debug_state = types.SimpleNamespace(
-        to_wire=lambda: {"generation": 4, "values": {"triton_strict": True}}
-    )
     manager._retire_channels_hook = None
     manager._restart_timeout_s = 10.0
     # Single node: the real coordinator is built, and every call through it
@@ -407,13 +402,7 @@ def test_restart_rotates_cohort_queues_and_releases_all_after_teardown(monkeypat
     assert len(manager.request_queue.items) == 1
     init_msg = manager.request_queue.items[0]
     assert init_msg["type"] == "init"
-    # The new pool is told its capacity and the server's debug state, so a
-    # key baked into captured graphs is in force before warm-up.
-    assert init_msg == {
-        "type": "init",
-        "max_output_len": 8192,
-        "debug_state": {"generation": 4, "values": {"triton_strict": True}},
-    }
+    assert init_msg == {"type": "init", "max_output_len": 8192}
     assert manager.response_queue.calls == []
     assert manager.response_queue.empty()
 

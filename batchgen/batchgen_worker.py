@@ -944,6 +944,10 @@ class BatchGenWorkerArgs:
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
 	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
 	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
+	# The server's debug state this worker pool starts under (wire form; None
+	# = empty). Rank 0 carries it from the server; every other rank takes rank
+	# 0's value before it builds its worker.
+	debug_state: Optional[dict] = None
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
 	debug_num_layers: Optional[int] = None
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
@@ -1496,9 +1500,11 @@ class BatchGenWorker:
 		# The server's debug state. ``_debug_state`` is the generation this
 		# worker runs under; a newer one received from the server waits in
 		# ``_pending_debug_state`` until the next phase entry adopts it.
-		self._debug_state: DebugState = DEBUG_KEY_REGISTRY.empty
+		self._debug_state: DebugState = DEBUG_KEY_REGISTRY.from_wire(args.debug_state)
 		self._pending_debug_state: Optional[DebugState] = None
-		self._debug_state_values: Optional[dict] = None
+		self._debug_state_values: Optional[dict] = (
+			self._debug_state.to_wire()["values"] or None
+		)
 		self._debug_state_logged_generation: Optional[int] = None
 
 		# 9. Initialization Flags
@@ -1635,9 +1641,10 @@ class BatchGenWorker:
 	def receive_debug_state(self, wire: Optional[dict], *, at_start: bool = False) -> None:
 		"""Take a debug state published by the server.
 
-		``at_start`` (the pool's init message): the pool starts under it, so
-		re-warm keys are in force before anything is captured. Otherwise it
-		waits for the next phase entry.
+		``at_start``: a state published before the pool was initialised (no
+		phase has run yet), taken at once. Otherwise it waits for the next
+		phase entry. The state a pool STARTS under comes with its launch
+		arguments, so that it is in force before the start-up warm-up.
 		"""
 		state = DEBUG_KEY_REGISTRY.from_wire(wire)
 		if at_start:

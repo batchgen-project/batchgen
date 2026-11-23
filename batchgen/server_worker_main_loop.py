@@ -808,6 +808,14 @@ def _server_worker_main_impl(
 		logging.error(f"Try restarting the server or check network connectivity between nodes.")
 		sys.exit(1)
 
+	# The pool starts under the server's debug state: rank 0 carries it from
+	# the server and every rank takes rank 0's value here, before the worker
+	# is built, so a key baked into captured graphs is in force for the
+	# start-up warm-up on every node.
+	start_debug_state = [args.debug_state if args.global_rank == 0 else None]
+	dist.broadcast_object_list(start_debug_state, src=0)
+	args.debug_state = start_debug_state[0]
+
 	# 2. Instantiate the BatchGenWorker
 	phase_reporter.enter(PHASE_MODEL_BUILD)
 	worker = BatchGenWorker(args)
@@ -1008,9 +1016,6 @@ def _server_worker_main_impl(
 				logging.info(f"Rank {global_rank}: Pool mode init received")
 				try:
 					current_max_output = task_data.get("max_output_len", 4096)
-					# The pool starts under the server's current debug state, so
-					# keys baked into captured graphs are in force before warm-up.
-					worker.receive_debug_state(task_data.get("debug_state"), at_start=True)
 
 					# Initialize worker with pool capacity (no sequences yet)
 					worker.Init(None, current_max_output, 0)
