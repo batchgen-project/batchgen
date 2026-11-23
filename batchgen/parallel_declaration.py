@@ -428,3 +428,27 @@ class ServerLayout:
             decode_moe=self.decode.moe,
             decode_graph=decode_graph,
         )
+
+
+def server_layout_from_declaration(
+    declaration: ParallelDeclaration, world_size: int
+) -> ServerLayout:
+    """The rank groups a manager's declared layout forms over ``world_size``."""
+    if not isinstance(declaration, ParallelDeclaration):
+        raise ParallelDeclarationError(
+            f"expected a ParallelDeclaration, got {type(declaration).__name__}"
+        )
+    return ServerLayout(
+        prefill=PhaseLayout(
+            PHASE_PREFILL,
+            declaration.prefill_attention,
+            declaration.prefill_moe,
+            world_size,
+        ),
+        decode=PhaseLayout(
+            PHASE_DECODE,
+            declaration.decode_attention,
+            declaration.decode_moe,
+            world_size,
+        ),
+    )

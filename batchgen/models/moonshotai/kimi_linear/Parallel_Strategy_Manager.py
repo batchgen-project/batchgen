@@ -2653,11 +2653,13 @@ class KimiLinearParallelStrategyManager:
         across groups), plain DP at G == 1; resident in decode always, and in
         prefill unless the planner streams all modules (K3 at G == 1 — a
         streamed prefill with G > 1 is refused at construction). MoE: the
-        planner-resolved modes map to the vocabulary — ``streamed`` and
-        ``streamed_sp8`` both run every expert replicated per rank with the
-        weights streamed from host (SP8 only changes the transport to
-        shard-and-all-gather), and ``resident_ep`` partitions the experts
-        over the world with the shard resident. An unknown mode fails by
+        planner-resolved modes map to the vocabulary — ``streamed`` runs every
+        expert replicated per rank with the weights streamed from host;
+        ``streamed_sp8`` partitions the routed experts over the ranks of one
+        attention group (each rank streams its share and the group exchanges
+        activations), so it is an expert-parallel group of that size with
+        streamed weights; and ``resident_ep`` partitions the experts over the
+        world with the shard resident. An unknown mode fails by
         name rather than declaring something untrue.
         """
         from batchgen.parallel_declaration import (
@@ -2679,8 +2681,12 @@ class KimiLinearParallelStrategyManager:
         attn_group = G if G > 1 else 1
 
         def _moe_slot(mode: str, phase: str) -> ModuleParallelism:
-            if mode in ("streamed", "streamed_sp8"):
+            if mode == "streamed":
                 return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
+            if mode == "streamed_sp8":
+                return ModuleParallelism(
+                    SCHEME_EP, RESIDENCY_STREAMED, group_size=G
+                )
             if mode == "resident_ep":
                 return ModuleParallelism(
                     SCHEME_EP, RESIDENCY_RESIDENT, group_size=self.world_size
