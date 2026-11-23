@@ -38,10 +38,21 @@ from batchgen.continuous_batching import (
     LoadingStrategy,
     plan_host_kv_growth_evictions,
     select_sequences_for_loading,
+    validate_boundary_payload_alignment,
 )
 from batchgen.worker.decode import reduce_decode_capacity_snapshot
 
 logger = logging.getLogger(__name__)
+
+# The worker package reaches the scheduler's boundary types through this
+# module only; the gather step (admission/boundary_planner.py) takes the
+# decision type and the payload check from here.
+__all__ = [
+    "BoundaryDecisionRequest",
+    "BoundaryDecisions",
+    "BoundaryHandler",
+    "validate_boundary_payload_alignment",
+]
 
 
 @dataclass(frozen=True)
