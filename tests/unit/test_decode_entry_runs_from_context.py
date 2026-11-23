@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import importlib
 import pathlib
 import sys
@@ -290,6 +291,109 @@ def test_in_decode_without_group_raises_under_tp_decode(monkeypatch):
 
     with pytest.raises(ValueError, match="has no decode_dp_group for"):
         DecodeEntry().select(h.ctx, 0)
+
+
+# --------------------------------------------------------------------------- #
+#  Shared-prefix runs (prefix cache on)                                       #
+# --------------------------------------------------------------------------- #
+
+
+class FakeHostView:
+    """Stands in for the host paged-KV view the shared runs are read from."""
+
+    def __init__(self, tables):
+        self.tables = tables
+        self.requests = []
+
+    def build_page_table(self, global_ids):
+        self.requests.append(list(global_ids))
+        return [list(self.tables[int(g)]) for g in global_ids]
+
+
+def _shared_prefix_harness(monkeypatch, *, world_size=1):
+    """Two PREFILLED rows of one book whose four Host pages are all shared."""
+    gpu = FakeGpuManager()
+    gpu.is_initialized = True
+    h = _context(monkeypatch, gpu, world_size=world_size)
+    facts = dataclasses.replace(h.ctx.facts, enable_prefix_cache=True)
+    h.ctx = dataclasses.replace(h.ctx, facts=facts)
+    _add_seq(h.pool, h.table, "a", 0, status=SequenceStatus.PREFILLED, req_pages=4)
+    _add_seq(h.pool, h.table, "b", 1, status=SequenceStatus.PREFILLED, req_pages=4)
+    h.view = FakeHostView({0: [7, 8, 9, 10], 1: [7, 8, 9, 10]})
+    monkeypatch.setattr(
+        kv_capacity_engine_module.KVCapacityEngine,
+        "_shared_page_identity_sources",
+        lambda self, ctx, manager: [(None, None, h.view)],
+    )
+    return h
+
+
+def test_local_shared_runs_are_read_from_the_host_page_ids(monkeypatch):
+    h = _shared_prefix_harness(monkeypatch)
+    runs = decode_entry_module._local_decode_shared_prefix_runs(h.ctx, ["a", "b"])
+    # One page of each reservation stays private even though all four Host
+    # pages are shared, so three pages are offered per row; the expectation
+    # is the pure planner on exactly those tables.
+    planned = decode_entry_module.plan_shared_runs({0: [7, 8, 9], 1: [7, 8, 9]})
+    assert planned, "the fixture must produce a shared run"
+    assert runs == {
+        uuid: ((int(planned[idx][0]), int(planned[idx][1])),)
+        for uuid, idx in (("a", 0), ("b", 1)) if idx in planned
+    }
+    assert runs
+    assert h.view.requests == [[0, 1]]
+
+
+def test_a_single_owned_candidate_has_no_shared_run(monkeypatch):
+    h = _shared_prefix_harness(monkeypatch)
+    assert decode_entry_module._local_decode_shared_prefix_runs(h.ctx, ["a"]) == {}
+    assert h.view.requests == []
+
+
+def test_shared_run_gather_is_skipped_without_the_prefix_cache(monkeypatch):
+    h = _shared_prefix_harness(monkeypatch)
+    off = dataclasses.replace(
+        h.ctx, facts=dataclasses.replace(h.ctx.facts, enable_prefix_cache=False)
+    )
+    assert decode_entry_module._gather_decode_shared_prefix_segments(off, ["a", "b"]) == {}
+    assert h.view.requests == [] and h.dist.calls == []
+
+
+def test_shared_run_gather_is_local_on_one_rank_and_collective_on_two(monkeypatch):
+    one = _shared_prefix_harness(monkeypatch)
+    local = decode_entry_module._local_decode_shared_prefix_runs(one.ctx, ["a", "b"])
+    assert decode_entry_module._gather_decode_shared_prefix_segments(
+        one.ctx, ["a", "b"]
+    ) == local
+    assert "all_gather_object" not in one.dist.calls
+
+    two = _shared_prefix_harness(monkeypatch, world_size=2)
+    merged = decode_entry_module._gather_decode_shared_prefix_segments(
+        two.ctx, ["a", "b"]
+    )
+    assert merged == local
+    assert two.dist.calls.count("all_gather_object") == 1
+
+
+def test_select_passes_the_shared_runs_to_the_pure_selection(monkeypatch):
+    h = _shared_prefix_harness(monkeypatch)
+    seen = {}
+    real = decode_entry_module.DecodeScheduler.select_decode_batch
+
+    def recording(request):
+        seen["segments"] = {
+            c.uuid: c.shared_prefix_segments for c in request.candidates
+        }
+        return real(request)
+
+    monkeypatch.setattr(
+        decode_entry_module.DecodeScheduler, "select_decode_batch",
+        staticmethod(recording),
+    )
+    selected = DecodeEntry().select(h.ctx, 0)
+    local = decode_entry_module._local_decode_shared_prefix_runs(h.ctx, ["a", "b"])
+    assert seen["segments"] == {u: local.get(u, ()) for u in ("a", "b")}
+    assert selected == ["a", "b"]
 
 
 # --------------------------------------------------------------------------- #
