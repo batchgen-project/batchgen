@@ -16,7 +16,7 @@ pytest.importorskip("fastapi")
 from fastapi import HTTPException, Request  # noqa: E402
 
 from batchgen.config.model_registry import DEBUG_KEY_REGISTRY  # noqa: E402
-from batchgen.debug_state import ADMIN_ENDPOINT, DebugState, DebugStateError  # noqa: E402
+from batchgen.server_debug_state import ADMIN_ENDPOINT, DebugState, DebugStateError  # noqa: E402
 
 SERVER = Path(__file__).resolve().parents[2] / "batchgen" / "server"
 

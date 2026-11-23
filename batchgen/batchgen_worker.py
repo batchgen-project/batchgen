@@ -324,7 +324,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 	DualPoolPageKeys,
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
-from batchgen.debug_state import DebugState, format_log_line as format_debug_state_log_line
+from batchgen.server_debug_state import DebugState, format_log_line as format_debug_state_log_line
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
 from batchgen_kernels import post_readiness
 from batchgen.worker.admission.plan import (

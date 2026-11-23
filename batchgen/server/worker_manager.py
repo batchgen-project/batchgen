@@ -20,7 +20,7 @@ import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
-from batchgen.debug_state import DebugState
+from batchgen.server_debug_state import DebugState
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.native_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient

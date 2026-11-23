@@ -1,5 +1,5 @@
-"""Server-level debug keys read by GLM-5 code (see ``batchgen/debug_state.py``)."""
-from batchgen.debug_state import (
+"""Server-level debug keys read by GLM-5 code (see ``batchgen/server_debug_state.py``)."""
+from batchgen.server_debug_state import (
     TIER_REWARM, key, parse_bool, parse_choice, parse_int, parse_layer_list, parse_number,
     parse_object,
 )

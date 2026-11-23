@@ -43,7 +43,7 @@ from batchgen.server.io_struct import (
     build_batch_object_from_create_request,
     batchgen_debug_refusal,
 )
-from batchgen.debug_state import ADMIN_ENDPOINT as DEBUG_STATE_ENDPOINT, DebugStateError
+from batchgen.server_debug_state import ADMIN_ENDPOINT as DEBUG_STATE_ENDPOINT, DebugStateError
 from batchgen.deprecation import (
     LEGACY_INFERENCE_ERROR_CODE,
     LEGACY_INFERENCE_MESSAGE,

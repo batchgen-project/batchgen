@@ -141,7 +141,7 @@ name at startup; a model without prefill MoE modes refuses the flag.
 
 # Debug state
 
-Debug switches are server-level (`batchgen/debug_state.py`; the registry is
+Debug switches are server-level (`batchgen/server_debug_state.py`; the registry is
 assembled as `config.model_registry.DEBUG_KEY_REGISTRY`). `WorkerManager`
 owns the current `DebugState` on node 0. `GET/POST /v1/admin/debug-state`
 (`http_server.py`) reads and changes it: a phase-entry key is published on

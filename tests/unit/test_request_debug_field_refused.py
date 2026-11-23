@@ -1,6 +1,6 @@
 """Admission refuses debug switches carried by a request.
 
-Debug switches belong to the server (``batchgen/debug_state.py``) and are set
+Debug switches belong to the server (``batchgen/server_debug_state.py``) and are set
 through the admin endpoint. A request that carries ``batchgen_debug`` is
 answered 400 naming that endpoint, before a worker sees it; the turn and
 stored-batch paths are covered in tests/test_turn_api.py.

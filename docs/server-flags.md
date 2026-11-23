@@ -160,8 +160,8 @@ long as the state is non-empty:
 A serving window that ran under a non-empty debug state is a diagnostic run,
 not an official result.
 
-The keys are declared in `batchgen/debug_state.py` (core keys) and in each
-model family's `debug_keys.py`, each with its owner, the phase that reads it
+The keys are declared in `batchgen/server_debug_state.py` (core keys) and in each
+model family's `server_debug_keys.py`, each with its owner, the phase that reads it
 and its tier. A request (`/v1/batches`, `/v1/turns`) that carries
 `batchgen_debug` is refused with `400`.
 

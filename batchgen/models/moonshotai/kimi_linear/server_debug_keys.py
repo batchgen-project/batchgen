@@ -1,5 +1,5 @@
-"""Server-level debug keys read by Kimi code (see ``batchgen/debug_state.py``)."""
-from batchgen.debug_state import TIER_REWARM, key, parse_bool, parse_choice
+"""Server-level debug keys read by Kimi code (see ``batchgen/server_debug_state.py``)."""
+from batchgen.server_debug_state import TIER_REWARM, key, parse_bool, parse_choice
 
 DEBUG_KEYS = (
     key("k3_triton_strict", "kimi_linear", "both", parse_bool,

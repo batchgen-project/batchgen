@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from batchgen import debug_state as ds
+from batchgen import server_debug_state as ds
 from batchgen.config.model_registry import DEBUG_KEY_REGISTRY as REGISTRY
 
 EMPTY = REGISTRY.empty
@@ -130,8 +130,8 @@ def test_the_request_field_refusal_names_the_admin_endpoint():
 
 def test_core_declares_no_model_key_and_each_family_declares_only_its_own():
     assert {key.owner for key in ds.CORE_KEYS} == {"core"}
-    from batchgen.models.glm.glm5 import debug_keys as glm5
-    from batchgen.models.moonshotai.kimi_linear import debug_keys as kimi
+    from batchgen.models.glm.glm5 import server_debug_keys as glm5
+    from batchgen.models.moonshotai.kimi_linear import server_debug_keys as kimi
     assert {key.owner for key in glm5.DEBUG_KEYS} == {"glm5"}
     assert {key.owner for key in kimi.DEBUG_KEYS} == {"kimi_linear"}
 

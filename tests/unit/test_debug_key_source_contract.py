@@ -1,7 +1,7 @@
 """Every debug key the code reads is declared, and every declared key is read.
 
-The registry (``batchgen/debug_state.py`` plus each model family's
-``debug_keys.py``) is the only place a key is defined. This file checks the
+The registry (``batchgen/server_debug_state.py`` plus each model family's
+``server_debug_keys.py``) is the only place a key is defined. This file checks the
 source tree against it, so a key cannot be added by reading it, a retired key
 cannot linger in a reader, and a declared key cannot be dead.
 """
@@ -15,9 +15,9 @@ from batchgen.config.model_registry import DEBUG_KEY_REGISTRY
 ROOT = Path(__file__).resolve().parents[2]
 SCANNED = ("batchgen", "batchgen_kernels")
 DECLARATIONS = {
-    ROOT / "batchgen" / "debug_state.py",
-    ROOT / "batchgen" / "models" / "glm" / "glm5" / "debug_keys.py",
-    ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "debug_keys.py",
+    ROOT / "batchgen" / "server_debug_state.py",
+    ROOT / "batchgen" / "models" / "glm" / "glm5" / "server_debug_keys.py",
+    ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "server_debug_keys.py",
 }
 
 

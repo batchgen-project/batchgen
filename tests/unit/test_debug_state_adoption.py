@@ -18,7 +18,7 @@ from typing import Optional
 import pytest
 
 from batchgen.config.model_registry import DEBUG_KEY_REGISTRY
-from batchgen.debug_state import DebugState, format_log_line
+from batchgen.server_debug_state import DebugState, format_log_line
 from tests.worker_method_source import load_worker_methods
 
 ROOT = Path(__file__).resolve().parents[2]

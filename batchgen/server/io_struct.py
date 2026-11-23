@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, root_validator, validator
 
-from batchgen.debug_state import request_field_refusal
+from batchgen.server_debug_state import request_field_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ class BatchStatus(str, Enum):
 def batchgen_debug_refusal(debug: Optional[Dict[str, Any]]) -> Optional[str]:
     """Why a request that carries ``batchgen_debug`` switches is refused.
 
-    Debug switches belong to the server (``batchgen/debug_state.py``): they
+    Debug switches belong to the server (``batchgen/server_debug_state.py``): they
     are set through the admin endpoint and hold for every request. Admission
     refuses a request that carries any (HTTP 400 on /v1/batches and /v1/turns,
     a failed batch for one already stored), so none reaches a worker.
