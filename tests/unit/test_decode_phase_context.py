@@ -41,6 +41,7 @@ class _Worker:
     prefix_cache_debug_stats = False
     _kv_stats_native = True
     _kv_stats_compare = False
+    shared_prefix_admission = True
     global_batch = object()
     seq_table = object()
     _traj = object()
