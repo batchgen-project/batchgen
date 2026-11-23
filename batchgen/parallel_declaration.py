@@ -452,3 +452,212 @@ def server_layout_from_declaration(
             world_size,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Implemented layouts: what a model family has built, declared as data.
+#
+# A manager lists, per phase, the (attention, MoE) combinations it implements.
+# The layout a server resolved is checked against that list at start-up; one
+# outside it is refused by name and the message lists the implemented ones.
+# The list is the model family's own statement, so "what is implemented" can
+# be read (and rendered into one table) without reading the model code.
+# ---------------------------------------------------------------------------
+
+GROUP_ONE = "1"            # a replicated module: no shard group
+GROUP_WORLD = "world"      # one group spanning every rank of the server
+GROUP_DIVISOR = "g"        # any group size that divides the world size
+GROUP_ATTENTION = "attn"   # the same group as the phase's attention
+_GROUP_RULES = (GROUP_ONE, GROUP_WORLD, GROUP_DIVISOR, GROUP_ATTENTION)
+# A group rule may also be a fixed size, written as an int greater than 1.
+
+
+def _is_fixed_group(group) -> bool:
+    return isinstance(group, int) and not isinstance(group, bool) and group > 1
+
+
+class UnsupportedLayoutError(ParallelDeclarationError):
+    """The resolved layout is not one the model family implements."""
+
+
+@dataclass(frozen=True)
+class ModuleSupport:
+    """The shapes of one module that a layout entry admits."""
+
+    scheme: str
+    residencies: Tuple[str, ...] = ()
+    group: object = GROUP_ONE
+
+    def __post_init__(self) -> None:
+        if self.scheme not in SCHEMES:
+            raise ParallelDeclarationError(
+                f"parallelism scheme {self.scheme!r} is not one of {SCHEMES}"
+            )
+        if self.group not in _GROUP_RULES and not _is_fixed_group(self.group):
+            raise ParallelDeclarationError(
+                f"group rule {self.group!r} is not one of {_GROUP_RULES} "
+                "or a fixed size greater than 1"
+            )
+        if self.scheme == SCHEME_NONE:
+            if self.residencies or self.group != GROUP_ONE:
+                raise ParallelDeclarationError(
+                    "a 'none' module admits no residency and no group"
+                )
+            return
+        if not self.residencies or any(r not in RESIDENCIES for r in self.residencies):
+            raise ParallelDeclarationError(
+                f"residencies {self.residencies!r} must be a non-empty subset "
+                f"of {RESIDENCIES}"
+            )
+        if (self.scheme in _GROUPED_SCHEMES) == (self.group == GROUP_ONE):
+            raise ParallelDeclarationError(
+                f"a {self.scheme} module {'needs' if self.scheme in _GROUPED_SCHEMES else 'has no'} "
+                f"shard group; got group rule {self.group!r}"
+            )
+
+    def admits(
+        self, module: ModuleParallelism, world_size: int, attention_group: int
+    ) -> bool:
+        if module.scheme != self.scheme:
+            return False
+        if self.scheme == SCHEME_NONE:
+            return True
+        if module.residency not in self.residencies:
+            return False
+        size = module.group_size
+        if _is_fixed_group(self.group):
+            return size == self.group
+        if self.group == GROUP_ONE:
+            return size == 1
+        if self.group == GROUP_WORLD:
+            return size == world_size
+        if self.group == GROUP_ATTENTION:
+            return size == attention_group
+        return size >= 1 and world_size % size == 0
+
+    def render(self) -> str:
+        if self.scheme == SCHEME_NONE:
+            return SCHEME_NONE
+        scheme = self.scheme
+        if scheme in _GROUPED_SCHEMES:
+            scheme = f"{scheme}<{self.group}>"
+        return f"{scheme}:{'|'.join(self.residencies)}"
+
+
+@dataclass(frozen=True)
+class LayoutSupport:
+    """One implemented (attention, MoE) combination of a phase."""
+
+    attention: ModuleSupport
+    moe: ModuleSupport
+
+    def __post_init__(self) -> None:
+        for name in ("attention", "moe"):
+            if not isinstance(getattr(self, name), ModuleSupport):
+                raise ParallelDeclarationError(
+                    f"layout support {name} must be a ModuleSupport"
+                )
+        if self.attention.group == GROUP_ATTENTION:
+            raise ParallelDeclarationError(
+                "the attention group cannot be defined by itself"
+            )
+
+    def admits(self, layout: PhaseLayout) -> bool:
+        attention_group = layout.attention.group_size
+        return self.attention.admits(
+            layout.attention, layout.world_size, attention_group
+        ) and self.moe.admits(layout.moe, layout.world_size, attention_group)
+
+    def render(self) -> str:
+        return f"attention={self.attention.render()} moe={self.moe.render()}"
+
+
+def replicated_prefill_world_ep_decode(
+    *,
+    prefill_moe: Tuple[str, ...] = (RESIDENCY_STREAMED,),
+    decode_attention: Tuple[str, ...] = (RESIDENCY_RESIDENT,),
+    decode_moe: Tuple[str, ...] = (RESIDENCY_RESIDENT, RESIDENCY_PARTIAL),
+) -> dict:
+    """The one layout most families implement: every module replicated per
+    rank in prefill with the attention weights streamed, and in decode a
+    replicated attention with the routed experts partitioned over the world."""
+    return {
+        PHASE_PREFILL: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+                ModuleSupport(SCHEME_DP, prefill_moe),
+            ),
+        ),
+        PHASE_DECODE: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, decode_attention),
+                ModuleSupport(SCHEME_EP, decode_moe, GROUP_WORLD),
+            ),
+        ),
+    }
+
+
+def read_supported_layouts(parallel_manager) -> Optional[dict]:
+    """The manager's ``SUPPORTED_LAYOUTS`` (``{phase: (LayoutSupport, ...)}``),
+    or None when the family does not declare one. A present table of the wrong
+    shape is a hard error."""
+    table = getattr(parallel_manager, "SUPPORTED_LAYOUTS", None)
+    if table is None:
+        return None
+    if not isinstance(table, dict) or set(table) != set(LAYOUT_PHASES):
+        raise ParallelDeclarationError(
+            f"{type(parallel_manager).__name__}.SUPPORTED_LAYOUTS must map "
+            f"exactly {LAYOUT_PHASES}"
+        )
+    for phase, entries in table.items():
+        if not isinstance(entries, tuple) or not entries or any(
+            not isinstance(entry, LayoutSupport) for entry in entries
+        ):
+            raise ParallelDeclarationError(
+                f"SUPPORTED_LAYOUTS[{phase!r}] must be a non-empty tuple of "
+                "LayoutSupport"
+            )
+    return table
+
+
+def check_layout_supported(model: str, supported: dict, layout: ServerLayout) -> None:
+    """Refuse, by name, a layout the model family does not implement."""
+    for phase in LAYOUT_PHASES:
+        phase_layout = layout.phase(phase)
+        entries = supported[phase]
+        if any(entry.admits(phase_layout) for entry in entries):
+            continue
+        implemented = "; ".join(entry.render() for entry in entries)
+        raise UnsupportedLayoutError(
+            f"layout {phase} {phase_layout.render()} on {phase_layout.world_size} "
+            f"ranks is not implemented for {model}; implemented {phase} "
+            f"layouts: {implemented}"
+        )
+
+
+def resolve_server_layout(
+    parallel_manager, world_size: int, decode_graph_owner=None
+) -> Tuple[Optional[ServerLayout], Optional[ParallelDeclaration]]:
+    """The layout the manager built, checked against what its family declares
+    as implemented. ``(None, None)`` when the manager declares nothing."""
+    declaration = read_parallel_declaration(parallel_manager, decode_graph_owner)
+    if declaration is None:
+        return None, None
+    layout = server_layout_from_declaration(declaration, world_size)
+    supported = read_supported_layouts(parallel_manager)
+    if supported is not None:
+        check_layout_supported(type(parallel_manager).__name__, supported, layout)
+    return layout, declaration
+
+
+def render_supported_layouts(tables: dict) -> str:
+    """One Markdown table of every family's implemented layouts."""
+    lines = ["| family | phase | attention | MoE |", "|---|---|---|---|"]
+    for family in sorted(tables):
+        for phase in LAYOUT_PHASES:
+            for entry in tables[family][phase]:
+                lines.append(
+                    f"| {family} | {phase} | {entry.attention.render()} | "
+                    f"{entry.moe.render()} |"
+                )
+    return "\n".join(lines)

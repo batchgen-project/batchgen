@@ -32,11 +32,16 @@ from batchgen.phase_lifecycle import (
     PhaseEnterContext,
     PhaseKey,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 
 NUM_TOTAL_EXPERTS = 256
 
 
 class MiniMaxM25ParallelStrategyManager:
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
     def __init__(self, loaded_model_config, engine_config, model_config,
                  core_engine, skeleton_state_dict, local_rank, global_rank, world_size):
         self.loaded_model_config = loaded_model_config

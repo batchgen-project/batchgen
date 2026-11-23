@@ -78,6 +78,20 @@ from .wrappers import (
     KimiLinearExpertWrapper,
     KimiLinearKDAWrapper,
 )
+from batchgen.parallel_declaration import (
+    GROUP_ATTENTION,
+    GROUP_DIVISOR,
+    GROUP_WORLD,
+    LayoutSupport,
+    ModuleSupport,
+    PHASE_DECODE,
+    PHASE_PREFILL,
+    RESIDENCY_RESIDENT,
+    RESIDENCY_STREAMED,
+    SCHEME_DP,
+    SCHEME_EP,
+    SCHEME_TP,
+)
 
 
 def _replace_param(root_module, dotted_name, tensor):
@@ -201,6 +215,50 @@ def uniform_expert_assignment(
 
 class KimiLinearParallelStrategyManager:
     """Parallel Strategy Manager for Kimi-Linear (KDA + NoPE-MLA hybrid)."""
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name. Attention
+    # is replicated at group size 1 and head-parallel over the attention group
+    # otherwise; the MoE follows the planner-resolved mode (``streamed``,
+    # ``streamed_sp8`` on the TP8 group, ``resident_ep`` over the world).
+    SUPPORTED_LAYOUTS = {
+        PHASE_PREFILL: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT, RESIDENCY_STREAMED)),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), 8),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_STREAMED,), GROUP_ATTENTION),
+            ),
+        ),
+        PHASE_DECODE: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+        ),
+    }
 
     def __init__(
         self,
