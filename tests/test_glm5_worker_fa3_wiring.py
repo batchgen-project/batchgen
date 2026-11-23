@@ -354,8 +354,13 @@ def test_admission_refuses_over_budget_rows_in_an_all_short_lifetime():
     an all_short capture is live, identically on every rank, so no rank can
     diverge from the collective mid-replay."""
     source = _WORKER_SRC.read_text()
-    anchor = source.index("DecodeScheduler.select_decode_batch")
+    # The selection itself is DecodeEntry.select; the worker runs this guard
+    # on its result before anything else reads the batch.
+    anchor = source.index("def _prepare_decode_batch")
     window = source[anchor: anchor + 2500]
+    assert window.index("DecodeEntry().select(") < window.index(
+        "glm5_whole_model_all_short"
+    )
     assert "glm5_whole_model_all_short" in window
     assert "kv_token_budget" in window
     assert "raise RuntimeError" in window
@@ -372,5 +377,5 @@ def test_guards_read_the_stored_index_topk():
     gate = engine_source[engine_source.index("_glm5_whole_graph_active = bool("):]
     gate = gate[: gate.index("_use_graph = (")]
     assert "glm5_whole_model_index_topk" in gate
-    admission = source[source.index("DecodeScheduler.select_decode_batch"):][:2500]
+    admission = source[source.index("def _prepare_decode_batch"):][:2500]
     assert "glm5_whole_model_index_topk" in admission
