@@ -154,7 +154,8 @@ node answers `409` naming node 0) and has no access check of its own, like
 `POST /v1/workers/restart`: protect it the way the rest of the server's port
 is protected.
 
-Every adoption logs one line on each node,
+Each node logs one line per new generation, and one per phase entry for as
+long as the state is non-empty:
 `[DEBUG_STATE] generation=N node=K keys=<key=value,...|none> phase=<prefill|decode>`.
 A serving window that ran under a non-empty debug state is a diagnostic run,
 not an official result.

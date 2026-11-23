@@ -131,7 +131,9 @@ def test_a_rewarm_key_cannot_change_on_a_running_pool(key, value):
     assert worker._debug_state.generation == 0 and worker._debug_values() is None
 
 
-def test_each_generation_is_logged_once_by_the_first_rank_of_each_node(caplog):
+def test_a_non_empty_state_is_logged_at_every_phase_entry_by_the_first_rank_of_each_node(
+    caplog,
+):
     lines = {}
     for local_rank, node in ((0, 0), (3, 0), (0, 1)):
         worker = _worker(local_rank=local_rank, node=node)
@@ -139,24 +141,31 @@ def test_each_generation_is_logged_once_by_the_first_rank_of_each_node(caplog):
         with caplog.at_level(logging.INFO):
             caplog.clear()
             worker._adopt_debug_state("prefill")
-            worker._adopt_debug_state("decode")      # same generation: no line
+            worker._adopt_debug_state("decode")
             lines[(local_rank, node)] = [
                 record.getMessage() for record in caplog.records
                 if record.getMessage().startswith("[DEBUG_STATE]")
             ]
+    # Every phase served under debug switches says so, so a slice of the log
+    # that starts after the adoption still shows the state.
     assert lines[(0, 0)] == [
-        "[DEBUG_STATE] generation=1 node=0 keys=triton_strict=True phase=prefill"
+        "[DEBUG_STATE] generation=1 node=0 keys=triton_strict=True phase=prefill",
+        "[DEBUG_STATE] generation=1 node=0 keys=triton_strict=True phase=decode",
     ]
     assert lines[(3, 0)] == []
     assert lines[(0, 1)] == [
-        "[DEBUG_STATE] generation=1 node=1 keys=triton_strict=True phase=prefill"
+        "[DEBUG_STATE] generation=1 node=1 keys=triton_strict=True phase=prefill",
+        "[DEBUG_STATE] generation=1 node=1 keys=triton_strict=True phase=decode",
     ]
 
 
-def test_the_empty_state_is_logged_too_so_a_window_can_be_proven_clean(caplog):
+def test_the_empty_state_is_logged_once_per_generation(caplog):
     worker = _worker()
     with caplog.at_level(logging.INFO):
         worker._adopt_debug_state("prefill")
+        worker._adopt_debug_state("decode")
+        worker._adopt_debug_state("prefill")
+    # The official path stays quiet: one line, then nothing per phase.
     assert [record.getMessage() for record in caplog.records] == [
         "[DEBUG_STATE] generation=0 node=0 keys=none phase=prefill"
     ]

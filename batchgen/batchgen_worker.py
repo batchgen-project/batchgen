@@ -1668,7 +1668,13 @@ class BatchGenWorker:
 			self._debug_state = pending
 			self._debug_state_values = pending.to_wire()["values"] or None
 		self._pending_debug_state = None
-		if self._debug_state_logged_generation != self._debug_state.generation:
+		# One line per new generation, and one per phase entry for as long as
+		# the state is non-empty: any slice of the log that contains a phase
+		# served under debug switches then says so by itself.
+		if (
+			self._debug_state_logged_generation != self._debug_state.generation
+			or self._debug_state.values
+		):
 			self._debug_state_logged_generation = self._debug_state.generation
 			if self.local_rank == 0:
 				logging.info(
