@@ -440,7 +440,7 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
             primary_slots=GLM5AttnWrapper.glm5_decode_primary_slot_indices,
             aux_slots=GLM5AttnWrapper.glm5_decode_aux_slot_indices,
             rank_counts=Glm5MoE._rank_token_counts,
-            debug=dict(AttnWrapperBase.batchgen_debug),
+            debug=AttnWrapperBase.batchgen_debug,
             ntp=[moe.num_tokens_per_rank for moe in moes],
         )
 
@@ -450,16 +450,14 @@ def test_two_consecutive_probe_calls_restore_all_published_state(monkeypatch):
     manager.startup_decode_probe_step(4)
     assert model.calls == 2
 
-    # During the step: eager forced, per-step graph state cleared, all rows
+    # During the step: no debug values, per-step graph state cleared, all rows
     # long, pure-DP width at the probe's plan on every MoE layer.
     assert during["short_count"] == 0
     assert during["prev_topk"] is None
     assert during["primary_slots"] is None
     assert during["aux_slots"] is None
     assert during["rank_counts"] is None
-    assert during["debug"] == {
-        "glm5_dsa_mode": "eager", "glm5_moe_mode": "eager",
-    }
+    assert during["debug"] is None
     assert during["ntp"] == [4, 4]
 
     # After the step: gate patch removed, DP width restored, every published

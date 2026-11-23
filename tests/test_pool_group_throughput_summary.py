@@ -113,21 +113,27 @@ def test_rejected_sequences_are_not_counted():
 
 
 def test_generate_starts_a_new_group_before_each_idle_admission():
+    # The idle wait hands every queue message to the worker's one dispatcher;
+    # for an admission, the new group must exist BEFORE its sequences are
+    # admitted into it.
     fn = _method("generate")
-    admits = 0
+    dispatches = 0
     for node in ast.walk(fn):
         body = getattr(node, "body", None)
         if not isinstance(body, list):
             continue
         for prev, stmt in zip(body, body[1:]):
-            call = getattr(stmt, "value", None)
-            if not (isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "_admit_sequences_from_message"):
+            test = getattr(stmt, "test", None)
+            if not (isinstance(stmt, ast.If) and isinstance(test, ast.Call)
+                    and isinstance(test.func, ast.Attribute)
+                    and test.func.attr == "_take_queue_message"):
                 continue
-            admits += 1
-            assert ast.unparse(prev) == "self._group_uuids = set()", ast.unparse(prev)
-    assert admits == 2  # rank-0 and non-rank-0 idle-admission branches
+            dispatches += 1
+            message = ast.unparse(test.args[0])
+            assert ast.unparse(prev) == (
+                f"if {message}.get('type') == 'admit':\n    self._group_uuids = set()"
+            ), ast.unparse(prev)
+    assert dispatches == 2  # rank-0 and non-rank-0 idle-wait branches
 
 
 def test_summaries_use_group_totals():

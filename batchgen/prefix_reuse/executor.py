@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from batchgen.prefix_reuse.wave_plan import PlanChunk, PlanItem, WavePrefixPlan
 
 
-# Batch-level ``batchgen_debug`` flag, read by the worker when it builds the
+# Server debug-state key, read by the worker when it builds the
 # executor. DIAGNOSTIC ONLY: see ``PoolChunkExecutor.__init__``.
 PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
 
@@ -77,7 +77,7 @@ class PoolChunkExecutor:
         *,
         pad_poison: bool = False,
     ) -> None:
-        """``pad_poison`` is the batch-level ``prefix_pool_pad_poison`` probe.
+        """``pad_poison`` is the ``prefix_pool_pad_poison`` debug-state probe.
 
         A chunk's page table is one rectangle, so a row shorter than the
         widest one is padded. The pad value is 0, which is a REAL pool page -

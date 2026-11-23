@@ -28,7 +28,7 @@ Parts:
     that the CPU tests check the table against;
   * the compile recorder, the late-compile guard and the two-phase runner
     from ``batchgen_kernels.triton_prewarm``, bound here to the
-    ``[K3_TRITON_WARMUP]`` log tag and ``batchgen_debug.k3_triton_strict``;
+    ``[K3_TRITON_WARMUP]`` log tag and ``debug_state.k3_triton_strict``;
   * ``prewarm_k3_triton_kernels``: phase 1 partitions the entries over the
     node-local attention-TP ranks, which share one Triton cache directory;
     after a barrier, phase 2 runs every entry on every rank, loading from
@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 LOG_TAG = "[K3_TRITON_WARMUP]"
 
-# Batch-level ``batchgen_debug`` key that turns a late compile into an error.
+# Server debug-state key that turns a late compile into an error.
 STRICT_DEBUG_KEY = "k3_triton_strict"
 
 # Row counts for kernels whose row count only sizes the launch grid. Two
@@ -235,7 +235,7 @@ def strict_requested(debug) -> bool:
 
 def _batch_debug() -> dict:
     """The served batch's ``batchgen_debug``, through the class attribute
-    that ``batchgen_debug.kimi_decode_graph_mode`` is read from."""
+    that ``debug_state.kimi_decode_graph_mode`` is read from."""
     try:
         from .cuda_graph_segments import _debug_dict
     except ImportError:
@@ -831,7 +831,7 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
         active.guard.arm()
         logger.info(
             "%s rank=%s late-compile guard armed: later compiles log at "
-            "WARNING; batchgen_debug.%s makes them raise",
+            "WARNING; debug_state.%s makes them raise",
             LOG_TAG, rank, STRICT_DEBUG_KEY,
         )
     _PREWARM_DONE = True
@@ -863,7 +863,7 @@ def arm_at_readiness(rank, strict: bool = False) -> None:
 
 def check_late_deepgemm_compiles(rank, where: str):
     """Report the DeepGEMM kernels compiled since readiness (WARNING; raises
-    under ``batchgen_debug.k3_triton_strict``). None before readiness."""
+    under ``debug_state.k3_triton_strict``). None before readiness."""
     return _deepgemm_guard().check_late_compiles(
         rank, where, strict=strict_requested(_batch_debug()),
         log_tag=DEEPGEMM_LOG_TAG,

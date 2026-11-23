@@ -28,7 +28,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
 from batchgen.config.layer_truncation import require_layer_truncation_applied
-from batchgen.config.model_registry import load_config
+from batchgen.config.model_registry import DEBUG_KEY_REGISTRY, load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
 from batchgen.config.config import detect_gpu_arch
@@ -320,6 +320,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import (
 	DualPoolPageKeys,
 )
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
+from batchgen.server_debug_state import DebugState, format_log_line as format_debug_state_log_line
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, configure_page_buffers
 from batchgen_kernels import post_readiness
 from batchgen.worker.admission.plan import (
@@ -432,7 +433,7 @@ class _WeightPasses:
 		self._current = None
 		self._carried = None
 		self._carried_produce_only = False
-		# Batch-level debug skew (batchgen_debug.weight_pass_end_delay): this
+		# Debug skew (debug_state.weight_pass_end_delay): this
 		# rank sleeps before closing each prefill pass, so its siblings run
 		# ahead exactly where a per-rank stop used to strand the node daemon.
 		self.end_delay_s = 0.0
@@ -845,6 +846,8 @@ class InputArguments:
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
+	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
 	debug_num_layers: Optional[int] = None
 
@@ -934,6 +937,12 @@ class BatchGenWorkerArgs:
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
+	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
+	# The server's debug state this worker pool starts under (wire form; None
+	# = empty). Rank 0 carries it from the server; every other rank takes rank
+	# 0's value before it builds its worker.
+	debug_state: Optional[dict] = None
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
 	debug_num_layers: Optional[int] = None
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
@@ -1483,12 +1492,15 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
-		self._batchgen_debug: Optional[dict] = None
-		# Sticky: set once an admitted sequence carries per-request debug
-		# flags. Only gates the per-row scan in
-		# _active_batchgen_debug_for_sequences, whose result is None while no
-		# sequence carries any, so a sticky True merely restores the scan.
-		self._any_sequence_batchgen_debug: bool = False
+		# The server's debug state. ``_debug_state`` is the generation this
+		# worker runs under; a newer one received from the server waits in
+		# ``_pending_debug_state`` until the next phase entry adopts it.
+		self._debug_state: DebugState = DEBUG_KEY_REGISTRY.from_wire(args.debug_state)
+		self._pending_debug_state: Optional[DebugState] = None
+		self._debug_state_values: Optional[dict] = (
+			self._debug_state.to_wire()["values"] or None
+		)
+		self._debug_state_logged_generation: Optional[int] = None
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -1613,22 +1625,65 @@ class BatchGenWorker:
 			self,
 		)
 		
-	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
-		if self._batchgen_debug:
-			return self._batchgen_debug
-		if not self._any_sequence_batchgen_debug:
-			# No sequence admitted on this worker ever carried per-request
-			# debug flags, so the merge below can only return None. Decode
-			# calls this every step, once per row.
-			return None
-		merged = {}
-		for seq in batch_sequences or []:
-			seq_debug = getattr(seq, "batchgen_debug", None)
-			if isinstance(seq_debug, dict):
-				for key, value in seq_debug.items():
-					if value is not None and key not in merged:
-						merged[key] = value
-		return merged or None
+	def _debug_values(self) -> Optional[dict]:
+		"""The adopted server debug state as a dict (None when it is empty).
+
+		The same object for every sequence, wave and step until the next phase
+		entry adopts a newer generation; readers must not modify it.
+		"""
+		return self._debug_state_values
+
+	def receive_debug_state(self, wire: Optional[dict], *, at_start: bool = False) -> None:
+		"""Take a debug state published by the server.
+
+		``at_start``: a state published before the pool was initialised (no
+		phase has run yet), taken at once. Otherwise it waits for the next
+		phase entry. The state a pool STARTS under comes with its launch
+		arguments, so that it is in force before the start-up warm-up.
+		"""
+		state = DEBUG_KEY_REGISTRY.from_wire(wire)
+		if at_start:
+			self._debug_state = state
+			self._debug_state_values = state.to_wire()["values"] or None
+			self._pending_debug_state = None
+		else:
+			self._pending_debug_state = state
+
+	def _adopt_debug_state(self, phase: str) -> None:
+		"""Phase entry: make the newest received debug state the running one.
+
+		Called at the start of a prefill wave and at decode entry, on every
+		rank, never inside a wave or a decode step. A change of a re-warm key
+		cannot arrive here: its value is baked into captured graphs or into a
+		phase instance, so the server applies it by re-warming the worker
+		pool, and the new pool starts with it.
+		"""
+		pending = self._pending_debug_state
+		if pending is not None and pending.generation != self._debug_state.generation:
+			baked = self._debug_state.rewarm_keys_changed(pending)
+			if baked:
+				raise RuntimeError(
+					f"Rank {self.rank}: debug state generation {pending.generation} changes "
+					f"{', '.join(baked)} on a running worker pool; these keys take effect "
+					"only through a re-warm of the pool"
+				)
+			self._debug_state = pending
+			self._debug_state_values = pending.to_wire()["values"] or None
+		self._pending_debug_state = None
+		# One line per new generation, and one per phase entry for as long as
+		# the state is non-empty: any slice of the log that contains a phase
+		# served under debug switches then says so by itself.
+		if (
+			self._debug_state_logged_generation != self._debug_state.generation
+			or self._debug_state.values
+		):
+			self._debug_state_logged_generation = self._debug_state.generation
+			if self.local_rank == 0:
+				logging.info(
+					"%s phase=%s",
+					format_debug_state_log_line(self._debug_state, node=self.args.nnode_rank),
+					phase,
+				)
 
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
 		return isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace"))
@@ -1643,15 +1698,13 @@ class BatchGenWorker:
 		counts_text = ",".join(f"{key}={counts[key]}" for key in sorted(counts))
 		logging.warning(
 			"[GLM5_DISPATCH_TRACE] rank=%s summary reason=%s trace=%s "
-			"batch_ids=%s global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s counts=%s",
+			"batch_ids=%s global_ids=%s bsz=%s counts=%s",
 			context.get("rank", self.rank),
 			reason,
 			getattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None) or "unknown",
 			context.get("batch_ids", "-"),
 			context.get("global_ids", "-"),
 			context.get("bsz", "-"),
-			context.get("glm5_dsa_mode", "-"),
-			context.get("glm5_moe_mode", "-"),
 			counts_text,
 		)
 
@@ -1683,13 +1736,10 @@ class BatchGenWorker:
 			"batch_ids": ",".join(batch_ids) if batch_ids else "-",
 			"global_ids": ",".join(global_ids) if global_ids else "-",
 			"bsz": len(seqs),
-			"glm5_dsa_mode": debug.get("glm5_dsa_mode", "-"),
-			"glm5_moe_mode": debug.get("glm5_moe_mode", "-"),
 			"glm5_moe_router_mode": debug.get("glm5_moe_router_mode", "-"),
 		}
 		trace_id = (
 			f"batches={context['batch_ids']}|global_ids={context['global_ids']}|"
-			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}|"
 			f"router={context['glm5_moe_router_mode']}"
 		)
 		if (
@@ -1704,15 +1754,12 @@ class BatchGenWorker:
 			GLM5AttnWrapper.glm5_dispatch_seen = set()
 			logging.warning(
 				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
-				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s "
-				"debug_moe_router=%s",
+				"global_ids=%s bsz=%s debug_moe_router=%s",
 				self.rank,
 				trace_id,
 				context["batch_ids"],
 				context["global_ids"],
 				context["bsz"],
-				context["glm5_dsa_mode"],
-				context["glm5_moe_mode"],
 				context["glm5_moe_router_mode"],
 			)
 		else:
@@ -1757,7 +1804,7 @@ class BatchGenWorker:
 				msg = self._admission_queue.get_nowait()
 				if msg is None:
 					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") == "admit":
+				elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
 					msg_data = msg
 					has_new = True
 				elif isinstance(msg, dict) and "prompts" in msg:
@@ -1770,6 +1817,10 @@ class BatchGenWorker:
 					# queue: fail loudly rather than park. Deliberately NOT a
 					# Unknown messages must fail loudly rather than being swallowed.
 					raise LegacyInferenceDeprecated()
+				else:
+					raise RuntimeError(
+						f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+					)
 			except queue_mod.Empty:
 				pass
 
@@ -1786,9 +1837,26 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			self._admit_sequences_from_message(msg_data)
+			return self._take_queue_message(msg_data)
 
 		return has_new
+
+	# What rank 0 may take off the admission queue and broadcast.
+	_QUEUE_MESSAGE_TYPES = ("admit", "debug_state")
+
+	def _take_queue_message(self, msg: dict) -> bool:
+		"""Act on a broadcast admission-queue message; True if it admitted sequences.
+
+		The one place a message from the server is interpreted, on every rank
+		and for both readers of the queue (the poll and the idle wait).
+		"""
+		if msg.get("type") == "debug_state":
+			# Not an admission: every rank keeps the new state until its next
+			# phase entry adopts it.
+			self.receive_debug_state(msg.get("state"))
+			return False
+		self._admit_sequences_from_message(msg)
+		return True
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -1843,9 +1911,6 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 			)
 			seq.batch_id = entry.get("batch_id")
-			seq.batchgen_debug = entry.get("batchgen_debug")
-			if isinstance(seq.batchgen_debug, dict) and seq.batchgen_debug:
-				self._any_sequence_batchgen_debug = True
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
 			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
@@ -4960,7 +5025,7 @@ class BatchGenWorker:
 				)
 				self._prefix.prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
-		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# M3 Slice 2, SAME debug-state key as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
 		# commits are off. With it off nothing here runs and no attachment is
 		# taken, so the restore seam stays empty and this wave is
@@ -6048,7 +6113,6 @@ class BatchGenWorker:
 		*,
 		local_bsz: int,
 		global_bsz: int,
-		sequences=None,
 	) -> bool:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_step_observability_engine", None)
@@ -6056,18 +6120,11 @@ class BatchGenWorker:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
-		# Batch-level debug flags live on the admitted sequences
-		# (self._batchgen_debug is never populated on the pool path), and the
-		# worker owns that lookup, so the merged view is resolved here.
 		return engine._nsys_prefill_profile_begin(
 			self,
 			local_bsz=local_bsz,
 			global_bsz=global_bsz,
-			debug=(
-				self._active_batchgen_debug_for_sequences(sequences)
-				or self._batchgen_debug
-				or {}
-			),
+			debug=self._debug_values() or {},
 		)
 
 	def _nsys_prefill_profile_end(self, active: bool) -> None:
@@ -6114,8 +6171,8 @@ class BatchGenWorker:
 			self._decode_profile_capture = capture
 		return capture
 
-	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
-		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: a
+	def _decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
+		"""Server debug state ``decode_profile_steps = N``: a
 		per-kernel breakdown of N decode steps without a server restart."""
 		self._decode_profile_capture_state().step(batchgen_debug, batch_rows)
 
@@ -6540,21 +6597,24 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
-						elif isinstance(msg, dict) and msg.get("type") == "admit":
-							# Broadcast that we got new work
+						elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
+							# Broadcast that a message arrived
 							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							self._group_uuids = set()
-							self._admit_sequences_from_message(msg)
-							# Reset per-batch-group timing so each admission cycle
-							# emits its own "Pool batch group completed" summary.
-							prefill_time = 0.0
-							decoding_time = 0.0
-							generation_start_time = time.perf_counter()
-							self._timing_logged = False
-							# Continue loop — new sequences will be picked up
+							# A new batch group starts BEFORE its sequences are
+							# admitted into it.
+							if msg.get("type") == "admit":
+								self._group_uuids = set()
+							if self._take_queue_message(msg):
+								# Reset per-batch-group timing so each admission cycle
+								# emits its own "Pool batch group completed" summary.
+								prefill_time = 0.0
+								decoding_time = 0.0
+								generation_start_time = time.perf_counter()
+								self._timing_logged = False
+								# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
 							# guard in _poll_admissions. The `else` below would
@@ -6562,8 +6622,11 @@ class BatchGenWorker:
 							# completion off the shared response queue.
 							raise LegacyInferenceDeprecated()
 						else:
-							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
-							dist.broadcast(status, src=0)
+							# An unknown message must fail loudly: dropping it
+							# here would lose it without a trace.
+							raise RuntimeError(
+								f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+							)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
 						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
@@ -6578,13 +6641,14 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._group_uuids = set()
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						if container[0].get("type") == "admit":
+							self._group_uuids = set()
+						if self._take_queue_message(container[0]):
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
@@ -6735,12 +6799,6 @@ class BatchGenWorker:
 					_prefill_profile_active = self._nsys_prefill_profile_begin(
 						local_bsz=len(local_prefill_indices),
 						global_bsz=len(prefill_uuids),
-						sequences=[
-							seq for seq in (
-								self.global_batch.get_sequence(uuid)
-								for uuid in prefill_uuids
-							) if seq is not None
-						],
 					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
@@ -7096,11 +7154,10 @@ class BatchGenWorker:
 				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
+				self._adopt_debug_state("decode")
 				phase_state.bind_debug(
 					AttnWrapperBase,
-					batchgen_debug=self._active_batchgen_debug_for_sequences(
-						global_decode_sequences
-					),
+					batchgen_debug=self._debug_values(),
 				)
 				self._configure_glm5_dispatch_trace(global_decode_sequences)
 
@@ -7128,7 +7185,7 @@ class BatchGenWorker:
 				# from the probe in the resident decode graph (none is a value)
 				# arms a recapture, which the warmup below then runs.
 				self._configure_criticality_probe(
-					self._active_batchgen_debug_for_sequences(global_decode_sequences)
+					self._debug_values()
 				)
 
 				# CUDA Graph Warmup (configure-time). A decode instance kept
@@ -7784,21 +7841,19 @@ class BatchGenWorker:
 		flags from its subset. ``_desired_phase_key`` refuses a wave that was
 		not resolved here.
 		"""
-		sequences = []
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				sequences.append(seq)
-		debug = self._active_batchgen_debug_for_sequences(sequences) or {}
+		self._adopt_debug_state("prefill")
 		self._prefill_wave_uuids = tuple(prefill_uuids)
-		self._prefill_wave_debug = debug
+		self._prefill_wave_debug = self._debug_values() or {}
+		# What the wave's planners and probes read; the phase key re-binds the
+		# same value when it is resolved.
+		self._phase_prefill_debug = self._prefill_wave_debug
 
 	def _server_prefill_moe_mode(self) -> Optional[str]:
 		"""The prefill MoE mode every wave of this server runs in.
 
 		Read once from the parallel manager and kept for the process: prefill
 		parallelism never changes inside a server, and no batch or debug flag
-		changes it (admission refuses the retired per-batch key). The server
+		changes it (a request cannot carry debug switches at all). The server
 		chooses it at start with ``--prefill-moe-mode``, else the model's
 		default. Prefill MoE modes are a manager capability declared by the
 		pair ``default_prefill_moe_mode`` / ``set_prefill_moe_mode``; a manager
@@ -9238,6 +9293,7 @@ class BatchGenWorker:
 		return engine._prefix_rank_packing_mode(
 			self,
 			seqs,
+			mode=self.args.prefix_rank_assignment_mode,
 		)
 
 	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
@@ -9250,6 +9306,7 @@ class BatchGenWorker:
 		return engine._prefix_rank_cost_profile_disabled(
 			self,
 			seqs,
+			value=self.args.prefix_rank_cost_profile,
 		)
 
 	def _cached_prefix_rank_cost_profile(self, disabled: bool=False):
@@ -9929,16 +9986,16 @@ class BatchGenWorker:
 					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _trajectory_commit_requested(self, batch_sequences) -> bool:
-		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
+		"""Server-level ``debug_state.prefix_trajectory_commit`` (M3 1b).
 
-		Same seam as ``prefix_pool_offload_check``: the flag rides on the
-		batch's own sequences, so it can be turned on against a server that is
+		Same seam as ``prefix_pool_offload_check``: the key is part of the
+		server's debug state, so it can be turned on against a server that is
 		already up. A value other than ``"on"``/``"off"`` is refused by name
 		rather than read as off -- a mistyped flag would look like a clean run
 		with no frontier committed.
 		"""
 		return self._traj.commit_requested(
-			self._active_batchgen_debug_for_sequences(batch_sequences)
+			self._debug_values()
 		)
 
 	def _trajectory_group_geometry(self) -> tuple:
@@ -12378,7 +12435,7 @@ class BatchGenWorker:
 	def _weight_pass_end_delay(self, value) -> float:
 		"""Seconds this rank sleeps before closing each prefill weight pass.
 
-		``value`` is the batch-level ``weight_pass_end_delay`` debug entry,
+		``value`` is the ``weight_pass_end_delay`` debug-state entry,
 		``{"rank": <global rank>, "seconds": <float>}``; any other rank, or no
 		entry, gets 0.
 		"""
@@ -12391,14 +12448,14 @@ class BatchGenWorker:
 			or not 0 < value["seconds"] <= 60
 		):
 			raise ValueError(
-				"batchgen_debug.weight_pass_end_delay must be "
+				"debug_state.weight_pass_end_delay must be "
 				'{"rank": <int>, "seconds": <0 < s <= 60>}, '
 				f"got {value!r}"
 			)
 		return float(value["seconds"]) if value["rank"] == self.rank else 0.0
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
@@ -12422,26 +12479,26 @@ class BatchGenWorker:
 		)
 
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 
 	def _glm5_whole_model_graph_timing_requested_for_current_batch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_whole_model_graph_timing")):
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
 	def _glm5_whole_model_graph_debug_value(self, key: str):
 		"""The current batch's ``batchgen_debug[key]`` (None when absent)."""
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		debug = self._debug_values() or {}
 		if not isinstance(debug, dict):
 			return None
 		return debug.get(key)
@@ -12456,11 +12513,11 @@ class BatchGenWorker:
 		if value is None:
 			return 1e-2
 		if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}")
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}")
 		try:
 			return float(value)
 		except ValueError as exc:
-			raise ValueError(f"batchgen_debug.{key} must be a number, got {value!r}") from exc
+			raise ValueError(f"debug_state.{key} must be a number, got {value!r}") from exc
 
 	def _glm5_whole_model_graph_probe_layers(self, num_layers: int) -> tuple:
 		"""``glm5_whole_model_graph_probe_layers``: decoder layers to probe.
@@ -12481,16 +12538,17 @@ class BatchGenWorker:
 		):
 			return tuple(value)
 		raise ValueError(
-			"batchgen_debug.glm5_whole_model_graph_probe_layers must be \"all\", a "
+			"debug_state.glm5_whole_model_graph_probe_layers must be \"all\", a "
 			f"comma-separated index string or a list of ints, got {value!r}"
 		)
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
+		# The per-layer graph modes this used to switch off are retired, so
+		# nothing is forced any more: the eager re-run only gets its own copy
+		# of the bound debug values, restored afterwards.
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
-		debug["glm5_dsa_mode"] = "eager"
-		debug["glm5_moe_mode"] = "eager"
 		phase_state.bind_debug(AttnWrapperBase, batchgen_debug=debug)
 		try:
 			yield
@@ -13000,9 +13058,7 @@ class BatchGenWorker:
 	):
 		phase_state.bind_debug(
 			AttnWrapperBase,
-			batchgen_debug=self._active_batchgen_debug_for_sequences(
-				global_decode_sequences
-			),
+			batchgen_debug=self._debug_values(),
 		)
 		if (
 			AttnWrapperBase.batchgen_debug is not None
@@ -13024,7 +13080,7 @@ class BatchGenWorker:
 					self.rank,
 					_step_probe_request,
 				)
-		self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+		self._decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
 		self._configure_glm5_dispatch_trace(global_decode_sequences)
 		return probe_mismatch_logged
 

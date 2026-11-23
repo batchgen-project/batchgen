@@ -876,7 +876,7 @@ class Glm5MoEGraphSegment:
         if probe is not None and not self.deepep_ll:
             raise RuntimeError(
                 f"Layer {self.moe.layer_idx}: the GLM-5 decode criticality probe "
-                "(batchgen_debug.glm5_criticality_probe) supports only the "
+                "(debug_state.glm5_criticality_probe) supports only the "
                 "DeepEP MoE decode path; this graph uses the NCCL "
                 "all_gather/reduce_scatter path. Start the server with "
                 "--enable-deepep to probe it."

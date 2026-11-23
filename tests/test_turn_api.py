@@ -826,7 +826,6 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
     monkeypatch.setattr(turn_api, "MAX_TURN_BODY_BYTES", 4096)
     monkeypatch.setattr(turn_api, "MAX_TURN_MESSAGES", 4)
     monkeypatch.setattr(turn_api, "MAX_TURN_TOOLS", 2)
-    monkeypatch.setattr(turn_api, "MAX_TURN_DEBUG_BYTES", 64)
     tool = {"type": "function", "function": {"name": "ls", "parameters": {"type": "object"}}}
 
     async def scenario(client, scheduler, worker, app):
@@ -851,11 +850,11 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
         out["messages"] = await client.post("/v1/turns", json=many)
         out["tools"] = await client.post("/v1/turns", json=_turn_body("s1", tools=[tool] * 3))
         out["debug"] = await client.post(
-            "/v1/turns", json=_turn_body("s1", batchgen_debug={"note": "z" * 100}))
+            "/v1/turns", json=_turn_body("s1", batchgen_debug={"k3_prefill_profile": True}))
         out["state"] = app.state.session_registry.get("s1").state.value
         out["turns"] = app.state.session_registry.get("s1").turns
         out["at_limit"] = await client.post("/v1/turns", json=_turn_body(
-            "s1", max_tokens=CONTEXT, tools=[tool] * 2, batchgen_debug={"k": 1}))
+            "s1", max_tokens=CONTEXT, tools=[tool] * 2, batchgen_debug={}))
         return out, list(worker.admitted)
 
     out, admitted = asyncio.run(_serve(tmp_path, scenario))
@@ -866,7 +865,7 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
         "body_undeclared": (413, "request_body_too_large"),
         "messages": (400, "too_many_messages"),
         "tools": (400, "too_many_tools"),
-        "debug": (413, "batchgen_debug_too_large"),
+        "debug": (400, "batchgen_debug_not_accepted"),
     }
     got = {}
     for name in expected:
@@ -914,37 +913,38 @@ def test_e2e_turn_finish_reason_reports_parsed_tool_calls(tmp_path):
         "role": "assistant", "content": TRUNCATED_TOOL_CALL_TEXT}
 
 
-RETIRED_MODE_DEBUG = {"k3_prefill_moe_mode": "resident_ep"}
+REQUEST_DEBUG = {"k3_prefill_profile": True}
 
 
-def test_e2e_a_turn_with_the_retired_mode_key_is_refused(tmp_path):
-    # The prefill MoE mode is a server constant (--prefill-moe-mode); the
-    # per-batch key that switched it is refused before the session or a
-    # worker sees the turn.
+def test_e2e_a_turn_that_carries_debug_switches_is_refused(tmp_path):
+    # Debug switches belong to the server (POST /v1/admin/debug-state); a
+    # turn that carries any is refused before the session or a worker sees
+    # it.
     async def scenario(client, scheduler, worker, app):
         await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
         refused = await client.post(
-            "/v1/turns", json=_turn_body("s1", batchgen_debug=RETIRED_MODE_DEBUG))
+            "/v1/turns", json=_turn_body("s1", batchgen_debug=REQUEST_DEBUG))
         session = app.state.session_registry.get("s1")
         return refused, (session.state.value, session.turns), list(worker.admitted)
 
     refused, session, admitted = asyncio.run(_serve(tmp_path, scenario))
     assert refused.status_code == 400
     detail = refused.json()["detail"]
-    assert detail["code"] == "retired_batchgen_debug_key"
-    assert "--prefill-moe-mode" in detail["message"]
+    assert detail["code"] == "batchgen_debug_not_accepted"
+    assert "/v1/admin/debug-state" in detail["message"]
+    assert "k3_prefill_profile" in detail["message"]
     assert session == ("open", 0)
     assert admitted == []
 
 
-def test_a_stored_batch_with_the_retired_mode_key_fails_before_any_worker(tmp_path):
-    # POST /v1/batches refuses the key; a batch stored before that (the
-    # store survives restarts) fails when the scheduler picks it up.
+def test_a_stored_batch_that_carries_debug_switches_fails_before_any_worker(tmp_path):
+    # POST /v1/batches refuses debug switches; a batch stored before that
+    # (the store survives restarts) fails when the scheduler picks it up.
     worker = _ns_worker()
     scheduler = _scheduler(tmp_path, worker)
     batch = SimpleNamespace(
         status=bs.BatchStatus.VALIDATING, input_file_id="file-1",
-        batchgen_debug=RETIRED_MODE_DEBUG,
+        batchgen_debug=REQUEST_DEBUG,
     )
     scheduler.storage.load_batch = lambda batch_id: batch
     scheduler.storage.load_metadata = lambda file_id: pytest.fail(
@@ -954,5 +954,5 @@ def test_a_stored_batch_with_the_retired_mode_key_fails_before_any_worker(tmp_pa
 
     (batch_id, status, kwargs), = scheduler.storage.statuses
     assert (batch_id, status) == ("batch_old", bs.BatchStatus.FAILED)
-    assert "--prefill-moe-mode" in kwargs["error"]
+    assert "/v1/admin/debug-state" in kwargs["error"]
     assert scheduler.intake_pool_size() == 0

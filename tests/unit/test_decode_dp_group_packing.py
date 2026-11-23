@@ -70,8 +70,8 @@ _METHODS = (
     "_pack_decode_dp_groups_for_sharing",
     "_prefix_rank_packing_mode",
     "_cached_prefix_rank_cost_profile",
-    # The A/B arm the packer call sites resolve per batch; these fakes carry no
-    # batchgen_debug, so it is always the default (profile) arm.
+    # The A/B arm is a launch parameter; these fakes run the default (profile)
+    # arm.
     "_prefix_rank_cost_profile_disabled",
     # Placement scores with the server mode's prefill token cap.
     "_server_prefill_token_cap",
@@ -131,9 +131,10 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=CHUNK)),
         # Startup resolved the server prefill mode: every wave is streamed.
         _server_prefill_moe_mode_resolved=("streamed",),
-        _active_batchgen_debug_for_sequences=lambda batch_sequences: (
-            {"prefix_rank_assignment_mode": "packing_v2" if packing
-            else "global_idx"}
+        # The launch parameters the worker's delegators hand to the engine.
+        args=SimpleNamespace(
+            prefix_rank_assignment_mode="packing_v2" if packing else "global_idx",
+            prefix_rank_cost_profile="on",
         ),
         _decode_attn_tp_size=lambda: G,
         _prefill_prefix_pool_enabled=lambda: pool,

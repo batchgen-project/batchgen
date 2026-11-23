@@ -15,8 +15,8 @@ For every other model ``--enable-cuda-graph`` is rejected with
 worker starts. Ignoring it would let a launch look graph-enabled while it
 decodes eagerly, which is how GPT-OSS ran eager unnoticed before this module.
 Kimi-Linear / Kimi-K3 decode graphs are chosen by their planner
-(``Basic_Config.decode_graph_mode``) and per batch by
-``batchgen_debug.kimi_decode_graph_mode``, so the CLI flag is rejected for
+(``Basic_Config.decode_graph_mode``) and by the server debug-state key
+``debug_state.kimi_decode_graph_mode``, so the CLI flag is rejected for
 them too, with an error that names the knob that does control them.
 """
 
@@ -68,7 +68,7 @@ def require_cuda_graph_flag_supported(
         raise UnsupportedCudaGraphFlagError(
             f"--enable-cuda-graph does not apply to {model_name!r}: Kimi-Linear/K3 "
             "decode graphs are chosen by the planner (Basic_Config.decode_graph_mode) "
-            "and per batch by batchgen_debug.kimi_decode_graph_mode. Drop the flag."
+            "and by debug_state.kimi_decode_graph_mode. Drop the flag."
         )
     raise UnsupportedCudaGraphFlagError(
         f"--enable-cuda-graph is not supported for {model_name!r}: the model has "

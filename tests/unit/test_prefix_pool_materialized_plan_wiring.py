@@ -94,7 +94,7 @@ METHODS = (
     "_prefill_pool_page_bytes",
     "_pool_pad_poison_enabled",
     "_new_pool_kernel_dump_recorder",
-    "_active_batchgen_debug_for_sequences",
+    "_debug_values",
     "_debug_flag_enabled",
     "_server_prefill_token_cap",
     "_server_prefill_moe_mode",
@@ -203,7 +203,9 @@ def _seqs(*, debug="on", group=0, prompts=PROMPTS):
             decode_dp_group=group,
             prompt_length=len(prompt),
             input_ids=torch.tensor([prompt], dtype=torch.long),
-            batchgen_debug=(
+            # Test-only: the server debug state this wave runs under, which
+            # ``_worker`` installs as the adopted state.
+            test_server_debug=(
                 None if debug is None else {"prefix_trajectory_commit": debug}
             ),
         )
@@ -260,8 +262,8 @@ def _worker(
         # The wave _begin_prefill_wave resolved, on a streamed server.
         _prefill_wave_uuids=("wave",),
         _server_prefill_moe_mode_resolved=("streamed",),
-        _batchgen_debug=None,
-        _any_sequence_batchgen_debug=True,
+        _debug_state_values=next(iter(sequences.values())).test_server_debug,
+        _phase_prefill_debug=next(iter(sequences.values())).test_server_debug or {},
     )
     attach_identity(
         worker,

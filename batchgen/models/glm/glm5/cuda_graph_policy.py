@@ -8,7 +8,7 @@ the retired modes return ``False`` unconditionally.
 
 The server-level graph mode is decided only by the CLI at startup. The
 eager-vs-graph compare is a per-batch choice inside that mode
-(``batchgen_debug.glm5_whole_model_graph_compare``, read by the worker); it
+(``debug_state.glm5_whole_model_graph_compare``, read by the worker); it
 no longer feeds these routing predicates.
 """
 

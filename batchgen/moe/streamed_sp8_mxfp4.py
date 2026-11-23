@@ -762,7 +762,7 @@ class StreamedSP8MXFP4MoELayer:
     # a host synchronization at every layer boundary.
     _prefill_finite_checks = []
 
-    # Batch-level byte-verification (batchgen_debug.k3_seam_verify_bytes):
+    # Byte-verification (debug_state.k3_seam_verify_bytes):
     # after every layer's local-shard acquisition, log one uint64 sum per
     # tensor of the aggregated ``local`` buffer. The slot-group members
     # [s, 8+s, 16+s, 24+s] assemble the same shard from full-replica stores,
@@ -802,7 +802,7 @@ class StreamedSP8MXFP4MoELayer:
     # the layer's shard as BF16 once and runs grouped BF16 GEMMs (H200: 8.7 ms
     # per 65K-row chunk vs 25.5 ms for the M16 Marlin path, kernel-dev
     # k3_routed_mxfp4 v1); "marlin" keeps the grouped M16 Marlin kernels.
-    # ``batchgen_debug.k3_prefill_routed_kernel`` overrides per batch.
+    # ``debug_state.k3_prefill_routed_kernel`` overrides it for the server.
     prefill_routed_kernel = "dequant_once"
 
     @classmethod

@@ -1,4 +1,4 @@
-"""``batchgen_debug.glm5_lmhead_fp32``: a batch flag, never an env guard.
+"""``debug_state.glm5_lmhead_fp32``: a batch flag, never an env guard.
 
 The FP32 cast of the unpooled prefill lm_head matmul used to be opted into
 with ``BATCHGEN_GLM5_LMHEAD_FP32=1``. An env var is fixed for the server's

@@ -171,26 +171,18 @@ def test_the_batched_helper_does_not_decide_which_rows_are_live():
 
 # ------------------------------------------------------------- debug scanning
 
-def test_debug_flag_scan_exits_before_scanning_when_no_sequence_carries_flags():
-    fn = _method("_active_batchgen_debug_for_sequences")
-    guard = next(
-        n for n in fn.body
-        if isinstance(n, ast.If)
-        and ast.unparse(n.test) == "not self._any_sequence_batchgen_debug"
-    )
-    assert isinstance(guard.body[0], ast.Return)
-    assert ast.unparse(guard.body[0].value) == "None"
-    loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For))
-    assert guard.lineno < loop.lineno
+def test_reading_the_debug_state_on_a_step_scans_no_sequence():
+    # The server's debug state is adopted once per phase entry; a decode step
+    # reads the adopted value back, per row, with no loop over the batch.
+    fn = _method("_debug_values")
+    assert not [n for n in ast.walk(fn) if isinstance(n, (ast.For, ast.While))]
+    (returned,) = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    assert ast.unparse(returned.value) == "self._debug_state_values"
 
 
-def test_the_debug_flag_is_raised_where_sequences_receive_their_flags():
+def test_admission_gives_a_sequence_no_debug_flags():
     fn = _method("_admit_sequences_from_message")
-    raised = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-              and [ast.unparse(t) for t in n.targets]
-              == ["self._any_sequence_batchgen_debug"]]
-    assert len(raised) == 1
-    assert ast.unparse(raised[0].value) == "True"
+    assert "batchgen_debug" not in ast.unparse(fn)
 
 
 # ----------------------------------------------- tracked dead per-step write

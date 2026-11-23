@@ -1,6 +1,6 @@
 """The pooled-wave offload byte-equality check.
 
-Flag `batchgen_debug.prefix_pool_offload_check` arms a recorder for the wave;
+Flag `debug_state.prefix_pool_offload_check` arms a recorder for the wave;
 every pooled row the rank offloads has its SOURCE bytes digested at
 offload-issue time, and after the wave's D2H retires the worker re-reads the
 DESTINATION Host pages and compares. The check has to be exact about
@@ -563,11 +563,6 @@ exec(compile(ast.fix_missing_locations(ast.Module(
 )), str(WORKER), "exec"), _NAMESPACE)
 
 
-class _Sequence:
-    def __init__(self, debug):
-        self.batchgen_debug = debug
-
-
 class _Plan:
     segments = (object(),)
 
@@ -586,7 +581,6 @@ class _Wave:
 
 class _Worker:
     rank = 2
-    _batchgen_debug = None
 
     _pool_probe_debug = _NAMESPACE["_pool_probe_debug"]
     _debug_flag_enabled = _NAMESPACE["_debug_flag_enabled"]
@@ -597,10 +591,8 @@ class _Worker:
 
     def __init__(self, debug):
         self._prefill_pool_wave = _Wave(debug)
-        sequences = {uuid: _Sequence(debug) for uuid in self._prefill_pool_wave.uuids}
-        self.global_batch = type(
-            "_Batch", (), {"get_sequence": staticmethod(sequences.get)}
-        )()
+        # The server's debug state as the wave adopted it.
+        self._phase_prefill_debug = debug or {}
 
 
 @pytest.mark.parametrize("value", [True, 1, "1", "true", "on", "YES"])
@@ -613,7 +605,7 @@ def test_flag_on_arms_a_recorder_for_the_wave(value):
 
 @pytest.mark.parametrize(
     "debug",
-    [None, {}, {"prefix_rank_assignment_mode": "packing_v2"}, {DEBUG_FLAG: False},
+    [None, {}, {"glm5_dispatch_trace": True}, {DEBUG_FLAG: False},
      {DEBUG_FLAG: 0}, {DEBUG_FLAG: "off"}],
 )
 def test_flag_off_arms_nothing(debug):

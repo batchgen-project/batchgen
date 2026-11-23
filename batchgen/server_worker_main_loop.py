@@ -808,6 +808,14 @@ def _server_worker_main_impl(
 		logging.error(f"Try restarting the server or check network connectivity between nodes.")
 		sys.exit(1)
 
+	# The pool starts under the server's debug state: rank 0 carries it from
+	# the server and every rank takes rank 0's value here, before the worker
+	# is built, so a key baked into captured graphs is in force for the
+	# start-up warm-up on every node.
+	start_debug_state = [args.debug_state if args.global_rank == 0 else None]
+	dist.broadcast_object_list(start_debug_state, src=0)
+	args.debug_state = start_debug_state[0]
+
 	# 2. Instantiate the BatchGenWorker
 	phase_reporter.enter(PHASE_MODEL_BUILD)
 	worker = BatchGenWorker(args)
@@ -997,6 +1005,11 @@ def _server_worker_main_impl(
 			if task_data is None:
 				logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
 				break
+
+			# --- STEP 3.5: a debug state published before the pool's init ---
+			if isinstance(task_data, dict) and task_data.get("type") == "debug_state":
+				worker.receive_debug_state(task_data.get("state"), at_start=True)
+				continue
 
 			# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
 			if isinstance(task_data, dict) and task_data.get("type") == "init":

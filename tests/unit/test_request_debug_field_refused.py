@@ -1,8 +1,8 @@
-"""Admission refuses retired batchgen_debug keys before a worker sees them.
+"""Admission refuses debug switches carried by a request.
 
-The prefill MoE mode is chosen once per server (--prefill-moe-mode); the
-per-batch ``batchgen_debug.k3_prefill_moe_mode`` that used to switch one
-wave's mode is retired. POST /v1/batches answers 400 for it; the turn and
+Debug switches belong to the server (``batchgen/server_debug_state.py``) and are set
+through the admin endpoint. A request that carries ``batchgen_debug`` is
+answered 400 naming that endpoint, before a worker sees it; the turn and
 stored-batch paths are covered in tests/test_turn_api.py.
 """
 
@@ -34,21 +34,18 @@ def _load_io_struct():
 io_struct = _load_io_struct()
 
 
-def test_the_retired_mode_key_is_refused_naming_the_server_flag():
-    message = io_struct.retired_batchgen_debug_error(
-        {"k3_prefill_moe_mode": "resident_ep", "glm5_moe_mode": "graph"}
+def test_any_debug_switch_on_a_request_is_refused_naming_the_admin_endpoint():
+    message = io_struct.batchgen_debug_refusal(
+        {"k3_prefill_profile": True, "glm5_graph_path_log": True}
     )
     assert message is not None
-    assert "batchgen_debug.k3_prefill_moe_mode is no longer accepted" in message
-    assert "--prefill-moe-mode" in message
-    assert "glm5_moe_mode" not in message
+    assert "POST /v1/admin/debug-state" in message
+    assert "Keys sent: glm5_graph_path_log, k3_prefill_profile." in message
 
 
-@pytest.mark.parametrize(
-    "debug", [None, {}, {"k3_prefill_profile": True, "glm5_moe_mode": "eager"}]
-)
-def test_current_debug_keys_pass(debug):
-    assert io_struct.retired_batchgen_debug_error(debug) is None
+@pytest.mark.parametrize("debug", [None, {}])
+def test_a_request_without_debug_switches_passes(debug):
+    assert io_struct.batchgen_debug_refusal(debug) is None
 
 
 def _create_batch_handler():
@@ -65,7 +62,7 @@ def _create_batch_handler():
         "HTTPException": HTTPException,
         "Request": Request,
         "CreateBatchRequest": io_struct.CreateBatchRequest,
-        "retired_batchgen_debug_error": io_struct.retired_batchgen_debug_error,
+        "batchgen_debug_refusal": io_struct.batchgen_debug_refusal,
     }
     module = ast.Module(body=[node], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "http_server.py", "exec"), namespace)
@@ -85,9 +82,10 @@ def test_create_batch_answers_400_before_touching_pool_or_storage():
     request = SimpleNamespace(app=SimpleNamespace(state=state))
     body = io_struct.CreateBatchRequest(
         input_file_id="file-1",
-        batchgen_debug={"k3_prefill_moe_mode": "resident_ep"},
+        batchgen_debug={"k3_prefill_profile": True},
     )
     with pytest.raises(HTTPException) as refused:
         asyncio.run(handler(request, body))
     assert refused.value.status_code == 400
-    assert "--prefill-moe-mode" in refused.value.detail
+    assert "/v1/admin/debug-state" in refused.value.detail
+    assert "k3_prefill_profile" in refused.value.detail
