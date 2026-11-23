@@ -1802,7 +1802,7 @@ class BatchGenWorker:
 				msg = self._admission_queue.get_nowait()
 				if msg is None:
 					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") in ("admit", "debug_state"):
+				elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
 					msg_data = msg
 					has_new = True
 				elif isinstance(msg, dict) and "prompts" in msg:
@@ -1815,6 +1815,10 @@ class BatchGenWorker:
 					# queue: fail loudly rather than park. Deliberately NOT a
 					# Unknown messages must fail loudly rather than being swallowed.
 					raise LegacyInferenceDeprecated()
+				else:
+					raise RuntimeError(
+						f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+					)
 			except queue_mod.Empty:
 				pass
 
@@ -1831,14 +1835,26 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			if msg_data.get("type") == "debug_state":
-				# Not an admission: every rank keeps the new state until its
-				# next phase entry adopts it.
-				self.receive_debug_state(msg_data.get("state"))
-				return False
-			self._admit_sequences_from_message(msg_data)
+			return self._take_queue_message(msg_data)
 
 		return has_new
+
+	# What rank 0 may take off the admission queue and broadcast.
+	_QUEUE_MESSAGE_TYPES = ("admit", "debug_state")
+
+	def _take_queue_message(self, msg: dict) -> bool:
+		"""Act on a broadcast admission-queue message; True if it admitted sequences.
+
+		The one place a message from the server is interpreted, on every rank
+		and for both readers of the queue (the poll and the idle wait).
+		"""
+		if msg.get("type") == "debug_state":
+			# Not an admission: every rank keeps the new state until its next
+			# phase entry adopts it.
+			self.receive_debug_state(msg.get("state"))
+			return False
+		self._admit_sequences_from_message(msg)
+		return True
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -6731,21 +6747,24 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
-						elif isinstance(msg, dict) and msg.get("type") == "admit":
-							# Broadcast that we got new work
+						elif isinstance(msg, dict) and msg.get("type") in self._QUEUE_MESSAGE_TYPES:
+							# Broadcast that a message arrived
 							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							self._group_uuids = set()
-							self._admit_sequences_from_message(msg)
-							# Reset per-batch-group timing so each admission cycle
-							# emits its own "Pool batch group completed" summary.
-							prefill_time = 0.0
-							decoding_time = 0.0
-							generation_start_time = time.perf_counter()
-							self._timing_logged = False
-							# Continue loop — new sequences will be picked up
+							# A new batch group starts BEFORE its sequences are
+							# admitted into it.
+							if msg.get("type") == "admit":
+								self._group_uuids = set()
+							if self._take_queue_message(msg):
+								# Reset per-batch-group timing so each admission cycle
+								# emits its own "Pool batch group completed" summary.
+								prefill_time = 0.0
+								decoding_time = 0.0
+								generation_start_time = time.perf_counter()
+								self._timing_logged = False
+								# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
 							# guard in _poll_admissions. The `else` below would
@@ -6753,8 +6772,11 @@ class BatchGenWorker:
 							# completion off the shared response queue.
 							raise LegacyInferenceDeprecated()
 						else:
-							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
-							dist.broadcast(status, src=0)
+							# An unknown message must fail loudly: dropping it
+							# here would lose it without a trace.
+							raise RuntimeError(
+								f"Rank {self.rank}: unexpected admission-queue message: {msg!r}"
+							)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
 						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
@@ -6769,13 +6791,14 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._group_uuids = set()
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						if container[0].get("type") == "admit":
+							self._group_uuids = set()
+						if self._take_queue_message(container[0]):
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless

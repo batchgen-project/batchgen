@@ -196,23 +196,51 @@ def test_adoption_happens_at_exactly_the_two_phase_entries():
     assert _calls(_worker_method("_begin_prefill_wave"), "_adopt_debug_state")
 
 
-def test_a_published_state_is_broadcast_like_an_admission_and_admits_nothing():
-    poll = _worker_method("_poll_admissions")
-    source = ast.unparse(poll)
-    assert "msg.get('type') in ('admit', 'debug_state')" in source
-    branch = next(
-        node for node in ast.walk(poll)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "msg_data.get('type') == 'debug_state'"
-    )
-    assert _calls(branch, "receive_debug_state")
-    assert isinstance(branch.body[-1], ast.Return)
-    assert ast.unparse(branch.body[-1].value) == "False"
-    # The broadcast precedes the branch: every rank receives the same message.
-    broadcast = next(node for node in ast.walk(poll)
-                     if isinstance(node, ast.Call)
-                     and ast.unparse(node.func) == "dist.broadcast_object_list")
-    assert broadcast.lineno < branch.lineno
+def test_a_published_state_is_kept_as_pending_and_admits_nothing():
+    worker = _worker()
+    take = load_worker_methods(("_take_queue_message",), {})["_take_queue_message"]
+    admitted = []
+    worker._admit_sequences_from_message = admitted.append
+    worker._take_queue_message = take.__get__(worker)
+
+    wire = _wire(1, triton_strict=True)
+    assert worker._take_queue_message({"type": "debug_state", "state": wire}) is False
+    assert admitted == []
+    assert worker._pending_debug_state.to_wire() == wire
+    assert worker._debug_values() is None           # not adopted before a phase entry
+
+    message = {"type": "admit", "entries": []}
+    assert worker._take_queue_message(message) is True
+    assert admitted == [message]
+
+
+def test_every_reader_of_the_admission_queue_goes_through_the_one_dispatcher():
+    # The worker reads the queue in two places: the poll at phase boundaries
+    # and the idle wait while every sequence is complete. A message type that
+    # only one of them knew was silently dropped by the other (found on a
+    # real server: a debug state published to an idle pool never arrived).
+    source = WORKER_SOURCE.read_text()
+    tree = ast.parse(source)
+    readers = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) in (
+            "self._admission_queue.get", "self._admission_queue.get_nowait")
+    ]
+    assert len(readers) == 2
+    # Sequences are admitted only inside the dispatcher.
+    admits = [node for node in ast.walk(tree)
+              if isinstance(node, ast.Call)
+              and ast.unparse(node.func) == "self._admit_sequences_from_message"]
+    assert len(admits) == 1
+    dispatcher = _worker_method("_take_queue_message")
+    assert dispatcher.lineno <= admits[0].lineno <= dispatcher.end_lineno
+    # Both readers accept the same message types and hand them to it.
+    assert source.count('msg.get("type") in self._QUEUE_MESSAGE_TYPES') == 2
+    assert len(_calls(_worker_method("_poll_admissions"), "_take_queue_message")) == 1
+    assert len(_calls(_worker_method("generate"), "_take_queue_message")) == 2
+    # Neither reader drops a message it does not know.
+    assert source.count("unexpected admission-queue message") == 2
 
 
 def test_no_worker_code_reads_debug_flags_from_a_sequence():
