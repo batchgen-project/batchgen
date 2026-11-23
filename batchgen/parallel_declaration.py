@@ -270,3 +270,161 @@ def read_parallel_declaration(
             f"return a ParallelDeclaration, got {type(declaration).__name__}"
         )
     return declaration
+
+
+# ---------------------------------------------------------------------------
+# Phase layout: the rank groups a phase's two modules form.
+#
+# A phase gives the attention and the MoE each their own scheme and group
+# size. Sequences are owned by an attention group; no activation collective
+# leaves a DP worker, whose size is the larger of the two group sizes. A
+# group is a tuple of global ranks, never "the first G local ranks of a
+# node", so that groups may later span machines.
+# ---------------------------------------------------------------------------
+
+PHASE_PREFILL = "prefill"
+PHASE_DECODE = "decode"
+LAYOUT_PHASES = (PHASE_PREFILL, PHASE_DECODE)
+
+
+def _rank_groups(world_size: int, group_size: int) -> Tuple[Tuple[int, ...], ...]:
+    return tuple(
+        tuple(range(start, start + group_size))
+        for start in range(0, world_size, group_size)
+    )
+
+
+@dataclass(frozen=True)
+class PhaseLayout:
+    """One phase's layout over a world of ranks."""
+
+    phase: str
+    attention: ModuleParallelism
+    moe: ModuleParallelism
+    world_size: int
+
+    def __post_init__(self) -> None:
+        if self.phase not in LAYOUT_PHASES:
+            raise ParallelDeclarationError(
+                f"phase {self.phase!r} is not one of {LAYOUT_PHASES}"
+            )
+        for name in ("attention", "moe"):
+            if not isinstance(getattr(self, name), ModuleParallelism):
+                raise ParallelDeclarationError(
+                    f"{self.phase} {name} must be a ModuleParallelism"
+                )
+        if self.attention.scheme == SCHEME_NONE:
+            raise ParallelDeclarationError(f"{self.phase} attention cannot be 'none'")
+        if (
+            not isinstance(self.world_size, int)
+            or isinstance(self.world_size, bool)
+            or self.world_size < 1
+        ):
+            raise ParallelDeclarationError(
+                f"world_size must be a positive int, got {self.world_size!r}"
+            )
+        small, large = sorted((self.attention.group_size, self.moe.group_size))
+        if large % small:
+            raise ParallelDeclarationError(
+                f"{self.phase} layout {self.render()}: the attention group size "
+                f"{self.attention.group_size} and the MoE group size "
+                f"{self.moe.group_size} must divide one another"
+            )
+        if self.world_size % large:
+            raise ParallelDeclarationError(
+                f"{self.phase} layout {self.render()}: the DP worker size {large} "
+                f"does not divide the world size {self.world_size}"
+            )
+
+    @property
+    def dp_worker_size(self) -> int:
+        """Ranks one DP worker spans: the larger of the two group sizes."""
+        return max(self.attention.group_size, self.moe.group_size)
+
+    @property
+    def num_dp_workers(self) -> int:
+        return self.world_size // self.dp_worker_size
+
+    @property
+    def dp_workers(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.dp_worker_size)
+
+    @property
+    def attention_groups(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.attention.group_size)
+
+    @property
+    def moe_groups(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.moe.group_size)
+
+    def _check_rank(self, rank: int) -> None:
+        if not isinstance(rank, int) or isinstance(rank, bool) or not (
+            0 <= rank < self.world_size
+        ):
+            raise ParallelDeclarationError(
+                f"rank {rank!r} is outside the world of {self.world_size} ranks"
+            )
+
+    def attention_group_of(self, rank: int) -> Tuple[int, ...]:
+        """The attention group that owns the sequences served on ``rank``."""
+        self._check_rank(rank)
+        return self.attention_groups[rank // self.attention.group_size]
+
+    def moe_group_of(self, rank: int) -> Tuple[int, ...]:
+        self._check_rank(rank)
+        return self.moe_groups[rank // self.moe.group_size]
+
+    def dp_worker_of(self, rank: int) -> Tuple[int, ...]:
+        """The ranks an activation collective issued on ``rank`` may reach."""
+        self._check_rank(rank)
+        return self.dp_workers[rank // self.dp_worker_size]
+
+    def render(self) -> str:
+        return f"attention={self.attention.render()} moe={self.moe.render()}"
+
+
+@dataclass(frozen=True)
+class ServerLayout:
+    """The two phase layouts of a server; each phase owns its own (C1)."""
+
+    prefill: PhaseLayout
+    decode: PhaseLayout
+
+    def __post_init__(self) -> None:
+        for phase in LAYOUT_PHASES:
+            layout = getattr(self, phase)
+            if not isinstance(layout, PhaseLayout) or layout.phase != phase:
+                raise ParallelDeclarationError(
+                    f"server layout slot {phase} must be the {phase} PhaseLayout"
+                )
+        if self.prefill.world_size != self.decode.world_size:
+            raise ParallelDeclarationError(
+                "both phases run on the same world: "
+                f"{self.prefill.world_size} != {self.decode.world_size}"
+            )
+        if (self.prefill.moe.scheme == SCHEME_NONE) != (
+            self.decode.moe.scheme == SCHEME_NONE
+        ):
+            raise ParallelDeclarationError(
+                "a model either has a MoE in both phases or in neither"
+            )
+
+    def phase(self, phase: str) -> PhaseLayout:
+        if phase not in LAYOUT_PHASES:
+            raise ParallelDeclarationError(
+                f"phase {phase!r} is not one of {LAYOUT_PHASES}"
+            )
+        return getattr(self, phase)
+
+    def declaration(
+        self, decode_graph: DecodeGraphDeclaration = DecodeGraphDeclaration()
+    ) -> ParallelDeclaration:
+        """The four-slot report rendered from this layout, so that what is
+        reported and what is executed come from one object."""
+        return ParallelDeclaration(
+            prefill_attention=self.prefill.attention,
+            prefill_moe=self.prefill.moe,
+            decode_attention=self.decode.attention,
+            decode_moe=self.decode.moe,
+            decode_graph=decode_graph,
+        )
