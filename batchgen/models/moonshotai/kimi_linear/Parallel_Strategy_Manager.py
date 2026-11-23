@@ -460,10 +460,12 @@ class KimiLinearParallelStrategyManager:
         they bake lives at fixed addresses (``_resident_ep_arena``), and the
         KV pool is remapped at its reserved addresses by the worker.
         """
-        return bool(
-            self._instances_are_reused
-            and self._decode_graph_mode() in ("graph", "compare")
-        )
+        graph = getattr(self, "_decode_graph", None)
+        # The mode in force, not only the planner's: under the server debug
+        # state ``kimi_decode_graph_mode: eager`` nothing is captured, so the
+        # kept instance owns no graphs and the startup capture expects none.
+        mode = self._decode_graph_mode() if graph is None else graph.capture_mode()
+        return bool(self._instances_are_reused and mode in ("graph", "compare"))
 
     def release_decode_routed_experts(self):
         """Return the resident EP shard's HBM; its addresses stay reserved.
