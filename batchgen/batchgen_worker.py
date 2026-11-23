@@ -249,8 +249,6 @@ from batchgen.worker.boundary import (
 )
 from batchgen.worker.decode import (
 	DecodeBatchRequest,
-	DecodeCandidate,
-	DecodeScheduler,
 	DecodeCapacitySnapshot,
 	reduce_decode_capacity_snapshot,
 )
@@ -261,7 +259,6 @@ from batchgen.cuda_graph.buckets import (
 )
 from batchgen.worker.shared_prefix_charge import (
 	SharedPrefixLedger,
-	plan_shared_runs,
 )
 from batchgen.config.max_model_len import (
 	SequenceLengthCapacity, resolve_max_model_len, verify_max_model_len,
@@ -2093,6 +2090,7 @@ class BatchGenWorker:
 				prefix_cache_debug_stats=self.prefix_cache_debug_stats,
 				kv_stats_native=self._kv_stats_native,
 				kv_stats_compare=self._kv_stats_compare,
+				shared_prefix_admission=self.shared_prefix_admission,
 			),
 			sched=SchedulingState(
 				pool=self.global_batch,
@@ -5683,37 +5681,16 @@ class BatchGenWorker:
 		)
 
 	def _prepare_decode_batch(self) -> List[str]:
-		"""
-		Select sequences for decode phase from PREFILLED sequences.
-		Greedily fill the current physical GPU-KV free capacity.
-		"""
-		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		onhold_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		
-		# Combine and sort for deterministic ordering
-		all_candidates = prefilled_uuids + onhold_uuids
-		all_candidates.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-		
-		# Get a collective live capacity snapshot.  The old implementation used
-		# only one rank's total_pages and a metadata-derived resident count, which
-		# could admit against stale state or strand a candidate at the 90% guard.
-		capacity = self._snapshot_decode_capacity()
-		if not all_candidates:
-			return []
+		"""Select the decode entry batch; the selection lives in ``DecodeEntry``.
 
-		# Candidate enumeration and logging stay here; pure physical-capacity
-		# selection is delegated.
-		# Owner-reported shared GPU prefixes, gathered before the pure
-		# selection so every rank charges the same marginal cost: rows that
-		# reference one Host page get ONE physical GPU page, so charging each
-		# row its whole context would bound decode by the logical page sum.
-		shared_segments = self._gather_decode_shared_prefix_segments(
-			all_candidates
-		)
-		decode_batch = DecodeScheduler.select_decode_batch(
-			self._make_decode_batch_request(
-				all_candidates, capacity, shared_segments=shared_segments
-			)
+		``DecodeEntry.select`` runs from the decode context. The worker keeps
+		the model-specific admission guard below and the rank-0 summary log,
+		in that original order: the guard raises before the log line.
+		"""
+		from batchgen.worker.admission.decode_entry import DecodeEntry
+		decode_batch = DecodeEntry().select(
+			self._decode_phase_context(),
+			getattr(self, "_decode_padding_bsz", 0) or 0,
 		)
 
 		# An all_short whole-model capture never runs indexer scoring, so a
@@ -5744,172 +5721,40 @@ class BatchGenWorker:
 		return decode_batch
 
 	def _decode_shared_prefix_credit_enabled(self) -> bool:
-		"""Whether decode admission may charge a shared GPU prefix once.
-
-		The credit is only honest where the ALLOCATOR shares: GPU pages are
-		deduplicated by Host page id inside
-		``allocate_pages_for_sequences_with_page_keys``, which
-		``_allocate_gpu_pages_with_host_identity`` reaches exactly when
-		``_shared_page_identity_sources`` names the pools to key. A DSA dual
-		coordinator is now one of those: both of its pools deduplicate, each
-		on its own Host region's page ids. Everywhere else each row really
-		does load its own copy, so each row must pay for it -- the same
-		condition ``_host_identity_page_keys`` tests before returning page
-		keys at all.
-		"""
-		if not self.shared_prefix_admission:
-			return False
-		if not self.enable_prefix_cache:
-			return False
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is None or not manager.is_initialized:
-			return False
-		return self._shared_page_identity_sources(manager) is not None
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._decode_shared_prefix_credit_enabled(
+			self._decode_phase_context()
+		)
 
 	def _local_decode_shared_prefix_runs(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Shared leading page runs among the candidates THIS rank owns.
-
-		Grouped per owner because sharing only pays inside one GPU pool: the
-		pool belongs to one DP rank (or one replicated TP group whose Host-KV
-		leader owns every row), so two rows loading onto different pools each
-		need their own physical copy.
-
-		The identity is the HOST page id, which is what the allocator dedups
-		on, so a run here means those rows provably reference one physical
-		copy -- not merely equal tokens, which two distinct Host copies can
-		also have.
-
-		The view comes from ``_shared_page_identity_sources``, so the runs are
-		read from exactly the key space the allocator will dedup on. On a DSA
-		dual coordinator that is the PRIMARY pool (the MLA latent region): the
-		auxiliary pool shares the same rows page for page, and the charge is
-		counted in primary-pool pages, so one pool's identity describes the
-		credit for both.
-		"""
-		sources = self._shared_page_identity_sources(
-			self.gpu_paged_kv_cache_manager
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._local_decode_shared_prefix_runs(
+			self._decode_phase_context(), all_candidates
 		)
-		if not sources:
-			return {}
-		worker_view = sources[0][2]
-		mine = []
-		for uuid in all_candidates:
-			if uuid not in self._uuid_to_local_map:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			req_pages = int(seq.get_gpu_pages_for_two_page_buffer())
-			if req_pages <= 1:
-				continue
-			mine.append((uuid, seq, req_pages))
-		if len(mine) < 2:
-			return {}
-		host_tables = worker_view.build_page_table(
-			[int(seq.global_idx) for _, seq, _ in mine]
-		)
-		tables: Dict[int, List[int]] = {}
-		for (_uuid, seq, req_pages), host_pages in zip(mine, host_tables):
-			# Credit only pages that exist, and never the row's whole
-			# reservation: one page stays private so no row is charged zero.
-			# A Host table shorter than the reservation is named loudly by
-			# _host_identity_page_keys at allocation time; admission must not
-			# credit pages it cannot see.
-			usable = min(req_pages - 1, len(host_pages))
-			if usable <= 0:
-				continue
-			tables[int(seq.global_idx)] = [
-				int(page) for page in host_pages[:usable]
-			]
-		runs = plan_shared_runs(tables)
-		local: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for uuid, seq, _req_pages in mine:
-			run = runs.get(int(seq.global_idx))
-			if run is None:
-				continue
-			local[uuid] = ((int(run[0]), int(run[1])),)
-		return local
 
 	def _gather_decode_shared_prefix_segments(
 		self, all_candidates: List[str]
 	) -> Dict[str, Tuple[Tuple[int, int], ...]]:
-		"""Collect every rank's shared runs so selection stays rank-identical.
-
-		``select_decode_batch`` is pure and runs on every rank; a rank that
-		credited a run its peers did not would admit a different batch and the
-		next collective would deadlock. Only an owner can read its rows' Host
-		page tables, so the ground truth is gathered rather than re-derived.
-		``all_candidates`` is already rank-uniform (it comes from replicated
-		sequence status), so every rank reaches this gather together.
-		"""
-		if not self._decode_shared_prefix_credit_enabled():
-			return {}
-		local = self._local_decode_shared_prefix_runs(all_candidates)
-		if self.world_size == 1:
-			return local
-		if not dist.is_initialized():
-			raise RuntimeError(
-				"distributed process group is required to gather decode "
-				"shared-prefix runs"
-			)
-		gathered: List[Optional[Dict[str, Tuple[Tuple[int, int], ...]]]] = (
-			[None] * self.world_size
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._gather_decode_shared_prefix_segments(
+			self._decode_phase_context(), all_candidates
 		)
-		dist.all_gather_object(gathered, local)
-		merged: Dict[str, Tuple[Tuple[int, int], ...]] = {}
-		for part in gathered:
-			if part:
-				merged.update(part)
-		return merged
 
 	def _make_decode_batch_request(
 		self, all_candidates: List[str], capacity: DecodeCapacitySnapshot,
 		shared_segments: Optional[Dict[str, Tuple[Tuple[int, int], ...]]] = None,
 	) -> DecodeBatchRequest:
-		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
-		shared_segments = shared_segments or {}
-		attn_tp_size = self._decode_attn_tp_size()
-		num_capacity_groups = self.world_size // attn_tp_size
-		existing_pages = [0] * num_capacity_groups
-		existing_sequence_counts = [0] * num_capacity_groups
-		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
-			seq = self.global_batch.get_sequence(uuid)
-			if attn_tp_size > 1:
-				r = seq.decode_dp_group
-				if r is None:
-					raise ValueError(
-						f"sequence {uuid[:8]} has no decode_dp_group for "
-						f"attn_tp_size={attn_tp_size}"
-					)
-			else:
-				r = seq.assigned_rank
-			if not 0 <= r < num_capacity_groups:
-				raise ValueError(
-					f"sequence {uuid[:8]} has invalid decode capacity group {r}"
-				)
-			existing_pages[r] += max(0, seq.gpu_pages_allocated)
-			existing_sequence_counts[r] += 1
-
-		candidates = []
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			candidates.append(DecodeCandidate(
-				uuid=uuid,
-				assigned_rank=seq.assigned_rank,
-				global_idx=seq.global_idx,
-				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
-				decode_dp_group=seq.decode_dp_group,
-				shared_prefix_segments=shared_segments.get(uuid, ()),
-			))
-		return DecodeBatchRequest(
-			candidates=tuple(candidates),
-			total_pages=capacity.total_pages,
-			world_size=self.world_size,
-			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
-			attn_tp_size=attn_tp_size,
-			existing_pages=tuple(existing_pages),
-			free_pages=capacity.free_pages,
-			existing_sequence_counts=tuple(existing_sequence_counts),
+		"""Delegate: the moved statements live in ``admission.decode_entry``."""
+		from batchgen.worker.admission import decode_entry
+		return decode_entry._make_decode_batch_request(
+			self._decode_phase_context(), all_candidates, capacity,
+			getattr(self, "_decode_padding_bsz", 0) or 0,
+			shared_segments=shared_segments,
 		)
 
 	def _check_and_handle_completions(
