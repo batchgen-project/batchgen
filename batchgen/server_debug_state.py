@@ -28,7 +28,7 @@ benchmark recorder reads.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional
 

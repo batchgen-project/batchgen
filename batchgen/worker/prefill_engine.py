@@ -348,10 +348,6 @@ class PrefillEngine:
         parameter ``--prefix-rank-assignment-mode global_idx``, which is what
         the A/B arms use; it holds for every wave of the server.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if mode not in ("packing_v2", "global_idx"):
             raise ValueError(
                 "--prefix-rank-assignment-mode must be "
@@ -367,10 +363,6 @@ class PrefillEngine:
         a property of the server: every rank of every group reads the same
         launch value, so the packing stays replicated.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if value not in ("on", "off"):
             raise ValueError(
                 f"--prefix-rank-cost-profile must be 'on' or 'off', got {value!r}"
