@@ -9,7 +9,30 @@ import logging
 
 import torch
 
+from batchgen.parallel_declaration import (
+    planned_resident_experts,
+    replicated_prefill_world_ep_decode_layout,
+)
 from batchgen.planner.base_planner import BasePlanner
+
+
+GLM5_NUM_ROUTED_EXPERTS = 256
+
+
+def glm5_local_expert_split(ep_config, world_size: int) -> tuple:
+    """(offloading enabled, routed experts a rank keeps resident in decode)."""
+    return planned_resident_experts(ep_config, world_size, GLM5_NUM_ROUTED_EXPERTS)
+
+
+def glm5_server_layout(engine_config, world_size: int):
+    """GLM-5's layout, resolved before the model manager is built: every
+    module replicated and streamed in prefill; in decode a resident attention
+    per rank and the routed experts partitioned over the world."""
+    _, resident = glm5_local_expert_split(engine_config.EP_Config, world_size)
+    return replicated_prefill_world_ep_decode_layout(
+        world_size,
+        decode_moe_fully_resident=resident == GLM5_NUM_ROUTED_EXPERTS // int(world_size),
+    )
 
 
 class GLM5Planner(BasePlanner):

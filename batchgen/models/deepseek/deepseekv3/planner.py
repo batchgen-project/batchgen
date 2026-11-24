@@ -21,6 +21,29 @@
 from batchgen.planner.base_planner import BasePlanner
 
 
+DEEPSEEKV3_NUM_ROUTED_EXPERTS = 256
+
+
+def deepseekv3_server_layout(engine_config, world_size: int):
+    """This family's layout, resolved before the model manager is built:
+    every module replicated and streamed in prefill; in decode a resident
+    attention per rank and the routed experts partitioned over the world."""
+    from batchgen.parallel_declaration import (
+        planned_resident_experts,
+        replicated_prefill_world_ep_decode_layout,
+    )
+
+    _, resident = planned_resident_experts(
+        engine_config.EP_Config, world_size, DEEPSEEKV3_NUM_ROUTED_EXPERTS
+    )
+    return replicated_prefill_world_ep_decode_layout(
+        world_size,
+        decode_moe_fully_resident=(
+            resident == DEEPSEEKV3_NUM_ROUTED_EXPERTS // int(world_size)
+        ),
+    )
+
+
 class DeepSeekV3Planner(BasePlanner):
     """Planner specialized for DeepSeek-V3/R1 models.
 

@@ -26,7 +26,7 @@ from batchgen.hardware.machine_family import detect_device_facts
 
 from .config import KimiLinearConfig, is_k3_model_type, require_num_routed_experts
 from .dsa_runtime import require_servable_indexer
-from .planner import KimiLinearPlanner
+from .planner import KimiLinearPlanner, kimi_linear_server_layout
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -193,6 +193,13 @@ class KimiLinearInitializer:
         # returns it as its default and validates it against the topology.
         self.engine_config.Basic_Config.prefill_moe_mode = getattr(
             input_arguments, "prefill_moe_mode", None
+        )
+        # The server layout is resolved here, before any model manager
+        # exists; a prefill MoE mode the topology cannot run is refused now.
+        self.engine_config.Basic_Config.server_layout = kimi_linear_server_layout(
+            self.engine_config,
+            self.engine_config.Basic_Config.world_size,
+            is_k3=self.is_k3,
         )
         if self.distributed_weight_transport == "hierarchical_gdr":
             # S4: hierarchical_gdr always runs the engine-bound replica

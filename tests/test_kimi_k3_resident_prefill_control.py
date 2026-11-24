@@ -203,6 +203,8 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed_sp8"
     manager._latent_tp_planned = False
+    manager._stream_all_modules = False
+    manager._attn_tp_size = 8
     manager.engine_config = SimpleNamespace(
         Basic_Config=SimpleNamespace(prefill_moe_mode=None)
     )

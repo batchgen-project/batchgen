@@ -58,64 +58,30 @@ class MiniMaxM25ParallelStrategyManager:
         self.enable_ep_offloading = False
 
     def parallel_declaration(self, decode_graph_state=None):
-        """MiniMax-M2.5's declared parallel layout (batchgen.parallel_declaration).
+        """This family's parallel layout (batchgen.parallel_declaration): the
+        planner's, resolved before this manager was built."""
+        from batchgen.parallel_declaration import DecodeGraphDeclaration
 
-        Prefill runs every module replicated per rank with the weights
-        streamed from host (pure DP); decode keeps attention resident per
-        rank (pure DP) and partitions the routed experts over the world
-        (EP). The decode shard's residency comes from the same
-        deployment-constant planner ``configure_decoding`` assigns from
-        (``_plan_local_expert_split``), so the declaration and the configure
-        can never disagree: a rank keeping only part of its shard resident
-        streams the remainder and declares ``partial``.
-        """
-        from batchgen.parallel_declaration import (
-            DecodeGraphDeclaration,
-            ModuleParallelism,
-            ParallelDeclaration,
-            RESIDENCY_PARTIAL,
-            RESIDENCY_RESIDENT,
-            RESIDENCY_STREAMED,
-            SCHEME_DP,
-            SCHEME_EP,
-        )
+        from batchgen.models.minimax.minimax_m25.planner import minimax_m25_server_layout
 
-        _, num_local = self._plan_local_expert_split()
-        experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
-        return ParallelDeclaration(
-            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            prefill_moe=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
-            decode_moe=ModuleParallelism(
-                SCHEME_EP,
-                RESIDENCY_RESIDENT
-                if num_local == experts_per_rank
-                else RESIDENCY_PARTIAL,
-                group_size=self.world_size,
-            ),
-            decode_graph=DecodeGraphDeclaration.off(),
+        return minimax_m25_server_layout(self.engine_config, self.world_size).declaration(
+            DecodeGraphDeclaration.off()
+            if decode_graph_state is None
+            else decode_graph_state
         )
 
     def _plan_local_expert_split(self):
         """(offloading enabled, routed experts this rank keeps resident).
 
-        Derived from the world size and the EP configuration only, so it is
-        the same answer before and after ``configure_decoding`` assigns it.
-        The GLM-5 planner seam (glm/glm5/Parallel_Strategy_Manager.py); model
-        families do not import one another's modules, so the helper is
-        duplicated here rather than cross-imported.
-        """
-        experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
-        if self.world_size > 8:
-            # Multi-node: every rank's shard is resident.
-            return False, experts_per_rank
-        if self.engine_config.EP_Config.enable_offloading:
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            return True, int(experts_per_rank * (1 - offload_ratio))
-        configured = self.engine_config.EP_Config.num_local_expert_per_layer
-        if configured is None or configured == 0:
-            return False, experts_per_rank
-        return False, configured
+        The rule lives with the planner, which resolves the server layout
+        from it before this manager is built."""
+        from batchgen.parallel_declaration import planned_resident_experts
+
+        from batchgen.models.minimax.minimax_m25.planner import MINIMAX_M25_NUM_ROUTED_EXPERTS
+
+        return planned_resident_experts(
+            self.engine_config.EP_Config, self.world_size, MINIMAX_M25_NUM_ROUTED_EXPERTS
+        )
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP).
