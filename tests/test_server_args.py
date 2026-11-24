@@ -123,12 +123,22 @@ def test_resident_ep_prefill_with_the_prefix_cache_is_refused_at_startup(
 def test_prefill_moe_mode_flag_parses_to_server_args():
     parser = server_args_module._build_parser()
     base = ["--model", "m", "--host-kv-cache-size", "1"]
-    for mode in ("streamed", "streamed_sp8", "resident_ep"):
+    for mode in ("streamed", "resident_ep"):
         parsed = parser.parse_args(base + ["--prefill-moe-mode", mode])
         assert parsed.prefill_moe_mode == mode
     assert parser.parse_args(base).prefill_moe_mode is None
     with pytest.raises(SystemExit):
         parser.parse_args(base + ["--prefill-moe-mode", "resident"])
+
+
+def test_the_retired_prefill_moe_mode_is_refused_with_its_replacement(capsys):
+    parser = server_args_module._build_parser()
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--prefill-moe-mode", "streamed_sp8"])
+    message = capsys.readouterr().err
+    assert "streamed_sp8 is retired" in message
+    assert "--prefill-moe-mode streamed --prefill-moe-ep 8" in message
 
 
 def test_prefix_rank_launch_parameters_parse_and_default_to_the_packer():

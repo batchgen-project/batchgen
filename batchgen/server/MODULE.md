@@ -137,9 +137,12 @@ valid result of the model.
 # Prefill MoE mode (`--prefill-moe-mode`)
 
 The prefill MoE mode is a prefill-phase parameter chosen once per server:
-`--prefill-moe-mode {streamed,streamed_sp8,resident_ep}` on models that
-declare prefill MoE modes (Kimi-K3), else the model's streaming default for
-its weight topology. Every prefill wave of the server runs that one mode; no
+`--prefill-moe-mode {streamed,resident_ep}` on models that declare prefill
+MoE modes (Kimi-K3), default `streamed`. With streamed experts the ranks one
+expert partition spans are `--prefill-moe-ep` (1 or the 8-rank attention
+group), by default what the weight topology needs. The retired value
+`streamed_sp8` is refused at argument parsing with its replacement
+(`--prefill-moe-mode streamed --prefill-moe-ep 8`). Every prefill wave of the server runs that one mode; no
 batch or debug flag changes it. The model's strategy manager validates the
 mode against its topology at construction and refuses an impossible one by
 name at startup; a model without prefill MoE modes refuses the flag.

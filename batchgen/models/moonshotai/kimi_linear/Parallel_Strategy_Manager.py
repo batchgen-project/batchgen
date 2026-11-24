@@ -712,6 +712,9 @@ class KimiLinearParallelStrategyManager:
             distributed_weight_sharded=self._distributed_weight_sharded,
             stream_all_modules=self._stream_all_modules,
             attention_group_size=self._attn_tp_size,
+            requested_ep=getattr(
+                self.engine_config.Basic_Config, "prefill_moe_ep", None
+            ),
         )
 
     def prefill_uses_resident_ep(self):

@@ -72,6 +72,22 @@ _K3_DISTRIBUTED_NODE_COUNTS = (2, 4)
 _K3_FAMILY_MODEL_TYPES = frozenset({"kimi_k3", "kimi_k31"})
 
 
+def _prefill_moe_mode(value: str) -> str:
+    """--prefill-moe-mode: streamed or resident_ep. The retired value that
+    named an expert group inside the mode is refused with its replacement."""
+    mode = value.strip().lower()
+    if mode == "streamed_sp8":
+        raise argparse.ArgumentTypeError(
+            "streamed_sp8 is retired: the expert group is its own parameter; "
+            "pass --prefill-moe-mode streamed --prefill-moe-ep 8"
+        )
+    if mode not in ("streamed", "resident_ep"):
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {value!r} (choose from 'streamed', 'resident_ep')"
+        )
+    return mode
+
+
 def _is_kimi_k3_model(model_name: Optional[str]) -> bool:
     """A registered Kimi-K3-family identity, not a substring guess.
 
@@ -465,16 +481,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prefill-moe-mode",
-        choices=("streamed", "streamed_sp8", "resident_ep"),
+        type=_prefill_moe_mode,
         default=None,
         help=(
             "Prefill MoE mode for every prefill wave of this server, on models "
-            "that declare prefill MoE modes; no batch can change it. Default: "
-            "the model's streaming mode for its weight topology. streamed: "
-            "every rank streams all routed experts (only with unsharded "
-            "latent MoE projections and node-local weights). streamed_sp8: "
-            "each of a node's eight TP ranks streams its share of the routed "
-            "experts. resident_ep keeps every rank's EP shard resident from "
+            "that declare prefill MoE modes; no batch can change it: streamed "
+            "(default) or resident_ep. streamed: the routed experts are "
+            "streamed from host; --prefill-moe-ep gives the ranks one expert "
+            "partition spans (1: every rank streams all experts, only with "
+            "unsharded latent MoE projections and node-local weights; 8: each "
+            "of a node's eight TP ranks streams its share), default by weight "
+            "topology. resident_ep keeps every rank's EP shard resident from "
             "startup and runs every wave, the first included, against it. "
             "The model refuses a mode its topology cannot run at startup, and "
             "a model without prefill MoE modes refuses the option."

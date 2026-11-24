@@ -79,6 +79,9 @@ class BasicConfig:
     # Server-level prefill MoE mode (--prefill-moe-mode). None = the model's
     # default (streaming); every prefill wave of the server uses one mode.
     prefill_moe_mode: Optional[str] = None
+    # --prefill-moe-ep: the ranks one prefill expert partition spans, for
+    # models whose planner takes it; None = the planner's default.
+    prefill_moe_ep: Optional[int] = None
     # The server's two phase layouts (parallel_declaration.ServerLayout),
     # resolved by the model's planner before the model manager is built; the
     # manager is built for exactly this layout.

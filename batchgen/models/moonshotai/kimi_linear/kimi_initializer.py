@@ -200,6 +200,9 @@ class KimiLinearInitializer:
         self.engine_config.Basic_Config.prefill_moe_mode = getattr(
             input_arguments, "prefill_moe_mode", None
         )
+        self.engine_config.Basic_Config.prefill_moe_ep = getattr(
+            input_arguments, "prefill_moe_ep", None
+        )
         # The server layout is resolved here, before any model manager
         # exists; a prefill MoE mode the topology cannot run is refused now.
         self.engine_config.Basic_Config.server_layout = kimi_linear_server_layout(
