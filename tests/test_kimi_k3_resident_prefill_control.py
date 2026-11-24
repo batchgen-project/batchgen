@@ -463,6 +463,8 @@ def _sp8_schedule_manager(*, hierarchical_gdr, cross_source=False):
     manager._stream_all_modules = False
     manager._attn_tp_size = 8
     manager._attn_tp_rank = 3
+    manager._streamed_expert_group_size = 8
+    manager._streamed_expert_group_rank = 3
     manager._hierarchical_gdr = hierarchical_gdr
     manager._cross_weight_source = cross_source
     manager._cross_seam = False
@@ -541,6 +543,8 @@ def test_hierarchical_gdr_builds_the_exact_cross_node_group_and_root_map():
         manager._hierarchical_gdr = hierarchical_gdr
         manager._attn_tp_size = 8
         manager._attn_tp_rank = global_rank % 8
+        manager._streamed_expert_group_size = 8
+        manager._streamed_expert_group_rank = global_rank % 8
         manager.world_size = 32
         manager.global_rank = global_rank
         manager._cross_weight_group = None
@@ -620,6 +624,8 @@ def test_hierarchical_gdr_cross_node_map_follows_the_node_count():
                 manager._hierarchical_gdr = True
                 manager._attn_tp_size = 8
                 manager._attn_tp_rank = global_rank % 8
+                manager._streamed_expert_group_size = 8
+                manager._streamed_expert_group_rank = global_rank % 8
                 manager.world_size = world_size
                 manager.global_rank = global_rank
                 manager._cross_weight_group = None

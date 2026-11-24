@@ -388,13 +388,33 @@ class KimiLinearParallelStrategyManager:
         self._attn_tp_hl = kda_num_heads // G
         self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
         self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        # The group the streamed prefill experts are partitioned over is the
+        # layout's prefill MoE group, a quantity of its own: it decides which
+        # experts this rank streams and which ranks assemble a layer's weights.
+        # Size 1 means no streamed expert group (every rank streams all
+        # experts, or the experts are resident).
+        prefill_moe = layout.prefill.moe
+        expert_group = (
+            int(prefill_moe.group_size)
+            if (prefill_moe.scheme, prefill_moe.residency)
+            == (SCHEME_EP, RESIDENCY_STREAMED)
+            else 1
+        )
+        assert world_size % expert_group == 0, (
+            f"world_size {world_size} not divisible by the streamed expert "
+            f"group size {expert_group}"
+        )
+        self._streamed_expert_group_size = expert_group
+        self._streamed_expert_group_rank = global_rank % expert_group
+        self._streamed_expert_group_id = global_rank // expert_group
         # World-level, so built once per process and reused by every later
         # model rebuild (``_build_attn_tp_group``). The signature is the
         # (world_size, attention TP degree) the live groups were built for; a
         # later build request that disagrees is refused by name there.
         self._attn_tp_groups_built = False
         self._attn_tp_group_signature = None
-        # Weight assembly has its own communicator.  The streamed-SP8
+        # Weight assembly has its own communicator, over the streamed expert
+        # group (built only when the layout has one).  The streamed-SP8
         # prefetcher launches the next layer's six all-gathers from a host
         # thread while the main thread runs the next layer's attention.  A
         # separate process group prevents those collectives from being
@@ -1339,10 +1359,11 @@ class KimiLinearParallelStrategyManager:
                 task["shared_expert"].append(f"shared_expert_{layer_idx}")
             for e_idx in range(len(moe.experts)):
                 if self.prefill_uses_streamed_sp8():
-                    start = self._attn_tp_rank * (
-                        len(moe.experts) // self._attn_tp_size
+                    per_rank = (
+                        len(moe.experts) // self._streamed_expert_group_size
                     )
-                    end = start + len(moe.experts) // self._attn_tp_size
+                    start = self._streamed_expert_group_rank * per_rank
+                    end = start + per_rank
                     if not (start <= e_idx < end):
                         continue
                 task["routed_expert"].append(
@@ -1528,10 +1549,20 @@ class KimiLinearParallelStrategyManager:
                     "experts, EP32 collectives, compact routed scratch"
                 )
         elif self.prefill_uses_streamed_sp8():
-            if self._stream_all_modules or self._attn_tp_size != 8:
+            # The token rows are split over the attention group and the
+            # experts over the expert group; the forward is implemented only
+            # where the two are the same ranks.
+            if (
+                self._stream_all_modules
+                or self._attn_tp_size <= 1
+                or self._streamed_expert_group_size != self._attn_tp_size
+            ):
                 raise RuntimeError(
-                    "streamed-SP8 prefill requires K3's resident TP8 attention "
-                    "layout (attention_group_size=8, stream_all_modules=False)"
+                    "streamed group-expert prefill requires K3's resident TP "
+                    "attention layout with the expert group equal to the "
+                    f"attention group (attention group {self._attn_tp_size}, "
+                    f"expert group {self._streamed_expert_group_size}, "
+                    f"stream_all_modules={self._stream_all_modules})"
                 )
             self._set_resident_ep_prefill_enabled(False)
             self._release_resident_ep_decode()
@@ -2499,8 +2530,8 @@ class KimiLinearParallelStrategyManager:
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
             tp_group=self._weight_tp_group,
-            tp_rank=self._attn_tp_rank,
-            tp_size=self._attn_tp_size,
+            tp_rank=self._streamed_expert_group_rank,
+            tp_size=self._streamed_expert_group_size,
             num_experts=cfg.n_routed_experts,
             intermediate_size=cfg.moe_intermediate_size,
             latent_size=cfg.routed_expert_hidden_size,
@@ -3239,25 +3270,34 @@ class KimiLinearParallelStrategyManager:
         """Build the head-parallel (KDA TP) NCCL sub-groups (M2a).
 
         COLLECTIVE: every rank creates every group, in the same order, and
-        keeps the one it belongs to as ``self._attn_tp_group``. No-op for
-        G==1. The global PyNccl communicator (``self._comm``, EP-32) is
-        untouched; this is a separate torch NCCL group, exactly like the
-        worker's own ``dist.new_group`` usage.
+        keeps the one it belongs to as ``self._attn_tp_group``. The global
+        PyNccl communicator (``self._comm``, EP-32) is untouched; this is a
+        separate torch NCCL group, exactly like the worker's own
+        ``dist.new_group`` usage.
+
+        Two node-local families, each built only when the layout has the
+        group: the attention groups (activation collectives) and the streamed
+        expert groups (weight assembly). No-op when both sizes are 1.
         """
-        if self._attn_tp_size <= 1:
+        if self._attn_tp_size <= 1 and self._streamed_expert_group_size <= 1:
             return
         # The topology the live groups were built for. It is immutable for the
         # life of the process today (both values are fixed at construction),
         # so a later call that disagrees is a lifecycle error, not a request
         # to rebuild: say so by name instead of handing back groups that no
         # longer describe the world.
-        signature = (int(self.world_size), int(self._attn_tp_size))
+        signature = (
+            int(self.world_size),
+            int(self._attn_tp_size),
+            int(self._streamed_expert_group_size),
+        )
         if self._attn_tp_groups_built:
             if signature != self._attn_tp_group_signature:
                 raise RuntimeError(
                     "attention TP topology changed in-process after the NCCL "
                     "sub-groups were built: they were created for "
-                    "(world_size, attention_group_size)="
+                    "(world_size, attention_group_size, "
+                    "streamed_expert_group_size)="
                     f"{self._attn_tp_group_signature} and this call asks for "
                     f"{signature}. The groups are world-level and cannot be "
                     "rebuilt here (torch drops a group only at "
@@ -3292,18 +3332,22 @@ class KimiLinearParallelStrategyManager:
                 "(head-parallel KDA builds NCCL sub-groups at configure time)."
             )
         G = self._attn_tp_size
-        for g in range(self.world_size // G):
-            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
-            if g == self._attn_tp_group_id:
-                self._attn_tp_group = grp
-        # Do not reuse the attention group for streamed weight assembly.  The
-        # prefetch thread can otherwise enqueue a weight all-gather after one
-        # rank has already entered the next attention all-reduce, which is an
-        # invalid NCCL ordering even though both collectives are node-local.
-        for g in range(self.world_size // G):
-            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
-            if g == self._attn_tp_group_id:
-                self._weight_tp_group = grp
+        if G > 1:
+            for g in range(self.world_size // G):
+                grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
+                if g == self._attn_tp_group_id:
+                    self._attn_tp_group = grp
+        # Streamed weight assembly runs over the expert group and never reuses
+        # an attention group, even when both are the same ranks.  The prefetch
+        # thread can otherwise enqueue a weight all-gather after one rank has
+        # already entered the next attention all-reduce, which is an invalid
+        # NCCL ordering even though both collectives are node-local.
+        M = self._streamed_expert_group_size
+        if M > 1:
+            for g in range(self.world_size // M):
+                grp = dist.new_group(ranks=list(range(g * M, (g + 1) * M)))
+                if g == self._streamed_expert_group_id:
+                    self._weight_tp_group = grp
         self._build_cross_weight_group()
         # Every family is up; later rebuilds reuse them (see the guard above),
         # and the signature records the topology they belong to.
