@@ -44,6 +44,7 @@ from batchgen.phase_lifecycle import (
     PhaseEnterContext,
     PhaseKey,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 if os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL") == "1":
     from pplx_kernels.all_to_all import AllToAll
 else:
@@ -54,6 +55,10 @@ NUM_TOTAL_EXPERTS = 384  # K2.5 has 384 routed experts per MoE layer
 
 
 class KimiK25ParallelStrategyManager:
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
     def __init__(
         self,
         loaded_model_config,

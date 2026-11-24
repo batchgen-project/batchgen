@@ -215,6 +215,7 @@ def _snapshot_worker(**overrides):
             return 3200
 
     worker = SimpleNamespace(
+        world_size=8,
         parallel_manager=SimpleNamespace(),  # no declaration
         engine_config=SimpleNamespace(
             Basic_Config=SimpleNamespace(enable_cuda_graphs=False)
@@ -342,5 +343,44 @@ def test_snapshot_defaults_full_count_for_models_without_the_stamp():
 def test_snapshot_refuses_to_run_after_the_pool_is_retired():
     worker, snapshot = _snapshot_worker(gpu_paged_kv_cache_manager=None)
     with pytest.raises(RuntimeError, match="device-KV pool"):
+        snapshot(worker)
+    assert worker.server_config is None
+
+
+def test_snapshot_keeps_the_layout_object_and_refuses_an_unimplemented_one():
+    from batchgen.parallel_declaration import (
+        ModuleParallelism,
+        ParallelDeclaration,
+        UnsupportedLayoutError,
+        replicated_prefill_world_ep_decode,
+    )
+
+    def manager(prefill_attention):
+        return SimpleNamespace(
+            SUPPORTED_LAYOUTS=replicated_prefill_world_ep_decode(),
+            parallel_declaration=lambda graph_state: ParallelDeclaration(
+                prefill_attention=prefill_attention,
+                prefill_moe=ModuleParallelism("dp", "streamed"),
+                decode_attention=ModuleParallelism("dp", "resident"),
+                decode_moe=ModuleParallelism("ep", "resident", group_size=8),
+                decode_graph=graph_state,
+            ),
+        )
+
+    worker, snapshot = _snapshot_worker(
+        parallel_manager=manager(ModuleParallelism("dp", "streamed"))
+    )
+    snapshot(worker)
+    layout = worker._server_layout
+    assert layout.decode.moe_groups == (tuple(range(8)),)
+    reported = sc.ServerConfig.from_dict(worker.server_config)
+    assert (reported.prefill_attn, reported.decode_moe) == (
+        layout.prefill.attention.render(), layout.decode.moe.render()
+    )
+
+    worker, snapshot = _snapshot_worker(
+        parallel_manager=manager(ModuleParallelism("tp", "resident", group_size=2))
+    )
+    with pytest.raises(UnsupportedLayoutError, match="prefill attention=tp2:resident"):
         snapshot(worker)
     assert worker.server_config is None
