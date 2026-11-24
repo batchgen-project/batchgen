@@ -1455,6 +1455,11 @@ class BatchGenWorker:
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
+		# THE decode-phase admission context. Built exactly once per decode
+		# phase by _enter_decode_phase_context (in generate(), after the
+		# wave's GPU KV pool init) and dropped by _exit_decode_phase_context
+		# on every path out of the phase; None outside a decode phase.
+		self._held_decode_phase_context: Optional[DecodePhaseContext] = None
 		# Set once by _bind_gpu_paged_kv_manager and never cleared: whether
 		# this process has ever created a GPU KV pool.
 		self._gpu_kv_pool_created = False
@@ -2198,7 +2203,14 @@ class BatchGenWorker:
 		layout (C1: each phase owns its layout)."""
 		return self._server_layout.prefill.attention.group_size
 
-	def _decode_phase_context(self) -> DecodePhaseContext:
+	def _build_decode_phase_context(self) -> DecodePhaseContext:
+		"""Collect the frozen decode admission context from the worker state.
+
+		Direct callers are the decode-phase entry bracket and
+		``_decode_phase_context`` outside a decode phase; a call site inside
+		a decode phase reads the phase's held context instead, so a mid-phase
+		rebuild cannot fork two views of the phase.
+		"""
 		return DecodePhaseContext(
 			facts=RankFacts(
 				rank=self.rank,
@@ -2234,6 +2246,45 @@ class BatchGenWorker:
 			chunk_sizer=getattr(self, "adaptive_chunk_sizer", None),
 			parallel_manager=getattr(self, "parallel_manager", None),
 		)
+
+	def _enter_decode_phase_context(self) -> None:
+		"""Decode-phase entry: build the phase's ONE admission context.
+
+		Runs once per decode wave in ``generate``, after the wave's decode
+		model load and GPU KV pool init — the pool bind
+		(``_bind_gpu_paged_kv_manager``) is the only post-setup reassignment
+		of a context field, so building after it lets the held context carry
+		the live pool for the whole phase. Entering with a context still
+		held is a lifecycle bug, never a refresh point.
+		"""
+		if self._held_decode_phase_context is not None:
+			raise RuntimeError(
+				f"Rank {self.rank}: decode-phase entry found a held decode "
+				"context; the previous decode phase did not exit through "
+				"_exit_decode_phase_context"
+			)
+		self._held_decode_phase_context = self._build_decode_phase_context()
+
+	def _exit_decode_phase_context(self) -> None:
+		"""Decode-phase exit: drop the held context, on every path out."""
+		self._held_decode_phase_context = None
+
+	def _decode_phase_context(self) -> DecodePhaseContext:
+		"""The running decode phase's held context; a fresh build outside one.
+
+		Inside a decode phase (between the enter/exit brackets in
+		``generate``) every call returns THE context built at decode-phase
+		entry — never a rebuild, so a reassigned worker field cannot
+		silently hand two halves of one phase different state. Outside a
+		decode phase (prefill admission and prefill-wave bookkeeping,
+		startup instance build, completion of prefill-only sequences) each
+		caller builds its own frozen snapshot, which is correct there
+		because every context field is stable once setup assigned it.
+		"""
+		held = self._held_decode_phase_context
+		if held is not None:
+			return held
+		return self._build_decode_phase_context()
 
 	def _prefill_phase_context(self) -> PrefillPhaseContext:
 		decode_ctx = self._decode_phase_context()
@@ -4254,6 +4305,15 @@ class BatchGenWorker:
 		)
 
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
+		if self._held_decode_phase_context is not None:
+			# The one post-setup reassignment of a decode-context field. A
+			# decode phase holds the context built at its entry, so a rebind
+			# while one is held would strand that phase on the old pool.
+			raise RuntimeError(
+				f"Rank {self.rank}: GPU KV manager rebind while a decode-phase "
+				"context is held; the pool is created before decode-phase "
+				"entry, never inside a decode phase"
+			)
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
@@ -7055,244 +7115,254 @@ class BatchGenWorker:
 				# Only initializes if not already done; subsequent iterations skip
 				self._init_gpu_kv_with_actual_size()
 
-				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
-				decode_uuids = self._prepare_decode_batch()
+				# ============ Decode-phase entry: ONE admission context per wave ============
+				# The GPU KV pool bind above (STEP B) is the only post-setup
+				# reassignment of a context field, so the phase context is
+				# built after it and held until the wave leaves, on every
+				# path (loop-back, completion break, cohort shutdown break,
+				# watermark break, exception).
+				self._enter_decode_phase_context()
+				try:
+					# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
+					decode_uuids = self._prepare_decode_batch()
 
-				# Include currently running sequences - PRESERVE ORDER
-				current_decoding = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-				seen = set(decode_uuids)
-				for uuid in current_decoding:
-					if uuid not in seen:
-						decode_uuids.append(uuid)
-						seen.add(uuid)
+					# Include currently running sequences - PRESERVE ORDER
+					current_decoding = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+					seen = set(decode_uuids)
+					for uuid in current_decoding:
+						if uuid not in seen:
+							decode_uuids.append(uuid)
+							seen.add(uuid)
 				
-				# Sort for deterministic cross-rank ordering
-				decode_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+					# Sort for deterministic cross-rank ordering
+					decode_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 
-				# OPTIMIZATION: Use tensor-based sync instead of expensive all_gather_object
-				# This reduces completion sync from ~5-10ms to ~0.2ms per decode iteration
+					# OPTIMIZATION: Use tensor-based sync instead of expensive all_gather_object
+					# This reduces completion sync from ~5-10ms to ~0.2ms per decode iteration
 
-				# Step 1: Sync decode_uuids across ranks using tensor operations
-				# This ensures all ranks have the same decode candidates
-				decode_uuids = self._sync_decode_uuids_tensor(decode_uuids)
+					# Step 1: Sync decode_uuids across ranks using tensor operations
+					# This ensures all ranks have the same decode candidates
+					decode_uuids = self._sync_decode_uuids_tensor(decode_uuids)
 
-				# Step 2: Sync completion status using tensor-based all_reduce
-				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
-				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
+					# Step 2: Sync completion status using tensor-based all_reduce
+					# Returns (completed_set, active_list) - active_list is already sorted by global_idx
+					global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
 
-				if global_completed:
-					# Refresh rank-0's sequence replicas first: _report_completion
-					# reads prompt_length/decoded_length from the local entry,
-					# which is stale here for sequences owned by other ranks
-					# (only the completion BIT was all-reduced above).
-					self._sync_sequence_metadata(list(global_completed))
-					# Gather decoded tokens from owning ranks before reporting
-					# (each rank only writes decoded tokens for its own sequences)
-					gathered_texts = self._gather_completed_tokens(list(global_completed))
-					# ORDERING FIX: release resources BEFORE _report_completion
-					# pops local_map entries. See matching fix in _page_boundary_fast
-					# Phase 4.A and in the legacy decode path.
-					completed_list = list(global_completed)
-					my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
-					if my_completed:
-						# Only release GPU pages for seqs that were actually GPU-allocated.
-						# prefill_prepacked writes KV directly to host (never registers
-						# with the GPU paged manager), so zero-tok-EOS prefill completions
-						# are in _uuid_to_local_map but never in manager._sequences.
-						# _sequences_with_gpu_kv is the source-of-truth tracking set
-						# (added at :1619/:4904/:6191, discarded on release/eviction).
-						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
-						if gpu_allocated:
-							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-						# The rows remaining in decode are the ones read into
-						# current_decoding above minus the rows the completion
-						# sync just moved to COMPLETED; no other status write
-						# runs between that read and this call.
-						self._release_host_kv_pages_for_batch(
-							my_completed,
-							remaining_decode_uuids=[
-								u for u in current_decoding
-								if u not in global_completed
-							],
-						)
-					# All-ranks scalar cleanup
-					for uuid in completed_list:
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None:
-							seq.gpu_pages_allocated = 0
-							seq.host_pages_allocated = 0
-							seq.host_owned_pages = 0
-							seq.host_token_capacity = 0
-							seq.evicted_from_dp_group = None
-							self._sequences_with_gpu_kv.discard(uuid)
-					# Report completions (pops local_map; runs LAST).
-					# Guard: only report if status actually reached COMPLETED.
-					# _sync_completion_status_tensor may detect eos_reached=True
-					# for a PREFILLED sequence (stale from pre-eviction), but
-					# PREFILLED→COMPLETED is an invalid transition. Without this
-					# guard, _report_completion pops local_map for a sequence
-					# whose status never changed, creating an orphan.
-					for uuid in completed_list:
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None and seq.status == SequenceStatus.COMPLETED:
-							self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
-						elif seq is not None:
-							logging.warning(
-								f"Rank {self.rank}: Skipping _report_completion for {uuid[:8]} "
-								f"(status={seq.status.name}, expected COMPLETED). "
-								f"Likely stale eos_reached from pre-eviction cycle."
+					if global_completed:
+						# Refresh rank-0's sequence replicas first: _report_completion
+						# reads prompt_length/decoded_length from the local entry,
+						# which is stale here for sequences owned by other ranks
+						# (only the completion BIT was all-reduced above).
+						self._sync_sequence_metadata(list(global_completed))
+						# Gather decoded tokens from owning ranks before reporting
+						# (each rank only writes decoded tokens for its own sequences)
+						gathered_texts = self._gather_completed_tokens(list(global_completed))
+						# ORDERING FIX: release resources BEFORE _report_completion
+						# pops local_map entries. See matching fix in _page_boundary_fast
+						# Phase 4.A and in the legacy decode path.
+						completed_list = list(global_completed)
+						my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
+						if my_completed:
+							# Only release GPU pages for seqs that were actually GPU-allocated.
+							# prefill_prepacked writes KV directly to host (never registers
+							# with the GPU paged manager), so zero-tok-EOS prefill completions
+							# are in _uuid_to_local_map but never in manager._sequences.
+							# _sequences_with_gpu_kv is the source-of-truth tracking set
+							# (added at :1619/:4904/:6191, discarded on release/eviction).
+							gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+							if gpu_allocated:
+								self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+							# The rows remaining in decode are the ones read into
+							# current_decoding above minus the rows the completion
+							# sync just moved to COMPLETED; no other status write
+							# runs between that read and this call.
+							self._release_host_kv_pages_for_batch(
+								my_completed,
+								remaining_decode_uuids=[
+									u for u in current_decoding
+									if u not in global_completed
+								],
 							)
+						# All-ranks scalar cleanup
+						for uuid in completed_list:
+							seq = self.global_batch.get_sequence(uuid)
+							if seq is not None:
+								seq.gpu_pages_allocated = 0
+								seq.host_pages_allocated = 0
+								seq.host_owned_pages = 0
+								seq.host_token_capacity = 0
+								seq.evicted_from_dp_group = None
+								self._sequences_with_gpu_kv.discard(uuid)
+						# Report completions (pops local_map; runs LAST).
+						# Guard: only report if status actually reached COMPLETED.
+						# _sync_completion_status_tensor may detect eos_reached=True
+						# for a PREFILLED sequence (stale from pre-eviction), but
+						# PREFILLED→COMPLETED is an invalid transition. Without this
+						# guard, _report_completion pops local_map for a sequence
+						# whose status never changed, creating an orphan.
+						for uuid in completed_list:
+							seq = self.global_batch.get_sequence(uuid)
+							if seq is not None and seq.status == SequenceStatus.COMPLETED:
+								self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+							elif seq is not None:
+								logging.warning(
+									f"Rank {self.rank}: Skipping _report_completion for {uuid[:8]} "
+									f"(status={seq.status.name}, expected COMPLETED). "
+									f"Likely stale eos_reached from pre-eviction cycle."
+								)
 
-				if not decode_uuids:
-					break
+					if not decode_uuids:
+						break
 				
-				for uuid in decode_uuids:
-					seq = self.global_batch.get_sequence(uuid)
-					prev_status = "ON_HOLD" if seq.had_initial_gpu_reservation else "PREFILLED"
-					seq.log_event(SeqEvent.DECODE_START, self.rank,
-						f"from={prev_status}")
+					for uuid in decode_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						prev_status = "ON_HOLD" if seq.had_initial_gpu_reservation else "PREFILLED"
+						seq.log_event(SeqEvent.DECODE_START, self.rank,
+							f"from={prev_status}")
 
-				# ============ CRITICAL: Sync metadata before decode config ============
-				# After decode→prefill→decode transitions, sequence metadata
-				# (decoded_length, current_context_length, host_pages_allocated) may be
-				# stale on non-owning ranks. The last sync was at the previous decode
-				# group's final boundary. Sequences decoded additional tokens after that
-				# boundary without cross-rank sync. Without this sync,
-				# _allocate_gpu_kv_two_page_buffer may allocate too few GPU pages
-				# (capped by stale host_pages_allocated), causing KV corruption at the
-				# DECISION_INTERVAL boundary (~134-token truncation bug).
-				if decode_uuids:
+					# ============ CRITICAL: Sync metadata before decode config ============
+					# After decode→prefill→decode transitions, sequence metadata
+					# (decoded_length, current_context_length, host_pages_allocated) may be
+					# stale on non-owning ranks. The last sync was at the previous decode
+					# group's final boundary. Sequences decoded additional tokens after that
+					# boundary without cross-rank sync. Without this sync,
+					# _allocate_gpu_kv_two_page_buffer may allocate too few GPU pages
+					# (capped by stale host_pages_allocated), causing KV corruption at the
+					# DECISION_INTERVAL boundary (~134-token truncation bug).
+					if decode_uuids:
+						self._sync_sequence_metadata(decode_uuids)
+
+					# M2b: stamp the decode DP-group before local-index resolution so
+					# the G ranks of a group resolve the SAME sequences (no-op, G==1).
+					self._assign_decode_dp_groups(decode_uuids)
+					# The local rows this resolves are the rows the decode forward
+					# asks KDA state for, so refuse a row that the group map does
+					# not own here instead of inside prepare_decode_step.
+					self._check_local_binding_matches_group(
+						decode_uuids, "decode entry"
+					)
+					local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
+					global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
+					self._adopt_debug_state("decode")
+					phase_state.bind_debug(
+						AttnWrapperBase,
+						batchgen_debug=self._debug_values(),
+					)
+					self._configure_glm5_dispatch_trace(global_decode_sequences)
+
+					# B. Config Decode
+					config_start = time.perf_counter()
+					self._config_decoding_for_batch(decode_uuids, local_decode_indices)
+					self._sync_decode_moe_rank_counts(
+						local_decode_indices,
+						reason="pre_decode_warmup",
+					)
+					self._bind_decode_attention_metadata_for_graph_config(local_decode_indices)
+					config_decode_time += time.perf_counter() - config_start
+					self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY)
 					self._sync_sequence_metadata(decode_uuids)
 
-				# M2b: stamp the decode DP-group before local-index resolution so
-				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
-				self._assign_decode_dp_groups(decode_uuids)
-				# The local rows this resolves are the rows the decode forward
-				# asks KDA state for, so refuse a row that the group map does
-				# not own here instead of inside prepare_decode_step.
-				self._check_local_binding_matches_group(
-					decode_uuids, "decode entry"
-				)
-				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
-				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
-				self._adopt_debug_state("decode")
-				phase_state.bind_debug(
-					AttnWrapperBase,
-					batchgen_debug=self._debug_values(),
-				)
-				self._configure_glm5_dispatch_trace(global_decode_sequences)
+					# Model-owned decode prewarm/capture against the live GPU KV
+					# manager: Kimi-K3's segmented attention + resident-MXFP4 MoE
+					# graphs are captured here, and GLM-5's geometry-keyed JIT
+					# prewarm re-runs here only when the page-table geometry
+					# changed (a retained lifecycle already ran it before
+					# readiness, in _capture_startup_decode_graphs).
+					self._prewarm_decode_jit()
 
-				# B. Config Decode
-				config_start = time.perf_counter()
-				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
-				self._sync_decode_moe_rank_counts(
-					local_decode_indices,
-					reason="pre_decode_warmup",
-				)
-				self._bind_decode_attention_metadata_for_graph_config(local_decode_indices)
-				config_decode_time += time.perf_counter() - config_start
-				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY)
-				self._sync_sequence_metadata(decode_uuids)
+					# The round's criticality probe request. A request that differs
+					# from the probe in the resident decode graph (none is a value)
+					# arms a recapture, which the warmup below then runs.
+					self._configure_criticality_probe(
+						self._debug_values()
+					)
 
-				# Model-owned decode prewarm/capture against the live GPU KV
-				# manager: Kimi-K3's segmented attention + resident-MXFP4 MoE
-				# graphs are captured here, and GLM-5's geometry-keyed JIT
-				# prewarm re-runs here only when the page-table geometry
-				# changed (a retained lifecycle already ran it before
-				# readiness, in _capture_startup_decode_graphs).
-				self._prewarm_decode_jit()
-
-				# The round's criticality probe request. A request that differs
-				# from the probe in the resident decode graph (none is a value)
-				# arms a recapture, which the warmup below then runs.
-				self._configure_criticality_probe(
-					self._debug_values()
-				)
-
-				# CUDA Graph Warmup (configure-time). A decode instance kept
-				# across phases had its graphs captured before readiness
-				# (_startup_decode_graph_capture), so this finds them and
-				# captures nothing.
-				has_queueing = self.global_batch.has_queueing()
-				if self._decode_graph_capture_needed_at_configure(has_queueing):
-					if has_queueing:
-						logging.info(
-							f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
-							"prefill work still pending when the requested graph path supports it"
-						)
-					self._warmup_cuda_graphs()
-
-				# C. Execute Continuous Decode
-				decode_start = time.perf_counter()
-				# One scope around the whole decode loop: every exit of it,
-				# including the early cohort-shutdown returns, closes the pass
-				# the last step carried.
-				with torch.inference_mode(), self._weight_passes.scope("decode"):
-					if local_decode_indices:
-						new_tokens = self._rebuild_input_tokens(local_decode_indices)
-					else:
-						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
-
-					self._log_phase_switch("decode")
-					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
-				self._mark_phase_end("decode")
-				decoding_time += time.perf_counter() - decode_start
-
-				# The decode loop returned because this cohort is being torn
-				# down.  Stop here: the cleanup immediately below ends in
-				# dist.barrier(), a fresh collective on a communicator that was
-				# very likely just aborted, and the rank that reaches it either
-				# raises or re-wedges.  Leaving both loops instead carries the
-				# rank out of generate() having issued nothing further, which is
-				# what lets the supervisor run the ordered teardown.
-				if self._cohort_shutdown_observed:
-					break
-
-				# D. Cleanup
-				self._finish_decode_interval()
-				dist.barrier()
-
-				# Poll for new admissions after each decode interval.
-				# This ensures newly submitted batches are admitted to global_batch
-				# so has_queueing() can detect them and trigger prefill.
-				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
-						logging.info(f"[DECODE] Mid-cycle admission, total in batch: {len(self.global_batch)}")
-
-				# Check if there are queued sequences waiting for prefill AND
-				# host KV has enough free capacity to make prefill worthwhile.
-				# Without the watermark check, decode oscillates: breaks every
-				# DECISION_INTERVAL, puts all seqs ON_HOLD during a phase transition, prefills
-				# only a handful of sequences, then resumes — destroying throughput.
-				has_pending = self.global_batch.has_queueing() or (
-					self.enable_host_kv_eviction and self.global_batch.has_evicted()
-				)
-				needs_prefill = has_pending and self._check_host_kv_watermark_trigger()
-				if needs_prefill:
-					if self.rank == 0:
-						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
-						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
-						logging.info(f"[DECODE] Breaking for prefill (watermark) - {num_queued} queued, {num_evicted} evicted")
-					in_decode_uuids = [
-						u for u in decode_uuids
-						if self.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
-					]
-					# DIAG: Log ON_HOLD transition details
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and in_decode_uuids:
-						sample = in_decode_uuids[:5]
-						for u in sample:
-							s = self.global_batch.get_sequence(u)
+					# CUDA Graph Warmup (configure-time). A decode instance kept
+					# across phases had its graphs captured before readiness
+					# (_startup_decode_graph_capture), so this finds them and
+					# captures nothing.
+					has_queueing = self.global_batch.has_queueing()
+					if self._decode_graph_capture_needed_at_configure(has_queueing):
+						if has_queueing:
 							logging.info(
-								f"[MULTI_DIAG] ON_HOLD transition: {u[:8]} gid={s.global_idx} "
-								f"decoded={s.decoded_length} ctx={s.current_context_length} "
-								f"prompt={s.prompt_length} gpu_pages={s.gpu_pages_allocated}"
+								f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
+								"prefill work still pending when the requested graph path supports it"
 							)
-						logging.info(f"[MULTI_DIAG] Putting {len(in_decode_uuids)} seqs ON_HOLD (decode_group={self._decode_group_idx})")
-					if in_decode_uuids:
-						self._put_sequences_on_hold(in_decode_uuids)
-					self._decode_group_idx += 1
-					break
+						self._warmup_cuda_graphs()
+
+					# C. Execute Continuous Decode
+					decode_start = time.perf_counter()
+					# One scope around the whole decode loop: every exit of it,
+					# including the early cohort-shutdown returns, closes the pass
+					# the last step carried.
+					with torch.inference_mode(), self._weight_passes.scope("decode"):
+						if local_decode_indices:
+							new_tokens = self._rebuild_input_tokens(local_decode_indices)
+						else:
+							new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+
+						self._log_phase_switch("decode")
+						self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+					self._mark_phase_end("decode")
+					decoding_time += time.perf_counter() - decode_start
+
+					# The decode loop returned because this cohort is being torn
+					# down.  Stop here: the cleanup immediately below ends in
+					# dist.barrier(), a fresh collective on a communicator that was
+					# very likely just aborted, and the rank that reaches it either
+					# raises or re-wedges.  Leaving both loops instead carries the
+					# rank out of generate() having issued nothing further, which is
+					# what lets the supervisor run the ordered teardown.
+					if self._cohort_shutdown_observed:
+						break
+
+					# D. Cleanup
+					self._finish_decode_interval()
+					dist.barrier()
+
+					# Poll for new admissions after each decode interval.
+					# This ensures newly submitted batches are admitted to global_batch
+					# so has_queueing() can detect them and trigger prefill.
+					if self._admission_queue is not None:
+						admitted = self._poll_admissions()
+						if admitted and self.rank == 0:
+							logging.info(f"[DECODE] Mid-cycle admission, total in batch: {len(self.global_batch)}")
+
+					# Check if there are queued sequences waiting for prefill AND
+					# host KV has enough free capacity to make prefill worthwhile.
+					# Without the watermark check, decode oscillates: breaks every
+					# DECISION_INTERVAL, puts all seqs ON_HOLD during a phase transition, prefills
+					# only a handful of sequences, then resumes — destroying throughput.
+					has_pending = self.global_batch.has_queueing() or (
+						self.enable_host_kv_eviction and self.global_batch.has_evicted()
+					)
+					needs_prefill = has_pending and self._check_host_kv_watermark_trigger()
+					if needs_prefill:
+						if self.rank == 0:
+							num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
+							num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
+							logging.info(f"[DECODE] Breaking for prefill (watermark) - {num_queued} queued, {num_evicted} evicted")
+						in_decode_uuids = [
+							u for u in decode_uuids
+							if self.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
+						]
+						# DIAG: Log ON_HOLD transition details
+						if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and in_decode_uuids:
+							sample = in_decode_uuids[:5]
+							for u in sample:
+								s = self.global_batch.get_sequence(u)
+								logging.info(
+									f"[MULTI_DIAG] ON_HOLD transition: {u[:8]} gid={s.global_idx} "
+									f"decoded={s.decoded_length} ctx={s.current_context_length} "
+									f"prompt={s.prompt_length} gpu_pages={s.gpu_pages_allocated}"
+								)
+							logging.info(f"[MULTI_DIAG] Putting {len(in_decode_uuids)} seqs ON_HOLD (decode_group={self._decode_group_idx})")
+						if in_decode_uuids:
+							self._put_sequences_on_hold(in_decode_uuids)
+						self._decode_group_idx += 1
+						break
+				finally:
+					self._exit_decode_phase_context()
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
@@ -12683,6 +12753,12 @@ class BatchGenWorker:
 		3. Reduced logging overhead
 		4. No timing object allocation in hot path
 		"""
+		if self._held_decode_phase_context is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: decoding_continuous entered with no held "
+				"decode-phase context; a decode phase enters through "
+				"_enter_decode_phase_context in generate()"
+			)
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 
