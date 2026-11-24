@@ -449,6 +449,11 @@ def stub_modules(monkeypatch):
             format_decode_group_plan_line=_DP_GROUP.format_decode_group_plan_line,
             num_decode_dp_groups=_DP_GROUP.num_decode_dp_groups,
             rank_in_decode_group=_DP_GROUP.rank_in_decode_group,
+            host_page_table_payload=_DP_GROUP.host_page_table_payload,
+            install_host_page_tables=_DP_GROUP.install_host_page_tables,
+            require_serve_group_within_node=(
+                _DP_GROUP.require_serve_group_within_node
+            ),
         ),
     )
     monkeypatch.setitem(

@@ -16,6 +16,8 @@ import dataclasses
 import logging
 import math
 import sys
+
+import batchgen.decode_dp_group as _dp_group
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +184,12 @@ def _stub_prefix_modules(monkeypatch):
         sys.modules, "batchgen.decode_dp_group",
         SimpleNamespace(
             host_kv_owner_rank=lambda group, size: int(group) * size,
+            # The mirror's page-table halves are the real shared helpers.
+            host_page_table_payload=_dp_group.host_page_table_payload,
+            install_host_page_tables=_dp_group.install_host_page_tables,
+            require_serve_group_within_node=(
+                _dp_group.require_serve_group_within_node
+            ),
         ),
     )
     monkeypatch.setitem(
@@ -194,7 +202,8 @@ def _rank(rank, *, attn_tp_size, world_size, seqs, views, fake_dist,
           local_world_size=8):
     """A fake worker holding only what the mirror path reads."""
     methods = _worker_methods(
-        ["_mirror_group_host_kv", "_owns_host_kv", "_decode_attn_tp_size"],
+        ["_mirror_group_host_kv", "_mirror_group_host_page_tables",
+         "_owns_host_kv", "_decode_attn_tp_size"],
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
@@ -381,7 +390,9 @@ def _gate_names(method):
 
 def _reads_gate(test, names):
     for node in ast.walk(test):
-        if isinstance(node, ast.Attribute) and node.attr == "_owns_host_kv":
+        # The worker spells the rule self._owns_host_kv, the context-taking
+        # code ctx.facts.rank_ctx.owns_host_kv.
+        if isinstance(node, ast.Attribute) and node.attr in ("_owns_host_kv", "owns_host_kv"):
             return True
         if isinstance(node, ast.Name) and node.id in names:
             return True
@@ -613,7 +624,7 @@ def test_g2_growth_extends_the_shared_chain_once_and_mirrors_it(monkeypatch):
                        views=views_by_rank[rank], fake_dist=fake_dist)
         workers[rank] = worker
         _run_growth_section(worker, uuids, growth_pages)
-        worker._mirror_group_host_kv(uuids, {})
+        worker._mirror_group_host_page_tables(uuids)
 
     # The shared chain is extended exactly once per region, by the leader — the
     # plan charged three pages and three pages came out of the pool.
@@ -674,11 +685,6 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator,
         [
             "_release_host_kv_pages_for_batch",
             "_release_prefix_cache_attachments",
-            "_release_trajectory_attachments",
-            # M3 Slice 1c joined the same teardown seam: a config-time
-            # snapshot arena that never reached the post-barrier finalize
-            # gives its Host pages back here.
-            "_rollback_trajectory_reservations",
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",
@@ -962,8 +968,18 @@ def _parents(method):
     return parents
 
 
+def _boundary_carry_out_node():
+    """The page boundary's carry-out: ``BoundaryExecutor.apply``."""
+    path = (Path(__file__).resolve().parents[2]
+            / "batchgen" / "worker" / "admission" / "boundary_executor.py")
+    executor = next(node for node in ast.parse(path.read_text()).body
+                    if isinstance(node, ast.ClassDef) and node.name == "BoundaryExecutor")
+    return next(node for node in executor.body
+                if isinstance(node, ast.FunctionDef) and node.name == "apply")
+
+
 def test_boundary_host_growth_is_gated_on_owns_host_kv():
-    method = _worker_method_node("_page_boundary_fast")
+    method = _boundary_carry_out_node()
     parents = _parents(method)
 
     appends = [
@@ -998,13 +1014,13 @@ def test_boundary_host_growth_is_gated_on_owns_host_kv():
 
 
 def test_boundary_growth_mirror_is_reached_under_a_rank_uniform_condition():
-    method = _worker_method_node("_page_boundary_fast")
+    method = _boundary_carry_out_node()
     parents = _parents(method)
     calls = [
         node for node in ast.walk(method)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_mirror_group_host_kv"
+        and node.func.attr == "_mirror_group_host_page_tables"
     ]
     assert len(calls) == 1
     node = calls[0]
@@ -1012,10 +1028,59 @@ def test_boundary_growth_mirror_is_reached_under_a_rank_uniform_condition():
         node = parents[node]
         if isinstance(node, ast.If):
             test = ast.unparse(node.test)
-            for rank_dependent in ("_owns_host_kv", "self.rank", "_uuid_to_local_map"):
+            for rank_dependent in ("owns_host_kv", "facts.rank", "uuid_to_local"):
                 assert rank_dependent not in test, (
                     f"the growth mirror's gather sits under {test!r}"
                 )
+
+
+def test_page_table_mirror_is_a_no_op_for_g1(monkeypatch):
+    _stub_prefix_modules(monkeypatch)
+    fake_dist = FakeDist(world_size=1)
+    views = _two_group_views({0: FakeBackend(1000)}, 0)
+    worker = _rank(0, attn_tp_size=1, world_size=1, seqs=_seqs(group=None),
+                   views=views, fake_dist=fake_dist)
+
+    worker._mirror_group_host_page_tables(["a", "b"])
+
+    assert fake_dist.calls == 0
+    assert views[0].table == {}
+
+
+def test_page_table_mirror_reaches_the_gather_with_no_grown_rows(monkeypatch):
+    """The growth decision is rank-uniform but the grown rows are not: a rank
+    with none of them must still join the one collective."""
+    _stub_prefix_modules(monkeypatch)
+    fake_dist = FakeDist(world_size=2)
+    for rank in (0, 1):
+        fake_dist.rank = rank
+        views = _two_group_views({0: FakeBackend(1000)}, rank)
+        worker = _rank(rank, attn_tp_size=2, world_size=2,
+                       seqs=_seqs(group=0), views=views, fake_dist=fake_dist)
+        worker._mirror_group_host_page_tables([])
+        assert views[0].table == {}
+    assert fake_dist.calls == 2
+
+
+def test_page_table_mirror_names_a_follower_without_a_leader_payload(monkeypatch):
+    _stub_prefix_modules(monkeypatch)
+    fake_dist = FakeDist(world_size=2)
+    fake_dist.rank = 1
+    worker = _rank(1, attn_tp_size=2, world_size=2, seqs=_seqs(group=0),
+                   views=_two_group_views({0: FakeBackend(1000)}, 1),
+                   fake_dist=fake_dist)
+    with pytest.raises(RuntimeError, match="leader 0 mirrored no host KV"):
+        worker._mirror_group_host_page_tables(["a", "b"])
+
+
+def test_page_table_mirror_refuses_a_serve_group_spanning_nodes(monkeypatch):
+    _stub_prefix_modules(monkeypatch)
+    fake_dist = FakeDist(world_size=16)
+    worker = _rank(0, attn_tp_size=16, world_size=16, seqs={}, views={},
+                   fake_dist=fake_dist, local_world_size=8)
+    with pytest.raises(RuntimeError, match="must divide local_world_size"):
+        worker._mirror_group_host_page_tables([])
+    assert fake_dist.calls == 0
 
 
 def test_mirror_refuses_a_serve_group_spanning_nodes():

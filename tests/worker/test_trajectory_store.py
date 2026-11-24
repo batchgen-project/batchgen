@@ -17,6 +17,9 @@ from batchgen.worker.prefix_reuse_state import PrefixReuseState
 from batchgen.worker.trajectory_store import TrajectoryStore
 
 
+from tests.worker_method_source import load_worker_shaped_methods
+
+
 def _worker_method_from_source(name):
 	"""Load one current worker method without importing CUDA-only modules."""
 	path = Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py"
@@ -420,8 +423,11 @@ def test_release_seam_call_order():
 	events = []
 	worker = SimpleNamespace()
 	worker.enable_prefix_cache = True
-	worker._release_trajectory_attachments = lambda ids: events.append("trajectory")
-	worker._rollback_trajectory_reservations = lambda ids: events.append("rollback")
+	worker.rank = 2
+	worker._traj = SimpleNamespace(
+		release_attachments=lambda ids, *, rank: events.append(("trajectory", list(ids), rank)),
+		rollback_reservations=lambda ids, *, rank: events.append(("rollback", list(ids), rank)),
+	)
 	worker._release_pool_segment_refs = lambda gid: events.append("pool")
 
 	class Prefix(PrefixReuseState):
@@ -436,10 +442,15 @@ def test_release_seam_call_order():
 	worker.prefix_cache_coordinator = SimpleNamespace(
 		release_attachment=lambda handle: events.append(("coordinator", handle))
 	)
-	_worker_method_from_source("_release_prefix_cache_attachments")(worker, [7])
+	# The body lives in the KV capacity engine and takes the decode context;
+	# it is compiled here in the worker's shape.
+	release = load_worker_shaped_methods(
+		["_release_prefix_cache_attachments"], {"Sequence": Sequence}
+	)["_release_prefix_cache_attachments"]
+	release(worker, [7])
 	assert events == [
-		"trajectory",
-		"rollback",
+		("trajectory", [7], 2),
+		("rollback", [7], 2),
 		"pool",
 		"prefix-pop",
 		("coordinator", "commit"),

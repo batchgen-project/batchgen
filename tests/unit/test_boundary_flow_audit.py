@@ -174,6 +174,27 @@ def _functions() -> Dict[str, List[Tuple[str, ast.FunctionDef]]]:
 
 
 _INDEX = _functions()
+def _worker_function(name: str) -> ast.FunctionDef:
+    return next(
+        node for file_name, node in _INDEX[name] if file_name == "batchgen_worker.py"
+    )
+
+
+_EXECUTOR = _ROOT / "batchgen" / "worker" / "admission" / "boundary_executor.py"
+
+
+def _executor_apply() -> ast.FunctionDef:
+    tree = ast.parse(_EXECUTOR.read_text(), filename=str(_EXECUTOR))
+    executor = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BoundaryExecutor"
+    )
+    return next(
+        node for node in executor.body
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
+    )
+
+
 _PLANNER = _ROOT / "batchgen" / "worker" / "admission" / "boundary_planner.py"
 
 
@@ -189,45 +210,60 @@ def _planner_plan() -> ast.FunctionDef:
     )
 
 
-def _boundary_with_plan_inlined() -> ast.FunctionDef:
-    """The page boundary as one function, in execution order.
-
-    The gather, the rank-0 decision and the broadcast are
-    ``BoundaryPlanner.plan``; the worker's boundary reaches it through
-    ``_plan_boundary``, which it calls once. The facts below are about the
-    order of statements across the whole boundary, so the plan's statements
-    are put back where the call is, with line numbers shifted so that source
-    order equals execution order: before the plan, the plan, the rest.
-    """
-    boundary = copy.deepcopy(next(
-        node for name, node in _INDEX["_page_boundary_fast"]
-        if name == "batchgen_worker.py"
-    ))
-    plan = copy.deepcopy(_planner_plan())
-    calls = [
-        index for index, statement in enumerate(boundary.body)
+def _statement_calling(body, name: str) -> int:
+    found = [
+        index for index, statement in enumerate(body)
         if any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_plan_boundary"
+            and node.func.attr == name
             for node in ast.walk(statement)
         )
     ]
-    assert len(calls) == 1, "the boundary calls its plan step exactly once"
-    at = calls[0]
-    after = boundary.body[at + 1:]
-    for offset, statements in ((1_000_000, plan.body), (2_000_000, after)):
-        for statement in statements:
-            for node in ast.walk(statement):
-                if hasattr(node, "lineno"):
-                    node.lineno += offset
-                if getattr(node, "end_lineno", None) is not None:
-                    node.end_lineno += offset
-    boundary.body = boundary.body[:at] + plan.body + after
+    assert len(found) == 1, f"the boundary calls {name} exactly once"
+    return found[0]
+
+
+def _shift(statements, offset: int) -> None:
+    for statement in statements:
+        for node in ast.walk(statement):
+            if hasattr(node, "lineno"):
+                node.lineno += offset
+            if getattr(node, "end_lineno", None) is not None:
+                node.end_lineno += offset
+
+
+def _boundary_with_carry_out_inlined() -> ast.FunctionDef:
+    """The page boundary as one function again, in execution order.
+
+    The worker's boundary keeps the wait for pending work and the closing
+    page-table rebuild and checks. In between it calls two steps once each:
+    ``_plan_boundary`` (``BoundaryPlanner.plan``: gather, rank-0 decision,
+    broadcast) and ``_apply_boundary_decisions`` (``BoundaryExecutor.apply``:
+    the carry-out). The facts below are about the order of statements across
+    the whole boundary, so both steps' statements are put back where their
+    calls are, with line numbers shifted so that source order equals
+    execution order: before the plan, the plan, the carry-out, the rest.
+    """
+    boundary = copy.deepcopy(_worker_function("_page_boundary_fast"))
+    plan = copy.deepcopy(_planner_plan())
+    carry_out = copy.deepcopy(_executor_apply())
+    plan_at = _statement_calling(boundary.body, "_plan_boundary")
+    apply_at = _statement_calling(boundary.body, "_apply_boundary_decisions")
+    assert plan_at < apply_at
+    between = boundary.body[plan_at + 1:apply_at]
+    # The statement after the carry-out call returns early when no decode row
+    # is left; in the carry-out that is its own early return, so it is dropped.
+    after = boundary.body[apply_at + 2:]
+    _shift(plan.body, 1_000_000)
+    _shift(between, 2_000_000)
+    _shift(carry_out.body, 3_000_000)
+    _shift(after, 4_000_000)
+    boundary.body = boundary.body[:plan_at] + plan.body + between + carry_out.body + after
     return boundary
 
 
-_BOUNDARY = _boundary_with_plan_inlined()
+_BOUNDARY = _boundary_with_carry_out_inlined()
 
 
 def _calls(node: ast.AST, name: str) -> List[ast.Call]:
@@ -266,10 +302,19 @@ def _status_reads(node: ast.AST) -> Set[Tuple[str, str]]:
     return found
 
 
+# The executor reaches the completion outlet through its CompletionIO argument;
+# these are the worker methods the caller binds to its two fields.
+_COMPLETION_OUTLET = {
+    "gather_completed_tokens": "_gather_completed_tokens",
+    "report_completion": "_report_completion",
+}
+
+
 def _status_writes() -> List[Tuple[int, str]]:
     writes = []
-    for call in _calls(_BOUNDARY, "_update_batch_status"):
-        writes.append((call.lineno, ast.unparse(call.args[1]).split(".")[-1]))
+    # update_batch_status(pool, rank, uuids, status, edge)
+    for call in _calls(_BOUNDARY, "update_batch_status"):
+        writes.append((call.lineno, ast.unparse(call.args[3]).split(".")[-1]))
     for call in _calls(_BOUNDARY, "apply_or_raise"):
         status = next(
             n.attr for n in ast.walk(call)
@@ -284,7 +329,7 @@ def test_planned_statuses_apply_at_one_point_then_at_most_the_amendment():
     """All PLANNED status changes apply at one point; one amendment later.
 
     The decision is a partition (Part A), so the three planned groups are
-    known when the decision arrives: COMPLETED through `_update_batch_status`
+    known when the decision arrives: COMPLETED through `update_batch_status`
     (rows the per-step sync already completed must be skipped), then EVICTED
     and ON_HOLD through `apply_or_raise` with the boundary edge, with no other
     call between them. The only later status write is the ON_HOLD amendment
@@ -298,7 +343,7 @@ def test_planned_statuses_apply_at_one_point_then_at_most_the_amendment():
     # One point: between the first and third write, the only calls are the
     # write mechanism itself.
     lo, hi = writes[0][0], writes[2][0]
-    mechanism = {"_update_batch_status", "apply_or_raise",
+    mechanism = {"update_batch_status", "apply_or_raise",
                  "TransitionPlan", "Transition", "tuple"}
     for node in ast.walk(_BOUNDARY):
         if (isinstance(node, ast.Call)
@@ -391,10 +436,13 @@ def test_no_step_between_the_status_writes_acts_on_a_status():
                     follow(call.func.attr)
 
     for n in span:
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr.startswith("_")
-                and n.func.attr != "_update_batch_status"):
-            follow(n.func.attr)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr.startswith("_"):
+                follow(n.func.attr)
+            elif n.func.attr in _COMPLETION_OUTLET:
+                # completion.report_completion(...) is the worker's
+                # _report_completion, handed to the executor by the caller.
+                follow(_COMPLETION_OUTLET[n.func.attr])
 
     # B2 completion split: the LOCALMAP-POP log line (the one status read on
     # the completion report path) moved with the slot/index release into
@@ -421,42 +469,38 @@ def test_only_the_group_mirror_sits_inside_the_carry_out_step():
     def inside(name: str) -> List[bool]:
         return [start < c.lineno < end for c in _calls(_BOUNDARY, name)]
 
-    assert inside("_mirror_group_host_kv") == [True]
+    assert inside("_mirror_group_host_page_tables") == [True]
     assert inside("_rebuild_page_table_for_batch") == [False, False, False]
     assert inside("_check_host_kv_watermark_trigger") == [False]
 
 
-def test_the_boundary_mirror_call_uses_none_of_the_trajectory_work():
-    """Why the mirror is worker-only today, and why that is not inherent.
+def test_the_boundary_mirror_copies_page_tables_and_nothing_else():
+    """The boundary's mirror is its own function, limited to page tables.
 
-    `_mirror_group_host_kv` serves prefill and the boundary. Every use of the
-    trajectory machinery in it is guarded by its `trajectory` flag, and the
-    boundary calls it without the flag and with no prefix states.
+    Prefill keeps `_mirror_group_host_kv` (prefix states, pool segments,
+    trajectory arenas). After a decode-time host growth the followers only
+    need the leader's grown page tables, so the boundary calls
+    `_mirror_group_host_page_tables`: one collective, built from the decode
+    context, with no prefix, pool-wave or trajectory state in it.
     """
-    call = _calls(_BOUNDARY, "_mirror_group_host_kv")[0]
-    assert not call.keywords                      # trajectory stays False
-    assert ast.unparse(call.args[1]) == "{}"      # no prefix states
+    assert _calls(_BOUNDARY, "_mirror_group_host_kv") == []
+    call = _calls(_BOUNDARY, "_mirror_group_host_page_tables")[0]
+    assert len(call.args) == 2 and not call.keywords
+    assert ast.unparse(call.args[0]) == "ctx"
 
-    mirror = next(node for name, node in _INDEX["_mirror_group_host_kv"]
-                  if name == "batchgen_worker.py")
-    parent = {c: p for p in ast.walk(mirror) for c in ast.iter_child_nodes(p)}
-
-    def guarded(node: ast.AST) -> bool:
-        p = node
-        while p in parent:
-            p = parent[p]
-            test = getattr(p, "test", None)
-            if test is not None and "trajectory" in ast.unparse(test):
-                return True
-        return False
-
-    trajectory_calls = [
+    mirror = next(node for name, node in _INDEX["_mirror_group_host_page_tables"]
+                  if name == "kv_capacity_engine.py")
+    assert [a.arg for a in mirror.args.args] == ["self", "ctx", "uuids"]
+    collectives = [
         n for n in ast.walk(mirror)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and "trajectory" in n.func.attr
+        and n.func.attr in {"all_gather_object", "broadcast_object_list",
+                            "all_reduce", "all_gather", "broadcast"}
     ]
-    assert len(trajectory_calls) == 8
-    assert all(guarded(n) for n in trajectory_calls)
+    assert [c.func.attr for c in collectives] == ["all_gather_object"]
+    body = ast.unparse(ast.Module(body=mirror.body[1:], type_ignores=[]))
+    for foreign in ("prefix", "trajectory", "_traj", "segment", "wave"):
+        assert foreign not in body, foreign
 
 
 def test_releases_finish_on_every_rank_before_host_growth():
@@ -529,34 +573,22 @@ def _package_index() -> Dict[str, List[Tuple[str, ast.AST]]]:
 
 
 def _package_defs(index, name):
-    defs = index.get(name, [])
+    # BoundaryExecutor.apply is the carry-out itself (the root of the closure),
+    # not a callee: `apply` by name means SequenceBatch.apply here.
+    defs = [
+        (rel, node) for rel, node in index.get(name, [])
+        if not (name == "apply" and rel.endswith("admission/boundary_executor.py"))
+    ]
     if name in _PINNED:
         defs = [(rel, node) for rel, node in defs if rel == _PINNED[name]]
     return defs
 
 
 def _called_names(fn_node) -> List[str]:
-    """Called names in ``fn_node``, skipping the group mirror's
-    trajectory-guarded calls: the boundary calls the mirror with the
-    trajectory flag off (pinned by
-    test_the_boundary_mirror_call_uses_none_of_the_trajectory_work), so that
-    branch cannot run in the carry-out."""
-    prune = fn_node.name == "_mirror_group_host_kv"
-    parent = ({c: p for p in ast.walk(fn_node) for c in ast.iter_child_nodes(p)}
-              if prune else {})
-
-    def guarded(node) -> bool:
-        p = node
-        while p in parent:
-            p = parent[p]
-            test = getattr(p, "test", None)
-            if test is not None and "trajectory" in ast.unparse(test):
-                return True
-        return False
-
+    """Called names in ``fn_node``."""
     names = []
     for call in ast.walk(fn_node):
-        if not isinstance(call, ast.Call) or (prune and guarded(call)):
+        if not isinstance(call, ast.Call):
             continue
         if isinstance(call.func, ast.Attribute):
             names.append(call.func.attr)
@@ -618,6 +650,9 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
             name = (node.func.attr if isinstance(node.func, ast.Attribute)
                     else node.func.id if isinstance(node.func, ast.Name)
                     else None)
+            # The completion outlet is reached through the CompletionIO
+            # argument; follow the worker methods bound to it.
+            name = _COMPLETION_OUTLET.get(name, name)
             if name and name not in _SKIP and name not in seen:
                 seen.add(name)
                 queue.append(name)
@@ -660,12 +695,60 @@ def test_whole_package_closure_reads_status_only_in_pinned_places():
     }
 
 
+def test_the_carry_out_is_one_method_with_a_declared_result():
+    """The carry-out is ``BoundaryExecutor.apply``; the worker only wires it.
+
+    ``apply`` takes the decode context and the completion outlet, never the
+    worker. It ends in exactly two places: early, when no decode row is left
+    after the releases and host growth, and at the end. Both return the same
+    eight values; the seventh tells the boundary which of the two it was and
+    the eighth is the pointer bundle of a load launched here, or None.
+    """
+    carry_out = _executor_apply()
+    assert [arg.arg for arg in carry_out.args.args] == [
+        "self", "ctx", "completion", "decisions", "decode_uuids", "batch",
+        "gpu_manager", "worker_view", "global_seq_state", "chunk_size",
+        "timing", "boundary_start", "t0",
+    ]
+    names = {node.id for node in ast.walk(carry_out) if isinstance(node, ast.Name)}
+    assert "worker" not in names
+    assert not any(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        for node in ast.walk(carry_out)
+    ), "the executor is stateless and holds no worker"
+    returns = [node for node in ast.walk(carry_out) if isinstance(node, ast.Return)]
+    assert len(returns) == 2
+    for node in returns:
+        assert isinstance(node.value, ast.Tuple) and len(node.value.elts) == 8
+    assert sorted(ast.unparse(node.value.elts[6]) for node in returns) == ["False", "True"]
+    assert sorted(ast.unparse(node.value.elts[7]) for node in returns) == [
+        "None", "async_load_tensors",
+    ]
+
+    # The worker's method builds the context and the outlet, calls apply once,
+    # and keeps the pointer bundle.
+    wiring = _worker_function("_apply_boundary_decisions")
+    applies = _calls(wiring, "apply")
+    assert len(applies) == 1
+    assert ast.unparse(applies[0].args[0]) == "self._decode_phase_context()"
+    outlet = applies[0].args[1]
+    assert {kw.arg: ast.unparse(kw.value) for kw in outlet.keywords} == {
+        "gather_completed_tokens": "self._gather_completed_tokens",
+        "report_completion": "self._report_completion",
+    }
+    assert "self._async_load_tensors = async_load_tensors" in ast.unparse(wiring)
+
+    boundary = _worker_function("_page_boundary_fast")
+    assert len(_calls(boundary, "_apply_boundary_decisions")) == 1
+
+
 def test_the_plan_step_takes_the_context_and_returns_what_the_carry_out_reads():
     """``BoundaryPlanner.plan`` is the gather, the rank-0 decision and the broadcast.
 
     It takes the decode context, never the worker. The completion rule and
     the decode padding batch size are the caller's and arrive as arguments.
-    It returns in one place, with the five values the carry-out reads.
+    It returns in one place, with the five values the carry-out is called with.
     """
     plan = _planner_plan()
     assert [arg.arg for arg in plan.args.args] == [
@@ -682,16 +765,15 @@ def test_the_plan_step_takes_the_context_and_returns_what_the_carry_out_reads():
     assert [ast.unparse(node.value) for node in returns] == [
         "(decisions, global_seq_state, worker_view, chunk_size, t0)"
     ]
+    # One gather of per-rank payloads and one broadcast of the decisions, in
+    # that order, with the rank-0 decision between them.
     gather = _calls(plan, "all_gather_object")
     decide = _calls(plan, "_compute_decisions")
     broadcast = _calls(plan, "broadcast_object_list")
     assert len(decide) == 1 and len(broadcast) == 1 and gather
     assert gather[0].lineno < decide[0].lineno < broadcast[0].lineno
 
-    wiring = next(
-        node for name, node in _INDEX["_plan_boundary"]
-        if name == "batchgen_worker.py"
-    )
+    wiring = _worker_function("_plan_boundary")
     plans = _calls(wiring, "plan")
     assert len(plans) == 1
     assert [ast.unparse(arg) for arg in plans[0].args[:3]] == [
@@ -699,4 +781,6 @@ def test_the_plan_step_takes_the_context_and_returns_what_the_carry_out_reads():
         "self._is_sequence_completed",
         "getattr(self, '_decode_padding_bsz', 0) or 0",
     ]
+    boundary = _worker_function("_page_boundary_fast")
+    assert len(_calls(boundary, "_plan_boundary")) == 1
 

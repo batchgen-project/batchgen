@@ -31,6 +31,7 @@ class SchedulingState:
     pool: Any
     seq_table: Any
     trajectories: Any
+    prefix: Any = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class DecodePhaseContext:
     prefix_runtime: Optional[Any]
     chunk_sizer: Optional[Any]
     parallel_manager: Optional[Any] = None
+    host_view_aux: Optional[Any] = None
 
 
 @dataclass(frozen=True)

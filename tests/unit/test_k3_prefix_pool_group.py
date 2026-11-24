@@ -26,6 +26,8 @@ import hashlib
 import logging
 import math
 import sys
+
+import batchgen.decode_dp_group as _dp_group
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,7 @@ from typing import List, Optional, Sequence
 
 import pytest
 
+from tests.worker_method_source import worker_shaped_method_node
 from tests.worker.worker_fakes import (
     attach_identity,
     attach_prefix_state,
@@ -95,8 +98,12 @@ _MOVED = {
     "_pool_probe_debug", "_new_pool_epilogue_tracer",
     "_record_unsharded_epilogue_gather", "_new_pool_kernel_dump_recorder",
     "_pool_pad_poison_enabled", "_new_pool_offload_check_recorder",
-    "_finish_prefill_pool_wave", "_release_pool_segment_refs",
+    "_finish_prefill_pool_wave",
 }
+
+# Bodies that live in another engine and take the decode context: they compile
+# from that engine in the worker's shape.
+_CONTEXT_MOVED = {"_release_pool_segment_refs"}
 
 
 def _worker_class():
@@ -128,9 +135,13 @@ def _worker_methods(names, globals_=None):
     loaded = {}
     for name in names:
         source = ENGINE if name in _MOVED else WORKER
-        node = copy.deepcopy(
-            _engine_method_node(name) if name in _MOVED else _worker_method_node(name)
-        )
+        if name in _CONTEXT_MOVED:
+            node = worker_shaped_method_node(name)
+        else:
+            node = copy.deepcopy(
+                _engine_method_node(name) if name in _MOVED
+                else _worker_method_node(name)
+            )
         module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
         scope = dict(namespace)
         exec(compile(module, str(source), "exec"), scope)
@@ -355,7 +366,15 @@ def _stub_heavy_modules(monkeypatch, *, free_state_slots):
     )
     monkeypatch.setitem(
         sys.modules, "batchgen.decode_dp_group",
-        SimpleNamespace(host_kv_owner_rank=lambda group, size: int(group) * size),
+        SimpleNamespace(
+            host_kv_owner_rank=lambda group, size: int(group) * size,
+            # The mirror's page-table halves are the real shared helpers.
+            host_page_table_payload=_dp_group.host_page_table_payload,
+            install_host_page_tables=_dp_group.install_host_page_tables,
+            require_serve_group_within_node=(
+                _dp_group.require_serve_group_within_node
+            ),
+        ),
     )
     state_manager = (
         None if free_state_slots is None else SimpleNamespace(
@@ -966,12 +985,171 @@ def test_leader_release_frees_segment_pages_after_its_last_member(monkeypatch):
     )
     worker._prefix.pool_member_sids = {gid: (-1,) for gid in GLOBAL_IDS}
     worker._prefix.pool_sid_members = {-1: 2}
+    view_builds = []
+    build_views = worker._host_views_by_group
+    worker._host_views_by_group = lambda: view_builds.append(1) or build_views()
 
     worker._release_pool_segment_refs(GLOBAL_IDS[0])
     assert backend.released == []  # one member still reads the segment
+    # Nothing was freed, so the Host views were not even built.
+    assert view_builds == []
 
     worker._release_pool_segment_refs(GLOBAL_IDS[1])
     assert backend.released == [(0, [-1])]
+    assert view_builds == [1]
+
+
+def test_pool_segment_release_takes_the_decode_context_not_the_worker():
+    """The release body reads the prefix state and the Host views from the
+    context; it has no worker parameter and no rebinding to one."""
+    source = (Path(__file__).resolve().parents[2]
+              / "batchgen" / "worker" / "kv_capacity_engine.py").read_text()
+    engine = next(node for node in ast.parse(source).body
+                  if isinstance(node, ast.ClassDef) and node.name == "KVCapacityEngine")
+    method = next(node for node in engine.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_release_pool_segment_refs")
+    assert [arg.arg for arg in method.args.args] == ["self", "ctx", "global_id"]
+    names = {node.id for node in ast.walk(method) if isinstance(node, ast.Name)}
+    assert "worker" not in names
+    body = ast.unparse(method)
+    assert "ctx.sched.prefix.release_pool_segment_refs" in body
+    assert "self._host_views_by_group(ctx)" in body
+
+
+def _release_worker(monkeypatch, *, member_sids, sid_members):
+    """A leader holding the given pool bookkeeping, counting Host-view fetches."""
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    backend = FakeBackend(1000)
+    views = {0: FakeView(backend, 0)}
+    worker = _finish_worker(
+        0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
+    )
+    worker._prefix.pool_member_sids = dict(member_sids)
+    worker._prefix.pool_sid_members = dict(sid_members)
+    view_builds = []
+    build_views = worker._host_views_by_group
+    worker._host_views_by_group = lambda: view_builds.append(1) or build_views()
+    return worker, backend, view_builds
+
+
+def test_release_of_a_sequence_without_pool_segments_touches_no_host_view(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch, member_sids={}, sid_members={-1: 1},
+    )
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert view_builds == []
+    assert backend.released == [] and backend.unregistered == []
+    assert worker._prefix.pool_sid_members == {-1: 1}
+
+
+def test_release_frees_several_segments_one_at_a_time(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert backend.released == [(0, [-1]), (0, [-2])]
+    assert backend.unregistered == [(0, [-1]), (0, [-2])]
+    # The Host views are fetched once per freed segment.
+    assert view_builds == [1, 1]
+    assert worker._prefix.pool_sid_members == {}
+
+
+def test_release_frees_a_segment_before_a_later_one_fails(monkeypatch):
+    # The chain names a segment that has no count. The segment before it has
+    # lost its last member and its pages must not be stranded by the failure.
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1},
+    )
+
+    with pytest.raises(KeyError):
+        worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert backend.released == [(0, [-1])]
+    assert backend.unregistered == [(0, [-1])]
+    assert view_builds == [1]
+
+
+def test_release_counts_the_next_segment_only_after_releasing_the_previous(monkeypatch):
+    # The counts as each segment's pages go: the segment after it must still
+    # be counted, so a release never runs with later segments already dropped.
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+    view = worker._host_views_by_group()[0]
+    view_builds.clear()
+    counts_at_release = []
+    release_pages = view.release_sequence_pages
+
+    def recording_release(ids):
+        counts_at_release.append((list(ids), dict(worker._prefix.pool_sid_members)))
+        release_pages(ids)
+
+    view.release_sequence_pages = recording_release
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert counts_at_release == [([-1], {-2: 1}), ([-2], {})]
+
+
+def test_a_failed_page_release_leaves_the_later_segments_counted(monkeypatch):
+    worker, backend, view_builds = _release_worker(
+        monkeypatch,
+        member_sids={GLOBAL_IDS[0]: (-1, -2)}, sid_members={-1: 1, -2: 1},
+    )
+    view = worker._host_views_by_group()[0]
+    view_builds.clear()
+
+    def failing_release(ids):
+        raise RuntimeError("page release failed")
+
+    view.release_sequence_pages = failing_release
+
+    with pytest.raises(RuntimeError, match="page release failed"):
+        worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert worker._prefix.pool_sid_members == {-2: 1}
+    assert backend.unregistered == []
+    assert view_builds == [1]
+
+
+def test_every_host_view_releases_a_segment_before_the_next_is_counted(monkeypatch):
+    # Two Host regions: both must release and unregister a freed segment while
+    # the segment after it is still counted.
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    views = {0: FakeView(FakeBackend(1000), 0), 1: FakeView(FakeBackend(2000), 0)}
+    worker = _finish_worker(
+        0, views=views, wave=None, states={}, coordinator=RecordingCoordinator(),
+    )
+    worker._prefix.pool_member_sids = {GLOBAL_IDS[0]: (-1, -2)}
+    worker._prefix.pool_sid_members = {-1: 1, -2: 1}
+    events = []
+
+    def record(group, kind, call):
+        def wrapped(ids):
+            events.append((group, kind, list(ids), dict(worker._prefix.pool_sid_members)))
+            call(ids)
+        return wrapped
+
+    for group, view in views.items():
+        view.release_sequence_pages = record(group, "release", view.release_sequence_pages)
+        view.unregister_sequences = record(group, "unregister", view.unregister_sequences)
+
+    worker._release_pool_segment_refs(GLOBAL_IDS[0])
+
+    assert events == [
+        (0, "release", [-1], {-2: 1}), (0, "unregister", [-1], {-2: 1}),
+        (1, "release", [-1], {-2: 1}), (1, "unregister", [-1], {-2: 1}),
+        (0, "release", [-2], {}), (0, "unregister", [-2], {}),
+        (1, "release", [-2], {}), (1, "unregister", [-2], {}),
+    ]
 
 
 # --------------------------------------------------------------------------- #

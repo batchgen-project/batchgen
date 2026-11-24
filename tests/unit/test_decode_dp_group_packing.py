@@ -497,7 +497,11 @@ def test_redundant_eviction_keeps_the_saved_group():
 def _completion_cleanup_loops():
     """Every all-ranks scalar cleanup loop over completed sequences."""
     loops = []
-    for node in ast.walk(_worker_class()):
+    # Two loops live in the worker; the page boundary's is in its executor.
+    executor = ast.parse(
+        (WORKER.parent / "worker" / "admission" / "boundary_executor.py").read_text()
+    )
+    for node in [*ast.walk(_worker_class()), *ast.walk(executor)]:
         if (
             isinstance(node, ast.For)
             and isinstance(node.iter, ast.Name)
@@ -517,14 +521,16 @@ def test_completion_cleanup_clears_the_saved_group():
         seq.status = SequenceStatus.COMPLETED
         seq.gpu_pages_allocated = seq.host_pages_allocated = 4
         seq.host_owned_pages = seq.host_token_capacity = 4
-        fake = SimpleNamespace(
-            global_batch=_Batch([seq]), _sequences_with_gpu_kv={"c"},
-        )
+        resident = {"c"}
+        batch = _Batch([seq])
+        # The worker's loops read self.*, the executor's loop reads the context.
+        fake = SimpleNamespace(global_batch=batch, _sequences_with_gpu_kv=resident)
+        ctx = SimpleNamespace(sched=SimpleNamespace(pool=batch), gpu_resident=resident)
         module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
         exec(
             compile(module, str(WORKER), "exec"),
-            {"self": fake, loop.iter.id: ["c"]},
+            {"self": fake, "ctx": ctx, loop.iter.id: ["c"]},
         )
         assert seq.evicted_from_dp_group is None
         assert seq.host_token_capacity == 0
-        assert fake._sequences_with_gpu_kv == set()
+        assert resident == set()

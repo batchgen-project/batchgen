@@ -327,3 +327,38 @@ def format_decode_group_summary(group_rows: Sequence[int], group_size: int) -> s
         f"  Decode groups: {format_group_rows(group_rows)} "
         f"(tp={int(group_size)}, ntp={ntp})"
     )
+
+
+def require_serve_group_within_node(group_size: int, local_world_size: int) -> None:
+    """Mirrored page ids index the leader's per-node host region, so a serve
+    group must not straddle a node boundary."""
+    if local_world_size % group_size:
+        raise RuntimeError(
+            f"attn_tp_size={group_size} must divide local_world_size="
+            f"{local_world_size}: a serve group spanning nodes would "
+            f"read another node's host-KV page ids"
+        )
+
+
+def host_page_table_payload(pool, host_views: dict, uuids: List[str]) -> dict:
+    """The leader's host page tables for ``uuids``, as plain lists."""
+    global_ids = [int(pool.get_sequence(uuid).global_idx) for uuid in uuids]
+    return {
+        "global_ids": global_ids,
+        "page_tables": {
+            group_id: [
+                [int(page) for page in pages]
+                for pages in view.build_page_table(global_ids)
+            ]
+            for group_id, view in host_views.items()
+        },
+    }
+
+
+def install_host_page_tables(host_views: dict, entry: dict) -> None:
+    """Install a leader's mirrored page tables into this rank's worker views."""
+    for group_id, view in host_views.items():
+        for global_id, pages in zip(
+            entry["global_ids"], entry["page_tables"][group_id]
+        ):
+            view.set_sequence_pages(global_id, pages)

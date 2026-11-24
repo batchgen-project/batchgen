@@ -329,7 +329,10 @@ def test_decode_entry_checks_bindings_before_resolving_local_rows():
 
 
 def test_host_eviction_releases_the_kda_state_before_dropping_the_group():
-    source = WORKER.read_text()
-    release = source.index("self._release_kda_state_slots([int(seq.global_idx)])")
+    # Host eviction is carried out by the boundary executor.
+    source = (
+        WORKER.parent / "worker" / "admission" / "boundary_executor.py"
+    ).read_text()
+    release = source.index("kv._release_kda_state_slots(ctx, [int(seq.global_idx)])")
     drop = source.index("evict_from_decode_dp_group(seq)")
     assert release < drop

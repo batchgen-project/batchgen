@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pytest
 
-from batchgen.worker.prefix_reuse_state import PrefixReuseState
+from batchgen.worker.prefix_reuse_state import PrefixReuseState, release_pool_segments
 from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 
 
@@ -204,7 +204,9 @@ def test_pool_refcounts_release_last_member():
             self.released.append(("unregister", ids))
 
     view = View()
-    store.release_pool_segment_refs(9, host_views_provider=lambda: {0: view})
+    freed = list(store.release_pool_segment_refs(9))
+    assert freed == [-1]
+    release_pool_segments({0: view}, freed)
     assert view.released == [("release", [-1]), ("unregister", [-1])]
     assert store.pool_sid_members == {}
 
@@ -306,12 +308,83 @@ def test_refcount_add_release_paths():
 			self.calls.append(("unregister", list(ids)))
 
 	view = View()
-	store.release_pool_segment_refs(1, host_views_provider=lambda: {0: view})
+	freed = list(store.release_pool_segment_refs(1))
+	assert freed == [-4]
+	release_pool_segments({0: view}, freed)
 	assert store.pool_sid_members == {-3: 1}
 	assert view.calls == [("release", [-4]), ("unregister", [-4])]
-	store.release_pool_segment_refs(2, host_views_provider=lambda: {0: view})
+	freed = list(store.release_pool_segment_refs(2))
+	assert freed == [-3]
+	release_pool_segments({0: view}, freed)
 	assert store.pool_sid_members == {}
 	assert view.calls[-2:] == [("release", [-3]), ("unregister", [-3])]
+
+
+# A member whose segments still have other members, or that has none, frees
+# nothing, so its caller builds no Host views.
+def test_release_returns_nothing_while_a_segment_has_members():
+	store = PrefixReuseState()
+	store.add_pool_member_refs(1, [-3])
+	store.add_pool_member_refs(2, [-3])
+	assert list(store.release_pool_segment_refs(1)) == []
+	assert store.pool_sid_members == {-3: 1}
+	assert list(store.release_pool_segment_refs(77)) == []
+	assert store.pool_sid_members == {-3: 1}
+	assert list(store.release_pool_segment_refs(2)) == [-3]
+
+
+# Freed segments come out in the member's chain order, one at a time, and
+# nothing is counted down until the iterator is consumed.
+def test_release_yields_freed_segments_in_chain_order_when_consumed():
+	store = PrefixReuseState()
+	store.add_pool_member_refs(1, [-5, -6, -7])
+	store.add_pool_member_refs(2, [-6])
+	pending = store.release_pool_segment_refs(1)
+	assert store.pool_member_sids == {1: (-5, -6, -7), 2: (-6,)}
+	assert next(pending) == -5
+	assert store.pool_sid_members == {-6: 2, -7: 1}
+	assert list(pending) == [-7]
+	assert store.pool_sid_members == {-6: 1}
+	assert store.pool_member_sids == {2: (-6,)}
+
+
+# A chain that names a segment without a count fails on that segment only:
+# the segment freed before it has already been handed out for release.
+def test_release_hands_out_a_freed_segment_before_a_later_one_fails():
+	store = PrefixReuseState()
+	store.pool_member_sids[9] = (-1, -2)
+	store.pool_sid_members[-1] = 1
+	released = []
+	with pytest.raises(KeyError):
+		for sid in store.release_pool_segment_refs(9):
+			released.append(sid)
+	assert released == [-1]
+	assert store.pool_sid_members == {}
+
+
+# One segment at a time; for each segment every view releases, then unregisters.
+def test_release_pool_segments_order_across_views():
+	calls = []
+
+	class View:
+		def __init__(self, name):
+			self.name = name
+
+		def release_sequence_pages(self, ids):
+			calls.append((self.name, "release", list(ids)))
+
+		def unregister_sequences(self, ids):
+			calls.append((self.name, "unregister", list(ids)))
+
+	release_pool_segments({0: View(0), 1: View(1)}, [-1, -2])
+	assert calls == [
+		(0, "release", [-1]), (0, "unregister", [-1]),
+		(1, "release", [-1]), (1, "unregister", [-1]),
+		(0, "release", [-2]), (0, "unregister", [-2]),
+		(1, "release", [-2]), (1, "unregister", [-2]),
+	]
+	release_pool_segments({0: View(0)}, [])
+	assert len(calls) == 8
 
 
 def test_attach_helpers_raise_on_unknown_override():

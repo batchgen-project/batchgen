@@ -1113,6 +1113,201 @@ class KVCapacityEngine:
                 return flag_bucket
         return _MAX_DECODE_RANK_BSZ
 
+    def _mirror_group_host_page_tables(self, ctx, uuids: List[str]) -> None:
+        """Re-install the serve-group leader's host page tables on its followers.
+
+        Every rank reads and writes host KV through its own worker-view page
+        table, but only the group leader grows a sequence's chain in the
+        shared host region. After a decode-time growth the followers copy the
+        leader's tables for the grown rows; nothing else is mirrored (prefix
+        attachments, pool segments and trajectory state belong to prefill).
+
+        No-op for G==1. For G>1 every rank reaches the one collective: the
+        growth decision is identical on all ranks while ``uuids`` is not.
+        """
+        group_size = ctx.facts.attn_tp_size
+        if group_size <= 1:
+            return
+        from batchgen.decode_dp_group import (
+            host_kv_owner_rank,
+            host_page_table_payload,
+            install_host_page_tables,
+            require_serve_group_within_node,
+        )
+
+        require_serve_group_within_node(group_size, ctx.facts.local_world_size)
+
+        host_views = self._host_views_by_group(ctx)
+        payload = None
+        if uuids and all(
+            ctx.facts.rank_ctx.owns_host_kv(ctx.sched.pool.get_sequence(uuid))
+            for uuid in uuids
+        ):
+            payload = host_page_table_payload(ctx.sched.pool, host_views, uuids)
+
+        gathered = [None] * ctx.facts.world_size
+        dist.all_gather_object(gathered, payload)
+
+        leader = host_kv_owner_rank(ctx.facts.rank // group_size, group_size)
+        if leader == ctx.facts.rank:
+            return
+        entry = gathered[leader]
+        if entry is None:
+            if uuids:
+                raise RuntimeError(
+                    f"Rank {ctx.facts.rank}: serve-group leader {leader} mirrored "
+                    f"no host KV for the {len(uuids)} sequences this rank serves"
+                )
+            return
+        install_host_page_tables(host_views, entry)
+
+    def _release_host_kv_pages_for_batch(
+        self, ctx, uuids: List[str], *, remaining_decode_uuids: List[str]
+    ) -> None:
+        """Release host KV pages for completed sequences owned by this rank.
+
+        NOTE: This function only releases HOST KV pages. GPU KV pages should be
+        released separately by calling _release_gpu_kv_pages() BEFORE this function.
+
+        ``remaining_decode_uuids`` is the caller's statement of which sequences
+        remain in decode after this release, in any order. The caller provides
+        it so this function never reads sequence status (a boundary can then
+        apply all of its status changes at one point). Rows not held locally
+        and rows being released here are filtered out below before the GPU
+        page-table rebuild.
+        """
+        if not uuids:
+            return
+        
+        # Keep lifecycle mutations on the worker-owned view.  For DSA this is the
+        # DualHostKVCoordinator; the engine keeps only its primary view for the
+        # attention wrapper and must not be used to release a sequence by itself.
+        worker_view = ctx.host_view
+        if worker_view is None:
+            worker_view = getattr(ctx.core_engine, "host_paged_kv_worker_view", None)
+        if worker_view is None:
+            logging.warning("Host paged KV worker view is unavailable")
+            return
+        
+        my_uuids = [uuid for uuid in uuids if uuid in ctx.sched.seq_table.uuid_to_local]
+
+        # Host KV is ONE run-namespaced per-node SHARED shm region keyed
+        # by global_idx. Under Option 1 (G>1) all G ranks of a group hold the uuid
+        # in _uuid_to_local_map, so releasing on every rank double-frees the single
+        # shared entry -- the first releaser tombstones it and the rest raise
+        # "Sequence ID ... not found during release". Release the shared entry on
+        # EXACTLY the group leader (_owns_host_kv). G==1: host_release_uuids ==
+        # my_uuids, so the validated single-owner path is byte-identical.
+        host_release_uuids = [
+            uuid for uuid in my_uuids
+            if ctx.facts.rank_ctx.owns_host_kv(ctx.sched.pool.get_sequence(uuid))
+        ]
+
+        if host_release_uuids:
+            global_sequence_ids = [
+                ctx.sched.pool.get_sequence(uuid).global_idx
+                for uuid in host_release_uuids
+            ]
+
+            logging.debug(f"Rank {ctx.facts.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
+
+            # NOTE: GPU KV pages should already be released by caller
+            # Do NOT call _release_gpu_kv_pages here to avoid double-free
+
+            # Release host KV pages through the mirrored coordinator when DSA is
+            # active.  It owns both primary and auxiliary page tables.
+            worker_view.release_sequence_pages(global_sequence_ids)
+            # A model with an aux region OUTSIDE the coordinator (K3 keeps its
+            # indexer keys there) releases it explicitly; the dual coordinator
+            # already mirrored its own aux above.
+            aux_view = ctx.host_view_aux
+            if aux_view is not None and not isinstance(
+                worker_view, DualHostKVCoordinator
+            ):
+                aux_view.release_sequence_pages(global_sequence_ids)
+            self._release_prefix_cache_attachments(ctx, global_sequence_ids)
+
+        # The G-1 followers of a serve group never touched the shared pages, but
+        # they do hold the leader's page table MIRRORED into their own view plus
+        # a mirrored prefix state. Drop those rank-local records too, or the next
+        # register of the same global_idx finds a stale row. unregister_sequences
+        # only edits the view's own HostKVPageTable; the pages themselves were
+        # freed exactly once, by the leader above. A mirrored prefix state has
+        # lookup_result=None (no attachment handle, so no coordinator call) and a
+        # follower owns no pool segment refs, so the shared release path inside
+        # _release_prefix_cache_attachments is a no-op here. G==1: the local-map
+        # owner IS the host-KV owner, so this list is always empty.
+        mirror_release_uuids = [
+            uuid for uuid in my_uuids
+            if not ctx.facts.rank_ctx.owns_host_kv(ctx.sched.pool.get_sequence(uuid))
+        ]
+        if mirror_release_uuids:
+            mirror_global_ids = [
+                ctx.sched.pool.get_sequence(uuid).global_idx
+                for uuid in mirror_release_uuids
+            ]
+            for view in self._host_views_by_group(ctx).values():
+                view.unregister_sequences(mirror_global_ids)
+            # An aux region OUTSIDE the prefix groups (K3 indexer keys) holds
+            # follower rows too; dropping only the group views would leave
+            # stale aux rows behind for the next use of the same global id.
+            aux_view = ctx.host_view_aux
+            if aux_view is not None and not isinstance(
+                ctx.host_view,
+                DualHostKVCoordinator,
+            ):
+                aux_view.unregister_sequences(mirror_global_ids)
+            self._release_prefix_cache_attachments(ctx, mirror_global_ids)
+
+        # GPU page table is PER-RANK (GPU KV is replicated across the group's G
+        # ranks under Option 1), so EVERY rank that held these sequences rebuilds
+        # its own remaining page table -- keyed on my_uuids, not the leader subset.
+        if my_uuids:
+            manager = ctx.gpu_kv
+            if manager is not None and manager.is_initialized:
+                remaining_global_ids = []
+                for uuid in remaining_decode_uuids:
+                    if uuid in ctx.sched.seq_table.uuid_to_local and uuid not in my_uuids:
+                        seq = ctx.sched.pool.get_sequence(uuid)
+                        remaining_global_ids.append(seq.global_idx)
+
+                if remaining_global_ids:
+                    remaining_global_ids.sort()
+                    manager.rebuild_page_table(remaining_global_ids)
+
+    def _release_prefix_cache_attachments(
+        self, ctx, global_sequence_ids: Sequence[int]
+    ) -> None:
+        if not ctx.facts.enable_prefix_cache:
+            return
+        sequence_ids = [int(sequence_id) for sequence_id in global_sequence_ids]
+        # A trajectory attachment that never reached its restore leaves
+        # through the same seam, so a rejected wave, a rolled back allocation
+        # and a completed row all return the live count to zero.
+        ctx.sched.trajectories.release_attachments(sequence_ids, rank=ctx.facts.rank)
+        # A pass that died between the config-time arena reservation and the
+        # post-barrier finalize never installed a record, so its arena is
+        # holding Host pages nothing names. Every such path goes through here.
+        ctx.sched.trajectories.rollback_reservations(sequence_ids, rank=ctx.facts.rank)
+        for sequence_id in sequence_ids:
+            self._release_pool_segment_refs(ctx, sequence_id)
+            state = ctx.sched.prefix.pop_state(sequence_id)
+            if state is None:
+                continue
+            for handle in (*state.commit_attachment_handles, state.attachment_handle):
+                if handle:
+                    ctx.prefix_coordinator.release_attachment(handle)
+
+    def _release_pool_segment_refs(self, ctx, global_id: int) -> None:
+        """Release pool pseudo-sids through the PrefixReuseState owner."""
+        from batchgen.worker.prefix_reuse_state import release_pool_segments
+
+        # One freed segment at a time: its Host pages go before the next
+        # segment is counted down. Host views are fetched per freed segment,
+        # so a sequence that frees nothing never touches them.
+        for sid in ctx.sched.prefix.release_pool_segment_refs(int(global_id)):
+            release_pool_segments(self._host_views_by_group(ctx), [sid])
+
     def _host_views_by_group(self, ctx) -> dict:
         """One Host-KV worker view per prefix-cache KV group.
 
