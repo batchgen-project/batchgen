@@ -339,6 +339,19 @@ def load_worker_functions(
     return loaded
 
 
+# What the worker's delegators pass to the engine besides their own arguments:
+# launch parameters, which the engine takes as values instead of reading the
+# worker's args. A fake sets ``worker.args`` the way a server's launch does.
+PREFILL_ENGINE_DELEGATOR_KWARGS = {
+    "_prefix_rank_packing_mode": lambda worker: {
+        "mode": worker.args.prefix_rank_assignment_mode
+    },
+    "_prefix_rank_cost_profile_disabled": lambda worker: {
+        "value": worker.args.prefix_rank_cost_profile
+    },
+}
+
+
 def load_prefill_engine_methods(
     names: Iterable[str],
     namespace: Dict[str, Any],
@@ -377,7 +390,12 @@ def load_prefill_engine_methods(
         exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
         engine_method = scope[node.name]
 
-        def worker_method(worker, *args, _engine_method=engine_method, **kwargs):
+        def worker_method(
+            worker, *args, _engine_method=engine_method, _name=node.name, **kwargs
+        ):
+            extra = PREFILL_ENGINE_DELEGATOR_KWARGS.get(_name)
+            if extra is not None:
+                kwargs = {**extra(worker), **kwargs}
             return _engine_method(None, worker, *args, **kwargs)
 
         loaded[node.name] = worker_method
@@ -421,6 +439,17 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         and isinstance(stmt.value, ast.Name)
         and stmt.value.id == "worker"
     ]
+    if not rebinds:
+        # The rebinding exists to keep a moved body's ``self.`` spellings. A
+        # body that never names ``self`` reads nothing from the worker (it is
+        # a function of its arguments), needs no rebinding, and an unused one
+        # is a lint finding.
+        named = [n for n in ast.walk(method) if isinstance(n, ast.Name) and n.id == "self"]
+        if named:
+            raise AssertionError(
+                f"{node.name}: names `self` without the `self = worker` rebinding"
+            )
+        return method
     if len(rebinds) != 1:
         raise AssertionError(f"{node.name}: expected one `self = worker`, found {len(rebinds)}")
     del method.body[rebinds[0]]
@@ -578,3 +607,27 @@ def load_worker_shaped_methods(
         exec(compile(module, str(WORKER_SOURCE), "exec"), scope)  # noqa: S102
         loaded[name] = scope[name]
     return loaded
+
+
+def attention_group_layout(group_size: int, world_size: int = 0):
+    """A server layout whose attention runs in groups of ``group_size`` in
+    both phases, for fakes of the worker: the worker reads its group widths
+    from ``_server_layout``. ``world_size`` defaults to one group."""
+    from batchgen.parallel_declaration import (
+        ModuleParallelism,
+        PhaseLayout,
+        ServerLayout,
+    )
+
+    size = max(1, int(group_size))
+    world = int(world_size) or size
+    attention = (
+        ModuleParallelism("tp", "resident", group_size=size)
+        if size > 1
+        else ModuleParallelism("dp", "resident")
+    )
+    none = ModuleParallelism("none", None)
+    return ServerLayout(
+        prefill=PhaseLayout("prefill", attention, none, world),
+        decode=PhaseLayout("decode", attention, none, world),
+    )

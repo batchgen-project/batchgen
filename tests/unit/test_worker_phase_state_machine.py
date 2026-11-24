@@ -186,12 +186,8 @@ class _ServerManager:
         return object(), {}
 
 
-def _sequences(*debugs):
-    """One sequence per debug dict (None = no per-request flags)."""
-    return {
-        f"u{index}": SimpleNamespace(uuid=f"u{index}", batchgen_debug=debug)
-        for index, debug in enumerate(debugs)
-    }
+def _sequences(count=1):
+    return {f"u{index}": SimpleNamespace(uuid=f"u{index}") for index in range(count)}
 
 
 def _server_worker(*, resident_cap=RESIDENT_CAP, manager=None):
@@ -208,15 +204,11 @@ def _server_worker(*, resident_cap=RESIDENT_CAP, manager=None):
         get_sequence=lambda uuid: worker._sequences.get(uuid)
     )
 
-    # The worker's own first-value-wins merge of per-request flags.
-    def merge(sequences):
-        merged = {}
-        for seq in sequences:
-            for key, value in (seq.batchgen_debug or {}).items():
-                merged.setdefault(key, value)
-        return merged or None
-
-    worker._active_batchgen_debug_for_sequences = merge
+    # The server's debug state as the wave adopts it: one value for the
+    # whole wave, set by a test through ``_run_prefill_wave``.
+    worker._server_debug = None
+    worker._adopt_debug_state = lambda phase: None
+    worker._debug_values = lambda: worker._server_debug
     worker._debug_flag_enabled = lambda value: bool(value)
     worker._weight_pass_end_delay = lambda value: 0.0
     worker._weight_passes = SimpleNamespace(
@@ -231,13 +223,15 @@ def _server_worker(*, resident_cap=RESIDENT_CAP, manager=None):
     return worker, events
 
 
-def _run_prefill_wave(worker, *debugs):
-    """Resolve, plan and transition the way one wave does.
+def _run_prefill_wave(worker, debug=None):
+    """Resolve, plan and transition the way one wave does, under ``debug``
+    as the server's debug state.
 
     Returns the wave's key and the token cap its readers (receipt placement,
     the pre-transition pool plan and the live prefill) all use.
     """
-    worker._sequences = _sequences(*(debugs or (None,)))
+    worker._server_debug = debug
+    worker._sequences = _sequences()
     uuids = list(worker._sequences)
     worker._begin_prefill_wave(uuids)
     worker._phase_request_uuids = tuple(uuids)
@@ -525,7 +519,7 @@ def test_pool_plan_cap_is_the_server_cap_for_every_group_subset():
 
 def test_phase_key_refuses_a_wave_that_was_not_resolved():
     worker, _ = _server_worker()
-    worker._sequences = _sequences(None)
+    worker._sequences = _sequences()
     worker._phase_request_uuids = ("u0",)
     with pytest.raises(RuntimeError, match="did not resolve"):
         worker._desired_phase_key("prefill")

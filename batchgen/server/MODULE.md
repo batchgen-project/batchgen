@@ -137,11 +137,24 @@ batch or debug flag changes it. The model's strategy manager validates the
 mode against its topology at construction and refuses an impossible one by
 name at startup; a model without prefill MoE modes refuses the flag.
 `resident_ep` cannot be combined with `--enable-prefix-cache`
-(`validate_server_args` refuses the pair by name). A batch or turn that still
-sends the retired per-batch key `batchgen_debug.k3_prefill_moe_mode` is
-refused with HTTP 400 (`io_struct.RETIRED_BATCHGEN_DEBUG_KEYS`); a batch
-stored before the refusal existed fails in `BatchScheduler._process_batch`
-before any request reaches a worker.
+(`validate_server_args` refuses the pair by name).
+
+# Debug state
+
+Debug switches are server-level (`batchgen/server_debug_state.py`; the registry is
+assembled as `config.model_registry.DEBUG_KEY_REGISTRY`). `WorkerManager`
+owns the current `DebugState` on node 0. `GET/POST /v1/admin/debug-state`
+(`http_server.py`) reads and changes it: a phase-entry key is published on
+the admission queue (`WorkerManager.publish_debug_state`) and adopted by the
+workers at the next prefill wave or decode entry; a re-warm key needs
+`rewarm: true` and goes through `restart_workers`. Every pool start carries
+the state in the workers' launch arguments (`_spawn_workers`); rank 0
+broadcasts it to every rank before the worker is built, so it is in force for
+the start-up warm-up on every node. A batch or turn
+that carries `batchgen_debug` is refused with HTTP 400
+(`io_struct.batchgen_debug_refusal`); a batch stored before the refusal
+existed fails in `BatchScheduler._process_batch` before any request reaches a
+worker.
 
 # Batch request counts
 

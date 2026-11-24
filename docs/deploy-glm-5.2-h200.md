@@ -194,7 +194,7 @@ phase arms a late-compile guard:
 [GLM5_TRITON_WARMUP] prefill rank=R phase1 compiled=N loaded=M entries=E failed=F wall=Xs
 [GLM5_TRITON_WARMUP] rank=R prefill entries=E total wall=Xs
 [GLM5_TRITON_WARMUP] rank=R geometry primary_width=... aux_width=... page_sizes=.../... ...
-[GLM5_TRITON_WARMUP] rank=R late-compile guard armed: later compiles log at WARNING; batchgen_debug.glm5_triton_strict makes them raise
+[GLM5_TRITON_WARMUP] rank=R late-compile guard armed: later compiles log at WARNING; debug_state.glm5_triton_strict makes them raise
 ```
 
 The `decode` phase also logs which kernels the configuration can reach without
@@ -211,9 +211,9 @@ Decode batches larger than the top CUDA-graph bucket run eagerly, and some
 eager-decode kernels are keyed on the active page-table width, which follows
 the longest sequence; those keys are not prewarmed, so late-compile lines on
 that path are expected. To make a late compile raise instead (acceptance runs
-only, never in production), create the batch with
-`"batchgen_debug": {"glm5_triton_strict": true}` (see
-[Batch API](batch-api.md#post-v1batches)). The error is raised inside the
+only, never in production), set the server debug-state key
+`glm5_triton_strict` before submitting (see
+[Debug state](server-flags.md#debug-state)). The error is raised inside the
 model forward, so it stops the worker pool, not only that batch, and it applies
 to every sequence decoded in the same step.
 
@@ -315,8 +315,8 @@ reported as
 [GLM5_DEEPGEMM_WARMUP] rank=R DeepGEMM compiled N kernels after the prewarm (cache ...: A -> B, seen at ...)
 ```
 
-and raises instead when the batch sets
-`"batchgen_debug": {"glm5_triton_strict": true}` (acceptance runs only). The
+and raises instead when the server debug-state key
+`glm5_triton_strict` is set (acceptance runs only). The
 cache is shared by the node's ranks, so the count covers all of them. An eager
 decode batch larger than the slot capacity can still compile the paged
 scorer's schedule kernel for its batch alignment.

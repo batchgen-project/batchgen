@@ -8,7 +8,7 @@ captured right after the op, its duration is swept across replays of ONE
 captured graph, and the slope of the mean step time against the delay injected
 per step is the criticality of that position.
 
-Activation is batch-level only, through ``batchgen_debug``::
+Activation is through the server's debug state only::
 
     "batchgen_debug": {"glm5_criticality_probe": {
         "sites": ["after_router"], "layers": "all",

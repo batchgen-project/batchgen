@@ -507,7 +507,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
     # scope. They are now owned by this GLM-5 subclass.
     #
     # Dispatch-trace instrumentation (per-step counts of GLM-5 dispatch
-    # paths; toggled by `batchgen_debug.glm5_dispatch_trace`).
+    # paths; toggled by `debug_state.glm5_dispatch_trace`).
     glm5_dispatch_trace_enabled: ClassVar[bool] = False
     glm5_dispatch_trace_id: ClassVar[Optional[str]] = None
     glm5_dispatch_trace_context: ClassVar[Optional[Dict[str, Any]]] = None

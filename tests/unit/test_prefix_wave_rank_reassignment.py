@@ -117,8 +117,8 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
         worker_state._trajectory_tokens = (
             lambda seq, length=None, **_: prompts[seq.uuid][:length]
         )
-        worker_state._active_batchgen_debug_for_sequences = (
-            lambda batch_sequences: {"prefix_rank_assignment_mode": "global_idx"}
+        worker_state.args = SimpleNamespace(
+            prefix_rank_assignment_mode="global_idx", prefix_rank_cost_profile="on"
         )
         worker_state._prefix_rank_packing_mode = types.MethodType(
             _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
@@ -207,9 +207,9 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
             Module_Batching_Config=SimpleNamespace(prefill_micro_batch_token_cap=64)),
         # Startup resolved the server prefill mode: every wave is streamed.
         _server_prefill_moe_mode_resolved=("streamed",),
-        _active_batchgen_debug_for_sequences=lambda batch_sequences: {
-            "prefix_rank_assignment_mode": "packing_v2"
-        },
+        args=SimpleNamespace(
+            prefix_rank_assignment_mode="packing_v2", prefix_rank_cost_profile="on"
+        ),
         query_book={index: object() for index in slots.values()},
     )
     attach_identity(worker_state, rank=rank, world_size=world_size,
@@ -225,8 +225,8 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         ],
         worker_state,
     )
-    # The arm is batch level: no batchgen_debug on these fakes means the
-    # default (profile) arm, which is what these tests pin.
+    # The arm is a launch parameter; these fakes run the default (profile)
+    # arm, which is what these tests pin.
     worker_state._prefix_rank_cost_profile_disabled = types.MethodType(
         _worker_methods("_prefix_rank_cost_profile_disabled")[
             "_prefix_rank_cost_profile_disabled"
@@ -387,9 +387,7 @@ def test_opt_out_mode_still_uses_the_legacy_assigner(monkeypatch):
                         SimpleNamespace(assign_ranks_for_sharing=assign_ranks_for_sharing))
     seqs = _mixed_wave(0)
     worker_state = _packing_worker(0, seqs, {"q0": 4})
-    worker_state._active_batchgen_debug_for_sequences = (
-        lambda batch_sequences: {"prefix_rank_assignment_mode": "global_idx"}
-    )
+    worker_state.args.prefix_rank_assignment_mode = "global_idx"
     _assignment_method()(worker_state, ["q0", "q1"], current_wave=True)
     assert len(calls) == 1 and calls[0][0] == [[4, 5, 6], [7, 8]]
     assert calls[0][1]["initial_loads"] == [0, 0]

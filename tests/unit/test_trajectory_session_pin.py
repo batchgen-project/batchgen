@@ -15,6 +15,7 @@ worker methods are compiled out of the module's AST onto a namespace of fakes,
 exactly as the other prefix-reuse unit tests do.
 """
 
+from tests.worker_method_source import attention_group_layout
 import ast
 import copy
 import importlib.util
@@ -496,6 +497,7 @@ def _mirror_rank(
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _prefill_pool_wave=None,
         _host_views_by_group=lambda: {0: _FakeView({})},
@@ -698,7 +700,7 @@ def _assign_worker(
             "_assign_decode_dp_groups",
             "_trajectory_session_residency",
             "_trajectory_commit_requested",
-            "_active_batchgen_debug_for_sequences",
+            "_debug_values",
             "_decode_attn_tp_size",
             "_trajectory_restore_fields",
             "_pack_decode_dp_groups_for_sharing",
@@ -710,6 +712,7 @@ def _assign_worker(
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         # The real GlobalBatch is iterable AND resolves by uuid; a
         # SimpleNamespace cannot route dunder lookups, so the batch is its own
         # small fake.
@@ -726,11 +729,15 @@ def _assign_worker(
         _server_prefill_moe_mode_resolved=("streamed",),
         _cached_prefix_rank_cost_profile=lambda disabled: None,
         _prefix_rank_cost_profile_disabled=lambda seqs: False,
-        _batchgen_debug=debug,
-        # The real worker latches this when an admitted sequence carries
-        # per-request debug flags; these sequences do, so the merge path the
-        # pin depends on stays reachable.
-        _any_sequence_batchgen_debug=True,
+        # The server's debug state as adopted: ``debug`` when a test passes
+        # one, else the state the test's sequences were built for.
+        _debug_state_values=(
+            debug if debug is not None
+            else next(iter(seqs.values())).test_server_debug
+        ),
+        args=SimpleNamespace(
+            prefix_rank_assignment_mode="packing_v2", prefix_rank_cost_profile="on"
+        ),
         # Residency selects the real packer without the packing_v2 flag.
         _prefill_prefix_pool_enabled=lambda: False,
         _trajectory_tokens=lambda seq, length=None: _FakeTokens(
@@ -776,7 +783,9 @@ def _sequence(uuid, *, prompt_length, debug="on"):
         # Real Sequence field read by the balancer path: a first admission
         # has no eviction history.
         evicted_from_dp_group=None,
-        batchgen_debug=(
+        # Test-only: the server debug state this sequence's wave runs under,
+        # which ``_assign_worker`` installs as the adopted state.
+        test_server_debug=(
             {"prefix_trajectory_commit": debug} if debug is not None else None
         ),
     )

@@ -229,10 +229,17 @@ def test_kimi_k3_declares_head_parallel_attention_and_resident_ep():
     declared = pm.parallel_declaration()
     assert rendered(declared) == {
         "prefill_attention": "tp8:resident",
-        "prefill_moe": "dp:streamed",
+        # The 8-way streamed shard is an expert-parallel group of 8, not DP.
+        "prefill_moe": "ep8:streamed",
         "decode_attention": "tp8:resident",
         "decode_moe": "ep16:resident",
     }
+    from batchgen.parallel_declaration import server_layout_from_declaration
+
+    layout = server_layout_from_declaration(declared, pm.world_size)
+    # Prefill: a DP worker is one attention group; decode EP spans the world.
+    assert layout.prefill.dp_worker_size == 8 and layout.prefill.num_dp_workers == 2
+    assert layout.decode.dp_worker_size == 16
     assert declared.decode_graph.mode == "off"
     pm._decode_graph = SimpleNamespace(
         mode="graph", bucketing=SimpleNamespace(bucket_sizes=[1, 2, 4])

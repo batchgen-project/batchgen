@@ -1,0 +1,278 @@
+"""A worker runs under one debug-state generation and changes it only at a phase entry.
+
+The server publishes a state; every rank keeps it as pending and adopts it at
+the start of a prefill wave or at decode entry, never inside a wave or a decode
+step. A change of a key that is baked into captured graphs or into a phase
+instance must not reach a running pool this way: the server re-warms the pool
+and the new pool starts under the state.
+
+The worker methods are compiled from source (``load_worker_methods``), so these
+run without the GPU stack.
+"""
+import ast
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Optional
+
+import pytest
+
+from batchgen.config.model_registry import DEBUG_KEY_REGISTRY
+from batchgen.server_debug_state import DebugState, format_log_line
+from tests.worker_method_source import load_worker_methods
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKER_SOURCE = ROOT / "batchgen" / "batchgen_worker.py"
+MAIN_LOOP_SOURCE = ROOT / "batchgen" / "server_worker_main_loop.py"
+
+_METHODS = ("_debug_values", "receive_debug_state", "_adopt_debug_state")
+
+
+def _worker(*, local_rank=0, node=0):
+    methods = load_worker_methods(_METHODS, {
+        "Optional": Optional,
+        "logging": logging,
+        "DebugState": DebugState,
+        "DEBUG_KEY_REGISTRY": DEBUG_KEY_REGISTRY,
+        "format_debug_state_log_line": format_log_line,
+    })
+    worker = SimpleNamespace(
+        rank=8 * node + local_rank,
+        local_rank=local_rank,
+        args=SimpleNamespace(nnode_rank=node),
+        _debug_state=DEBUG_KEY_REGISTRY.empty,
+        _pending_debug_state=None,
+        _debug_state_values=None,
+        _debug_state_logged_generation=None,
+    )
+    for name, function in methods.items():
+        setattr(worker, name, function.__get__(worker))
+    return worker
+
+
+def _wire(generation, **values):
+    state = DEBUG_KEY_REGISTRY.empty
+    for _ in range(generation):
+        state = state.changed(set=values)
+    return state.to_wire()
+
+
+def test_a_received_state_waits_for_the_next_phase_entry():
+    worker = _worker()
+    worker.receive_debug_state(_wire(1, glm5_graph_path_log=True))
+    # Published, not adopted: a wave or a decode step in flight keeps reading
+    # the generation it started under.
+    assert worker._debug_values() is None
+    assert worker._debug_state.generation == 0
+
+    worker._adopt_debug_state("prefill")
+
+    assert worker._debug_state.generation == 1
+    assert worker._debug_values() == {"glm5_graph_path_log": True}
+    assert worker._pending_debug_state is None
+
+
+def test_the_adopted_values_are_plain_and_the_same_object_until_the_next_adoption():
+    worker = _worker()
+    worker.receive_debug_state(_wire(
+        1, weight_pass_end_delay={"rank": 1, "seconds": 2}, decode_profile_ranks=[0, 8]
+    ))
+    worker._adopt_debug_state("decode")
+    values = worker._debug_values()
+    # Readers test ``isinstance(value, dict)`` and ``rank in value``.
+    assert values == {
+        "weight_pass_end_delay": {"rank": 1, "seconds": 2.0},
+        "decode_profile_ranks": [0, 8],
+    }
+    assert type(values["weight_pass_end_delay"]) is dict
+    assert worker._debug_values() is values
+    worker._adopt_debug_state("prefill")
+    assert worker._debug_values() is values
+
+
+def test_clearing_every_key_returns_the_worker_to_no_debug_values():
+    worker = _worker()
+    worker.receive_debug_state(_wire(1, triton_strict=True))
+    worker._adopt_debug_state("prefill")
+    cleared = worker._debug_state.changed(clear=["triton_strict"])
+    worker.receive_debug_state(cleared.to_wire())
+    worker._adopt_debug_state("decode")
+    assert worker._debug_values() is None and worker._debug_state.generation == 2
+
+
+def test_a_state_published_before_the_pool_is_initialised_is_taken_at_once():
+    worker = _worker()
+    worker.receive_debug_state(_wire(3, kimi_decode_graph_mode="eager"), at_start=True)
+    # No phase has run: no phase entry is needed.
+    assert worker._debug_state.generation == 3
+    assert worker._debug_values() == {"kimi_decode_graph_mode": "eager"}
+    assert worker._pending_debug_state is None
+
+
+def test_a_pool_started_without_a_state_runs_under_the_empty_one():
+    worker = _worker()
+    worker.receive_debug_state(None, at_start=True)
+    assert worker._debug_state is DEBUG_KEY_REGISTRY.empty
+    assert worker._debug_values() is None
+
+
+@pytest.mark.parametrize("key,value", [
+    ("kimi_decode_graph_mode", "eager"),
+    ("k3_prefill_profile", True),
+    ("glm52_recv_count_hist", True),
+])
+def test_a_rewarm_key_cannot_change_on_a_running_pool(key, value):
+    worker = _worker()
+    worker.receive_debug_state(_wire(1, **{key: value}))
+    with pytest.raises(RuntimeError, match=f"{key} on a running worker pool"):
+        worker._adopt_debug_state("decode")
+    # Nothing was adopted.
+    assert worker._debug_state.generation == 0 and worker._debug_values() is None
+
+
+def test_a_non_empty_state_is_logged_at_every_phase_entry_by_the_first_rank_of_each_node(
+    caplog,
+):
+    lines = {}
+    for local_rank, node in ((0, 0), (3, 0), (0, 1)):
+        worker = _worker(local_rank=local_rank, node=node)
+        worker.receive_debug_state(_wire(1, triton_strict=True))
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            worker._adopt_debug_state("prefill")
+            worker._adopt_debug_state("decode")
+            lines[(local_rank, node)] = [
+                record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("[DEBUG_STATE]")
+            ]
+    # Every phase served under debug switches says so, so a slice of the log
+    # that starts after the adoption still shows the state.
+    assert lines[(0, 0)] == [
+        "[DEBUG_STATE] generation=1 node=0 keys=triton_strict=True phase=prefill",
+        "[DEBUG_STATE] generation=1 node=0 keys=triton_strict=True phase=decode",
+    ]
+    assert lines[(3, 0)] == []
+    assert lines[(0, 1)] == [
+        "[DEBUG_STATE] generation=1 node=1 keys=triton_strict=True phase=prefill",
+        "[DEBUG_STATE] generation=1 node=1 keys=triton_strict=True phase=decode",
+    ]
+
+
+def test_the_empty_state_is_logged_once_per_generation(caplog):
+    worker = _worker()
+    with caplog.at_level(logging.INFO):
+        worker._adopt_debug_state("prefill")
+        worker._adopt_debug_state("decode")
+        worker._adopt_debug_state("prefill")
+    # The official path stays quiet: one line, then nothing per phase.
+    assert [record.getMessage() for record in caplog.records] == [
+        "[DEBUG_STATE] generation=0 node=0 keys=none phase=prefill"
+    ]
+
+
+# ------------------------------------------------------------- source pins
+
+def _worker_method(name):
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    klass = next(node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    return next(node for node in klass.body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def _calls(function, attr):
+    return [node for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr]
+
+
+def test_adoption_happens_at_exactly_the_two_phase_entries():
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    sites = [ast.unparse(node.args[0]) for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "_adopt_debug_state"]
+    assert sorted(sites) == ["'decode'", "'prefill'"]
+    assert _calls(_worker_method("_begin_prefill_wave"), "_adopt_debug_state")
+
+
+def test_a_published_state_is_kept_as_pending_and_admits_nothing():
+    worker = _worker()
+    take = load_worker_methods(("_take_queue_message",), {})["_take_queue_message"]
+    admitted = []
+    worker._admit_sequences_from_message = admitted.append
+    worker._take_queue_message = take.__get__(worker)
+
+    wire = _wire(1, triton_strict=True)
+    assert worker._take_queue_message({"type": "debug_state", "state": wire}) is False
+    assert admitted == []
+    assert worker._pending_debug_state.to_wire() == wire
+    assert worker._debug_values() is None           # not adopted before a phase entry
+
+    message = {"type": "admit", "entries": []}
+    assert worker._take_queue_message(message) is True
+    assert admitted == [message]
+
+
+def test_every_reader_of_the_admission_queue_goes_through_the_one_dispatcher():
+    # The worker reads the queue in two places: the poll at phase boundaries
+    # and the idle wait while every sequence is complete. A message type that
+    # only one of them knew was silently dropped by the other (found on a
+    # real server: a debug state published to an idle pool never arrived).
+    source = WORKER_SOURCE.read_text()
+    tree = ast.parse(source)
+    readers = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) in (
+            "self._admission_queue.get", "self._admission_queue.get_nowait")
+    ]
+    assert len(readers) == 2
+    # Sequences are admitted only inside the dispatcher.
+    admits = [node for node in ast.walk(tree)
+              if isinstance(node, ast.Call)
+              and ast.unparse(node.func) == "self._admit_sequences_from_message"]
+    assert len(admits) == 1
+    dispatcher = _worker_method("_take_queue_message")
+    assert dispatcher.lineno <= admits[0].lineno <= dispatcher.end_lineno
+    # Both readers accept the same message types and hand them to it.
+    assert source.count('msg.get("type") in self._QUEUE_MESSAGE_TYPES') == 2
+    assert len(_calls(_worker_method("_poll_admissions"), "_take_queue_message")) == 1
+    assert len(_calls(_worker_method("generate"), "_take_queue_message")) == 2
+    # Neither reader drops a message it does not know.
+    assert source.count("unexpected admission-queue message") == 2
+
+
+def test_no_worker_code_reads_debug_flags_from_a_sequence():
+    source = WORKER_SOURCE.read_text()
+    assert "_active_batchgen_debug_for_sequences" not in source
+    assert "seq.batchgen_debug" not in source
+    assert "_any_sequence_batchgen_debug" not in source
+    sequence = (ROOT / "batchgen" / "sequence.py").read_text()
+    assert "batchgen_debug" not in sequence
+
+
+def test_the_main_loop_takes_a_state_published_before_the_pool_is_initialised():
+    source = MAIN_LOOP_SOURCE.read_text()
+    assert 'task_data.get("type") == "debug_state"' in source
+    assert 'worker.receive_debug_state(task_data.get("state"), at_start=True)' in source
+    early = source.index('task_data.get("type") == "debug_state"')
+    init = source.index('task_data.get("type") == "init"')
+    assert early < init
+
+
+def test_every_rank_starts_under_rank_zeros_state_before_its_worker_is_built():
+    # The start-up warm-up (compiles, graph captures) runs inside the worker's
+    # construction and start-up pass, before any message from the server; a
+    # key baked into captured graphs must already be in force there, on every
+    # node, although only node 0's server owns the state.
+    source = MAIN_LOOP_SOURCE.read_text()
+    broadcast = source.index(
+        "start_debug_state = [args.debug_state if args.global_rank == 0 else None]"
+    )
+    taken = source.index("args.debug_state = start_debug_state[0]")
+    built = source.index("worker = BatchGenWorker(args)")
+    assert broadcast < source.index(
+        "dist.broadcast_object_list(start_debug_state, src=0)"
+    ) < taken < built
+    worker_source = WORKER_SOURCE.read_text()
+    assert "DEBUG_KEY_REGISTRY.from_wire(args.debug_state)" in worker_source

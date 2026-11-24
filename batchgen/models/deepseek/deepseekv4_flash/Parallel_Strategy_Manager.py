@@ -29,9 +29,17 @@ from batchgen.phase_lifecycle import (
 from .model import DeepSeekV4FlashForCausalLM
 from .tensor_contract import build_v4_weight_contract, model_key_to_checkpoint_key
 from .wrappers import DeepSeekV4FlashAttnWrapper, DeepSeekV4FlashExpertWrapper
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 
 
 class DeepSeekV4FlashParallelStrategyManager:
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode(
+        decode_attention=("streamed",),
+        decode_moe=("streamed",),
+    )
     def __init__(
         self,
         loaded_model_config,

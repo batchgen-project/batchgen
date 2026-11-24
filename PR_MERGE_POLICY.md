@@ -55,8 +55,9 @@ deleted — on their own PRs.)
    packages. Tests live in the repository's `tests/` tree.
 3. **Server-side env-var debug guards.** Do not add `os.environ.get("BATCHGEN_…")` /
    `os.getenv("BATCHGEN_…")` guards to gate debug or diagnostic behavior in production code;
-   represent debug behavior as a batch-level `/v1/batches` `batchgen_debug` flag (togglable per
-   job, no restart). Any env-guard added while developing **must be removed before the PR is
+   represent debug behavior as a key of the server's debug state, declared in the debug-key
+   registry and set through `POST /v1/admin/debug-state` (togglable on a running server, no
+   cold start). Any env-guard added while developing **must be removed before the PR is
    merged**. A genuinely-needed **new environment variable** is a deliberate config change —
    introduce it in its **own dedicated PR**, never bundled into a feature/fix. (The only
    sanctioned env-flag module is `batchgen/timing.py`.)
@@ -233,7 +234,7 @@ Run this before marking a PR **Ready for review**. It is reproduced in
 - [ ] **Change type** declared in the PR template; all changed files are within that type's permitted set (§2.5) — no scaffolding edits in a `model`/`kernel` PR (§2.6).
 - [ ] No `debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or root (§1.1). (`bench_*` is allowed.)
 - [ ] No `test_*.py` added inside the runtime package; tests are under `tests/` (§1.2, §2.1).
-- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3). A genuinely-needed new env var goes in its own PR.
+- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a declared server debug-state key (§1.3). A genuinely-needed new env var goes in its own PR.
 - [ ] No leftover `print()` or commented-out code in the changed files (§1.4–§1.5). (`logging.debug()` is fine.)
 - [ ] No logs, profiler traces, CSVs, checkpoints, wheels, or compiled artifacts staged; nothing added with `-f` (§1.6).
 - [ ] Touched modules' `MODULE.md` updated if the public API changed (§2.2).

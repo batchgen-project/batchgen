@@ -29,7 +29,7 @@ def gemm_tilem_avg(global_rows: int, topk: int, num_global_experts: int) -> int:
 
 
 def _tilem_avg_override():
-    """Batch-level sweep override `batchgen_debug.glm5_moe_tilem_avg` (int).
+    """Server-level sweep override `debug_state.glm5_moe_tilem_avg` (int).
 
     Graphs are re-captured every decode round, so the override takes effect
     on the next round's capture; the eager path reads it per call. Absent or
@@ -66,7 +66,7 @@ def recv_count_histogram_width(stride: int, block_m: int) -> int:
 
 
 def recv_count_histogram_enabled() -> bool:
-    """Batch-level diagnostic `batchgen_debug.glm52_recv_count_hist` (bool).
+    """Server-level diagnostic `debug_state.glm52_recv_count_hist` (bool).
 
     Read on the host where the decode graph is built, exactly like
     :func:`_tilem_avg_override`: graphs are re-captured every decode round, so

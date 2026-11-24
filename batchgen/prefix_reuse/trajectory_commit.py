@@ -23,7 +23,7 @@ that are load-bearing, not incidental:
   namespace is what marks them -- and the blob is laid out in one fixed order
   derived from ``KDASnapshotProfile``.
 
-Everything here is flag-gated by ``batchgen_debug.prefix_trajectory_commit``.
+Everything here is flag-gated by ``debug_state.prefix_trajectory_commit``.
 With the flag off nothing in this module runs and no registry write happens.
 """
 
@@ -47,7 +47,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
 )
 
 
-# The batch-level flag and the log prefix every line here carries.
+# The debug-state key and the log prefix every line here carries.
 DEBUG_FLAG = "prefix_trajectory_commit"
 PREFIX = "TRAJECTORY_FRONTIER"
 
@@ -165,7 +165,7 @@ class TrajectoryStateUnavailable(TrajectoryCommitError):
 
 
 # ---------------------------------------------------------------------------
-# The batch-level flag
+# The debug-state key
 # ---------------------------------------------------------------------------
 
 

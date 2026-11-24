@@ -49,6 +49,7 @@ from .wrappers import (
     GLM5AttnWrapper,
     _required_dsa_kernel_import_failures,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 
 
 def _synchronize_prefill_preloads():
@@ -155,6 +156,10 @@ def uniform_expert_assignment(
 
 
 class GLM5ParallelStrategyManager:
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
     # ``prewarm_decode_graphs`` compiles the decode kernels keyed on the KV
     # page-table geometry; it captures no graph. The worker therefore runs it
     # before readiness in every lifecycle, with or without decode graphs.
@@ -640,7 +645,7 @@ class GLM5ParallelStrategyManager:
 
     def _check_late_deepgemm_compiles(self, where):
         """Log the DeepGEMM kernels compiled since the last geometry
-        prewarm; ``batchgen_debug.glm5_triton_strict`` makes it raise."""
+        prewarm; ``debug_state.glm5_triton_strict`` makes it raise."""
         if not torch.cuda.is_available():
             return
         from .deepgemm_prewarm import check_late_compiles
@@ -1068,8 +1073,7 @@ class GLM5ParallelStrategyManager:
           appended host-side. Honest exclusion: the scorer's context width is
           ``index_topk + 1``, the minimal long context, so transients that
           grow with a longer decode context are not measured here;
-        - forces the eager decode path for the whole step
-          (``batchgen_debug.glm5_dsa_mode/glm5_moe_mode = "eager"``): graph
+        - runs the whole step eagerly and under no debug values: graph
           replays bind the worker's real page tables and shared graph
           buffers, which this synthetic step must not touch. At the startup
           seam no decode graph exists yet anyway — the probe runs BEFORE
@@ -1444,17 +1448,10 @@ class GLM5ParallelStrategyManager:
         patched_gates = []
 
         try:
-            # Force the eager decode path for both the DSA attention and the
-            # MoE: graph replays bind the worker's real page tables and
-            # shared graph buffers, which this synthetic step must not touch.
-            # The configured batch debug dict is restored below.
-            phase_state.bind_debug(
-                AttnWrapperBase,
-                batchgen_debug={
-                    "glm5_dsa_mode": "eager",
-                    "glm5_moe_mode": "eager",
-                },
-            )
+            # The synthetic step runs under no debug values (it is eager: no
+            # decode graph exists at this seam). The bound debug values are
+            # restored below.
+            phase_state.bind_debug(AttnWrapperBase, batchgen_debug=None)
             # Every synthetic row is long, so the worker's per-step short-row
             # hint is 0 and no selector falls back to a host-side reduction.
             GLM5AttnWrapper._dsa_short_count = 0

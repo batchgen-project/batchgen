@@ -46,6 +46,7 @@ from batchgen.phase_lifecycle import (
     PhaseEnterContext,
     PhaseKey,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 
 
 class StartupDecodeProbeError(RuntimeError):
@@ -164,6 +165,12 @@ class GptOssParallelStrategyManager:
     addresses are released on every exit and rebuilt from the host store on
     the next activation, exactly as the per-phase rebuild did.
     """
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode(
+        prefill_moe=("streamed", "resident"),
+    )
 
     NUM_TOTAL_EXPERTS = 128
 

@@ -131,6 +131,40 @@ def test_prefill_moe_mode_flag_parses_to_server_args():
         parser.parse_args(base + ["--prefill-moe-mode", "resident"])
 
 
+def test_prefix_rank_launch_parameters_parse_and_default_to_the_packer():
+    parser = server_args_module._build_parser()
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    parsed = parser.parse_args(base)
+    assert parsed.prefix_rank_assignment_mode == "packing_v2"
+    assert parsed.prefix_rank_cost_profile == "on"
+    assert ServerArgs(model="m").prefix_rank_assignment_mode == "packing_v2"
+    assert ServerArgs(model="m").prefix_rank_cost_profile == "on"
+    parsed = parser.parse_args(base + [
+        "--prefix-rank-assignment-mode", "global_idx",
+        "--prefix-rank-cost-profile", "off",
+    ])
+    assert parsed.prefix_rank_assignment_mode == "global_idx"
+    assert parsed.prefix_rank_cost_profile == "off"
+    for flag in ("--prefix-rank-assignment-mode", "--prefix-rank-cost-profile"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(base + [flag, "maybe"])
+
+
+@pytest.mark.parametrize(
+    "field", ["prefix_rank_assignment_mode", "prefix_rank_cost_profile"]
+)
+def test_prefix_rank_launch_parameters_reach_the_worker(field):
+    # Parsed -> ServerArgs -> the worker's args: a flag that is accepted and
+    # then dropped on the way would silently run the default arm.
+    root = Path(server_args_module.__file__).resolve().parents[1]
+    server_args_source = Path(server_args_module.__file__).read_text()
+    assert f"{field}=parsed.{field}," in server_args_source
+    manager_source = (root / "server" / "worker_manager.py").read_text()
+    assert f"{field}=self.args.{field}," in manager_source
+    worker_source = (root / "batchgen_worker.py").read_text()
+    assert f"=self.args.{field}," in worker_source
+
+
 def test_debug_num_layers_flag_parses_and_defaults_to_all_layers():
     parser = server_args_module._build_parser()
     base = ["--model", "m", "--host-kv-cache-size", "1"]

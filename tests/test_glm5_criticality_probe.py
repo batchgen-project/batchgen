@@ -5,7 +5,7 @@ fixed sites and sweeps their duration across replays of that one graph
 (``batchgen/models/glm/glm5/criticality_probe.py``). What is checkable on a
 CPU box:
 
-* the ``batchgen_debug.glm5_criticality_probe`` request is parsed strictly
+* the ``debug_state.glm5_criticality_probe`` request is parsed strictly
   (unknown site/key, non-integer, negative or over-cap delay, empty schedule
   all fail loud) and the schedule maps steps to levels with cycling;
 * the probe launches exactly one spin node per enabled site and selected

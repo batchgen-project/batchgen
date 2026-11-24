@@ -74,7 +74,7 @@ class _Rig:
 
 
 def _debug(steps=5, **extra):
-    return {"k3_decode_profile_steps": steps, **extra}
+    return {"decode_profile_steps": steps, **extra}
 
 
 def test_full_window_starts_after_warmup_and_stops_after_n_steps(caplog):
@@ -109,7 +109,7 @@ def test_round_end_stops_a_window_that_never_filled(caplog):
     assert "ended early: the decode round ended; 40 requested" in caplog.text
 
 
-@pytest.mark.parametrize("later_debug", [None, {}, {"k3_decode_profile_steps": 0}])
+@pytest.mark.parametrize("later_debug", [None, {}, {"decode_profile_steps": 0}])
 def test_a_step_without_the_request_stops_the_window(later_debug):
     rig = _Rig()
     rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1, _debug(steps=40))
@@ -129,7 +129,7 @@ def test_capture_is_one_per_generation():
 
 def test_unlisted_rank_follows_the_window_without_a_profiler(caplog):
     rig = _Rig(rank=1)
-    debug = _debug(k3_decode_profile_ranks=[0, 8])
+    debug = _debug(decode_profile_ranks=[0, 8])
     with caplog.at_level(logging.INFO):
         rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1 + 5, debug)
         rig.capture.end_round()
@@ -143,7 +143,7 @@ def test_unlisted_rank_follows_the_window_without_a_profiler(caplog):
 
 def test_listed_non_zero_rank_profiles():
     rig = _Rig(rank=8)
-    rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1 + 5, _debug(k3_decode_profile_ranks=[0, 8]))
+    rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1 + 5, _debug(decode_profile_ranks=[0, 8]))
     assert rig.log == ["start", "sync", "stop"]
 
 
@@ -157,7 +157,7 @@ def test_log_suffix_marks_only_a_profiled_generation():
 def test_no_request_leaves_the_rank_untouched():
     rig = _Rig()
     rig.steps(20, None)
-    rig.steps(20, {"k3_decode_profile_steps": "not-a-number"})
+    rig.steps(20, {"decode_profile_steps": "not-a-number"})
     rig.capture.end_round()
     assert rig.log == [] and rig.capture.profiled is False
     assert rig.capture._done is False
@@ -166,7 +166,7 @@ def test_no_request_leaves_the_rank_untouched():
 def test_trace_is_written_when_requested(tmp_path):
     rig = _Rig()
     trace_dir = tmp_path / "traces"
-    rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1 + 5, _debug(k3_decode_profile_trace=str(trace_dir)))
+    rig.steps(DECODE_PROFILE_WARMUP_STEPS + 1 + 5, _debug(decode_profile_trace=str(trace_dir)))
     assert rig.log[-1] == ("trace", str(trace_dir / "k3_decode_profile_rows8_rank0.json"))
     assert trace_dir.is_dir()
 

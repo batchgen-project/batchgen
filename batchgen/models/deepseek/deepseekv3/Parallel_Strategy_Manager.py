@@ -17,12 +17,17 @@ from batchgen.phase_lifecycle import (
 	PhaseEnterContext,
 	PhaseKey,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 if os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL") == "1":
 	from pplx_kernels.all_to_all import AllToAll
 else:
 	AllToAll = None  # Optional dependency
 	
 class DeepseekV3ParallelStrategyManager:
+
+	# The layouts this family implements (batchgen.parallel_declaration); a
+	# resolved layout outside this table is refused at start-up by name.
+	SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
 	NUM_TOTAL_EXPERTS = 256  # Total routed experts per MoE layer
 
 	def parallel_declaration(self, decode_graph_state=None):

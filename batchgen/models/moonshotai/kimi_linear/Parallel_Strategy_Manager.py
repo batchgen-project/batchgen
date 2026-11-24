@@ -78,6 +78,20 @@ from .wrappers import (
     KimiLinearExpertWrapper,
     KimiLinearKDAWrapper,
 )
+from batchgen.parallel_declaration import (
+    GROUP_ATTENTION,
+    GROUP_DIVISOR,
+    GROUP_WORLD,
+    LayoutSupport,
+    ModuleSupport,
+    PHASE_DECODE,
+    PHASE_PREFILL,
+    RESIDENCY_RESIDENT,
+    RESIDENCY_STREAMED,
+    SCHEME_DP,
+    SCHEME_EP,
+    SCHEME_TP,
+)
 
 
 def _replace_param(root_module, dotted_name, tensor):
@@ -201,6 +215,50 @@ def uniform_expert_assignment(
 
 class KimiLinearParallelStrategyManager:
     """Parallel Strategy Manager for Kimi-Linear (KDA + NoPE-MLA hybrid)."""
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name. Attention
+    # is replicated at group size 1 and head-parallel over the attention group
+    # otherwise; the MoE follows the planner-resolved mode (``streamed``,
+    # ``streamed_sp8`` on the TP8 group, ``resident_ep`` over the world).
+    SUPPORTED_LAYOUTS = {
+        PHASE_PREFILL: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT, RESIDENCY_STREAMED)),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), 8),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_STREAMED,), GROUP_ATTENTION),
+            ),
+        ),
+        PHASE_DECODE: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), GROUP_DIVISOR),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+            ),
+        ),
+    }
 
     def __init__(
         self,
@@ -460,10 +518,12 @@ class KimiLinearParallelStrategyManager:
         they bake lives at fixed addresses (``_resident_ep_arena``), and the
         KV pool is remapped at its reserved addresses by the worker.
         """
-        return bool(
-            self._instances_are_reused
-            and self._decode_graph_mode() in ("graph", "compare")
-        )
+        graph = getattr(self, "_decode_graph", None)
+        # The mode in force, not only the planner's: under the server debug
+        # state ``kimi_decode_graph_mode: eager`` nothing is captured, so the
+        # kept instance owns no graphs and the startup capture expects none.
+        mode = self._decode_graph_mode() if graph is None else graph.capture_mode()
+        return bool(self._instances_are_reused and mode in ("graph", "compare"))
 
     def release_decode_routed_experts(self):
         """Return the resident EP shard's HBM; its addresses stay reserved.
@@ -1466,7 +1526,7 @@ class KimiLinearParallelStrategyManager:
 
     def _check_late_deepgemm_compiles(self, where):
         """Log the DeepGEMM kernels compiled since readiness;
-        ``batchgen_debug.k3_triton_strict`` makes it raise."""
+        ``debug_state.k3_triton_strict`` makes it raise."""
         if not torch.cuda.is_available():
             return
         from .triton_prewarm import check_late_deepgemm_compiles
@@ -1662,7 +1722,7 @@ class KimiLinearParallelStrategyManager:
             return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
-        # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
+        # debug_state.kimi_decode_graph_mode can switch graph/compare/eager
         # on a live server — the project's debug-flag policy (cf.
         # glm5_moe_mode), instead of a cold restart per experiment. The
         # ladder is captured by the first prewarm in a captured mode, so
@@ -2653,11 +2713,13 @@ class KimiLinearParallelStrategyManager:
         across groups), plain DP at G == 1; resident in decode always, and in
         prefill unless the planner streams all modules (K3 at G == 1 — a
         streamed prefill with G > 1 is refused at construction). MoE: the
-        planner-resolved modes map to the vocabulary — ``streamed`` and
-        ``streamed_sp8`` both run every expert replicated per rank with the
-        weights streamed from host (SP8 only changes the transport to
-        shard-and-all-gather), and ``resident_ep`` partitions the experts
-        over the world with the shard resident. An unknown mode fails by
+        planner-resolved modes map to the vocabulary — ``streamed`` runs every
+        expert replicated per rank with the weights streamed from host;
+        ``streamed_sp8`` partitions the routed experts over the ranks of one
+        attention group (each rank streams its share and the group exchanges
+        activations), so it is an expert-parallel group of that size with
+        streamed weights; and ``resident_ep`` partitions the experts over the
+        world with the shard resident. An unknown mode fails by
         name rather than declaring something untrue.
         """
         from batchgen.parallel_declaration import (
@@ -2679,8 +2741,12 @@ class KimiLinearParallelStrategyManager:
         attn_group = G if G > 1 else 1
 
         def _moe_slot(mode: str, phase: str) -> ModuleParallelism:
-            if mode in ("streamed", "streamed_sp8"):
+            if mode == "streamed":
                 return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
+            if mode == "streamed_sp8":
+                return ModuleParallelism(
+                    SCHEME_EP, RESIDENCY_STREAMED, group_size=G
+                )
             if mode == "resident_ep":
                 return ModuleParallelism(
                     SCHEME_EP, RESIDENCY_RESIDENT, group_size=self.world_size

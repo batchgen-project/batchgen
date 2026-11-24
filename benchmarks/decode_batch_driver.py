@@ -4,7 +4,7 @@
 usage:
   python3 scripts/decode_batch_driver.py --name RUN --input WORKLOAD.jsonl \
       --workload-manifest WORKLOAD.manifest.json --out-dir DIR \
-      [--base-url http://127.0.0.1:11710] [--debug '{"k3_decode_profile_steps": 5}'] \
+      [--base-url http://127.0.0.1:11710] [--debug '{"decode_profile_steps": 5}'] \
       [--mode batch-api|concurrent-chat] [--prefill-peak]
 
 Modes:
@@ -72,6 +72,36 @@ def curl(args: list[str]) -> str:
 
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+DEBUG_STATE_URL = "/v1/admin/debug-state"
+
+
+def post_debug_state(base_url: str, body: dict[str, Any]) -> dict[str, Any]:
+    """POST a change of the server's debug state; raises when it is refused."""
+    answer = json.loads(curl([
+        "-X", "POST", base_url + DEBUG_STATE_URL,
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(body),
+    ]))
+    if "generation" not in answer:
+        raise RuntimeError(f"debug state refused: {json.dumps(answer)[:400]}")
+    return answer
+
+
+def set_debug_state(base_url: str, debug: dict[str, Any], rewarm: bool) -> dict[str, Any]:
+    """Set ``debug`` on the server and return the change that undoes it.
+
+    Debug switches belong to the server, not to a batch: they are set before
+    the batch is submitted and hold until they are changed back.
+    """
+    before = json.loads(curl([base_url + DEBUG_STATE_URL])).get("values", {})
+    post_debug_state(base_url, {"set": debug, "rewarm": rewarm})
+    return {
+        "set": {key: before[key] for key in debug if key in before},
+        "clear": [key for key in debug if key not in before],
+        "rewarm": rewarm,
+    }
 
 
 def read_rows(path: Path) -> list[dict[str, Any]]:
@@ -258,8 +288,18 @@ def main_batch_api(args: argparse.Namespace, manifest: dict[str, Any], debug: di
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
     body = {"input_file_id": uploaded["id"], "endpoint": CHAT_URL, "completion_window": "24h"}
-    if debug:
-        body["batchgen_debug"] = debug
+    restore = set_debug_state(args.base_url, debug, args.debug_rewarm) if debug else None
+    try:
+        return run_batch(args, manifest, debug, body)
+    finally:
+        if restore is not None:
+            post_debug_state(args.base_url, restore)
+
+
+def run_batch(
+    args: argparse.Namespace, manifest: dict[str, Any], debug: dict[str, Any] | None,
+    body: dict[str, Any],
+) -> int:
     start = time.perf_counter()
     created = json.loads(curl([
         "-X", "POST", args.base_url + "/v1/batches",
@@ -305,7 +345,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:11710")
     parser.add_argument("--mode", choices=MODES, default="batch-api")
-    parser.add_argument("--debug", default="", help="batch-level batchgen_debug JSON object (batch-api only)")
+    parser.add_argument(
+        "--debug", default="",
+        help="JSON object of server debug-state keys (batch-api only): set through "
+             "POST /v1/admin/debug-state before the batch and changed back after it. "
+             "A run under a debug state is not an official result.",
+    )
+    parser.add_argument(
+        "--debug-rewarm", action="store_true",
+        help="Allow --debug keys that are baked into captured graphs: the server "
+             "restarts its worker pool under them (and again when they are changed back).",
+    )
     parser.add_argument(
         "--prefill-peak", action="store_true",
         help="Cap every row at 1 completion token (pure-prefill side channel), identically for every engine.",
@@ -330,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"REFUSED {args.name}: --arrival-order-seed applies to concurrent-chat; the Batch API takes the file as is")
         return 2
     if args.mode == "concurrent-chat" and debug:
-        log(f"REFUSED {args.name}: --debug is a batch-level Batch API flag; concurrent-chat has no batch")
+        log(f"REFUSED {args.name}: --debug sets BatchGen's server debug state; concurrent-chat targets other engines")
         return 2
     args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.mode == "concurrent-chat":
