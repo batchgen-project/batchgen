@@ -1,4 +1,4 @@
-"""``batchgen_debug.prefix_pool_dump_kernel_args``: the dump and its schema.
+"""``debug_state.prefix_pool_dump_kernel_args``: the dump and its schema.
 
 The probe records, at the one seam where the pooled prefill both writes the
 pool and reads it back (``pool_prefill_attention``), the kernel arguments plus

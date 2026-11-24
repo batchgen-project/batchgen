@@ -18,7 +18,6 @@ import torch.distributed as dist
 
 from batchgen.lifespan import SeqEvent
 from batchgen.sequence import SequenceStatus
-from batchgen.worker.admission.boundary_executor import _trajectory_slot
 from batchgen.worker.boundary import (
     BoundaryDecisions,
     BoundaryHandler,
@@ -26,6 +25,20 @@ from batchgen.worker.boundary import (
 )
 from batchgen.worker.decode import reduce_decode_capacity_snapshot
 from batchgen.worker.kv_capacity_engine import KVCapacityEngine
+
+
+def _trajectory_slot(ctx, seq) -> int:
+    if ctx.sched.trajectories.trajectory_book is None:
+        raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
+    try:
+        # Slot numbers are local to a node's allocator, so the same UUID holds
+        # different slots on different nodes; never trust the process-global
+        # ``_buffer_slot`` field (last set on another node) as the lookup key.
+        return ctx.sched.trajectories.slot_for(seq.uuid)
+    except KeyError as exc:
+        raise RuntimeError(
+            f"sequence {seq.uuid} has no active trajectory reservation"
+        ) from exc
 
 
 def _sync_trajectory_metadata(ctx, seq, state) -> None:

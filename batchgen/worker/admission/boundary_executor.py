@@ -22,6 +22,7 @@ import torch.distributed as dist
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.lifespan import SeqEvent
 from batchgen.sequence import SequenceStatus
+from batchgen.worker.admission.boundary_planner import _trajectory_slot
 from batchgen.worker.admission.plan import (
     StatusEdge,
     Transition,
@@ -55,17 +56,6 @@ def _index_request(ctx) -> IndexLookupRequest:
         uuid_to_local=ctx.sched.seq_table.uuid_to_local,
         global_batch=ctx.sched.pool,
     )
-
-
-def _trajectory_slot(ctx, seq) -> int:
-    if ctx.sched.trajectories.trajectory_book is None:
-        raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
-    try:
-        return ctx.sched.trajectories.slot_for(seq.uuid)
-    except KeyError as exc:
-        raise RuntimeError(
-            f"sequence {seq.uuid} has no active trajectory reservation"
-        ) from exc
 
 
 class BoundaryExecutor:

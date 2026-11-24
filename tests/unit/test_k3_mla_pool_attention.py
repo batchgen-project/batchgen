@@ -151,7 +151,7 @@ class FakeAttnWrapperBase:
     prefill_pool = None
     prefill_pool_batch = None
     prefill_pool_row_starts = None
-    # Batch-level batchgen_debug.prefix_pool_offload_check installs a recorder
+    # Server-level debug_state.prefix_pool_offload_check installs a recorder
     # here; None is the production default and the only state the offload path
     # needs to stay free of the check.
     prefill_pool_offload_recorder = None

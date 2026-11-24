@@ -1,4 +1,4 @@
-"""``batchgen_debug.prefix_pool_pad_poison``: what a row's pad columns hold.
+"""``debug_state.prefix_pool_pad_poison``: what a row's pad columns hold.
 
 A chunk's page table is one rectangle, so every row shorter than the widest is
 padded. The pad value is 0 - a REAL pool page, normally the one holding the

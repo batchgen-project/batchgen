@@ -44,9 +44,10 @@ That is enough to decide, from one armed run, between:
 
 Off by default and nothing in this module runs.
 
-Arming (batch level, no env var, no cold restart)::
+Arming (server debug state, no env var, no cold restart)::
 
-    {"batchgen_debug": {"prefix_pool_epilogue_trace": true}}
+    POST /v1/admin/debug-state
+    {"set": {"prefix_pool_epilogue_trace": true}}
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ from typing import Optional, Sequence
 
 from batchgen.prefix_reuse.probe_guard import probe_safe
 
-# Batch-level ``batchgen_debug`` keys.
+# Server debug-state keys.
 DEBUG_FLAG = "prefix_pool_epilogue_trace"
 # Optional companion: a token id whose first-token logit every row reports, so
 # a run can ask "how far was the reference's first token from winning here".
@@ -218,7 +219,7 @@ PATHS = ("pool", "unpooled")
 def tracer_from_debug(debug, *, rank: int, path: str):
     """The armed tracer for one prefill, or None. Shared by both prefill paths.
 
-    The pooled wave and the unpooled prefill read the SAME batch-level keys,
+    The pooled wave and the unpooled prefill read the SAME debug-state keys,
     so one armed batch traces whichever path actually runs; ``path`` tags
     every line it emits.
     """

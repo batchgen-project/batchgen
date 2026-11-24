@@ -163,9 +163,11 @@ For GLM-5, a DeepGEMM kernel compiled after the prewarm is reported at the next 
 switch as `[GLM5_DEEPGEMM_WARMUP] ... DeepGEMM compiled N kernels after the prewarm`.
 
 **Fix:** Report the line. To make such a compile fail instead (acceptance runs only,
-never in production), create the batch with `"batchgen_debug": {"k3_triton_strict": true}`
-for Kimi-K3 or `"batchgen_debug": {"glm5_triton_strict": true}` for GLM-5. The error is
-raised inside the model forward, so it stops the worker pool, not only that batch.
+never in production), set the server debug-state key `k3_triton_strict` for Kimi-K3 or
+`glm5_triton_strict` for GLM-5 before submitting:
+`POST /v1/admin/debug-state` with `{"set": {"k3_triton_strict": true}}` (see
+[Debug state](server-flags.md#debug-state)). The error is raised inside the model
+forward, so it stops the worker pool, not only one batch.
 
 ---
 

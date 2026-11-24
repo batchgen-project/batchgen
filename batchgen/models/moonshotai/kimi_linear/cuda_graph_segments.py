@@ -98,7 +98,7 @@ static outputs the driver appends to the auxiliary Host region after replay.
 
 Mode is planner/config-driven (`Basic_Config.decode_graph_mode`, default
 "eager") with a batch-level override through
-`batchgen_debug.kimi_decode_graph_mode` = "graph" | "eager" | "compare"
+`debug_state.kimi_decode_graph_mode` = "graph" | "eager" | "compare"
 (glm5_moe_mode precedent). No env vars, new or old.
 """
 
@@ -1285,6 +1285,14 @@ class KimiLinearDecodeGraph:
         torch.cuda.synchronize(device)
         dist.barrier()
 
+    def capture_mode(self) -> str:
+        """The mode in force: the server debug state's
+        ``kimi_decode_graph_mode`` when it is set, else the planner's mode.
+
+        The one answer for the capture, for every replay, and for whether the
+        manager's kept decode instance owns graphs at all."""
+        return _debug_mode() or self.mode
+
     def prewarm_decode_graphs(self) -> bool:
         """Capture this adapter's whole decode graph ladder, once.
 
@@ -1308,7 +1316,7 @@ class KimiLinearDecodeGraph:
         captures' EP-world collectives match across the cohort. Returns
         whether a captured ladder is in place.
         """
-        mode = _debug_mode() or self.mode
+        mode = self.capture_mode()
         if mode == "eager":
             return False
         if AttnWrapperBase.phase != "decode":
@@ -1418,7 +1426,7 @@ class KimiLinearDecodeGraph:
         self._whole_step_active = False
         if AttnWrapperBase.phase != "decode":
             return
-        mode = _debug_mode() or self.mode
+        mode = self.capture_mode()
         if mode == "eager":
             return
         if not self._ladder_captured:

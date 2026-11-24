@@ -116,7 +116,7 @@ for f in ${CHANGED_PROD[@]+"${CHANGED_PROD[@]}"}; do
     | awk '/^\+\+\+/{next} /^\+/{print}' | grep -vF 'noqa: hygiene' || true)"
   [[ -z "$added" ]] && continue
   if printf '%s\n' "$added" | grep -Eq '(environ\.get|getenv)\([^)]*BATCHGEN_'; then
-    warn "§1.3 new BATCHGEN_* env guard in production code — use a batchgen_debug batch flag: $f"
+    warn "§1.3 new BATCHGEN_* env guard in production code — use a server debug-state key: $f"
   fi
   if printf '%s\n' "$added" | grep -Eq '^\+[[:space:]]*print\('; then
     warn "§1.4 new print() in production path — use a one-shot guarded logger: $f"

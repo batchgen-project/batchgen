@@ -100,10 +100,10 @@ def _load_create_batch_handler():
         "build_batch_object_from_create_request": (
             lambda **kwargs: SimpleNamespace(**kwargs)
         ),
-        # The real refusal of retired batchgen_debug keys (io_struct); these
+        # The real refusal of debug switches on a request (io_struct); these
         # scenarios send none, so it answers None.
-        "retired_batchgen_debug_error": (
-            _load_io_struct_module().retired_batchgen_debug_error
+        "batchgen_debug_refusal": (
+            _load_io_struct_module().batchgen_debug_refusal
         ),
     }
     module = ast.Module(body=[node], type_ignores=[])

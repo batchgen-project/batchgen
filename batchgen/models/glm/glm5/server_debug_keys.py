@@ -1,0 +1,51 @@
+"""Server-level debug keys read by GLM-5 code (see ``batchgen/server_debug_state.py``)."""
+from batchgen.server_debug_state import (
+    TIER_REWARM, key, parse_bool, parse_choice, parse_int, parse_layer_list, parse_number,
+    parse_object,
+)
+
+DEBUG_KEYS = (
+    key("glm5_triton_strict", "glm5", "both", parse_bool,
+         "raise on a GLM-5 kernel compile after readiness"),
+    key("glm5_dispatch_trace", "glm5", "decode", parse_bool,
+         "log the decode dispatch path"),
+    key("glm5_moe_router_mode", "glm5", "both", parse_choice("custom", "cublas"),
+         "MoE router GEMM implementation"),
+    key("prefill_grouped_gemm", "glm5", "prefill", parse_choice("deepgemm", "cute_ptrs"),
+         "grouped-GEMM backend of prefill"),
+    key("prefill_s1_act_quant", "glm5", "prefill", parse_choice("fused", "unfused"),
+         "activation-quantisation form of the first prefill GEMM"),
+    key("glm5_lmhead_fp32", "glm5", "prefill", parse_bool,
+         "compute the prefill LM head in fp32"),
+    key("glm5_prefill_nsys_profile", "glm5", "prefill", parse_bool,
+         "bracket prefill with the CUDA profiler start/stop"),
+    key("glm5_graph_path_log", "glm5", "decode", parse_bool,
+         "log whether a decode step ran from a captured graph"),
+    key("glm5_whole_model_graph_compare", "glm5", "decode", parse_bool,
+         "re-run each graph step eagerly and compare"),
+    key("glm5_whole_model_graph_timing", "glm5", "decode", parse_bool,
+         "time graph steps from outside the graph"),
+    key("glm5_whole_model_graph_compare_fail", "glm5", "decode", parse_bool,
+         "raise when the graph/eager comparison mismatches"),
+    key("glm5_whole_model_graph_compare_atol", "glm5", "decode", parse_number(minimum=0.0),
+         "absolute tolerance of the graph/eager comparison"),
+    key("glm5_whole_model_graph_compare_rtol", "glm5", "decode", parse_number(minimum=0.0),
+         "relative tolerance of the graph/eager comparison"),
+    key("glm5_moe_tilem_avg", "glm5", "decode", parse_int(minimum=1),
+         "tile-M override of the ragged MoE GEMM; a capture constant",
+         tier=TIER_REWARM),
+    key("glm52_recv_count_hist", "glm5", "decode", parse_bool,
+         "accumulate the received-token histogram; adds graph nodes",
+         tier=TIER_REWARM),
+    key("glm5_whole_model_graph_probe_layers", "glm5", "decode", parse_layer_list,
+         "layers whose outputs the captured graph exposes",
+         tier=TIER_REWARM),
+    key("glm5_criticality_probe", "glm5", "decode", parse_object,
+         "inject delays at named sites; part of the graph signature",
+         tier=TIER_REWARM),
+)
+
+RETIRED_DEBUG_KEYS = {
+    "glm5_dsa_mode": "it selected nothing (it was only echoed into a log line)",
+    "glm5_moe_mode": "it selected nothing (it was only echoed into a log line)",
+}

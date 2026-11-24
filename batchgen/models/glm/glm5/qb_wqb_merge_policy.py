@@ -32,7 +32,7 @@ are never merged; their segment keeps the plain q_b GEMM either way.
 The switch is a module-level constant on purpose:
 
   * The decode graphs are captured once per server lifetime, so the choice has
-    to be fixed before capture -- a batch-level ``batchgen_debug`` flag cannot
+    to be fixed before capture -- a debug-state key, adopted at a phase entry, cannot
     express it.
   * Repo policy forbids a ``BATCHGEN_*`` env guard for model behaviour.
 

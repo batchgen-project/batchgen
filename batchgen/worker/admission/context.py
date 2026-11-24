@@ -23,6 +23,7 @@ class RankFacts:
     prefix_cache_debug_stats: bool = False
     kv_stats_native: bool = False
     kv_stats_compare: bool = False
+    shared_prefix_admission: bool = True
 
 
 @dataclass(frozen=True)

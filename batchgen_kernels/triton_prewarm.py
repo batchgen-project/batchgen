@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_TAG = "[TRITON_PREWARM]"
 
-# Batch-level ``batchgen_debug`` keys that turn a late compile into an error.
+# Server debug-state keys that turn a late compile into an error.
 DEFAULT_STRICT_KEYS = ("triton_strict",)
 
 # A post-compile hook that fires this long after the cache hook is counted as
@@ -197,7 +197,7 @@ class LateCompileGuard:
             return "a guard armed strict"
         key = strict_key(self._debug_source(), self.strict_keys)
         if key is not None:
-            return f"batchgen_debug.{key}"
+            return f"debug_state.{key}"
         return "strict mode"
 
 

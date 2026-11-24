@@ -83,6 +83,17 @@ DELEGATED_ENGINES = (
     (PREFILL_ENGINE_SOURCE, PREFILL_ENGINE_CLASS),
     (GRAPH_RUNTIME_SOURCE, GRAPH_RUNTIME_CLASS),
 )
+DECODE_ENTRY_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "admission"
+    / "decode_entry.py"
+)
+# Admission modules whose MODULE-LEVEL helpers hold worker method bodies in
+# the frozen-context shape ``(ctx, ...)``. The worker keeps a same-name
+# delegator for each, exactly like the class-based engines above.
+DELEGATED_CONTEXT_MODULES = (DECODE_ENTRY_SOURCE,)
 
 
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
@@ -126,6 +137,7 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.facts.prefix_cache_debug_stats": "self.prefix_cache_debug_stats",
         "ctx.facts.kv_stats_native": "self._kv_stats_native",
         "ctx.facts.kv_stats_compare": "self._kv_stats_compare",
+        "ctx.facts.shared_prefix_admission": "self.shared_prefix_admission",
         "ctx.parallel_manager": "self.parallel_manager",
     }
     if text == "ctx.facts.attn_tp_size":
@@ -190,17 +202,36 @@ class _ContextToWorker(ast.NodeTransformer):
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Call)
             and isinstance(node.func.value.func, ast.Name)
-            and node.func.value.func.id == "StepObservabilityEngine"
+            and node.func.value.func.id
+            in {"StepObservabilityEngine", "KVCapacityEngine"}
             and node.args
             and isinstance(node.args[0], ast.Name)
             and node.args[0].id == "ctx"
         ):
-            # A cross-engine observability call made with the same context;
-            # the worker spelling is the worker's same-name delegator.
+            # A cross-engine call made with the same context; the worker
+            # spelling is the worker's same-name delegator.
             return ast.Call(
                 func=ast.Attribute(
                     value=ast.Name(id="self", ctx=ast.Load()),
                     attr=node.func.attr,
+                    ctx=ast.Load(),
+                ),
+                args=node.args[1:],
+                keywords=node.keywords,
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _context_module_function_names()
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "ctx"
+        ):
+            # A sibling context helper of the same admission module; the
+            # worker spelling is the worker's same-name delegator.
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=node.func.id,
                     ctx=ast.Load(),
                 ),
                 args=node.args[1:],
@@ -301,6 +332,19 @@ def load_worker_functions(
     return loaded
 
 
+# What the worker's delegators pass to the engine besides their own arguments:
+# launch parameters, which the engine takes as values instead of reading the
+# worker's args. A fake sets ``worker.args`` the way a server's launch does.
+PREFILL_ENGINE_DELEGATOR_KWARGS = {
+    "_prefix_rank_packing_mode": lambda worker: {
+        "mode": worker.args.prefix_rank_assignment_mode
+    },
+    "_prefix_rank_cost_profile_disabled": lambda worker: {
+        "value": worker.args.prefix_rank_cost_profile
+    },
+}
+
+
 def load_prefill_engine_methods(
     names: Iterable[str],
     namespace: Dict[str, Any],
@@ -339,7 +383,12 @@ def load_prefill_engine_methods(
         exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
         engine_method = scope[node.name]
 
-        def worker_method(worker, *args, _engine_method=engine_method, **kwargs):
+        def worker_method(
+            worker, *args, _engine_method=engine_method, _name=node.name, **kwargs
+        ):
+            extra = PREFILL_ENGINE_DELEGATOR_KWARGS.get(_name)
+            if extra is not None:
+                kwargs = {**extra(worker), **kwargs}
             return _engine_method(None, worker, *args, **kwargs)
 
         loaded[node.name] = worker_method
@@ -383,6 +432,17 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         and isinstance(stmt.value, ast.Name)
         and stmt.value.id == "worker"
     ]
+    if not rebinds:
+        # The rebinding exists to keep a moved body's ``self.`` spellings. A
+        # body that never names ``self`` reads nothing from the worker (it is
+        # a function of its arguments), needs no rebinding, and an unused one
+        # is a lint finding.
+        named = [n for n in ast.walk(method) if isinstance(n, ast.Name) and n.id == "self"]
+        if named:
+            raise AssertionError(
+                f"{node.name}: names `self` without the `self = worker` rebinding"
+            )
+        return method
     if len(rebinds) != 1:
         raise AssertionError(f"{node.name}: expected one `self = worker`, found {len(rebinds)}")
     del method.body[rebinds[0]]
@@ -399,6 +459,51 @@ def _class_methods(path: pathlib.Path, class_name: str) -> Dict[str, ast.Functio
         node.name: node for node in cls.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def _module_level_functions(path: pathlib.Path) -> Dict[str, ast.FunctionDef]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _is_context_function_shape(node: ast.FunctionDef) -> bool:
+    args = node.args.args
+    return len(args) >= 1 and args[0].arg == "ctx"
+
+
+def _context_module_function_names() -> set:
+    names: set = set()
+    for source in DELEGATED_CONTEXT_MODULES:
+        names |= {
+            name for name, node in _module_level_functions(source).items()
+            if _is_context_function_shape(node)
+        }
+    return names
+
+
+def context_function_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
+    """Convert a module-level helper ``(ctx, ...)`` to the worker's shape.
+
+    The admission context helpers take the frozen context first; their context
+    paths map back to the worker spelling exactly as the AS3.1 engine methods
+    do, and the signature of record is the worker's same-name delegator.
+    """
+    method = copy.deepcopy(node)
+    args = method.args.args
+    if not args or args[0].arg != "ctx":
+        raise AssertionError(f"{node.name} is not a context function (ctx, ...)")
+    method.body = _ContextToWorker().visit(method).body
+    worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
+    if worker_method is None:
+        raise AssertionError(
+            f"{WORKER_CLASS} keeps no same-name delegator for {node.name}"
+        )
+    method.args = copy.deepcopy(worker_method.args)
+    ast.fix_missing_locations(method)
+    return method
 
 
 def rank_sync_method_names() -> set:
@@ -424,6 +529,10 @@ def worker_shaped_method_node(name: str) -> ast.FunctionDef:
         engine = _class_methods(source, class_name)
         if name in engine and _is_delegator_shape(engine[name]):
             return engine_method_as_worker_method(engine[name])
+    for source in DELEGATED_CONTEXT_MODULES:
+        functions = _module_level_functions(source)
+        if name in functions and _is_context_function_shape(functions[name]):
+            return context_function_as_worker_method(functions[name])
     worker = _class_methods(WORKER_SOURCE, WORKER_CLASS)
     if name not in worker:
         raise AssertionError(f"{WORKER_CLASS} has no method {name}")
@@ -442,6 +551,10 @@ def delegated_method_source(name: str) -> str:
         engine = _class_methods(source, class_name)
         if name in engine and _is_delegator_shape(engine[name]):
             return ast.get_source_segment(source.read_text(), engine[name])
+    for source in DELEGATED_CONTEXT_MODULES:
+        functions = _module_level_functions(source)
+        if name in functions and _is_context_function_shape(functions[name]):
+            return ast.get_source_segment(source.read_text(), functions[name])
     raise KeyError(f"{name} is not a delegated engine method")
 
 
@@ -453,6 +566,7 @@ def delegated_method_names() -> set:
             name for name, node in _class_methods(source, class_name).items()
             if _is_delegator_shape(node)
         }
+    names |= _context_module_function_names()
     return names
 
 

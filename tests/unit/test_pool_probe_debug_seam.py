@@ -5,15 +5,15 @@
 # ---------------------------------------------------------------------------- #
 """The pooled-prefill probe seam: free when off, honest about the gather.
 
-Four diagnostics ride the same batch-level ``batchgen_debug`` seam - the
-epilogue trace, the Host offload byte check, the kernel-argument dump and the
-pad-poison probe. Two properties of that seam are load-bearing and neither is
-visible from a probe's own unit tests:
+Four diagnostics are armed through the server's debug state, as the wave
+adopted it - the epilogue trace, the Host offload byte check, the
+kernel-argument dump and the pad-poison probe. Two properties of that seam are
+load-bearing and neither is visible from a probe's own unit tests:
 
 1. OFF IS FREE. A production prefill arms none of them, so deciding that must
-   not build a list of sequences, build a merged debug dict, or import a probe
-   module - and it must walk the wave's sequences ONCE for all four probes, not
-   once each. This file counts the walk and counts the imports.
+   not look a key up, build a dict, or import a probe module - and an armed
+   state is read ONCE per wave for all four probes, not once each. This file
+   counts the key reads and counts the imports.
 
 2. THE GATHER RECORD IS NOT HAND-WRITTEN WHERE IT COULD BE WRONG. The trace
    line carries ``tp=<rank>/<size>`` and an owned mask. Writing ``0/1, owned``
@@ -131,26 +131,27 @@ for _name in _ENGINE_METHODS:
 # --------------------------------------------------------------------------- #
 #  A fake worker and wave: only what the seam reads
 # --------------------------------------------------------------------------- #
-class _GlobalBatch:
-    """Counts every sequence lookup, which is what "walked once" means."""
+class _Reads:
+    """A debug dict that counts how many times a key is looked up in it."""
 
-    def __init__(self, sequences):
-        self._sequences = sequences
+    def __init__(self, values):
+        self._values = dict(values)
         self.lookups = 0
 
-    def get_sequence(self, uuid):
+    def __bool__(self):
+        return bool(self._values)
+
+    def get(self, key, default=None):
         self.lookups += 1
-        return self._sequences[uuid]
+        return self._values.get(key, default)
 
 
 class _Worker:
-    def __init__(self, debug_by_uuid, *, server_debug=None, rank=3):
+    """``debug`` is the server's debug state as the wave adopted it."""
+
+    def __init__(self, debug=None, *, rank=3):
         self.rank = rank
-        self._batchgen_debug = server_debug
-        self.global_batch = _GlobalBatch({
-            uuid: SimpleNamespace(batchgen_debug=debug)
-            for uuid, debug in debug_by_uuid.items()
-        })
+        self._phase_prefill_debug = _Reads(debug or {})
 
     for _name in _SEAM:
         locals()[_name] = _NAMESPACE[_name]
@@ -203,27 +204,25 @@ _EIGHT = tuple(f"u{index}" for index in range(8))
 # --------------------------------------------------------------------------- #
 #  (1) Off is free
 # --------------------------------------------------------------------------- #
-def test_a_wave_that_armed_nothing_walks_its_sequences_once_and_imports_nothing():
-    worker = _Worker({uuid: None for uuid in _EIGHT})
+def test_a_wave_under_an_empty_debug_state_reads_no_key_and_imports_nothing():
+    worker = _Worker()
     wave = _wave(_EIGHT)
 
     results, imported = _with_import_log(lambda: _setups(worker, wave))
 
     assert results == (None, False, None, None)
-    # ONE pass over the eight members for all four probes, not four passes.
-    assert worker.global_batch.lookups == len(_EIGHT)
+    # An empty state is answered without looking any key up, for all four
+    # probes and however many sequences the wave has.
+    assert worker._phase_prefill_debug.lookups == 0
     assert imported == []
     # No dict was built for the answer: None IS the answer, and it is cached.
     assert wave.probe_debug is None and wave.probe_debug_read is True
 
 
 def test_unrelated_debug_keys_leave_every_pooled_probe_off():
-    """A batch debugging something else must not arm a pooled probe."""
+    """A server debugging something else must not arm a pooled probe."""
 
-    worker = _Worker({
-        uuid: {"glm5_dispatch_trace": True, "k3_prefill_profile": 1}
-        for uuid in _EIGHT
-    })
+    worker = _Worker({"glm5_dispatch_trace": True, "k3_prefill_profile": True})
     wave = _wave(_EIGHT)
 
     results, imported = _with_import_log(lambda: _setups(worker, wave))
@@ -234,25 +233,25 @@ def test_unrelated_debug_keys_leave_every_pooled_probe_off():
 
 
 def test_the_cached_answer_is_read_once_however_many_probes_ask():
-    worker = _Worker({
-        uuid: ({"prefix_pool_offload_check": True} if uuid == "u5" else None)
-        for uuid in _EIGHT
-    })
+    worker = _Worker({"prefix_pool_offload_check": True})
     wave = _wave(_EIGHT)
 
     _setups(worker, wave)
-    after_first_pass = worker.global_batch.lookups
+    after_first_pass = worker._phase_prefill_debug.lookups
     _setups(worker, wave)
 
-    assert after_first_pass == len(_EIGHT)
-    assert worker.global_batch.lookups == len(_EIGHT), "the wave was re-walked"
+    assert after_first_pass == len(_PROBE_KEYS)
+    assert worker._phase_prefill_debug.lookups == after_first_pass, (
+        "the debug state was re-read for the same wave"
+    )
     assert wave.probe_debug == {"prefix_pool_offload_check": True}
 
 
-def test_only_the_pooled_probe_keys_are_kept_and_the_first_member_wins():
+def test_only_the_pooled_probe_keys_are_kept():
     worker = _Worker({
-        "u0": {"prefix_pool_pad_poison": True, "glm5_dispatch_trace": True},
-        "u1": {"prefix_pool_pad_poison": False, "prefix_pool_dump_dir": "/d"},
+        "prefix_pool_pad_poison": True,
+        "prefix_pool_dump_dir": "/d",
+        "glm5_dispatch_trace": True,
     })
     wave = _wave(("u0", "u1"))
 
@@ -262,22 +261,10 @@ def test_only_the_pooled_probe_keys_are_kept_and_the_first_member_wins():
     assert worker._pool_pad_poison_enabled(wave) is True
 
 
-def test_the_server_level_debug_wins_outright_and_reads_no_sequence():
-    worker = _Worker(
-        {uuid: None for uuid in _EIGHT},
-        server_debug={"prefix_pool_pad_poison": "on", "unrelated": 1},
-    )
-    wave = _wave(_EIGHT)
-
-    assert worker._pool_probe_debug(wave) == {"prefix_pool_pad_poison": "on"}
-    assert worker.global_batch.lookups == 0
-    assert worker._pool_pad_poison_enabled(wave) is True
-
-
 def test_a_malformed_probe_flag_costs_the_probe_and_not_the_prefill(caplog):
     """The parse refuses the value; the prefill still gets its tracer slot."""
 
-    worker = _Worker({"u0": {"prefix_pool_epilogue_trace": "maybe"}})
+    worker = _Worker({"prefix_pool_epilogue_trace": "maybe"})
     wave = _wave(("u0",))
 
     with caplog.at_level(logging.WARNING):
