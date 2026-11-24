@@ -139,6 +139,20 @@ name at startup; a model without prefill MoE modes refuses the flag.
 `resident_ep` cannot be combined with `--enable-prefix-cache`
 (`validate_server_args` refuses the pair by name).
 
+# Layout group sizes (`--<phase>-attention-tp`, `--<phase>-moe-ep`)
+
+`--prefill-attention-tp`, `--prefill-moe-ep`, `--decode-attention-tp` and
+`--decode-moe-ep` ask for the group sizes of the server's parallel layout:
+the ranks one attention shard group or one expert partition spans, per
+phase. Unset, a group size is the model's default for the machine. The four
+values travel parser -> `ServerArgs` -> worker arguments -> the model
+initializer's input arguments. The worker resolves the layout right after
+it builds the model manager and then checks every given flag against it: a
+flag is honoured or refused by name, never ignored
+(`parallel_declaration.check_requested_group_sizes`). A model family that
+consumes a flag validates it itself (Kimi-Linear runs one attention group
+for both phases, so its two attention flags must agree).
+
 # Debug state
 
 Debug switches are server-level (`batchgen/server_debug_state.py`; the registry is
