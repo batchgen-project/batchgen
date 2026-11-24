@@ -42,10 +42,19 @@ from batchgen.worker.admission.plan import (
     TransitionPlan,
     apply_or_raise,
 )
+from batchgen.worker.gpu_residency import GpuResidencySet
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+
+
+def _residency(*uuids):
+    """A seeded owner, exactly as the worker's allocation path builds one."""
+    owner = GpuResidencySet()
+    for uuid in uuids:
+        owner.mark_resident(uuid)
+    return owner
 
 
 def _isolated_worker_method(function_name, globals_=None):
@@ -389,7 +398,7 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
         global_batch=_Batch(),
         gpu_paged_kv_cache_manager=_Manager(),
         _uuid_to_local_map={"u": 3},
-        _sequences_with_gpu_kv={"u"},
+        _sequences_with_gpu_kv=_residency("u"),
         _sync_sequence_metadata=lambda uuids: None,
     )
     method = _isolated_worker_method(

@@ -64,6 +64,7 @@ from batchgen.worker.admission.context import (  # noqa: E402
     SchedulingState,
 )
 from batchgen.worker.admission.decode_entry import DecodeEntry  # noqa: E402
+from batchgen.worker.gpu_residency import GpuResidencySet  # noqa: E402
 from batchgen.worker.admission.plan import (  # noqa: E402
     StatusEdge,
     Transition,
@@ -210,7 +211,7 @@ def _context(monkeypatch, gpu, *, world_size=1, attn_tp_size=1):
         gpu_kv=gpu,
         host_view=None,
         core_engine=None,
-        gpu_resident=set(),
+        gpu_resident=GpuResidencySet(),
         prefix_coordinator=None,
         prefix_runtime=None,
         chunk_sizer=None,

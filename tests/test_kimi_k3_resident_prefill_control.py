@@ -10,9 +10,18 @@ from types import SimpleNamespace
 import pytest
 
 from batchgen.worker.admission.plan import StatusEdge
+from batchgen.worker.gpu_residency import GpuResidencySet
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _residency(*uuids):
+    """A seeded owner, exactly as the worker's allocation path builds one."""
+    owner = GpuResidencySet()
+    for uuid in uuids:
+        owner.mark_resident(uuid)
+    return owner
 
 
 def _function(path, class_name, function_name):
@@ -291,7 +300,7 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         rank=1,
         global_batch=batch,
         _uuid_to_local_map={"u": 0},
-        _sequences_with_gpu_kv=set(),
+        _sequences_with_gpu_kv=GpuResidencySet(),
         _response_queue=object(),
         _sync_sequence_metadata=lambda uuids: None,
         _gather_completed_tokens=lambda uuids: {"u": "<|sep|>"},
@@ -348,7 +357,7 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         rank=1,
         global_batch=batch,
         _uuid_to_local_map={"u": 0},
-        _sequences_with_gpu_kv={"u"},
+        _sequences_with_gpu_kv=_residency("u"),
         _response_queue=object(),
         _sync_sequence_metadata=lambda uuids: None,
         _gather_completed_tokens=lambda uuids: {"u": "<|sep|>"},

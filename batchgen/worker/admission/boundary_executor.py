@@ -192,7 +192,7 @@ class BoundaryExecutor:
                     seq.host_owned_pages = 0
                     seq.host_token_capacity = 0
                     seq.evicted_from_dp_group = None
-                    ctx.gpu_resident.discard(uuid)
+                    ctx.gpu_resident.drop(uuid)
 
             # Report completions (this is what pops local_map on the owner).
             # Must run LAST so the _release_*_pages calls above see the
@@ -328,7 +328,7 @@ class BoundaryExecutor:
                 seq.host_pages_allocated = 0
                 seq.host_owned_pages = 0
                 seq.host_token_capacity = 0
-                ctx.gpu_resident.discard(uuid)
+                ctx.gpu_resident.drop(uuid)
                 # Destroy the head-sharded KDA state the comment below relies
                 # on. Host eviction frees the sequence's pages but reached the
                 # group drop without releasing its state item, so the slot
@@ -503,7 +503,7 @@ class BoundaryExecutor:
                 if global_ids and gpu_manager:
                     gpu_manager.free_pages_for_sequences(global_ids)
                 for uuid in my_onhold:
-                    ctx.gpu_resident.discard(uuid)
+                    ctx.gpu_resident.drop(uuid)
 
             # All-ranks: scalar metadata must be kept consistent. Non-owners
             # MUST also zero gpu_pages_allocated; otherwise their stale value
@@ -595,7 +595,7 @@ class BoundaryExecutor:
                 if ext_failed_global and gpu_manager is not None:
                     gpu_manager.free_pages_for_sequences(ext_failed_global)
                 for uuid in my_remaining_ext:
-                    ctx.gpu_resident.discard(uuid)
+                    ctx.gpu_resident.drop(uuid)
 
             # All ranks: zero scalars and update status for ALL failed seqs
             # (remaining_needing_ext is the globally-consistent list).

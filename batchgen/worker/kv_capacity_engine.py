@@ -1954,7 +1954,7 @@ class KVCapacityEngine:
         # Track in set
         for local_idx in local_sequence_ids:
             uuid = self._local_to_uuid_map[local_idx]
-            self._sequences_with_gpu_kv.add(uuid)
+            self._sequences_with_gpu_kv.mark_resident(uuid)
     
         # Rebuild page table with ALL active sequences
         all_active_global_ids = []
@@ -2273,7 +2273,7 @@ class KVCapacityEngine:
         for local_idx in local_sequence_ids:
             uuid = ctx.sched.seq_table.local_to_uuid.get(local_idx)
             if uuid:
-                ctx.gpu_resident.discard(uuid)
+                ctx.gpu_resident.drop(uuid)
                 seq = ctx.sched.pool.get_sequence(uuid)
                 if seq is not None:
                     seq.gpu_pages_allocated = 0
@@ -3024,7 +3024,7 @@ class KVCapacityEngine:
             manager.destroy(empty_cuda_cache=empty_cuda_cache)
     
         # FIX Bug 2: Clear tracking set when GPU KV is destroyed
-        self._sequences_with_gpu_kv.clear()
+        self._sequences_with_gpu_kv.drop_all()
     
         # CRITICAL FIX: Reset GPU allocation state for ALL non-completed sequences
         # Without this, sequences retain stale had_initial_gpu_reservation=True,
@@ -3817,7 +3817,7 @@ class KVCapacityEngine:
                     # which sequence a row resolves to, so row-keyed state must
                     # be invalidated here and not only where `batch` is rebound.
                     self._bump_decode_row_epoch()
-                    self._sequences_with_gpu_kv.discard(uuid)
+                    self._sequences_with_gpu_kv.drop(uuid)
                     # Remove query_book entry
                     self.query_book.pop(local_idx, None)
                     logging.debug(
@@ -3940,7 +3940,7 @@ class KVCapacityEngine:
                 # Also remove from tracking set
                 for uuid in uuids:
                     if uuid in self._uuid_to_local_map:
-                        self._sequences_with_gpu_kv.discard(uuid)
+                        self._sequences_with_gpu_kv.drop(uuid)
 
         # Update sequence status and reset GPU allocation
         # NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
@@ -4108,7 +4108,7 @@ class KVCapacityEngine:
             seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
             # Mark that this sequence has received its initial GPU reservation
             seq.mark_initial_gpu_reservation_done()
-            ctx.gpu_resident.add(uuid)
+            ctx.gpu_resident.mark_resident(uuid)
             seq.validate_metadata(f"rank {ctx.facts.rank} _finalize_async_load_minimal")
             seq.log_event(SeqEvent.KV_LOAD_DONE, ctx.facts.rank,
                 f"gpu_pages={seq.gpu_pages_allocated}")
