@@ -92,6 +92,7 @@ METHODS = (
     "_trajectory_restore_payload",
     "_trajectory_group_geometry",
     "_decode_attn_tp_size",
+    "_prefill_attn_tp_size",
     "_prefill_pool_page_bytes",
     "_pool_pad_poison_enabled",
     "_new_pool_kernel_dump_recorder",

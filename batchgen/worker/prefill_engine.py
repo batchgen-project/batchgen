@@ -140,6 +140,7 @@ class PrefillEngine:
         compute_cached_tokens: List[int],
         *,
         token_cap: int,
+        attn_group_size: int,
     ) -> Tuple[List[Tuple[int, int]], int, bool]:
         """Build the one authoritative prepacked-forward plan for local rows.
 
@@ -179,7 +180,7 @@ class PrefillEngine:
                     "the model planner sets no prefill_prefix_pool_workspace_bytes"
                     ", so the temporary full-length KV cannot be bounded"
                 )
-            if self._decode_attn_tp_size() != 1:
+            if attn_group_size != 1:
                 raise RuntimeError(
                     "prefix-hit prefill splits micro-batches by a rank-local "
                     "budget, which a serve group of attn_tp_size>1 cannot share"
@@ -245,7 +246,7 @@ class PrefillEngine:
         )
         return len(micro_batches)
 
-    def _prefill_prefix_pool_enabled(self, worker) -> bool:
+    def _prefill_prefix_pool_enabled(self, worker, *, attn_group_size: int) -> bool:
         """In-wave prefix pool: prefix caching on, planner workspace set, pure DP prefill."""
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
@@ -271,7 +272,7 @@ class PrefillEngine:
             hasattr(self.parallel_manager, "prefill_uses_resident_ep")
             and self.parallel_manager.prefill_uses_resident_ep()
         ) or (
-            self._decode_attn_tp_size() != 1
+            attn_group_size != 1
             and not self._pool_prefill_group_safe()
         ):
             raise RuntimeError(
@@ -298,13 +299,13 @@ class PrefillEngine:
         )
         return declares is not None and bool(declares())
 
-    def _prefill_pool_group(self, worker):
+    def _prefill_pool_group(self, worker, *, attn_group_size: int):
         """The process group a pool wave must be identical over; None at G==1."""
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
         self = worker
-        if self._decode_attn_tp_size() <= 1:
+        if attn_group_size <= 1:
             return None
         group = getattr(self.parallel_manager, "attn_tp_group", None)
         if group is None:
@@ -369,7 +370,7 @@ class PrefillEngine:
             )
         return value == "off"
 
-    def _cached_prefix_rank_cost_profile(self, worker, disabled: bool = False):
+    def _cached_prefix_rank_cost_profile(self, worker, disabled: bool = False, *, attn_group_size: int):
         """This deployment's prefill executor cost profile, looked up once.
 
         Model, device properties and parallel layout are deployment constants,
@@ -399,7 +400,7 @@ class PrefillEngine:
         if key not in self._prefix_rank_cost_profiles:
             from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 
-            G = self._decode_attn_tp_size()
+            G = attn_group_size
             group_size = G if G > 1 else 1
             if key:
                 profile = None
@@ -1068,7 +1069,7 @@ class PrefillEngine:
             self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
         )
 
-    def _check_pool_plan_identical(self, worker, plan, group) -> None:
+    def _check_pool_plan_identical(self, worker, plan, group, *, attn_group_size: int) -> None:
         """Raise unless every rank of the serve group planned the same wave.
 
         Deterministic planning over replicated prompts and a group-MIN budget
@@ -1097,7 +1098,7 @@ class PrefillEngine:
             device=self.torch_device,
         )
         gathered = [
-            torch.zeros_like(digest) for _ in range(self._decode_attn_tp_size())
+            torch.zeros_like(digest) for _ in range(attn_group_size)
         ]
         dist.all_gather(gathered, digest, group=group)
         if len({int(item.item()) for item in gathered}) != 1:
@@ -3633,7 +3634,8 @@ class PrefillEngine:
         return prefill_batch
 
     def _config_prefill_for_batch(
-        self, worker, prefill_uuids: List[str], *, token_cap: int
+        self, worker, prefill_uuids: List[str], *, token_cap: int,
+        attn_group_size: int,
     ) -> None:
         """Configure prefill phase for a batch of sequences."""
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
@@ -3892,7 +3894,7 @@ class PrefillEngine:
         self._traj.trajectory_arena_payload = {}
         self._traj.trajectory_mirrored_restores = {}
         mirror_trajectory = (
-            self._decode_attn_tp_size() > 1
+            attn_group_size > 1
             and self.enable_prefix_cache
             and self._trajectory_commit_requested(
                 [
