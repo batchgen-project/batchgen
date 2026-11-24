@@ -2143,17 +2143,17 @@ class BatchGenWorker:
 		"""Take the layout the family's planner resolved and check it before
 		the manager is built.
 
-		The layout comes with the planned config (``Basic_Config.server_layout``).
-		One outside the family's implemented table is refused here by name, with
-		no model object created yet, and every later reader of a group width
+		The layout comes with the planned config (``Basic_Config.server_layout``)
+		and is required: a model that plans none is refused by name. One
+		outside the family's implemented table is refused here too, with no
+		model object created yet, and every later reader of a group width
 		takes it from this object.
 		"""
 		from batchgen.parallel_declaration import check_planned_server_layout
 
 		planned = getattr(self.engine_config.Basic_Config, "server_layout", None)
-		if planned is not None:
-			check_planned_server_layout(manager_class, planned, int(self.world_size))
-			self._check_requested_group_sizes(manager_class.__name__, planned)
+		check_planned_server_layout(manager_class, planned, int(self.world_size))
+		self._check_requested_group_sizes(manager_class.__name__, planned)
 		self._server_layout = planned
 
 	def _check_requested_group_sizes(self, model: str, layout) -> None:
@@ -2176,44 +2176,27 @@ class BatchGenWorker:
 		"""Check the manager just built against the planned layout.
 
 		Runs right after the manager is constructed, before any weight is
-		loaded: the manager must have been built for exactly the layout its
-		planner resolved. A family that plans no layout takes the one its
-		manager declares, checked against the implemented table; a manager
-		that declares none must be pure DP.
+		loaded: the manager must declare exactly the layout its planner
+		resolved.
 		"""
 		from batchgen.parallel_declaration import (
-			ParallelDeclarationError,
 			check_built_layout_is_planned,
 			resolve_server_layout,
 		)
 
 		layout, _ = resolve_server_layout(self.parallel_manager, int(self.world_size))
-		planned = self._server_layout
-		if planned is not None:
-			check_built_layout_is_planned(
-				type(self.parallel_manager).__name__, planned, layout
-			)
-			return
-		if layout is None and int(getattr(self.parallel_manager, "attn_tp_size", 1)) != 1:
-			raise ParallelDeclarationError(
-				f"{type(self.parallel_manager).__name__} runs an attention group "
-				"but declares no layout (parallel_declaration)"
-			)
-		self._check_requested_group_sizes(type(self.parallel_manager).__name__, layout)
-		self._server_layout = layout
+		check_built_layout_is_planned(
+			type(self.parallel_manager).__name__, self._server_layout, layout
+		)
 
 	def _decode_attn_tp_size(self) -> int:
-		"""The decode attention group size, read from the server layout; 1
-		(pure DP) for a manager that declares no layout."""
-		layout = self._server_layout
-		return 1 if layout is None else layout.decode.attention.group_size
+		"""The decode attention group size, read from the server layout."""
+		return self._server_layout.decode.attention.group_size
 
 	def _prefill_attn_tp_size(self) -> int:
 		"""The prefill attention group size, read from the prefill phase's own
-		layout (C1: each phase owns its layout); 1 for a manager that declares
-		no layout."""
-		layout = self._server_layout
-		return 1 if layout is None else layout.prefill.attention.group_size
+		layout (C1: each phase owns its layout)."""
+		return self._server_layout.prefill.attention.group_size
 
 	def _decode_phase_context(self) -> DecodePhaseContext:
 		return DecodePhaseContext(
@@ -6282,10 +6265,7 @@ class BatchGenWorker:
 		0 publishes the snapshot with the deployment capacity and the server
 		logs it once per generation and node (batchgen.worker.server_config).
 		"""
-		from batchgen.parallel_declaration import (
-			resolve_server_layout,
-			undeclared_slots,
-		)
+		from batchgen.parallel_declaration import resolve_server_layout
 		from batchgen.worker.server_config import ServerConfig
 
 		# The report is rendered from the layout the planner resolved before
@@ -6300,16 +6280,8 @@ class BatchGenWorker:
 				"the layout the built model declares differs from the layout "
 				f"resolved at construction: built={built} resolved={layout}"
 			)
-		slots = (
-			undeclared_slots()
-			if layout is None
-			else layout.declaration(declaration.decode_graph).rendered_slots()
-		)
-		graph = (
-			None
-			if declaration is None
-			else declaration.decode_graph
-		)
+		slots = layout.declaration(declaration.decode_graph).rendered_slots()
+		graph = declaration.decode_graph
 		gpu_manager = self.gpu_paged_kv_cache_manager
 		if gpu_manager is None:
 			raise RuntimeError(
@@ -6328,8 +6300,8 @@ class BatchGenWorker:
 			prefill_moe=slots["prefill_moe"],
 			decode_attn=slots["decode_attention"],
 			decode_moe=slots["decode_moe"],
-			cuda_graphs=bool(graph and graph.mode != "off"),
-			graph_buckets=None if graph is None else graph.buckets,
+			cuda_graphs=graph.mode != "off",
+			graph_buckets=graph.buckets,
 			host_kv_gib=float(self.global_host_kv_cache_size_gb),
 			host_kv_pages=self._get_host_kv_total_pages(),
 			device_kv_gib=float(self.gpu_kv_cache_size_gb),

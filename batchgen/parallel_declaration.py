@@ -14,11 +14,10 @@ describing each (phase, module) slot, computed from the launch configuration
 at start-up (world size, EP configuration, planner output) — never hard-coded
 where the layout depends on launch arguments.
 
-The contract is deliberately optional, like ``recurrent_state_owner``: the
-worker reads it with ``read_parallel_declaration`` below, and a manager that
-has not declared is reported as ``undeclared`` in the ``[SERVER_CONFIG]``
-line rather than guessed at. There is no default declaration: a base-supplied
-guess would silently report something untrue for the models it is wrong for.
+The contract is required: the worker reads it with
+``read_parallel_declaration`` below and refuses, by name, a manager that does
+not declare. There is no default declaration: a base-supplied guess would
+silently report something untrue for the models it is wrong for.
 
 Vocabulary (closed; every registered model fits it):
 
@@ -44,8 +43,7 @@ Residency
 
 A slot renders as ``scheme:residency`` with the group width appended to a
 sharded scheme — ``dp:streamed``, ``tp8:resident``, ``ep8:partial`` — or as
-the bare ``none``. ``undeclared`` is reserved for a manager without the
-contract and is never a value a declaration may carry.
+the bare ``none``.
 """
 
 from __future__ import annotations
@@ -74,7 +72,6 @@ GRAPH_MODES = (GRAPH_MODE_OFF, GRAPH_MODE_GRAPH, GRAPH_MODE_COMPARE)
 
 # What the [SERVER_CONFIG] line reports for every slot of a manager that has
 # not declared. Never a legal value inside a ParallelDeclaration.
-UNDECLARED = "undeclared"
 
 # The four declaration slots, in the order the [SERVER_CONFIG] line prints.
 DECLARATION_SLOTS = (
@@ -240,26 +237,23 @@ class ParallelDeclaration:
         return {slot: getattr(self, slot).render() for slot in DECLARATION_SLOTS}
 
 
-def undeclared_slots() -> dict:
-    """What the ``[SERVER_CONFIG]`` line reports without a declaration."""
-    return {slot: UNDECLARED for slot in DECLARATION_SLOTS}
-
-
 def read_parallel_declaration(
     parallel_manager, decode_graph_owner=None
-) -> Optional[ParallelDeclaration]:
-    """The manager's declaration, or None when it does not implement one.
+) -> ParallelDeclaration:
+    """The manager's declaration.
 
-    Read like the worker's other optional model declarations
-    (``recurrent_state_owner``): absence is a legal, explicit state — the
-    caller reports ``undeclared`` — but a present contract that returns the
-    wrong type is a hard error, never coerced.  When supplied, the one graph
-    owner argument is converted to ``DecodeGraphDeclaration`` and passed to
-    every manager through the same method parameter.
+    Every manager declares its layout: one without ``parallel_declaration``
+    is refused by name, and a contract that returns the wrong type is a hard
+    error, never coerced.  When supplied, the one graph owner argument is
+    converted to ``DecodeGraphDeclaration`` and passed to every manager
+    through the same method parameter.
     """
     declares = getattr(parallel_manager, "parallel_declaration", None)
     if declares is None:
-        return None
+        raise ParallelDeclarationError(
+            f"{type(parallel_manager).__name__} declares no parallel layout: "
+            "a model manager must implement parallel_declaration()"
+        )
     if decode_graph_owner is None:
         declaration = declares()
     else:
@@ -637,12 +631,10 @@ def check_layout_supported(model: str, supported: dict, layout: ServerLayout) ->
 
 def resolve_server_layout(
     parallel_manager, world_size: int, decode_graph_owner=None
-) -> Tuple[Optional[ServerLayout], Optional[ParallelDeclaration]]:
+) -> Tuple[ServerLayout, ParallelDeclaration]:
     """The layout the manager built, checked against what its family declares
-    as implemented. ``(None, None)`` when the manager declares nothing."""
+    as implemented."""
     declaration = read_parallel_declaration(parallel_manager, decode_graph_owner)
-    if declaration is None:
-        return None, None
     layout = server_layout_from_declaration(declaration, world_size)
     supported = read_supported_layouts(parallel_manager)
     if supported is not None:
@@ -659,23 +651,19 @@ REQUESTED_GROUP_FLAGS = {
 
 
 def check_requested_group_sizes(
-    model: str, layout: Optional[ServerLayout], requested: dict
+    model: str, layout: ServerLayout, requested: dict
 ) -> None:
     """Refuse, by name, a launch flag whose group size the model did not
     resolve to. ``requested`` maps ``(phase, "attention"|"moe")`` to the
-    flag's value or None; a model that declares no layout runs every module
-    replicated, which is group size 1."""
+    flag's value or None."""
     for slot, flag in REQUESTED_GROUP_FLAGS.items():
         value = requested.get(slot)
         if value is None:
             continue
         phase, module = slot
-        if layout is None:
-            actual, rendered = 1, "an undeclared (replicated) layout"
-        else:
-            parallelism = getattr(layout.phase(phase), module)
-            actual = parallelism.group_size
-            rendered = f"{phase} {module}={parallelism.render()}"
+        parallelism = getattr(layout.phase(phase), module)
+        actual = parallelism.group_size
+        rendered = f"{phase} {module}={parallelism.render()}"
         if int(value) != actual:
             raise UnsupportedLayoutError(
                 f"{flag} {value} was requested, but {model} resolved "
@@ -743,6 +731,11 @@ def check_planned_server_layout(manager_class, planned, world_size: int) -> None
     declares as implemented. Nothing of the model exists yet when this
     refuses."""
     name = getattr(manager_class, "__name__", type(manager_class).__name__)
+    if planned is None:
+        raise ParallelDeclarationError(
+            f"{name} has no planned layout: the model's initializer must "
+            "resolve Basic_Config.server_layout before the manager is built"
+        )
     if not isinstance(planned, ServerLayout):
         raise ParallelDeclarationError(
             f"the planned layout of {name} must be a ServerLayout, got "
@@ -758,15 +751,15 @@ def check_planned_server_layout(manager_class, planned, world_size: int) -> None
         check_layout_supported(name, supported, planned)
 
 
-def check_built_layout_is_planned(model: str, planned: ServerLayout, built) -> None:
+def check_built_layout_is_planned(
+    model: str, planned: ServerLayout, built: ServerLayout
+) -> None:
     """Refuse a manager that was built for another layout than the planned
     one, naming both."""
     if built == planned:
         return
 
-    def render(layout) -> str:
-        if layout is None:
-            return "no layout"
+    def render(layout: ServerLayout) -> str:
         return (
             f"prefill {layout.prefill.render()}; decode {layout.decode.render()}"
         )

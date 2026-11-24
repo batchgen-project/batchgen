@@ -185,8 +185,11 @@ def test_resolve_refuses_an_unimplemented_layout():
         resolve_server_layout(_Manager(prefill_attention=("tp", "resident", 2)), 8)
 
 
-def test_a_manager_without_a_declaration_resolves_to_nothing():
-    assert resolve_server_layout(object(), 8) == (None, None)
+def test_a_manager_without_a_declaration_is_refused_by_name():
+    from batchgen.parallel_declaration import ParallelDeclarationError
+
+    with pytest.raises(ParallelDeclarationError, match="object declares no parallel layout"):
+        resolve_server_layout(object(), 8)
 
 
 @pytest.mark.parametrize("table", [
@@ -247,7 +250,6 @@ def test_a_requested_group_size_the_model_resolved_to_is_accepted():
         ("prefill", "attention"): 1, ("prefill", "moe"): 1,
         ("decode", "attention"): None, ("decode", "moe"): 8,
     })
-    check_requested_group_sizes("M", None, {("decode", "attention"): 1})
     check_requested_group_sizes("M", _glm_like_layout(), {})
 
 
@@ -267,13 +269,6 @@ def test_a_requested_group_size_the_model_did_not_resolve_to_is_refused_by_name(
     message = str(error.value)
     assert flag in message and resolved in message
     assert "GLM5ParallelStrategyManager" in message
-
-
-def test_a_flag_on_a_model_without_a_layout_is_refused_unless_it_asks_for_one():
-    from batchgen.parallel_declaration import check_requested_group_sizes
-
-    with pytest.raises(UnsupportedLayoutError, match="--decode-moe-ep 8"):
-        check_requested_group_sizes("M", None, {("decode", "moe"): 8})
 
 
 # --- Kimi: one attention group for both phases, taken from the flags ------- #

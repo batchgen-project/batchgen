@@ -424,10 +424,10 @@ def test_prompt_at_or_above_limit_fails_alone_and_omission_gets_remaining_budget
 # A cohort's code identity, as a tree without git metadata publishes it.
 NO_GIT_IDENTITY = {"source": "none", "revision": "unknown", "dirty": None, "reason": "no_git_metadata"}
 
-# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+# A minimal valid [SERVER_CONFIG] publication (no graphs).
 SERVER_CONFIG = {
-    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
-    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "prefill_attn": "dp:streamed", "prefill_moe": "dp:streamed",
+    "decode_attn": "dp:resident", "decode_moe": "ep8:resident",
     "cuda_graphs": False, "graph_buckets": None,
     "host_kv_gib": 1.0, "host_kv_pages": 8,
     "device_kv_gib": 1.0, "device_kv_pages": 8,

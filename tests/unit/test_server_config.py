@@ -46,10 +46,10 @@ def test_log_line_format_is_pinned():
         "device_kv_gib=52.500 device_kv_pages=3440 "
         "gpu_memory_frac=0.9 max_pool=3200 num_layers=78 num_layers_full=78"
     )
-    eager = config(cuda_graphs=False, graph_buckets=None, decode_moe="undeclared")
+    eager = config(cuda_graphs=False, graph_buckets=None, decode_moe="ep8:resident")
     assert eager.log_line(2, 3) == (
         "[SERVER_CONFIG] generation=2 node=3 prefill_attn=dp:streamed "
-        "prefill_moe=dp:streamed decode_attn=dp:resident decode_moe=undeclared "
+        "prefill_moe=dp:streamed decode_attn=dp:resident decode_moe=ep8:resident "
         "cuda_graphs=off graph_buckets=none "
         "host_kv_gib=860.000 host_kv_pages=56320 "
         "device_kv_gib=52.500 device_kv_pages=3440 "
@@ -108,13 +108,11 @@ def test_truncated_layer_counts_are_legal_and_in_the_line():
     assert sc.ServerConfig.from_dict(truncated.as_dict()) == truncated
 
 
-def test_undeclared_slots_are_legal_but_unknown_tokens_are_not():
-    assert config(
-        prefill_attn="undeclared", prefill_moe="undeclared",
-        decode_attn="undeclared", decode_moe="undeclared",
-    ).log_line(1, 0).count("undeclared") == 4
-    with pytest.raises(sc.ServerConfigError):
-        config(prefill_moe="not-declared")
+def test_only_rendered_layout_tokens_are_slots():
+    # Every server has a layout, so "undeclared" is not a value a slot takes.
+    for token in ("undeclared", "not-declared"):
+        with pytest.raises(sc.ServerConfigError):
+            config(prefill_moe=token)
 
 
 # -- publication: worker main loop -> scheduler -> WorkerManager -------------
@@ -220,7 +218,7 @@ def _snapshot_worker(**overrides):
             prefill_attention_tp=None, prefill_moe_ep=None,
             decode_attention_tp=None, decode_moe_ep=None,
         ),
-        parallel_manager=SimpleNamespace(),  # no declaration
+        parallel_manager=None,
         engine_config=SimpleNamespace(
             Basic_Config=SimpleNamespace(enable_cuda_graphs=False)
         ),
@@ -240,6 +238,20 @@ def _snapshot_worker(**overrides):
     )
     for name, value in overrides.items():
         setattr(worker, name, value)
+    if worker.parallel_manager is None:
+        from batchgen.parallel_declaration import ModuleParallelism
+
+        worker.parallel_manager = _layout_manager(ModuleParallelism("dp", "streamed"))
+    basic = worker.engine_config.Basic_Config
+    declares = getattr(worker.parallel_manager, "parallel_declaration", None)
+    if not hasattr(basic, "server_layout") and declares is not None:
+        # What the model's initializer does: the planner resolves the layout
+        # (here, the one this manager is built for) before the manager exists.
+        from batchgen.parallel_declaration import server_layout_from_declaration
+
+        basic.server_layout = server_layout_from_declaration(
+            declares(), int(worker.world_size)
+        )
     methods = load_worker_methods(
         [
             "_snapshot_server_config",
@@ -260,12 +272,11 @@ def _snapshot_worker(**overrides):
     return worker, methods["_snapshot_server_config"]
 
 
-def test_snapshot_reads_the_owners_and_reports_undeclared_models():
+def test_snapshot_reads_the_owners_and_renders_the_layout():
     worker, snapshot = _snapshot_worker()
     snapshot(worker)
     assert sc.ServerConfig.from_dict(worker.server_config) == config(
-        prefill_attn="undeclared", prefill_moe="undeclared",
-        decode_attn="undeclared", decode_moe="undeclared",
+        decode_moe="ep8:resident",
         cuda_graphs=False, graph_buckets=None,
         host_kv_gib=860.0, host_kv_pages=56320,
         device_kv_gib=52.5, device_kv_pages=3440,
@@ -449,18 +460,39 @@ def test_a_launch_flag_is_honoured_or_refused_at_construction():
         _snapshot_worker(parallel_manager=manager, args=args(decode_attention_tp=8))
 
 
-def test_a_manager_with_an_attention_group_must_declare_its_layout():
+def test_a_model_without_a_planned_layout_is_refused_before_the_build():
     from batchgen.parallel_declaration import ParallelDeclarationError
 
-    with pytest.raises(ParallelDeclarationError, match="declares no layout"):
-        _snapshot_worker(parallel_manager=SimpleNamespace(attn_tp_size=2))
+    with pytest.raises(ParallelDeclarationError, match="has no planned layout"):
+        _snapshot_worker(parallel_manager=SimpleNamespace())
+
+
+def test_a_manager_that_declares_no_layout_is_refused_after_the_build():
+    from batchgen.parallel_declaration import (
+        ModuleParallelism,
+        ParallelDeclarationError,
+        server_layout_from_declaration,
+    )
+
+    planned = server_layout_from_declaration(
+        _layout_manager(ModuleParallelism("dp", "streamed")).parallel_declaration(), 8
+    )
+    with pytest.raises(ParallelDeclarationError, match="declares no parallel layout"):
+        _snapshot_worker(
+            parallel_manager=SimpleNamespace(),
+            engine_config=SimpleNamespace(
+                Basic_Config=SimpleNamespace(
+                    enable_cuda_graphs=False, server_layout=planned
+                )
+            ),
+        )
 
 
 def test_the_group_width_is_read_from_the_layout():
     from tests.worker_method_source import attention_group_layout, load_worker_methods
 
     width = load_worker_methods(["_decode_attn_tp_size"], {})["_decode_attn_tp_size"]
-    assert width(SimpleNamespace(_server_layout=None)) == 1
+    assert width(SimpleNamespace(_server_layout=attention_group_layout(1, 8))) == 1
     assert width(SimpleNamespace(_server_layout=attention_group_layout(4, 8))) == 4
 
 
@@ -477,4 +509,3 @@ def test_each_phase_reads_its_own_attention_group_width():
     worker = SimpleNamespace(_server_layout=layout)
     assert methods["_prefill_attn_tp_size"](worker) == 2
     assert methods["_decode_attn_tp_size"](worker) == 4
-    assert methods["_prefill_attn_tp_size"](SimpleNamespace(_server_layout=None)) == 1

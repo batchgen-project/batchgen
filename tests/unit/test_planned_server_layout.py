@@ -214,6 +214,11 @@ class _Manager:
     SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
 
 
+def test_a_model_without_a_planned_layout_is_refused_by_name():
+    with pytest.raises(ParallelDeclarationError, match="_Manager has no planned layout"):
+        check_planned_server_layout(_Manager, None, 8)
+
+
 def test_a_planned_layout_is_checked_before_the_manager_is_built():
     planned = replicated_prefill_world_ep_decode_layout(8, decode_moe_fully_resident=True)
     check_planned_server_layout(_Manager, planned, 8)
@@ -247,8 +252,6 @@ def test_a_manager_built_for_another_layout_is_refused_with_both_named():
     with pytest.raises(ParallelDeclarationError) as error:
         check_built_layout_is_planned("M", planned, other)
     assert "planned" in str(error.value) and "ep8:partial" in str(error.value)
-    with pytest.raises(ParallelDeclarationError, match="built no layout"):
-        check_built_layout_is_planned("M", planned, None)
 
 
 def _worker(planned, declared):
