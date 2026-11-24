@@ -29,7 +29,7 @@ from batchgen.worker.rank_context import RankContext
 from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from batchgen.sequence import SequenceBatch, SequenceEntry
 from batchgen.worker.prefill import compute_prefill_host_reservation
-from tests.worker_method_source import load_worker_functions, load_worker_shaped_methods
+from tests.worker_method_source import load_worker_functions, load_worker_shaped_methods, attention_group_layout
 
 _admitted_prompt_ids = load_worker_functions(
     ["_admitted_prompt_ids"], {"np": np, "torch": torch}
@@ -87,6 +87,7 @@ class _Worker:
     def __init__(self, adaptive: bool):
         self.args = SimpleNamespace(global_rank=0, world_size=1)
         self.parallel_manager = SimpleNamespace(attn_tp_size=1)
+        self._server_layout = attention_group_layout(1)
         self._core_initialized = True
         self.host_kv_chunk_size = HOST_KV_CHUNK
         self.adaptive_chunk_sizer = (

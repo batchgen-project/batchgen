@@ -25,7 +25,7 @@ from batchgen.continuous_batching import (
     validate_boundary_payload_alignment,
 )
 from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
-from tests.worker_method_source import WORKER_SOURCE, load_worker_methods
+from tests.worker_method_source import WORKER_SOURCE, load_worker_methods, attention_group_layout
 
 PAGE_TOKENS = 64
 HOST_PAGES = 6
@@ -106,6 +106,7 @@ _METHODS = load_worker_methods(
 def _worker(rank, *, world_size, attn_tp_size, seqs, held):
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _sync_trajectory_metadata=lambda seq, state: None,
     )

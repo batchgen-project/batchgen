@@ -2132,10 +2132,32 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
+	def _resolve_server_layout(self) -> None:
+		"""Resolve the server's two phase layouts from the manager just built.
+
+		Runs right after the manager is constructed, before any weight is
+		loaded: a layout outside the family's implemented table is refused
+		here by name, and every later reader of a group width takes it from
+		this object. A manager that declares no layout must be pure DP.
+		"""
+		from batchgen.parallel_declaration import (
+			ParallelDeclarationError,
+			resolve_server_layout,
+		)
+
+		layout, _ = resolve_server_layout(self.parallel_manager, int(self.world_size))
+		if layout is None and int(getattr(self.parallel_manager, "attn_tp_size", 1)) != 1:
+			raise ParallelDeclarationError(
+				f"{type(self.parallel_manager).__name__} runs an attention group "
+				"but declares no layout (parallel_declaration)"
+			)
+		self._server_layout = layout
+
 	def _decode_attn_tp_size(self) -> int:
-		"""G (attn_tp_size) for decode; 1 (pure-DP) unless the PSM head-shards."""
-		pm = getattr(self, "parallel_manager", None)
-		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
+		"""The decode attention group size, read from the server layout; 1
+		(pure DP) for a manager that declares no layout."""
+		layout = self._server_layout
+		return 1 if layout is None else layout.decode.attention.group_size
 
 	def _decode_phase_context(self) -> DecodePhaseContext:
 		return DecodePhaseContext(
@@ -3958,6 +3980,7 @@ class BatchGenWorker:
 			self.global_rank,
 			self.world_size
 		)
+		self._resolve_server_layout()
 		self._verify_manager_phase_contract()
 
 		# The token pool is fixed for the lifetime of the worker. Its byte budget
@@ -6250,12 +6273,18 @@ class BatchGenWorker:
 		)
 		from batchgen.worker.server_config import ServerConfig
 
-		# The layout object is what the report is rendered from, and a layout
-		# outside the family's implemented list is refused here by name.
-		layout, declaration = resolve_server_layout(
+		# The report is rendered from the layout resolved when the manager was
+		# built. What the manager declares now, with the model built, must be
+		# that same layout: the reported layout is the executed one.
+		layout = self._server_layout
+		built, declaration = resolve_server_layout(
 			self.parallel_manager, int(self.world_size), self._graph
 		)
-		self._server_layout = layout
+		if built != layout:
+			raise RuntimeError(
+				"the layout the built model declares differs from the layout "
+				f"resolved at construction: built={built} resolved={layout}"
+			)
 		slots = (
 			undeclared_slots()
 			if layout is None
