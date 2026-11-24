@@ -14,8 +14,10 @@ WORKER = ROOT / "batchgen/batchgen_worker.py"
 
 def test_prefill_to_decode_metadata_sync_brackets_status_transition():
     source = WORKER.read_text()
-    block_start = source.index("\t\t\t\tif not decode_uuids:\n\t\t\t\t\tbreak")
-    block_end = source.index("\t\t\t\t# CUDA Graph Warmup", block_start)
+    # One tab deeper since AS3.3: the decode wave's statements sit inside the
+    # decode-phase context try block of generate().
+    block_start = source.index("\t\t\t\t\tif not decode_uuids:\n\t\t\t\t\t\tbreak")
+    block_end = source.index("\t\t\t\t\t# CUDA Graph Warmup", block_start)
     block = source[block_start:block_end]
 
     pre_config_sync = block.index("self._sync_sequence_metadata(decode_uuids)")

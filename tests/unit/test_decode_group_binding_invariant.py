@@ -318,11 +318,14 @@ def test_prefill_config_checks_bindings_after_it_creates_them():
 
 
 def test_decode_entry_checks_bindings_before_resolving_local_rows():
-    source = WORKER.read_text()
-    check = source.index(
-        "self._check_local_binding_matches_group(\n\t\t\t\t\tdecode_uuids"
+    # Unparsed (indentation-free): the decode wave's statements live inside
+    # the decode-phase context try block (AS3.3), so a raw-text pin on their
+    # tab depth would re-break on any structural change around them.
+    body = ast.unparse(_method("generate"))
+    check = body.index(
+        "self._check_local_binding_matches_group(decode_uuids, 'decode entry')"
     )
-    resolve = source.index(
+    resolve = body.index(
         "local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)"
     )
     assert check < resolve

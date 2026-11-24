@@ -2569,8 +2569,14 @@ def test_generate_carries_the_decode_exit_out_before_the_next_collective():
         node for node in outer.body
         if isinstance(node, ast.While) and "has_in_decode" in ast.unparse(node.test)
     )
+    # The decode wave holds its admission context in a try whose finally is
+    # the decode-phase exit bracket (AS3.3); the latch check is a statement of
+    # the wave, directly in the loop body or directly in that try.
+    wave_scopes = [decode_phase.body] + [
+        node.body for node in decode_phase.body if isinstance(node, ast.Try)
+    ]
     latch_checks = [
-        node for node in decode_phase.body
+        node for scope in wave_scopes for node in scope
         if isinstance(node, ast.If)
         and ast.unparse(node.test) == "self._cohort_shutdown_observed"
     ]
