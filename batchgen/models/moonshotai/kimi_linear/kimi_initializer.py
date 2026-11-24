@@ -209,6 +209,7 @@ class KimiLinearInitializer:
             self.engine_config,
             self.engine_config.Basic_Config.world_size,
             is_k3=self.is_k3,
+            attention_group_size=G,
         )
         if self.distributed_weight_transport == "hierarchical_gdr":
             # S4: hierarchical_gdr always runs the engine-bound replica
@@ -216,7 +217,9 @@ class KimiLinearInitializer:
             # slots, one collective per frame: the routed ring must hold
             # two frames of this slot's expert block (one landing, one
             # being consumed).
-            group_size = int(self.engine_config.Basic_Config.attention_group_size)
+            group_size = int(
+                self.engine_config.Basic_Config.server_layout.decode.attention.group_size
+            )
             num_experts = int(self.model_config.num_local_experts)
             if num_experts % group_size:
                 raise ValueError(

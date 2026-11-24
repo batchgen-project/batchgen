@@ -13,6 +13,7 @@ import pytest
 
 from batchgen.phase_lifecycle import PHASES, ExitMode, PhaseEnterContext, PhaseKey
 from batchgen.phase_lifecycle import verify_phase_contract
+from tests.kimi_layout_fixture import planned_kimi_layout
 from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
 
 
@@ -802,7 +803,11 @@ def _k3_manager_class():
             self._attn_tp_size = 8
             self.engine_config = SimpleNamespace(
                 EP_Config=SimpleNamespace(decode_moe_mode="resident_ep"),
-                Basic_Config=SimpleNamespace(prefill_moe_mode=None),
+                Basic_Config=SimpleNamespace(
+                    server_layout=planned_kimi_layout(
+                        world_size=16, group=8, latent_tp=True
+                    )
+                ),
             )
             self._comm = None
             self._resident_ep_built = False

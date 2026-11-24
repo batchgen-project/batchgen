@@ -363,7 +363,16 @@ class KimiLinearParallelStrategyManager:
         # every KDA seam below is byte-identical to before). G>1 slices
         # kda_num_heads across G contiguous ranks (one attn_tp sub-group per
         # block of G ranks); this rank owns heads [rank%G * Hl : +Hl].
-        G = int(getattr(engine_config.Basic_Config, "attention_group_size", 1))
+        # The group size comes from the layout the planner resolved before
+        # this manager was built; the family runs one group for both phases.
+        layout = engine_config.Basic_Config.server_layout
+        G = int(layout.decode.attention.group_size)
+        if int(layout.prefill.attention.group_size) != G:
+            raise ValueError(
+                "Kimi-Linear runs one attention group for both phases; the "
+                f"planned layout has prefill {layout.prefill.attention.render()} "
+                f"and decode {layout.decode.attention.render()}"
+            )
         kda_num_heads = int(loaded_model_config.kda_num_heads)
         assert kda_num_heads % G == 0, (
             f"kda_num_heads {kda_num_heads} not divisible by "
@@ -691,30 +700,18 @@ class KimiLinearParallelStrategyManager:
         """Return the server prefill MoE mode, fixed for the server's lifetime.
 
         The worker reads it once and every prefill wave runs it; no batch
-        changes it. The rule lives with the planner
-        (``planner.server_prefill_moe_mode``), which resolves the server
-        layout from it before this manager is built: without
-        ``--prefill-moe-mode`` the mode follows the weight topology, and a
-        requested mode the topology cannot run is refused here, at
-        construction, before any model is built. The resident EP shard a
-        distributed ``resident_ep`` server needs is built by the startup
-        decode configure before the worker installs the mode, and
-        ``set_prefill_moe_mode`` re-checks it then.
+        changes it. It is the path of the planned layout's prefill MoE slot
+        (``planner.prefill_moe_path``): the planner resolved that layout from
+        the launch parameters and the weight topology before this manager
+        was built, and refused a request the topology cannot run there. The
+        resident EP shard a distributed ``resident_ep`` server needs is built
+        by the startup decode configure before the worker installs the mode,
+        and ``set_prefill_moe_mode`` re-checks it then.
         """
-        from batchgen.models.moonshotai.kimi_linear.planner import server_prefill_moe_mode
+        from batchgen.models.moonshotai.kimi_linear.planner import prefill_moe_path
 
-        return server_prefill_moe_mode(
-            requested=getattr(
-                self.engine_config.Basic_Config, "prefill_moe_mode", None
-            ),
-            is_k3=self._is_k3,
-            latent_tp_planned=self._latent_tp_planned,
-            distributed_weight_sharded=self._distributed_weight_sharded,
-            stream_all_modules=self._stream_all_modules,
-            attention_group_size=self._attn_tp_size,
-            requested_ep=getattr(
-                self.engine_config.Basic_Config, "prefill_moe_ep", None
-            ),
+        return prefill_moe_path(
+            self.engine_config.Basic_Config.server_layout.prefill.moe
         )
 
     def prefill_uses_resident_ep(self):

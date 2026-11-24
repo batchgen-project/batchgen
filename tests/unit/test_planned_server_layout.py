@@ -116,8 +116,8 @@ def _kimi_config(
     shard_latent=False, ep=None,
 ):
     return SimpleNamespace(
+        group=group,
         Basic_Config=SimpleNamespace(
-            attention_group_size=group,
             stream_all_modules=stream_all,
             distributed_weight_sharded=distributed,
             prefill_moe_mode=mode,
@@ -176,7 +176,9 @@ def _kimi_config(
 def test_kimi_layout_is_resolved_from_the_planned_config(config, world, expected):
     from batchgen.models.moonshotai.kimi_linear.planner import kimi_linear_server_layout
 
-    assert _render(kimi_linear_server_layout(config, world, is_k3=True)) == expected
+    assert _render(kimi_linear_server_layout(
+        config, world, is_k3=True, attention_group_size=config.group
+    )) == expected
 
 
 @pytest.mark.parametrize(
@@ -198,7 +200,9 @@ def test_kimi_refuses_a_mode_the_topology_cannot_run_before_any_model(config, me
     from batchgen.models.moonshotai.kimi_linear.planner import kimi_linear_server_layout
 
     with pytest.raises(ValueError, match=message):
-        kimi_linear_server_layout(config, 16, is_k3=True)
+        kimi_linear_server_layout(
+            config, 16, is_k3=True, attention_group_size=config.group
+        )
 
 
 def test_kimi_non_k3_refuses_the_k3_modes():
@@ -206,7 +210,8 @@ def test_kimi_non_k3_refuses_the_k3_modes():
 
     with pytest.raises(ValueError, match="only for Kimi-K3"):
         kimi_linear_server_layout(
-            _kimi_config(group=8, mode="resident_ep"), 16, is_k3=False
+            _kimi_config(group=8, mode="resident_ep"), 16, is_k3=False,
+            attention_group_size=8,
         )
 
 
@@ -394,3 +399,22 @@ def test_the_kimi_manager_and_planner_name_the_same_prefill_modes():
 
     family = MODELS / "moonshotai" / "kimi_linear"
     assert modes(family / "planner.py") == modes(family / "Parallel_Strategy_Manager.py")
+
+
+def test_the_kimi_prefill_path_is_read_back_from_the_layout():
+    """The manager takes its prefill MoE path from the planned layout; the
+    mapping is the inverse of the one the planner builds the layout with."""
+    from batchgen.models.moonshotai.kimi_linear.planner import (
+        PREFILL_MOE_MODES,
+        kimi_linear_layout,
+        prefill_moe_path,
+    )
+
+    for mode in PREFILL_MOE_MODES:
+        layout = kimi_linear_layout(
+            world_size=16, attention_group_size=8, stream_all_modules=False,
+            prefill_moe_mode=mode, decode_moe_mode="resident_ep",
+        )
+        assert prefill_moe_path(layout.prefill.moe) == mode
+    with pytest.raises(ParallelDeclarationError, match="no prefill MoE path"):
+        prefill_moe_path(SimpleNamespace(scheme="dp", residency="resident", render=lambda: "dp:resident"))

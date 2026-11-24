@@ -205,8 +205,12 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
     manager._latent_tp_planned = False
     manager._stream_all_modules = False
     manager._attn_tp_size = 8
+    from tests.kimi_layout_fixture import planned_kimi_layout
+
     manager.engine_config = SimpleNamespace(
-        Basic_Config=SimpleNamespace(prefill_moe_mode=None)
+        Basic_Config=SimpleNamespace(
+            server_layout=planned_kimi_layout(world_size=16, group=8, distributed=True)
+        )
     )
     _bind_prefill_mode_validator(manager, path)
     default_mode = _isolated_method(
