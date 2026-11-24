@@ -284,7 +284,13 @@ reach the replicated parameter server only because they pass `--replicated-weigh
   missing, damaged, or from another checkpoint falls back to a normal build and is replaced. The
   slot needs room for one node store.
 
-  At launch, argument validation refuses a store whose completion manifest is missing or
+  The store keeps the replicated tensors first, padded with zeros to a page boundary, then the
+  routed-expert modules; with the page-multiple expert module of Kimi-K3 every module starts on a
+  page boundary. The server pins the store for GPU transfers in several registrations, each under
+  the driver's per-registration limit and cut only between tensors, which needs those boundaries.
+
+  At launch, argument validation refuses a store that an older store builder wrote (rebuild it; a
+  rebuild takes a few minutes per node), a store whose completion manifest is missing or
   incomplete, whose files no longer match it (a cleared tmpfs, a partial copy, metadata of another
   build), that was built from a different converted checkpoint or `config.json` than the launch's
   `--converted-ckpt-dir` (or `--cache-dir`/converted_ckpt) and `--cache-dir`, that belongs to

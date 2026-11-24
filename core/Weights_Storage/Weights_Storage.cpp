@@ -404,6 +404,9 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
     std::string line;
     std::unordered_map<std::string, uint64_t> remote_module_bases;
     std::vector<std::pair<int64_t, int64_t>> pin_intervals;
+    // Byte ranges of the tensors this node's store holds: a registration
+    // boundary may only fall between two of them.
+    std::vector<std::pair<int64_t, int64_t>> local_extents;
     size_t local_tensors = 0;
     size_t remote_tensors = 0;
     while (std::getline(metadata_handle, line)) {
@@ -475,6 +478,9 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
                     static_cast<char*>(this->compact_ptr_) +
                         compact_offset,
                     shape, tensor_bytes, dtype);
+            local_extents.emplace_back(
+                static_cast<int64_t>(compact_offset),
+                static_cast<int64_t>(compact_offset) + tensor_bytes);
             ++local_tensors;
         } else {
             auto base = remote_module_bases.find(module_key);
@@ -490,14 +496,39 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
         }
     }
     // host_rdma serves arbitrary modules to arbitrary peers, so it keeps the
-    // whole compact store pinned. hierarchical_gdr registers the coalesced
-    // slot ranges only, which is what turns a >20 min startup into seconds.
+    // whole compact store pinned, in segments no larger than one
+    // cudaHostRegister can take and cut only between tensors (a copy whose
+    // source spans two registrations fails). hierarchical_gdr registers the
+    // coalesced slot ranges only, which is what turns a >20 min startup into
+    // seconds.
     if (this->hierarchical_gdr_) {
         pin_intervals =
             merge_pin_intervals(std::move(pin_intervals),
                                 this->compact_bytes_);
     } else {
-        pin_intervals = {{0, this->compact_bytes_}};
+        try {
+            pin_intervals = plan_host_registration_segments(
+                std::move(local_extents), this->compact_bytes_,
+                kMaxHostRegistrationBytes,
+                static_cast<int64_t>(sysconf(_SC_PAGESIZE)));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("distributed weight store cannot be pinned in "
+                            "registrations of at most ") +
+                std::to_string(kMaxHostRegistrationBytes >> 30) +
+                " GiB: " + error.what() +
+                " (a store whose expert modules do not start on page "
+                "boundaries must be rebuilt with the current store builder)");
+        }
+    }
+    for (const auto& range : pin_intervals) {
+        if (range.second - range.first > kMaxHostRegistrationBytes) {
+            throw std::runtime_error(
+                "distributed weight store pin range of " +
+                std::to_string(range.second - range.first) +
+                " bytes exceeds the per-registration ceiling of " +
+                std::to_string(kMaxHostRegistrationBytes) + " bytes");
+        }
     }
     // Reserve before the first registration so recording a successful pin
     // cannot allocate and throw between cudaHostRegister and emplace_back.
