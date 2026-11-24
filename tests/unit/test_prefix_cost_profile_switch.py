@@ -14,7 +14,7 @@ Worker methods are compiled out of the module's AST onto fakes, as in
 import ast
 import functools
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -80,13 +80,15 @@ def _worker(*, model=K3_MODEL, world=WORLD, group=G, cost_profile="on",
             device_properties=_Props):
     worker = SimpleNamespace(rank=0, world_size=world, model_name=model)
     worker._decode_attn_tp_size = lambda: group
+    worker._prefill_attn_tp_size = lambda: group
     methods = _methods((
         "_cached_prefix_rank_cost_profile",
         "_prefix_rank_cost_profile_disabled",
     ))
-    worker._cached_prefix_rank_cost_profile = MethodType(
-        methods["_cached_prefix_rank_cost_profile"], worker
-    )
+    # The worker's delegator: it hands the engine the prefill group width.
+    worker._cached_prefix_rank_cost_profile = lambda disabled=False: methods[
+        "_cached_prefix_rank_cost_profile"
+    ](worker, disabled, attn_group_size=worker._prefill_attn_tp_size())
     # The worker's delegator: it hands the engine the launch value.
     worker._prefix_rank_cost_profile_disabled = lambda seqs: methods[
         "_prefix_rank_cost_profile_disabled"

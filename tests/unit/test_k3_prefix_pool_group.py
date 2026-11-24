@@ -15,6 +15,10 @@ impossible: ``FakeDist`` reduces or gathers the caller's contribution against
 peer values the test configures, which is what the collective would produce.
 """
 
+from tests.worker_method_source import (
+    PREFILL_ATTENTION_WIDTH_METHODS,
+    attention_group_layout,
+)
 import ast
 import copy
 import dataclasses
@@ -152,7 +156,15 @@ def _worker_methods(names, globals_=None):
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
         elif name in _MOVED:
-            def worker_method(worker, *args, _function=function, **kwargs):
+            def worker_method(
+                worker, *args, _function=function, _name=name, **kwargs
+            ):
+                # Mirror the worker's delegator: it hands these engine methods
+                # the prefill phase's attention group width.
+                if _name in PREFILL_ATTENTION_WIDTH_METHODS:
+                    kwargs.setdefault(
+                        "attn_group_size", worker._prefill_attn_tp_size()
+                    )
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
         loaded[name] = function
@@ -397,6 +409,7 @@ def _plan_worker(
             "_prefill_pool_free_state_slots",
             "_replace_prefix_lookup_hits",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
             # The executor and the pool are built with the probes of the
@@ -437,6 +450,7 @@ def _plan_worker(
         parallel_manager.prefill_pool_layout = lambda: dict(layout)
         parallel_manager.supports_group_pool_prefill = lambda: True
     worker = SimpleNamespace(
+        _server_layout=attention_group_layout(attn_tp_size),
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,
@@ -753,10 +767,12 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
             "_next_pool_segment_sid",
             "_owns_host_kv",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
         ],
         {"dist": fake_dist},
     )
     worker = SimpleNamespace(
+        _server_layout=attention_group_layout(2),
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         host_paged_kv_worker_view=views[0],
@@ -866,9 +882,11 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
         ],
     )
     worker = SimpleNamespace(
+        _server_layout=attention_group_layout(2),
         parallel_manager=SimpleNamespace(attn_tp_size=2),
         global_batch=SimpleNamespace(get_sequence=_seqs().get),
         prefix_cache_coordinator=coordinator,
@@ -1179,7 +1197,8 @@ def _gate_worker(
 ):
     methods = _worker_methods(
         ["_prefill_prefix_pool_enabled", "_pool_prefill_group_safe",
-         "_decode_attn_tp_size"],
+         "_decode_attn_tp_size",
+         "_prefill_attn_tp_size"],
     )
     parallel_manager = SimpleNamespace(attn_tp_size=attn_tp_size)
     if group_safe is not None:
@@ -1187,6 +1206,7 @@ def _gate_worker(
     if resident_ep is not None:
         parallel_manager.prefill_uses_resident_ep = lambda: resident_ep
     worker = SimpleNamespace(
+        _server_layout=attention_group_layout(attn_tp_size),
         enable_prefix_cache=enable_prefix_cache,
         _prefix_integrity=integrity,
         parallel_manager=parallel_manager,

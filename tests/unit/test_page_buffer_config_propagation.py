@@ -104,15 +104,26 @@ def _worker_sequence_imports() -> dict:
 
 
 def _worker_method(name: str, namespace: dict):
-    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
-    worker = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    # A delegated method compiles from the body that actually runs (its
+    # engine/admission-module source, in the worker's shape); every other
+    # name compiles from the worker class as before.
+    from tests.worker_method_source import (
+        delegated_method_names,
+        worker_shaped_method_node,
     )
-    method = next(
-        node for node in worker.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
+
+    if name in delegated_method_names():
+        method = worker_shaped_method_node(name)
+    else:
+        tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
+        worker = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        )
+        method = next(
+            node for node in worker.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
     module = ast.fix_missing_locations(
         ast.Module(body=[copy.deepcopy(method)], type_ignores=[])
     )

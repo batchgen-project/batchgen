@@ -50,6 +50,25 @@ class DecodePhaseContext:
 
 
 @dataclass(frozen=True)
+class PrefillPhaseContext:
+    """State the prefill admission selection reads, frozen per call.
+
+    ``facts`` and ``sched`` are the same objects the decode context carries:
+    one rank identity, one pool, one sequence table, one trajectory store.
+    ``prefix`` is the worker's shared prefix-reuse state bundle; the selection
+    records the wave's credit decision on it exactly as the worker did.
+
+    The context carries state objects only, never a bound worker method:
+    values the worker computes (the candidates' shared-prefix segments) are
+    resolved by the delegator and passed as arguments.
+    """
+
+    facts: RankFacts
+    sched: SchedulingState
+    prefix: Any
+
+
+@dataclass(frozen=True)
 class WaitOutcome:
     num_tasks: int
     new_deferred_errors: Optional[Tuple[str, ...]] = None

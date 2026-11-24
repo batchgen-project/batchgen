@@ -15,6 +15,7 @@ worker methods are compiled out of the module's AST onto a namespace of fakes,
 exactly as the other prefix-reuse unit tests do.
 """
 
+from tests.worker_method_source import attention_group_layout
 import ast
 import copy
 import importlib.util
@@ -501,6 +502,7 @@ def _mirror_rank(
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _prefill_pool_wave=None,
         _host_views_by_group=lambda: {0: _FakeView({})},
@@ -715,6 +717,7 @@ def _assign_worker(
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         # The real GlobalBatch is iterable AND resolves by uuid; a
         # SimpleNamespace cannot route dunder lookups, so the batch is its own
         # small fake.

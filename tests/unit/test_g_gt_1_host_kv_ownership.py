@@ -30,7 +30,7 @@ from tests.worker.worker_fakes import (
     attach_prefix_state,
     attach_trajectory_state,
 )
-from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+from tests.worker_method_source import delegated_method_names, worker_shaped_method_node, attention_group_layout
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -208,6 +208,7 @@ def _rank(rank, *, attn_tp_size, world_size, seqs, views, fake_dist,
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _host_views_by_group=lambda: views,
     )
@@ -524,6 +525,7 @@ def _selection_request(attn_tp_size, monkeypatch):
     )
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=lambda uuid: seq),
         # This test is about the replication factor, not shared-prefix credit:
         # report no shared segment so the candidate keeps its standalone
@@ -700,6 +702,7 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator,
     seqs = seqs if seqs is not None else _seqs(group=0)
     worker = SimpleNamespace(
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(
             get_sequence=seqs.get,
             get_sequences_by_status=_forbidden_status_read,
@@ -909,6 +912,7 @@ def _append_worker(attn_tp_size, view):
     worker = SimpleNamespace(
         rank=1,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
+        _server_layout=attention_group_layout(attn_tp_size),
         # The append path resolves the row through SequenceBatch's maintained
         # global_idx index, as the other fakes here expose get_sequence.
         global_batch=SimpleNamespace(

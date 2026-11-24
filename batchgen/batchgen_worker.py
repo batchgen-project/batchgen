@@ -232,7 +232,6 @@ from batchgen.worker.sync import (
 	TorchDistCollectiveBackend,
 )
 from batchgen.worker.prefill import (
-	PrefillCandidate,
 	PrefillProgressGuard,
 	PrefillSelectionRequest,
 	describe_prefill_blockers,
@@ -329,6 +328,7 @@ from batchgen.worker.admission.plan import (
 )
 from batchgen.worker.admission.context import (
 	DecodePhaseContext,
+	PrefillPhaseContext,
 	RankFacts,
 	SchedulingState,
 )
@@ -2129,10 +2129,39 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
+	def _resolve_server_layout(self) -> None:
+		"""Resolve the server's two phase layouts from the manager just built.
+
+		Runs right after the manager is constructed, before any weight is
+		loaded: a layout outside the family's implemented table is refused
+		here by name, and every later reader of a group width takes it from
+		this object. A manager that declares no layout must be pure DP.
+		"""
+		from batchgen.parallel_declaration import (
+			ParallelDeclarationError,
+			resolve_server_layout,
+		)
+
+		layout, _ = resolve_server_layout(self.parallel_manager, int(self.world_size))
+		if layout is None and int(getattr(self.parallel_manager, "attn_tp_size", 1)) != 1:
+			raise ParallelDeclarationError(
+				f"{type(self.parallel_manager).__name__} runs an attention group "
+				"but declares no layout (parallel_declaration)"
+			)
+		self._server_layout = layout
+
 	def _decode_attn_tp_size(self) -> int:
-		"""G (attn_tp_size) for decode; 1 (pure-DP) unless the PSM head-shards."""
-		pm = getattr(self, "parallel_manager", None)
-		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
+		"""The decode attention group size, read from the server layout; 1
+		(pure DP) for a manager that declares no layout."""
+		layout = self._server_layout
+		return 1 if layout is None else layout.decode.attention.group_size
+
+	def _prefill_attn_tp_size(self) -> int:
+		"""The prefill attention group size, read from the prefill phase's own
+		layout (C1: each phase owns its layout); 1 for a manager that declares
+		no layout."""
+		layout = self._server_layout
+		return 1 if layout is None else layout.prefill.attention.group_size
 
 	def _decode_phase_context(self) -> DecodePhaseContext:
 		return DecodePhaseContext(
@@ -2169,6 +2198,14 @@ class BatchGenWorker:
 			prefix_runtime=getattr(self, "prefix_cache_runtime_config", None),
 			chunk_sizer=getattr(self, "adaptive_chunk_sizer", None),
 			parallel_manager=getattr(self, "parallel_manager", None),
+		)
+
+	def _prefill_phase_context(self) -> PrefillPhaseContext:
+		decode_ctx = self._decode_phase_context()
+		return PrefillPhaseContext(
+			facts=decode_ctx.facts,
+			sched=decode_ctx.sched,
+			prefix=self._prefix,
 		)
 
 	def _owns_local_sequence(self, seq) -> bool:
@@ -3956,6 +3993,7 @@ class BatchGenWorker:
 			self.global_rank,
 			self.world_size
 		)
+		self._resolve_server_layout()
 		self._verify_manager_phase_contract()
 
 		# The token pool is fixed for the lifetime of the worker. Its byte budget
@@ -5357,24 +5395,11 @@ class BatchGenWorker:
 		)
 
 	def _prefill_candidate_digest(self, candidate_uuids: List[str]) -> int:
-		"""Digest the inputs the prefill candidate snapshot is derived from.
-
-		Covers identity and ORDER plus every field
-		``_make_prefill_selection_request`` reads, including the two that decide
-		a candidate's node (``assigned_rank``, ``decode_dp_group``). Gathered by
-		the admission collective so a divergence is named instead of letting one
-		rank reclaim, raise, or enter a collective the others do not.
-		"""
-		hasher = hashlib.blake2b(digest_size=7)
-		for uuid in candidate_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			hasher.update(
-				f"{uuid}:{int(seq.status)}:{seq.global_idx}:{seq.prompt_length}:"
-				f"{seq.kv_token_budget}:{seq.PAGE_SIZE}:{seq.assigned_rank}:"
-				f"{seq.decode_dp_group}:"
-				f"{getattr(seq, 'prefill_order', None)};".encode()
-			)
-		return int.from_bytes(hasher.digest(), "little")
+		"""Delegate: the moved statements live in ``admission.prefill_selection``."""
+		from batchgen.worker.admission import prefill_selection
+		return prefill_selection._prefill_candidate_digest(
+			self._prefill_phase_context(), candidate_uuids
+		)
 
 	def _prefill_prefix_pressure(self) -> Tuple[int, int, int]:
 		"""``(resident_nodes, active_attachments, pending_loads)`` of this node.
@@ -5531,6 +5556,7 @@ class BatchGenWorker:
 			full_seq_lengths,
 			compute_cached_tokens,
 			token_cap=self._server_prefill_token_cap(),
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
@@ -5660,64 +5686,21 @@ class BatchGenWorker:
 		per_rank_sequence_free=None, per_node_sequence_free=None,
 		per_node_host_reclaimable=None,
 	) -> PrefillSelectionRequest:
-		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
+		"""Delegate: the moved statements live in ``admission.prefill_selection``.
+
+		The shared-prefix segment resolution stays here, in its original
+		first-statement position: its chain (the trajectory token store, the
+		prefix-pool gating) is worker state, and the context never carries a
+		bound worker method, so the delegator resolves and hands the VALUE in.
+		"""
+		from batchgen.worker.admission import prefill_selection
 		shared_segments = self._admission_shared_prefix_segments(all_candidates)
-		self._prefix.shared_prefix_credit_applied = bool(shared_segments)
-		candidates = []
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			seq_node = self.rank_ctx.node_of(seq.assigned_rank)
-			G = self._decode_attn_tp_size()
-			if G > 1:
-				if seq.decode_dp_group is None:
-					raise RuntimeError(
-						f"sequence {uuid[:8]} has no decode_dp_group before "
-						"TP prefill selection"
-					)
-				from batchgen.decode_dp_group import host_kv_owner_rank
-				seq_node = self.rank_ctx.node_of(
-					host_kv_owner_rank(seq.decode_dp_group, G)
-				)
-			candidates.append(PrefillCandidate(
-				uuid=uuid,
-				assigned_rank=seq.assigned_rank,
-				node_id=seq_node,
-				is_evicted=(seq.status == SequenceStatus.EVICTED),
-				global_idx=seq.global_idx,
-				total_decoded_before_eviction=getattr(
-					seq, "total_decoded_before_eviction", 0
-				),
-				prompt_length=seq.prompt_length,
-				kv_token_budget=seq.kv_token_budget,
-				page_size=seq.PAGE_SIZE,
-				# G>1 no longer replicates the reservation: only the serve-group
-				# leader (_owns_host_kv) registers / allocates in the per-node
-				# shared host region and the other G-1 ranks mirror its page
-				# table (_mirror_group_host_kv), so one admitted sequence costs
-				# the node allocator exactly one copy of req_pages.
-				host_kv_replication_factor=1,
-				prefill_order=getattr(seq, "prefill_order", None),
-				shared_prefix_segments=shared_segments.get(uuid, ()),
-			))
-		return PrefillSelectionRequest(
-			candidates=tuple(candidates),
-			per_node_host_free=tuple(per_node_host_free),
-			chunk_size=chunk_size,
-			num_nodes=num_nodes,
-			gpus_per_node=self.local_world_size,
-			initial_gpu_page_buffer=_sequence_module.INITIAL_GPU_PAGE_BUFFER,
-			per_rank_sequence_free=(
-				tuple(per_rank_sequence_free)
-				if per_rank_sequence_free is not None else None
-			),
-			per_node_sequence_free=(
-				tuple(per_node_sequence_free)
-				if per_node_sequence_free is not None else None
-			),
-			per_node_host_reclaimable=(
-				tuple(per_node_host_reclaimable)
-				if per_node_host_reclaimable is not None else None
-			),
+		return prefill_selection._make_prefill_selection_request(
+			self._prefill_phase_context(), all_candidates, shared_segments,
+			per_node_host_free, num_nodes, chunk_size,
+			per_rank_sequence_free=per_rank_sequence_free,
+			per_node_sequence_free=per_node_sequence_free,
+			per_node_host_reclaimable=per_node_host_reclaimable,
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
@@ -6248,12 +6231,18 @@ class BatchGenWorker:
 		)
 		from batchgen.worker.server_config import ServerConfig
 
-		# The layout object is what the report is rendered from, and a layout
-		# outside the family's implemented list is refused here by name.
-		layout, declaration = resolve_server_layout(
+		# The report is rendered from the layout resolved when the manager was
+		# built. What the manager declares now, with the model built, must be
+		# that same layout: the reported layout is the executed one.
+		layout = self._server_layout
+		built, declaration = resolve_server_layout(
 			self.parallel_manager, int(self.world_size), self._graph
 		)
-		self._server_layout = layout
+		if built != layout:
+			raise RuntimeError(
+				"the layout the built model declares differs from the layout "
+				f"resolved at construction: built={built} resolved={layout}"
+			)
 		slots = (
 			undeclared_slots()
 			if layout is None
@@ -8122,7 +8111,10 @@ class BatchGenWorker:
 		# The engine never reaches into the worker for the cap: the delegator
 		# resolves the server mode's one cap and hands it over explicitly.
 		return engine._config_prefill_for_batch(
-			self, prefill_uuids, token_cap=self._server_prefill_token_cap()
+			self,
+			prefill_uuids,
+			token_cap=self._server_prefill_token_cap(),
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _load_decode_model(self, comm=None) -> None:
@@ -9140,6 +9132,7 @@ class BatchGenWorker:
 			self._prefill_engine = engine
 		return engine._prefill_prefix_pool_enabled(
 			self,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _pool_prefill_group_safe(self) -> bool:
@@ -9162,6 +9155,7 @@ class BatchGenWorker:
 			self._prefill_engine = engine
 		return engine._prefill_pool_group(
 			self,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_free_state_slots(self) -> int:
@@ -9222,6 +9216,7 @@ class BatchGenWorker:
 		return engine._cached_prefix_rank_cost_profile(
 			self,
 			disabled,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
@@ -9557,6 +9552,7 @@ class BatchGenWorker:
 			self,
 			plan,
 			group,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_layout(self, geometry) -> tuple:
