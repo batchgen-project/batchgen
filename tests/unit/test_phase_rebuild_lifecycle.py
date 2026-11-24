@@ -130,14 +130,22 @@ def _loaded_model_config():
 
 
 def _engine_config(**basic):
+    from tests.kimi_layout_fixture import planned_kimi_layout
+
     fields = dict(
         distributed_weight_sharded=False,
         distributed_weight_transport="host_rdma",
-        attention_group_size=G,
         stream_all_modules=False,
         device_torch="cpu",
     )
+    # The manager reads its attention group from the planned layout.
+    group = basic.pop("attention_group_size", G)
     fields.update(basic)
+    fields["server_layout"] = planned_kimi_layout(
+        world_size=WORLD, group=group,
+        stream_all=fields["stream_all_modules"],
+        distributed=fields["distributed_weight_sharded"],
+    )
     return SimpleNamespace(
         Basic_Config=SimpleNamespace(**fields),
         GPU_Buffer_Config=SimpleNamespace(

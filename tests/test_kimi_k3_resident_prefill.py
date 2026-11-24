@@ -78,12 +78,28 @@ def _psm_stub(**attrs):
     obj._prefill_moe_mode = "streamed_sp8"
     obj._latent_tp_planned = False
     obj._decode_graph = None
-    obj.engine_config = SimpleNamespace(
-        Basic_Config=SimpleNamespace(prefill_moe_mode=None)
-    )
+    obj.engine_config = SimpleNamespace(Basic_Config=SimpleNamespace())
     for key, value in attrs.items():
         setattr(obj, key, value)
+    _plan(obj)
     return obj
+
+
+def _plan(obj, mode=None, ep=None):
+    """What the initializer does before the manager exists: the planner
+    resolves the layout from the launch request and the weight topology."""
+    from tests.kimi_layout_fixture import planned_kimi_layout
+
+    obj.engine_config.Basic_Config.server_layout = planned_kimi_layout(
+        world_size=16,
+        group=obj._attn_tp_size,
+        stream_all=obj._stream_all_modules,
+        distributed=obj._distributed_weight_sharded,
+        latent_tp=obj._latent_tp_planned,
+        mode=mode,
+        ep=ep,
+        is_k3=obj._is_k3,
+    )
 
 
 def test_distributed_weights_accept_resident_ep_only_after_the_shard_exists():
@@ -140,8 +156,7 @@ def test_distributed_weights_default_to_streamed_sp8():
 
 def _requested(mode, ep=None, **attrs):
     psm = _psm_stub(**attrs)
-    psm.engine_config.Basic_Config.prefill_moe_mode = mode
-    psm.engine_config.Basic_Config.prefill_moe_ep = ep
+    _plan(psm, mode, ep)
     return psm
 
 

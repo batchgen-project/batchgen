@@ -315,11 +315,37 @@ def kimi_linear_layout(
     )
 
 
-def kimi_linear_server_layout(engine_config, world_size: int, *, is_k3: bool):
-    """The server layout, resolved from the planned config before the model
-    manager is built."""
+def prefill_moe_path(prefill_moe) -> str:
+    """The prefill MoE execution path (``PREFILL_MOE_MODES``) of a planned
+    layout's prefill MoE slot: the inverse of ``kimi_linear_layout``."""
+    from batchgen.parallel_declaration import (
+        ParallelDeclarationError,
+        RESIDENCY_RESIDENT,
+        RESIDENCY_STREAMED,
+        SCHEME_DP,
+        SCHEME_EP,
+    )
+
+    key = (prefill_moe.scheme, prefill_moe.residency)
+    if key == (SCHEME_DP, RESIDENCY_STREAMED):
+        return "streamed"
+    if key == (SCHEME_EP, RESIDENCY_STREAMED):
+        return "streamed_sp8"
+    if key == (SCHEME_EP, RESIDENCY_RESIDENT):
+        return "resident_ep"
+    raise ParallelDeclarationError(
+        f"Kimi-Linear has no prefill MoE path for {prefill_moe.render()}"
+    )
+
+
+def kimi_linear_server_layout(
+    engine_config, world_size: int, *, is_k3: bool, attention_group_size: int
+):
+    """The server layout, resolved from the launch's attention group size and
+    the planned config before the model manager is built. The layout is the
+    only carrier of the group size: the manager reads it from here."""
     basic = engine_config.Basic_Config
-    G = int(getattr(basic, "attention_group_size", 1))
+    G = int(attention_group_size)
     stream_all = bool(getattr(basic, "stream_all_modules", False))
     distributed = bool(getattr(basic, "distributed_weight_sharded", False))
     latent_tp = plans_latent_tp_sharding(
@@ -598,12 +624,6 @@ class KimiLinearPlanner(BasePlanner):
         # routed experts. Read by the PSM at configure_prefill. OFF for the
         # 48B so its validated path keeps every weight resident, bit-for-bit.
         self.config.Basic_Config.stream_all_modules = self.stream_all_modules
-
-        # M2a — head-parallel TP degree for KDA (G). Read by the PSM
-        # (__init__) to derive the attn_tp sub-group layout. 1 = single-shard
-        # (unchanged); >1 shards kda_num_heads across G ranks with an o_proj
-        # all_reduce.
-        self.config.Basic_Config.attention_group_size = self.attention_group_size
 
         if self.is_k3:
             self._adjust_config_for_k3(k3_profile)
