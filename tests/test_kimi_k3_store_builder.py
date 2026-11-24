@@ -333,8 +333,28 @@ def test_replicated_prefix_is_packed_in_source_read_order(env):
         assert record.owner == sb.REPLICATED_OWNER
         assert record.compact_offset == cursor
         cursor += record.byte_size
-    assert cursor == plan.replicated_bytes
-    assert plan.replicated_bytes > 0
+    assert cursor == plan.replicated_payload_bytes > 0
+    # The experts begin on the next page boundary after the prefix.
+    assert plan.replicated_bytes % sb.STORE_PAGE_BYTES == 0
+    assert 0 <= plan.replicated_bytes - cursor < sb.STORE_PAGE_BYTES
+    assert plan.padding_bytes == plan.replicated_bytes - cursor
+
+
+def test_expert_modules_start_on_page_boundaries_when_the_module_is_page_sized(env):
+    """With a page-multiple module size every expert module starts on a page
+    boundary, which is what lets the engine pin the store in several
+    registrations cut between tensors."""
+    plan = env.plan(0)
+    starts = sorted(
+        {
+            record.compact_offset
+            for record in plan.expert_records
+            if (record.compact_offset - plan.replicated_bytes) % plan.module_bytes == 0
+        }
+    )
+    assert starts and starts[0] == plan.replicated_bytes
+    page_sized = plan.module_bytes % sb.STORE_PAGE_BYTES == 0
+    assert all(start % sb.STORE_PAGE_BYTES == 0 for start in starts) == page_sized or len(starts) == 1
 
 
 def test_store_bytes_is_an_exact_identity(env):
@@ -347,7 +367,7 @@ def test_store_bytes_is_an_exact_identity(env):
         _byte_size(dtype, shape) for _, dtype, shape in _declarations(env.cfg)
     )
     assert (
-        plan.replicated_bytes + len(MOE_LAYERS) * EXPERTS * plan.module_bytes
+        plan.replicated_payload_bytes + len(MOE_LAYERS) * EXPERTS * plan.module_bytes
         == checkpoint_bytes
     )
 
@@ -664,7 +684,11 @@ def test_published_store_is_consumed_through_the_real_loader(env):
         span = blob[row.compact_offset : row.compact_offset + row.byte_size]
         assert span == env.payloads[name], name
         covered += row.byte_size
-    assert covered == config["store_bytes"]
+    # Everything but the page padding after the replicated prefix, which is zeros.
+    padding = config["store_bytes"] - covered
+    assert 0 <= padding < sb.STORE_PAGE_BYTES
+    payload_end = config["replicated_bytes"] - padding
+    assert blob[payload_end : config["replicated_bytes"]] == bytes(padding)
     owned = {row.module_key for row in local if row.owner == 1}
     assert owned == {
         f"routed_expert_{layer}_{expert}"
@@ -798,14 +822,22 @@ def test_manifest_records_identity_sizes_and_segment_hashes(env, monkeypatch):
     assert manifest["source"]["model_config"]["digest"] == hashlib.blake2b(
         (env.model_dir / "config.json").read_bytes(), digest_size=16
     ).hexdigest()
-    assert sum(s["bytes_copied"] for s in manifest["source"]["shards"]) == plan.store_bytes
+    assert (
+        sum(s["bytes_copied"] for s in manifest["source"]["shards"]) + plan.padding_bytes
+        == plan.store_bytes
+    )
     assert manifest["build_command"].startswith(f"python -m {sb.BUILDER_MODULE} ")
 
     segments = manifest["store"]["segments"]
     assert len(segments) > 3
+    # Segments are contiguous ranges that cover the store in order; the only
+    # gap is the page padding after the replicated prefix.
     cursor = 0
     for segment in segments:
-        assert segment["offset"] == cursor
+        if segment["offset"] != cursor:
+            assert cursor == plan.replicated_payload_bytes
+            assert segment["offset"] == plan.replicated_bytes
+            cursor = segment["offset"]
         cursor += segment["bytes"]
     assert cursor == plan.store_bytes
 

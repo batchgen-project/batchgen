@@ -244,3 +244,71 @@ def test_host_kv_layer_extents_plan_cuts_on_layer_boundaries():
     boundaries = {i * layer_bytes for i in range(layers + 1)}
     for begin, end in segments:
         assert begin in boundaries and end in boundaries
+
+
+# --------------------------------------------------------------------------
+# Distributed compact store (Weights_Storage::InitDistributed, host_rdma)
+# --------------------------------------------------------------------------
+
+def test_distributed_store_is_pinned_in_planned_segments_not_in_one_call():
+    section = _section(
+        WEIGHTS_STORAGE.read_text(), "void Weights_Storage::InitDistributed(",
+        "pinned_compact_bytes += ",
+    )
+    assert "{{0, this->compact_bytes_}}" not in section
+    assert "plan_host_registration_segments(" in section
+    assert "std::move(local_extents), this->compact_bytes_" in section
+    assert "kMaxHostRegistrationBytes" in section
+    # Every range that is registered, on either transport, is under the ceiling.
+    assert "exceeds the per-registration ceiling" in section
+
+
+def _compact_store_extents(replicated_payload, module_bytes, modules, tensors_per_module=6):
+    """The builder's layout: packed replicated tensors, page padding, then
+    uniform expert modules of back-to-back tensors."""
+    extents, cursor = [], 0
+    while cursor < replicated_payload:
+        size = min(replicated_payload - cursor, 3 * PAGE + 513)
+        extents.append((cursor, cursor + size))
+        cursor += size
+    base = -(-replicated_payload // PAGE) * PAGE
+    part = module_bytes // tensors_per_module
+    for module in range(modules):
+        start = base + module * module_bytes
+        for index in range(tensors_per_module):
+            end = start + part if index < tensors_per_module - 1 else base + (module + 1) * module_bytes
+            extents.append((start, end))
+            start = end
+    return extents, base + modules * module_bytes
+
+
+def test_a_padded_compact_store_plans_under_the_ceiling():
+    core_engine = _core_engine()
+    module_bytes = 4284 * PAGE  # the K3 routed-expert module, a page multiple
+    extents, total = _compact_store_extents(
+        replicated_payload=40 * module_bytes + 1024, module_bytes=module_bytes, modules=400,
+    )
+    ceiling = 64 * module_bytes
+    segments = core_engine.plan_host_registration_segments(extents, total, ceiling, PAGE)
+    assert len(segments) > 1
+    _assert_valid_plan(segments, extents, total, ceiling)
+
+
+def test_an_unpadded_compact_store_above_the_ceiling_has_no_plan():
+    """Experts packed right after an unaligned prefix start off page
+    boundaries, so no registration boundary exists between them."""
+    core_engine = _core_engine()
+    module_bytes = 4284 * PAGE
+    prefix = 40 * module_bytes + 1024
+    extents = [(0, prefix)]
+    part = module_bytes // 6
+    for module in range(400):
+        start = prefix + module * module_bytes
+        for index in range(6):
+            end = start + part if index < 5 else prefix + (module + 1) * module_bytes
+            extents.append((start, end))
+            start = end
+    with pytest.raises(RuntimeError):
+        core_engine.plan_host_registration_segments(
+            extents, prefix + 400 * module_bytes, 64 * module_bytes, PAGE
+        )

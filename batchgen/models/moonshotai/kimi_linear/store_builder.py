@@ -18,9 +18,14 @@ Layout
 ------
 ``store.bin`` is::
 
-    [ replicated prefix ][ layer 1 local experts ][ layer 2 ... ] ... [ layer L ... ]
+    [ replicated prefix ][ pad ][ layer 1 local experts ][ layer 2 ... ] ... [ layer L ... ]
 
-with no padding anywhere.  A routed-expert module begins at
+The only padding is the zero bytes that round the replicated prefix up to a
+page boundary (``STORE_PAGE_BYTES``), so that ``replicated_bytes`` and, with a
+page-multiple ``module_bytes``, every routed-expert module start are page
+aligned: the engine pins the store for DMA in several registrations, and a
+registration can only begin on a page boundary between two tensors.  A
+routed-expert module begins at
 
     replicated_bytes
       + ((layer - 1) * experts_per_owner + expert % experts_per_owner)
@@ -241,9 +246,15 @@ DTYPE_ITEMSIZE = {
 
 BUILDER_MODULE = "batchgen.models.moonshotai.kimi_linear.store_builder"
 #: Bumped whenever the bytes or rows a given checkpoint produces change.
-STORE_BUILDER_VERSION = 1
+#: 2: the replicated prefix is padded to a page boundary.
+STORE_BUILDER_VERSION = 2
+#: The replicated prefix is padded to a multiple of this, so expert modules
+#: start on page boundaries (see the module docstring).
+STORE_PAGE_BYTES = 4096
 MANIFEST_FORMAT = "batchgen.kimi_k3.distributed_store_manifest"
-MANIFEST_FORMAT_VERSION = 1
+#: 2: the store layout pads the replicated prefix to a page boundary. The
+#: launch preflight refuses a store of another version with the rebuild command.
+MANIFEST_FORMAT_VERSION = 2
 STORE_FILE_NAME = "store.bin"
 METADATA_FILE_NAME = "metadata.tsv"
 MANIFEST_FILE_NAME = "store_manifest.json"
@@ -334,8 +345,12 @@ class StorePlan:
     n_experts: int
     experts_per_owner: int
     module_bytes: int
+    #: Where the routed experts begin: the replicated tensors' bytes rounded
+    #: up to ``STORE_PAGE_BYTES`` (``replicated_payload_bytes`` + zero padding).
     replicated_bytes: int
     store_bytes: int
+    #: The bytes of the replicated tensors themselves.
+    replicated_payload_bytes: int = 0
     #: Metadata emission order: replicated rows in prefix order, then every
     #: node's experts by (layer, expert, tensor_key).
     records: List[TensorRecord] = field(default_factory=list)
@@ -344,6 +359,11 @@ class StorePlan:
     shards: List[ShardMetadata] = field(default_factory=list)
     #: Tensors under a :data:`K3_IGNORE_RULES` root, carried in the skeleton.
     ignored_tensors: int = 0
+
+    @property
+    def padding_bytes(self) -> int:
+        """Zero bytes between the last replicated tensor and the experts."""
+        return self.replicated_bytes - self.replicated_payload_bytes
 
     @property
     def local_records(self) -> List[TensorRecord]:
@@ -755,7 +775,9 @@ def build_store_plan(
     for record in replicated:
         record.compact_offset = cursor
         cursor += record.byte_size
-    replicated_bytes = cursor
+    replicated_payload_bytes = cursor
+    # Round the experts' base up to a page boundary (see the module docstring).
+    replicated_bytes = -(-cursor // STORE_PAGE_BYTES) * STORE_PAGE_BYTES
 
     store_bytes = replicated_bytes + n_layers * experts_per_owner * module_bytes
 
@@ -798,6 +820,7 @@ def build_store_plan(
         module_bytes=module_bytes,
         replicated_bytes=replicated_bytes,
         store_bytes=store_bytes,
+        replicated_payload_bytes=replicated_payload_bytes,
         records=records,
         replicated_records=replicated,
         expert_records=expert_records,
@@ -895,22 +918,33 @@ def _validate_plan_bounds(
         for shard in shards
         for (_, _, _, byte_size) in shard.state_dict.values()
     )
+    if not 0 <= plan.padding_bytes < STORE_PAGE_BYTES or (
+        plan.replicated_bytes % STORE_PAGE_BYTES
+    ):
+        raise K3StoreBuilderError(
+            f"replicated prefix of {plan.replicated_payload_bytes} B is not "
+            f"padded to the next {STORE_PAGE_BYTES} B boundary: experts begin "
+            f"at {plan.replicated_bytes}"
+        )
     accounted = (
-        plan.replicated_bytes
+        plan.replicated_payload_bytes
         + plan.n_layers * plan.n_experts * plan.module_bytes
     )
     if accounted != checkpoint_bytes:
         raise K3StoreBuilderError(
-            f"replicated {plan.replicated_bytes} B + "
+            f"replicated {plan.replicated_payload_bytes} B + "
             f"{plan.n_layers}x{plan.n_experts}x{plan.module_bytes} B does not "
             f"account for the checkpoint's {checkpoint_bytes} B"
         )
 
 
 def _validate_local_tiling(plan: StorePlan) -> None:
-    """This node's spans cover ``[0, store_bytes)`` exactly once."""
+    """This node's spans cover ``[0, store_bytes)`` exactly once, except the
+    padding ``[replicated_payload_bytes, replicated_bytes)``."""
     cursor = 0
     for record in sorted(plan.local_records, key=lambda item: item.compact_offset):
+        if cursor == plan.replicated_payload_bytes:
+            cursor = plan.replicated_bytes
         if record.compact_offset != cursor:
             raise K3StoreBuilderError(
                 f"local spans do not tile the store: {record.module_key}/"
@@ -918,6 +952,8 @@ def _validate_local_tiling(plan: StorePlan) -> None:
                 f"expected {cursor}"
             )
         cursor += record.byte_size
+    if cursor == plan.replicated_payload_bytes:
+        cursor = plan.replicated_bytes
     if cursor != plan.store_bytes:
         raise K3StoreBuilderError(
             f"local spans cover {cursor} B of a {plan.store_bytes} B store"
@@ -1404,12 +1440,13 @@ def self_check(plan: StorePlan, store_path: Path, written: int) -> None:
         raise K3StoreBuilderError(
             f"{store_path} is {size} B, expected {plan.store_bytes} B"
         )
-    # Every local byte written exactly once: the replicated prefix plus this
-    # node's contiguous expert region is the whole file, with no padding.
-    if written != plan.store_bytes:
+    # Every local byte written exactly once: the replicated tensors plus this
+    # node's contiguous expert region is the whole file but the page padding
+    # after the prefix, which stays the zeros the file was created with.
+    if written + plan.padding_bytes != plan.store_bytes:
         raise K3StoreBuilderError(
-            f"wrote {written} B into a {plan.store_bytes} B store; the local "
-            "spans do not tile it exactly"
+            f"wrote {written} B (+{plan.padding_bytes} B padding) into a "
+            f"{plan.store_bytes} B store; the local spans do not tile it exactly"
         )
     local_experts = {
         record.module_key
@@ -1436,14 +1473,16 @@ def segment_spans(
     spans: Sequence[Span], target_bytes: Optional[int] = None
 ) -> List[List[Span]]:
     """Group offset-ordered spans into runs of at most ``target_bytes``
-    (default :data:`SEGMENT_TARGET_BYTES`)."""
+    (default :data:`SEGMENT_TARGET_BYTES`). A segment is one contiguous byte
+    range: the page padding after the replicated prefix ends a segment."""
     if target_bytes is None:
         target_bytes = SEGMENT_TARGET_BYTES
     segments: List[List[Span]] = []
     current: List[Span] = []
     current_bytes = 0
     for span in spans:
-        if current and current_bytes + span[2] > target_bytes:
+        contiguous = not current or current[-1][1] + current[-1][2] == span[1]
+        if current and (current_bytes + span[2] > target_bytes or not contiguous):
             segments.append(current)
             current, current_bytes = [], 0
         current.append(span)
@@ -2194,7 +2233,8 @@ def manifest_segment_spans(
     """This node's tensor spans grouped into the manifest's store segments.
 
     Reads ``metadata.tsv`` under the engine's row contract, requires this
-    node's rows to tile the store exactly, and requires every manifest
+    node's rows to tile the store (but for the page padding after the
+    replicated prefix), and requires every manifest
     segment to start on a row and cover a whole number of rows. A segment's
     manifest digest is the rollup of its spans' tensor digests in this order
     (:func:`verify_store`), so these spans are what any re-hash of the store
@@ -2219,8 +2259,17 @@ def manifest_segment_spans(
         ),
         key=lambda span: span[1],
     )
+    # The rows tile the store but for the page padding that ends the
+    # replicated prefix: the experts begin at replicated_bytes.
+    replicated_bytes = int(config["replicated_bytes"])
     cursor = 0
     for row, offset, byte_size in local:
+        if (
+            offset != cursor
+            and offset == replicated_bytes
+            and 0 < offset - cursor < STORE_PAGE_BYTES
+        ):
+            cursor = offset
         if offset != cursor:
             raise K3StoreBuilderError(
                 f"node {node_rank}'s metadata rows do not tile the store: row "
