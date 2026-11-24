@@ -241,10 +241,21 @@ def _snapshot_worker(**overrides):
     for name, value in overrides.items():
         setattr(worker, name, value)
     methods = load_worker_methods(
-        ["_snapshot_server_config", "_resolve_server_layout"], {}
+        [
+            "_snapshot_server_config",
+            "_check_planned_server_layout",
+            "_check_requested_group_sizes",
+            "_resolve_server_layout",
+        ],
+        {},
     )
+    worker._check_requested_group_sizes = lambda model, layout: methods[
+        "_check_requested_group_sizes"
+    ](worker, model, layout)
     if "_server_layout" not in overrides:
-        # What worker construction does right after it builds the manager.
+        # What worker construction does around building the manager: the
+        # planned layout is checked first, the built manager right after.
+        methods["_check_planned_server_layout"](worker, type(worker.parallel_manager))
         methods["_resolve_server_layout"](worker)
     return worker, methods["_snapshot_server_config"]
 

@@ -23,7 +23,7 @@ import torch
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
 from .config import MiniMaxM25Config
-from .planner import MiniMaxM25Planner
+from .planner import MiniMaxM25Planner, minimax_m25_server_layout
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -58,6 +58,10 @@ class MiniMaxM25Initializer:
         self.planner = MiniMaxM25Planner()
         self.engine_config = self.planner.generate_config(
             self.engine_config, self.model_config.model_type
+        )
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = minimax_m25_server_layout(
+            self.engine_config, self.engine_config.Basic_Config.world_size
         )
 
         # Post-planner fixups (depend on values set by planner)

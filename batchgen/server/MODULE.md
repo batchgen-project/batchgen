@@ -78,10 +78,17 @@ the outgoing generation is still current, so its identity stays reported next
 to state `restarting`; after a failed restart it is null. The identity names a
 revision, never a directory.
 
+The layout is resolved before the model manager is built. Each family's
+planner resolves the two phase layouts from the planned config and the world
+size and stores them as `Basic_Config.server_layout`; the worker checks that
+layout against the family's implemented table (`SUPPORTED_LAYOUTS`) before it
+constructs the manager, and refuses a manager that was built for another
+layout right after construction and again when the report is snapshotted.
+
 The publication also carries the cohort's `server_config`
-(`batchgen/worker/server_config.py`): the parallel layout the model's
-strategy manager declares per phase (`batchgen/parallel_declaration.py`;
-an undeclared manager reports `undeclared`, never a guessed default), the
+(`batchgen/worker/server_config.py`): that parallel layout per phase
+(`batchgen/parallel_declaration.py`; a manager whose family plans and
+declares none reports `undeclared`, never a guessed default), the
 CUDA-graph flag with the owning model's installed or captured bucket ladder, the host- and device-KV
 pool sizes and page counts, the GPU memory fraction and the derived
 scheduling capacity. Local rank 0 of each node snapshots it while the decode

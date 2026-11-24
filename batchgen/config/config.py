@@ -79,6 +79,10 @@ class BasicConfig:
     # Server-level prefill MoE mode (--prefill-moe-mode). None = the model's
     # default (streaming); every prefill wave of the server uses one mode.
     prefill_moe_mode: Optional[str] = None
+    # The server's two phase layouts (parallel_declaration.ServerLayout),
+    # resolved by the model's planner before the model manager is built; the
+    # manager is built for exactly this layout.
+    server_layout: Optional[Any] = None
     enable_cuda_graphs: bool = False  # Default off (128K+ NCCL corruption when graph warmup runs MoE AllGather)
     cuda_graph_bucket_sizes: Optional[List[int]] = None
 

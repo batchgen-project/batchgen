@@ -98,6 +98,195 @@ def requested_attention_group_size(*, prefill_tp, decode_tp, environ) -> int:
     return size
 
 
+PREFILL_MOE_MODES = ("streamed", "resident_ep", "streamed_sp8")
+
+
+def plans_latent_tp_sharding(*, is_k3: bool, module_batching_config, attention_group_size: int) -> bool:
+    """Whether the LatentMoE projections are TP-sharded on this deployment: a
+    function of the planner flag and the attention group size only, so the
+    prefill mode is known before any model is built."""
+    return bool(
+        is_k3
+        and getattr(module_batching_config, "k3_shard_latent_projections", False)
+        and int(attention_group_size) > 1
+    )
+
+
+def validated_prefill_moe_mode(
+    mode, *, is_k3: bool, latent_tp_planned: bool,
+    distributed_weight_sharded: bool, resident_shard_built: bool,
+) -> str:
+    """Normalize ``mode`` and refuse one this topology cannot run."""
+    value = str(mode or "streamed").strip().lower()
+    if value not in PREFILL_MOE_MODES:
+        raise ValueError(
+            "prefill MoE mode must be 'streamed', 'resident_ep' or "
+            "'streamed_sp8', "
+            f"got {mode!r}"
+        )
+    if value in {"resident_ep", "streamed_sp8"} and not is_k3:
+        raise ValueError(
+            f"{value} prefill is implemented only for Kimi-K3"
+        )
+    if value == "streamed" and latent_tp_planned:
+        # The streamed path would hand each rank's latent column slice to
+        # full-width experts (activation contract violation 93 layers in).
+        raise ValueError(
+            "prefill MoE mode 'streamed' needs unsharded LatentMoE "
+            "projections; with TP-sharded projections use 'streamed_sp8' "
+            "or 'resident_ep'"
+        )
+    if (
+        distributed_weight_sharded
+        and value != "streamed_sp8"
+        and not (value == "resident_ep" and resident_shard_built)
+    ):
+        # resident_ep is legal once the shard exists: it was built from
+        # this node's ingress store and the resident layer never requests
+        # an expert by name, so no cross-shard fetch can happen.
+        raise ValueError(
+            "distributed K3 host weights require prefill MoE mode "
+            "'streamed_sp8' (the legacy replicated path would request "
+            "experts outside this worker's ingress shard); 'resident_ep' "
+            "is accepted only after the resident EP shard has been built"
+        )
+    return value
+
+
+def server_prefill_moe_mode(
+    *, requested, is_k3: bool, latent_tp_planned: bool,
+    distributed_weight_sharded: bool, stream_all_modules: bool,
+    attention_group_size: int,
+) -> str:
+    """The server prefill MoE mode, fixed for the server's lifetime.
+
+    Without ``--prefill-moe-mode`` it follows the weight topology:
+    ``streamed`` feeds each rank's full-width latent into full-width experts,
+    so it is only valid while the LatentMoE projections are unsharded; once
+    they are TP-sharded, or the host weights are distributed, prefill goes
+    through ``streamed_sp8``. A requested mode is validated against the
+    topology, so one it cannot run is refused before any model is built.
+    """
+    if requested is None:
+        if distributed_weight_sharded or latent_tp_planned:
+            return "streamed_sp8"
+        return "streamed"
+    mode = validated_prefill_moe_mode(
+        requested, is_k3=is_k3, latent_tp_planned=latent_tp_planned,
+        distributed_weight_sharded=distributed_weight_sharded,
+        resident_shard_built=True,
+    )
+    if mode == "resident_ep" and (
+        stream_all_modules or int(attention_group_size) <= 1
+    ):
+        raise ValueError(
+            "--prefill-moe-mode resident_ep needs K3's resident TP "
+            "attention layout (attention_group_size > 1, "
+            "stream_all_modules off)"
+        )
+    if mode == "streamed_sp8" and (
+        stream_all_modules or int(attention_group_size) != 8
+    ):
+        raise ValueError(
+            "--prefill-moe-mode streamed_sp8 needs K3's resident TP8 "
+            "attention layout (attention_group_size == 8, "
+            "stream_all_modules off)"
+        )
+    return mode
+
+
+def kimi_linear_layout(
+    *, world_size: int, attention_group_size: int, stream_all_modules: bool,
+    prefill_moe_mode: str, decode_moe_mode: str,
+):
+    """The family's layout for the given facts.
+
+    Attention: head-parallel over the attention group when it is larger than
+    one, plain DP otherwise; resident in decode always, and in prefill unless
+    all modules are streamed. MoE: ``streamed`` runs every expert replicated
+    per rank with the weights streamed from host; ``streamed_sp8`` partitions
+    the routed experts over the ranks of one attention group, streamed;
+    ``resident_ep`` partitions them over the world with the shard resident.
+    An unknown mode fails by name.
+    """
+    from batchgen.parallel_declaration import (
+        ModuleParallelism,
+        PHASE_DECODE,
+        PHASE_PREFILL,
+        ParallelDeclarationError,
+        PhaseLayout,
+        RESIDENCY_RESIDENT,
+        RESIDENCY_STREAMED,
+        SCHEME_DP,
+        SCHEME_EP,
+        SCHEME_TP,
+        ServerLayout,
+    )
+
+    world_size = int(world_size)
+    G = int(attention_group_size)
+    scheme = SCHEME_TP if G > 1 else SCHEME_DP
+    group = G if G > 1 else 1
+
+    def moe(mode: str, phase: str) -> ModuleParallelism:
+        if mode == "streamed":
+            return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
+        if mode == "streamed_sp8":
+            return ModuleParallelism(SCHEME_EP, RESIDENCY_STREAMED, group_size=G)
+        if mode == "resident_ep":
+            return ModuleParallelism(
+                SCHEME_EP, RESIDENCY_RESIDENT, group_size=world_size
+            )
+        raise ParallelDeclarationError(f"undeclarable {phase} MoE mode {mode!r}")
+
+    return ServerLayout(
+        prefill=PhaseLayout(
+            PHASE_PREFILL,
+            ModuleParallelism(
+                scheme,
+                RESIDENCY_STREAMED if stream_all_modules else RESIDENCY_RESIDENT,
+                group_size=group,
+            ),
+            moe(prefill_moe_mode, "prefill"),
+            world_size,
+        ),
+        decode=PhaseLayout(
+            PHASE_DECODE,
+            ModuleParallelism(scheme, RESIDENCY_RESIDENT, group_size=group),
+            moe(decode_moe_mode, "decode"),
+            world_size,
+        ),
+    )
+
+
+def kimi_linear_server_layout(engine_config, world_size: int, *, is_k3: bool):
+    """The server layout, resolved from the planned config before the model
+    manager is built."""
+    basic = engine_config.Basic_Config
+    G = int(getattr(basic, "attention_group_size", 1))
+    stream_all = bool(getattr(basic, "stream_all_modules", False))
+    distributed = bool(getattr(basic, "distributed_weight_sharded", False))
+    latent_tp = plans_latent_tp_sharding(
+        is_k3=is_k3,
+        module_batching_config=engine_config.Module_Batching_Config,
+        attention_group_size=G,
+    )
+    return kimi_linear_layout(
+        world_size=world_size,
+        attention_group_size=G,
+        stream_all_modules=stream_all,
+        prefill_moe_mode=server_prefill_moe_mode(
+            requested=getattr(basic, "prefill_moe_mode", None),
+            is_k3=is_k3,
+            latent_tp_planned=latent_tp,
+            distributed_weight_sharded=distributed,
+            stream_all_modules=stream_all,
+            attention_group_size=G,
+        ),
+        decode_moe_mode=getattr(engine_config.EP_Config, "decode_moe_mode", "resident_ep"),
+    )
+
+
 def kimi_prefix_pool_workspace_bytes(
     *, machine_family: MachineFamily | None, attention_group_size: int,
     is_k3: bool, world_size: int,

@@ -274,66 +274,35 @@ class GptOssParallelStrategyManager:
         )
 
     def parallel_declaration(self, decode_graph_state=None):
-        """GPT-OSS's declared parallel layout (batchgen.parallel_declaration).
+        """GPT-OSS's parallel layout (batchgen.parallel_declaration): the
+        planner's (``planner.gpt_oss_server_layout``), resolved before this
+        manager was built from the same deployment constants
+        ``configure_decoding`` assigns from."""
+        from batchgen.models.openai.gpt_oss_120b.planner import gpt_oss_server_layout
+        from batchgen.parallel_declaration import DecodeGraphDeclaration
 
-        Prefill streams the attention weights and replicates every routed
-        expert per rank — resident unless EP offloading is enabled, which
-        streams them instead. Decode keeps attention resident per rank (pure
-        DP) and partitions the experts over the world; the shard's residency
-        comes from the same deployment-constant planner
-        ``configure_decoding`` assigns from (``_plan_local_expert_split``),
-        so the declaration and the configure can never disagree.
-        """
-        from batchgen.parallel_declaration import (
-            ModuleParallelism,
-            DecodeGraphDeclaration,
-            ParallelDeclaration,
-            RESIDENCY_PARTIAL,
-            RESIDENCY_RESIDENT,
-            RESIDENCY_STREAMED,
-            SCHEME_DP,
-            SCHEME_EP,
-        )
-
-        offloading = bool(self.engine_config.EP_Config.enable_offloading)
-        _, resident, owned = self._plan_local_expert_split()
-        return ParallelDeclaration(
-            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            prefill_moe=ModuleParallelism(
-                SCHEME_DP,
-                RESIDENCY_STREAMED if offloading else RESIDENCY_RESIDENT,
-            ),
-            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
-            decode_moe=ModuleParallelism(
-                SCHEME_EP,
-                RESIDENCY_RESIDENT if resident >= owned else RESIDENCY_PARTIAL,
-                group_size=self.world_size,
-            ),
-            decode_graph=(
-                DecodeGraphDeclaration.off()
-                if decode_graph_state is None
-                else decode_graph_state
-            ),
+        return gpt_oss_server_layout(
+            self.engine_config, self.world_size, self.model_config.num_local_experts
+        ).declaration(
+            DecodeGraphDeclaration.off()
+            if decode_graph_state is None
+            else decode_graph_state
         )
 
     def _plan_local_expert_split(self) -> Tuple[bool, int, int]:
         """(EP offloading on, experts resident per layer, experts owned per layer).
 
-        Derived from the world size and the EP configuration only, so it gives
-        the same answer before and after ``configure_decoding`` assigns the
-        ranges: the reuse decision is asked before the first decode configure.
-        A single-GPU deployment decodes with every expert resident.
-        """
-        if self.world_size <= 1:
-            owned = self.model_config.num_local_experts
-            return False, owned, owned
-        owned = self.NUM_TOTAL_EXPERTS // self.world_size
-        if self.world_size > 8:
-            return False, owned, owned
-        if self.engine_config.EP_Config.enable_offloading:
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            return True, int(owned * (1 - offload_ratio)), owned
-        return False, owned, owned
+        The rule lives with the planner, which resolves the server layout from
+        it before this manager is built; it gives the same answer before and
+        after ``configure_decoding`` assigns the ranges."""
+        from batchgen.models.openai.gpt_oss_120b.planner import gpt_oss_local_expert_split
+
+        return gpt_oss_local_expert_split(
+            self.engine_config.EP_Config,
+            self.world_size,
+            self.model_config.num_local_experts,
+            self.NUM_TOTAL_EXPERTS,
+        )
 
     def _local_routed_experts_fully_resident(self) -> bool:
         """True when this rank keeps every one of its routed experts on GPU."""
