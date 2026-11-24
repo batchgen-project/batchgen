@@ -673,89 +673,49 @@ class KimiLinearParallelStrategyManager:
         )
 
     def _validated_prefill_moe_mode(self, mode, *, resident_shard_built):
-        """Normalize ``mode`` and refuse one this topology cannot run."""
-        value = str(mode or "streamed").strip().lower()
-        if value not in PREFILL_MOE_MODES:
-            raise ValueError(
-                "prefill MoE mode must be 'streamed', 'resident_ep' or "
-                "'streamed_sp8', "
-                f"got {mode!r}"
-            )
-        if value in {"resident_ep", "streamed_sp8"} and not self._is_k3:
-            raise ValueError(
-                f"{value} prefill is implemented only for Kimi-K3"
-            )
-        if value == "streamed" and self._latent_tp_planned:
-            # The streamed path would hand each rank's latent column slice to
-            # full-width experts (activation contract violation 93 layers in).
-            raise ValueError(
-                "prefill MoE mode 'streamed' needs unsharded LatentMoE "
-                "projections; with TP-sharded projections use 'streamed_sp8' "
-                "or 'resident_ep'"
-            )
-        if (
-            getattr(self, "_distributed_weight_sharded", False)
-            and value != "streamed_sp8"
-            and not (value == "resident_ep" and resident_shard_built)
-        ):
-            # resident_ep is legal once the shard exists: it was built from
-            # this node's ingress store and the resident layer never requests
-            # an expert by name, so no cross-shard fetch can happen.
-            raise ValueError(
-                "distributed K3 host weights require prefill MoE mode "
-                "'streamed_sp8' (the legacy replicated path would request "
-                "experts outside this worker's ingress shard); 'resident_ep' "
-                "is accepted only after the resident EP shard has been built"
-            )
-        return value
+        """Normalize ``mode`` and refuse one this topology cannot run. The rule
+        lives with the planner (``planner.validated_prefill_moe_mode``)."""
+        from batchgen.models.moonshotai.kimi_linear.planner import validated_prefill_moe_mode
+
+        return validated_prefill_moe_mode(
+            mode,
+            is_k3=self._is_k3,
+            latent_tp_planned=self._latent_tp_planned,
+            distributed_weight_sharded=getattr(
+                self, "_distributed_weight_sharded", False
+            ),
+            resident_shard_built=resident_shard_built,
+        )
 
     def default_prefill_moe_mode(self):
         """Return the server prefill MoE mode, fixed for the server's lifetime.
 
         The worker reads it once and every prefill wave runs it; no batch
-        changes it. Without ``--prefill-moe-mode`` it follows the weight
-        topology: ``streamed`` feeds each rank's full-width latent into
-        full-width experts, so it is only valid while the LatentMoE
-        projections are unsharded. Once they are TP-sharded (planner
-        ``k3_shard_latent_projections``, TP8 K3, single node or not) each rank
-        holds a column slice and prefill must go through ``streamed_sp8``,
-        which rebuilds the full projections per phase. Distributed host
-        weights force ``streamed_sp8`` for the same reason plus ingress.
-
-        ``--prefill-moe-mode`` (``Basic_Config.prefill_moe_mode``) replaces
-        that default and is validated here, at construction, so a mode the
-        topology cannot run is refused before any model is built. The
-        resident EP shard a distributed ``resident_ep`` server needs is built
-        by the startup decode configure before the worker installs the mode,
-        and ``set_prefill_moe_mode`` re-checks it then.
+        changes it. The rule lives with the planner
+        (``planner.server_prefill_moe_mode``), which resolves the server
+        layout from it before this manager is built: without
+        ``--prefill-moe-mode`` the mode follows the weight topology, and a
+        requested mode the topology cannot run is refused here, at
+        construction, before any model is built. The resident EP shard a
+        distributed ``resident_ep`` server needs is built by the startup
+        decode configure before the worker installs the mode, and
+        ``set_prefill_moe_mode`` re-checks it then.
         """
-        requested = getattr(
-            self.engine_config.Basic_Config, "prefill_moe_mode", None
+        from batchgen.models.moonshotai.kimi_linear.planner import server_prefill_moe_mode
+
+        return server_prefill_moe_mode(
+            requested=getattr(
+                self.engine_config.Basic_Config, "prefill_moe_mode", None
+            ),
+            is_k3=self._is_k3,
+            latent_tp_planned=self._latent_tp_planned,
+            distributed_weight_sharded=self._distributed_weight_sharded,
+            stream_all_modules=self._stream_all_modules,
+            attention_group_size=self._attn_tp_size,
+            requested_ep=getattr(
+                self.engine_config.Basic_Config, "prefill_moe_ep", None
+            ),
         )
-        if requested is None:
-            if self._distributed_weight_sharded or self._latent_tp_planned:
-                return "streamed_sp8"
-            return "streamed"
-        mode = self._validated_prefill_moe_mode(
-            requested, resident_shard_built=True
-        )
-        if mode == "resident_ep" and (
-            self._stream_all_modules or self._attn_tp_size <= 1
-        ):
-            raise ValueError(
-                "--prefill-moe-mode resident_ep needs K3's resident TP "
-                "attention layout (attention_group_size > 1, "
-                "stream_all_modules off)"
-            )
-        if mode == "streamed_sp8" and (
-            self._stream_all_modules or self._attn_tp_size != 8
-        ):
-            raise ValueError(
-                "--prefill-moe-mode streamed_sp8 needs K3's resident TP8 "
-                "attention layout (attention_group_size == 8, "
-                "stream_all_modules off)"
-            )
-        return mode
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"
@@ -2707,53 +2667,21 @@ class KimiLinearParallelStrategyManager:
         return True
 
     def parallel_declaration(self, decode_graph_state=None):
-        """Kimi-Linear's declared parallel layout (batchgen.parallel_declaration).
+        """Kimi-Linear's parallel layout (batchgen.parallel_declaration).
 
-        Attention: head-parallel over the attention group when G > 1 (DP
-        across groups), plain DP at G == 1; resident in decode always, and in
-        prefill unless the planner streams all modules (K3 at G == 1 — a
-        streamed prefill with G > 1 is refused at construction). MoE: the
-        planner-resolved modes map to the vocabulary — ``streamed`` runs every
-        expert replicated per rank with the weights streamed from host;
-        ``streamed_sp8`` partitions the routed experts over the ranks of one
-        attention group (each rank streams its share and the group exchanges
-        activations), so it is an expert-parallel group of that size with
-        streamed weights; and ``resident_ep`` partitions the experts over the
-        world with the shard resident. An unknown mode fails by
-        name rather than declaring something untrue.
+        The layout of the facts this manager was built with, through the
+        planner's one mapping (``planner.kimi_linear_layout``): the attention
+        group size, whether all modules stream in prefill, and the two MoE
+        modes. The planner resolves the same layout from the config before
+        this manager exists; the worker refuses a start whose built manager
+        declares another one.
         """
         from batchgen.parallel_declaration import (
             DecodeGraphDeclaration,
             GRAPH_MODE_COMPARE,
             GRAPH_MODE_GRAPH,
-            ModuleParallelism,
-            ParallelDeclaration,
-            ParallelDeclarationError,
-            RESIDENCY_RESIDENT,
-            RESIDENCY_STREAMED,
-            SCHEME_DP,
-            SCHEME_EP,
-            SCHEME_TP,
         )
-
-        G = int(self._attn_tp_size)
-        attn_scheme = SCHEME_TP if G > 1 else SCHEME_DP
-        attn_group = G if G > 1 else 1
-
-        def _moe_slot(mode: str, phase: str) -> ModuleParallelism:
-            if mode == "streamed":
-                return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
-            if mode == "streamed_sp8":
-                return ModuleParallelism(
-                    SCHEME_EP, RESIDENCY_STREAMED, group_size=G
-                )
-            if mode == "resident_ep":
-                return ModuleParallelism(
-                    SCHEME_EP, RESIDENCY_RESIDENT, group_size=self.world_size
-                )
-            raise ParallelDeclarationError(
-                f"undeclarable {phase} MoE mode {mode!r}"
-            )
+        from batchgen.models.moonshotai.kimi_linear.planner import kimi_linear_layout
 
         graph = getattr(self, "_decode_graph", None)
         graph_mode = getattr(graph, "mode", "eager")
@@ -2766,21 +2694,13 @@ class KimiLinearParallelStrategyManager:
         else:
             decode_graph = DecodeGraphDeclaration.off()
 
-        return ParallelDeclaration(
-            prefill_attention=ModuleParallelism(
-                attn_scheme,
-                RESIDENCY_STREAMED
-                if self._stream_all_modules
-                else RESIDENCY_RESIDENT,
-                group_size=attn_group,
-            ),
-            prefill_moe=_moe_slot(self._prefill_moe_mode, "prefill"),
-            decode_attention=ModuleParallelism(
-                attn_scheme, RESIDENCY_RESIDENT, group_size=attn_group
-            ),
-            decode_moe=_moe_slot(self._decode_moe_mode(), "decode"),
-            decode_graph=decode_graph,
-        )
+        return kimi_linear_layout(
+            world_size=self.world_size,
+            attention_group_size=self._attn_tp_size,
+            stream_all_modules=self._stream_all_modules,
+            prefill_moe_mode=self._prefill_moe_mode,
+            decode_moe_mode=self._decode_moe_mode(),
+        ).declaration(decode_graph)
 
     def recurrent_state_owner(self):
         """Owner of the per-sequence KDA state the worker frees and snapshots.
@@ -3166,19 +3086,15 @@ class KimiLinearParallelStrategyManager:
         return bool(getattr(self, "_latent_tp_sharded", False))
 
     def _plans_latent_tp_sharding(self):
-        """Whether ``_shard_latent_projections`` shards this deployment.
+        """Whether ``_shard_latent_projections`` shards this deployment
+        (``planner.plans_latent_tp_sharding``): known before the model is
+        built, so the prefill mode can be chosen first."""
+        from batchgen.models.moonshotai.kimi_linear.planner import plans_latent_tp_sharding
 
-        A function of the planner flag ``k3_shard_latent_projections`` and the
-        attention TP degree only, so the prefill mode can be chosen before
-        the model is built.
-        """
-        return bool(
-            self._is_k3
-            and getattr(
-                self.engine_config.Module_Batching_Config,
-                "k3_shard_latent_projections", False,
-            )
-            and self._attn_tp_size > 1
+        return plans_latent_tp_sharding(
+            is_k3=self._is_k3,
+            module_batching_config=self.engine_config.Module_Batching_Config,
+            attention_group_size=self._attn_tp_size,
         )
 
     def _shard_vocab_parallel(self):

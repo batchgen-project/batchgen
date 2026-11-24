@@ -1752,45 +1752,21 @@ class GLM5ParallelStrategyManager:
         return resident == self.NUM_TOTAL_EXPERTS // self.world_size
 
     def parallel_declaration(self, decode_graph_state=None):
-        """GLM-5's declared parallel layout (batchgen.parallel_declaration).
+        """GLM-5's parallel layout (batchgen.parallel_declaration).
 
-        Prefill runs every module replicated per rank with the weights
-        streamed from host ("all modules offloaded (DP)"); decode keeps
-        attention resident per rank (pure DP) and partitions the routed
-        experts over the world (EP). The decode shard's residency comes from
-        the same deployment-constant planner ``configure_decoding`` assigns
-        from (``_plan_local_expert_split``), so the declaration and the
-        configure can never disagree: a rank keeping only part of its shard
-        resident streams the remainder and declares ``partial``.
+        The layout is the planner's (``planner.glm5_server_layout``): the one
+        the initializer resolved before this manager was built, from the same
+        deployment constants ``configure_decoding`` assigns from, so the
+        declaration and the configure can never disagree.
         """
-        from batchgen.parallel_declaration import (
-            ModuleParallelism,
-            DecodeGraphDeclaration,
-            ParallelDeclaration,
-            RESIDENCY_PARTIAL,
-            RESIDENCY_RESIDENT,
-            RESIDENCY_STREAMED,
-            SCHEME_DP,
-            SCHEME_EP,
-        )
+        from batchgen.parallel_declaration import DecodeGraphDeclaration
 
-        decode_moe_residency = (
-            RESIDENCY_RESIDENT
-            if self._local_routed_experts_fully_resident()
-            else RESIDENCY_PARTIAL
-        )
-        return ParallelDeclaration(
-            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            prefill_moe=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_RESIDENT),
-            decode_moe=ModuleParallelism(
-                SCHEME_EP, decode_moe_residency, group_size=self.world_size
-            ),
-            decode_graph=(
-                DecodeGraphDeclaration.off()
-                if decode_graph_state is None
-                else decode_graph_state
-            ),
+        from batchgen.models.glm.glm5.planner import glm5_server_layout
+
+        return glm5_server_layout(self.engine_config, self.world_size).declaration(
+            DecodeGraphDeclaration.off()
+            if decode_graph_state is None
+            else decode_graph_state
         )
 
     def _plan_local_expert_split(self) -> tuple[bool, int]:
@@ -1799,17 +1775,13 @@ class GLM5ParallelStrategyManager:
         Derived from the world size and the EP configuration only, so it is
         the same answer before and after ``configure_decoding`` assigns it.
         """
-        experts_per_rank = self.NUM_TOTAL_EXPERTS // self.world_size
-        if self.world_size > 8:
-            # Multi-node: every rank's shard is resident.
-            return False, experts_per_rank
-        if self.engine_config.EP_Config.enable_offloading:
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            return True, int(experts_per_rank * (1 - offload_ratio))
-        configured = self.engine_config.EP_Config.num_local_expert_per_layer
-        if configured is None or configured == 0:
-            return False, experts_per_rank
-        return False, configured
+        # The rule lives with the planner, which resolves the server layout
+        # from it before this manager is built.
+        from batchgen.parallel_declaration import planned_resident_experts
+
+        return planned_resident_experts(
+            self.engine_config.EP_Config, self.world_size, self.NUM_TOTAL_EXPERTS
+        )
 
     def _bind_local_routed_expert_stacks(self, carve):
         """Point every local routed expert at a row of its layer's 3D stack.

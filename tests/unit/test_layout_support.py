@@ -230,3 +230,82 @@ def test_the_tables_render_into_one_page():
     assert "| common | decode | dp:resident | ep<world>:resident|partial |" in lines
     assert "| kimi-linear | prefill | tp<8>:resident | ep<attn>:streamed |" in lines
     assert {line.split(" | ")[1] for line in lines[2:]} == set(LAYOUT_PHASES)
+
+
+# --- launch flags: honoured or refused, never ignored ---------------------- #
+def _glm_like_layout():
+    return server_layout_from_declaration(
+        _declaration(("dp", "streamed"), ("dp", "streamed"),
+                     ("dp", "resident"), ("ep", "resident", 8)), 8,
+    )
+
+
+def test_a_requested_group_size_the_model_resolved_to_is_accepted():
+    from batchgen.parallel_declaration import check_requested_group_sizes
+
+    check_requested_group_sizes("M", _glm_like_layout(), {
+        ("prefill", "attention"): 1, ("prefill", "moe"): 1,
+        ("decode", "attention"): None, ("decode", "moe"): 8,
+    })
+    check_requested_group_sizes("M", None, {("decode", "attention"): 1})
+    check_requested_group_sizes("M", _glm_like_layout(), {})
+
+
+@pytest.mark.parametrize("slot, value, flag, resolved", [
+    (("decode", "attention"), 2, "--decode-attention-tp 2", "decode attention=dp:resident"),
+    (("prefill", "attention"), 8, "--prefill-attention-tp 8", "prefill attention=dp:streamed"),
+    (("decode", "moe"), 4, "--decode-moe-ep 4", "decode moe=ep8:resident"),
+    (("prefill", "moe"), 8, "--prefill-moe-ep 8", "prefill moe=dp:streamed"),
+])
+def test_a_requested_group_size_the_model_did_not_resolve_to_is_refused_by_name(
+    slot, value, flag, resolved
+):
+    from batchgen.parallel_declaration import check_requested_group_sizes
+
+    with pytest.raises(UnsupportedLayoutError) as error:
+        check_requested_group_sizes("GLM5ParallelStrategyManager", _glm_like_layout(), {slot: value})
+    message = str(error.value)
+    assert flag in message and resolved in message
+    assert "GLM5ParallelStrategyManager" in message
+
+
+def test_a_flag_on_a_model_without_a_layout_is_refused_unless_it_asks_for_one():
+    from batchgen.parallel_declaration import check_requested_group_sizes
+
+    with pytest.raises(UnsupportedLayoutError, match="--decode-moe-ep 8"):
+        check_requested_group_sizes("M", None, {("decode", "moe"): 8})
+
+
+# --- Kimi: one attention group for both phases, taken from the flags ------- #
+def _kimi_group(**kwargs):
+    from batchgen.models.moonshotai.kimi_linear.planner import (
+        requested_attention_group_size,
+    )
+
+    kwargs.setdefault("environ", {})
+    kwargs.setdefault("prefill_tp", None)
+    kwargs.setdefault("decode_tp", None)
+    return requested_attention_group_size(**kwargs)
+
+
+def test_kimi_group_size_comes_from_either_flag_and_defaults_to_one():
+    assert _kimi_group() == 1
+    assert _kimi_group(decode_tp=8) == 8
+    assert _kimi_group(prefill_tp=4) == 4
+    assert _kimi_group(prefill_tp=8, decode_tp=8) == 8
+
+
+def test_kimi_refuses_a_different_group_per_phase_by_name():
+    with pytest.raises(ValueError, match="--prefill-attention-tp 4 and --decode-attention-tp 8 differ"):
+        _kimi_group(prefill_tp=4, decode_tp=8)
+
+
+def test_kimi_refuses_the_retired_environment_variable_by_name():
+    with pytest.raises(ValueError, match="BATCHGEN_KIMI_ATTENTION_GROUP_SIZE is retired"):
+        _kimi_group(decode_tp=8, environ={"BATCHGEN_KIMI_ATTENTION_GROUP_SIZE": "8"})
+
+
+def test_kimi_refuses_a_non_positive_group_size():
+    with pytest.raises(ValueError, match="must be positive"):
+        _kimi_group(decode_tp=0)
+

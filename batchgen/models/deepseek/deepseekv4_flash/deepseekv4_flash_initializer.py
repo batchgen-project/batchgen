@@ -25,7 +25,7 @@ from batchgen.config.engine_config_parser import parse_config_from_json
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.config.decode_strategy import apply_normalized_attn_mode
 
-from .set_basic_config import set_basic_config
+from .set_basic_config import deepseekv4_flash_server_layout, set_basic_config
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -50,6 +50,10 @@ class DeepSeekV4FlashInitializer:
         self.engine_config = EngineConfig()
         self.engine_config = set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config(input_arguments)
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = deepseekv4_flash_server_layout(
+            self.world_size
+        )
 
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name

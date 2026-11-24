@@ -44,7 +44,7 @@ except ImportError:
 from typing import Tuple
 from ....config.engine_config_parser import parse_config_from_json
 from .set_basic_config import set_basic_config
-from .planner import DeepSeekV3Planner
+from .planner import DeepSeekV3Planner, deepseekv3_server_layout
 
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.server.process_utils import get_model_byte_size
@@ -165,6 +165,10 @@ class DeepseekV3Initializer:
         self.planner = DeepSeekV3Planner()
         self.engine_config = self.planner.generate_config(
             self.engine_config, self.model_config.model_type
+        )
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = deepseekv3_server_layout(
+            self.engine_config, self.engine_config.Basic_Config.world_size
         )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")

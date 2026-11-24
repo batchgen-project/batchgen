@@ -22,6 +22,18 @@ import torch
 from batchgen.config.config import EngineConfig
 
 
+def deepseekv4_flash_server_layout(world_size: int):
+    """DeepSeek-V4-Flash's layout, resolved before the model manager is
+    built. The weight contract is built once and both phases reuse it, so
+    every module streams from host in BOTH phases; prefill runs the MoE
+    replicated and decode partitions the routed experts over the world."""
+    from batchgen.parallel_declaration import replicated_prefill_world_ep_decode_layout
+
+    return replicated_prefill_world_ep_decode_layout(
+        world_size, decode_moe_fully_resident=True, decode_residency="streamed"
+    )
+
+
 def _get_arg(input_arguments, name: str, default=None):
     if hasattr(input_arguments, "get"):
         return input_arguments.get(name, default)

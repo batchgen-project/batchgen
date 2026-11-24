@@ -650,6 +650,133 @@ def resolve_server_layout(
     return layout, declaration
 
 
+REQUESTED_GROUP_FLAGS = {
+    (PHASE_PREFILL, "attention"): "--prefill-attention-tp",
+    (PHASE_PREFILL, "moe"): "--prefill-moe-ep",
+    (PHASE_DECODE, "attention"): "--decode-attention-tp",
+    (PHASE_DECODE, "moe"): "--decode-moe-ep",
+}
+
+
+def check_requested_group_sizes(
+    model: str, layout: Optional[ServerLayout], requested: dict
+) -> None:
+    """Refuse, by name, a launch flag whose group size the model did not
+    resolve to. ``requested`` maps ``(phase, "attention"|"moe")`` to the
+    flag's value or None; a model that declares no layout runs every module
+    replicated, which is group size 1."""
+    for slot, flag in REQUESTED_GROUP_FLAGS.items():
+        value = requested.get(slot)
+        if value is None:
+            continue
+        phase, module = slot
+        if layout is None:
+            actual, rendered = 1, "an undeclared (replicated) layout"
+        else:
+            parallelism = getattr(layout.phase(phase), module)
+            actual = parallelism.group_size
+            rendered = f"{phase} {module}={parallelism.render()}"
+        if int(value) != actual:
+            raise UnsupportedLayoutError(
+                f"{flag} {value} was requested, but {model} resolved "
+                f"{rendered} (group size {actual}) on this deployment; the "
+                "requested layout is not implemented for it"
+            )
+
+
+def planned_resident_experts(ep_config, world_size: int, num_routed_experts: int) -> tuple:
+    """(offloading enabled, routed experts a rank keeps resident in decode).
+
+    A deployment constant: derived from the world size and the EP
+    configuration only, so a family's planner, its layout and its strategy
+    manager all read this one answer.
+    """
+    experts_per_rank = int(num_routed_experts) // int(world_size)
+    if world_size > 8:
+        # Multi-node: every rank's shard is resident.
+        return False, experts_per_rank
+    if ep_config.enable_offloading:
+        return True, int(experts_per_rank * (1 - ep_config.offloading_ratio))
+    configured = ep_config.num_local_expert_per_layer
+    if configured is None or configured == 0:
+        return False, experts_per_rank
+    return False, configured
+
+
+def replicated_prefill_world_ep_decode_layout(
+    world_size: int,
+    *,
+    decode_moe_fully_resident: bool,
+    prefill_moe_residency: str = "streamed",
+    decode_residency: str = "resident",
+):
+    """The layout most families run, as an object resolved before the model
+    manager is built: every module replicated per rank in prefill with the
+    attention weights streamed; in decode a replicated attention and the
+    routed experts partitioned over the world. ``decode_residency`` is the
+    residency of the decode attention and of a fully resident expert shard;
+    a rank that keeps only part of its shard resident is ``partial``."""
+    world_size = int(world_size)
+    return ServerLayout(
+        prefill=PhaseLayout(
+            PHASE_PREFILL,
+            ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
+            ModuleParallelism(SCHEME_DP, prefill_moe_residency),
+            world_size,
+        ),
+        decode=PhaseLayout(
+            PHASE_DECODE,
+            ModuleParallelism(SCHEME_DP, decode_residency),
+            ModuleParallelism(
+                SCHEME_EP,
+                decode_residency if decode_moe_fully_resident else RESIDENCY_PARTIAL,
+                group_size=world_size,
+            ),
+            world_size,
+        ),
+    )
+
+
+def check_planned_server_layout(manager_class, planned, world_size: int) -> None:
+    """Check the layout a family's planner resolved, before its manager is
+    built: it must be a ``ServerLayout`` over this world and one the family
+    declares as implemented. Nothing of the model exists yet when this
+    refuses."""
+    name = getattr(manager_class, "__name__", type(manager_class).__name__)
+    if not isinstance(planned, ServerLayout):
+        raise ParallelDeclarationError(
+            f"the planned layout of {name} must be a ServerLayout, got "
+            f"{type(planned).__name__}"
+        )
+    if planned.decode.world_size != int(world_size):
+        raise ParallelDeclarationError(
+            f"the planned layout of {name} is over {planned.decode.world_size} "
+            f"ranks but the server runs {int(world_size)}"
+        )
+    supported = read_supported_layouts(manager_class)
+    if supported is not None:
+        check_layout_supported(name, supported, planned)
+
+
+def check_built_layout_is_planned(model: str, planned: ServerLayout, built) -> None:
+    """Refuse a manager that was built for another layout than the planned
+    one, naming both."""
+    if built == planned:
+        return
+
+    def render(layout) -> str:
+        if layout is None:
+            return "no layout"
+        return (
+            f"prefill {layout.prefill.render()}; decode {layout.decode.render()}"
+        )
+
+    raise ParallelDeclarationError(
+        f"{model} was built for another layout than the planned one: planned "
+        f"{render(planned)}; built {render(built)}"
+    )
+
+
 def render_supported_layouts(tables: dict) -> str:
     """One Markdown table of every family's implemented layouts."""
     lines = ["| family | phase | attention | MoE |", "|---|---|---|---|"]

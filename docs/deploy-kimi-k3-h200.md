@@ -196,8 +196,9 @@ python -m batchgen.launch_http_server \
 
 > **Prefill mode is fixed for the server.** Every prefill wave, including waves admitted after
 > decode has started, runs the one prefill MoE mode chosen at startup with
-> `--prefill-moe-mode {streamed,streamed_sp8,resident_ep}`. Unset, it is the streaming default
-> for the weight topology: on this topology `streamed_sp8`, where a wave that follows decode
+> `--prefill-moe-mode {streamed,resident_ep}`. Unset, it is `streamed` with the expert group the
+> weight topology needs: on this topology each of a node's eight TP ranks streams its share of the
+> routed experts (`--prefill-moe-ep 8`), where a wave that follows decode
 > releases the resident decode experts, prefills streamed, and the experts are rebuilt when
 > decode resumes. `--prefill-moe-mode resident_ep` runs every wave, the first included, against
 > the resident EP shard; it cannot be combined with `--enable-prefix-cache`. To run another
