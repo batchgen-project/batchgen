@@ -24,6 +24,7 @@ from batchgen.decode_dp_group import (
     assign_decode_dp_groups,
     evict_from_decode_dp_group,
 )
+from batchgen.sequence import SequenceEntry
 from batchgen.prefix_reuse.rank_packing import (
     _feature_score,
     pack_groups_for_sharing,
@@ -94,10 +95,16 @@ class _Batch:
 
 
 def _seq(uuid, tokens, *, status=SequenceStatus.QUEUEING, group=None):
-    return SimpleNamespace(
+    seq = SimpleNamespace(
         uuid=uuid, tokens=list(tokens), prompt_length=len(tokens), status=status,
         decode_dp_group=group, evicted_token_ids=None, evicted_from_dp_group=None,
     )
+    # The resource-scalar writes are owned by SequenceEntry methods; bind the
+    # real ones (never re-implemented here) so the production code paths the
+    # tests execute can call them on this stand-in.
+    for name in ("drop_decode_group", "release_all_kv", "finish_and_release"):
+        setattr(seq, name, MethodType(getattr(SequenceEntry, name), seq))
+    return seq
 
 
 def _evicted(uuid, tokens, *, decoded_on):
@@ -507,7 +514,7 @@ def _completion_cleanup_loops():
             isinstance(node, ast.For)
             and isinstance(node.iter, ast.Name)
             and node.iter.id in ("completed_uuids", "completed_list")
-            and "seq.host_token_capacity = 0" in ast.unparse(node)
+            and "seq.finish_and_release()" in ast.unparse(node)
         ):
             loops.append(node)
     return loops

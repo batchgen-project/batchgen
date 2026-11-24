@@ -596,8 +596,16 @@ PINS = {
                 "PAGE_SIZE": "64",
             },
             "public_methods": [
+                # The resource-scalar lifecycle methods (begin_eviction,
+                # drop_decode_group, finish_and_release, grow_host_kv,
+                # release_all_kv, release_gpu_pages) moved the per-sequence
+                # scalar writes behind the owning entry; see
+                # tests/worker/test_sequence_resource_scalars_single_writer.py.
+                "begin_eviction",
                 "check_completion",
                 "clamp_decode_to_context",
+                "drop_decode_group",
+                "finish_and_release",
                 "get_additional_gpu_pages_needed",
                 "get_current_pages_used",
                 "get_gpu_page_headroom",
@@ -606,6 +614,7 @@ PINS = {
                 "get_host_growth_pages",
                 "get_host_pages_for_initial_chunk",
                 "get_pages_required",
+                "grow_host_kv",
                 "is_active_in_decode",
                 "is_finished",
                 "is_resumable",
@@ -613,6 +622,8 @@ PINS = {
                 "mark_initial_gpu_reservation_done",
                 "needs_gpu_page_extension",
                 "needs_host_kv_growth",
+                "release_all_kv",
+                "release_gpu_pages",
                 "remaining_decode_tokens",
                 "reset_gpu_allocation",
                 "should_check_completion",

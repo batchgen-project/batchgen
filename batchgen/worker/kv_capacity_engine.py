@@ -2276,7 +2276,7 @@ class KVCapacityEngine:
                 ctx.gpu_resident.drop(uuid)
                 seq = ctx.sched.pool.get_sequence(uuid)
                 if seq is not None:
-                    seq.gpu_pages_allocated = 0
+                    seq.release_gpu_pages()
 
     def _release_kda_state_slots(self, ctx, global_sequence_ids: List[int]) -> None:
         """Release Kimi-Linear KDA state independently of paged GPU KV."""
@@ -3948,7 +3948,7 @@ class KVCapacityEngine:
         # get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
         for uuid in uuids:
             seq = self.global_batch.get_sequence(uuid)
-            seq.gpu_pages_allocated = 0
+            seq.release_gpu_pages()
             seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=watermark")
         # None of the per-sequence steps above reads a status, so the
         # transitions apply together, in loop order, after them.

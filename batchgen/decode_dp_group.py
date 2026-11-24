@@ -107,10 +107,11 @@ def evict_from_decode_dp_group(seq) -> None:
     never re-grouped) must not erase that record, so only a held group is
     saved. Every rank runs this on the same replicated group id, so the
     record is replicated too. G==1 never stamps a group, so nothing is saved.
+
+    The scalar writes themselves are owned by the sequence entry; this is the
+    module-level spelling the call sites use.
     """
-    if seq.decode_dp_group is not None:
-        seq.evicted_from_dp_group = seq.decode_dp_group
-    seq.decode_dp_group = None
+    seq.drop_decode_group()
 
 
 def assign_decode_dp_groups(

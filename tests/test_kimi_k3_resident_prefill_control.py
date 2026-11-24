@@ -5,10 +5,11 @@ import math
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
+from batchgen.sequence import SequenceEntry
 from batchgen.worker.admission.plan import StatusEdge
 from batchgen.worker.gpu_residency import GpuResidencySet
 
@@ -22,6 +23,17 @@ def _residency(*uuids):
     for uuid in uuids:
         owner.mark_resident(uuid)
     return owner
+
+
+def _with_owner_methods(seq):
+    """Bind the real resource-scalar owner methods onto a stand-in sequence.
+
+    The completion path releases scalars through ``SequenceEntry`` methods,
+    so a ``SimpleNamespace`` stand-in carries the real ones (never a test
+    re-implementation)."""
+    for name in ("release_all_kv", "finish_and_release"):
+        setattr(seq, name, MethodType(getattr(SequenceEntry, name), seq))
+    return seq
 
 
 def _function(path, class_name, function_name):
@@ -281,7 +293,7 @@ def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
 def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
     path = ROOT / "batchgen" / "batchgen_worker.py"
     prefilled = object()
-    seq = SimpleNamespace(
+    seq = _with_owner_methods(SimpleNamespace(
         uuid="u",
         global_idx=17,
         status=prefilled,
@@ -290,7 +302,7 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
         gpu_pages_allocated=0,
         host_pages_allocated=1,
         host_token_capacity=64,
-    )
+    ))
     batch = SimpleNamespace(
         get_sequence=lambda uuid: seq if uuid == "u" else None,
         get_sequences_by_status=lambda status: [],
@@ -338,7 +350,7 @@ def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
 def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
     path = ROOT / "batchgen" / "batchgen_worker.py"
     prefilled = object()
-    seq = SimpleNamespace(
+    seq = _with_owner_methods(SimpleNamespace(
         uuid="u",
         global_idx=17,
         status=prefilled,
@@ -347,7 +359,7 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
         gpu_pages_allocated=1,
         host_pages_allocated=1,
         host_token_capacity=64,
-    )
+    ))
     batch = SimpleNamespace(
         get_sequence=lambda uuid: seq if uuid == "u" else None,
         get_sequences_by_status=lambda status: [],

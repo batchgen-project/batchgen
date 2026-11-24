@@ -6095,11 +6095,7 @@ class BatchGenWorker:
 		for uuid in completed_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is not None:
-				seq.gpu_pages_allocated = 0
-				seq.host_pages_allocated = 0
-				seq.host_owned_pages = 0
-				seq.host_token_capacity = 0
-				seq.evicted_from_dp_group = None
+				seq.finish_and_release()
 				self._sequences_with_gpu_kv.drop(uuid)
 
 		self._update_batch_status(
@@ -7190,11 +7186,7 @@ class BatchGenWorker:
 						for uuid in completed_list:
 							seq = self.global_batch.get_sequence(uuid)
 							if seq is not None:
-								seq.gpu_pages_allocated = 0
-								seq.host_pages_allocated = 0
-								seq.host_owned_pages = 0
-								seq.host_token_capacity = 0
-								seq.evicted_from_dp_group = None
+								seq.finish_and_release()
 								self._sequences_with_gpu_kv.drop(uuid)
 						# Report completions (pops local_map; runs LAST).
 						# Guard: only report if status actually reached COMPLETED.
