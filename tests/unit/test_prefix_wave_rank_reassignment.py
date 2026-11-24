@@ -219,6 +219,8 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
         worker_state,
     )
+    # The worker's delegator hands the engine the prefill group width.
+    worker_state._prefill_attn_tp_size = lambda: 1
     worker_state._cached_prefix_rank_cost_profile = types.MethodType(
         _worker_methods("_cached_prefix_rank_cost_profile")[
             "_cached_prefix_rank_cost_profile"

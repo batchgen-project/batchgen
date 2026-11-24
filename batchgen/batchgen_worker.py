@@ -2159,6 +2159,13 @@ class BatchGenWorker:
 		layout = self._server_layout
 		return 1 if layout is None else layout.decode.attention.group_size
 
+	def _prefill_attn_tp_size(self) -> int:
+		"""The prefill attention group size, read from the prefill phase's own
+		layout (C1: each phase owns its layout); 1 for a manager that declares
+		no layout."""
+		layout = self._server_layout
+		return 1 if layout is None else layout.prefill.attention.group_size
+
 	def _decode_phase_context(self) -> DecodePhaseContext:
 		return DecodePhaseContext(
 			facts=RankFacts(
@@ -5556,6 +5563,7 @@ class BatchGenWorker:
 			full_seq_lengths,
 			compute_cached_tokens,
 			token_cap=self._server_prefill_token_cap(),
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
@@ -8153,7 +8161,10 @@ class BatchGenWorker:
 		# The engine never reaches into the worker for the cap: the delegator
 		# resolves the server mode's one cap and hands it over explicitly.
 		return engine._config_prefill_for_batch(
-			self, prefill_uuids, token_cap=self._server_prefill_token_cap()
+			self,
+			prefill_uuids,
+			token_cap=self._server_prefill_token_cap(),
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _load_decode_model(self, comm=None) -> None:
@@ -9271,6 +9282,7 @@ class BatchGenWorker:
 			self._prefill_engine = engine
 		return engine._prefill_prefix_pool_enabled(
 			self,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _pool_prefill_group_safe(self) -> bool:
@@ -9293,6 +9305,7 @@ class BatchGenWorker:
 			self._prefill_engine = engine
 		return engine._prefill_pool_group(
 			self,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_free_state_slots(self) -> int:
@@ -9353,6 +9366,7 @@ class BatchGenWorker:
 		return engine._cached_prefix_rank_cost_profile(
 			self,
 			disabled,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
@@ -9688,6 +9702,7 @@ class BatchGenWorker:
 			self,
 			plan,
 			group,
+			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_layout(self, geometry) -> tuple:

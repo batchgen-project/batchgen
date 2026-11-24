@@ -432,3 +432,19 @@ def test_the_group_width_is_read_from_the_layout():
     width = load_worker_methods(["_decode_attn_tp_size"], {})["_decode_attn_tp_size"]
     assert width(SimpleNamespace(_server_layout=None)) == 1
     assert width(SimpleNamespace(_server_layout=attention_group_layout(4, 8))) == 4
+
+
+def test_each_phase_reads_its_own_attention_group_width():
+    from batchgen.parallel_declaration import ModuleParallelism, PhaseLayout, ServerLayout
+    from tests.worker_method_source import load_worker_methods
+
+    methods = load_worker_methods(["_decode_attn_tp_size", "_prefill_attn_tp_size"], {})
+    none = ModuleParallelism("none", None)
+    layout = ServerLayout(
+        prefill=PhaseLayout("prefill", ModuleParallelism("tp", "resident", group_size=2), none, 8),
+        decode=PhaseLayout("decode", ModuleParallelism("tp", "resident", group_size=4), none, 8),
+    )
+    worker = SimpleNamespace(_server_layout=layout)
+    assert methods["_prefill_attn_tp_size"](worker) == 2
+    assert methods["_decode_attn_tp_size"](worker) == 4
+    assert methods["_prefill_attn_tp_size"](SimpleNamespace(_server_layout=None)) == 1

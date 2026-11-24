@@ -128,6 +128,7 @@ def test_worker_lookup_passes_the_serve_group_size(
     worker = SimpleNamespace(
         rank=11, local_rank=3, world_size=16, model_name="moonshotai/Kimi-K3",
         _decode_attn_tp_size=lambda: G,
+        _prefill_attn_tp_size=lambda: G,
     )
     worker._cached_prefix_rank_cost_profile = MethodType(_cached_profile_method(), worker)
     with caplog.at_level(logging.INFO):
