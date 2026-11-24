@@ -90,10 +90,17 @@ DECODE_ENTRY_SOURCE = (
     / "admission"
     / "decode_entry.py"
 )
+PREFILL_SELECTION_SOURCE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "batchgen"
+    / "worker"
+    / "admission"
+    / "prefill_selection.py"
+)
 # Admission modules whose MODULE-LEVEL helpers hold worker method bodies in
 # the frozen-context shape ``(ctx, ...)``. The worker keeps a same-name
 # delegator for each, exactly like the class-based engines above.
-DELEGATED_CONTEXT_MODULES = (DECODE_ENTRY_SOURCE,)
+DELEGATED_CONTEXT_MODULES = (DECODE_ENTRY_SOURCE, PREFILL_SELECTION_SOURCE)
 
 
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
@@ -137,6 +144,8 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.facts.kv_stats_compare": "self._kv_stats_compare",
         "ctx.facts.shared_prefix_admission": "self.shared_prefix_admission",
         "ctx.parallel_manager": "self.parallel_manager",
+        # PrefillPhaseContext (admission.prefill_selection)
+        "ctx.prefix": "self._prefix",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -471,6 +480,16 @@ def context_function_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
             f"{WORKER_CLASS} keeps no same-name delegator for {node.name}"
         )
     method.args = copy.deepcopy(worker_method.args)
+    if node.name == "_make_prefill_selection_request":
+        # The worker delegator resolves the shared-prefix segments and passes
+        # the VALUE (the context never carries a bound worker method). The
+        # worker-shaped body restores that resolution as its first statement
+        # after the docstring, which is exactly where the pre-move method ran
+        # it.
+        method.body.insert(1, ast.parse(
+            "shared_segments = "
+            "self._admission_shared_prefix_segments(all_candidates)"
+        ).body[0])
     ast.fix_missing_locations(method)
     return method
 
