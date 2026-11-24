@@ -78,6 +78,13 @@ MEDIA_PAD_TOKEN_ID = 1000
 # ============================================================================ #
 
 
+def _text_token_ids(shape):
+    """Random text token ids. The media pad id is not a text token: a filler
+    position that drew it by chance would count as one more image position."""
+    assert MEDIA_PAD_TOKEN_ID < VOCAB_SIZE
+    return torch.randint(0, MEDIA_PAD_TOKEN_ID, shape)
+
+
 def _replace_gelu_with_silu(module: nn.Module):
     """Replace nn.GELU with nn.SiLU in a module tree.
 
@@ -127,21 +134,21 @@ def test_text_embedding_basic():
         embedder = make_mock_embedder(enable_vision=False)
 
         # Single sequence
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, 32))
+        input_ids = _text_token_ids((1, 32))
         output = embedder.embed_text(input_ids)
         assert output.shape == (1, 32, HIDDEN_SIZE), (
             f"Expected (1, 32, {HIDDEN_SIZE}), got {output.shape}"
         )
 
         # Batch of sequences
-        input_ids = torch.randint(0, VOCAB_SIZE, (4, 64))
+        input_ids = _text_token_ids((4, 64))
         output = embedder.embed_text(input_ids)
         assert output.shape == (4, 64, HIDDEN_SIZE), (
             f"Expected (4, 64, {HIDDEN_SIZE}), got {output.shape}"
         )
 
         # 1D input (packed tokens)
-        input_ids = torch.randint(0, VOCAB_SIZE, (128,))
+        input_ids = _text_token_ids((128,))
         output = embedder.embed_text(input_ids)
         assert output.shape == (128, HIDDEN_SIZE), (
             f"Expected (128, {HIDDEN_SIZE}), got {output.shape}"
@@ -194,7 +201,7 @@ def test_media_pad_replacement():
         num_vision_tokens = 4
 
         # Create input_ids with some media_pad tokens in the middle
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, seq_len))
+        input_ids = _text_token_ids((1, seq_len))
         pad_start = 5
         input_ids[0, pad_start:pad_start + num_vision_tokens] = MEDIA_PAD_TOKEN_ID
 
@@ -235,7 +242,7 @@ def test_media_pad_replacement_multiple_images():
 
         seq_len = 30
         # Two images: 4 tokens each, at different positions
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, seq_len))
+        input_ids = _text_token_ids((1, seq_len))
         # Image 1: positions 3-6
         input_ids[0, 3:7] = MEDIA_PAD_TOKEN_ID
         # Image 2: positions 15-18
@@ -279,7 +286,7 @@ def test_media_pad_replacement_count_mismatch():
     with torch.no_grad():
         embedder = make_mock_embedder(enable_vision=False)
 
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, 20))
+        input_ids = _text_token_ids((1, 20))
         input_ids[0, 5:9] = MEDIA_PAD_TOKEN_ID  # 4 pad positions
 
         text_embeds = torch.randn(1, 20, HIDDEN_SIZE)
@@ -303,7 +310,7 @@ def test_forward_text_only():
     with torch.no_grad():
         embedder = make_mock_embedder(enable_vision=False)
 
-        input_ids = torch.randint(0, VOCAB_SIZE, (2, 48))
+        input_ids = _text_token_ids((2, 48))
 
         # forward() with no media should equal embed_text()
         forward_output = embedder.forward(input_ids, media_items=None)
@@ -334,7 +341,7 @@ def test_forward_with_mock_vision():
         seq_len = pad_start + num_vision_tokens + 10  # Room for pads + suffix
 
         # Build input_ids with media pad tokens
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, seq_len))
+        input_ids = _text_token_ids((1, seq_len))
         input_ids[0, pad_start:pad_start + num_vision_tokens] = MEDIA_PAD_TOKEN_ID
 
         # Create fake vision embeddings that encode_vision would produce
@@ -371,7 +378,7 @@ def test_supports_vision_flag():
     with torch.no_grad():
         embedder = make_mock_embedder(enable_vision=False)
 
-        input_ids = torch.randint(0, VOCAB_SIZE, (1, 20))
+        input_ids = _text_token_ids((1, 20))
         media_items = [MediaItem(data=b"fake_image_bytes")]
 
         # With vision disabled, media_items should be ignored
