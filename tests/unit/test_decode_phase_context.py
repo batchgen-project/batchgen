@@ -17,13 +17,13 @@ from tests.worker_method_source import load_worker_methods
 
 
 _build_context = load_worker_methods(
-    ["_decode_phase_context"],
+    ["_build_decode_phase_context"],
     {
         "DecodePhaseContext": DecodePhaseContext,
         "RankFacts": RankFacts,
         "SchedulingState": SchedulingState,
     },
-)["_decode_phase_context"]
+)["_build_decode_phase_context"]
 
 
 class _Worker:
