@@ -216,6 +216,10 @@ def _snapshot_worker(**overrides):
 
     worker = SimpleNamespace(
         world_size=8,
+        args=SimpleNamespace(
+            prefill_attention_tp=None, prefill_moe_ep=None,
+            decode_attention_tp=None, decode_moe_ep=None,
+        ),
         parallel_manager=SimpleNamespace(),  # no declaration
         engine_config=SimpleNamespace(
             Basic_Config=SimpleNamespace(enable_cuda_graphs=False)
@@ -240,10 +244,14 @@ def _snapshot_worker(**overrides):
         [
             "_snapshot_server_config",
             "_check_planned_server_layout",
+            "_check_requested_group_sizes",
             "_resolve_server_layout",
         ],
         {},
     )
+    worker._check_requested_group_sizes = lambda model, layout: methods[
+        "_check_requested_group_sizes"
+    ](worker, model, layout)
     if "_server_layout" not in overrides:
         # What worker construction does around building the manager: the
         # planned layout is checked first, the built manager right after.
@@ -424,6 +432,21 @@ def test_the_snapshot_refuses_a_built_model_that_declares_another_layout():
     with pytest.raises(RuntimeError, match="differs from the layout resolved at construction"):
         snapshot(worker)
     assert worker.server_config is None
+
+
+def test_a_launch_flag_is_honoured_or_refused_at_construction():
+    from batchgen.parallel_declaration import ModuleParallelism, UnsupportedLayoutError
+
+    def args(**flags):
+        base = dict(prefill_attention_tp=None, prefill_moe_ep=None,
+                    decode_attention_tp=None, decode_moe_ep=None)
+        return SimpleNamespace(**{**base, **flags})
+
+    manager = _layout_manager(ModuleParallelism("dp", "streamed"))
+    worker, _ = _snapshot_worker(parallel_manager=manager, args=args(decode_moe_ep=8))
+    assert worker._server_layout.decode.moe.group_size == 8
+    with pytest.raises(UnsupportedLayoutError, match="--decode-attention-tp 8 was requested"):
+        _snapshot_worker(parallel_manager=manager, args=args(decode_attention_tp=8))
 
 
 def test_a_manager_with_an_attention_group_must_declare_its_layout():

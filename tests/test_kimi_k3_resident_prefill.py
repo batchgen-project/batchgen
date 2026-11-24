@@ -138,9 +138,10 @@ def test_distributed_weights_default_to_streamed_sp8():
         assert psm.default_prefill_moe_mode() == "streamed_sp8"
 
 
-def _requested(mode, **attrs):
+def _requested(mode, ep=None, **attrs):
     psm = _psm_stub(**attrs)
     psm.engine_config.Basic_Config.prefill_moe_mode = mode
+    psm.engine_config.Basic_Config.prefill_moe_ep = ep
     return psm
 
 
@@ -156,31 +157,40 @@ def test_server_option_replaces_the_topology_default():
     psm.set_prefill_moe_mode(psm.default_prefill_moe_mode())
     assert psm.prefill_uses_resident_ep()
 
-    assert _requested("streamed_sp8").default_prefill_moe_mode() == "streamed_sp8"
+    # Streamed experts: the group is --prefill-moe-ep, by default what the
+    # weight topology needs. The path of the 8-rank group keeps its name.
+    assert _requested("streamed").default_prefill_moe_mode() == "streamed_sp8"
+    assert _requested("streamed", ep=8).default_prefill_moe_mode() == "streamed_sp8"
     unsharded = _requested(
         "streamed", _distributed_weight_sharded=False, _latent_tp_planned=False
     )
     assert unsharded.default_prefill_moe_mode() == "streamed"
+    grouped = _requested(
+        "streamed", ep=8, _distributed_weight_sharded=False, _latent_tp_planned=False
+    )
+    assert grouped.default_prefill_moe_mode() == "streamed_sp8"
 
 
 @pytest.mark.parametrize(
-    "mode, attrs, match",
+    "mode, ep, attrs, match",
     [
-        ("streamed", {"_latent_tp_planned": True,
-                      "_distributed_weight_sharded": False}, "unsharded LatentMoE"),
-        ("streamed", {}, "distributed K3 host weights"),
-        ("resident_ep", {"_attn_tp_size": 1}, "resident TP attention layout"),
-        ("resident_ep", {"_stream_all_modules": True}, "resident TP attention"),
-        ("streamed_sp8", {"_attn_tp_size": 4}, "resident TP8 attention layout"),
-        ("resident_ep", {"_is_k3": False}, "only for Kimi-K3"),
-        ("resident", {}, "must be 'streamed'"),
+        ("streamed", 1, {"_latent_tp_planned": True,
+                         "_distributed_weight_sharded": False}, "unsharded LatentMoE"),
+        ("streamed", 1, {}, "distributed K3 host weights"),
+        ("resident_ep", None, {"_attn_tp_size": 1}, "resident TP attention layout"),
+        ("resident_ep", None, {"_stream_all_modules": True}, "resident TP attention"),
+        ("streamed", 8, {"_attn_tp_size": 4}, "resident TP8 attention layout"),
+        ("streamed", 4, {}, "replicated per rank"),
+        ("resident_ep", None, {"_is_k3": False}, "only for Kimi-K3"),
+        ("resident", None, {}, "must be 'streamed' or 'resident_ep'"),
+        ("streamed_sp8", None, {}, "streamed_sp8 is retired"),
     ],
 )
 def test_server_option_the_topology_cannot_run_is_refused_at_construction(
-    mode, attrs, match
+    mode, ep, attrs, match
 ):
     with pytest.raises(ValueError, match=match):
-        _requested(mode, **attrs).default_prefill_moe_mode()
+        _requested(mode, ep=ep, **attrs).default_prefill_moe_mode()
 
 
 def _latent_plan_stub(*, is_k3, want, group_size):

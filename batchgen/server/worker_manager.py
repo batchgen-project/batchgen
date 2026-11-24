@@ -1916,6 +1916,10 @@ class WorkerManager:
             pre_dequantize_weights=self.args.pre_dequantize_weights,
             enable_deepep=getattr(self.args, "enable_deepep", False),
             prefill_moe_mode=getattr(self.args, "prefill_moe_mode", None),
+            prefill_attention_tp=self.args.prefill_attention_tp,
+            prefill_moe_ep=self.args.prefill_moe_ep,
+            decode_attention_tp=self.args.decode_attention_tp,
+            decode_moe_ep=self.args.decode_moe_ep,
             prefix_rank_assignment_mode=self.args.prefix_rank_assignment_mode,
             prefix_rank_cost_profile=self.args.prefix_rank_cost_profile,
             # The pool starts under the server's current debug state.

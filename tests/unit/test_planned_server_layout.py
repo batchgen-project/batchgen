@@ -111,13 +111,17 @@ def test_deepseek_v4_flash_streams_both_phases():
     )
 
 
-def _kimi_config(*, group=1, stream_all=False, distributed=False, mode=None, shard_latent=False):
+def _kimi_config(
+    *, group=1, stream_all=False, distributed=False, mode=None,
+    shard_latent=False, ep=None,
+):
     return SimpleNamespace(
         Basic_Config=SimpleNamespace(
             attention_group_size=group,
             stream_all_modules=stream_all,
             distributed_weight_sharded=distributed,
             prefill_moe_mode=mode,
+            prefill_moe_ep=ep,
         ),
         Module_Batching_Config=SimpleNamespace(k3_shard_latent_projections=shard_latent),
         EP_Config=SimpleNamespace(),
@@ -152,6 +156,21 @@ def _kimi_config(*, group=1, stream_all=False, distributed=False, mode=None, sha
             16,
             "attention=tp8:resident moe=ep16:resident | attention=tp8:resident moe=ep16:resident",
         ),
+        (  # the group is asked for explicitly, on a topology that does not need it
+            _kimi_config(group=8, mode="streamed", ep=8),
+            16,
+            "attention=tp8:resident moe=ep8:streamed | attention=tp8:resident moe=ep16:resident",
+        ),
+        (  # an explicit mode still takes the group the topology needs
+            _kimi_config(group=8, shard_latent=True, mode="streamed"),
+            16,
+            "attention=tp8:resident moe=ep8:streamed | attention=tp8:resident moe=ep16:resident",
+        ),
+        (
+            _kimi_config(group=8, mode="streamed", ep=1),
+            16,
+            "attention=tp8:resident moe=dp:streamed | attention=tp8:resident moe=ep16:resident",
+        ),
     ],
 )
 def test_kimi_layout_is_resolved_from_the_planned_config(config, world, expected):
@@ -163,11 +182,16 @@ def test_kimi_layout_is_resolved_from_the_planned_config(config, world, expected
 @pytest.mark.parametrize(
     "config, message",
     [
-        (_kimi_config(group=8, shard_latent=True, mode="streamed"), "unsharded LatentMoE"),
-        (_kimi_config(group=8, distributed=True, mode="streamed"), "require prefill MoE mode"),
+        (_kimi_config(group=8, shard_latent=True, ep=1), "unsharded LatentMoE"),
+        (_kimi_config(group=8, distributed=True, ep=1), "distributed K3 host weights require"),
         (_kimi_config(group=1, mode="resident_ep"), "resident TP"),
-        (_kimi_config(group=4, mode="streamed_sp8"), "resident TP8"),
-        (_kimi_config(group=8, mode="bogus"), "must be 'streamed'"),
+        (_kimi_config(group=4, ep=8), "resident TP8"),
+        (_kimi_config(group=8, ep=4), "replicated per rank .1. or partitioned"),
+        (_kimi_config(group=8, mode="bogus"), "must be 'streamed' or 'resident_ep'"),
+        (
+            _kimi_config(group=8, mode="streamed_sp8"),
+            "streamed_sp8 is retired.*--prefill-moe-mode streamed --prefill-moe-ep 8",
+        ),
     ],
 )
 def test_kimi_refuses_a_mode_the_topology_cannot_run_before_any_model(config, message):
@@ -237,31 +261,66 @@ def _worker(planned, declared):
             parallel_declaration=lambda graph_state=None: declared.declaration()
         ),
         _server_layout=None,
+        args=SimpleNamespace(
+            prefill_attention_tp=None,
+            prefill_moe_ep=None,
+            decode_attention_tp=None,
+            decode_moe_ep=None,
+        ),
     )
+
+
+def _layout_methods():
+    return load_worker_methods(
+        [
+            "_check_planned_server_layout",
+            "_check_requested_group_sizes",
+            "_resolve_server_layout",
+        ],
+        {},
+    )
+
+
+def _bind_flag_check(worker, methods):
+    worker._check_requested_group_sizes = lambda model, layout: methods[
+        "_check_requested_group_sizes"
+    ](worker, model, layout)
 
 
 def test_the_worker_takes_the_planned_layout_before_the_manager_exists():
-    methods = load_worker_methods(
-        ["_check_planned_server_layout", "_resolve_server_layout"], {}
-    )
+    methods = _layout_methods()
     planned = replicated_prefill_world_ep_decode_layout(8, decode_moe_fully_resident=True)
     worker = _worker(planned, planned)
+    _bind_flag_check(worker, methods)
     del worker.parallel_manager  # nothing is built yet
     methods["_check_planned_server_layout"](worker, _Manager)
     assert worker._server_layout is planned
 
 
+def test_a_launch_flag_is_checked_against_the_planned_layout_before_the_build():
+    methods = _layout_methods()
+    planned = replicated_prefill_world_ep_decode_layout(8, decode_moe_fully_resident=True)
+    worker = _worker(planned, planned)
+    _bind_flag_check(worker, methods)
+    del worker.parallel_manager  # nothing is built yet
+    worker.args.decode_moe_ep = 8
+    methods["_check_planned_server_layout"](worker, _Manager)
+    worker.args.decode_attention_tp = 8
+    with pytest.raises(ParallelDeclarationError, match="--decode-attention-tp"):
+        methods["_check_planned_server_layout"](worker, _Manager)
+
+
 def test_the_worker_refuses_a_manager_built_for_another_layout():
-    methods = load_worker_methods(
-        ["_check_planned_server_layout", "_resolve_server_layout"], {}
-    )
+    methods = _layout_methods()
     planned = replicated_prefill_world_ep_decode_layout(8, decode_moe_fully_resident=True)
     other = replicated_prefill_world_ep_decode_layout(8, decode_moe_fully_resident=False)
     worker = _worker(planned, other)
+    _bind_flag_check(worker, methods)
     methods["_check_planned_server_layout"](worker, _Manager)
     with pytest.raises(ParallelDeclarationError, match="another layout than the planned"):
         methods["_resolve_server_layout"](worker)
     worker = _worker(planned, planned)
+    _bind_flag_check(worker, methods)
     methods["_check_planned_server_layout"](worker, _Manager)
     methods["_resolve_server_layout"](worker)
     assert worker._server_layout == server_layout_from_declaration(

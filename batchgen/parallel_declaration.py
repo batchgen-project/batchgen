@@ -650,6 +650,40 @@ def resolve_server_layout(
     return layout, declaration
 
 
+REQUESTED_GROUP_FLAGS = {
+    (PHASE_PREFILL, "attention"): "--prefill-attention-tp",
+    (PHASE_PREFILL, "moe"): "--prefill-moe-ep",
+    (PHASE_DECODE, "attention"): "--decode-attention-tp",
+    (PHASE_DECODE, "moe"): "--decode-moe-ep",
+}
+
+
+def check_requested_group_sizes(
+    model: str, layout: Optional[ServerLayout], requested: dict
+) -> None:
+    """Refuse, by name, a launch flag whose group size the model did not
+    resolve to. ``requested`` maps ``(phase, "attention"|"moe")`` to the
+    flag's value or None; a model that declares no layout runs every module
+    replicated, which is group size 1."""
+    for slot, flag in REQUESTED_GROUP_FLAGS.items():
+        value = requested.get(slot)
+        if value is None:
+            continue
+        phase, module = slot
+        if layout is None:
+            actual, rendered = 1, "an undeclared (replicated) layout"
+        else:
+            parallelism = getattr(layout.phase(phase), module)
+            actual = parallelism.group_size
+            rendered = f"{phase} {module}={parallelism.render()}"
+        if int(value) != actual:
+            raise UnsupportedLayoutError(
+                f"{flag} {value} was requested, but {model} resolved "
+                f"{rendered} (group size {actual}) on this deployment; the "
+                "requested layout is not implemented for it"
+            )
+
+
 def planned_resident_experts(ep_config, world_size: int, num_routed_experts: int) -> tuple:
     """(offloading enabled, routed experts a rank keeps resident in decode).
 

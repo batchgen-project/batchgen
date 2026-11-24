@@ -66,6 +66,38 @@ def k3_deepep_low_latency(*, sharded_latent: bool, enable_deepep: bool = False) 
     return True
 
 
+RETIRED_ATTENTION_GROUP_ENV = "BATCHGEN_KIMI_ATTENTION_GROUP_SIZE"
+
+
+def requested_attention_group_size(*, prefill_tp, decode_tp, environ) -> int:
+    """The attention group size the launch asked for (1 when it asked for none).
+
+    The family runs ONE attention group for both phases, so the two per-phase
+    flags must agree and either one alone sets both. The environment variable
+    that used to carry the size is retired and refused by name: a launcher
+    that still exports it must not start a server with another layout than
+    the one it asked for.
+    """
+    if RETIRED_ATTENTION_GROUP_ENV in environ:
+        raise ValueError(
+            f"{RETIRED_ATTENTION_GROUP_ENV} is retired; pass "
+            "--decode-attention-tp N and unset the variable"
+        )
+    if prefill_tp is not None and decode_tp is not None and (
+        int(prefill_tp) != int(decode_tp)
+    ):
+        raise ValueError(
+            f"--prefill-attention-tp {prefill_tp} and --decode-attention-tp "
+            f"{decode_tp} differ: Kimi-Linear runs one attention group for both "
+            "phases; a layout with a different group per phase is not implemented"
+        )
+    requested = decode_tp if decode_tp is not None else prefill_tp
+    size = 1 if requested is None else int(requested)
+    if size < 1:
+        raise ValueError(f"the attention group size must be positive, got {size}")
+    return size
+
+
 PREFILL_MOE_MODES = ("streamed", "resident_ep", "streamed_sp8")
 
 
@@ -121,46 +153,102 @@ def validated_prefill_moe_mode(
     return value
 
 
+# What --prefill-moe-mode accepts. The group the streamed experts are
+# partitioned over is its own launch parameter (--prefill-moe-ep).
+LAUNCH_PREFILL_MOE_MODES = ("streamed", "resident_ep")
+RETIRED_PREFILL_MOE_MODE = "streamed_sp8"
+STREAMED_EXPERT_GROUP_SIZE = 8
+
+
+def refuse_retired_prefill_moe_mode(requested) -> None:
+    """The launch value that named a group size inside a mode is retired."""
+    if str(requested or "").strip().lower() == RETIRED_PREFILL_MOE_MODE:
+        raise ValueError(
+            f"--prefill-moe-mode {RETIRED_PREFILL_MOE_MODE} is retired: the "
+            "expert group is its own parameter; pass --prefill-moe-mode "
+            f"streamed --prefill-moe-ep {STREAMED_EXPERT_GROUP_SIZE}"
+        )
+
+
 def server_prefill_moe_mode(
     *, requested, is_k3: bool, latent_tp_planned: bool,
     distributed_weight_sharded: bool, stream_all_modules: bool,
-    attention_group_size: int,
+    attention_group_size: int, requested_ep=None,
 ) -> str:
-    """The server prefill MoE mode, fixed for the server's lifetime.
+    """The prefill MoE execution path, fixed for the server's lifetime.
 
-    Without ``--prefill-moe-mode`` it follows the weight topology:
-    ``streamed`` feeds each rank's full-width latent into full-width experts,
-    so it is only valid while the LatentMoE projections are unsharded; once
-    they are TP-sharded, or the host weights are distributed, prefill goes
-    through ``streamed_sp8``. A requested mode is validated against the
-    topology, so one it cannot run is refused before any model is built.
+    The launch gives a mode (``--prefill-moe-mode streamed | resident_ep``,
+    default ``streamed``) and, for streamed experts, the group they are
+    partitioned over (``--prefill-moe-ep``). The path is one of
+    ``PREFILL_MOE_MODES``: ``streamed`` (every rank streams all routed
+    experts), ``streamed_sp8`` (the ranks of one attention group each stream
+    their share) or ``resident_ep``.
+
+    Without ``--prefill-moe-ep`` the streamed group follows the weight
+    topology: every rank streaming all experts feeds its full-width latent
+    into full-width experts, which is only valid while the LatentMoE
+    projections are unsharded and the host weights node-local; otherwise the
+    experts are partitioned over the attention group. A request the topology
+    cannot run is refused before any model is built.
     """
-    if requested is None:
-        if distributed_weight_sharded or latent_tp_planned:
-            return "streamed_sp8"
+    refuse_retired_prefill_moe_mode(requested)
+    mode = "streamed" if requested is None else str(requested).strip().lower()
+    if mode not in LAUNCH_PREFILL_MOE_MODES:
+        raise ValueError(
+            "--prefill-moe-mode must be 'streamed' or 'resident_ep', "
+            f"got {requested!r}"
+        )
+    if mode == "resident_ep":
+        validated_prefill_moe_mode(
+            mode, is_k3=is_k3, latent_tp_planned=latent_tp_planned,
+            distributed_weight_sharded=distributed_weight_sharded,
+            resident_shard_built=True,
+        )
+        if stream_all_modules or int(attention_group_size) <= 1:
+            raise ValueError(
+                "--prefill-moe-mode resident_ep needs K3's resident TP "
+                "attention layout (attention_group_size > 1, "
+                "stream_all_modules off)"
+            )
+        return mode
+
+    topology_needs_group = bool(distributed_weight_sharded or latent_tp_planned)
+    if requested_ep is None:
+        return "streamed_sp8" if topology_needs_group else "streamed"
+    group = int(requested_ep)
+    if group == 1:
+        if latent_tp_planned:
+            raise ValueError(
+                "--prefill-moe-ep 1 (every rank streams all routed experts) "
+                "needs unsharded LatentMoE projections; with TP-sharded "
+                f"projections pass --prefill-moe-ep {STREAMED_EXPERT_GROUP_SIZE} "
+                "or --prefill-moe-mode resident_ep"
+            )
+        if distributed_weight_sharded:
+            raise ValueError(
+                "--prefill-moe-ep 1 would request experts outside this "
+                "worker's ingress shard: distributed K3 host weights require "
+                f"--prefill-moe-ep {STREAMED_EXPERT_GROUP_SIZE}"
+            )
         return "streamed"
-    mode = validated_prefill_moe_mode(
-        requested, is_k3=is_k3, latent_tp_planned=latent_tp_planned,
-        distributed_weight_sharded=distributed_weight_sharded,
-        resident_shard_built=True,
-    )
-    if mode == "resident_ep" and (
-        stream_all_modules or int(attention_group_size) <= 1
-    ):
+    if group != STREAMED_EXPERT_GROUP_SIZE:
         raise ValueError(
-            "--prefill-moe-mode resident_ep needs K3's resident TP "
-            "attention layout (attention_group_size > 1, "
+            f"--prefill-moe-ep {group}: streamed prefill experts run "
+            "replicated per rank (1) or partitioned over the "
+            f"{STREAMED_EXPERT_GROUP_SIZE}-rank attention group"
+        )
+    if not is_k3:
+        raise ValueError(
+            f"--prefill-moe-ep {group} with streamed experts is implemented "
+            "only for Kimi-K3"
+        )
+    if stream_all_modules or int(attention_group_size) != STREAMED_EXPERT_GROUP_SIZE:
+        raise ValueError(
+            f"--prefill-moe-ep {group} with streamed experts needs K3's "
+            "resident TP8 attention layout (attention_group_size == 8, "
             "stream_all_modules off)"
         )
-    if mode == "streamed_sp8" and (
-        stream_all_modules or int(attention_group_size) != 8
-    ):
-        raise ValueError(
-            "--prefill-moe-mode streamed_sp8 needs K3's resident TP8 "
-            "attention layout (attention_group_size == 8, "
-            "stream_all_modules off)"
-        )
-    return mode
+    return "streamed_sp8"
 
 
 def kimi_linear_layout(
@@ -250,6 +338,7 @@ def kimi_linear_server_layout(engine_config, world_size: int, *, is_k3: bool):
             distributed_weight_sharded=distributed,
             stream_all_modules=stream_all,
             attention_group_size=G,
+            requested_ep=getattr(basic, "prefill_moe_ep", None),
         ),
         decode_moe_mode=getattr(engine_config.EP_Config, "decode_moe_mode", "resident_ep"),
     )

@@ -846,6 +846,11 @@ class InputArguments:
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# Requested layout group sizes (None = the model's default); see server_args.
+	prefill_attention_tp: Optional[int] = None
+	prefill_moe_ep: Optional[int] = None
+	decode_attention_tp: Optional[int] = None
+	decode_moe_ep: Optional[int] = None
 	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
 	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
@@ -937,6 +942,11 @@ class BatchGenWorkerArgs:
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# Requested layout group sizes (None = the model's default); see server_args.
+	prefill_attention_tp: Optional[int] = None
+	prefill_moe_ep: Optional[int] = None
+	decode_attention_tp: Optional[int] = None
+	decode_moe_ep: Optional[int] = None
 	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
 	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# The server's debug state this worker pool starts under (wire form; None
@@ -2146,7 +2156,24 @@ class BatchGenWorker:
 		planned = getattr(self.engine_config.Basic_Config, "server_layout", None)
 		if planned is not None:
 			check_planned_server_layout(manager_class, planned, int(self.world_size))
+			self._check_requested_group_sizes(manager_class.__name__, planned)
 		self._server_layout = planned
+
+	def _check_requested_group_sizes(self, model: str, layout) -> None:
+		"""A launch flag that asks for a group size is honoured or refused,
+		never ignored: the resolved layout must have that size."""
+		from batchgen.parallel_declaration import check_requested_group_sizes
+
+		check_requested_group_sizes(
+			model,
+			layout,
+			{
+				("prefill", "attention"): self.args.prefill_attention_tp,
+				("prefill", "moe"): self.args.prefill_moe_ep,
+				("decode", "attention"): self.args.decode_attention_tp,
+				("decode", "moe"): self.args.decode_moe_ep,
+			},
+		)
 
 	def _resolve_server_layout(self) -> None:
 		"""Check the manager just built against the planned layout.
@@ -2175,6 +2202,7 @@ class BatchGenWorker:
 				f"{type(self.parallel_manager).__name__} runs an attention group "
 				"but declares no layout (parallel_declaration)"
 			)
+		self._check_requested_group_sizes(type(self.parallel_manager).__name__, layout)
 		self._server_layout = layout
 
 	def _decode_attn_tp_size(self) -> int:
@@ -3934,6 +3962,10 @@ class BatchGenWorker:
 			"distributed_weight_config": self.args.distributed_weight_config,
 			"enable_deepep": getattr(self.args, "enable_deepep", False),
 			"prefill_moe_mode": getattr(self.args, "prefill_moe_mode", None),
+			"prefill_attention_tp": self.args.prefill_attention_tp,
+			"prefill_moe_ep": self.args.prefill_moe_ep,
+			"decode_attention_tp": self.args.decode_attention_tp,
+			"decode_moe_ep": self.args.decode_moe_ep,
 			"debug_num_layers": getattr(self.args, "debug_num_layers", None),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
