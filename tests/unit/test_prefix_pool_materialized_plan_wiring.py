@@ -24,6 +24,7 @@ reused here rather than copied.
 """
 
 from __future__ import annotations
+from tests.worker_method_source import attention_group_layout
 
 import sys
 from pathlib import Path
@@ -243,6 +244,7 @@ def _worker(
     )
     sequences = _seqs() if seqs is None else seqs
     worker = SimpleNamespace(
+        _server_layout=attention_group_layout(attn_tp_size),
         torch_device="cpu",
         huggingface_ckpt_name="moonshotai/Kimi-K3",
         parallel_manager=parallel_manager,

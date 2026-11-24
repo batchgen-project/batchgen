@@ -588,3 +588,27 @@ def load_worker_shaped_methods(
         exec(compile(module, str(WORKER_SOURCE), "exec"), scope)  # noqa: S102
         loaded[name] = scope[name]
     return loaded
+
+
+def attention_group_layout(group_size: int, world_size: int = 0):
+    """A server layout whose attention runs in groups of ``group_size`` in
+    both phases, for fakes of the worker: the worker reads its group widths
+    from ``_server_layout``. ``world_size`` defaults to one group."""
+    from batchgen.parallel_declaration import (
+        ModuleParallelism,
+        PhaseLayout,
+        ServerLayout,
+    )
+
+    size = max(1, int(group_size))
+    world = int(world_size) or size
+    attention = (
+        ModuleParallelism("tp", "resident", group_size=size)
+        if size > 1
+        else ModuleParallelism("dp", "resident")
+    )
+    none = ModuleParallelism("none", None)
+    return ServerLayout(
+        prefill=PhaseLayout("prefill", attention, none, world),
+        decode=PhaseLayout("decode", attention, none, world),
+    )

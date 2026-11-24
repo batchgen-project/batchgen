@@ -236,10 +236,13 @@ def _snapshot_worker(**overrides):
     )
     for name, value in overrides.items():
         setattr(worker, name, value)
-    snapshot = load_worker_methods(["_snapshot_server_config"], {})[
-        "_snapshot_server_config"
-    ]
-    return worker, snapshot
+    methods = load_worker_methods(
+        ["_snapshot_server_config", "_resolve_server_layout"], {}
+    )
+    if "_server_layout" not in overrides:
+        # What worker construction does right after it builds the manager.
+        methods["_resolve_server_layout"](worker)
+    return worker, methods["_snapshot_server_config"]
 
 
 def test_snapshot_reads_the_owners_and_reports_undeclared_models():
@@ -266,12 +269,12 @@ def test_snapshot_reports_the_declaration_and_the_captured_ladder():
     )
     worker, snapshot = _snapshot_worker(
         parallel_manager=SimpleNamespace(
-            parallel_declaration=lambda graph_state: ParallelDeclaration(
+            parallel_declaration=lambda graph_state=None: ParallelDeclaration(
                 prefill_attention=declared.prefill_attention,
                 prefill_moe=declared.prefill_moe,
                 decode_attention=declared.decode_attention,
                 decode_moe=declared.decode_moe,
-                decode_graph=graph_state,
+                **({} if graph_state is None else {"decode_graph": graph_state}),
             )
         ),
         engine_config=SimpleNamespace(
@@ -303,7 +306,7 @@ def test_snapshot_uses_the_manager_graph_declaration_over_worker_graph_fields():
     )
     worker, snapshot = _snapshot_worker(
         parallel_manager=SimpleNamespace(
-            parallel_declaration=lambda graph_state: declared
+            parallel_declaration=lambda graph_state=None: declared
         ),
         _graph=_graph_state(
             whole_model_graph=True,
@@ -347,40 +350,85 @@ def test_snapshot_refuses_to_run_after_the_pool_is_retired():
     assert worker.server_config is None
 
 
-def test_snapshot_keeps_the_layout_object_and_refuses_an_unimplemented_one():
+def _layout_manager(prefill_attention, attn_tp_size=1):
     from batchgen.parallel_declaration import (
         ModuleParallelism,
         ParallelDeclaration,
-        UnsupportedLayoutError,
         replicated_prefill_world_ep_decode,
     )
 
-    def manager(prefill_attention):
-        return SimpleNamespace(
-            SUPPORTED_LAYOUTS=replicated_prefill_world_ep_decode(),
-            parallel_declaration=lambda graph_state: ParallelDeclaration(
-                prefill_attention=prefill_attention,
-                prefill_moe=ModuleParallelism("dp", "streamed"),
-                decode_attention=ModuleParallelism("dp", "resident"),
-                decode_moe=ModuleParallelism("ep", "resident", group_size=8),
-                decode_graph=graph_state,
-            ),
-        )
+    return SimpleNamespace(
+        attn_tp_size=attn_tp_size,
+        SUPPORTED_LAYOUTS=replicated_prefill_world_ep_decode(),
+        parallel_declaration=lambda graph_state=None: ParallelDeclaration(
+            prefill_attention=prefill_attention,
+            prefill_moe=ModuleParallelism("dp", "streamed"),
+            decode_attention=ModuleParallelism("dp", "resident"),
+            decode_moe=ModuleParallelism("ep", "resident", group_size=8),
+            **({} if graph_state is None else {"decode_graph": graph_state}),
+        ),
+    )
+
+
+def test_the_layout_is_resolved_at_construction_and_the_report_is_rendered_from_it():
+    from batchgen.parallel_declaration import ModuleParallelism
 
     worker, snapshot = _snapshot_worker(
-        parallel_manager=manager(ModuleParallelism("dp", "streamed"))
+        parallel_manager=_layout_manager(ModuleParallelism("dp", "streamed"))
     )
-    snapshot(worker)
     layout = worker._server_layout
     assert layout.decode.moe_groups == (tuple(range(8)),)
+    snapshot(worker)
+    assert worker._server_layout is layout
     reported = sc.ServerConfig.from_dict(worker.server_config)
     assert (reported.prefill_attn, reported.decode_moe) == (
         layout.prefill.attention.render(), layout.decode.moe.render()
     )
 
-    worker, snapshot = _snapshot_worker(
-        parallel_manager=manager(ModuleParallelism("tp", "resident", group_size=2))
-    )
+
+def test_an_unimplemented_layout_is_refused_at_construction_before_any_build():
+    from batchgen.parallel_declaration import ModuleParallelism, UnsupportedLayoutError
+
     with pytest.raises(UnsupportedLayoutError, match="prefill attention=tp2:resident"):
+        _snapshot_worker(
+            parallel_manager=_layout_manager(
+                ModuleParallelism("tp", "resident", group_size=2)
+            )
+        )
+
+
+def test_the_snapshot_refuses_a_built_model_that_declares_another_layout():
+    from batchgen.parallel_declaration import ModuleParallelism
+
+    worker, snapshot = _snapshot_worker(
+        parallel_manager=_layout_manager(ModuleParallelism("dp", "streamed"))
+    )
+    worker.parallel_manager = _layout_manager(ModuleParallelism("dp", "streamed"))
+    worker.parallel_manager.parallel_declaration = (
+        lambda graph_state=None, inner=worker.parallel_manager.parallel_declaration: (
+            type(inner())(
+                prefill_attention=inner().prefill_attention,
+                prefill_moe=inner().prefill_moe,
+                decode_attention=inner().decode_attention,
+                decode_moe=ModuleParallelism("ep", "partial", group_size=8),
+            )
+        )
+    )
+    with pytest.raises(RuntimeError, match="differs from the layout resolved at construction"):
         snapshot(worker)
     assert worker.server_config is None
+
+
+def test_a_manager_with_an_attention_group_must_declare_its_layout():
+    from batchgen.parallel_declaration import ParallelDeclarationError
+
+    with pytest.raises(ParallelDeclarationError, match="declares no layout"):
+        _snapshot_worker(parallel_manager=SimpleNamespace(attn_tp_size=2))
+
+
+def test_the_group_width_is_read_from_the_layout():
+    from tests.worker_method_source import attention_group_layout, load_worker_methods
+
+    width = load_worker_methods(["_decode_attn_tp_size"], {})["_decode_attn_tp_size"]
+    assert width(SimpleNamespace(_server_layout=None)) == 1
+    assert width(SimpleNamespace(_server_layout=attention_group_layout(4, 8))) == 4
