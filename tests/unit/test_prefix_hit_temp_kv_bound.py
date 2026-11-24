@@ -228,6 +228,9 @@ class _PlanWorker:
     def _decode_attn_tp_size(self):
         return self._attn_tp
 
+    def _prefill_attn_tp_size(self):
+        return self._attn_tp
+
     def _prefix_materialization_kv_config(self, full_seq_lengths):
         self.kv_config_calls += 1
         return temporary_gpu_kv_config(PROFILE, full_seq_lengths)

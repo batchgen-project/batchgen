@@ -333,12 +333,27 @@ def load_worker_functions(
 # What the worker's delegators pass to the engine besides their own arguments:
 # launch parameters, which the engine takes as values instead of reading the
 # worker's args. A fake sets ``worker.args`` the way a server's launch does.
+# Engine methods whose worker delegator hands them the prefill phase's
+# attention group width.
+PREFILL_ATTENTION_WIDTH_METHODS = (
+    "_plan_prefill_micro_batches",
+    "_prefill_prefix_pool_enabled",
+    "_prefill_pool_group",
+    "_cached_prefix_rank_cost_profile",
+    "_check_pool_plan_identical",
+    "_config_prefill_for_batch",
+)
+
 PREFILL_ENGINE_DELEGATOR_KWARGS = {
     "_prefix_rank_packing_mode": lambda worker: {
         "mode": worker.args.prefix_rank_assignment_mode
     },
     "_prefix_rank_cost_profile_disabled": lambda worker: {
         "value": worker.args.prefix_rank_cost_profile
+    },
+    **{
+        name: (lambda worker: {"attn_group_size": worker._prefill_attn_tp_size()})
+        for name in PREFILL_ATTENTION_WIDTH_METHODS
     },
 }
 

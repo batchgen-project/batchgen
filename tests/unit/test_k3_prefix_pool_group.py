@@ -15,7 +15,10 @@ impossible: ``FakeDist`` reduces or gathers the caller's contribution against
 peer values the test configures, which is what the collective would produce.
 """
 
-from tests.worker_method_source import attention_group_layout
+from tests.worker_method_source import (
+    PREFILL_ATTENTION_WIDTH_METHODS,
+    attention_group_layout,
+)
 import ast
 import copy
 import dataclasses
@@ -142,7 +145,15 @@ def _worker_methods(names, globals_=None):
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
         elif name in _MOVED:
-            def worker_method(worker, *args, _function=function, **kwargs):
+            def worker_method(
+                worker, *args, _function=function, _name=name, **kwargs
+            ):
+                # Mirror the worker's delegator: it hands these engine methods
+                # the prefill phase's attention group width.
+                if _name in PREFILL_ATTENTION_WIDTH_METHODS:
+                    kwargs.setdefault(
+                        "attn_group_size", worker._prefill_attn_tp_size()
+                    )
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
         loaded[name] = function
@@ -379,6 +390,7 @@ def _plan_worker(
             "_prefill_pool_free_state_slots",
             "_replace_prefix_lookup_hits",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
             # The executor and the pool are built with the probes of the
@@ -736,6 +748,7 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
             "_next_pool_segment_sid",
             "_owns_host_kv",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
         ],
         {"dist": fake_dist},
     )
@@ -850,6 +863,7 @@ def _finish_worker(rank, *, views, wave, states, coordinator):
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",
+            "_prefill_attn_tp_size",
         ],
     )
     worker = SimpleNamespace(
@@ -1005,7 +1019,8 @@ def _gate_worker(
 ):
     methods = _worker_methods(
         ["_prefill_prefix_pool_enabled", "_pool_prefill_group_safe",
-         "_decode_attn_tp_size"],
+         "_decode_attn_tp_size",
+         "_prefill_attn_tp_size"],
     )
     parallel_manager = SimpleNamespace(attn_tp_size=attn_tp_size)
     if group_safe is not None:

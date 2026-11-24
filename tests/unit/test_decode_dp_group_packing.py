@@ -137,6 +137,7 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             prefix_rank_cost_profile="on",
         ),
         _decode_attn_tp_size=lambda: G,
+        _prefill_attn_tp_size=lambda: G,
         _prefill_prefix_pool_enabled=lambda: pool,
         _trajectory_tokens=lambda seq, length=None, **_: torch.tensor(
             seq.tokens[:length], dtype=torch.int32
