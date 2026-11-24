@@ -846,6 +846,11 @@ class InputArguments:
 	distributed_weight_config: Optional[str] = None
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# Requested layout group sizes (None = the model's default); see server_args.
+	prefill_attention_tp: Optional[int] = None
+	prefill_moe_ep: Optional[int] = None
+	decode_attention_tp: Optional[int] = None
+	decode_moe_ep: Optional[int] = None
 	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
 	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# INTERNAL (--debug-num-layers): serve only the first N layers; None = all.
@@ -937,6 +942,11 @@ class BatchGenWorkerArgs:
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	prefill_moe_mode: Optional[str] = None  # Server prefill MoE mode (None = model default, streaming)
+	# Requested layout group sizes (None = the model's default); see server_args.
+	prefill_attention_tp: Optional[int] = None
+	prefill_moe_ep: Optional[int] = None
+	decode_attention_tp: Optional[int] = None
+	decode_moe_ep: Optional[int] = None
 	prefix_rank_assignment_mode: str = "packing_v2"  # --prefix-rank-assignment-mode
 	prefix_rank_cost_profile: str = "on"  # --prefix-rank-cost-profile
 	# The server's debug state this worker pool starts under (wire form; None
@@ -2142,6 +2152,7 @@ class BatchGenWorker:
 		"""
 		from batchgen.parallel_declaration import (
 			ParallelDeclarationError,
+			check_requested_group_sizes,
 			resolve_server_layout,
 		)
 
@@ -2151,6 +2162,18 @@ class BatchGenWorker:
 				f"{type(self.parallel_manager).__name__} runs an attention group "
 				"but declares no layout (parallel_declaration)"
 			)
+		# A launch flag that asks for a group size is honoured or refused,
+		# never ignored: the layout the model resolved must have that size.
+		check_requested_group_sizes(
+			type(self.parallel_manager).__name__,
+			layout,
+			{
+				("prefill", "attention"): self.args.prefill_attention_tp,
+				("prefill", "moe"): self.args.prefill_moe_ep,
+				("decode", "attention"): self.args.decode_attention_tp,
+				("decode", "moe"): self.args.decode_moe_ep,
+			},
+		)
 		self._server_layout = layout
 
 	def _decode_attn_tp_size(self) -> int:
@@ -3902,6 +3925,10 @@ class BatchGenWorker:
 			"distributed_weight_config": self.args.distributed_weight_config,
 			"enable_deepep": getattr(self.args, "enable_deepep", False),
 			"prefill_moe_mode": getattr(self.args, "prefill_moe_mode", None),
+			"prefill_attention_tp": self.args.prefill_attention_tp,
+			"prefill_moe_ep": self.args.prefill_moe_ep,
+			"decode_attention_tp": self.args.decode_attention_tp,
+			"decode_moe_ep": self.args.decode_moe_ep,
 			"debug_num_layers": getattr(self.args, "debug_num_layers", None),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")

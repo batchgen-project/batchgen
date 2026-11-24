@@ -26,7 +26,7 @@ from batchgen.hardware.machine_family import detect_device_facts
 
 from .config import KimiLinearConfig, is_k3_model_type, require_num_routed_experts
 from .dsa_runtime import require_servable_indexer
-from .planner import KimiLinearPlanner
+from .planner import KimiLinearPlanner, requested_attention_group_size
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -151,8 +151,10 @@ class KimiLinearInitializer:
         # distributed K3 store is only valid with TP8: each node's eight
         # workers own disjoint 112-expert ingress shards and the node-local
         # group reconstructs the current layer.
-        requested_G = int(
-            os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1")
+        requested_G = requested_attention_group_size(
+            prefill_tp=getattr(input_arguments, "prefill_attention_tp", None),
+            decode_tp=getattr(input_arguments, "decode_attention_tp", None),
+            environ=os.environ,
         )
         if self.distributed_weight_sharded:
             if requested_G != 8 and self.global_rank == 0:

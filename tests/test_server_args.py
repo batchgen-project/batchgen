@@ -165,6 +165,38 @@ def test_prefix_rank_launch_parameters_reach_the_worker(field):
     assert f"=self.args.{field}," in worker_source
 
 
+LAYOUT_GROUP_FLAGS = {
+    "prefill_attention_tp": "--prefill-attention-tp",
+    "prefill_moe_ep": "--prefill-moe-ep",
+    "decode_attention_tp": "--decode-attention-tp",
+    "decode_moe_ep": "--decode-moe-ep",
+}
+
+
+@pytest.mark.parametrize("field, flag", sorted(LAYOUT_GROUP_FLAGS.items()))
+def test_layout_group_flags_parse_and_default_to_the_model(field, flag):
+    parser = server_args_module._build_parser()
+    base = ["--model", "m", "--host-kv-cache-size", "1"]
+    assert getattr(parser.parse_args(base), field) is None
+    assert getattr(parser.parse_args(base + [flag, "8"]), field) == 8
+    assert getattr(ServerArgs(model="m"), field) is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + [flag, "eight"])
+
+
+@pytest.mark.parametrize("field", sorted(LAYOUT_GROUP_FLAGS))
+def test_layout_group_flags_reach_the_worker_and_the_model_initializer(field):
+    # Parsed -> ServerArgs -> the worker's args -> the initializer's input
+    # arguments: a flag accepted and then dropped on the way would silently
+    # run the default layout.
+    root = Path(server_args_module.__file__).resolve().parents[1]
+    assert f"{field}=parsed.{field}," in Path(server_args_module.__file__).read_text()
+    assert f"{field}=self.args.{field}," in (root / "server" / "worker_manager.py").read_text()
+    worker_source = (root / "batchgen_worker.py").read_text()
+    assert f'"{field}": self.args.{field},' in worker_source
+    assert worker_source.count(f"\t{field}: Optional[int] = None") == 2
+
+
 def test_debug_num_layers_flag_parses_and_defaults_to_all_layers():
     parser = server_args_module._build_parser()
     base = ["--model", "m", "--host-kv-cache-size", "1"]

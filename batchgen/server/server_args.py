@@ -189,6 +189,14 @@ class ServerArgs:
     # modes. None = the model's default, which is streaming; every prefill
     # wave of the server runs the one mode chosen here.
     prefill_moe_mode: Optional[str] = None
+    # The group sizes of the server's parallel layout, one per phase and
+    # module: the ranks one attention shard group (TP) or one expert
+    # partition (EP) spans. None = the model's default for the machine. A
+    # value the model does not resolve to is refused at start-up by name.
+    prefill_attention_tp: Optional[int] = None
+    prefill_moe_ep: Optional[int] = None
+    decode_attention_tp: Optional[int] = None
+    decode_moe_ep: Optional[int] = None
     # How a pool-served prefill wave assigns its sequences to ranks, and
     # whether the packer scores its targets by predicted seconds. Both shape
     # the workload of the whole server, so they are launch parameters and a
@@ -413,6 +421,46 @@ def _build_parser() -> argparse.ArgumentParser:
             "Whether the prefill wave packer scores its targets by predicted "
             "prefill seconds (on, default) or balances computed tokens (off), "
             "for every wave of this server."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-attention-tp",
+        type=int,
+        default=None,
+        help=(
+            "Ranks one prefill attention shard group (tensor parallel) spans. Default: the model's layout for "
+            "this machine. The server refuses, by name, a value the model "
+            "does not resolve to."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-moe-ep",
+        type=int,
+        default=None,
+        help=(
+            "Ranks one prefill expert partition (expert parallel) spans. Default: the model's layout for "
+            "this machine. The server refuses, by name, a value the model "
+            "does not resolve to."
+        ),
+    )
+    parser.add_argument(
+        "--decode-attention-tp",
+        type=int,
+        default=None,
+        help=(
+            "Ranks one decode attention shard group (tensor parallel) spans. Default: the model's layout for "
+            "this machine. The server refuses, by name, a value the model "
+            "does not resolve to."
+        ),
+    )
+    parser.add_argument(
+        "--decode-moe-ep",
+        type=int,
+        default=None,
+        help=(
+            "Ranks one decode expert partition (expert parallel) spans. Default: the model's layout for "
+            "this machine. The server refuses, by name, a value the model "
+            "does not resolve to."
         ),
     )
     parser.add_argument(
@@ -1181,6 +1229,10 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
         prefill_moe_mode=parsed.prefill_moe_mode,
+        prefill_attention_tp=parsed.prefill_attention_tp,
+        prefill_moe_ep=parsed.prefill_moe_ep,
+        decode_attention_tp=parsed.decode_attention_tp,
+        decode_moe_ep=parsed.decode_moe_ep,
         prefix_rank_assignment_mode=parsed.prefix_rank_assignment_mode,
         prefix_rank_cost_profile=parsed.prefix_rank_cost_profile,
         debug_num_layers=parsed.debug_num_layers,

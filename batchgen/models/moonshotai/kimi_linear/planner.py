@@ -66,6 +66,38 @@ def k3_deepep_low_latency(*, sharded_latent: bool, enable_deepep: bool = False) 
     return True
 
 
+RETIRED_ATTENTION_GROUP_ENV = "BATCHGEN_KIMI_ATTENTION_GROUP_SIZE"
+
+
+def requested_attention_group_size(*, prefill_tp, decode_tp, environ) -> int:
+    """The attention group size the launch asked for (1 when it asked for none).
+
+    The family runs ONE attention group for both phases, so the two per-phase
+    flags must agree and either one alone sets both. The environment variable
+    that used to carry the size is retired and refused by name: a launcher
+    that still exports it must not start a server with another layout than
+    the one it asked for.
+    """
+    if RETIRED_ATTENTION_GROUP_ENV in environ:
+        raise ValueError(
+            f"{RETIRED_ATTENTION_GROUP_ENV} is retired; pass "
+            "--decode-attention-tp N and unset the variable"
+        )
+    if prefill_tp is not None and decode_tp is not None and (
+        int(prefill_tp) != int(decode_tp)
+    ):
+        raise ValueError(
+            f"--prefill-attention-tp {prefill_tp} and --decode-attention-tp "
+            f"{decode_tp} differ: Kimi-Linear runs one attention group for both "
+            "phases; a layout with a different group per phase is not implemented"
+        )
+    requested = decode_tp if decode_tp is not None else prefill_tp
+    size = 1 if requested is None else int(requested)
+    if size < 1:
+        raise ValueError(f"the attention group size must be positive, got {size}")
+    return size
+
+
 def kimi_prefix_pool_workspace_bytes(
     *, machine_family: MachineFamily | None, attention_group_size: int,
     is_k3: bool, world_size: int,
