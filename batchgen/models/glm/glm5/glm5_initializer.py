@@ -26,7 +26,7 @@ from batchgen.config.batchgen_model_config import BatchGenModelConfig
 from batchgen.config.layer_truncation import apply_layer_truncation
 from .config import assert_indexer_schedule_consistent
 from .set_basic_config import set_basic_config
-from .planner import GLM5Planner
+from .planner import GLM5Planner, glm5_server_layout
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 
 try:
@@ -90,6 +90,10 @@ class GLM5Initializer:
         self.planner = GLM5Planner(model_name=input_arguments.huggingface_ckpt_name)
         self.engine_config = self.planner.generate_config(
             self.engine_config, self.model_config.model_type
+        )
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = glm5_server_layout(
+            self.engine_config, self.engine_config.Basic_Config.world_size
         )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")

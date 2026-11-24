@@ -65,33 +65,16 @@ class DeepSeekV4FlashParallelStrategyManager:
         )
 
     def parallel_declaration(self, decode_graph_state=None):
-        """DeepSeek-V4-Flash's declared layout (batchgen.parallel_declaration).
-
-        The weight contract is built once in ``__init__`` and both phases
-        reuse it, so every module whose key it holds — attention, shared and
-        routed experts — streams from host in BOTH phases (its wrappers are
-        non-persistent). Prefill runs the MoE replicated
-        (``_configure_moe_ranges(prefill=True)`` configures EP rank 0 of 1);
-        decode partitions the routed experts over the world
-        (``configure_ep(global_rank, world_size)``), still streamed.
-        """
-        from batchgen.parallel_declaration import (
-            DecodeGraphDeclaration,
-            ModuleParallelism,
-            ParallelDeclaration,
-            RESIDENCY_STREAMED,
-            SCHEME_DP,
-            SCHEME_EP,
+        """DeepSeek-V4-Flash's parallel layout (batchgen.parallel_declaration):
+        the one ``set_basic_config.deepseekv4_flash_server_layout`` resolves
+        before this manager is built."""
+        from batchgen.models.deepseek.deepseekv4_flash.set_basic_config import (
+            deepseekv4_flash_server_layout,
         )
+        from batchgen.parallel_declaration import DecodeGraphDeclaration
 
-        return ParallelDeclaration(
-            prefill_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            prefill_moe=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            decode_attention=ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED),
-            decode_moe=ModuleParallelism(
-                SCHEME_EP, RESIDENCY_STREAMED, group_size=self.world_size
-            ),
-            decode_graph=DecodeGraphDeclaration.off(),
+        return deepseekv4_flash_server_layout(self.world_size).declaration(
+            DecodeGraphDeclaration.off()
         )
 
     def configure_prefill(self):

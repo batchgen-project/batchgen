@@ -32,7 +32,7 @@ from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.layer_truncation import apply_layer_truncation
 from batchgen.config.model_registry import load_config
 from .configuration_gpt_oss import GptOssConfig
-from .planner import GptOssPlanner
+from .planner import GptOssPlanner, gpt_oss_server_layout
 from .gpt_oss_parameter_server import GptOss_Parameter_Server
 
 try:
@@ -106,6 +106,12 @@ class GptOssInitializer:
         self.planner = GptOssPlanner()
         self.engine_config = self.planner.generate_config(
             self.engine_config, self.model_config.model_type
+        )
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = gpt_oss_server_layout(
+            self.engine_config,
+            self.engine_config.Basic_Config.world_size,
+            self.model_config.num_local_experts,
         )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")

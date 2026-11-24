@@ -2132,20 +2132,44 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
+	def _check_planned_server_layout(self, manager_class) -> None:
+		"""Take the layout the family's planner resolved and check it before
+		the manager is built.
+
+		The layout comes with the planned config (``Basic_Config.server_layout``).
+		One outside the family's implemented table is refused here by name, with
+		no model object created yet, and every later reader of a group width
+		takes it from this object.
+		"""
+		from batchgen.parallel_declaration import check_planned_server_layout
+
+		planned = getattr(self.engine_config.Basic_Config, "server_layout", None)
+		if planned is not None:
+			check_planned_server_layout(manager_class, planned, int(self.world_size))
+		self._server_layout = planned
+
 	def _resolve_server_layout(self) -> None:
-		"""Resolve the server's two phase layouts from the manager just built.
+		"""Check the manager just built against the planned layout.
 
 		Runs right after the manager is constructed, before any weight is
-		loaded: a layout outside the family's implemented table is refused
-		here by name, and every later reader of a group width takes it from
-		this object. A manager that declares no layout must be pure DP.
+		loaded: the manager must have been built for exactly the layout its
+		planner resolved. A family that plans no layout takes the one its
+		manager declares, checked against the implemented table; a manager
+		that declares none must be pure DP.
 		"""
 		from batchgen.parallel_declaration import (
 			ParallelDeclarationError,
+			check_built_layout_is_planned,
 			resolve_server_layout,
 		)
 
 		layout, _ = resolve_server_layout(self.parallel_manager, int(self.world_size))
+		planned = self._server_layout
+		if planned is not None:
+			check_built_layout_is_planned(
+				type(self.parallel_manager).__name__, planned, layout
+			)
+			return
 		if layout is None and int(getattr(self.parallel_manager, "attn_tp_size", 1)) != 1:
 			raise ParallelDeclarationError(
 				f"{type(self.parallel_manager).__name__} runs an attention group "
@@ -3984,8 +4008,9 @@ class BatchGenWorker:
 				f"offloading_ratio={self.engine_config.EP_Config.offloading_ratio}"
 			)
 
-		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
-		self.parallel_manager = self.parallel_manager(
+		manager_class = get_parallel_strategy_manager(self.huggingface_ckpt_name)
+		self._check_planned_server_layout(manager_class)
+		self.parallel_manager = manager_class(
 			self.loaded_model_config,
 			self.engine_config,
 			self.model_config,
@@ -6233,9 +6258,9 @@ class BatchGenWorker:
 		)
 		from batchgen.worker.server_config import ServerConfig
 
-		# The report is rendered from the layout resolved when the manager was
-		# built. What the manager declares now, with the model built, must be
-		# that same layout: the reported layout is the executed one.
+		# The report is rendered from the layout the planner resolved before
+		# the manager was built. What the manager declares now, with the model
+		# built, must be that same layout: the reported layout is the executed one.
 		layout = self._server_layout
 		built, declaration = resolve_server_layout(
 			self.parallel_manager, int(self.world_size), self._graph

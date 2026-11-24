@@ -37,7 +37,7 @@ import torch
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
 from .config import KimiK25Config
-from .planner import KimiK25Planner
+from .planner import KimiK25Planner, kimi_k25_server_layout
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -82,6 +82,10 @@ class KimiK25Initializer:
         self.planner = KimiK25Planner()
         self.engine_config = self.planner.generate_config(
             self.engine_config, self.model_config.model_type
+        )
+        # The server layout is resolved here, before any model manager exists.
+        self.engine_config.Basic_Config.server_layout = kimi_k25_server_layout(
+            self.engine_config, self.engine_config.Basic_Config.world_size
         )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")

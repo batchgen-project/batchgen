@@ -24,6 +24,46 @@ Optimized for single H20 GPU deployment with MXFP4 quantized weights.
 from batchgen.planner.base_planner import BasePlanner
 
 
+GPT_OSS_NUM_ROUTED_EXPERTS = 128
+
+
+def gpt_oss_local_expert_split(
+    ep_config, world_size: int, num_local_experts: int,
+    num_routed_experts: int = GPT_OSS_NUM_ROUTED_EXPERTS,
+) -> tuple:
+    """(EP offloading on, experts resident per layer, experts owned per layer).
+
+    A deployment constant: derived from the world size and the EP
+    configuration only, so the layout and the strategy manager read this one
+    answer. A single-GPU deployment decodes with every expert resident.
+    """
+    if world_size <= 1:
+        owned = int(num_local_experts)
+        return False, owned, owned
+    owned = int(num_routed_experts) // int(world_size)
+    if world_size > 8:
+        return False, owned, owned
+    if ep_config.enable_offloading:
+        return True, int(owned * (1 - ep_config.offloading_ratio)), owned
+    return False, owned, owned
+
+
+def gpt_oss_server_layout(engine_config, world_size: int, num_local_experts: int):
+    """GPT-OSS's layout, resolved before the model manager is built: prefill
+    streams the attention weights and replicates every routed expert per rank
+    (resident unless EP offloading streams them); decode keeps attention
+    resident per rank and partitions the experts over the world."""
+    from batchgen.parallel_declaration import replicated_prefill_world_ep_decode_layout
+
+    ep_config = engine_config.EP_Config
+    _, resident, owned = gpt_oss_local_expert_split(ep_config, world_size, num_local_experts)
+    return replicated_prefill_world_ep_decode_layout(
+        world_size,
+        decode_moe_fully_resident=resident >= owned,
+        prefill_moe_residency="streamed" if ep_config.enable_offloading else "resident",
+    )
+
+
 class GptOssPlanner(BasePlanner):
     """Planner specialized for GPT-OSS-120B model.
 
