@@ -1,4 +1,4 @@
-"""Every registered model's parallel declaration, and the undeclared ratchet.
+"""Every registered model's parallel declaration: each manager must declare.
 
 The declarations are computed from launch configuration at start-up, so each
 test drives the real method on a bare instance (``__new__`` plus exactly the
@@ -56,11 +56,6 @@ REGISTERED_MANAGERS = {
     ),
 }
 
-# The ratchet: models whose manager has not declared yet, with the reason.
-# Shrink-only — a model may move OUT of this set, never back in.
-UNDECLARED_MODELS: dict = {}
-
-
 def test_registration_seam_and_this_list_agree():
     source = (ROOT / "batchgen/get_parallel_strategy_manager.py").read_text()
     for name, (_, cls) in REGISTERED_MANAGERS.items():
@@ -78,7 +73,7 @@ def test_registration_seam_and_this_list_agree():
 
 
 def test_every_registered_manager_is_declared():
-    undeclared = {}
+    missing = []
     for name, (path, cls_name) in REGISTERED_MANAGERS.items():
         tree = ast.parse((ROOT / path).read_text())
         cls = next(
@@ -89,10 +84,10 @@ def test_every_registered_manager_is_declared():
             isinstance(node, ast.FunctionDef) and node.name == "parallel_declaration"
             for node in cls.body
         ):
-            undeclared[name] = "no parallel_declaration on the manager"
-    assert undeclared == UNDECLARED_MODELS
-    # Acceptance ratchet: the GLM-5 family is declared.
-    assert "glm-5" not in undeclared
+            missing.append(name)
+    # A model without a declared layout is refused at start, so every
+    # registered manager declares.
+    assert missing == []
 
 
 def _lift_methods(model: str, names, namespace):

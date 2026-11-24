@@ -74,14 +74,9 @@ def test_declaration_slots_are_typed_and_consistent():
     assert dense.rendered_slots()["decode_moe"] == "none"
 
 
-def test_undeclared_is_reserved_and_covers_every_slot():
-    assert pd.undeclared_slots() == {
-        "prefill_attention": "undeclared",
-        "prefill_moe": "undeclared",
-        "decode_attention": "undeclared",
-        "decode_moe": "undeclared",
-    }
-    assert pd.UNDECLARED not in pd.SCHEMES and pd.UNDECLARED not in pd.RESIDENCIES
+def test_there_is_no_undeclared_value():
+    # Every model has a layout; nothing reports a slot as "undeclared".
+    assert not hasattr(pd, "UNDECLARED") and not hasattr(pd, "undeclared_slots")
 
 
 @pytest.mark.parametrize("mode", ["graph", "compare"])
@@ -117,7 +112,7 @@ class _WrongType:
         return {"prefill_attention": "dp:streamed"}
 
 
-def test_read_is_optional_but_never_coerced():
+def test_read_is_required_and_never_coerced():
     assert pd.read_parallel_declaration(_Declared()) == declaration()
     owner = type("Owner", (), {
         "whole_model_graph": True,
@@ -126,6 +121,7 @@ def test_read_is_optional_but_never_coerced():
     })()
     read = pd.read_parallel_declaration(_Declared(), owner)
     assert read.decode_graph == graph_declaration()
-    assert pd.read_parallel_declaration(_Undeclared()) is None
+    with pytest.raises(pd.ParallelDeclarationError, match="_Undeclared declares no parallel layout"):
+        pd.read_parallel_declaration(_Undeclared())
     with pytest.raises(pd.ParallelDeclarationError, match="_WrongType"):
         pd.read_parallel_declaration(_WrongType())

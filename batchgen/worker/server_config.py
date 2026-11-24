@@ -15,8 +15,8 @@ therefore prints one line per node, each under its own ``node=`` value.
 Every value is reported as its owner holds it, never re-derived:
 
 ``prefill_attn`` / ``prefill_moe`` / ``decode_attn`` / ``decode_moe``
-    The model's ``ParallelDeclaration`` slots, rendered; ``undeclared`` for
-    a manager without the contract (never a guessed default).
+    The slots of the server's layout, rendered. Every model has one: a model
+    without a layout is refused at start.
 ``cuda_graphs`` / ``graph_buckets``
     The owning model's decode-graph declaration and its installed or captured
     bucket ladder; ``none`` when no decode graph is declared.
@@ -45,11 +45,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from batchgen.parallel_declaration import UNDECLARED
-
 LOG_TAG = "[SERVER_CONFIG]"
 
-# A rendered parallelism slot: a ParallelDeclaration token, or UNDECLARED.
+# A rendered parallelism slot: a ParallelDeclaration token.
 _SLOT_TOKEN = re.compile(
     r"none|dp:(?:resident|streamed|partial)|(?:tp|ep)\d+:(?:resident|streamed|partial)"
 )
@@ -79,12 +77,10 @@ class ServerConfigError(ValueError):
 
 
 def _check_slot(name: str, value: Any) -> None:
-    if value == UNDECLARED:
-        return
     if not isinstance(value, str) or not _SLOT_TOKEN.fullmatch(value):
         raise ServerConfigError(
-            f"server config {name} {value!r} is neither {UNDECLARED!r} nor a "
-            "rendered ModuleParallelism token"
+            f"server config {name} {value!r} is not a rendered "
+            "ModuleParallelism token"
         )
 
 

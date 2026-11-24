@@ -73,10 +73,10 @@ TurnError = _M["agent_sessions"].TurnError
 MODEL = "gpt-oss-120b"
 CONTEXT = 4096  # the served model's context length in these tests
 
-# A minimal valid [SERVER_CONFIG] publication (undeclared model, no graphs).
+# A minimal valid [SERVER_CONFIG] publication (no graphs).
 SERVER_CONFIG = {
-    "prefill_attn": "undeclared", "prefill_moe": "undeclared",
-    "decode_attn": "undeclared", "decode_moe": "undeclared",
+    "prefill_attn": "dp:streamed", "prefill_moe": "dp:streamed",
+    "decode_attn": "dp:resident", "decode_moe": "ep8:resident",
     "cuda_graphs": False, "graph_buckets": None,
     "host_kv_gib": 1.0, "host_kv_pages": 8,
     "device_kv_gib": 1.0, "device_kv_pages": 8,

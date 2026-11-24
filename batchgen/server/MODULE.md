@@ -87,8 +87,8 @@ layout right after construction and again when the report is snapshotted.
 
 The publication also carries the cohort's `server_config`
 (`batchgen/worker/server_config.py`): that parallel layout per phase
-(`batchgen/parallel_declaration.py`; a manager whose family plans and
-declares none reports `undeclared`, never a guessed default), the
+(`batchgen/parallel_declaration.py`; a model whose family plans no layout
+is refused at start, by name, before its manager is built), the
 CUDA-graph flag with the owning model's installed or captured bucket ladder, the host- and device-KV
 pool sizes and page counts, the GPU memory fraction and the derived
 scheduling capacity. Local rank 0 of each node snapshots it while the decode
@@ -98,7 +98,7 @@ line per generation and node before the scheduler marks the deployment ready:
 
     [SERVER_CONFIG] generation=<G> node=<N> prefill_attn=<slot> prefill_moe=<slot> decode_attn=<slot> decode_moe=<slot> cuda_graphs=<on|off> graph_buckets=<b1,b2,...|none> host_kv_gib=<G.GGG> host_kv_pages=<P> device_kv_gib=<G.GGG> device_kv_pages=<P> gpu_memory_frac=<F> max_pool=<N> num_layers=<L> num_layers_full=<L>
 
-where `<slot>` is `undeclared`, `none`, or a `scheme:residency` token whose
+where `<slot>` is `none` or a `scheme:residency` token whose
 sharded schemes carry their group width: `dp:streamed`, `tp8:resident`,
 `ep8:partial`. `num_layers` is the layer count the engine serves and
 `num_layers_full` the checkpoint's; they differ only under
