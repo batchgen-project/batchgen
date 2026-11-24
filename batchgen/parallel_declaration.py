@@ -270,3 +270,394 @@ def read_parallel_declaration(
             f"return a ParallelDeclaration, got {type(declaration).__name__}"
         )
     return declaration
+
+
+# ---------------------------------------------------------------------------
+# Phase layout: the rank groups a phase's two modules form.
+#
+# A phase gives the attention and the MoE each their own scheme and group
+# size. Sequences are owned by an attention group; no activation collective
+# leaves a DP worker, whose size is the larger of the two group sizes. A
+# group is a tuple of global ranks, never "the first G local ranks of a
+# node", so that groups may later span machines.
+# ---------------------------------------------------------------------------
+
+PHASE_PREFILL = "prefill"
+PHASE_DECODE = "decode"
+LAYOUT_PHASES = (PHASE_PREFILL, PHASE_DECODE)
+
+
+def _rank_groups(world_size: int, group_size: int) -> Tuple[Tuple[int, ...], ...]:
+    return tuple(
+        tuple(range(start, start + group_size))
+        for start in range(0, world_size, group_size)
+    )
+
+
+@dataclass(frozen=True)
+class PhaseLayout:
+    """One phase's layout over a world of ranks."""
+
+    phase: str
+    attention: ModuleParallelism
+    moe: ModuleParallelism
+    world_size: int
+
+    def __post_init__(self) -> None:
+        if self.phase not in LAYOUT_PHASES:
+            raise ParallelDeclarationError(
+                f"phase {self.phase!r} is not one of {LAYOUT_PHASES}"
+            )
+        for name in ("attention", "moe"):
+            if not isinstance(getattr(self, name), ModuleParallelism):
+                raise ParallelDeclarationError(
+                    f"{self.phase} {name} must be a ModuleParallelism"
+                )
+        if self.attention.scheme == SCHEME_NONE:
+            raise ParallelDeclarationError(f"{self.phase} attention cannot be 'none'")
+        if (
+            not isinstance(self.world_size, int)
+            or isinstance(self.world_size, bool)
+            or self.world_size < 1
+        ):
+            raise ParallelDeclarationError(
+                f"world_size must be a positive int, got {self.world_size!r}"
+            )
+        small, large = sorted((self.attention.group_size, self.moe.group_size))
+        if large % small:
+            raise ParallelDeclarationError(
+                f"{self.phase} layout {self.render()}: the attention group size "
+                f"{self.attention.group_size} and the MoE group size "
+                f"{self.moe.group_size} must divide one another"
+            )
+        if self.world_size % large:
+            raise ParallelDeclarationError(
+                f"{self.phase} layout {self.render()}: the DP worker size {large} "
+                f"does not divide the world size {self.world_size}"
+            )
+
+    @property
+    def dp_worker_size(self) -> int:
+        """Ranks one DP worker spans: the larger of the two group sizes."""
+        return max(self.attention.group_size, self.moe.group_size)
+
+    @property
+    def num_dp_workers(self) -> int:
+        return self.world_size // self.dp_worker_size
+
+    @property
+    def dp_workers(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.dp_worker_size)
+
+    @property
+    def attention_groups(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.attention.group_size)
+
+    @property
+    def moe_groups(self) -> Tuple[Tuple[int, ...], ...]:
+        return _rank_groups(self.world_size, self.moe.group_size)
+
+    def _check_rank(self, rank: int) -> None:
+        if not isinstance(rank, int) or isinstance(rank, bool) or not (
+            0 <= rank < self.world_size
+        ):
+            raise ParallelDeclarationError(
+                f"rank {rank!r} is outside the world of {self.world_size} ranks"
+            )
+
+    def attention_group_of(self, rank: int) -> Tuple[int, ...]:
+        """The attention group that owns the sequences served on ``rank``."""
+        self._check_rank(rank)
+        return self.attention_groups[rank // self.attention.group_size]
+
+    def moe_group_of(self, rank: int) -> Tuple[int, ...]:
+        self._check_rank(rank)
+        return self.moe_groups[rank // self.moe.group_size]
+
+    def dp_worker_of(self, rank: int) -> Tuple[int, ...]:
+        """The ranks an activation collective issued on ``rank`` may reach."""
+        self._check_rank(rank)
+        return self.dp_workers[rank // self.dp_worker_size]
+
+    def render(self) -> str:
+        return f"attention={self.attention.render()} moe={self.moe.render()}"
+
+
+@dataclass(frozen=True)
+class ServerLayout:
+    """The two phase layouts of a server; each phase owns its own (C1)."""
+
+    prefill: PhaseLayout
+    decode: PhaseLayout
+
+    def __post_init__(self) -> None:
+        for phase in LAYOUT_PHASES:
+            layout = getattr(self, phase)
+            if not isinstance(layout, PhaseLayout) or layout.phase != phase:
+                raise ParallelDeclarationError(
+                    f"server layout slot {phase} must be the {phase} PhaseLayout"
+                )
+        if self.prefill.world_size != self.decode.world_size:
+            raise ParallelDeclarationError(
+                "both phases run on the same world: "
+                f"{self.prefill.world_size} != {self.decode.world_size}"
+            )
+        if (self.prefill.moe.scheme == SCHEME_NONE) != (
+            self.decode.moe.scheme == SCHEME_NONE
+        ):
+            raise ParallelDeclarationError(
+                "a model either has a MoE in both phases or in neither"
+            )
+
+    def phase(self, phase: str) -> PhaseLayout:
+        if phase not in LAYOUT_PHASES:
+            raise ParallelDeclarationError(
+                f"phase {phase!r} is not one of {LAYOUT_PHASES}"
+            )
+        return getattr(self, phase)
+
+    def declaration(
+        self, decode_graph: DecodeGraphDeclaration = DecodeGraphDeclaration()
+    ) -> ParallelDeclaration:
+        """The four-slot report rendered from this layout, so that what is
+        reported and what is executed come from one object."""
+        return ParallelDeclaration(
+            prefill_attention=self.prefill.attention,
+            prefill_moe=self.prefill.moe,
+            decode_attention=self.decode.attention,
+            decode_moe=self.decode.moe,
+            decode_graph=decode_graph,
+        )
+
+
+def server_layout_from_declaration(
+    declaration: ParallelDeclaration, world_size: int
+) -> ServerLayout:
+    """The rank groups a manager's declared layout forms over ``world_size``."""
+    if not isinstance(declaration, ParallelDeclaration):
+        raise ParallelDeclarationError(
+            f"expected a ParallelDeclaration, got {type(declaration).__name__}"
+        )
+    return ServerLayout(
+        prefill=PhaseLayout(
+            PHASE_PREFILL,
+            declaration.prefill_attention,
+            declaration.prefill_moe,
+            world_size,
+        ),
+        decode=PhaseLayout(
+            PHASE_DECODE,
+            declaration.decode_attention,
+            declaration.decode_moe,
+            world_size,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Implemented layouts: what a model family has built, declared as data.
+#
+# A manager lists, per phase, the (attention, MoE) combinations it implements.
+# The layout a server resolved is checked against that list at start-up; one
+# outside it is refused by name and the message lists the implemented ones.
+# The list is the model family's own statement, so "what is implemented" can
+# be read (and rendered into one table) without reading the model code.
+# ---------------------------------------------------------------------------
+
+GROUP_ONE = "1"            # a replicated module: no shard group
+GROUP_WORLD = "world"      # one group spanning every rank of the server
+GROUP_DIVISOR = "g"        # any group size that divides the world size
+GROUP_ATTENTION = "attn"   # the same group as the phase's attention
+_GROUP_RULES = (GROUP_ONE, GROUP_WORLD, GROUP_DIVISOR, GROUP_ATTENTION)
+# A group rule may also be a fixed size, written as an int greater than 1.
+
+
+def _is_fixed_group(group) -> bool:
+    return isinstance(group, int) and not isinstance(group, bool) and group > 1
+
+
+class UnsupportedLayoutError(ParallelDeclarationError):
+    """The resolved layout is not one the model family implements."""
+
+
+@dataclass(frozen=True)
+class ModuleSupport:
+    """The shapes of one module that a layout entry admits."""
+
+    scheme: str
+    residencies: Tuple[str, ...] = ()
+    group: object = GROUP_ONE
+
+    def __post_init__(self) -> None:
+        if self.scheme not in SCHEMES:
+            raise ParallelDeclarationError(
+                f"parallelism scheme {self.scheme!r} is not one of {SCHEMES}"
+            )
+        if self.group not in _GROUP_RULES and not _is_fixed_group(self.group):
+            raise ParallelDeclarationError(
+                f"group rule {self.group!r} is not one of {_GROUP_RULES} "
+                "or a fixed size greater than 1"
+            )
+        if self.scheme == SCHEME_NONE:
+            if self.residencies or self.group != GROUP_ONE:
+                raise ParallelDeclarationError(
+                    "a 'none' module admits no residency and no group"
+                )
+            return
+        if not self.residencies or any(r not in RESIDENCIES for r in self.residencies):
+            raise ParallelDeclarationError(
+                f"residencies {self.residencies!r} must be a non-empty subset "
+                f"of {RESIDENCIES}"
+            )
+        if (self.scheme in _GROUPED_SCHEMES) == (self.group == GROUP_ONE):
+            raise ParallelDeclarationError(
+                f"a {self.scheme} module {'needs' if self.scheme in _GROUPED_SCHEMES else 'has no'} "
+                f"shard group; got group rule {self.group!r}"
+            )
+
+    def admits(
+        self, module: ModuleParallelism, world_size: int, attention_group: int
+    ) -> bool:
+        if module.scheme != self.scheme:
+            return False
+        if self.scheme == SCHEME_NONE:
+            return True
+        if module.residency not in self.residencies:
+            return False
+        size = module.group_size
+        if _is_fixed_group(self.group):
+            return size == self.group
+        if self.group == GROUP_ONE:
+            return size == 1
+        if self.group == GROUP_WORLD:
+            return size == world_size
+        if self.group == GROUP_ATTENTION:
+            return size == attention_group
+        return size >= 1 and world_size % size == 0
+
+    def render(self) -> str:
+        if self.scheme == SCHEME_NONE:
+            return SCHEME_NONE
+        scheme = self.scheme
+        if scheme in _GROUPED_SCHEMES:
+            scheme = f"{scheme}<{self.group}>"
+        return f"{scheme}:{'|'.join(self.residencies)}"
+
+
+@dataclass(frozen=True)
+class LayoutSupport:
+    """One implemented (attention, MoE) combination of a phase."""
+
+    attention: ModuleSupport
+    moe: ModuleSupport
+
+    def __post_init__(self) -> None:
+        for name in ("attention", "moe"):
+            if not isinstance(getattr(self, name), ModuleSupport):
+                raise ParallelDeclarationError(
+                    f"layout support {name} must be a ModuleSupport"
+                )
+        if self.attention.group == GROUP_ATTENTION:
+            raise ParallelDeclarationError(
+                "the attention group cannot be defined by itself"
+            )
+
+    def admits(self, layout: PhaseLayout) -> bool:
+        attention_group = layout.attention.group_size
+        return self.attention.admits(
+            layout.attention, layout.world_size, attention_group
+        ) and self.moe.admits(layout.moe, layout.world_size, attention_group)
+
+    def render(self) -> str:
+        return f"attention={self.attention.render()} moe={self.moe.render()}"
+
+
+def replicated_prefill_world_ep_decode(
+    *,
+    prefill_moe: Tuple[str, ...] = (RESIDENCY_STREAMED,),
+    decode_attention: Tuple[str, ...] = (RESIDENCY_RESIDENT,),
+    decode_moe: Tuple[str, ...] = (RESIDENCY_RESIDENT, RESIDENCY_PARTIAL),
+) -> dict:
+    """The one layout most families implement: every module replicated per
+    rank in prefill with the attention weights streamed, and in decode a
+    replicated attention with the routed experts partitioned over the world."""
+    return {
+        PHASE_PREFILL: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_STREAMED,)),
+                ModuleSupport(SCHEME_DP, prefill_moe),
+            ),
+        ),
+        PHASE_DECODE: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, decode_attention),
+                ModuleSupport(SCHEME_EP, decode_moe, GROUP_WORLD),
+            ),
+        ),
+    }
+
+
+def read_supported_layouts(parallel_manager) -> Optional[dict]:
+    """The manager's ``SUPPORTED_LAYOUTS`` (``{phase: (LayoutSupport, ...)}``),
+    or None when the family does not declare one. A present table of the wrong
+    shape is a hard error."""
+    table = getattr(parallel_manager, "SUPPORTED_LAYOUTS", None)
+    if table is None:
+        return None
+    if not isinstance(table, dict) or set(table) != set(LAYOUT_PHASES):
+        raise ParallelDeclarationError(
+            f"{type(parallel_manager).__name__}.SUPPORTED_LAYOUTS must map "
+            f"exactly {LAYOUT_PHASES}"
+        )
+    for phase, entries in table.items():
+        if not isinstance(entries, tuple) or not entries or any(
+            not isinstance(entry, LayoutSupport) for entry in entries
+        ):
+            raise ParallelDeclarationError(
+                f"SUPPORTED_LAYOUTS[{phase!r}] must be a non-empty tuple of "
+                "LayoutSupport"
+            )
+    return table
+
+
+def check_layout_supported(model: str, supported: dict, layout: ServerLayout) -> None:
+    """Refuse, by name, a layout the model family does not implement."""
+    for phase in LAYOUT_PHASES:
+        phase_layout = layout.phase(phase)
+        entries = supported[phase]
+        if any(entry.admits(phase_layout) for entry in entries):
+            continue
+        implemented = "; ".join(entry.render() for entry in entries)
+        raise UnsupportedLayoutError(
+            f"layout {phase} {phase_layout.render()} on {phase_layout.world_size} "
+            f"ranks is not implemented for {model}; implemented {phase} "
+            f"layouts: {implemented}"
+        )
+
+
+def resolve_server_layout(
+    parallel_manager, world_size: int, decode_graph_owner=None
+) -> Tuple[Optional[ServerLayout], Optional[ParallelDeclaration]]:
+    """The layout the manager built, checked against what its family declares
+    as implemented. ``(None, None)`` when the manager declares nothing."""
+    declaration = read_parallel_declaration(parallel_manager, decode_graph_owner)
+    if declaration is None:
+        return None, None
+    layout = server_layout_from_declaration(declaration, world_size)
+    supported = read_supported_layouts(parallel_manager)
+    if supported is not None:
+        check_layout_supported(type(parallel_manager).__name__, supported, layout)
+    return layout, declaration
+
+
+def render_supported_layouts(tables: dict) -> str:
+    """One Markdown table of every family's implemented layouts."""
+    lines = ["| family | phase | attention | MoE |", "|---|---|---|---|"]
+    for family in sorted(tables):
+        for phase in LAYOUT_PHASES:
+            for entry in tables[family][phase]:
+                lines.append(
+                    f"| {family} | {phase} | {entry.attention.render()} | "
+                    f"{entry.moe.render()} |"
+                )
+    return "\n".join(lines)

@@ -1111,6 +1111,8 @@ class BatchGenWorker:
 		self.global_rank = args.global_rank
 		self.rank = args.global_rank # Alias for compatibility
 		self.world_size = args.world_size
+		# The server's two phase layouts, resolved at the config snapshot.
+		self._server_layout = None
 		self.local_world_size = args.local_world_size
 		# S3.5 state owners.  They are created eagerly so flag-off paths are
 		# plain field reads and the pool pseudo-sid seed is unconditional.
@@ -6243,18 +6245,21 @@ class BatchGenWorker:
 		logs it once per generation and node (batchgen.worker.server_config).
 		"""
 		from batchgen.parallel_declaration import (
-			read_parallel_declaration,
+			resolve_server_layout,
 			undeclared_slots,
 		)
 		from batchgen.worker.server_config import ServerConfig
 
-		declaration = read_parallel_declaration(
-			self.parallel_manager, self._graph
+		# The layout object is what the report is rendered from, and a layout
+		# outside the family's implemented list is refused here by name.
+		layout, declaration = resolve_server_layout(
+			self.parallel_manager, int(self.world_size), self._graph
 		)
+		self._server_layout = layout
 		slots = (
 			undeclared_slots()
-			if declaration is None
-			else declaration.rendered_slots()
+			if layout is None
+			else layout.declaration(declaration.decode_graph).rendered_slots()
 		)
 		graph = (
 			None

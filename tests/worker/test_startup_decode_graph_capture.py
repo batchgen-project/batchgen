@@ -497,6 +497,8 @@ def test_the_glm5_manager_declares_that_its_decode_prewarm_compiles_kernels():
     declared = {
         target.id: ast.literal_eval(node.value)
         for node in manager.body if isinstance(node, ast.Assign)
-        for target in node.targets if isinstance(target, ast.Name)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        and target.id == "decode_prewarm_compiles_kernels"
     }
     assert declared.get("decode_prewarm_compiles_kernels") is True

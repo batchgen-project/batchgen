@@ -49,6 +49,7 @@ from .wrappers import (
     GLM5AttnWrapper,
     _required_dsa_kernel_import_failures,
 )
+from batchgen.parallel_declaration import replicated_prefill_world_ep_decode
 
 
 def _synchronize_prefill_preloads():
@@ -155,6 +156,10 @@ def uniform_expert_assignment(
 
 
 class GLM5ParallelStrategyManager:
+
+    # The layouts this family implements (batchgen.parallel_declaration); a
+    # resolved layout outside this table is refused at start-up by name.
+    SUPPORTED_LAYOUTS = replicated_prefill_world_ep_decode()
     # ``prewarm_decode_graphs`` compiles the decode kernels keyed on the KV
     # page-table geometry; it captures no graph. The worker therefore runs it
     # before readiness in every lifecycle, with or without decode graphs.
