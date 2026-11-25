@@ -488,3 +488,238 @@ def test_request_and_candidate_are_frozen():
     c = _cand("a")
     with pytest.raises((AttributeError, Exception)):
         c.uuid = "b"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+#  Clause C7: per-wave binding-cap record
+# --------------------------------------------------------------------------- #
+
+
+from batchgen.worker.prefill import (  # noqa: E402 (grouped with its tests)
+    PREFILL_CAP_ALL_CANDIDATES_ADMITTED,
+    PREFILL_CAP_HOST_KV_PAGES,
+    PREFILL_CAP_SCHEDULING_POOL_EMPTY,
+    PREFILL_CAP_SEQUENCE_SLOTS,
+    PrefillWaveCapRecord,
+)
+
+
+def test_wave_record_all_candidates_admitted():
+    # Two prompt=100 candidates (34 pages each) into 68 free pages: everything
+    # offered is taken, which is not a cap and must be named as such.
+    wave = PrefillScheduler.select_prefill_wave(
+        _req([_cand("a", gidx=0), _cand("b", gidx=1)], [68])
+    )
+    assert wave.admitted_uuids == ("a", "b")
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_ALL_CANDIDATES_ADMITTED
+    assert record.candidates_offered == 2
+    assert record.candidates_admitted == 2
+    assert record.admitted_prompt_tokens == 200
+    assert record.first_blocked_uuid is None
+
+
+def test_wave_record_scheduling_pool_empty():
+    wave = PrefillScheduler.select_prefill_wave(_req([], [100]))
+    assert wave.admitted_uuids == ()
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_SCHEDULING_POOL_EMPTY
+    assert record.candidates_offered == 0
+    assert record.candidates_admitted == 0
+    assert record.admitted_prompt_tokens == 0
+    assert record.first_blocked_uuid is None
+
+
+def test_wave_record_host_kv_pages_binding():
+    # 40 free pages: "a" takes 34, "b" needs 34 but only 6 remain.
+    wave = PrefillScheduler.select_prefill_wave(
+        _req([_cand("a", gidx=0), _cand("b", gidx=1)], [40])
+    )
+    assert wave.admitted_uuids == ("a",)
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_HOST_KV_PAGES
+    assert record.candidates_offered == 2
+    assert record.candidates_admitted == 1
+    assert record.admitted_prompt_tokens == 100
+    assert record.first_blocked_uuid == "b"
+    assert record.first_blocked_node == 0
+    assert record.first_blocked_needed == 34
+    assert record.first_blocked_available == 6
+
+
+def test_wave_record_sequence_slots_per_rank_binding():
+    # Pages are plentiful; rank 0 has one slot, so "b" is refused a slot.
+    wave = PrefillScheduler.select_prefill_wave(
+        _req(
+            [_cand("a", gidx=0), _cand("b", gidx=1)],
+            [1000],
+            per_rank_sequence_free=[1] + [0] * (_GPN - 1),
+        )
+    )
+    assert wave.admitted_uuids == ("a",)
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_SEQUENCE_SLOTS
+    assert record.candidates_admitted == 1
+    assert record.first_blocked_uuid == "b"
+    assert record.first_blocked_node == 0
+    assert record.first_blocked_needed == 1
+    assert record.first_blocked_available == 0
+
+
+def test_wave_record_sequence_slots_per_node_binding():
+    wave = PrefillScheduler.select_prefill_wave(
+        _req(
+            [_cand("a", gidx=0), _cand("b", gidx=1)],
+            [1000],
+            per_node_sequence_free=[1],
+        )
+    )
+    assert wave.admitted_uuids == ("a",)
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_SEQUENCE_SLOTS
+    assert record.first_blocked_uuid == "b"
+    assert record.first_blocked_available == 0
+
+
+def test_wave_record_names_the_first_refusal_in_priority_order():
+    # Node 0 has no pages, so "a" (highest priority) is refused Host pages;
+    # node 1 then runs out of sequence slots for "c". The binding cap is the
+    # quantity that stopped the wave from taking the NEXT candidate: "a"'s.
+    wave = PrefillScheduler.select_prefill_wave(
+        _req(
+            [
+                _cand("a", gidx=0, node=0),
+                _cand("b", gidx=1, node=1, rank=_GPN),
+                _cand("c", gidx=2, node=1, rank=_GPN),
+            ],
+            [0, 1000],
+            per_node_sequence_free=[1, 1],
+        )
+    )
+    assert wave.admitted_uuids == ("b",)
+    record = wave.cap_record
+    assert record.cap == PREFILL_CAP_HOST_KV_PAGES
+    assert record.first_blocked_uuid == "a"
+    assert record.first_blocked_node == 0
+    assert record.first_blocked_needed == 34
+    assert record.first_blocked_available == 0
+
+
+def test_select_prefill_batch_is_the_wave_selection_uuid_list():
+    # Behaviour preservation: the legacy entry returns exactly the wave
+    # selection's uuids, in order, for a capacity-cut and an all-admitted wave.
+    for free in ([40], [68], [0]):
+        req = _req([_cand("a", gidx=0), _cand("b", gidx=1)], free)
+        assert PrefillScheduler.select_prefill_batch(req) == list(
+            PrefillScheduler.select_prefill_wave(req).admitted_uuids
+        )
+
+
+def test_wave_record_describe_names_cap_and_counts():
+    record = PrefillWaveCapRecord(
+        cap=PREFILL_CAP_HOST_KV_PAGES,
+        candidates_offered=5,
+        candidates_admitted=2,
+        admitted_prompt_tokens=200,
+        first_blocked_uuid="abcdef0123456789",
+        first_blocked_node=1,
+        first_blocked_needed=34,
+        first_blocked_available=6,
+    )
+    text = record.describe()
+    assert text == (
+        "host_kv_pages (admitted=2/5, admitted_prompt_tokens=200); "
+        "first blocked seq abcdef01 on node 1: needed=34, available=6"
+    )
+    exhausted = PrefillWaveCapRecord(
+        cap=PREFILL_CAP_ALL_CANDIDATES_ADMITTED,
+        candidates_offered=3,
+        candidates_admitted=3,
+        admitted_prompt_tokens=300,
+    )
+    assert exhausted.describe() == (
+        "all_candidates_admitted (admitted=3/3, admitted_prompt_tokens=300)"
+    )
+
+
+class _RecorderWorker:
+    """The three attributes ``record_prefill_binding_cap`` touches."""
+
+    def __init__(self, rank=0):
+        self.rank = rank
+        self._prefill_wave_ordinal = 0
+        self.prefill_binding_cap_counts = {}
+
+
+def _host_record():
+    return PrefillWaveCapRecord(
+        cap=PREFILL_CAP_HOST_KV_PAGES,
+        candidates_offered=2,
+        candidates_admitted=1,
+        admitted_prompt_tokens=100,
+        first_blocked_uuid="b" * 32,
+        first_blocked_node=0,
+        first_blocked_needed=34,
+        first_blocked_available=6,
+    )
+
+
+def test_binding_cap_recorder_counts_and_logs_one_line(caplog):
+    import logging
+
+    from batchgen.worker.prefill import record_prefill_binding_cap
+
+    worker = _RecorderWorker(rank=0)
+    with caplog.at_level(logging.INFO):
+        record_prefill_binding_cap(worker, _host_record())
+    assert worker._prefill_wave_ordinal == 1
+    assert worker.prefill_binding_cap_counts == {PREFILL_CAP_HOST_KV_PAGES: 1}
+    lines = [
+        r.getMessage() for r in caplog.records if "binding cap" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert lines[0] == (
+        "[PREFILL] Wave 1 binding cap: host_kv_pages (admitted=1/2, "
+        "admitted_prompt_tokens=100); first blocked seq bbbbbbbb on node 0: "
+        "needed=34, available=6"
+    )
+
+
+def test_binding_cap_recorder_accumulates_per_cap_name(caplog):
+    import logging
+
+    from batchgen.worker.prefill import record_prefill_binding_cap
+
+    worker = _RecorderWorker(rank=0)
+    empty = PrefillWaveCapRecord(
+        cap=PREFILL_CAP_SCHEDULING_POOL_EMPTY,
+        candidates_offered=0,
+        candidates_admitted=0,
+        admitted_prompt_tokens=0,
+    )
+    with caplog.at_level(logging.INFO):
+        record_prefill_binding_cap(worker, _host_record())
+        record_prefill_binding_cap(worker, _host_record())
+        record_prefill_binding_cap(worker, empty)
+    assert worker._prefill_wave_ordinal == 3
+    assert worker.prefill_binding_cap_counts == {
+        PREFILL_CAP_HOST_KV_PAGES: 2,
+        PREFILL_CAP_SCHEDULING_POOL_EMPTY: 1,
+    }
+    assert any("Wave 3 binding cap: scheduling_pool_empty" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_binding_cap_recorder_counts_on_every_rank_logs_on_rank0_only(caplog):
+    import logging
+
+    from batchgen.worker.prefill import record_prefill_binding_cap
+
+    worker = _RecorderWorker(rank=3)
+    with caplog.at_level(logging.INFO):
+        record_prefill_binding_cap(worker, _host_record())
+    assert worker._prefill_wave_ordinal == 1
+    assert worker.prefill_binding_cap_counts == {PREFILL_CAP_HOST_KV_PAGES: 1}
+    assert not [
+        r for r in caplog.records if "binding cap" in r.getMessage()
+    ]
