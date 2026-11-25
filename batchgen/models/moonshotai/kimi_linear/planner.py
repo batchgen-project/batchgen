@@ -261,7 +261,9 @@ def kimi_linear_layout(
     one, plain DP otherwise; resident in decode always, and in prefill unless
     all modules are streamed. MoE: ``streamed`` runs every expert replicated
     per rank with the weights streamed from host; ``streamed_sp8`` partitions
-    the routed experts over the ranks of one attention group, streamed;
+    the routed experts over an expert group of ``STREAMED_EXPERT_GROUP_SIZE``
+    ranks, streamed (the manager runs it only where that group is also the
+    attention group);
     ``resident_ep`` partitions them over the world with the shard resident.
     An unknown mode fails by name.
     """
@@ -288,7 +290,13 @@ def kimi_linear_layout(
         if mode == "streamed":
             return ModuleParallelism(SCHEME_DP, RESIDENCY_STREAMED)
         if mode == "streamed_sp8":
-            return ModuleParallelism(SCHEME_EP, RESIDENCY_STREAMED, group_size=G)
+            # The expert group is its own quantity, not the attention group:
+            # the one implemented streamed partition spans
+            # STREAMED_EXPERT_GROUP_SIZE ranks.
+            return ModuleParallelism(
+                SCHEME_EP, RESIDENCY_STREAMED,
+                group_size=STREAMED_EXPERT_GROUP_SIZE,
+            )
         if mode == "resident_ep":
             return ModuleParallelism(
                 SCHEME_EP, RESIDENCY_RESIDENT, group_size=world_size

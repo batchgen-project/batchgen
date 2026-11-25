@@ -73,7 +73,11 @@ def groups(monkeypatch):
     return created
 
 
-def _psm(*, attn_tp_size=G, rank=0, built=False):
+def _psm(*, attn_tp_size=G, expert_group=None, rank=0, built=False):
+    # The streamed expert group defaults to the attention group: K3's
+    # streamed group-expert layout, where both families exist.
+    if expert_group is None:
+        expert_group = attn_tp_size
     psm = SimpleNamespace(
         world_size=WORLD,
         global_rank=rank,
@@ -82,6 +86,9 @@ def _psm(*, attn_tp_size=G, rank=0, built=False):
         _attn_tp_rank=rank % attn_tp_size if attn_tp_size else 0,
         _attn_tp_group_id=rank // attn_tp_size if attn_tp_size else 0,
         _attn_tp_group=None,
+        _streamed_expert_group_size=expert_group,
+        _streamed_expert_group_rank=rank % expert_group,
+        _streamed_expert_group_id=rank // expert_group,
         _weight_tp_group=None,
         _cross_weight_group=None,
         _cross_weight_root=None,
@@ -141,6 +148,28 @@ def test_without_hierarchical_gdr_only_the_node_local_families_are_built(groups)
     assert len(groups) == WORLD // G + WORLD // G
 
 
+def test_without_a_streamed_expert_group_only_the_attention_family_is_built(groups):
+    """Experts replicated per rank or resident: no weight-assembly family."""
+    psm = _psm(expert_group=1, rank=9)
+    psm._hierarchical_gdr = False
+    psm._build_attn_tp_group()
+    assert groups == [tuple(range(0, 8)), tuple(range(8, 16))]
+    assert "(8, 9, 10, 11, 12, 13, 14, 15)" in psm._attn_tp_group
+    assert psm._weight_tp_group is None
+    assert psm._attn_tp_groups_built is True
+
+
+def test_the_weight_family_follows_the_expert_group_not_the_attention_group(groups):
+    """The two families are sized by their own groups."""
+    psm = _psm(attn_tp_size=1, expert_group=4, rank=9)
+    psm._hierarchical_gdr = False
+    psm._build_attn_tp_group()
+    assert groups == [tuple(range(s, s + 4)) for s in range(0, WORLD, 4)]
+    assert psm._attn_tp_group is None
+    assert "(8, 9, 10, 11)" in psm._weight_tp_group
+    assert psm._attn_tp_group_signature == (WORLD, 1, 4)
+
+
 def test_pure_dp_builds_nothing_and_stays_unbuilt(groups):
     psm = _psm(attn_tp_size=1)
     psm._build_attn_tp_group()
@@ -152,15 +181,16 @@ def test_the_signature_records_the_topology_the_groups_belong_to(groups):
     psm = _psm()
     assert psm._attn_tp_group_signature is None
     psm._build_attn_tp_group()
-    assert psm._attn_tp_group_signature == (WORLD, G)
+    assert psm._attn_tp_group_signature == (WORLD, G, G)
     # A same-signature rebuild keeps the fast return.
     psm._build_attn_tp_group()
-    assert psm._attn_tp_group_signature == (WORLD, G)
+    assert psm._attn_tp_group_signature == (WORLD, G, G)
 
 
 @pytest.mark.parametrize("field,value,wanted", [
-    ("world_size", 32, (32, G)),
-    ("_attn_tp_size", 4, (WORLD, 4)),
+    ("world_size", 32, (32, G, G)),
+    ("_attn_tp_size", 4, (WORLD, 4, G)),
+    ("_streamed_expert_group_size", 1, (WORLD, G, 1)),
 ])
 def test_a_changed_topology_is_refused_by_name(groups, field, value, wanted):
     """Silent reuse would serve groups that no longer describe the world.
@@ -181,7 +211,7 @@ def test_a_changed_topology_is_refused_by_name(groups, field, value, wanted):
         psm._build_attn_tp_group()
 
     message = str(excinfo.value)
-    assert str((WORLD, G)) in message, "the old signature is not named"
+    assert str((WORLD, G, G)) in message, "the old signature is not named"
     assert str(wanted) in message, "the new signature is not named"
     assert len(groups) == built, "the refused call still created groups"
 

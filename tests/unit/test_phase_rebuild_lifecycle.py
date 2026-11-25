@@ -145,6 +145,10 @@ def _engine_config(**basic):
         world_size=WORLD, group=group,
         stream_all=fields["stream_all_modules"],
         distributed=fields["distributed_weight_sharded"],
+        # K3's TP attention shards the latent projections, so the streamed
+        # experts are partitioned over the expert group (both node-local
+        # communicator families exist).
+        latent_tp=group > 1,
     )
     return SimpleNamespace(
         Basic_Config=SimpleNamespace(**fields),
@@ -312,7 +316,7 @@ def test_two_rebuild_cycles_keep_every_cross_phase_holder(groups):
         assert ResidentEPMXFP4MoELayer._prefill_y is None, cycle
         # The NCCL groups are world-level: the reset must NOT drop them.
         assert psm._attn_tp_groups_built is True, cycle
-        assert psm._attn_tp_group_signature == (WORLD, G), cycle
+        assert psm._attn_tp_group_signature == (WORLD, G, G), cycle
 
         # ---- planning in the phase window, with no model ---------------
         layout = psm.prefill_pool_layout()
@@ -424,8 +428,8 @@ def test_a_changed_attention_topology_is_refused_after_the_groups_exist(groups):
         psm._build_attn_tp_group()
 
     message = str(excinfo.value)
-    assert str((WORLD, G)) in message
-    assert str((WORLD, 4)) in message
+    assert str((WORLD, G, G)) in message
+    assert str((WORLD, 4, G)) in message
     assert len(groups) == built
 
 
