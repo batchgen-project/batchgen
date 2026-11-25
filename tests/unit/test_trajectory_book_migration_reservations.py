@@ -23,7 +23,7 @@ import threading
 import time
 from collections import defaultdict
 from queue import Queue
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Dict, List, Optional
 
 import pytest
@@ -206,14 +206,25 @@ def _admit(workers, prompts, owners):
     for worker in workers:
         for global_idx, uuid in enumerate(uuids, start=len(worker.global_batch._sequences)):
             length = len(prompts[uuid])
-            worker.global_batch.add(SimpleNamespace(
+            seq = SimpleNamespace(
                 uuid=uuid, global_idx=global_idx, assigned_rank=owners[uuid],
                 host_pages_allocated=1, host_owned_pages=1, host_token_capacity=PAGE_TOKENS,
                 prompt_length=length, original_prompt_length=length,
                 current_context_length=length, decoded_length=0,
                 text="", input_ids=None, decoded_tokens=None, kv_token_budget=CONTEXT,
                 _buffer_slot=-1, log_event=lambda *args, **kwargs: None,
-            ))
+                PAGE_SIZE=PAGE_TOKENS,
+            )
+            # The real owner methods (never re-implemented in tests): the
+            # rebalance under test commits the migrated host reservation and
+            # rebases the length pair through the SequenceEntry owner.
+            seq.commit_host_reservation = MethodType(
+                SequenceEntry.commit_host_reservation, seq
+            )
+            seq.rebase_decoded_length = MethodType(
+                SequenceEntry.rebase_decoded_length, seq
+            )
+            worker.global_batch.add(seq)
         slots = worker._trajectory_book.bind_batch(uuids, [CONTEXT] * len(uuids))
         for uuid, slot in zip(uuids, slots):
             worker._trajectory_book.write_prompt(slot, torch.tensor(prompts[uuid]))

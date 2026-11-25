@@ -13,7 +13,9 @@ saved before it is cleared; the eviction snapshot reads the decoded length,
 not the re-entry length), and the fields each method must NOT touch.
 """
 
-from batchgen.sequence import SequenceEntry
+import pytest
+
+from batchgen.sequence import HostReservationCommitError, SequenceEntry
 
 PAGE = SequenceEntry.PAGE_SIZE
 
@@ -178,3 +180,119 @@ def test_begin_eviction_restamps_the_three_length_scalars():
     seq2.begin_eviction(120)
     assert seq2.gpu_pages_allocated == 6
     assert seq2.host_pages_allocated == 4
+
+
+# --------------------------------------------------------------------------- #
+#  commit_host_reservation                                                     #
+# --------------------------------------------------------------------------- #
+
+def test_commit_host_reservation_stamps_exactly_the_three_host_counters():
+    seq = _entry(
+        host_pages_allocated=1,
+        host_owned_pages=1,
+        host_token_capacity=PAGE,
+        gpu_pages_allocated=4,
+        decoded_length=30,
+        current_context_length=130,
+    )
+    seq.commit_host_reservation(7, 7 * PAGE, 5)
+    assert seq.host_pages_allocated == 7
+    assert seq.host_token_capacity == 7 * PAGE
+    assert seq.host_owned_pages == 5
+    # Not a GPU-side or length write.
+    assert seq.gpu_pages_allocated == 4
+    assert seq.decoded_length == 30
+    assert seq.current_context_length == 130
+
+
+def test_commit_host_reservation_migration_form_owns_every_page():
+    # The migration rebase re-stamps all three from the destination's
+    # allocation: (p, p * PAGE_SIZE, p).
+    seq = _entry(host_pages_allocated=3, host_owned_pages=2,
+                 host_token_capacity=3 * PAGE)
+    seq.commit_host_reservation(9, 9 * PAGE, 9)
+    assert (seq.host_pages_allocated, seq.host_owned_pages) == (9, 9)
+    assert seq.host_token_capacity == 9 * PAGE
+
+
+def test_commit_host_reservation_refuses_a_broken_capacity_identity():
+    seq = _entry(host_pages_allocated=3, host_owned_pages=2,
+                 host_token_capacity=3 * PAGE)
+    with pytest.raises(HostReservationCommitError, match="tokens="):
+        seq.commit_host_reservation(7, 7 * PAGE - 1, 7)
+    # Refused before any write: the commit is all-or-nothing.
+    assert seq.host_pages_allocated == 3
+    assert seq.host_owned_pages == 2
+    assert seq.host_token_capacity == 3 * PAGE
+
+
+def test_commit_host_reservation_refuses_owning_more_than_allocated():
+    seq = _entry(host_pages_allocated=3, host_owned_pages=2,
+                 host_token_capacity=3 * PAGE)
+    with pytest.raises(HostReservationCommitError, match="exceeds pages"):
+        seq.commit_host_reservation(7, 7 * PAGE, 8)
+    assert seq.host_pages_allocated == 3
+    assert seq.host_owned_pages == 2
+    assert seq.host_token_capacity == 3 * PAGE
+
+
+# --------------------------------------------------------------------------- #
+#  share_owned_pages                                                           #
+# --------------------------------------------------------------------------- #
+
+def test_share_owned_pages_deducts_only_the_owned_count():
+    seq = _entry(host_pages_allocated=5, host_owned_pages=5,
+                 host_token_capacity=5 * PAGE)
+    seq.share_owned_pages(2, where="unit share")
+    assert seq.host_owned_pages == 3
+    # The chain allocation and capacity are not what sharing moves.
+    assert seq.host_pages_allocated == 5
+    assert seq.host_token_capacity == 5 * PAGE
+
+
+def test_share_owned_pages_zero_share_still_passes_the_invariant():
+    # A rank that shares nothing (a non-owner at reservation, an empty retain at prefix commit)
+    # still goes through HOST_OWNED_PAGE, so an empty chain is refused.
+    seq = _entry(host_pages_allocated=4, host_owned_pages=4)
+    seq.share_owned_pages(0, where="unit zero share")
+    assert seq.host_owned_pages == 4
+
+    empty = _entry(host_pages_allocated=0, host_owned_pages=0)
+    with pytest.raises(RuntimeError, match=r"HOST_OWNED_PAGE broken at unit zero"):
+        empty.share_owned_pages(0, where="unit zero share on empty chain")
+
+
+def test_share_owned_pages_refuses_sharing_the_whole_chain():
+    seq = _entry(host_pages_allocated=3, host_owned_pages=3)
+    with pytest.raises(RuntimeError, match=r"\[SCHED_INVARIANT\] HOST_OWNED_PAGE"):
+        seq.share_owned_pages(3, where="unit full share")
+    # Refused before the write.
+    assert seq.host_owned_pages == 3
+
+
+# --------------------------------------------------------------------------- #
+#  rebase_decoded_length                                                       #
+# --------------------------------------------------------------------------- #
+
+def test_rebase_decoded_length_restores_the_context_identity():
+    seq = _entry(decoded_length=5, current_context_length=105)
+    seq.rebase_decoded_length(42)
+    assert seq.decoded_length == 42
+    # ccl == original_prompt_length + dl, from the ORIGINAL prompt length.
+    assert seq.current_context_length == 100 + 42
+    # Not a prompt or resource write.
+    assert seq.prompt_length == 100
+    assert seq.original_prompt_length == 100
+    assert seq.host_pages_allocated == 0
+    assert seq.gpu_pages_allocated == 0
+
+
+def test_rebase_decoded_length_uses_original_prompt_after_reentry():
+    # After an eviction cycle prompt_length holds the re-entry length; the
+    # identity is anchored on original_prompt_length, exactly as the
+    # migration-receive site computed it.
+    seq = _entry(decoded_length=30, current_context_length=130)
+    seq.begin_eviction(120)
+    seq.rebase_decoded_length(30)
+    assert seq.prompt_length == 120
+    assert seq.current_context_length == 100 + 30

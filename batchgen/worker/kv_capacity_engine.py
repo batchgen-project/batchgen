@@ -3776,10 +3776,12 @@ class KVCapacityEngine:
             # All ranks execute this (migration list is deterministic), keeping fields consistent.
             seq = self.global_batch.get_sequence(uuid)
             if seq is not None:
-                seq.host_pages_allocated = mig.host_pages
                 # Dest allocates all host_pages into the sequence's own chain.
-                seq.host_owned_pages = mig.host_pages
-                seq.host_token_capacity = mig.host_pages * self.PAGE_SIZE
+                seq.commit_host_reservation(
+                    mig.host_pages,
+                    mig.host_pages * self.PAGE_SIZE,
+                    mig.host_pages,
+                )
 
         # Barrier to ensure all ranks have updated global_batch
         dist.barrier()
@@ -3864,10 +3866,7 @@ class KVCapacityEngine:
                         )
                     seq._buffer_slot = destination_slot
                     seq.prompt_length = pending['prompt_length']
-                    seq.decoded_length = pending['decoded_length']
-                    seq.current_context_length = (
-                        seq.original_prompt_length + seq.decoded_length
-                    )
+                    seq.rebase_decoded_length(pending['decoded_length'])
                     self.query_book[new_local_idx] = make_query_book_entry(seq)
                     logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
                 else:

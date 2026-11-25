@@ -78,34 +78,13 @@ def compute_prefill_host_reservation(
 	return pages, pages * page_size
 
 
-def host_owned_pages_after_sharing(
-    *,
-    chain_pages: int,
-    shared_pages: int,
-    sequence_id: int,
-    where: str,
-) -> int:
-	"""Return the pages left in a sequence's own Host chain after sharing.
-
-	Invariant HOST_OWNED_PAGE: a sequence holding Host KV with decode budget
-	left owns at least one page of its own chain. Admission reserves at least
-	``ceil((prompt + 1) / page)`` pages (``compute_prefill_host_reservation``
-	with ``max_tokens >= 1``), while prefix attach and prefix commit share at
-	most ``floor(prompt / page)`` full prompt pages, so the page holding the
-	first decode position always stays owned. The host-KV growth planner
-	relies on it: evicting every candidate then clears every grower's debt.
-	``chain_pages`` is the owned count before this move; ``shared_pages`` is
-	what leaves the chain for shared prefix residency.
-	"""
-	owned = int(chain_pages) - int(shared_pages)
-	if owned < 1:
-		raise RuntimeError(
-			f"[SCHED_INVARIANT] HOST_OWNED_PAGE broken at {where}: sequence "
-			f"{sequence_id} would own {owned} Host pages "
-			f"(chain_pages={chain_pages}, shared_pages={shared_pages}); a "
-			"decode-capable sequence must own >= 1 page of its Host chain"
-		)
-	return owned
+# host_owned_pages_after_sharing lives in batchgen.sequence now: the
+# HOST_OWNED_PAGE invariant guards a SequenceEntry scalar, and the owner's
+# SequenceEntry.share_owned_pages enforces it there (the cross-cutting layer
+# may not import worker modules).  Re-exported here for the existing callers.
+from batchgen.sequence import (  # noqa: F401
+	host_owned_pages_after_sharing as host_owned_pages_after_sharing,
+)
 
 
 @dataclass(frozen=True)
