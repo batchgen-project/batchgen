@@ -39,6 +39,10 @@ _FUSED_CU = _REPO_ROOT / "batchgen_kernels/src/attention/csrc/add_rmsnorm_fp8_qu
 _DSA_SEG = _REPO_ROOT / "batchgen/models/glm/glm5/cuda_graph_segments.py"
 _REUSE_SEG = _REPO_ROOT / "batchgen/models/glm/glm5/reuse_topk_segment.py"
 _LAYER_SEG = _REPO_ROOT / "batchgen/models/glm/glm5/layer_cuda_graph_segments.py"
+# The layer body (norm/quant call sites included) was extracted into the ONE
+# shared body function that the eager layer calls and the graph segment
+# captures; the call-site pins below moved with it.
+_LAYER_BODY = _REPO_ROOT / "batchgen/models/glm/glm5/layer_body.py"
 _MOE_SEG = _REPO_ROOT / "batchgen/models/glm/glm5/moe_cuda_graph_segments.py"
 _WRAPPERS = _REPO_ROOT / "batchgen/models/glm/glm5/wrappers.py"
 _SETUP = _REPO_ROOT / "batchgen_kernels/setup.py"
@@ -675,8 +679,8 @@ def test_every_act_quant_in_a_dsa_forward_is_switch_guarded(path, class_name):
     )
 
 
-def test_the_layer_segment_fuses_both_norms_behind_the_segments_request():
-    forward = _find_def(_LAYER_SEG, "Glm5DecoderLayerGraphSegment", "forward")
+def test_the_layer_body_fuses_both_norms_behind_the_segments_request():
+    forward = _find_def(_LAYER_BODY, None, "run_glm5_layer_body")
     fused = _calls_with_guards(forward, "cuda_add_rmsnorm_fp8_quant")
     assert len(fused) == 2, "input_layernorm and post_attention_layernorm"
     tests = [{t for t, _ in guards} for guards in fused]
@@ -702,13 +706,21 @@ def test_the_layer_segment_asks_the_segments_rather_than_the_switch():
     assert "glm5_norm_quant_fuse" not in text, (
         "the layer segment must not read the switch directly"
     )
+    # The shared body is phase-blind: it learns the fusion decisions ONLY
+    # through the operator set its caller built, never from the switch.
+    body_text = _LAYER_BODY.read_text()
+    assert "glm5_norm_quant_fuse" not in body_text, (
+        "the shared layer body must not read the switch directly"
+    )
+    assert "ops.consumes_fused_hidden_fp8" in body_text
+    assert "ops.consumes_fused_padded_fp8" in body_text
 
 
 def test_the_first_layer_keeps_its_standalone_quantize():
     """The chain's first layer has no residual add, so its input norm is the
     plain ``cuda_rmsnorm``, which has no fused FP8 version. Its ONE quantize
     per step stays standalone and the DSA segment still gets the pair."""
-    forward = _find_def(_LAYER_SEG, "Glm5DecoderLayerGraphSegment", "forward")
+    forward = _find_def(_LAYER_BODY, None, "run_glm5_layer_body")
     calls = _calls_with_guards(forward, "act_quant")
     assert len(calls) == 1
     guards = dict(calls[0])

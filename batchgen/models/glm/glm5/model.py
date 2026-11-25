@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 
 from .decode_utils import clamp_token_indices_to_seqlens
+from .layer_body import Glm5LayerBodyOps, run_glm5_layer_body
 # GLM-5 uses BatchGen's internal config (a plain BaseModelConfig dataclass), not
 # an HF transformers.PretrainedConfig — matching every other model (kimi, etc.).
 # Imported under the historical name `Glm5Config` so the __init__ type hints below
@@ -3414,31 +3415,50 @@ class Glm5DecoderLayer(nn.Module):
             and isinstance(self.mlp, Glm5MoE)
             and self.mlp._prefill_grouped_enabled
         )
-        try:
-            if grouped_prefill:
-                self.mlp._prefill_prepare_weights()
-            # Pre-norm attention
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-            hidden_states, attn_weights, present = self.self_attn(
+
+        # The eager operator set for the ONE shared layer body
+        # (run_glm5_layer_body): every fusion switch stays False and no row
+        # mask is installed, so the body reduces to exactly the historical
+        # eager sequence -- input_layernorm, attention, fused add+RMSNorm,
+        # MoE/FFN, materialized residual add.
+        def _eager_attn(*, hidden_states, hidden_fp8, hidden_scale):
+            if hidden_fp8 is not None or hidden_scale is not None:
+                raise RuntimeError(
+                    "GLM-5 eager attention consumes no fused FP8 pair; the "
+                    "eager operator set must leave consumes_fused_hidden_fp8 "
+                    "False"
+                )
+            attn_output, attn_weights, present = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
             )
+            return {
+                "attn_output": attn_output,
+                "attn_weights": attn_weights,
+                "present": present,
+            }
 
-            # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
-            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-            hidden_states, residual = cuda_add_rmsnorm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.eps,
+        def _eager_ffn(hidden_states, hidden_fp8, hidden_scale):
+            if hidden_fp8 is not None or hidden_scale is not None:
+                raise RuntimeError(
+                    "GLM-5 eager MoE/FFN consumes no fused FP8 pair; the "
+                    "eager operator set must leave consumes_fused_padded_fp8 "
+                    "False"
+                )
+            return self.mlp(hidden_states)
+
+        try:
+            if grouped_prefill:
+                self.mlp._prefill_prepare_weights()
+            out = run_glm5_layer_body(
+                layer=self,
+                ops=Glm5LayerBodyOps(attn=_eager_attn, ffn=_eager_ffn),
+                hidden_states=hidden_states,
             )
-
-            # MoE/FFN
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
+            hidden_states = out["hidden_states"]
 
             if (
                 grouped_prefill
@@ -3446,7 +3466,7 @@ class Glm5DecoderLayer(nn.Module):
             ):
                 Glm5MoE.retire_prefill_grouped_weights()
 
-            return hidden_states, attn_weights, present
+            return hidden_states, out.get("attn_weights"), out.get("present")
         except Exception:
             if grouped_prefill:
                 try:

@@ -422,6 +422,11 @@ def test_only_the_probe_constructor_imports_the_spin_extension():
 
 def _method(path, class_name, method_name):
     tree = ast.parse(path.read_text())
+    if class_name is None:
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == method_name:
+                return node
+        raise AssertionError(f"{method_name} not found in {path}")
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             for item in node.body:
@@ -430,8 +435,14 @@ def _method(path, class_name, method_name):
     raise AssertionError(f"{class_name}.{method_name} not found in {path}")
 
 
+# The shared layer body (layer_body.py) is a module-level function whose probe
+# arrives through the operator set, so its probe spelling is
+# ``ops.criticality_probe``; the segment methods keep ``self.criticality_probe``.
 def _probe_call(node):
-    return ast.unparse(node.func).startswith("self.criticality_probe.")
+    callee = ast.unparse(node.func)
+    return callee.startswith("self.criticality_probe.") or callee.startswith(
+        "ops.criticality_probe."
+    )
 
 
 def _source_order_calls(fn):
@@ -450,8 +461,15 @@ _PRE_PROBE_CALL_SNAPSHOT = {
         (60, "33b3e845aeb6b44fe110c98044381da8a54c9a6016c16e8d2e926d741f47b7f8"),
     ("reuse_topk_segment.py", "Glm5ReuseTopkAttnSegment", "forward"):
         (35, "a10f74043a783277001b673b9554e28230fa302976a4bb8be1163c69eb836bb1"),
-    ("layer_cuda_graph_segments.py", "Glm5DecoderLayerGraphSegment", "forward"):
-        (18, "f8687608a3ab9fdb0d77149e422f1b0f20c25c4512fd29693274dcc6bd5473c7"),
+    # The decoder-layer op sequence moved VERBATIM out of
+    # Glm5DecoderLayerGraphSegment.forward into the ONE shared body function
+    # (layer_body.py) that the eager layer also runs, so this entry was
+    # re-recorded against the body at the extraction. That the inactive-path
+    # LAUNCH sequence is unchanged is held by the runtime snapshot below
+    # (_PRE_PROBE_LAYER_CALLS, recorded pre-change) and by
+    # tests/unit/test_glm5_layer_body_unification.py.
+    ("layer_body.py", None, "run_glm5_layer_body"):
+        (15, "c8c1b2b217607fccdc375ce708b63151272edea7ad23a1b5f86b7d5e795f83b6"),
     ("moe_cuda_graph_segments.py", "Glm5MoEGraphSegment", "forward"):
         (18, "af3676815db3a625036c84b10c12657859235c27bc3e986f6c341352162df7c5"),
     ("moe_cuda_graph_segments.py", "Glm5MoEGraphSegment", "_forward_deepep"):
@@ -477,11 +495,14 @@ def test_inactive_call_sequence_matches_the_pre_probe_snapshot(key):
 
 
 def _probe_guards(fn):
-    """Every ``if self.criticality_probe is not None`` in ``fn``."""
+    """Every ``if <owner>.criticality_probe is not None`` in ``fn``."""
     return [
         n for n in ast.walk(fn)
         if isinstance(n, ast.If)
-        and ast.unparse(n.test) == "self.criticality_probe is not None"
+        and ast.unparse(n.test) in (
+            "self.criticality_probe is not None",
+            "ops.criticality_probe is not None",
+        )
     ]
 
 
@@ -501,9 +522,9 @@ def test_every_probe_call_is_a_lone_none_guarded_statement(key):
 
 
 _SITE_OWNERS = {
-    "after_input_norm_quant": [("layer_cuda_graph_segments.py", "Glm5DecoderLayerGraphSegment")],
-    "after_attention": [("layer_cuda_graph_segments.py", "Glm5DecoderLayerGraphSegment")],
-    "after_post_attn_norm_quant": [("layer_cuda_graph_segments.py", "Glm5DecoderLayerGraphSegment")],
+    "after_input_norm_quant": [("layer_body.py", None)],
+    "after_attention": [("layer_body.py", None)],
+    "after_post_attn_norm_quant": [("layer_body.py", None)],
     "after_q_a_norm_quant": [
         ("cuda_graph_segments.py", "Glm5FullDsaAttnSegment"),
         ("reuse_topk_segment.py", "Glm5ReuseTopkAttnSegment"),
@@ -521,7 +542,10 @@ _SITE_OWNERS = {
 def _marks_in(fn):
     out = {}
     for node in ast.walk(fn):
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "self.criticality_probe.mark":
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in (
+            "self.criticality_probe.mark",
+            "ops.criticality_probe.mark",
+        ):
             site = node.args[0].value
             out.setdefault(site, []).append(node)
     return out
