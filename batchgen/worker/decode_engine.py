@@ -12,6 +12,7 @@ import torch
 from batchgen import lifespan
 from batchgen.eventlog.counters import STEP_COUNTERS_INTERVAL_S, StepCounters
 from batchgen.lifespan import SeqEvent
+from batchgen.sampling import greedy_decode
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.decode_profile import DecodeProfileCapture
 from batchgen.worker.deferred_readback import (
@@ -949,7 +950,10 @@ class DecoupledGpuDecode:
                             for key, value in graph_out.items()
                             if key.startswith("probe_layer_")
                         }
-                        graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
+                        # Library greedy entry (token-identical: the fp32
+                        # upcast inside preserves lm_head-dtype ordering
+                        # exactly, so argmax matches the former bare call).
+                        graph_tokens_for_compare = greedy_decode(logits)
                         if _glm5_whole_timing:
                             torch.cuda.synchronize(self.torch_device)
                             _glm5_eager_start = time.perf_counter()
@@ -983,7 +987,7 @@ class DecoupledGpuDecode:
                             _glm5_whole_timing_items["eager_ms"] = (
                                 time.perf_counter() - _glm5_eager_start
                             ) * 1000.0
-                        eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
+                        eager_tokens_for_compare = greedy_decode(eager_logits)
                         new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
                         compare = self._compare_glm5_whole_model_graph_logits(
                             eager_logits=eager_logits,
