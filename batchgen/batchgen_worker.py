@@ -237,7 +237,6 @@ from batchgen.worker.prefill import (
 	PrefillSelectionRequest,
 	describe_prefill_blockers,
 	host_kv_eviction_enabled,
-	host_owned_pages_after_sharing,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.startup_phases import NULL_STARTUP_PHASE_REPORTER
@@ -5420,12 +5419,12 @@ class BatchGenWorker:
 		# Commit scalar reservation metadata only after every allocator agrees.
 		for uuid, (pages, tokens) in reservations.items():
 			seq = self.global_batch.get_sequence(uuid)
-			seq.host_pages_allocated = pages
-			seq.host_token_capacity = tokens
+			seq.commit_host_reservation(pages, tokens, pages)
 			# Attached prefix pages never enter the sequence's own chain, so
-			# releasing the row returns only the private remainder. Only the
-			# host-KV owner holds the prefix state here; every other rank (G>1
-			# followers included) takes the owner's value at the post-prefill
+			# sharing deducts them and releasing the row returns only the
+			# private remainder. Only the host-KV owner holds the prefix state
+			# here; every other rank (G>1 followers included) shares 0 pages
+			# and takes the owner's value at the post-prefill
 			# _sync_sequence_metadata.
 			state = (
 				self._prefix.prefix_sequence_states.get(seq.global_idx)
@@ -5435,11 +5434,8 @@ class BatchGenWorker:
 			attached_pages = (
 				state.attached_tokens // seq.PAGE_SIZE if state is not None else 0
 			)
-			seq.host_owned_pages = host_owned_pages_after_sharing(
-				chain_pages=pages,
-				shared_pages=attached_pages,
-				sequence_id=seq.global_idx,
-				where="prefill reservation commit",
+			seq.share_owned_pages(
+				attached_pages, where="prefill reservation commit"
 			)
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
@@ -10732,11 +10728,8 @@ class BatchGenWorker:
 			# group retains the same page count; host_owned_pages counts one.
 			# Leader-only at G>1: the followers adopt the result at the
 			# post-prefill _sync_sequence_metadata (host_kv_owner_reports).
-			seq.host_owned_pages = host_owned_pages_after_sharing(
-				chain_pages=seq.host_owned_pages,
-				shared_pages=len(retained.get(0, ())),
-				sequence_id=seq.global_idx,
-				where="prefix commit retain",
+			seq.share_owned_pages(
+				len(retained.get(0, ())), where="prefix commit retain"
 			)
 			if trajectory_frontier:
 				# M3 Slice 1b, inside this same transaction: the snapshot's

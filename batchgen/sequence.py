@@ -55,6 +55,40 @@ def configure_page_buffers(
     DECISION_FREQUENCY_PAGES = decision_frequency_pages
 
 
+class HostReservationCommitError(RuntimeError):
+    """A host-KV reservation commit broke the page/token/ownership contract."""
+
+
+def host_owned_pages_after_sharing(
+    *,
+    chain_pages: int,
+    shared_pages: int,
+    sequence_id: int,
+    where: str,
+) -> int:
+    """Return the pages left in a sequence's own Host chain after sharing.
+
+    Invariant HOST_OWNED_PAGE: a sequence holding Host KV with decode budget
+    left owns at least one page of its own chain. Admission reserves at least
+    ``ceil((prompt + 1) / page)`` pages (``compute_prefill_host_reservation``
+    with ``max_tokens >= 1``), while prefix attach and prefix commit share at
+    most ``floor(prompt / page)`` full prompt pages, so the page holding the
+    first decode position always stays owned. The host-KV growth planner
+    relies on it: evicting every candidate then clears every grower's debt.
+    ``chain_pages`` is the owned count before this move; ``shared_pages`` is
+    what leaves the chain for shared prefix residency.
+    """
+    owned = int(chain_pages) - int(shared_pages)
+    if owned < 1:
+        raise RuntimeError(
+            f"[SCHED_INVARIANT] HOST_OWNED_PAGE broken at {where}: sequence "
+            f"{sequence_id} would own {owned} Host pages "
+            f"(chain_pages={chain_pages}, shared_pages={shared_pages}); a "
+            "decode-capable sequence must own >= 1 page of its Host chain"
+        )
+    return owned
+
+
 class SequenceStatus(IntEnum):
     QUEUEING = 0      # Waiting to be prefilled
     IN_PREFILL = 1    # Currently being prefilled
@@ -645,6 +679,58 @@ class SequenceEntry:
         self.total_decoded_before_eviction = self.decoded_length
         self.prompt_length = reentry_length
         self.current_context_length = reentry_length
+
+    def commit_host_reservation(self, pages: int, tokens: int, owned: int) -> None:
+        """Commit a host-KV reservation after the owning allocator succeeded.
+
+        ``pages`` becomes the host page count, ``tokens`` the host token
+        capacity and ``owned`` the pages of the sequence's own Host chain.
+        Prefill admission commits the fresh reservation with ``owned ==
+        pages`` (sharing then deducts through ``share_owned_pages``); the
+        migration rebase re-stamps all three from the pages the destination
+        allocated into the sequence's own chain, ``(p, p * PAGE_SIZE, p)``.
+        A commit that breaks the capacity identity or the ownership bound is
+        refused here, where the wrong reservation was computed, instead of
+        surfacing later as a ``validate_metadata`` failure far from the cause.
+        """
+        if tokens != pages * self.PAGE_SIZE:
+            raise HostReservationCommitError(
+                f"host reservation commit for sequence {self.global_idx}: "
+                f"tokens={tokens} must equal pages * PAGE_SIZE = "
+                f"{pages * self.PAGE_SIZE} (pages={pages})"
+            )
+        if owned > pages:
+            raise HostReservationCommitError(
+                f"host reservation commit for sequence {self.global_idx}: "
+                f"owned={owned} exceeds pages={pages}"
+            )
+        self.host_pages_allocated = pages
+        self.host_token_capacity = tokens
+        self.host_owned_pages = owned
+
+    def share_owned_pages(self, shared_pages: int, *, where: str) -> None:
+        """Deduct pages that left the sequence's own Host chain for shared
+        prefix residency (prefix attach at admission, page retention at
+        prefix commit).  Enforces HOST_OWNED_PAGE through the shared helper;
+        a rank that shares nothing (``shared_pages == 0``) still passes
+        through it, so an empty chain is refused everywhere.
+        """
+        self.host_owned_pages = host_owned_pages_after_sharing(
+            chain_pages=self.host_owned_pages,
+            shared_pages=shared_pages,
+            sequence_id=self.global_idx,
+            where=where,
+        )
+
+    def rebase_decoded_length(self, decoded_length: int) -> None:
+        """Re-stamp the length pair from a restored decoded length.
+
+        The migration receiver restores the trajectory it was sent and then
+        re-establishes the context identity ``current_context_length ==
+        original_prompt_length + decoded_length`` from the received value.
+        """
+        self.decoded_length = decoded_length
+        self.current_context_length = self.original_prompt_length + decoded_length
 
     # ============ Dynamic Host KV Reservation Methods ============
 
