@@ -327,8 +327,8 @@ class FakePrefixCoordinator:
 
 def _profile():
     return KDASnapshotProfile(
-        num_kda_layers=2, num_heads_per_rank=2, head_dim=16,
-        conv_dim_per_rank=32, conv_width=4,
+        num_kda_layers=2, num_heads=2, head_dim=16,
+        conv_dim=32, conv_width=4,
         recurrent_element_bytes=4, conv_element_bytes=2,
     )
 
@@ -359,14 +359,17 @@ class PoolArenaAllocator:
         self.releases = []
         self._next_sid = -1
 
-    def store(self, *, page_count, chunks):
+    def store(self, *, page_count, unit_chunks):
         pages = tuple(self.pool.take(page_count))
         sid, self._next_sid = self._next_sid, self._next_sid - 1
         return SnapshotArena(
             storage_handle=0, pseudo_sid=sid, page_ids_by_group={0: pages},
             pages_per_group=int(page_count),
             capacity_bytes=int(page_count) * HOST_PAGE_BYTES,
-            payload_bytes=sum(int(c.numel()) for c in chunks),
+            payload_bytes=sum(
+                int(c.numel()) for chunks in unit_chunks for c in chunks
+            ),
+            unit_count=len(unit_chunks),
         )
 
     def release(self, arena):

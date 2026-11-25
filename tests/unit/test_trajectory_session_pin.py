@@ -88,9 +88,9 @@ NAMESPACE = (11, 22, 33, 44)
 def _profile():
     return KDASnapshotProfile(
         num_kda_layers=3,
-        num_heads_per_rank=2,
+        num_heads=2,
         head_dim=8,
-        conv_dim_per_rank=16,
+        conv_dim=16,
         conv_width=4,
         recurrent_element_bytes=4,
         conv_element_bytes=2,
@@ -118,7 +118,7 @@ def _begin(registry, *, tokens, group_id, handle=7):
             owning_group_id=group_id,
             profile=_profile(),
             boundary_tokens=boundary,
-            shard_count=2,
+            unit_count=2,
         ),
     )
 
@@ -136,7 +136,7 @@ def _advance(registry, record, *, tokens, group_id, handle):
             owning_group_id=group_id,
             profile=_profile(),
             boundary_tokens=len(tokens),
-            shard_count=2,
+            unit_count=2,
         ),
     )
 

@@ -87,7 +87,7 @@ METHODS = (
     "_replace_prefix_lookup_hits",
     "_settle_trajectory_restore_plan",
     "_restore_trajectory_frontiers",
-    "_restore_mirrored_trajectory_shards",
+    "_restore_mirrored_trajectory_units",
     "_get_trajectory_restorer",
     "_trajectory_restore_payload",
     "_trajectory_group_geometry",
@@ -283,7 +283,7 @@ def _worker(
         # The leader's handle->arena table, read by the mirrored payload.
         trajectory_frontier_committer=SimpleNamespace(
             arena_for=lambda handle: SimpleNamespace(
-                shard_count=attn_tp_size,
+                unit_count=attn_tp_size,
                 pseudo_sid=-3,
                 pages_per_group=1,
                 capacity_bytes=64,

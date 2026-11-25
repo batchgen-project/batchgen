@@ -76,7 +76,7 @@ from batchgen.prefix_reuse.trajectory_restore import (  # noqa: E402
     DECLINE_ARENA_MISSING,
     DECLINE_ARENA_READ_FAILED,
     DECLINE_GROUP_MISMATCH,
-    DECLINE_HEAD_SHARDED_GROUP,
+    DECLINE_RECORD_UNITS_INDIVISIBLE,
     DECLINE_NOT_PLANNED,
     DECLINE_REASONS,
     DECLINE_SLOTS_EXHAUSTED,
@@ -1037,7 +1037,7 @@ def test_an_arena_read_failure_of_a_planned_row_fails_loud_and_takes_no_slot():
     attachment = _hit(harness, restorer)
     free_before = harness.manager.get_stats().num_free_state_items
 
-    def _boom(arena, *, layout, shard_index=0):
+    def _boom(arena, *, layout, unit_index=0):
         raise SnapshotArenaCorrupt("arena read exploded")
 
     harness.arena_reader.read = _boom
@@ -1133,15 +1133,15 @@ def test_a_serving_group_other_than_the_owning_group_is_refused(caplog):
     assert "planned_offgroup=true" in caplog.text
 
 
-def test_a_shard_count_that_is_not_this_group_is_refused_by_name(caplog):
-    """A record whose shard count is not this rank's group size is refused.
+def test_a_unit_count_the_group_does_not_divide_is_refused_by_name(caplog):
+    """A record whose unit count this rank's group size does not divide is
+    refused.
 
-    Slice 1c made a G>1 record restorable -- every rank's head shard is in the
-    arena -- so the refusal is no longer "G>1 at all". What stays refused is a
-    MISMATCH: a one-shard record read by a rank of a 4-rank group would take
-    the whole arena as its own heads, and a 4-shard record read at G=1 would
-    take a quarter of the state as all of it. Both bind wrong state that no
-    downstream assertion can see, so both are refused rather than approximated.
+    The record splits into U equal head units and a group of g ranks reads it
+    iff g divides U. A one-unit record read by a rank of a 4-rank group has no
+    whole-unit split: the rank would have to take a fraction of a unit as its
+    own heads, which binds wrong state no downstream assertion can see, so it
+    is refused rather than approximated.
     """
 
     harness = _Harness()
@@ -1155,18 +1155,19 @@ def test_a_shard_count_that_is_not_this_group_is_refused_by_name(caplog):
                 serving_group_id=0,
                 compute_cached_tokens=len(BASE_PROMPT),
             )
-    assert excinfo.value.reason == DECLINE_HEAD_SHARDED_GROUP
+    assert excinfo.value.reason == DECLINE_RECORD_UNITS_INDIVISIBLE
     assert restorer.live_attachments == 0
     assert harness.manager.has_sequence_state_item(9) is False
     assert (
         restorer.counters()[
-            f"trajectory_decline_{DECLINE_HEAD_SHARDED_GROUP}"
+            f"trajectory_decline_{DECLINE_RECORD_UNITS_INDIVISIBLE}"
         ]
         == 1
     )
-    assert "binds 1 head shard(s) but this rank serves a 4-rank group" in (
-        "\n".join(record.getMessage() for record in caplog.records)
-    )
+    assert (
+        "splits into 1 head unit(s), which this rank's 4-rank group does "
+        "not divide"
+    ) in "\n".join(record.getMessage() for record in caplog.records)
 
 
 def test_an_unknown_decline_reason_is_refused():
@@ -1363,10 +1364,10 @@ class _GroupHarness:
     apart.
     """
 
-    def __init__(self, *, shard_count: int = 4, groups: int = 1, num_pages: int = 64):
-        self.shard_count = int(shard_count)
+    def __init__(self, *, group_size: int = 4, groups: int = 1, num_pages: int = 64):
+        self.group_size = int(group_size)
         self.managers = [
-            _state_manager() for _ in range(self.shard_count)
+            _state_manager() for _ in range(self.group_size)
         ]
         self.profile = profile_from_kda_state_config(self.managers[0].config)
         self.layout = SnapshotLayout(profile=self.profile)
@@ -1394,11 +1395,12 @@ class _GroupHarness:
                     ),
                     profile=self.profile,
                 ),
-                shard_count=self.shard_count,
-                shard_index=index,
+                group_size=self.group_size,
+                group_rank=index,
+                unit_count=self.group_size,
                 owns_registry=(index == 0),
             )
-            for index in range(self.shard_count)
+            for index in range(self.group_size)
         ]
 
     def _next_pseudo_sid(self) -> int:
@@ -1415,7 +1417,7 @@ class _GroupHarness:
             for group_id in self.views
         }
 
-    def restorer(self, shard_index: int, **kwargs) -> TrajectoryRestorer:
+    def restorer(self, group_rank: int, **kwargs) -> TrajectoryRestorer:
         kwargs.setdefault(
             "arena_reader",
             HostKVSnapshotArenaReader(
@@ -1427,16 +1429,16 @@ class _GroupHarness:
             "state_writer",
             KDAStateSnapshotWriter(
                 state_manager_provider=(
-                    lambda manager=self.managers[int(shard_index)]: manager
+                    lambda manager=self.managers[int(group_rank)]: manager
                 ),
                 profile=self.profile,
             ),
         )
-        kwargs.setdefault("attention_group_size", self.shard_count)
+        kwargs.setdefault("attention_group_size", self.group_size)
         return TrajectoryRestorer(
-            rank=int(shard_index),
+            rank=int(group_rank),
             committer=self.leader,
-            shard_index=int(shard_index),
+            group_rank=int(group_rank),
             **kwargs,
         )
 
@@ -1475,7 +1477,7 @@ class _GroupHarness:
         )
         for follower in self.committers[1:]:
             assert (
-                follower.write_shard(
+                follower.write_units(
                     sequence_id=sequence_id,
                     frontier_token_ids=tokens,
                     prompt_token_count=len(tokens),
@@ -1499,11 +1501,11 @@ def _group_hit(harness, restorer, *, sequence_id=9):
     return attachment
 
 
-@pytest.mark.parametrize("shard_count", [2, 4])
-def test_a_matching_shard_count_is_restored_instead_of_refused(shard_count):
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_a_matching_unit_count_is_restored_instead_of_refused(group_size):
     """The Slice 2 blanket G>1 refusal is gone for a complete snapshot."""
 
-    harness = _GroupHarness(shard_count=shard_count)
+    harness = _GroupHarness(group_size=group_size)
     harness.seed()
     harness.commit_pass()
     restorer = harness.restorer(0)
@@ -1515,14 +1517,14 @@ def test_a_matching_shard_count_is_restored_instead_of_refused(shard_count):
 
     assert outcome is not None
     assert restorer.counters()[
-        f"trajectory_decline_{DECLINE_HEAD_SHARDED_GROUP}"
+        f"trajectory_decline_{DECLINE_RECORD_UNITS_INDIVISIBLE}"
     ] == 0
     assert restorer.counters()["trajectory_restores"] == 1
     assert restorer.live_attachments == 0
 
 
-@pytest.mark.parametrize("shard_index", [0, 1, 2, 3])
-def test_each_rank_restores_exactly_its_own_window(shard_index):
+@pytest.mark.parametrize("group_rank", [0, 1, 2, 3])
+def test_each_rank_restores_exactly_its_own_window(group_rank):
     """Rank r's slot must come back with rank r's bytes, not a neighbour's.
 
     Every rank's source state is seeded differently, so reading the wrong
@@ -1530,11 +1532,11 @@ def test_each_rank_restores_exactly_its_own_window(shard_index):
     rank's heads -- the exact failure no downstream assertion can see.
     """
 
-    harness = _GroupHarness(shard_count=4)
+    harness = _GroupHarness(group_size=4)
     _slots, expected = harness.seed()
     harness.commit_pass()
 
-    restorer = harness.restorer(shard_index)
+    restorer = harness.restorer(group_rank)
     outcome = restorer.restore(
         _group_hit(harness, restorer),
         serving_group_id=0,
@@ -1542,22 +1544,22 @@ def test_each_rank_restores_exactly_its_own_window(shard_index):
     )
 
     assert outcome is not None
-    manager = harness.managers[shard_index]
+    manager = harness.managers[group_rank]
     restored = _slot_chunks(manager, outcome.state_slot)
-    assert restored == expected[shard_index]
-    # And it is NOT any other rank's shard.
+    assert restored == expected[group_rank]
+    # And it is NOT any other rank's slice.
     for other in range(4):
-        if other != shard_index:
+        if other != group_rank:
             assert restored != expected[other]
 
 
-def test_a_shard_count_that_is_not_this_ranks_group_is_refused_at_g_gt_1():
-    """A 4-shard record read by a rank that thinks G==2 is refused by name."""
+def test_a_unit_count_the_reading_group_does_not_divide_is_refused_at_g_gt_1():
+    """A 4-unit record read by a rank of an 8-rank group is refused by name."""
 
-    harness = _GroupHarness(shard_count=4)
+    harness = _GroupHarness(group_size=4)
     harness.seed()
     harness.commit_pass()
-    restorer = harness.restorer(0, attention_group_size=2)
+    restorer = harness.restorer(0, attention_group_size=8)
     attachment = _group_hit(harness, restorer)
     with pytest.raises(TrajectoryPlannedRestoreFailed) as excinfo:
         restorer.restore(
@@ -1565,16 +1567,16 @@ def test_a_shard_count_that_is_not_this_ranks_group_is_refused_at_g_gt_1():
             serving_group_id=0,
             compute_cached_tokens=len(BASE_PROMPT),
         )
-    assert excinfo.value.reason == DECLINE_HEAD_SHARDED_GROUP
-    assert "4 head shard(s)" in excinfo.value.detail
+    assert excinfo.value.reason == DECLINE_RECORD_UNITS_INDIVISIBLE
+    assert "splits into 4 head unit(s)" in excinfo.value.detail
     assert restorer.counters()[
-        f"trajectory_decline_{DECLINE_HEAD_SHARDED_GROUP}"
+        f"trajectory_decline_{DECLINE_RECORD_UNITS_INDIVISIBLE}"
     ] == 1
     assert restorer.live_attachments == 0
 
 
-def test_a_restorer_refuses_a_shard_index_outside_its_group():
-    harness = _GroupHarness(shard_count=2)
+def test_a_restorer_refuses_a_group_rank_outside_its_group():
+    harness = _GroupHarness(group_size=2)
     with pytest.raises(TrajectoryRestoreError) as excinfo:
         harness.restorer(1, attention_group_size=1)
     assert "outside a 1-rank owning group" in str(excinfo.value)
@@ -1583,8 +1585,8 @@ def test_a_restorer_refuses_a_shard_index_outside_its_group():
     assert "attention_group_size must be positive" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("shard_index", [1, 2, 3])
-def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
+@pytest.mark.parametrize("group_rank", [1, 2, 3])
+def test_a_follower_restores_its_units_from_the_mirrored_decision(group_rank):
     """A rank with NO registry restores from the leader's mirrored record.
 
     The follower keeps no record of its own precisely so a leader-side eviction
@@ -1592,12 +1594,12 @@ def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
     from the leader, so hit/miss cannot differ across the group.
     """
 
-    harness = _GroupHarness(shard_count=4)
+    harness = _GroupHarness(group_size=4)
     _slots, expected = harness.seed()
     arena, installed = harness.commit_pass()
 
-    restorer = harness.restorer(shard_index)
-    outcome = restorer.restore_mirrored_shard(
+    restorer = harness.restorer(group_rank)
+    outcome = restorer.restore_mirrored_units(
         sequence_id=9,
         arena=arena,
         layout=harness.layout,
@@ -1611,8 +1613,8 @@ def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
 
     assert outcome is not None
     assert outcome.session_key == installed.session_key
-    restored = _slot_chunks(harness.managers[shard_index], outcome.state_slot)
-    assert restored == expected[shard_index]
+    restored = _slot_chunks(harness.managers[group_rank], outcome.state_slot)
+    assert restored == expected[group_rank]
     counters = restorer.counters()
     assert counters["trajectory_restores"] == 1
     assert counters["trajectory_declines"] == 0
@@ -1621,7 +1623,7 @@ def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
 
 
 def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog):
-    harness = _GroupHarness(shard_count=4)
+    harness = _GroupHarness(group_size=4)
     harness.seed()
     arena, installed = harness.commit_pass()
     restorer = harness.restorer(1)
@@ -1629,7 +1631,7 @@ def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog)
     # Wrong serving group, on a row that is not planned at the boundary:
     # declined, exactly as on the attachment path.
     assert (
-        restorer.restore_mirrored_shard(
+        restorer.restore_mirrored_units(
             sequence_id=9,
             arena=arena,
             layout=harness.layout,
@@ -1645,7 +1647,7 @@ def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog)
     # Suffix that does not start exactly at the boundary: planner drift,
     # counted under the same name and raised, as on the attachment path.
     with pytest.raises(TrajectoryRestorePlanDrift, match="disagree"):
-        restorer.restore_mirrored_shard(
+        restorer.restore_mirrored_units(
             sequence_id=9,
             arena=arena,
             layout=harness.layout,
@@ -1666,7 +1668,7 @@ def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path(caplog)
 
 
 def test_the_mirrored_path_refuses_an_unknown_reason():
-    harness = _GroupHarness(shard_count=2)
+    harness = _GroupHarness(group_size=2)
     restorer = harness.restorer(1)
     with pytest.raises(TrajectoryAttachmentInvalid):
         restorer._decline_mirrored(
@@ -1678,26 +1680,26 @@ def test_the_mirrored_path_refuses_an_unknown_reason():
         )
 
 
-def test_the_g_wide_arena_holds_every_shard_and_only_those_pages():
-    harness = _GroupHarness(shard_count=4)
+def test_the_u_unit_arena_holds_every_unit_and_only_those_pages():
+    harness = _GroupHarness(group_size=4)
     harness.seed()
     arena, _installed = harness.commit_pass()
 
-    one_shard = harness.layout.shard_page_count(
+    one_unit = harness.layout.unit_page_count(
         host_page_bytes_all_layers=harness.host_page_bytes_all_layers,
         prefix_page_count=2,
     )
-    assert arena.pages_per_group == 4 * one_shard
+    assert arena.pages_per_group == 4 * one_unit
     # Retained exactly once, by the leader, and every arena page is resident.
     view = harness.views[0]
     assert set(arena.page_ids_by_group[0]) <= view.resident_pages
     # Every window carries real bytes: no shard was left zeroed.
-    for shard_index in range(4):
-        window = arena.shard_window(shard_index)
+    for unit_index in range(4):
+        window = arena.unit_window(unit_index)
         blob = b"".join(
             view.page_bytes_of(page) for page in window[0]
         )
-        assert blob.strip(b"\x00"), f"shard {shard_index} window is all zeros"
+        assert blob.strip(b"\x00"), f"unit {unit_index} window is all zeros"
 
 
 # ---------------------------------------------------------------------------
@@ -1885,12 +1887,12 @@ def test_an_attachment_short_of_its_boundary_is_refused_without_a_slot_write():
 
 
 def test_a_mirrored_restore_short_of_its_boundary_is_refused():
-    harness = _GroupHarness(shard_count=2)
+    harness = _GroupHarness(group_size=2)
     harness.seed()
     arena, installed = harness.commit_pass()
     restorer = harness.restorer(1)
     with pytest.raises(TrajectoryAttachmentInvalid, match="fewer than its"):
-        restorer.restore_mirrored_shard(
+        restorer.restore_mirrored_units(
             sequence_id=9,
             arena=arena,
             layout=harness.layout,
@@ -1939,7 +1941,7 @@ def _inject_core_failure(name, restorer, manager):
         return _boom
 
     if name == "arena_read":
-        def _corrupt(arena, *, layout, shard_index=0):
+        def _corrupt(arena, *, layout, unit_index=0):
             raise SnapshotArenaCorrupt("arena read exploded")
 
         restorer._arena_reader.read = _corrupt
@@ -2004,7 +2006,7 @@ def test_every_core_refusal_of_a_planned_row_raises_with_its_fields(name, caplog
     assert "full recompute" not in text
 
 
-@pytest.mark.parametrize("refusal", ["head_sharded_group", "group_mismatch"])
+@pytest.mark.parametrize("refusal", ["record_units_indivisible", "group_mismatch"])
 def test_a_shard_or_group_refusal_raises_only_for_a_planned_row(refusal, caplog):
     """Same refusal, two rows: the one starting at the boundary raises.
 
@@ -2014,7 +2016,7 @@ def test_a_shard_or_group_refusal_raises_only_for_a_planned_row(refusal, caplog)
 
     harness = _Harness()
     _commit_seeded_frontier(harness, sequence_id=7)
-    group_size = 2 if refusal == "head_sharded_group" else 1
+    group_size = 2 if refusal == "record_units_indivisible" else 1
     serving = 1 if refusal == "group_mismatch" else 0
     restorer = harness.restorer(attention_group_size=group_size)
 
@@ -2096,14 +2098,14 @@ def _mirrored(restorer, harness, arena, installed, **overrides):
         compute_cached_tokens=len(BASE_PROMPT),
     )
     kwargs.update(overrides)
-    return restorer.restore_mirrored_shard(**kwargs)
+    return restorer.restore_mirrored_units(**kwargs)
 
 
 @pytest.mark.parametrize("name", sorted(CORE_FAILURES))
 def test_every_core_refusal_of_a_planned_mirrored_row_raises_the_same(name):
     """The follower path: same reasons, same counters, same raise."""
 
-    harness = _GroupHarness(shard_count=2)
+    harness = _GroupHarness(group_size=2)
     harness.seed()
     arena, installed = harness.commit_pass()
     restorer = harness.restorer(1)
@@ -2130,12 +2132,12 @@ def test_every_core_refusal_of_a_planned_mirrored_row_raises_the_same(name):
     assert manager.get_stats().num_free_state_items == free_before
 
 
-@pytest.mark.parametrize("refusal", ["head_sharded_group", "group_mismatch"])
+@pytest.mark.parametrize("refusal", ["record_units_indivisible", "group_mismatch"])
 def test_a_mirrored_shard_or_group_refusal_raises_only_for_a_planned_row(refusal):
-    harness = _GroupHarness(shard_count=2)
+    harness = _GroupHarness(group_size=2)
     harness.seed()
     arena, installed = harness.commit_pass()
-    group_size = 4 if refusal == "head_sharded_group" else 2
+    group_size = 4 if refusal == "record_units_indivisible" else 2
     serving = 1 if refusal == "group_mismatch" else 0
     restorer = harness.restorer(1, attention_group_size=group_size)
 
@@ -2219,3 +2221,263 @@ def test_the_seam_leaves_an_unplanned_row_without_an_attachment_alone():
     worker._restore_trajectory_frontiers([0])
     assert restorer.counters()["trajectory_restores"] == 0
     assert restorer.counters()["trajectory_declines"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Record head units: the record is independent of the writing group size
+# ---------------------------------------------------------------------------
+#
+# The record splits the FULL KDA state into UNIT_COUNT equal head units, so a
+# record written by an attention group of size g1 is readable by a group of
+# size g2 for every pair that divides UNIT_COUNT. The harness runs the real
+# committers over byte-accurate Host views; the expectation is the full state
+# assembled OUTSIDE the mechanism, sliced per reading rank.
+
+UNIT_COUNT = 8
+FULL_HEADS = 16
+UNIT_HEAD_DIM = 4
+UNIT_CONV_WIDTH = 4
+FULL_CONV_DIM = FULL_HEADS * UNIT_HEAD_DIM
+
+
+def _sliced_state_manager(*, group_size: int):
+    manager = KDAStateGPUManager(
+        config=KDAStateGPUConfig(
+            num_kda_layers=2,
+            num_state_items=NUM_STATE_SLOTS,
+            num_heads=FULL_HEADS // int(group_size),
+            head_dim=UNIT_HEAD_DIM,
+            conv_dim=FULL_CONV_DIM // int(group_size),
+            conv_width=UNIT_CONV_WIDTH,
+        ),
+        device="cpu",
+    )
+    manager.initialize()
+    return manager
+
+
+class _CrossHarness:
+    """A write group of ``write_group`` ranks committing a U=8 record."""
+
+    def __init__(self, *, write_group: int, num_pages: int = 96):
+        self.write_group = int(write_group)
+        self.managers = [
+            _sliced_state_manager(group_size=self.write_group)
+            for _ in range(self.write_group)
+        ]
+        self.profile = profile_from_kda_state_config(self.managers[0].config)
+        self.views = {0: _FakeHostView(num_pages=num_pages)}
+        self.host_page_bytes_all_layers = GROUP_PAGE_BYTES
+        self._sid = 0
+        self.allocator = HostKVSnapshotArenaAllocator(
+            host_views_provider=lambda: self.views,
+            page_tokens=PAGE_TOKENS,
+            host_page_bytes_all_layers=self.host_page_bytes_all_layers,
+            next_pseudo_sid=self._next_pseudo_sid,
+        )
+        self.committers = [
+            TrajectoryFrontierCommitter(
+                rank=index,
+                page_tokens=PAGE_TOKENS,
+                host_page_bytes_all_layers=self.host_page_bytes_all_layers,
+                arena_allocator=self.allocator,
+                snapshot_reader=KDAStateSnapshotReader(
+                    state_manager_provider=(
+                        lambda manager=self.managers[index]: manager
+                    ),
+                    profile=self.profile,
+                ),
+                group_size=self.write_group,
+                group_rank=index,
+                unit_count=UNIT_COUNT,
+                owns_registry=(index == 0),
+            )
+            for index in range(self.write_group)
+        ]
+        self.slots = None
+        self.rank_chunks = None
+
+    def _next_pseudo_sid(self) -> int:
+        self._sid += 1
+        return -self._sid
+
+    @property
+    def leader(self):
+        return self.committers[0]
+
+    def seed(self, sequence_id: int = 7):
+        self.slots = []
+        self.rank_chunks = []
+        for index, manager in enumerate(self.managers):
+            slot = _seed_slot(manager, sequence_id, seed=4000 + 11 * index)
+            self.slots.append(slot)
+            self.rank_chunks.append(_slot_chunks(manager, slot))
+
+    def commit_pass(self, *, tokens=BASE_PROMPT, sequence_id=7):
+        pages = {0: (100, 101)}
+        if self.write_group == 1:
+            outcome = self.leader.commit(
+                namespace_digest=NAMESPACE,
+                frontier_token_ids=tokens,
+                page_ids_by_group=pages,
+                owning_group_id=0,
+                sequence_id=sequence_id,
+                prompt_token_count=len(tokens),
+            )
+            assert outcome is not None and outcome.installed
+            return (
+                self.leader.arena_for(outcome.record.snapshot.storage_handle),
+                outcome,
+            )
+        arena = self.leader.reserve_arena(
+            sequence_id=sequence_id,
+            prefix_page_count=2,
+            namespace_digest=NAMESPACE,
+            frontier_token_ids=tokens,
+        )
+        assert arena is not None
+        for follower in self.committers[1:]:
+            follower.adopt_arena(sequence_id=sequence_id, arena=arena)
+        assert (
+            self.leader.commit(
+                namespace_digest=NAMESPACE,
+                frontier_token_ids=tokens,
+                page_ids_by_group=pages,
+                owning_group_id=0,
+                sequence_id=sequence_id,
+                prompt_token_count=len(tokens),
+            )
+            is not None
+        )
+        for follower in self.committers[1:]:
+            assert (
+                follower.write_units(
+                    sequence_id=sequence_id,
+                    frontier_token_ids=tokens,
+                    prompt_token_count=len(tokens),
+                )
+                is not None
+            )
+        finalized = self.leader.finalize()
+        for follower in self.committers[1:]:
+            follower.finalize()
+        assert len(finalized.installed) == 1
+        return arena, finalized.installed[0]
+
+    def full_state(self):
+        """The four chunks of the WHOLE state, (rows x full-width) uint8.
+
+        Assembled OUTSIDE the record mechanism: each write rank holds the
+        next consecutive head block, so the full state is the ranks' slot
+        slices concatenated along the head/channel axis, layer row by layer
+        row.
+        """
+
+        rows = int(self.profile.num_kda_layers)
+        full = []
+        for index in range(len(SNAPSHOT_CHUNK_NAMES)):
+            parts = [
+                torch.frombuffer(
+                    bytearray(chunks[index]), dtype=torch.uint8
+                ).view(rows, -1)
+                for chunks in self.rank_chunks
+            ]
+            full.append(torch.cat(parts, dim=1))
+        return full
+
+    def restorer(self, *, read_group: int, read_rank: int, manager):
+        return TrajectoryRestorer(
+            rank=int(read_rank),
+            committer=self.leader,
+            arena_reader=HostKVSnapshotArenaReader(
+                host_views_provider=lambda: self.views,
+                next_pseudo_sid=self._next_pseudo_sid,
+            ),
+            state_writer=KDAStateSnapshotWriter(
+                state_manager_provider=lambda: manager,
+                profile=profile_from_kda_state_config(manager.config),
+            ),
+            attention_group_size=int(read_group),
+            group_rank=int(read_rank),
+        )
+
+
+@pytest.mark.parametrize("write_group", [1, 2, 4, 8])
+@pytest.mark.parametrize("read_group", [1, 2, 4, 8])
+def test_round_trip_for_every_group_size_pair(write_group, read_group):
+    """Every reading rank gets byte-identical state to its head slice."""
+
+    harness = _CrossHarness(write_group=write_group)
+    harness.seed()
+    harness.commit_pass()
+    full = harness.full_state()
+
+    for read_rank in range(read_group):
+        manager = _sliced_state_manager(group_size=read_group)
+        restorer = harness.restorer(
+            read_group=read_group, read_rank=read_rank, manager=manager
+        )
+        attachment = restorer.lookup(
+            namespace_digest=NAMESPACE,
+            prompt_token_ids=BASE_PROMPT + (201, 202),
+            sequence_id=50 + read_rank,
+        )
+        assert attachment is not None
+        outcome = restorer.restore(
+            attachment,
+            serving_group_id=0,
+            compute_cached_tokens=len(BASE_PROMPT),
+        )
+        assert outcome is not None
+        restored = _slot_chunks(manager, outcome.state_slot)
+        for index in range(len(SNAPSHOT_CHUNK_NAMES)):
+            cols = full[index].shape[1] // read_group
+            expected = (
+                full[index][:, read_rank * cols : (read_rank + 1) * cols]
+                .contiguous()
+                .reshape(-1)
+            )
+            assert restored[index] == bytes(expected.numpy()), (
+                f"chunk {SNAPSHOT_CHUNK_NAMES[index]} of read rank "
+                f"{read_rank}/{read_group} after a {write_group}-rank write"
+            )
+
+
+def test_g_equal_u_bytes_pages_and_windows_match_the_pre_unit_layout():
+    """At g == U the record is byte-identical to the pre-change layout.
+
+    The expectation is constructed independently of the unit mechanism: one
+    rank's blob is its four slot slices concatenated in the fixed chunk
+    order; it occupies ceil(blob / page) whole Host pages; and rank r's
+    window is the r-th consecutive run of those pages, zero-padded to the
+    page boundary.
+    """
+
+    harness = _CrossHarness(write_group=UNIT_COUNT)
+    harness.seed()
+    arena, installed = harness.commit_pass()
+    view = harness.views[0]
+
+    blob_bytes = sum(len(chunk) for chunk in harness.rank_chunks[0])
+    pages_per_rank = -(-blob_bytes // GROUP_PAGE_BYTES)
+    assert arena.pages_per_group == UNIT_COUNT * pages_per_rank
+    assert arena.pages_per_unit == pages_per_rank
+
+    for rank in range(UNIT_COUNT):
+        window_pages = arena.page_ids_by_group[0][
+            rank * pages_per_rank : (rank + 1) * pages_per_rank
+        ]
+        assert arena.unit_window(rank) == {0: tuple(window_pages)}
+        raw = b"".join(view.page_bytes_of(page) for page in window_pages)
+        expected = b"".join(harness.rank_chunks[rank])
+        expected += b"\x00" * (len(raw) - len(expected))
+        assert raw == expected, f"rank {rank}'s window differs from its blob"
+
+    charge = installed.record.charge()
+    assert charge.unit_count == UNIT_COUNT
+    assert charge.snapshot_bytes == blob_bytes
+    assert charge.snapshot_host_pages == pages_per_rank
+    assert charge.arena_host_pages == UNIT_COUNT * pages_per_rank
+    assert charge.owned_host_pages == charge.page_count + (
+        UNIT_COUNT * pages_per_rank
+    )
