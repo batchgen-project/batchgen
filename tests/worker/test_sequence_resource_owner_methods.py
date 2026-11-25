@@ -55,6 +55,59 @@ def test_drop_decode_group_saves_nothing_when_never_grouped():
 
 
 # --------------------------------------------------------------------------- #
+#  assign_decode_group                                                         #
+# --------------------------------------------------------------------------- #
+
+def test_assign_decode_group_stamps_the_group_and_clears_the_record():
+    # Symmetric to drop_decode_group: a re-entry that returns to the group it
+    # decoded on is grouped again, so the eviction record is cleared.
+    seq = _entry(decode_dp_group=None, evicted_from_dp_group=2)
+    seq.assign_decode_group(3)
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (3, None)
+
+
+# --------------------------------------------------------------------------- #
+#  mirror_decode_state                                                         #
+# --------------------------------------------------------------------------- #
+
+def test_mirror_decode_state_adopts_the_triple_without_validation():
+    # Deliberately inconsistent: ccl != original_prompt_length + dl.  A
+    # mirror must not validate or assert -- other local fields are stale at
+    # mirror time, and the call sites repair the identity afterwards.
+    seq = _entry(host_pages_allocated=4, host_owned_pages=4,
+                 host_token_capacity=4 * PAGE)
+    seq.mirror_decode_state(7, 999, 3)
+    assert seq.decoded_length == 7
+    assert seq.current_context_length == 999
+    assert seq.gpu_pages_allocated == 3
+    # Not a host-side or prompt write.
+    assert seq.host_pages_allocated == 4
+    assert seq.host_owned_pages == 4
+    assert seq.host_token_capacity == 4 * PAGE
+    assert seq.prompt_length == 100
+
+
+# --------------------------------------------------------------------------- #
+#  mirror_host_counters                                                        #
+# --------------------------------------------------------------------------- #
+
+def test_mirror_host_counters_adopts_even_a_terminal_capacity_gap():
+    # tokens != pages * PAGE_SIZE: commit_host_reservation refuses this, but
+    # the mirror adopts whatever the owner reported (the planner explicitly
+    # admits terminal capacity gaps via allow_terminal_capacity_gap).
+    seq = _entry(gpu_pages_allocated=4, decoded_length=30,
+                 current_context_length=130)
+    seq.mirror_host_counters(5, 2, 5 * PAGE - 1)
+    assert seq.host_pages_allocated == 5
+    assert seq.host_owned_pages == 2
+    assert seq.host_token_capacity == 5 * PAGE - 1
+    # Not a GPU-side or length write.
+    assert seq.gpu_pages_allocated == 4
+    assert seq.decoded_length == 30
+    assert seq.current_context_length == 130
+
+
+# --------------------------------------------------------------------------- #
 #  grow_host_kv                                                                #
 # --------------------------------------------------------------------------- #
 

@@ -102,7 +102,8 @@ def _seq(uuid, tokens, *, status=SequenceStatus.QUEUEING, group=None):
     # The resource-scalar writes are owned by SequenceEntry methods; bind the
     # real ones (never re-implemented here) so the production code paths the
     # tests execute can call them on this stand-in.
-    for name in ("drop_decode_group", "release_all_kv", "finish_and_release"):
+    for name in ("drop_decode_group", "assign_decode_group", "release_all_kv",
+                 "finish_and_release"):
         setattr(seq, name, MethodType(getattr(SequenceEntry, name), seq))
     return seq
 

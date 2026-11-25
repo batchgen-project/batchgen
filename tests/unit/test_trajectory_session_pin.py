@@ -38,6 +38,7 @@ from batchgen.prefix_reuse.wave_plan import (
     prefill_plan_work,
     validate_wave_prefix_plan,
 )
+from batchgen.sequence import SequenceEntry
 from tests.worker.worker_fakes import (
     attach_identity,
     attach_prefix_state,
@@ -779,7 +780,7 @@ class _FakeBatch:
 
 
 def _sequence(uuid, *, prompt_length, debug="on"):
-    return SimpleNamespace(
+    seq = SimpleNamespace(
         uuid=uuid,
         global_idx=int(uuid[-1]),
         prompt_length=prompt_length,
@@ -794,6 +795,12 @@ def _sequence(uuid, *, prompt_length, debug="on"):
             {"prefix_trajectory_commit": debug} if debug is not None else None
         ),
     )
+    # The group stamp is owned by SequenceEntry; bind the real method (never
+    # re-implemented here) so the assignment under test can call it.
+    seq.assign_decode_group = types.MethodType(
+        SequenceEntry.assign_decode_group, seq
+    )
+    return seq
 
 
 def _folded_index():
