@@ -75,6 +75,8 @@ class FakeSeq:
         self.original_max_decode_length = 32
         self.host_pages_allocated = HOST_PAGES
         self.host_owned_pages = owned
+        # 表 B: synced with the Host chain counters (0 = no state record).
+        self.kda_record_pages = 0
         self.host_token_capacity = HOST_PAGES * PAGE_TOKENS
         self.total_decoded_before_eviction = 0
         self.validated = []

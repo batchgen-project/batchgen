@@ -118,6 +118,25 @@ def prefix_reuse_requires_prefill_pool(model_type: str) -> bool:
     return model_type in _POOL_ONLY_MODEL_TYPES
 
 
+def host_kv_page_bytes_all_layers(
+    host_kv_config: Any, aux_host_kv_config: Any = None
+) -> int:
+    """Bytes ONE Host KV page holds across every region of the deployment.
+
+    The same figure ``PrefixCacheRuntimeConfig.host_page_bytes_all_layers``
+    carries, exposed for callers that run WITHOUT the prefix cache: the
+    per-sequence KDA record store charges and sizes its arenas in this unit
+    on every deployment, prefix cache enabled or not.
+    """
+
+    total = _host_page_bytes_all_layers(host_kv_config)
+    if aux_host_kv_config is not None:
+        total += _host_page_bytes_all_layers(aux_host_kv_config)
+    if total <= 0:
+        raise ValueError("host KV page byte size must be positive")
+    return total
+
+
 def _host_page_bytes_all_layers(host_kv_config: Any) -> int:
     return int(host_kv_config.num_layers) * int(host_kv_config.page_size_tokens) * (
         int(host_kv_config.num_k_heads)
