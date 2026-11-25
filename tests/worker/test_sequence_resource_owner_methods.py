@@ -271,6 +271,72 @@ def test_share_owned_pages_refuses_sharing_the_whole_chain():
 
 
 # --------------------------------------------------------------------------- #
+#  grant_gpu_pages                                                             #
+# --------------------------------------------------------------------------- #
+
+def test_grant_gpu_pages_initial_stamps_the_total_and_marks_the_reservation():
+    seq = _entry(
+        host_pages_allocated=4,
+        host_owned_pages=4,
+        host_token_capacity=4 * PAGE,
+        decoded_length=30,
+        current_context_length=130,
+    )
+    assert seq.had_initial_gpu_reservation is False
+    seq.grant_gpu_pages(6, initial=True)
+    assert seq.gpu_pages_allocated == 6
+    assert seq.had_initial_gpu_reservation is True
+    # Not a host-side or length write.
+    assert seq.host_pages_allocated == 4
+    assert seq.host_owned_pages == 4
+    assert seq.host_token_capacity == 4 * PAGE
+    assert seq.decoded_length == 30
+    assert seq.current_context_length == 130
+
+
+def test_grant_gpu_pages_extension_writes_the_total_and_keeps_the_flag():
+    # The page-boundary extension commits the new TOTAL (not a delta) and
+    # never touches the reservation flag, in either state.
+    seq = _entry(gpu_pages_allocated=6, had_initial_gpu_reservation=True)
+    seq.grant_gpu_pages(8, initial=False)
+    assert seq.gpu_pages_allocated == 8
+    assert seq.had_initial_gpu_reservation is True
+
+    fresh = _entry(gpu_pages_allocated=2)
+    fresh.grant_gpu_pages(3, initial=False)
+    assert fresh.gpu_pages_allocated == 3
+    assert fresh.had_initial_gpu_reservation is False
+
+
+def test_grant_gpu_pages_marks_after_the_scalar_write():
+    # Inside the method the scalar is committed BEFORE the reservation is
+    # marked, the statement order of every site it replaced; any sizing that
+    # reads the flag therefore happens in the caller, before the call.
+    seen = []
+
+    class _Observed(SequenceEntry):
+        def mark_initial_gpu_reservation_done(self):
+            seen.append(self.gpu_pages_allocated)
+            super().mark_initial_gpu_reservation_done()
+
+    seq = _Observed(
+        uuid="u" * 32, global_idx=7, prompt_length=100, max_decode_length=50
+    )
+    seq.grant_gpu_pages(5, initial=True)
+    assert seen == [5]
+
+
+def test_grant_gpu_pages_redundant_initial_restamp_is_idempotent():
+    # Decode entry re-stamps a sequence the allocator already granted: the
+    # recomputed total overwrites and the flag simply stays set.
+    seq = _entry()
+    seq.grant_gpu_pages(6, initial=True)
+    seq.grant_gpu_pages(6, initial=True)
+    assert seq.gpu_pages_allocated == 6
+    assert seq.had_initial_gpu_reservation is True
+
+
+# --------------------------------------------------------------------------- #
 #  rebase_decoded_length                                                       #
 # --------------------------------------------------------------------------- #
 

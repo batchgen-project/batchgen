@@ -598,9 +598,10 @@ PINS = {
             "public_methods": [
                 # The resource-scalar lifecycle methods (begin_eviction,
                 # commit_host_reservation, drop_decode_group,
-                # finish_and_release, grow_host_kv, rebase_decoded_length,
-                # release_all_kv, release_gpu_pages, share_owned_pages) moved
-                # the per-sequence scalar writes behind the owning entry; see
+                # finish_and_release, grant_gpu_pages, grow_host_kv,
+                # rebase_decoded_length, release_all_kv, release_gpu_pages,
+                # share_owned_pages) moved the per-sequence scalar writes
+                # behind the owning entry; see
                 # tests/worker/test_sequence_resource_scalars_single_writer.py.
                 "begin_eviction",
                 "check_completion",
@@ -616,6 +617,7 @@ PINS = {
                 "get_host_growth_pages",
                 "get_host_pages_for_initial_chunk",
                 "get_pages_required",
+                "grant_gpu_pages",
                 "grow_host_kv",
                 "is_active_in_decode",
                 "is_finished",
