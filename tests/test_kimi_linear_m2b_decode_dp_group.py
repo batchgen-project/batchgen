@@ -43,6 +43,7 @@ from batchgen.worker.admission.plan import (
     apply_or_raise,
 )
 from batchgen.worker.gpu_residency import GpuResidencySet
+from batchgen.sequence import SequenceEntry
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -370,6 +371,9 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
         assigned_rank = 0
         decode_dp_group = 0
         gpu_pages_allocated = 12
+
+        # The real owner method (never re-implemented in tests).
+        release_gpu_pages = SequenceEntry.release_gpu_pages
 
         def log_event(self, *args, **kwargs):
             pass

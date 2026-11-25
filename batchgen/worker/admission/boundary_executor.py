@@ -187,11 +187,7 @@ class BoundaryExecutor:
             for uuid in completed_uuids:
                 seq = ctx.sched.pool.get_sequence(uuid)
                 if seq is not None:
-                    seq.gpu_pages_allocated = 0
-                    seq.host_pages_allocated = 0
-                    seq.host_owned_pages = 0
-                    seq.host_token_capacity = 0
-                    seq.evicted_from_dp_group = None
+                    seq.finish_and_release()
                     ctx.gpu_resident.drop(uuid)
 
             # Report completions (this is what pops local_map on the owner).
@@ -303,15 +299,7 @@ class BoundaryExecutor:
                 baseline = seq.reentry_decoded_baseline
                 new_decoded_count = max(0, seq.decoded_length - baseline)
                 new_reentry_len = seq.prompt_length + new_decoded_count
-                # total_decoded_before_eviction tracks cumulative output length,
-                # which at this point equals seq.decoded_length (the full output
-                # buffer including historical tokens carried forward across
-                # re-entry cycles). Used downstream for eviction priority
-                # sorting and for computing remaining_decode_budget at the
-                # next re-entry.
-                seq.total_decoded_before_eviction = seq.decoded_length
-                seq.prompt_length = new_reentry_len
-                seq.current_context_length = new_reentry_len
+                seq.begin_eviction(new_reentry_len)
                 if ctx.sched.trajectories.trajectory_book is not None and ctx.sched.trajectories.trajectory_book.has_sequence(uuid):
                     slot = ctx.sched.trajectories.trajectory_book.slot_for(uuid)
                     # Record the replayed prompt boundary at eviction time. Re-entry
@@ -324,10 +312,7 @@ class BoundaryExecutor:
                 seq.log_event(SeqEvent.EVICTED, ctx.facts.rank,
                     f"saved_tokens={saved}, decoded={seq.decoded_length}, "
                     f"new_this_cycle={new_decoded_count}")
-                seq.gpu_pages_allocated = 0
-                seq.host_pages_allocated = 0
-                seq.host_owned_pages = 0
-                seq.host_token_capacity = 0
+                seq.release_all_kv()
                 ctx.gpu_resident.drop(uuid)
                 # Destroy the head-sharded KDA state the comment below relies
                 # on. Host eviction frees the sequence's pages but reached the
@@ -446,9 +431,7 @@ class BoundaryExecutor:
             # succeeded.  A failed growth therefore cannot leave a sequence claiming
             # pages that were never appended to its host chain.
             for uuid, growth_pages, seq in growth_entries:
-                seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-                seq.host_pages_allocated += growth_pages
-                seq.host_owned_pages += growth_pages
+                seq.grow_host_kv(growth_pages)
 
             if host_grow_requests:
                 if ctx.facts.rank == 0:
@@ -512,7 +495,7 @@ class BoundaryExecutor:
             # my_onhold owner-only branch, creating a cross-rank desync window.
             for uuid in onhold_uuids:
                 seq = ctx.sched.pool.get_sequence(uuid)
-                seq.gpu_pages_allocated = 0
+                seq.release_gpu_pages()
                 seq.log_event(SeqEvent.ON_HOLD, ctx.facts.rank, "trigger=boundary")
             # The rows' ON_HOLD transition was applied at the single planned
             # point above; only their resources are released here.
@@ -602,7 +585,7 @@ class BoundaryExecutor:
             ext_failed_set = set(remaining_needing_ext)
             for uuid in remaining_needing_ext:
                 seq = ctx.sched.pool.get_sequence(uuid)
-                seq.gpu_pages_allocated = 0
+                seq.release_gpu_pages()
                 seq.log_event(SeqEvent.ON_HOLD, ctx.facts.rank, "trigger=extension_failed")
             apply_or_raise(ctx.sched.pool, TransitionPlan(
                 StatusEdge.BOUNDARY,

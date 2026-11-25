@@ -572,6 +572,80 @@ class SequenceEntry:
         self.gpu_pages_allocated = 0
         self.had_initial_gpu_reservation = False
 
+    # ============ Resource-Scalar Lifecycle Methods ============
+    # The per-sequence resource scalars are owned here: callers release,
+    # grow, or re-stamp them through these methods instead of assigning the
+    # fields directly.  Each method commits scalar state only; the owning
+    # allocator/collective calls stay at the call site, and scalar commits
+    # follow allocator success.
+
+    def drop_decode_group(self) -> None:
+        """Drop the serve group at eviction, remembering where it decoded.
+
+        Only a held group is saved: a redundant eviction of a sequence that
+        holds no group (already evicted, never re-grouped) must not erase the
+        earlier record.  The next group assignment restamps the sequence and
+        clears the record.
+        """
+        if self.decode_dp_group is not None:
+            self.evicted_from_dp_group = self.decode_dp_group
+        self.decode_dp_group = None
+
+    def grow_host_kv(self, growth_pages: int) -> None:
+        """Commit a host-KV growth of ``growth_pages`` pages.
+
+        Called only after the owning allocator call has succeeded, so a
+        failed growth cannot leave the sequence claiming pages that were
+        never appended to its host chain.
+        """
+        self.host_token_capacity += growth_pages * self.PAGE_SIZE
+        self.host_pages_allocated += growth_pages
+        self.host_owned_pages += growth_pages
+
+    def release_gpu_pages(self) -> None:
+        """Zero the GPU page count after the pages were freed or put on hold.
+
+        Unlike ``reset_gpu_allocation`` this keeps
+        ``had_initial_gpu_reservation``: a resumed ON_HOLD sequence is
+        continuing decode, so its next load takes the extension buffer, not
+        the initial one.
+        """
+        self.gpu_pages_allocated = 0
+
+    def release_all_kv(self) -> None:
+        """Zero every KV page/capacity counter once GPU and host pages are freed."""
+        self.gpu_pages_allocated = 0
+        self.host_pages_allocated = 0
+        self.host_owned_pages = 0
+        self.host_token_capacity = 0
+
+    def finish_and_release(self) -> None:
+        """Zero a completed sequence's resource scalars on every rank.
+
+        Downstream reads iterating all sequences (e.g. migration planning)
+        must never see a stale non-zero page count or saved serve group for a
+        completed sequence.
+        """
+        self.release_all_kv()
+        self.evicted_from_dp_group = None
+
+    def begin_eviction(self, reentry_length: int) -> None:
+        """Re-stamp the length scalars when the sequence is evicted to recompute.
+
+        ``reentry_length`` is the next prefill's effective prompt (the
+        previous effective prompt plus the newly generated suffix of this KV
+        residency cycle).  The caller computes it from ``prompt_length``
+        BEFORE this call, which overwrites that field.
+        ``total_decoded_before_eviction`` snapshots the cumulative output
+        length, which at this point equals ``decoded_length`` (the full
+        output buffer including historical tokens carried forward across
+        re-entry cycles); it is used downstream for eviction priority sorting
+        and for the remaining decode budget at the next re-entry.
+        """
+        self.total_decoded_before_eviction = self.decoded_length
+        self.prompt_length = reentry_length
+        self.current_context_length = reentry_length
+
     # ============ Dynamic Host KV Reservation Methods ============
 
     def needs_host_kv_growth(self, chunk_size: int) -> bool:
