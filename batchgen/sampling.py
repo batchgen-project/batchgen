@@ -525,32 +525,3 @@ def sample_tokens(
 
 	split.write_sampling(result, sampled)
 	return result
-
-
-# Backward compatibility alias
-def sample_with_temperature_top_p(
-	logits: torch.Tensor,
-	temperature: float = 1.0,
-	top_p: float = 0.9,
-	top_k: int = None,
-	eps: float = 1e-10,
-) -> torch.Tensor:
-	"""
-	Legacy sampling function for backward compatibility.
-
-	Args:
-		logits: Tensor of shape [batch_size, vocab_size] containing the logits
-		temperature: Float controlling randomness (0.0 = deterministic)
-		top_p: Float for nucleus sampling (0.0 to 1.0)
-		top_k: Optional int to limit sampling to top k tokens
-		eps: Ignored (kept for API compatibility)
-
-	Returns:
-		Sampled token indices of shape [batch_size, 1]
-	"""
-	return sample_tokens(
-		logits,
-		temperature=temperature if temperature >= 1e-6 else None,
-		top_p=top_p,
-		top_k=top_k or 0,
-	)
