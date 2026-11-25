@@ -9099,9 +9099,7 @@ class BatchGenWorker:
 			for local_idx in local_decode_indices:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
-				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-				# Mark initial reservation done
-				seq.mark_initial_gpu_reservation_done()
+				seq.grant_gpu_pages(seq.get_gpu_pages_for_two_page_buffer(), initial=True)
 				self._sequences_with_gpu_kv.mark_resident(uuid)
 		else:
 			raise RuntimeError(

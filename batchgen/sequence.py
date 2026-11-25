@@ -636,6 +636,21 @@ class SequenceEntry:
         self.host_pages_allocated += growth_pages
         self.host_owned_pages += growth_pages
 
+    def grant_gpu_pages(self, total_pages: int, *, initial: bool) -> None:
+        """Commit a GPU page grant after the owning allocator call succeeded.
+
+        ``total_pages`` is the sequence's new TOTAL GPU page count, not a
+        delta; the caller computes it (and any buffer sizing that reads
+        ``had_initial_gpu_reservation``) BEFORE this call.  ``initial=True``
+        additionally marks the initial GPU reservation done, after the scalar
+        write, exactly as the first grant and the decode-entry re-stamp do;
+        ``initial=False`` is a page-boundary extension, which never touches
+        the reservation flag.
+        """
+        self.gpu_pages_allocated = total_pages
+        if initial:
+            self.mark_initial_gpu_reservation_done()
+
     def release_gpu_pages(self) -> None:
         """Zero the GPU page count after the pages were freed or put on hold.
 

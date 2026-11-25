@@ -1941,10 +1941,9 @@ class KVCapacityEngine:
         for local_idx in local_sequence_ids:
             uuid = self._local_to_uuid_map[local_idx]
             seq = self.global_batch.get_sequence(uuid)
-            pages = seq.get_gpu_pages_for_two_page_buffer()
-            seq.gpu_pages_allocated = pages
-            # Mark that this sequence has received its initial GPU reservation
-            seq.mark_initial_gpu_reservation_done()
+            seq.grant_gpu_pages(
+                seq.get_gpu_pages_for_two_page_buffer(), initial=True
+            )
     
         manager.rebuild_page_table(global_ids)
 
@@ -2025,7 +2024,7 @@ class KVCapacityEngine:
             new_total_tokens = new_total_pages * ctx.facts.page_size
         
             manager.extend_pages_for_sequence(global_id, new_total_tokens)
-            seq.gpu_pages_allocated = new_total_pages
+            seq.grant_gpu_pages(new_total_pages, initial=False)
     
         return True
 
@@ -4104,9 +4103,9 @@ class KVCapacityEngine:
         for local_idx in pending_local_indices:
             uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
             seq = ctx.sched.pool.get_sequence(uuid)
-            seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-            # Mark that this sequence has received its initial GPU reservation
-            seq.mark_initial_gpu_reservation_done()
+            seq.grant_gpu_pages(
+                seq.get_gpu_pages_for_two_page_buffer(), initial=True
+            )
             ctx.gpu_resident.mark_resident(uuid)
             seq.validate_metadata(f"rank {ctx.facts.rank} _finalize_async_load_minimal")
             seq.log_event(SeqEvent.KV_LOAD_DONE, ctx.facts.rank,

@@ -162,7 +162,6 @@ KNOWN_OFFENDERS = [
     "batchgen/worker/admission/boundary_planner.py: rebinding .host_token_capacity",
     "batchgen/worker/decode_engine.py: rebinding .current_context_length",
     "batchgen/worker/decode_engine.py: rebinding .decoded_length",
-    "batchgen/worker/kv_capacity_engine.py: rebinding .gpu_pages_allocated",
     "batchgen/worker/prefill_engine.py: rebinding .current_context_length",
     "batchgen/worker/prefill_engine.py: rebinding .decoded_length",
 ]
