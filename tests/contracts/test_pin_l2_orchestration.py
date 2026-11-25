@@ -600,9 +600,12 @@ PINS = {
                 # commit_host_reservation, drop_decode_group,
                 # finish_and_release, grant_gpu_pages, grow_host_kv,
                 # rebase_decoded_length, release_all_kv, release_gpu_pages,
-                # share_owned_pages) moved the per-sequence scalar writes
+                # share_owned_pages, and the stage-4 mirror/assignment
+                # methods assign_decode_group, mirror_decode_state,
+                # mirror_host_counters) moved the per-sequence scalar writes
                 # behind the owning entry; see
                 # tests/worker/test_sequence_resource_scalars_single_writer.py.
+                "assign_decode_group",
                 "begin_eviction",
                 "check_completion",
                 "clamp_decode_to_context",
@@ -624,6 +627,8 @@ PINS = {
                 "is_resumable",
                 "log_event",
                 "mark_initial_gpu_reservation_done",
+                "mirror_decode_state",
+                "mirror_host_counters",
                 "needs_gpu_page_extension",
                 "needs_host_kv_growth",
                 "rebase_decoded_length",
