@@ -837,6 +837,9 @@ def _wrapper_worker(torch, dist, *, rank, world, local_world, free, total, fail=
         PAGE_SIZE=PAGE, torch_device="cpu",
         host_paged_kv_worker_view=SimpleNamespace(get_stats=get_stats),
         _prefill_pool_segment_host_pages=lambda: 0,
+        # 方案甲: the preflight now charges each owned sequence's KDA record
+        # pages; this fake models a deployment without recurrent state.
+        _kda_record_pages_per_sequence=lambda: 0,
     )
     attach_identity(worker, rank=rank, world_size=world, local_world_size=local_world)
     ns = {

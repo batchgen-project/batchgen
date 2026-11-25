@@ -778,6 +778,10 @@ def _mirror_worker(rank, *, views, wave, fake_dist, states=None):
         host_paged_kv_worker_view=views[0],
         _host_views_by_group=lambda: views,
         _prefill_pool_wave=wave,
+        # 方案甲: the mirror now carries the per-sequence KDA record arenas;
+        # these fakes model a deployment without recurrent state.
+        _kda_record_mirror_payload=lambda uuids: {},
+        _adopt_kda_record_mirror=lambda payload: None,
     )
     attach_identity(worker, rank=rank, world_size=2, local_world_size=8,
                     decode_group_size=2)

@@ -58,6 +58,7 @@ def _make_prefill_selection_request(
     num_nodes: int, chunk_size: int, *,
     per_rank_sequence_free=None, per_node_sequence_free=None,
     per_node_host_reclaimable=None,
+    kda_record_pages: int = 0,
 ) -> PrefillSelectionRequest:
     """Snapshot the candidate metadata `select_prefill_batch` consumes."""
     ctx.prefix.shared_prefix_credit_applied = bool(shared_segments)
@@ -116,4 +117,8 @@ def _make_prefill_selection_request(
             tuple(per_node_host_reclaimable)
             if per_node_host_reclaimable is not None else None
         ),
+        # 方案甲: each admitted sequence also reserves its KDA record pages
+        # in the combined host budget. A VALUE the delegator resolved (the
+        # record store is worker state), like the shared segments above.
+        kda_record_pages=int(kda_record_pages),
     )

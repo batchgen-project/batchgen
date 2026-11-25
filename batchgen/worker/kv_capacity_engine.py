@@ -1226,6 +1226,16 @@ class KVCapacityEngine:
             ):
                 aux_view.release_sequence_pages(global_sequence_ids)
             self._release_prefix_cache_attachments(ctx, global_sequence_ids)
+            # 方案甲: a completed row's per-sequence KDA record pages go back
+            # to the Host pool in the SAME step as its KV chain -- releasing
+            # one without the other would be the forbidden half-state.
+            from batchgen.worker import kda_lifecycle
+            kda_lifecycle.release_records(
+                ctx.sched.trajectories.kda_record_store,
+                global_sequence_ids,
+                rank=ctx.facts.rank,
+                where="completion host release",
+            )
 
         # The G-1 followers of a serve group never touched the shared pages, but
         # they do hold the leader's page table MIRRORED into their own view plus
@@ -1258,6 +1268,16 @@ class KVCapacityEngine:
             ):
                 aux_view.unregister_sequences(mirror_global_ids)
             self._release_prefix_cache_attachments(ctx, mirror_global_ids)
+            # 方案甲 follower side: the record pages are the owner's; this
+            # rank only drops its adopted mirror entries.
+            from batchgen.worker import kda_lifecycle
+            kda_lifecycle.release_records(
+                ctx.sched.trajectories.kda_record_store,
+                (),
+                mirror_global_ids,
+                rank=ctx.facts.rank,
+                where="completion mirror release",
+            )
 
         # GPU page table is PER-RANK (GPU KV is replicated across the group's G
         # ranks under Option 1), so EVERY rank that held these sequences rebuilds
@@ -1431,6 +1451,7 @@ class KVCapacityEngine:
         self, worker,
         owner_requests: List[Tuple[str, int]],
         local_error: bool = False,
+        kda_record_pages_per_sequence: int = 0,
     ) -> Tuple[bool, Optional[Dict[int, Tuple[int, int]]]]:
         """Check a fresh per-node host-KV snapshot before any mutation.
 
@@ -1464,6 +1485,12 @@ class KVCapacityEngine:
             pool_segment_pages=(
                 self._prefill_pool_segment_host_pages() if owner_requests else 0
             ),
+            # 方案甲: each owned sequence also reserves its KDA record pages
+            # in the same transaction, so the preflight must see them or the
+            # allocation fails right after the preflight passed. The constant
+            # arrives as a parameter from the worker wrapper: the engine reads
+            # no new worker state.
+            kda_record_pages_per_sequence=kda_record_pages_per_sequence,
         )
         node_id = self.rank_ctx.node_id
         local_free = -1

@@ -113,13 +113,18 @@ def test_completed_pages_credit_satisfies_growth_without_eviction():
 # --------------------------------------------------------------------------
 
 
-def _cost_candidate(uuid, *, owned, growth=0, ctx=1000, gidx=0, priority=0):
+def _cost_candidate(uuid, *, owned, growth=0, ctx=1000, gidx=0, priority=0,
+                    kda=0):
     return (
         uuid,
         {
             "decoded_length": 0,
             "host_owned_pages": owned,
             "growth_pages": growth,
+            # KDA state record pages (combined host budget, 表 B). 0 is the
+            # degenerate case: a model without recurrent state, or a row
+            # holding no record — same formula, no special case.
+            "kda_record_pages": kda,
             "recompute_tokens": ctx,
             "global_idx": gidx,
             "priority": priority,
@@ -251,6 +256,76 @@ def test_cost_aware_candidate_without_cost_fields_fails_loud():
     bad = [("x", {"host_owned_pages": 3, "global_idx": 0, "priority": 0})]
     with pytest.raises(ValueError, match="growth_pages"):
         _cost_plan(bad, growth={"x": 1}, free_pages=0, total_pages=10)
+
+
+def test_cost_aware_candidate_without_kda_record_pages_fails_loud():
+    # 表 B: the combined-budget benefit term is required, never defaulted —
+    # a candidate assembled without it means the producer was not wired.
+    bad = [("x", {"host_owned_pages": 3, "growth_pages": 0,
+                  "recompute_tokens": 100, "global_idx": 0, "priority": 0})]
+    with pytest.raises(ValueError, match="kda_record_pages"):
+        _cost_plan(bad, growth={"x": 1}, free_pages=0, total_pages=10)
+
+
+def test_kda_record_pages_joins_the_benefit():
+    """表 B: benefit = owned + growth + kda_record_pages, exact integers.
+
+    Two candidates identical except for ``kda_record_pages``: the one whose
+    record returns more combined-budget pages per recompute token is the
+    better victim and is evicted first.
+    """
+    candidates = [
+        _cost_candidate("plain", owned=4, ctx=1000, gidx=0, kda=0),
+        _cost_candidate("record", owned=4, ctx=1000, gidx=1, kda=8),
+        # The grower itself is the worst victim, so the plan must choose
+        # between the two bystanders above.
+        _cost_candidate("g", owned=1, growth=1, ctx=10**6, gidx=9),
+    ]
+    plan = _cost_plan(
+        candidates,
+        growth={"g": 1},
+        free_pages=0,
+        total_pages=1000,
+    )
+    # One page of debt: the single victim must be the record holder
+    # (12/1000 beats 4/1000) although by global_idx "plain" would go first.
+    assert plan.evicted_uuids == ["record"]
+
+    # The combined benefit is an exact sum: owned=2 + kda=2 ties EXACTLY
+    # with owned=4 + kda=0 at the same cost, so the tie breaks on
+    # global_idx — proof the kda=0 row runs through the same formula, not a
+    # separate code path.
+    tie = [
+        _cost_candidate("b", owned=2, ctx=500, gidx=5, kda=2),
+        _cost_candidate("a", owned=4, ctx=500, gidx=7, kda=0),
+    ]
+    tie_plan = _cost_plan(
+        tie + [_cost_candidate("g", owned=1, growth=9, ctx=10**6, gidx=9)],
+        growth={"g": 9},
+        free_pages=0,
+        total_pages=1000,
+    )
+    assert tie_plan.evicted_uuids[:2] == ["b", "a"]
+    assert Fraction(2 + 2, 500) == Fraction(4 + 0, 500)
+
+
+def test_kda_record_pages_zero_is_the_degenerate_case_not_a_branch():
+    """A model without recurrent state (kda=0 everywhere) orders as before."""
+    base = [
+        _cost_candidate("long", owned=10, ctx=1000, gidx=0),
+        _cost_candidate("short", owned=4, ctx=100, gidx=1),
+        _cost_candidate("grower", owned=2, growth=4, ctx=100, gidx=2),
+    ]
+    explicit_zero = [
+        _cost_candidate(uuid, owned=state["host_owned_pages"],
+                        growth=state["growth_pages"],
+                        ctx=state["recompute_tokens"],
+                        gidx=state["global_idx"], kda=0)
+        for uuid, state in base
+    ]
+    kwargs = dict(growth={"grower": 4}, free_pages=0, total_pages=1000)
+    assert _cost_plan(base, **kwargs) == _cost_plan(explicit_zero, **kwargs)
+    assert _cost_plan(base, **kwargs).evicted_uuids == ["grower"]
 
 
 def test_gpu_eviction_selector_rejects_growth_cost_aware():

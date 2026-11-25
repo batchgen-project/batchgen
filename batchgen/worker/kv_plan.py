@@ -137,16 +137,25 @@ def prefill_owner_demand_pages(
     *,
     page_size: int,
     pool_segment_pages: int,
+    kda_record_pages_per_sequence: int = 0,
 ) -> int:
     """Host pages one rank's prefill owner requests need.
 
     ``pool_segment_pages`` is the prefill pool wave's computed-segment page
     count, already computed by the caller (and 0 for a rank with no owner
     demand: only the wave's host-KV leader allocates the segments).
+
+    ``kda_record_pages_per_sequence`` is the per-sequence KDA state record
+    reservation (方案甲): every owned sequence reserves exactly that many
+    pages in the same transaction as its KV pages -- including a sequence
+    whose KV demand is 0 tokens (a fully attached prefix still needs its
+    record). 0 for a model without recurrent state.
     """
+    tokens_list = list(owner_request_tokens)
     return (
-        sum(math.ceil(tokens / page_size) for tokens in owner_request_tokens)
+        sum(math.ceil(tokens / page_size) for tokens in tokens_list)
         + pool_segment_pages
+        + int(kda_record_pages_per_sequence) * len(tokens_list)
     )
 
 
