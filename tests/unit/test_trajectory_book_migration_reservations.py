@@ -33,6 +33,7 @@ from batchgen.lifespan import SeqEvent
 from batchgen.worker.kv_migration_types import MigrationOp
 from batchgen.query_book import QueryBook, make_query_book_entry
 from batchgen.sequence import SequenceEntry
+from batchgen.worker.gpu_residency import GpuResidencySet
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
 from tests.worker_method_source import load_worker_shaped_methods
@@ -186,7 +187,7 @@ def _make_cluster():
             local_world_size=LOCAL_WORLD_SIZE,
         )
         worker.query_book = {}
-        worker._sequences_with_gpu_kv = set()
+        worker._sequences_with_gpu_kv = GpuResidencySet()
         worker._release_prefix_cache_attachments = lambda indices: None
         worker._get_or_create_gloo_group = lambda: None
         worker._publish_trajectory_pool_capacity = lambda: None

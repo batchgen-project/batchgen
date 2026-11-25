@@ -30,6 +30,7 @@ from batchgen.prefix_reuse.rank_packing import (
     pack_wave_ranks,
     unit_features,
 )
+from batchgen.worker.gpu_residency import GpuResidencySet
 from batchgen.prefix_reuse.wave_plan import _build_tree
 from tests.worker.worker_fakes import attach_trajectory_state
 
@@ -521,7 +522,8 @@ def test_completion_cleanup_clears_the_saved_group():
         seq.status = SequenceStatus.COMPLETED
         seq.gpu_pages_allocated = seq.host_pages_allocated = 4
         seq.host_owned_pages = seq.host_token_capacity = 4
-        resident = {"c"}
+        resident = GpuResidencySet()
+        resident.mark_resident("c")
         batch = _Batch([seq])
         # The worker's loops read self.*, the executor's loop reads the context.
         fake = SimpleNamespace(global_batch=batch, _sequences_with_gpu_kv=resident)

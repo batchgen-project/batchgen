@@ -67,6 +67,7 @@ from batchgen.worker.admission.boundary_executor import (  # noqa: E402
     BoundaryExecutor,
     CompletionIO,
 )
+from batchgen.worker.gpu_residency import GpuResidencySet  # noqa: E402
 from batchgen.worker.admission.context import (  # noqa: E402
     DecodePhaseContext,
     RankFacts,
@@ -88,6 +89,14 @@ UUID_A = "seq-a"
 UUID_B = "seq-b"
 GID_A = 100
 GID_B = 101
+
+
+def _residency(*uuids):
+    """A seeded owner, exactly as the worker's allocation path builds one."""
+    owner = GpuResidencySet()
+    for uuid in uuids:
+        owner.mark_resident(uuid)
+    return owner
 
 
 # --------------------------------------------------------------------------- #
@@ -255,7 +264,7 @@ def _harness(monkeypatch, *, gpu_free=100, extend_raises=False):
         gpu_kv=gpu,
         host_view=view,
         core_engine=None,
-        gpu_resident={UUID_A, UUID_B},
+        gpu_resident=_residency(UUID_A, UUID_B),
         prefix_coordinator=None,
         prefix_runtime=None,
         chunk_sizer=None,

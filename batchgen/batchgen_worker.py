@@ -209,6 +209,7 @@ from batchgen.worker.rank_sync_engine import RankSyncEngine
 
 from batchgen.worker.rank_context import RankContext, node_of_rank
 from batchgen.worker.sequence_table import SequenceTable
+from batchgen.worker.gpu_residency import GpuResidencySet
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import (
 	is_kimi_k25_backend_model,
@@ -1546,8 +1547,10 @@ class BatchGenWorker:
 		# are live, published with the deployment capacity. Report-only.
 		self.server_config: Optional[dict] = None
 		
-		# Track sequences currently with GPU KV allocated
-		self._sequences_with_gpu_kv: Set[str] = set()
+		# Track sequences currently with GPU KV allocated. The owner component
+		# (batchgen.worker.gpu_residency) is created exactly here, once; every
+		# mutation anywhere goes through its named methods.
+		self._sequences_with_gpu_kv: GpuResidencySet = GpuResidencySet()
 
 		# Request pool: admission queue and response queue for persistent loop
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
@@ -6097,7 +6100,7 @@ class BatchGenWorker:
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				seq.evicted_from_dp_group = None
-				self._sequences_with_gpu_kv.discard(uuid)
+				self._sequences_with_gpu_kv.drop(uuid)
 
 		self._update_batch_status(
 			completed_uuids, SequenceStatus.COMPLETED, StatusEdge.COMPLETION
@@ -7192,7 +7195,7 @@ class BatchGenWorker:
 								seq.host_owned_pages = 0
 								seq.host_token_capacity = 0
 								seq.evicted_from_dp_group = None
-								self._sequences_with_gpu_kv.discard(uuid)
+								self._sequences_with_gpu_kv.drop(uuid)
 						# Report completions (pops local_map; runs LAST).
 						# Guard: only report if status actually reached COMPLETED.
 						# _sync_completion_status_tensor may detect eos_reached=True
@@ -9103,7 +9106,7 @@ class BatchGenWorker:
 				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 				# Mark initial reservation done
 				seq.mark_initial_gpu_reservation_done()
-				self._sequences_with_gpu_kv.add(uuid)
+				self._sequences_with_gpu_kv.mark_resident(uuid)
 		else:
 			raise RuntimeError(
 				f"Rank {self.rank}: collective GPU KV allocation preflight failed for "

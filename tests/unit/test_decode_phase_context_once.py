@@ -40,6 +40,7 @@ from batchgen.worker.admission.context import (
     RankFacts,
     SchedulingState,
 )
+from batchgen.worker.gpu_residency import GpuResidencySet
 from tests.worker_method_source import WORKER_CLASS, WORKER_SOURCE, load_worker_methods
 
 _METHODS = load_worker_methods(
@@ -82,7 +83,7 @@ class _Worker:
         self.gpu_paged_kv_cache_manager = object()
         self.host_paged_kv_worker_view = object()
         self.core_engine = object()
-        self._sequences_with_gpu_kv = set()
+        self._sequences_with_gpu_kv = GpuResidencySet()
         self.prefix_cache_coordinator = object()
         self.prefix_cache_runtime_config = object()
         self.adaptive_chunk_sizer = None

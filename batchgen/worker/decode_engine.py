@@ -140,7 +140,7 @@ class DecoupledGpuDecode:
         for local_idx in batch:
             uuid = self._local_to_uuid_map.get(local_idx)
             if uuid and uuid not in self._sequences_with_gpu_kv:
-                self._sequences_with_gpu_kv.add(uuid)
+                self._sequences_with_gpu_kv.mark_resident(uuid)
         
         # Use cumulative counters that persist across prefill/decode switches
         # Initialize instance vars if not present (shouldn't happen, but safety)
