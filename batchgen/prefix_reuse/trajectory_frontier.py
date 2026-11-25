@@ -114,19 +114,21 @@ def dtype_element_bytes(dtype_name: str) -> int:
 
 @dataclass(frozen=True)
 class KDASnapshotProfile:
-    """Geometry of ONE trajectory's KDA state as ONE rank holds it.
+    """Geometry of ONE contiguous head slice of a trajectory's KDA state.
 
     Mirrors ``KDAStateGPUConfig``: the recurrent pool is
     ``(layers, slots, heads, head_dim, head_dim)`` and each of the three conv
-    pools is ``(layers, slots, conv_dim, conv_width - 1)``. Heads and
-    ``conv_dim`` are the per-rank shard, because the KDA state is head-sharded
-    exactly as the owning group holds it.
+    pools is ``(layers, slots, conv_dim, conv_width - 1)``. ``num_heads`` and
+    ``conv_dim`` are the slice this profile describes, because the KDA state
+    is head-sharded: on the D2H side that slice is the shard ONE rank holds,
+    and on the record side it is ONE head unit of the stored record
+    (``unit_profile`` derives the latter from the former).
     """
 
     num_kda_layers: int
-    num_heads_per_rank: int
+    num_heads: int
     head_dim: int
-    conv_dim_per_rank: int
+    conv_dim: int
     conv_width: int
     recurrent_element_bytes: int
     conv_element_bytes: int
@@ -136,9 +138,9 @@ class KDASnapshotProfile:
     def __post_init__(self) -> None:
         positive = {
             "num_kda_layers": self.num_kda_layers,
-            "num_heads_per_rank": self.num_heads_per_rank,
+            "num_heads": self.num_heads,
             "head_dim": self.head_dim,
-            "conv_dim_per_rank": self.conv_dim_per_rank,
+            "conv_dim": self.conv_dim,
             "recurrent_element_bytes": self.recurrent_element_bytes,
             "conv_element_bytes": self.conv_element_bytes,
             "num_conv_pools": self.num_conv_pools,
@@ -157,12 +159,12 @@ class KDASnapshotProfile:
 
     @property
     def recurrent_bytes(self) -> int:
-        """Bytes of the recurrent state across all KDA layers on one rank."""
+        """Bytes of this slice's recurrent state across all KDA layers."""
 
         return (
             int(self.num_kda_layers)
             * int(self.num_state_slots)
-            * int(self.num_heads_per_rank)
+            * int(self.num_heads)
             * int(self.head_dim)
             * int(self.head_dim)
             * int(self.recurrent_element_bytes)
@@ -176,7 +178,7 @@ class KDASnapshotProfile:
             int(self.num_conv_pools)
             * int(self.num_kda_layers)
             * int(self.num_state_slots)
-            * int(self.conv_dim_per_rank)
+            * int(self.conv_dim)
             * (int(self.conv_width) - 1)
             * int(self.conv_element_bytes)
         )
@@ -186,12 +188,71 @@ class KDASnapshotProfile:
         return self.recurrent_bytes + self.conv_bytes
 
 
-def snapshot_bytes(profile: KDASnapshotProfile) -> int:
-    """Bytes one KDA snapshot costs on one rank.
+def unit_profile(
+    profile: KDASnapshotProfile, *, group_size: int, unit_count: int
+) -> KDASnapshotProfile:
+    """The geometry of ONE record head unit, derived from one rank's shard.
 
-    Derived from layers x per-rank head shard x (recurrent + conv) state dims
-    x dtype width. There is no workload constant here: change the model or the
-    attention group size and this follows.
+    ``profile`` is the slice ONE rank of a ``group_size`` attention group
+    holds (the live pool's own geometry), so the model's full head count is
+    ``profile.num_heads * group_size``. The record splits that full state into
+    ``unit_count`` equal head units; this function is the ONE owner of the
+    divisibility rules that make the split well-defined:
+
+    * ``group_size`` must divide ``unit_count`` -- a rank owns a whole number
+      of units;
+    * ``unit_count`` must divide the model's head count and its conv channel
+      count -- a unit boundary must fall on a head/channel boundary, or a
+      unit would mix bytes of two heads and no other group size could ever
+      reassemble them.
+
+    Every violation is refused by name; nothing is rounded.
+    """
+
+    from dataclasses import replace
+
+    group = int(group_size)
+    units = int(unit_count)
+    if group <= 0:
+        raise KDASnapshotProfileInvalid(
+            f"attention group_size must be positive, got {group_size}"
+        )
+    if units <= 0:
+        raise KDASnapshotProfileInvalid(
+            f"record unit_count must be positive, got {unit_count}"
+        )
+    if units % group:
+        raise KDASnapshotProfileInvalid(
+            f"record unit_count {units} is not divisible by the attention "
+            f"group size {group}, so a rank would not own a whole number of "
+            "head units"
+        )
+    total_heads = int(profile.num_heads) * group
+    total_conv_dim = int(profile.conv_dim) * group
+    if total_heads % units:
+        raise KDASnapshotProfileInvalid(
+            f"record unit_count {units} does not divide the model's KDA head "
+            f"count {total_heads}, so the record's head units cannot be equal"
+        )
+    if total_conv_dim % units:
+        raise KDASnapshotProfileInvalid(
+            f"record unit_count {units} does not divide the model's KDA conv "
+            f"dimension {total_conv_dim}, so the record's head units cannot "
+            "be equal"
+        )
+    return replace(
+        profile,
+        num_heads=total_heads // units,
+        conv_dim=total_conv_dim // units,
+    )
+
+
+def snapshot_bytes(profile: KDASnapshotProfile) -> int:
+    """Bytes one KDA snapshot slice costs.
+
+    Derived from layers x head slice x (recurrent + conv) state dims x dtype
+    width. There is no workload constant here: change the model or the
+    slicing and this follows.
     """
 
     if not isinstance(profile, KDASnapshotProfile):
@@ -255,9 +316,9 @@ def build_kda_snapshot_profile(
     heads_per_rank = num_heads // group_size
     return KDASnapshotProfile(
         num_kda_layers=num_kda_layers,
-        num_heads_per_rank=heads_per_rank,
+        num_heads=heads_per_rank,
         head_dim=head_dim,
-        conv_dim_per_rank=heads_per_rank * head_dim,
+        conv_dim=heads_per_rank * head_dim,
         conv_width=conv_width,
         recurrent_element_bytes=dtype_element_bytes(recurrent_dtype),
         conv_element_bytes=dtype_element_bytes(conv_dtype),
@@ -273,25 +334,27 @@ class KDASnapshotDescriptor:
     the group affinity the head sharding implies: a snapshot is only restorable
     into the group whose layout produced it.
 
-    ``shard_count`` is how many per-rank head shards the snapshot binds -- G,
-    the attention group size at commit time. It is part of the record's
-    identity, not a hint: a record taken at one G describes a head split that
-    a different G does not have, so a restore under a different G is refused by
-    name rather than reinterpreted. ``profile`` stays the geometry of ONE
-    shard, which is what a single rank reads and writes.
+    ``unit_count`` is how many equal head units the record splits the full
+    state into -- a property of the MODEL (the largest attention group size
+    among its implemented layouts), not of the group that happened to write
+    it. It is part of the record's identity: a group of size ``g`` reads or
+    writes the record iff ``g`` divides ``unit_count`` (rank ``r`` owns units
+    ``[r * unit_count/g, (r+1) * unit_count/g)``), and a group size that does
+    not divide it is refused by name rather than reinterpreted. ``profile``
+    is the geometry of ONE unit, the record's own quantum.
     """
 
     storage_handle: int
     owning_group_id: int
     profile: KDASnapshotProfile
     boundary_tokens: int
-    shard_count: int = 1
+    unit_count: int = 1
 
     def __post_init__(self) -> None:
-        if int(self.shard_count) <= 0:
+        if int(self.unit_count) <= 0:
             raise FrontierRecordInvalid(
-                "a KDA snapshot binds at least one head shard, got "
-                f"shard_count={self.shard_count}"
+                "a KDA snapshot splits into at least one head unit, got "
+                f"unit_count={self.unit_count}"
             )
         if int(self.storage_handle) <= 0:
             raise FrontierRecordInvalid(
@@ -314,15 +377,15 @@ class KDASnapshotDescriptor:
 
     @property
     def snapshot_bytes(self) -> int:
-        """Bytes of ONE rank's shard of this snapshot."""
+        """Bytes of ONE head unit of this snapshot."""
 
         return snapshot_bytes(self.profile)
 
     @property
     def snapshot_total_bytes(self) -> int:
-        """Bytes of every shard this snapshot binds."""
+        """Bytes of every head unit this snapshot binds."""
 
-        return int(self.shard_count) * snapshot_bytes(self.profile)
+        return int(self.unit_count) * snapshot_bytes(self.profile)
 
 
 # ---------------------------------------------------------------------------
@@ -448,26 +511,27 @@ class FrontierCharge:
     reported alongside, never instead: a byte figure charged into a page
     counter would silently under-credit the pool.
 
-    ``shard_count`` is G, the attention group size the snapshot was taken at.
-    ``snapshot_bytes`` is ONE rank's shard, so the node-wide cost of the
-    snapshot is ``shard_count`` shards: at G>1 every rank of the owning group
-    holds its own head shard and all G of them have to be stored for the
-    snapshot to describe the whole state. Each shard is rounded UP to whole
-    Host pages INDEPENDENTLY, because a rank writes its shard through its own
+    ``unit_count`` is U, the number of equal head units the record splits the
+    full state into (a property of the model, not of the writing group).
+    ``snapshot_bytes`` is ONE unit, so the node-wide cost of the snapshot is
+    ``unit_count`` units: all U of them have to be stored for the record to
+    describe the whole state. Each unit is rounded UP to whole Host pages
+    INDEPENDENTLY, because a unit is written and read through its own
     page-table window and a window is a whole number of pages -- summing bytes
-    first and rounding once would hand two ranks a shared page.
+    first and rounding once would hand two units a shared page, and a group
+    size other than the writer's could then never address them.
     """
 
     page_count: int
     host_page_bytes_all_layers: int
     snapshot_bytes: int
-    shard_count: int = 1
+    unit_count: int = 1
 
     def __post_init__(self) -> None:
-        if int(self.shard_count) <= 0:
+        if int(self.unit_count) <= 0:
             raise KDASnapshotProfileInvalid(
-                "a frontier charge needs at least one snapshot shard, got "
-                f"{self.shard_count}"
+                "a frontier charge needs at least one snapshot head unit, got "
+                f"{self.unit_count}"
             )
 
     @property
@@ -476,16 +540,16 @@ class FrontierCharge:
 
     @property
     def snapshot_host_pages(self) -> int:
-        """Whole Host pages ONE rank's shard occupies, rounded up."""
+        """Whole Host pages ONE head unit occupies, rounded up."""
 
         page_bytes = int(self.host_page_bytes_all_layers)
         return -(-int(self.snapshot_bytes) // page_bytes)
 
     @property
     def arena_host_pages(self) -> int:
-        """Whole Host pages the WHOLE snapshot occupies: G x one shard."""
+        """Whole Host pages the WHOLE snapshot occupies: U x one unit."""
 
-        return int(self.shard_count) * self.snapshot_host_pages
+        return int(self.unit_count) * self.snapshot_host_pages
 
     @property
     def owned_host_pages(self) -> int:
@@ -495,9 +559,9 @@ class FrontierCharge:
 
     @property
     def snapshot_total_bytes(self) -> int:
-        """Snapshot payload across every shard of the owning group."""
+        """Snapshot payload across every head unit of the record."""
 
-        return int(self.shard_count) * int(self.snapshot_bytes)
+        return int(self.unit_count) * int(self.snapshot_bytes)
 
     @property
     def total_bytes(self) -> int:
@@ -658,10 +722,10 @@ class TrajectoryFrontierRecord:
         return int(self._snapshot.owning_group_id)
 
     @property
-    def shard_count(self) -> int:
-        """Per-rank head shards this record's snapshot binds (G at commit)."""
+    def unit_count(self) -> int:
+        """Equal head units this record's snapshot splits into (U)."""
 
-        return int(self._snapshot.shard_count)
+        return int(self._snapshot.unit_count)
 
     @property
     def refcount(self) -> int:
@@ -684,7 +748,7 @@ class TrajectoryFrontierRecord:
             page_count=self.page_count,
             host_page_bytes_all_layers=self._host_page_bytes_all_layers,
             snapshot_bytes=self._snapshot.snapshot_bytes,
-            shard_count=int(self._snapshot.shard_count),
+            unit_count=int(self._snapshot.unit_count),
         )
 
     # -- lifetime ----------------------------------------------------------
@@ -829,21 +893,22 @@ class TrajectoryFrontierRegistry:
     def total_charge(self) -> FrontierCharge:
         """Aggregate charge of every resident frontier record.
 
-        Every resident record must share one ``shard_count``: G is fixed for a
-        rank's whole life, so a mix means a record survived a reconfiguration
-        and its arena no longer matches the group that would restore it. That
-        is reported as a broken invariant rather than averaged away -- the
-        aggregate page figure would otherwise be silently wrong.
+        Every resident record must share one ``unit_count``: the record unit
+        count is a property of the model, fixed for the life of the server, so
+        a mix means a record survived a reconfiguration and its arena no
+        longer matches the records committed since. That is reported as a
+        broken invariant rather than averaged away -- the aggregate page
+        figure would otherwise be silently wrong.
         """
 
-        shard_counts = {
-            int(record.shard_count) for record in self._records.values()
+        unit_counts = {
+            int(record.unit_count) for record in self._records.values()
         }
-        if len(shard_counts) > 1:
+        if len(unit_counts) > 1:
             raise FrontierRegistryInvariantError(
-                "resident frontier records disagree on their snapshot shard "
-                f"count ({sorted(shard_counts)}); one of them was committed "
-                "under a different attention group size"
+                "resident frontier records disagree on their snapshot unit "
+                f"count ({sorted(unit_counts)}); one of them was committed "
+                "under a different record unit count"
             )
         return FrontierCharge(
             page_count=sum(
@@ -854,7 +919,7 @@ class TrajectoryFrontierRegistry:
                 record.snapshot.snapshot_bytes
                 for record in self._records.values()
             ),
-            shard_count=shard_counts.pop() if shard_counts else 1,
+            unit_count=unit_counts.pop() if unit_counts else 1,
         )
 
     def session_group_summary(self) -> dict[str, tuple[int, int, str]]:
@@ -993,11 +1058,11 @@ class TrajectoryFrontierRegistry:
                 f"{previous.owning_group_id}; its snapshot cannot move to group "
                 f"{snapshot.owning_group_id}"
             )
-        if previous.shard_count != int(snapshot.shard_count):
+        if previous.unit_count != int(snapshot.unit_count):
             raise FrontierRegistryError(
-                f"session {session_key} holds a {previous.shard_count}-shard "
+                f"session {session_key} holds a {previous.unit_count}-unit "
                 "snapshot; advancing it to a "
-                f"{int(snapshot.shard_count)}-shard one would change the head "
+                f"{int(snapshot.unit_count)}-unit one would change the head "
                 "split the record describes"
             )
         if int(len(frontier_token_ids)) < previous.frontier_boundary_tokens:

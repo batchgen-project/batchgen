@@ -191,10 +191,18 @@ class TrajectoryStore:
         rank: int,
         runtime,
         group_geometry: tuple,
+        unit_count: int,
         host_views_provider: Callable[[], Any],
         next_pseudo_sid: Callable[[], int],
     ):
-        """Lazily build the frontier committer, including its optional imports."""
+        """Lazily build the frontier committer, including its optional imports.
+
+        ``group_geometry`` is the live attention group (size, rank-in-group,
+        leader) and ``unit_count`` is the RECORD's head-unit count -- a
+        property of the model (its largest implemented attention group size),
+        owned by ``parallel_declaration.max_supported_attention_group_size``
+        and passed in by the worker, never re-derived here.
+        """
         if self.trajectory_frontier_committer is not None:
             return self.trajectory_frontier_committer
         from batchgen.prefix_reuse.trajectory_commit import (
@@ -213,13 +221,14 @@ class TrajectoryStore:
             )
         page_tokens = int(runtime.group_specs[0].raw_page_tokens)
         page_bytes = int(runtime.host_page_bytes_all_layers)
-        shard_count, shard_index, is_leader = group_geometry
+        group_size, group_rank, is_leader = group_geometry
         self.trajectory_frontier_committer = TrajectoryFrontierCommitter(
             rank=rank,
             page_tokens=page_tokens,
             host_page_bytes_all_layers=page_bytes,
-            shard_count=shard_count,
-            shard_index=shard_index,
+            group_size=group_size,
+            group_rank=group_rank,
+            unit_count=int(unit_count),
             owns_registry=is_leader,
             arena_allocator=HostKVSnapshotArenaAllocator(
                 host_views_provider=host_views_provider,
@@ -262,10 +271,10 @@ class TrajectoryStore:
             ),
             state_writer=KDAStateSnapshotWriter(
                 state_manager_provider=self._owner_state_manager,
-                profile=committer.layout.profile,
+                profile=committer.rank_profile,
             ),
-            attention_group_size=committer.shard_count,
-            shard_index=committer.shard_index,
+            attention_group_size=committer.group_size,
+            group_rank=committer.group_rank,
         )
         return self.trajectory_restorer
 
@@ -282,7 +291,7 @@ class TrajectoryStore:
             pages_per_group=int(entry["pages_per_group"]),
             capacity_bytes=int(entry["capacity_bytes"]),
             payload_bytes=0,
-            shard_count=int(entry["shard_count"]),
+            unit_count=int(entry["unit_count"]),
         )
 
     def restore_fields(self) -> dict:
@@ -305,8 +314,8 @@ class TrajectoryStore:
     @staticmethod
     def group_geometry(*, decode_attn_tp_size: int, rank: int) -> tuple:
         G = int(decode_attn_tp_size)
-        shard_index = int(rank % G) if G > 1 else 0
-        return G, shard_index, shard_index == 0
+        group_rank = int(rank % G) if G > 1 else 0
+        return G, group_rank, group_rank == 0
 
     @staticmethod
     def commit_tokens(runtime, seq) -> int:
@@ -358,9 +367,9 @@ class TrajectoryStore:
                 )
 
     def restore_payload(
-        self, *, shard_count: int, is_leader: bool, planned_boundary_for
+        self, *, group_size: int, is_leader: bool, planned_boundary_for
     ) -> dict:
-        if shard_count <= 1 or not is_leader or not self.trajectory_attachments:
+        if group_size <= 1 or not is_leader or not self.trajectory_attachments:
             return {}
         committer = self.trajectory_frontier_committer
         if committer is None:
@@ -379,7 +388,7 @@ class TrajectoryStore:
                 "boundary_tokens": int(attachment.boundary_tokens),
                 "lcp_tokens": int(attachment.lcp_tokens),
                 "owning_group_id": int(attachment.owning_group_id),
-                "shard_count": int(arena.shard_count),
+                "unit_count": int(arena.unit_count),
                 "pseudo_sid": int(arena.pseudo_sid),
                 "pages_per_group": int(arena.pages_per_group),
                 "capacity_bytes": int(arena.capacity_bytes),
@@ -390,15 +399,15 @@ class TrajectoryStore:
             }
         return payload
 
-    def session_summary(self, *, shard_count: int, is_leader: bool, rank: int) -> dict:
-        if shard_count <= 1 or not is_leader:
+    def session_summary(self, *, group_size: int, is_leader: bool, rank: int) -> dict:
+        if group_size <= 1 or not is_leader:
             return {}
         committer = self.trajectory_frontier_committer
         if committer is None or not committer.owns_registry:
             return {}
         sessions = committer.registry.session_group_summary()
         return {
-            "group_id": int(rank // shard_count),
+            "group_id": int(rank // group_size),
             "sessions": {
                 str(session_key): [
                     int(owning_group_id),

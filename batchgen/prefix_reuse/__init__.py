@@ -33,6 +33,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
     longest_common_prefix_length,
     session_key_for_baseline,
     snapshot_bytes,
+    unit_profile,
 )
 from batchgen.prefix_reuse.trajectory_commit import (
     HostKVSnapshotArenaAllocator,
@@ -84,6 +85,7 @@ __all__ = [
     "longest_common_prefix_length",
     "session_key_for_baseline",
     "snapshot_bytes",
+    "unit_profile",
     "HostKVSnapshotArenaAllocator",
     "KDAStateSnapshotReader",
     "SnapshotArena",

@@ -54,6 +54,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
     FrontierReleaseFailed,
     KDASnapshotDescriptor,
     KDASnapshotProfile,
+    KDASnapshotProfileInvalid,
     session_key_for_baseline,
 )
 
@@ -70,9 +71,9 @@ def _profile() -> KDASnapshotProfile:
 
     return KDASnapshotProfile(
         num_kda_layers=2,
-        num_heads_per_rank=2,
+        num_heads=2,
         head_dim=16,
-        conv_dim_per_rank=32,
+        conv_dim=32,
         conv_width=4,
         recurrent_element_bytes=4,
         conv_element_bytes=2,
@@ -117,14 +118,14 @@ class _ArenaAllocator:
         # The G>1 phases, recorded separately so a test can assert that a
         # follower never allocated and that an arena was retained exactly once.
         self.allocations = []
-        self.shard_writes = []
+        self.unit_writes = []
         self.retains = []
         self.rollbacks = []
         self._next_page = int(first_page)
         self._next_sid = -1
         self._fail_times = int(fail_times)
         self._groups = pages_per_group or (0,)
-        self.shard_write_error = None
+        self.unit_write_error = None
 
     @staticmethod
     def identity(arena):
@@ -138,7 +139,7 @@ class _ArenaAllocator:
             ),
         )
 
-    def store(self, *, page_count, chunks):
+    def store(self, *, page_count, unit_chunks):
         if self._fail_times > 0:
             self._fail_times -= 1
             raise SnapshotArenaUnavailable("pool is out of Host pages")
@@ -157,14 +158,19 @@ class _ArenaAllocator:
             page_ids_by_group=pages_by_group,
             pages_per_group=int(page_count),
             capacity_bytes=int(page_count) * HOST_PAGE_BYTES,
-            payload_bytes=sum(int(chunk.numel()) for chunk in chunks),
+            payload_bytes=sum(
+                int(chunk.numel())
+                for chunks in unit_chunks
+                for chunk in chunks
+            ),
+            unit_count=len(unit_chunks),
         )
         self.stores.append(self.identity(arena))
         return arena
 
     # -- the G>1 phases ----------------------------------------------------
 
-    def allocate(self, *, page_count, shard_count=1):
+    def allocate(self, *, page_count, unit_count=1):
         if self._fail_times > 0:
             self._fail_times -= 1
             raise SnapshotArenaUnavailable("pool is out of Host pages")
@@ -184,20 +190,20 @@ class _ArenaAllocator:
             pages_per_group=int(page_count),
             capacity_bytes=int(page_count) * HOST_PAGE_BYTES,
             payload_bytes=0,
-            shard_count=int(shard_count),
+            unit_count=int(unit_count),
         )
         self.allocations.append(self.identity(arena))
         return arena
 
-    def write_shard(self, arena, *, shard_index, chunks):
-        if self.shard_write_error is not None:
-            raise self.shard_write_error
-        window = arena.shard_window(int(shard_index))
+    def write_unit(self, arena, *, unit_index, chunks):
+        if self.unit_write_error is not None:
+            raise self.unit_write_error
+        window = arena.unit_window(int(unit_index))
         payload = sum(int(chunk.numel()) for chunk in chunks)
-        self.shard_writes.append(
+        self.unit_writes.append(
             (
                 int(arena.pseudo_sid),
-                int(shard_index),
+                int(unit_index),
                 tuple(
                     (int(group_id), tuple(pages))
                     for group_id, pages in sorted(window.items())
@@ -458,7 +464,7 @@ def test_first_commit_begins_the_session_and_records_its_arena():
     arena = committer.arena_for(outcome.record.snapshot.storage_handle)
     assert arena is outcome.arena
     assert arena.pages_per_group == 3  # ceil(5248 / 2048)
-    assert arena.payload_bytes == committer.layout.total_bytes
+    assert arena.payload_bytes == committer.unit_layout.total_bytes
     assert set(arena.page_ids_by_group[0]).isdisjoint({1, 2})
     assert allocator.releases == []
 
@@ -819,7 +825,7 @@ def test_host_arena_allocator_refuses_a_zero_page_arena():
         next_pseudo_sid=lambda: -1,
     )
     with pytest.raises(SnapshotArenaCorrupt):
-        allocator.store(page_count=0, chunks=())
+        allocator.store(page_count=0, unit_chunks=((),))
 
 
 def test_host_arena_allocator_refuses_an_empty_view_set():
@@ -830,7 +836,7 @@ def test_host_arena_allocator_refuses_an_empty_view_set():
         next_pseudo_sid=lambda: -1,
     )
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        allocator.store(page_count=1, chunks=())
+        allocator.store(page_count=1, unit_chunks=((),))
     assert "no Host KV worker views" in str(excinfo.value)
 
 
@@ -857,7 +863,7 @@ def test_host_arena_allocator_reports_pool_pressure_as_unavailable():
         next_pseudo_sid=lambda: -11,
     )
     with pytest.raises(SnapshotArenaUnavailable) as excinfo:
-        allocator.store(page_count=3, chunks=())
+        allocator.store(page_count=3, unit_chunks=((),))
     assert "Insufficient free pages" in str(excinfo.value)
 
 
@@ -909,7 +915,7 @@ def test_host_arena_allocator_uses_a_negative_pseudo_sid_and_retains():
         next_pseudo_sid=lambda: -13,
         torch_module=_FakeTorch(),
     )
-    arena = allocator.store(page_count=2, chunks=(_FakeTensor(64),))
+    arena = allocator.store(page_count=2, unit_chunks=((_FakeTensor(64),),))
 
     assert arena.pseudo_sid == -13
     assert arena.page_ids_by_group == {0: (21, 22)}
@@ -1014,7 +1020,7 @@ def test_host_arena_allocator_does_not_downgrade_a_real_bug():
         next_pseudo_sid=lambda: -11,
     )
     with pytest.raises(AttributeError, match="no page table"):
-        allocator.store(page_count=3, chunks=())
+        allocator.store(page_count=3, unit_chunks=((),))
 
 
 def test_host_arena_allocator_learns_the_staging_shape_once():
@@ -1060,7 +1066,7 @@ def test_host_arena_allocator_learns_the_staging_shape_once():
         torch_module=torch_module,
     )
     for _ in range(3):
-        allocator.store(page_count=2, chunks=(_FakeTensor(64),))
+        allocator.store(page_count=2, unit_chunks=((_FakeTensor(64),),))
 
     assert view.read_backs == 1
     assert torch_module.empty_calls == [((2 * HOST_PAGE_BYTES,), "uint8")] * 2
@@ -1157,23 +1163,23 @@ def test_a_misaligned_prompt_leaves_an_existing_frontier_intact():
 # ---------------------------------------------------------------------------
 
 
-def test_the_arena_is_g_times_one_shards_pages():
+def test_the_arena_is_u_times_one_units_pages():
     layout = SnapshotLayout(profile=_profile())
-    one = layout.shard_page_count(
+    one = layout.unit_page_count(
         host_page_bytes_all_layers=HOST_PAGE_BYTES, prefix_page_count=2
     )
     for shards in (1, 2, 4, 8):
         assert layout.arena_page_count(
             host_page_bytes_all_layers=HOST_PAGE_BYTES,
             prefix_page_count=2,
-            shard_count=shards,
+            unit_count=shards,
         ) == shards * one
     # Each shard rounds up on its own: summing bytes first and rounding once
     # would hand two ranks a shared page.
     assert one * 4 >= -(-(4 * layout.total_bytes) // HOST_PAGE_BYTES)
 
 
-def test_the_shard_windows_are_page_disjoint_and_cover_the_arena():
+def test_the_unit_windows_are_page_disjoint_and_cover_the_arena():
     arena = SnapshotArena(
         storage_handle=1,
         pseudo_sid=-5,
@@ -1181,10 +1187,10 @@ def test_the_shard_windows_are_page_disjoint_and_cover_the_arena():
         pages_per_group=4,
         capacity_bytes=4 * HOST_PAGE_BYTES,
         payload_bytes=0,
-        shard_count=4,
+        unit_count=4,
     )
-    assert arena.pages_per_shard == 1
-    windows = [arena.shard_window(index) for index in range(4)]
+    assert arena.pages_per_unit == 1
+    windows = [arena.unit_window(index) for index in range(4)]
     assert windows[0] == {0: (10,), 1: (20,)}
     assert windows[3] == {0: (13,), 1: (23,)}
     seen = set()
@@ -1195,7 +1201,7 @@ def test_the_shard_windows_are_page_disjoint_and_cover_the_arena():
     assert seen == {10, 11, 12, 13, 20, 21, 22, 23}
 
 
-def test_a_two_shard_window_is_a_contiguous_page_run():
+def test_a_two_unit_window_is_a_contiguous_page_run():
     arena = SnapshotArena(
         storage_handle=1,
         pseudo_sid=-5,
@@ -1203,13 +1209,13 @@ def test_a_two_shard_window_is_a_contiguous_page_run():
         pages_per_group=4,
         capacity_bytes=4 * HOST_PAGE_BYTES,
         payload_bytes=0,
-        shard_count=2,
+        unit_count=2,
     )
-    assert arena.shard_window(0) == {0: (10, 11)}
-    assert arena.shard_window(1) == {0: (12, 13)}
+    assert arena.unit_window(0) == {0: (10, 11)}
+    assert arena.unit_window(1) == {0: (12, 13)}
 
 
-def test_an_out_of_range_shard_index_is_refused_by_name():
+def test_an_out_of_range_unit_index_is_refused_by_name():
     arena = SnapshotArena(
         storage_handle=1,
         pseudo_sid=-5,
@@ -1217,15 +1223,15 @@ def test_an_out_of_range_shard_index_is_refused_by_name():
         pages_per_group=2,
         capacity_bytes=2 * HOST_PAGE_BYTES,
         payload_bytes=0,
-        shard_count=2,
+        unit_count=2,
     )
     for index in (-1, 2, 99):
         with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-            arena.shard_window(index)
-        assert "outside the arena's 2 shard window(s)" in str(excinfo.value)
+            arena.unit_window(index)
+        assert "outside the arena's 2 unit window(s)" in str(excinfo.value)
 
 
-def test_an_arena_that_does_not_divide_into_shards_is_refused():
+def test_an_arena_that_does_not_divide_into_units_is_refused():
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
         SnapshotArena(
             storage_handle=1,
@@ -1234,7 +1240,7 @@ def test_an_arena_that_does_not_divide_into_shards_is_refused():
             pages_per_group=3,
             capacity_bytes=3 * HOST_PAGE_BYTES,
             payload_bytes=0,
-            shard_count=2,
+            unit_count=2,
         )
     assert "share a Host page with its neighbour" in str(excinfo.value)
 
@@ -1244,28 +1250,32 @@ def test_an_arena_that_does_not_divide_into_shards_is_refused():
 # ---------------------------------------------------------------------------
 
 
-def _group(shard_count=4, *, allocator=None, profile=None):
+def _group(group_size=4, *, allocator=None, profile=None, unit_count=None):
     """One leader plus G-1 followers over ONE shared arena allocator.
 
     The shared allocator stands in for the node-shared Host KV region: every
     rank of a serve group maps the same pages, which is the whole reason a
-    follower can write its own window without allocating anything.
+    follower can write its own window without allocating anything. The record
+    unit count defaults to the group size (one unit per rank), which is the
+    byte-identical pre-unit layout.
     """
 
     profile = profile or _profile()
     allocator = allocator or _ArenaAllocator()
+    units = int(group_size) if unit_count is None else int(unit_count)
     ranks = []
-    for shard_index in range(int(shard_count)):
+    for group_rank in range(int(group_size)):
         ranks.append(
             TrajectoryFrontierCommitter(
-                rank=shard_index,
+                rank=group_rank,
                 page_tokens=PAGE_TOKENS,
                 host_page_bytes_all_layers=HOST_PAGE_BYTES,
                 arena_allocator=allocator,
                 snapshot_reader=_SnapshotReader(profile),
-                shard_count=int(shard_count),
-                shard_index=shard_index,
-                owns_registry=(shard_index == 0),
+                group_size=int(group_size),
+                group_rank=group_rank,
+                unit_count=units,
+                owns_registry=(group_rank == 0),
             )
         )
     return ranks, allocator
@@ -1307,7 +1317,7 @@ def _group_commit(
     ]
     for follower in ranks[1:]:
         outcomes.append(
-            follower.write_shard(
+            follower.write_units(
                 sequence_id=sequence_id,
                 frontier_token_ids=tokens,
                 prompt_token_count=len(tokens),
@@ -1316,10 +1326,10 @@ def _group_commit(
     return arena, outcomes
 
 
-def test_the_leader_allocates_one_g_wide_arena():
-    ranks, allocator = _group(shard_count=4)
+def test_the_leader_allocates_one_u_unit_arena():
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
-    one_shard = leader.layout.shard_page_count(
+    one_unit = leader.unit_layout.unit_page_count(
         host_page_bytes_all_layers=HOST_PAGE_BYTES, prefix_page_count=2
     )
     arena = leader.reserve_arena(
@@ -1330,9 +1340,9 @@ def test_the_leader_allocates_one_g_wide_arena():
     )
 
     assert arena is not None
-    assert arena.shard_count == 4
-    assert arena.pages_per_group == 4 * one_shard
-    assert arena.pages_per_shard == one_shard
+    assert arena.unit_count == 4
+    assert arena.pages_per_group == 4 * one_unit
+    assert arena.pages_per_unit == one_unit
     assert len(allocator.allocations) == 1
     # Allocated, not yet retained: the pages left the free pool (the R1
     # invariant) but the pseudo row still owns them so retain can find them.
@@ -1340,8 +1350,8 @@ def test_the_leader_allocates_one_g_wide_arena():
     assert leader.reserved_sequence_ids() == (7,)
 
 
-def test_a_g_shard_commit_leaves_the_record_pending_until_finalize():
-    ranks, allocator = _group(shard_count=4)
+def test_a_g_group_commit_leaves_the_record_pending_until_finalize():
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     arena, outcomes = _group_commit(ranks, allocator)
 
@@ -1361,20 +1371,20 @@ def test_a_g_shard_commit_leaves_the_record_pending_until_finalize():
     assert len(leader.registry) == 1
     assert len(allocator.retains) == 1
     record = finalized.installed[0].record
-    assert record.shard_count == 4
+    assert record.unit_count == 4
     assert record.frontier_boundary_tokens == 8
 
 
 def test_every_rank_writes_only_its_own_window():
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     arena, _outcomes = _group_commit(ranks, allocator)
 
-    assert len(allocator.shard_writes) == 4
-    indices = [write[1] for write in allocator.shard_writes]
+    assert len(allocator.unit_writes) == 4
+    indices = [write[1] for write in allocator.unit_writes]
     assert sorted(indices) == [0, 1, 2, 3]
     written_pages = set()
-    for _sid, shard_index, groups, _payload in allocator.shard_writes:
-        expected = arena.shard_window(shard_index)
+    for _sid, unit_index, groups, _payload in allocator.unit_writes:
+        expected = arena.unit_window(unit_index)
         assert dict(groups) == {
             int(group_id): tuple(pages)
             for group_id, pages in expected.items()
@@ -1387,7 +1397,7 @@ def test_every_rank_writes_only_its_own_window():
 
 
 def test_only_the_leader_allocates_and_retains():
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     _arena, _outcomes = _group_commit(ranks, allocator)
     ranks[0].finalize()
     for follower in ranks[1:]:
@@ -1404,7 +1414,7 @@ def test_only_the_leader_allocates_and_retains():
 
 
 def test_a_follower_may_not_allocate_and_a_leader_may_not_adopt():
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader, follower = ranks
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
         follower.reserve_arena(
@@ -1427,7 +1437,7 @@ def test_a_follower_may_not_allocate_and_a_leader_may_not_adopt():
 
 
 def test_a_follower_cannot_install_a_record_and_a_leader_cannot_write_only():
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader, follower = ranks
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1449,16 +1459,16 @@ def test_a_follower_cannot_install_a_record_and_a_leader_cannot_write_only():
     assert "installs nothing" in str(excinfo.value)
 
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        leader.write_shard(
+        leader.write_units(
             sequence_id=7, frontier_token_ids=range(8), prompt_token_count=8
         )
-    assert "not write_shard" in str(excinfo.value)
+    assert "not write_units" in str(excinfo.value)
 
 
-def test_a_shard_write_failure_installs_no_record_and_gives_the_arena_back():
+def test_a_unit_write_failure_installs_no_record_and_gives_the_arena_back():
     """One rank's write fails -> no record, arena rolled back, old one intact."""
 
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     # An already committed frontier that must survive the failed pass.
     first_allocator = allocator
@@ -1481,7 +1491,7 @@ def test_a_shard_write_failure_installs_no_record_and_gives_the_arena_back():
     )
     for follower in ranks[1:]:
         follower.adopt_arena(sequence_id=7, arena=arena)
-    allocator.shard_write_error = RuntimeError("shard write exploded")
+    allocator.unit_write_error = RuntimeError("shard write exploded")
     with pytest.raises(RuntimeError, match="shard write exploded"):
         leader.commit(
             namespace_digest=NAMESPACE,
@@ -1511,7 +1521,7 @@ def test_finalize_gives_back_an_arena_no_commit_consumed():
     behind, and finalize is where those pages go home.
     """
 
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1532,7 +1542,7 @@ def test_finalize_gives_back_an_arena_no_commit_consumed():
 
 
 def test_a_misaligned_boundary_at_g_gt_1_rolls_its_arena_back():
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1558,7 +1568,7 @@ def test_a_misaligned_boundary_at_g_gt_1_rolls_its_arena_back():
 
 
 def test_a_failed_finalize_leaves_the_previous_record_installed():
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader = ranks[0]
     arena_one, _ = _group_commit(ranks, allocator, tokens=tuple(range(8)))
     first = leader.finalize().installed[0]
@@ -1584,17 +1594,17 @@ def test_a_failed_finalize_leaves_the_previous_record_installed():
     assert allocator.releases == []
 
 
-def test_the_charge_counts_every_shard_of_the_snapshot():
-    ranks, allocator = _group(shard_count=4)
+def test_the_charge_counts_every_unit_of_the_snapshot():
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     _group_commit(ranks, allocator)
     record = leader.finalize().installed[0].record
 
     charge = record.charge()
-    one_shard = charge.snapshot_host_pages
-    assert charge.shard_count == 4
-    assert charge.arena_host_pages == 4 * one_shard
-    assert charge.owned_host_pages == charge.page_count + 4 * one_shard
+    one_unit = charge.snapshot_host_pages
+    assert charge.unit_count == 4
+    assert charge.arena_host_pages == 4 * one_unit
+    assert charge.owned_host_pages == charge.page_count + 4 * one_unit
     assert charge.snapshot_total_bytes == 4 * charge.snapshot_bytes
     # The arena the leader actually allocated matches the charge exactly: the
     # planner cannot double-promise bytes the snapshot is holding.
@@ -1603,12 +1613,12 @@ def test_the_charge_counts_every_shard_of_the_snapshot():
     )
 
 
-def test_a_committer_refuses_an_impossible_shard_identity():
-    for bad in ({"shard_count": 0}, {"shard_index": 4, "shard_count": 4}):
+def test_a_committer_refuses_an_impossible_group_identity():
+    for bad in ({"group_size": 0}, {"group_rank": 4, "group_size": 4}):
         with pytest.raises(SnapshotArenaCorrupt):
             _committer(**bad)
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        _committer(shard_count=1, owns_registry=False)
+        _committer(group_size=1, owns_registry=False)
     assert "must own its registry" in str(excinfo.value)
 
 
@@ -1620,7 +1630,7 @@ def test_a_reservation_can_be_given_back_outside_finalize():
     refused as a double reservation.
     """
 
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1647,7 +1657,7 @@ def test_a_reservation_can_be_given_back_outside_finalize():
 def test_a_follower_giving_back_an_adopted_arena_frees_nothing():
     """The leader owns the pages; a follower may only drop its own view."""
 
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader, follower = ranks
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1665,7 +1675,7 @@ def test_a_follower_giving_back_an_adopted_arena_frees_nothing():
 
 
 def test_a_double_reservation_is_refused_by_name():
-    ranks, _allocator = _group(shard_count=2)
+    ranks, _allocator = _group(group_size=2)
     leader = ranks[0]
     leader.reserve_arena(
         sequence_id=7,
@@ -1685,7 +1695,7 @@ def test_a_double_reservation_is_refused_by_name():
 
 def test_pool_pressure_at_reservation_time_is_named_and_reserves_nothing():
     allocator = _ArenaAllocator(fail_times=1)
-    ranks, allocator = _group(shard_count=4, allocator=allocator)
+    ranks, allocator = _group(group_size=4, allocator=allocator)
     leader = ranks[0]
     assert leader.reserve_arena(
         sequence_id=7,
@@ -1702,8 +1712,8 @@ def test_pool_pressure_at_reservation_time_is_named_and_reserves_nothing():
     assert finalized.rolled_back_sequence_ids == ()
 
 
-def test_a_follower_adopting_a_foreign_shard_count_is_refused():
-    ranks, _allocator = _group(shard_count=4)
+def test_a_follower_adopting_a_foreign_unit_count_is_refused():
+    ranks, _allocator = _group(group_size=4)
     leader, follower = ranks[0], ranks[1]
     arena = leader.reserve_arena(
         sequence_id=7,
@@ -1711,10 +1721,10 @@ def test_a_follower_adopting_a_foreign_shard_count_is_refused():
         namespace_digest=NAMESPACE,
         frontier_token_ids=tuple(range(8)),
     )
-    two_shard = replace(arena, shard_count=2)
+    two_unit = replace(arena, unit_count=2)
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        follower.adopt_arena(sequence_id=7, arena=two_shard)
-    assert "2 shard window(s) but this rank serves a 4-rank group" in str(
+        follower.adopt_arena(sequence_id=7, arena=two_unit)
+    assert "2 unit window(s) but this rank's record unit count is 4" in str(
         excinfo.value
     )
 
@@ -1831,7 +1841,7 @@ def test_replaying_a_committed_baseline_at_g_gt_1_reserves_nothing():
     then raised out of ``registry.begin`` inside finalize.
     """
 
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     readers = _readers(ranks)
     tokens = tuple(range(8))
@@ -1848,7 +1858,7 @@ def test_replaying_a_committed_baseline_at_g_gt_1_reserves_nothing():
     # No arena left the free pool and no shard window was written.
     assert len(allocator.allocations) == 1
     assert allocator.rollbacks == []
-    assert len(allocator.shard_writes) == 4
+    assert len(allocator.unit_writes) == 4
     assert leader.reserved_sequence_ids() == ()
 
     # The commit boundary still runs: the prefix IS resident, so the worker
@@ -1880,7 +1890,7 @@ def test_replaying_a_committed_baseline_at_g_gt_1_reserves_nothing():
 def test_two_sequences_over_one_baseline_commit_one_session():
     """Same-pass duplicates: the first installs, the second dedupes by name."""
 
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader = ranks[0]
     tokens = tuple(range(8))
 
@@ -1909,7 +1919,7 @@ def test_two_sequences_over_one_baseline_commit_one_session():
         )
     for follower in ranks[1:]:
         assert (
-            follower.write_shard(
+            follower.write_units(
                 sequence_id=7,
                 frontier_token_ids=tokens,
                 prompt_token_count=len(tokens),
@@ -1933,7 +1943,7 @@ def test_a_pending_shard_dedupes_at_finalize_if_its_session_appeared():
     back through the rollback path instead of raising out of the install.
     """
 
-    ranks, allocator = _group(shard_count=2)
+    ranks, allocator = _group(group_size=2)
     leader = ranks[0]
     tokens = tuple(range(8))
     arena, _outcomes = _group_commit(ranks, allocator, tokens=tokens)
@@ -1947,9 +1957,9 @@ def test_a_pending_shard_dedupes_at_finalize_if_its_session_appeared():
         snapshot=KDASnapshotDescriptor(
             storage_handle=4242,
             owning_group_id=0,
-            profile=leader.layout.profile,
+            profile=leader.unit_layout.profile,
             boundary_tokens=len(tokens),
-            shard_count=2,
+            unit_count=2,
         ),
     )
 
@@ -2000,7 +2010,7 @@ def test_recommitting_a_baseline_a_session_advanced_past_is_refused():
 def test_a_backwards_recommit_at_g_gt_1_refuses_without_a_traceback(caplog):
     """The 16-traceback case: one named WARNING line, arena rolled back."""
 
-    ranks, allocator = _group(shard_count=4)
+    ranks, allocator = _group(group_size=4)
     leader = ranks[0]
     _group_commit(ranks, allocator, tokens=tuple(range(8)))
     leader.finalize()
@@ -2096,9 +2106,9 @@ def test_a_diverged_frontier_under_one_session_key_is_refused():
             snapshot=KDASnapshotDescriptor(
                 storage_handle=4321,
                 owning_group_id=0,
-                profile=committer.layout.profile,
+                profile=committer.unit_layout.profile,
                 boundary_tokens=4,
-                shard_count=1,
+                unit_count=1,
             ),
         )
     )
@@ -2156,3 +2166,84 @@ def test_an_install_decision_cannot_carry_a_skip_reason():
         FrontierInstallDecision(
             action=INSTALL_ADVANCE, session_key="k", boundary_tokens=8
         )
+
+
+# ---------------------------------------------------------------------------
+# The record's head-unit identity at construction
+# ---------------------------------------------------------------------------
+
+
+def test_a_committer_refuses_a_group_that_does_not_divide_the_unit_count():
+    with pytest.raises(SnapshotArenaCorrupt) as excinfo:
+        _committer(group_size=3, group_rank=0, unit_count=8, owns_registry=True)
+    assert "not divisible by the attention group size 3" in str(excinfo.value)
+
+
+def test_a_committer_refuses_a_unit_count_that_does_not_divide_the_heads():
+    # The test profile is a 2-head shard of a 1-rank group: 5 units cannot
+    # split 2 heads equally, and the refusal names the head count.
+    with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
+        _committer(group_size=1, group_rank=0, unit_count=5)
+    assert "does not divide the model's KDA head count" in str(excinfo.value)
+
+
+def test_a_rank_owns_a_contiguous_span_of_units():
+    from batchgen.prefix_reuse.trajectory_commit import rank_unit_window
+
+    assert rank_unit_window(unit_count=8, group_size=2, group_rank=1) == (
+        4, 5, 6, 7,
+    )
+    assert rank_unit_window(unit_count=8, group_size=8, group_rank=3) == (3,)
+    assert rank_unit_window(unit_count=4, group_size=1, group_rank=0) == (
+        0, 1, 2, 3,
+    )
+    with pytest.raises(SnapshotArenaCorrupt):
+        rank_unit_window(unit_count=4, group_size=8, group_rank=0)
+
+
+def test_a_committer_at_more_units_than_ranks_writes_its_whole_span():
+    """g < U: one rank writes U/g unit windows, each its own page window.
+
+    The split is a real tensor operation, so this test's reader hands back
+    real uint8 tensors of the profile's chunk sizes.
+    """
+
+    import torch
+
+    class _TensorReader:
+        def __init__(self, profile):
+            self.profile = profile
+
+        def read_slot(self, sequence_id):
+            return tuple(
+                torch.arange(size, dtype=torch.int64).to(torch.uint8)
+                for size in SnapshotLayout(profile=self.profile).chunk_bytes
+            )
+
+    profile = _profile()
+    allocator = _ArenaAllocator()
+    ranks = [
+        TrajectoryFrontierCommitter(
+            rank=group_rank,
+            page_tokens=PAGE_TOKENS,
+            host_page_bytes_all_layers=HOST_PAGE_BYTES,
+            arena_allocator=allocator,
+            snapshot_reader=_TensorReader(profile),
+            group_size=2,
+            group_rank=group_rank,
+            unit_count=4,
+            owns_registry=(group_rank == 0),
+        )
+        for group_rank in range(2)
+    ]
+    leader = ranks[0]
+    assert leader.unit_indices == (0, 1)
+    assert ranks[1].unit_indices == (2, 3)
+    arena, _outcomes = _group_commit(ranks, allocator)
+    assert arena.unit_count == 4
+    # Every unit window was written exactly once, across the two ranks.
+    written = sorted(write[1] for write in allocator.unit_writes)
+    assert written == [0, 1, 2, 3]
+    finalized = leader.finalize()
+    assert len(finalized.installed) == 1
+    assert finalized.installed[0].record.unit_count == 4

@@ -2490,7 +2490,7 @@ class BatchGenWorker:
 			self._prefix.prefix_sequence_states[global_id] = state
 		if trajectory:
 			# M3 Slice 1c, follower side. Both halves come from the leader: the
-			# arena this rank writes its own shard into, and the hit it must
+			# arena this rank writes its own units into, and the hit it must
 			# restore. Taking the leader's decision is what keeps the group's
 			# prefill in lockstep -- G independent lookups could disagree, and
 			# a rank that declined while its peers restored would run the same
@@ -2506,7 +2506,7 @@ class BatchGenWorker:
 			)
 			if self._traj.trajectory_arena_payload or self._traj.trajectory_mirrored_restores:
 				logging.info(
-					"[TRAJECTORY_FRONTIER] Rank %s shard=%s adopted %s arena(s) "
+					"[TRAJECTORY_FRONTIER] Rank %s group_rank=%s adopted %s arena(s) "
 					"and %s mirrored restore(s) from serve-group leader %s",
 					self.rank,
 					self._trajectory_group_geometry()[1],
@@ -7043,9 +7043,9 @@ class BatchGenWorker:
 					)
 					dist.barrier()
 					# M3 Slice 1c: THE post-barrier finalize. Every rank of
-					# every serve group has returned from its own shard write
+					# every serve group has returned from its own unit writes
 					# before any rank gets past the barrier above, so a frontier
-					# record installed here binds a complete G-shard snapshot.
+					# record installed here binds a complete U-unit snapshot.
 					# This is also where an arena no commit consumed gives its
 					# Host pages back.
 					self._finalize_trajectory_frontiers()
@@ -9977,14 +9977,15 @@ class BatchGenWorker:
 		)
 
 	def _trajectory_group_geometry(self) -> tuple:
-		"""(G, this rank's shard index, whether it leads its serve group).
+		"""(G, this rank's rank-in-group, whether it leads its serve group).
 
-		The KDA state is head-sharded across the G ranks of a serve group, so a
-		complete snapshot is G shards and rank ``r`` of the group owns shard
-		``r``. The group leader is ``decode_dp_group * G`` (``host_kv_owner
-		_rank``), so within the group the leader is index 0 and this rank's
-		shard index is simply ``rank % G`` -- the same arithmetic, read from the
-		other end, so there is no second notion of group membership.
+		The KDA state is head-sharded across the G ranks of a serve group, so
+		rank ``r`` of the group holds the ``r``-th consecutive head block --
+		and therefore owns record units ``[r*U/g, (r+1)*U/g)`` of a snapshot.
+		The group leader is ``decode_dp_group * G`` (``host_kv_owner_rank``),
+		so within the group the leader is index 0 and this rank's position is
+		simply ``rank % G`` -- the same arithmetic, read from the other end, so
+		there is no second notion of group membership.
 		"""
 		return self._traj.group_geometry(
 			decode_attn_tp_size=self._decode_attn_tp_size(), rank=self.rank
@@ -10004,8 +10005,30 @@ class BatchGenWorker:
 			rank=self.rank,
 			runtime=runtime,
 			group_geometry=self._trajectory_group_geometry(),
+			unit_count=self._trajectory_record_unit_count(),
 			host_views_provider=self._host_views_by_group,
 			next_pseudo_sid=self._next_pool_segment_sid,
+		)
+
+	def _trajectory_record_unit_count(self) -> int:
+		"""U: the head-unit count every trajectory record splits into.
+
+		A property of the MODEL for the life of the server: the largest
+		attention group size among the family's implemented layouts
+		(``SUPPORTED_LAYOUTS``) on this world, owned by
+		``max_supported_attention_group_size``. Deriving it from the support
+		table -- never from the group that happens to be serving -- is what
+		makes a record written under one attention group size readable under
+		every other implemented one.
+		"""
+		from batchgen.parallel_declaration import (
+			max_supported_attention_group_size,
+			read_supported_layouts,
+		)
+
+		return max_supported_attention_group_size(
+			read_supported_layouts(self.parallel_manager),
+			int(self.world_size),
 		)
 
 	def _trajectory_frontier_eviction_hook(self):
@@ -10047,7 +10070,7 @@ class BatchGenWorker:
 		return self._traj.commit_tokens(self.prefix_cache_runtime_config, seq)
 
 	def _reserve_trajectory_arenas(self, uuids) -> dict:
-		"""Pre-allocate each committing sequence's G-wide snapshot arena.
+		"""Pre-allocate each committing sequence's U-unit snapshot arena.
 
 		Runs in prefill config, on the serve-group LEADER only, because the
 		arena's page ids have to be on the host-KV mirror that runs at the end
@@ -10069,8 +10092,8 @@ class BatchGenWorker:
 		No-op at G==1: one rank owns the whole arena, so it allocates, writes
 		and retains it inside the commit step exactly as before.
 		"""
-		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or not is_leader:
+		group_size, _group_rank, is_leader = self._trajectory_group_geometry()
+		if group_size <= 1 or not is_leader:
 			return {}
 		committer = self._get_trajectory_frontier_committer()
 		runtime = self.prefix_cache_runtime_config
@@ -10104,7 +10127,7 @@ class BatchGenWorker:
 				continue
 			payload[global_id] = {
 				"pseudo_sid": int(arena.pseudo_sid),
-				"shard_count": int(arena.shard_count),
+				"unit_count": int(arena.unit_count),
 				"pages_per_group": int(arena.pages_per_group),
 				"capacity_bytes": int(arena.capacity_bytes),
 				"pages": {
@@ -10128,13 +10151,13 @@ class BatchGenWorker:
 		The leader's lookup agreement rides along for the follower's
 		token-identity check.
 		"""
-		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		group_size, _group_rank, is_leader = self._trajectory_group_geometry()
 		def _planned_boundary(global_id: int) -> int:
 			state = self._prefix.prefix_sequence_states.get(int(global_id))
 			return 0 if state is None else int(state.trajectory_restore_boundary)
 
 		return self._traj.restore_payload(
-			shard_count=shard_count,
+			group_size=group_size,
 			is_leader=is_leader,
 			planned_boundary_for=_planned_boundary,
 		)
@@ -10155,9 +10178,9 @@ class BatchGenWorker:
 		committed; a same-pass continuation could not hit anyway, since its
 		record does not exist until finalize.
 		"""
-		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		group_size, _group_rank, is_leader = self._trajectory_group_geometry()
 		return self._traj.session_summary(
-			shard_count=shard_count, is_leader=is_leader, rank=self.rank
+			group_size=group_size, is_leader=is_leader, rank=self.rank
 		)
 
 	def _fold_trajectory_session_groups(self, gathered) -> None:
@@ -10328,7 +10351,7 @@ class BatchGenWorker:
 					boundary_tokens=planned,
 				)
 		if self._traj.trajectory_mirrored_restores:
-			self._restore_mirrored_trajectory_shards(local_indices)
+			self._restore_mirrored_trajectory_units(local_indices)
 		if not self._traj.trajectory_attachments:
 			return
 		restorer = self._get_trajectory_restorer()
@@ -10374,8 +10397,8 @@ class BatchGenWorker:
 				compute_cached_tokens=int(state.compute_cached_tokens),
 			)
 
-	def _restore_mirrored_trajectory_shards(self, local_indices) -> None:
-		"""Follower side of the restore: this rank's shard, leader's decision.
+	def _restore_mirrored_trajectory_units(self, local_indices) -> None:
+		"""Follower side of the restore: this rank's units, leader's decision.
 
 		A follower holds no frontier record -- the leader's registry is the
 		group's only one, so a leader-side eviction can never leave a stale
@@ -10414,10 +10437,10 @@ class BatchGenWorker:
 			if entry is None:
 				continue
 			state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
-			restorer.restore_mirrored_shard(
+			restorer.restore_mirrored_units(
 				sequence_id=int(seq.global_idx),
 				arena=self._trajectory_arena_from_payload(entry),
-				layout=committer.layout,
+				layout=committer.unit_layout,
 				session_key=str(entry["session_key"]),
 				boundary_tokens=int(entry["boundary_tokens"]),
 				lcp_tokens=int(entry["lcp_tokens"]),
@@ -10460,20 +10483,21 @@ class BatchGenWorker:
 			return None
 		return pages
 
-	def _write_trajectory_shards(self, local_sequence_ids) -> None:
-		"""Follower side of the commit boundary: write THIS rank's shard.
+	def _write_trajectory_units(self, local_sequence_ids) -> None:
+		"""Follower side of the commit boundary: write THIS rank's units.
 
 		Runs on every rank of a head-sharded serve group that is NOT the
 		host-KV leader. It mutates no allocator state: the arena's pages were
 		allocated by the leader and mirrored here, and the write narrows this
-		rank's own page-table row to its own window before copying into it.
+		rank's own page-table row to its own unit windows before copying into
+		them.
 
-		Which sequences get a shard is the LEADER's decision, carried here as
-		the set of arenas it mirrored, so the ranks of a group cannot disagree
-		about which frontiers exist.
+		Which sequences get their units written is the LEADER's decision,
+		carried here as the set of arenas it mirrored, so the ranks of a group
+		cannot disagree about which frontiers exist.
 		"""
-		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1 or is_leader or not self._traj.trajectory_arena_payload:
+		group_size, group_rank, is_leader = self._trajectory_group_geometry()
+		if group_size <= 1 or is_leader or not self._traj.trajectory_arena_payload:
 			return
 		committer = self._get_trajectory_frontier_committer()
 		for local_idx in local_sequence_ids:
@@ -10495,23 +10519,23 @@ class BatchGenWorker:
 				seq, length=seq.prompt_length
 			).tolist()
 			try:
-				committer.write_shard(
+				committer.write_units(
 					sequence_id=global_id,
 					frontier_token_ids=token_ids[:commit_tokens],
 					prompt_token_count=len(token_ids),
 				)
 			except Exception:
-				# A shard write is a memcpy into pages this rank already holds
+				# A unit write is a memcpy into pages this rank already holds
 				# the ids of: the only way it fails is a bug, and a bug here
-				# would leave the leader installing a record whose shard is
+				# would leave the leader installing a record whose units are
 				# missing. Named and re-raised rather than degraded.
 				logging.exception(
-					"[TRAJECTORY_FRONTIER] Rank %s shard=%s/%s FAILED to write "
-					"its snapshot shard for sequence %s; the group's frontier "
-					"must not be installed",
+					"[TRAJECTORY_FRONTIER] Rank %s group_rank=%s/%s FAILED to "
+					"write its snapshot units for sequence %s; the group's "
+					"frontier must not be installed",
 					self.rank,
-					shard_index,
-					shard_count,
+					group_rank,
+					group_size,
 					global_id,
 				)
 				raise
@@ -10533,8 +10557,8 @@ class BatchGenWorker:
 		committer = self._traj.trajectory_frontier_committer
 		if committer is None:
 			return
-		shard_count, _shard_index, _is_leader = self._trajectory_group_geometry()
-		if shard_count <= 1:
+		group_size, _group_rank, _is_leader = self._trajectory_group_geometry()
+		if group_size <= 1:
 			return
 		try:
 			outcome = committer.finalize()
@@ -10633,7 +10657,7 @@ class BatchGenWorker:
 			# own head shard, so the followers do their write here too. The
 			# loop below stays leader-only (it publishes prefix pages and moves
 			# host_owned_pages, which exactly one rank may do).
-			self._write_trajectory_shards(local_sequence_ids)
+			self._write_trajectory_units(local_sequence_ids)
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)

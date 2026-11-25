@@ -43,6 +43,7 @@ is_frontier_hit = _MODULE.is_frontier_hit
 longest_common_prefix_length = _MODULE.longest_common_prefix_length
 session_key_for_baseline = _MODULE.session_key_for_baseline
 snapshot_bytes = _MODULE.snapshot_bytes
+unit_profile = _MODULE.unit_profile
 
 
 PAGE_TOKENS = 4
@@ -78,9 +79,9 @@ class _Releaser:
 def _profile(**overrides):
     base = dict(
         num_kda_layers=3,
-        num_heads_per_rank=2,
+        num_heads=2,
         head_dim=8,
-        conv_dim_per_rank=16,
+        conv_dim=16,
         conv_width=4,
         recurrent_element_bytes=4,
         conv_element_bytes=2,
@@ -90,14 +91,14 @@ def _profile(**overrides):
 
 
 def _snapshot(
-    *, boundary_tokens, handle=7, group_id=0, profile=None, shard_count=1
+    *, boundary_tokens, handle=7, group_id=0, profile=None, unit_count=1
 ):
     return KDASnapshotDescriptor(
         storage_handle=handle,
         owning_group_id=group_id,
         profile=profile if profile is not None else _profile(),
         boundary_tokens=boundary_tokens,
-        shard_count=shard_count,
+        unit_count=unit_count,
     )
 
 
@@ -117,7 +118,7 @@ def _registry(*, releaser=None, page_tokens=PAGE_TOKENS):
 
 
 def _begin(
-    registry, *, tokens, groups=(0,), handle=7, group_id=0, shard_count=1
+    registry, *, tokens, groups=(0,), handle=7, group_id=0, unit_count=1
 ):
     boundary = len(tokens)
     return registry.begin(
@@ -128,7 +129,7 @@ def _begin(
             boundary_tokens=boundary,
             handle=handle,
             group_id=group_id,
-            shard_count=shard_count,
+            unit_count=unit_count,
         ),
     )
 
@@ -143,9 +144,9 @@ def test_snapshot_bytes_matches_the_pool_geometry_computed_in_the_test():
     recurrent_elem, conv_elem = 4, 2
     profile = _profile(
         num_kda_layers=layers,
-        num_heads_per_rank=heads,
+        num_heads=heads,
         head_dim=head_dim,
-        conv_dim_per_rank=conv_dim,
+        conv_dim=conv_dim,
         conv_width=width,
         recurrent_element_bytes=recurrent_elem,
         conv_element_bytes=conv_elem,
@@ -164,9 +165,9 @@ def test_snapshot_bytes_tracks_every_geometry_axis():
     assert snapshot_bytes(_profile(num_kda_layers=6)) == 2 * base
     # Doubling the head shard doubles the recurrent term and the conv term,
     # because conv_dim follows the shard in the real pool.
-    doubled = _profile(num_heads_per_rank=4, conv_dim_per_rank=32)
+    doubled = _profile(num_heads=4, conv_dim=32)
     assert snapshot_bytes(doubled) == 2 * base
-    quadrupled_recurrent = _profile(head_dim=16, conv_dim_per_rank=32)
+    quadrupled_recurrent = _profile(head_dim=16, conv_dim=32)
     assert (
         quadrupled_recurrent.recurrent_bytes == 4 * _profile().recurrent_bytes
     )
@@ -212,8 +213,8 @@ def test_profile_from_model_config_shards_heads_by_attention_group():
         conv_dtype="bfloat16",
     )
     assert profile.num_kda_layers == 4
-    assert profile.num_heads_per_rank == 2
-    assert profile.conv_dim_per_rank == 2 * 8
+    assert profile.num_heads == 2
+    assert profile.conv_dim == 2 * 8
     expected = 4 * 2 * 8 * 8 * 4 + 3 * 4 * (2 * 8) * 3 * 2
     assert snapshot_bytes(profile) == expected
 
@@ -923,9 +924,9 @@ def test_snapshot_page_charge_rounds_up_so_the_planner_cannot_overpromise():
     # A snapshot that is one byte over a whole page must cost two pages.
     profile = _profile(
         num_kda_layers=1,
-        num_heads_per_rank=1,
+        num_heads=1,
         head_dim=16,
-        conv_dim_per_rank=4,
+        conv_dim=4,
         conv_width=2,
         recurrent_element_bytes=4,
         conv_element_bytes=2,
@@ -942,9 +943,9 @@ def test_snapshot_page_charge_rounds_up_so_the_planner_cannot_overpromise():
     assert charge.snapshot_host_pages == 1
     bigger = _profile(
         num_kda_layers=2,
-        num_heads_per_rank=1,
+        num_heads=1,
         head_dim=32,
-        conv_dim_per_rank=4,
+        conv_dim=4,
         conv_width=2,
         recurrent_element_bytes=4,
         conv_element_bytes=2,
@@ -997,36 +998,36 @@ def test_registry_refuses_a_non_positive_page_size():
 
 
 # ---------------------------------------------------------------------------
-# Slice 1c: the snapshot binds G head shards, and the charge counts all of them
+# The snapshot binds U head units, and the charge counts all of them
 # ---------------------------------------------------------------------------
 
 
-def test_a_snapshot_defaults_to_one_shard():
-    """Pure DP is unchanged: one rank, one shard, the pre-Slice-1c numbers."""
+def test_a_snapshot_defaults_to_one_unit():
+    """Pure DP is unchanged: one rank, one unit, the pre-Slice-1c numbers."""
 
     snapshot = _snapshot(boundary_tokens=8)
-    assert snapshot.shard_count == 1
+    assert snapshot.unit_count == 1
     assert snapshot.snapshot_total_bytes == snapshot.snapshot_bytes
 
 
-def test_a_snapshot_binds_every_shard_of_its_owning_group():
-    snapshot = _snapshot(boundary_tokens=8, shard_count=4)
-    assert snapshot.shard_count == 4
+def test_a_snapshot_binds_every_unit_of_the_record():
+    snapshot = _snapshot(boundary_tokens=8, unit_count=4)
+    assert snapshot.unit_count == 4
     # ``profile`` stays ONE rank's geometry -- what a single rank reads and
     # writes -- while the descriptor says how many of those the record binds.
     assert snapshot.snapshot_bytes == snapshot_bytes(snapshot.profile)
     assert snapshot.snapshot_total_bytes == 4 * snapshot.snapshot_bytes
 
 
-def test_a_snapshot_needs_at_least_one_shard():
+def test_a_snapshot_needs_at_least_one_unit():
     for bad in (0, -1):
         with pytest.raises(FrontierRecordInvalid) as excinfo:
-            _snapshot(boundary_tokens=8, shard_count=bad)
-        assert "binds at least one head shard" in str(excinfo.value)
+            _snapshot(boundary_tokens=8, unit_count=bad)
+        assert "splits into at least one head unit" in str(excinfo.value)
 
 
-def test_the_charge_rounds_each_shard_up_independently():
-    """A rank writes through its own page window, so its shard owns whole pages.
+def test_the_charge_rounds_each_unit_up_independently():
+    """A unit is written through its own page window, so it owns whole pages.
 
     Rounding the summed bytes once would give a smaller arena whose windows
     straddle a page boundary -- two ranks writing one page.
@@ -1036,7 +1037,7 @@ def test_the_charge_rounds_each_shard_up_independently():
         page_count=2,
         host_page_bytes_all_layers=HOST_PAGE_BYTES,
         snapshot_bytes=HOST_PAGE_BYTES + 1,
-        shard_count=4,
+        unit_count=4,
     )
     assert charge.snapshot_host_pages == 2
     assert charge.arena_host_pages == 8
@@ -1047,93 +1048,93 @@ def test_the_charge_rounds_each_shard_up_independently():
     assert charge.total_bytes == charge.page_bytes + charge.snapshot_total_bytes
 
 
-def test_a_one_shard_charge_is_the_pre_slice_1c_charge():
+def test_a_one_unit_charge_is_the_pre_slice_1c_charge():
     charge = FrontierCharge(
         page_count=3,
         host_page_bytes_all_layers=HOST_PAGE_BYTES,
         snapshot_bytes=HOST_PAGE_BYTES + 1,
     )
-    assert charge.shard_count == 1
+    assert charge.unit_count == 1
     assert charge.arena_host_pages == charge.snapshot_host_pages == 2
     assert charge.owned_host_pages == 3 + 2
     assert charge.total_bytes == charge.page_bytes + charge.snapshot_bytes
 
 
-def test_a_charge_needs_at_least_one_shard():
+def test_a_charge_needs_at_least_one_unit():
     with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
         FrontierCharge(
             page_count=1,
             host_page_bytes_all_layers=HOST_PAGE_BYTES,
             snapshot_bytes=16,
-            shard_count=0,
+            unit_count=0,
         )
-    assert "at least one snapshot shard" in str(excinfo.value)
+    assert "at least one snapshot head unit" in str(excinfo.value)
 
 
-def test_a_record_reports_its_snapshot_shard_count():
+def test_a_record_reports_its_snapshot_unit_count():
     registry = _registry()
-    record = _begin(registry, tokens=range(8), shard_count=4)
-    assert record.shard_count == 4
-    assert record.charge().shard_count == 4
+    record = _begin(registry, tokens=range(8), unit_count=4)
+    assert record.unit_count == 4
+    assert record.charge().unit_count == 4
     assert record.charge().arena_host_pages == (
         4 * record.charge().snapshot_host_pages
     )
 
 
-def test_advance_refuses_a_shard_count_change():
+def test_advance_refuses_a_unit_count_change():
     """A session's head split cannot move: its arena windows are that split."""
 
     registry = _registry()
-    record = _begin(registry, tokens=range(8), shard_count=4)
+    record = _begin(registry, tokens=range(8), unit_count=4)
     with pytest.raises(FrontierRegistryError) as excinfo:
         registry.advance(
             session_key=record.session_key,
             namespace_digest=NAMESPACE,
             frontier_token_ids=range(12),
             page_ids_by_group=_pages(3),
-            snapshot=_snapshot(boundary_tokens=12, handle=8, shard_count=2),
+            snapshot=_snapshot(boundary_tokens=12, handle=8, unit_count=2),
         )
-    assert "4-shard snapshot" in str(excinfo.value)
-    assert "2-shard" in str(excinfo.value)
+    assert "4-unit snapshot" in str(excinfo.value)
+    assert "2-unit" in str(excinfo.value)
     # Refused BEFORE anything moved: the old frontier is untouched.
     assert len(registry) == 1
     assert registry.require(record.session_key) is record
     assert record.frontier_boundary_tokens == 8
 
 
-def test_advance_keeps_the_shard_count():
+def test_advance_keeps_the_unit_count():
     registry = _registry()
-    record = _begin(registry, tokens=range(8), shard_count=4)
+    record = _begin(registry, tokens=range(8), unit_count=4)
     advance = registry.advance(
         session_key=record.session_key,
         namespace_digest=NAMESPACE,
         frontier_token_ids=range(12),
         page_ids_by_group=_pages(3),
-        snapshot=_snapshot(boundary_tokens=12, handle=8, shard_count=4),
+        snapshot=_snapshot(boundary_tokens=12, handle=8, unit_count=4),
     )
-    assert advance.record.shard_count == 4
+    assert advance.record.unit_count == 4
     registry.check_invariants()
 
 
-def test_total_charge_refuses_records_that_disagree_on_shard_count():
+def test_total_charge_refuses_records_that_disagree_on_unit_count():
     """A mix means one record outlived a reconfiguration: its arena windows no
     longer match the group that would restore it. Reported, not averaged."""
 
     registry = _registry()
-    _begin(registry, tokens=range(8), shard_count=4)
-    _begin(registry, tokens=range(100, 108), handle=9, shard_count=2)
+    _begin(registry, tokens=range(8), unit_count=4)
+    _begin(registry, tokens=range(100, 108), handle=9, unit_count=2)
     with pytest.raises(FrontierRegistryInvariantError) as excinfo:
         registry.total_charge()
-    assert "disagree on their snapshot shard count" in str(excinfo.value)
+    assert "disagree on their snapshot unit count" in str(excinfo.value)
     assert "[2, 4]" in str(excinfo.value)
 
 
-def test_total_charge_of_matching_records_counts_every_shard():
+def test_total_charge_of_matching_records_counts_every_unit():
     registry = _registry()
-    first = _begin(registry, tokens=range(8), shard_count=4)
-    second = _begin(registry, tokens=range(100, 108), handle=9, shard_count=4)
+    first = _begin(registry, tokens=range(8), unit_count=4)
+    second = _begin(registry, tokens=range(100, 108), handle=9, unit_count=4)
     charge = registry.total_charge()
-    assert charge.shard_count == 4
+    assert charge.unit_count == 4
     assert charge.page_count == first.page_count + second.page_count
     assert charge.snapshot_bytes == (
         first.snapshot.snapshot_bytes + second.snapshot.snapshot_bytes
@@ -1143,6 +1144,54 @@ def test_total_charge_of_matching_records_counts_every_shard():
 
 def test_an_empty_registry_still_reports_a_usable_charge():
     charge = _registry().total_charge()
-    assert charge.shard_count == 1
+    assert charge.unit_count == 1
     assert charge.page_count == 0
     assert charge.arena_host_pages == 0
+
+
+# ---------------------------------------------------------------------------
+# unit_profile: the one owner of the record's head-unit divisibility rules
+# ---------------------------------------------------------------------------
+
+
+def test_unit_profile_divides_a_rank_shard_into_equal_units():
+    # One rank of a 2-rank group holds 2 heads, so the model has 4; at
+    # unit_count=4 one unit is one head and one quarter of the conv channels.
+    rank = _profile(num_heads=2, conv_dim=16)
+    unit = unit_profile(rank, group_size=2, unit_count=4)
+    assert unit.num_heads == 1
+    assert unit.conv_dim == 8
+    assert unit.num_kda_layers == rank.num_kda_layers
+    assert 4 * unit.total_bytes == 2 * rank.total_bytes
+
+
+def test_unit_profile_at_unit_count_equal_group_is_the_rank_shard():
+    rank = _profile()
+    assert unit_profile(rank, group_size=4, unit_count=4) == rank
+    assert unit_profile(rank, group_size=1, unit_count=1) == rank
+
+
+def test_unit_profile_refuses_a_group_that_does_not_divide_the_units():
+    with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
+        unit_profile(_profile(), group_size=3, unit_count=8)
+    assert "not divisible by the attention group size 3" in str(excinfo.value)
+
+
+def test_unit_profile_refuses_units_that_do_not_divide_heads_or_conv():
+    # 1 rank x 2 heads: 5 units cannot split 2 heads equally.
+    with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
+        unit_profile(_profile(num_heads=2), group_size=1, unit_count=5)
+    assert "does not divide the model's KDA head count 2" in str(excinfo.value)
+    # Heads divide but the conv channels do not.
+    with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
+        unit_profile(
+            _profile(num_heads=4, conv_dim=6), group_size=1, unit_count=4
+        )
+    assert "KDA conv dimension 6" in str(excinfo.value)
+
+
+def test_unit_profile_refuses_non_positive_inputs_by_name():
+    with pytest.raises(KDASnapshotProfileInvalid):
+        unit_profile(_profile(), group_size=0, unit_count=4)
+    with pytest.raises(KDASnapshotProfileInvalid):
+        unit_profile(_profile(), group_size=1, unit_count=0)

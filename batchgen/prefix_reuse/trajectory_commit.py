@@ -20,8 +20,12 @@ that are load-bearing, not incidental:
   it was; nothing is ever credited back to it when a snapshot is freed, because
   nothing was ever promised.
 * The pages are a byte ARENA. They carry no KV token semantics -- the pseudo-sid
-  namespace is what marks them -- and the blob is laid out in one fixed order
-  derived from ``KDASnapshotProfile``.
+  namespace is what marks them -- and the record splits into equal HEAD UNITS,
+  each one page-disjoint window holding one blob in the fixed order derived
+  from ``KDASnapshotProfile``. The unit count is a property of the model (the
+  largest attention group size among its implemented layouts), so a record
+  written by an attention group of one size is readable by a group of another:
+  rank ``r`` of a ``g``-rank group owns units ``[r*U/g, (r+1)*U/g)``.
 
 Everything here is flag-gated by ``debug_state.prefix_trajectory_commit``.
 With the flag off nothing in this module runs and no registry write happens.
@@ -44,6 +48,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
     dtype_element_bytes,
     frontier_index_key,
     session_key_for_baseline,
+    unit_profile,
 )
 
 
@@ -57,8 +62,9 @@ PREFIX = "TRAJECTORY_FRONTIER"
 _POOL_PRESSURE_MARKERS = ("Insufficient free pages",)
 
 # The fixed blob order. ``KDAStateGPUManager`` keeps one recurrent pool and
-# three short-conv pools (q, k, v); a snapshot is those four slot slices
-# concatenated in this order, and a restore reads them back in it.
+# three short-conv pools (q, k, v); every snapshot blob -- one head unit of
+# the record -- is those four slot slices concatenated in this order, and a
+# restore reads them back in it.
 SNAPSHOT_CHUNK_NAMES = ("recurrent", "conv_q", "conv_k", "conv_v")
 
 
@@ -228,9 +234,9 @@ def profile_from_kda_state_config(config: object) -> KDASnapshotProfile:
         ) from exc
     return KDASnapshotProfile(
         num_kda_layers=num_kda_layers,
-        num_heads_per_rank=num_heads,
+        num_heads=num_heads,
         head_dim=head_dim,
-        conv_dim_per_rank=conv_dim,
+        conv_dim=conv_dim,
         conv_width=conv_width,
         recurrent_element_bytes=dtype_element_bytes(str(recurrent_dtype)),
         conv_element_bytes=dtype_element_bytes(str(conv_dtype)),
@@ -244,12 +250,13 @@ def profile_from_kda_state_config(config: object) -> KDASnapshotProfile:
 
 @dataclass(frozen=True)
 class SnapshotLayout:
-    """Byte layout of ONE snapshot blob inside its arena.
+    """Byte layout of ONE snapshot blob (one head slice, chunks in order).
 
-    Offsets come from ``KDASnapshotProfile`` alone, so changing the model or the
-    attention group size moves them automatically. The three conv pools are
+    Offsets come from ``KDASnapshotProfile`` alone, so changing the model or
+    the record's unit split moves them automatically. The three conv pools are
     equal-sized by construction (same per-layer view shape), which is asserted
-    rather than assumed.
+    rather than assumed. On the record side the profile is ONE head unit's;
+    on the D2H side it is one rank's live shard.
     """
 
     profile: KDASnapshotProfile
@@ -279,10 +286,10 @@ class SnapshotLayout:
     def total_bytes(self) -> int:
         return int(self.profile.total_bytes)
 
-    def shard_page_count(
+    def unit_page_count(
         self, *, host_page_bytes_all_layers: int, prefix_page_count: int
     ) -> int:
-        """Host pages ONE rank's shard of this blob needs.
+        """Host pages ONE blob of this layout needs.
 
         Routed through ``FrontierCharge`` rather than recomputed: the charge is
         the one owner of "snapshot bytes -> whole Host pages", and R1 repurposes
@@ -302,23 +309,170 @@ class SnapshotLayout:
         *,
         host_page_bytes_all_layers: int,
         prefix_page_count: int,
-        shard_count: int = 1,
+        unit_count: int = 1,
     ) -> int:
-        """Host pages the WHOLE snapshot needs: G x one shard's pages.
+        """Host pages the WHOLE snapshot needs: U x one unit's pages.
 
-        Each shard is rounded up to whole pages independently, so a rank's
-        window is a whole number of pages and two ranks can never share one.
-        ``shard_count=1`` is the pure-DP arena and is byte-identical to the
-        pre-shard figure.
+        Each unit is rounded up to whole pages independently, so a unit's
+        window is a whole number of pages and two units can never share one.
+        ``unit_count=1`` is the one-unit arena and is byte-identical to the
+        pre-unit figure.
         """
 
         charge = FrontierCharge(
             page_count=int(prefix_page_count),
             host_page_bytes_all_layers=int(host_page_bytes_all_layers),
             snapshot_bytes=self.total_bytes,
-            shard_count=int(shard_count),
+            unit_count=int(unit_count),
         )
         return int(charge.arena_host_pages)
+
+
+def rank_unit_window(
+    *, unit_count: int, group_size: int, group_rank: int
+) -> tuple[int, ...]:
+    """The record units rank ``group_rank`` of a ``group_size`` group owns.
+
+    THE one owner of the unit-ownership rule: rank ``r`` of a group of ``g``
+    ranks owns units ``[r * U/g, (r+1) * U/g)`` -- a contiguous span, so its
+    pages form one contiguous window. The write side and the read side both
+    derive their windows here, so they cannot drift, and a group size that
+    does not divide the unit count is refused by name: such a group has no
+    whole-unit split of the record to own.
+    """
+
+    units = int(unit_count)
+    group = int(group_size)
+    rank = int(group_rank)
+    if units <= 0:
+        raise SnapshotArenaCorrupt(
+            f"a snapshot record holds at least one head unit, got {unit_count}"
+        )
+    if group <= 0:
+        raise SnapshotArenaCorrupt(
+            f"an attention group has at least one rank, got {group_size}"
+        )
+    if not 0 <= rank < group:
+        raise SnapshotArenaCorrupt(
+            f"group rank {group_rank} is outside a {group}-rank group"
+        )
+    if units % group:
+        raise SnapshotArenaCorrupt(
+            f"the record's {units} head unit(s) are not divisible by the "
+            f"attention group size {group}, so no rank owns a whole number "
+            "of units"
+        )
+    units_per_rank = units // group
+    start = rank * units_per_rank
+    return tuple(range(start, start + units_per_rank))
+
+
+def _chunk_rows(profile) -> int:
+    """Rows a snapshot chunk splits into: one per (layer, state slot).
+
+    The head/channel dimension is INSIDE a row, after the layer dimension, so
+    splitting a chunk along heads means splitting every row at the same
+    offsets -- which is why the unit split below reshapes to (rows, units,
+    bytes-per-unit-row) instead of slicing the flat blob.
+    """
+
+    return int(profile.num_kda_layers) * int(profile.num_state_slots)
+
+
+def split_chunks_into_units(
+    chunks: Sequence[object], *, profile, unit_count: int
+) -> tuple[tuple[object, ...], ...]:
+    """Split one blob's chunks along heads/channels into equal unit blobs.
+
+    ``chunks`` are the four flat uint8 chunks of ONE head slice (a rank's D2H
+    copy) whose geometry is ``profile``; the result is ``unit_count`` chunk
+    tuples, where tuple ``u`` holds heads ``[u*H/U, (u+1)*H/U)`` (and the
+    matching conv channels) of EVERY KDA layer, in the same fixed chunk order.
+    ``unit_profile`` owns the divisibility rules, so an impossible split is
+    refused by name before any byte moves.
+
+    ``unit_count == 1`` is the identity split: the chunks pass through
+    untouched (the allocator boundary's chunk contract -- any object with
+    ``numel()`` -- is preserved, and the bytes written are exactly the
+    pre-unit bytes).
+    """
+
+    units = int(unit_count)
+    # The divisibility rules have ONE owner; group_size=1 says ``profile``
+    # covers the whole blob being split.
+    sub_profile = unit_profile(profile, group_size=1, unit_count=units)
+    if units == 1:
+        return (tuple(chunks),)
+    import torch
+
+    rows = _chunk_rows(profile)
+    whole_sizes = SnapshotLayout(profile=profile).chunk_bytes
+    unit_sizes = SnapshotLayout(profile=sub_profile).chunk_bytes
+    unit_chunks: list[list[object]] = [[] for _ in range(units)]
+    for name, chunk, whole_size, unit_size in zip(
+        SNAPSHOT_CHUNK_NAMES, chunks, whole_sizes, unit_sizes
+    ):
+        flat = chunk.reshape(-1).view(torch.uint8)
+        if int(flat.numel()) != int(whole_size):
+            raise TrajectorySnapshotShapeMismatch(
+                f"KDA snapshot chunk {name!r} holds {int(flat.numel())} B but "
+                f"its profile says {int(whole_size)} B"
+            )
+        table = flat.view(rows, units, int(unit_size) // rows)
+        for unit in range(units):
+            unit_chunks[unit].append(
+                table[:, unit, :].contiguous().view(-1)
+            )
+    return tuple(tuple(per_unit) for per_unit in unit_chunks)
+
+
+def merge_unit_chunks(
+    unit_chunks: Sequence[Sequence[object]], *, unit_profile
+) -> tuple[object, ...]:
+    """Reassemble consecutive unit blobs into one head slice's chunks.
+
+    The exact inverse of ``split_chunks_into_units``: ``unit_chunks`` holds
+    one chunk tuple per CONSECUTIVE head unit (a rank's own span, in unit
+    order) and ``unit_profile`` is the geometry of one unit. A single unit is
+    the identity merge, so a one-unit-per-rank read returns the reader's
+    chunks untouched.
+    """
+
+    units = len(unit_chunks)
+    if units == 0:
+        raise TrajectorySnapshotShapeMismatch(
+            "a KDA snapshot merge needs at least one head unit"
+        )
+    for per_unit in unit_chunks:
+        if len(per_unit) != len(SNAPSHOT_CHUNK_NAMES):
+            raise TrajectorySnapshotShapeMismatch(
+                f"a KDA snapshot unit is {len(SNAPSHOT_CHUNK_NAMES)} chunks "
+                f"({', '.join(SNAPSHOT_CHUNK_NAMES)}), got {len(per_unit)}"
+            )
+    if units == 1:
+        return tuple(unit_chunks[0])
+    import torch
+
+    rows = _chunk_rows(unit_profile)
+    unit_sizes = SnapshotLayout(profile=unit_profile).chunk_bytes
+    merged: list[object] = []
+    for index, (name, unit_size) in enumerate(
+        zip(SNAPSHOT_CHUNK_NAMES, unit_sizes)
+    ):
+        unit_cols = int(unit_size) // rows
+        out = torch.empty(rows * units * unit_cols, dtype=torch.uint8)
+        table = out.view(rows, units, unit_cols)
+        for unit in range(units):
+            chunk = unit_chunks[unit][index]
+            flat = chunk.reshape(-1).view(torch.uint8)
+            if int(flat.numel()) != int(unit_size):
+                raise TrajectorySnapshotShapeMismatch(
+                    f"KDA snapshot unit chunk {name!r} holds "
+                    f"{int(flat.numel())} B but one unit is {int(unit_size)} B"
+                )
+            table[:, unit, :] = flat.view(rows, unit_cols)
+        merged.append(out)
+    return tuple(merged)
 
 
 @dataclass(frozen=True)
@@ -330,13 +484,15 @@ class SnapshotArena:
     sequence is unregistered, so the arena is identified by its page ids alone
     and is released with ``release_resident_pages``.
 
-    SHARD LAYOUT (the G>1 contract): the arena holds ``shard_count`` equal
-    windows, and rank ``r`` of the owning group owns window ``r``: pages
-    ``[r * pages_per_shard : (r + 1) * pages_per_shard]`` of EVERY group's page
-    list. The windows are page-disjoint by construction, which is what lets G
-    ranks write the same arena concurrently with no coordination beyond knowing
-    the page list. ``shard_count == 1`` is the pure-DP arena: one window, the
-    whole page list, byte-identical to the pre-shard layout.
+    UNIT LAYOUT (the record contract): the arena holds ``unit_count`` equal
+    page-disjoint windows, one per head unit of the record. Window ``u`` is
+    pages ``[u * pages_per_unit : (u + 1) * pages_per_unit]`` of EVERY group's
+    page list, and rank ``r`` of a ``g``-rank owning group owns the contiguous
+    unit span ``rank_unit_window`` derives -- which is what lets g ranks write
+    the same arena concurrently with no coordination beyond knowing the page
+    list, and what lets a DIFFERENT group size read it back, unit by unit.
+    ``unit_count == 1`` is the one-unit arena: one window, the whole page
+    list, byte-identical to the pre-unit layout.
     """
 
     storage_handle: int
@@ -345,7 +501,7 @@ class SnapshotArena:
     pages_per_group: int
     capacity_bytes: int
     payload_bytes: int
-    shard_count: int = 1
+    unit_count: int = 1
 
     def __post_init__(self) -> None:
         if int(self.pseudo_sid) >= 0:
@@ -356,15 +512,15 @@ class SnapshotArena:
             )
         if not self.page_ids_by_group:
             raise SnapshotArenaCorrupt("a snapshot arena needs pages")
-        if int(self.shard_count) <= 0:
+        if int(self.unit_count) <= 0:
             raise SnapshotArenaCorrupt(
-                "a snapshot arena holds at least one shard window, got "
-                f"shard_count={self.shard_count}"
+                "a snapshot arena holds at least one unit window, got "
+                f"unit_count={self.unit_count}"
             )
-        if int(self.pages_per_group) % int(self.shard_count):
+        if int(self.pages_per_group) % int(self.unit_count):
             raise SnapshotArenaCorrupt(
                 f"{self.pages_per_group} arena page(s) per group do not divide "
-                f"into {self.shard_count} equal shard windows; a rank's window "
+                f"into {self.unit_count} equal unit windows; a unit's window "
                 "would have to share a Host page with its neighbour"
             )
         for group_id, page_ids in self.page_ids_by_group.items():
@@ -381,27 +537,27 @@ class SnapshotArena:
             )
 
     @property
-    def pages_per_shard(self) -> int:
-        """Host pages ONE rank's window holds, in every group."""
+    def pages_per_unit(self) -> int:
+        """Host pages ONE unit window holds, in every group."""
 
-        return int(self.pages_per_group) // int(self.shard_count)
+        return int(self.pages_per_group) // int(self.unit_count)
 
-    def shard_window(self, shard_index: int) -> dict[int, tuple[int, ...]]:
-        """The page ids rank ``shard_index`` owns, per KV group.
+    def unit_window(self, unit_index: int) -> dict[int, tuple[int, ...]]:
+        """The page ids head unit ``unit_index`` occupies, per KV group.
 
         The ONE place the window is derived, so the write side and the read
         side cannot drift: a restore that computed the window differently from
-        the commit would read another rank's shard and bind plausible-looking
+        the commit would read another unit's bytes and bind plausible-looking
         wrong state.
         """
 
-        index = int(shard_index)
-        if index < 0 or index >= int(self.shard_count):
+        index = int(unit_index)
+        if index < 0 or index >= int(self.unit_count):
             raise SnapshotArenaCorrupt(
-                f"shard index {index} is outside the arena's "
-                f"{self.shard_count} shard window(s)"
+                f"unit index {index} is outside the arena's "
+                f"{self.unit_count} unit window(s)"
             )
-        span = self.pages_per_shard
+        span = self.pages_per_unit
         start = index * span
         return {
             int(group_id): tuple(page_ids)[start : start + span]
@@ -461,7 +617,7 @@ class HostKVSnapshotArenaAllocator:
         return self._torch
 
     def allocate(
-        self, *, page_count: int, shard_count: int = 1
+        self, *, page_count: int, unit_count: int = 1
     ) -> SnapshotArena:
         """Take ``page_count`` Host pages per group; write and retain nothing.
 
@@ -477,19 +633,19 @@ class HostKVSnapshotArenaAllocator:
         """
 
         pages = int(page_count)
-        shards = int(shard_count)
+        units = int(unit_count)
         if pages <= 0:
             raise SnapshotArenaCorrupt(
                 f"a snapshot arena needs at least one Host page, got {pages}"
             )
-        if shards <= 0:
+        if units <= 0:
             raise SnapshotArenaCorrupt(
-                f"a snapshot arena needs at least one shard, got {shards}"
+                f"a snapshot arena needs at least one head unit, got {units}"
             )
-        if pages % shards:
+        if pages % units:
             raise SnapshotArenaCorrupt(
-                f"{pages} arena page(s) do not divide into {shards} equal "
-                "shard windows"
+                f"{pages} arena page(s) do not divide into {units} equal "
+                "unit windows"
             )
         views = dict(self._host_views_provider())
         if not views:
@@ -539,26 +695,27 @@ class HostKVSnapshotArenaAllocator:
             pages_per_group=pages,
             capacity_bytes=pages * self._host_page_bytes_all_layers,
             payload_bytes=0,
-            shard_count=shards,
+            unit_count=units,
         )
 
-    def write_shard(
+    def write_unit(
         self,
         arena: SnapshotArena,
         *,
-        shard_index: int,
+        unit_index: int,
         chunks: Sequence[object],
     ) -> int:
-        """Write ONE rank's shard into its own window. Mutates no allocator.
+        """Write ONE head unit's blob into its own window. Mutates no allocator.
 
-        PHASE 2, and the phase that runs on EVERY rank of the owning group.
-        All local ranks map the same node-shared Host KV region, so a rank only
-        needs the arena's page list to reach its own bytes: the local page table
-        is narrowed to this shard's window with ``set_sequence_pages`` (a
-        rank-local page-table write -- the same call the G>1 host-KV mirror uses
-        for the leader's page tables) and the blob is copied into exactly those
-        pages. Nothing is registered, allocated, retained or released here, so a
-        follower never touches state only the leader may own.
+        PHASE 2, and the phase that runs on EVERY rank of the owning group
+        (each rank calls it once per unit it owns). All local ranks map the
+        same node-shared Host KV region, so a rank only needs the arena's page
+        list to reach its own bytes: the local page table is narrowed to this
+        unit's window with ``set_sequence_pages`` (a rank-local page-table
+        write -- the same call the G>1 host-KV mirror uses for the leader's
+        page tables) and the blob is copied into exactly those pages. Nothing
+        is registered, allocated, retained or released here, so a follower
+        never touches state only the leader may own.
 
         The full page list is put back into the local row before returning, so
         the leader's later ``retain`` sees the whole arena and a follower's row
@@ -568,22 +725,22 @@ class HostKVSnapshotArenaAllocator:
         views = dict(self._host_views_provider())
         if not views:
             raise SnapshotArenaCorrupt(
-                "no Host KV worker views to write a snapshot shard into"
+                "no Host KV worker views to write a snapshot unit into"
             )
-        window = arena.shard_window(shard_index)
+        window = arena.unit_window(unit_index)
         missing = sorted(set(window) - set(int(key) for key in views))
         if missing:
             raise SnapshotArenaCorrupt(
                 "missing Host KV worker view for snapshot arena group(s) "
                 f"{missing}"
             )
-        capacity = arena.pages_per_shard * self._host_page_bytes_all_layers
+        capacity = arena.pages_per_unit * self._host_page_bytes_all_layers
         payload = sum(int(chunk.numel()) for chunk in chunks)
         if payload > capacity:
             raise TrajectorySnapshotShapeMismatch(
-                f"snapshot payload {payload} B does not fit shard window "
-                f"{int(shard_index)}'s {capacity} B "
-                f"({arena.pages_per_shard} page(s) x "
+                f"snapshot payload {payload} B does not fit unit window "
+                f"{int(unit_index)}'s {capacity} B "
+                f"({arena.pages_per_unit} page(s) x "
                 f"{self._host_page_bytes_all_layers} B)"
             )
         pseudo_sid = int(arena.pseudo_sid)
@@ -679,18 +836,26 @@ class HostKVSnapshotArenaAllocator:
         views = dict(self._host_views_provider())
         self._rollback(views, sorted(int(key) for key in views), arena.pseudo_sid)
 
-    def store(self, *, page_count: int, chunks: Sequence[object]) -> SnapshotArena:
-        """Allocate ``page_count`` Host pages per group and write the blob.
+    def store(
+        self, *, page_count: int, unit_chunks: Sequence[Sequence[object]]
+    ) -> SnapshotArena:
+        """Allocate ``page_count`` Host pages per group and write every unit.
 
         The single-shot pure-DP (G==1) transaction: one rank owns the whole
         arena, so all three phases run back to back with no cross-rank ordering
-        to respect. Composed from the phases rather than duplicating them, so
-        the one-shard and G-shard paths cannot drift.
+        to respect. ``unit_chunks`` is one chunk tuple per head unit, in unit
+        order. Composed from the phases rather than duplicating them, so the
+        one-shot and barrier paths cannot drift.
         """
 
-        arena = self.allocate(page_count=int(page_count), shard_count=1)
+        units = len(unit_chunks)
+        arena = self.allocate(page_count=int(page_count), unit_count=units)
+        payload = 0
         try:
-            payload = self.write_shard(arena, shard_index=0, chunks=chunks)
+            for unit_index, chunks in enumerate(unit_chunks):
+                payload += self.write_unit(
+                    arena, unit_index=unit_index, chunks=chunks
+                )
         except Exception:
             self.rollback(arena)
             raise
@@ -913,9 +1078,10 @@ class TrajectoryCommitOutcome:
 
     ``installed`` separates the pure-DP transaction from the G>1 one. At G==1
     one rank owns the whole arena, so the record is installed inside
-    ``commit``. At G>1 the record binds G shards written by G different ranks,
-    so ``commit`` only writes THIS rank's shard and the record is installed by
-    ``finalize`` once every rank has passed the all-ranks barrier.
+    ``commit``. At G>1 the record binds unit windows written by G different
+    ranks, so ``commit`` only writes THIS rank's units and the record is
+    installed by ``finalize`` once every rank has passed the all-ranks
+    barrier.
     """
 
     session_key: str
@@ -924,13 +1090,14 @@ class TrajectoryCommitOutcome:
     advanced: bool
     previous_release: FrontierReleaseOutcome | None
     installed: bool = True
-    shard_index: int = 0
-    shard_bytes: int = 0
+    group_rank: int = 0
+    rank_bytes: int = 0
 
 
 @dataclass(frozen=True)
 class _PendingFrontier:
-    """A shard written, waiting for the barrier before its record installs.
+    """A rank's units written, waiting for the barrier before its record
+    installs.
 
     Deliberately carries NO install decision: the decision is re-taken at
     finalize from the registry as it stands after the barrier, because a
@@ -952,7 +1119,7 @@ class TrajectoryFinalizeOutcome:
     """What the post-barrier finalize step installed and what it gave back.
 
     ``rolled_back_sequence_ids`` is every arena whose pages went home WITHOUT a
-    record: a reservation no commit consumed, and a pending shard the decision
+    record: a reservation no commit consumed, and a pending write the decision
     table turned down at the barrier. ``deduped_sequence_ids`` is the subset of
     those the table named a dedupe or a refusal for, so a no-op is countable
     separately from a sequence that simply never committed.
@@ -1049,34 +1216,43 @@ class TrajectoryFrontierCommitter:
         host_page_bytes_all_layers: int,
         arena_allocator,
         snapshot_reader,
-        shard_count: int = 1,
-        shard_index: int = 0,
+        group_size: int = 1,
+        group_rank: int = 0,
+        unit_count: int = 1,
         owns_registry: bool = True,
         logger=None,
     ) -> None:
         self._rank = int(rank)
-        if int(shard_count) <= 0:
+        if int(group_size) == 1 and not owns_registry:
             raise SnapshotArenaCorrupt(
-                f"shard_count must be positive, got {shard_count}"
-            )
-        if not 0 <= int(shard_index) < int(shard_count):
-            raise SnapshotArenaCorrupt(
-                f"shard_index {shard_index} is outside a {shard_count}-shard "
-                "owning group"
-            )
-        if int(shard_count) == 1 and not owns_registry:
-            raise SnapshotArenaCorrupt(
-                "a pure-DP (shard_count=1) committer is the only rank of its "
+                "a pure-DP (group_size=1) committer is the only rank of its "
                 "group, so it must own its registry"
             )
-        self._shard_count = int(shard_count)
-        self._shard_index = int(shard_index)
+        # ``rank_unit_window`` owns the ownership rule, including the named
+        # refusals of a non-positive group, an out-of-range rank and a group
+        # size that does not divide the record's unit count.
+        self._unit_indices = rank_unit_window(
+            unit_count=unit_count, group_size=group_size, group_rank=group_rank
+        )
+        self._group_size = int(group_size)
+        self._group_rank = int(group_rank)
+        self._unit_count = int(unit_count)
         self._owns_registry = bool(owns_registry)
         self._host_page_bytes_all_layers = int(host_page_bytes_all_layers)
         self._arena_allocator = arena_allocator
         self._snapshot_reader = snapshot_reader
         self._logger = logger if logger is not None else logging
-        self._layout = SnapshotLayout(profile=snapshot_reader.profile)
+        # The D2H blob this rank copies (one live shard) and the record's own
+        # quantum (one head unit). ``unit_profile`` refuses, by name, a unit
+        # count that does not divide the model's head or conv-channel count.
+        self._rank_layout = SnapshotLayout(profile=snapshot_reader.profile)
+        self._unit_layout = SnapshotLayout(
+            profile=unit_profile(
+                snapshot_reader.profile,
+                group_size=self._group_size,
+                unit_count=self._unit_count,
+            )
+        )
         self._registry = TrajectoryFrontierRegistry(
             page_tokens=int(page_tokens),
             host_page_bytes_all_layers=int(host_page_bytes_all_layers),
@@ -1091,7 +1267,7 @@ class TrajectoryFrontierCommitter:
         self._pages_by_session: dict[str, set[tuple[int, int]]] = {}
         self._next_storage_handle = 0
         # G>1 only: arenas the LEADER pre-allocated for this pass (sequence id
-        # -> arena), and the shards already written into them awaiting the
+        # -> arena), and the unit writes already made into them awaiting the
         # post-barrier install.
         self._reserved: dict[int, SnapshotArena] = {}
         self._pending: dict[int, _PendingFrontier] = {}
@@ -1114,16 +1290,34 @@ class TrajectoryFrontierCommitter:
         return self._registry
 
     @property
-    def layout(self) -> SnapshotLayout:
-        return self._layout
+    def unit_layout(self) -> SnapshotLayout:
+        """Byte layout of ONE record head unit (the arena window layout)."""
+
+        return self._unit_layout
 
     @property
-    def shard_count(self) -> int:
-        return self._shard_count
+    def rank_profile(self):
+        """Geometry of the live shard THIS rank copies and restores."""
+
+        return self._rank_layout.profile
 
     @property
-    def shard_index(self) -> int:
-        return self._shard_index
+    def group_size(self) -> int:
+        return self._group_size
+
+    @property
+    def group_rank(self) -> int:
+        return self._group_rank
+
+    @property
+    def unit_count(self) -> int:
+        return self._unit_count
+
+    @property
+    def unit_indices(self) -> tuple[int, ...]:
+        """The record units this rank owns, in unit order."""
+
+        return self._unit_indices
 
     @property
     def owns_registry(self) -> bool:
@@ -1211,12 +1405,12 @@ class TrajectoryFrontierCommitter:
         return int(prompt_token_count) == int(commit_tokens)
 
     def plan_arena_pages(self, *, prefix_page_count: int) -> int:
-        """Host pages one snapshot arena needs: G x one shard's pages."""
+        """Host pages one snapshot arena needs: U x one unit's pages."""
 
-        return self._layout.arena_page_count(
+        return self._unit_layout.arena_page_count(
             host_page_bytes_all_layers=self._host_page_bytes_all_layers,
             prefix_page_count=int(prefix_page_count),
-            shard_count=self._shard_count,
+            unit_count=self._unit_count,
         )
 
     # -- the install decision table ----------------------------------------
@@ -1425,7 +1619,7 @@ class TrajectoryFrontierCommitter:
             sequence_id=key,
         )
         previous = self._decisions.get(key)
-        if self._shard_count > 1:
+        if self._group_size > 1:
             self._decisions[key] = decision
         if not decision.installs and (
             previous is None or previous.skip_reason != decision.skip_reason
@@ -1451,7 +1645,7 @@ class TrajectoryFrontierCommitter:
         namespace_digest: Sequence[int],
         frontier_token_ids: Sequence[int],
     ) -> SnapshotArena | None:
-        """Pre-allocate the G-wide arena for a sequence. Leader-only.
+        """Pre-allocate the U-unit arena for a sequence. Leader-only.
 
         PHASE 1 of the G>1 transaction, run in prefill config so the arena's
         page ids can ride the host-KV mirror that already runs there -- which
@@ -1460,8 +1654,8 @@ class TrajectoryFrontierCommitter:
         holds exactly as before: the boundary planner cannot double-promise
         bytes a snapshot is already holding.
 
-        ``None`` means no arena, so no rank writes a shard and the sequence's
-        frontier is simply not committed this pass. Two reasons, both named and
+        ``None`` means no arena, so no rank writes its units and the
+        sequence's frontier is simply not committed this pass. Two reasons, both named and
         counted: pool pressure, the one recoverable allocation outcome, and a
         decision table that says there is nothing to install. Every arena handed
         out here is either consumed by a ``commit`` or rolled back by
@@ -1470,7 +1664,7 @@ class TrajectoryFrontierCommitter:
         THIS is the earliest sound point for the install decision, which is why
         the reservation needs the frontier identity: the session key and the
         boundary are already known here, a full prefill config BEFORE the D2H
-        and the shard writes, and the registry cannot install a record between
+        and the unit writes, and the registry cannot install a record between
         here and the barrier. A dedupe therefore costs no Host pages, no device
         copy and no page-table write at all.
         """
@@ -1497,7 +1691,7 @@ class TrajectoryFrontierCommitter:
         arena_pages = self.plan_arena_pages(prefix_page_count=prefix_page_count)
         try:
             arena = self._arena_allocator.allocate(
-                page_count=arena_pages, shard_count=self._shard_count
+                page_count=arena_pages, unit_count=self._unit_count
             )
         except SnapshotArenaUnavailable as exc:
             self._skip(
@@ -1509,8 +1703,8 @@ class TrajectoryFrontierCommitter:
                 self._rank,
                 key,
                 arena_pages,
-                self._shard_count,
-                arena_pages // self._shard_count,
+                self._unit_count,
+                arena_pages // self._unit_count,
                 exc,
             )
             # The claim goes with the arena: this sequence will not commit the
@@ -1566,11 +1760,11 @@ class TrajectoryFrontierCommitter:
                 f"rank {self._rank} owns its group's frontier registry, so it "
                 "allocates its arenas rather than adopting one"
             )
-        if int(arena.shard_count) != self._shard_count:
+        if int(arena.unit_count) != self._unit_count:
             raise SnapshotArenaCorrupt(
-                f"the mirrored arena holds {arena.shard_count} shard "
-                f"window(s) but this rank serves a {self._shard_count}-rank "
-                "group"
+                f"the mirrored arena holds {arena.unit_count} unit "
+                f"window(s) but this rank's record unit count is "
+                f"{self._unit_count}"
             )
         self._reserved[int(sequence_id)] = arena
 
@@ -1586,17 +1780,18 @@ class TrajectoryFrontierCommitter:
         sequence_id: int,
         prompt_token_count: int,
     ) -> TrajectoryCommitOutcome | None:
-        """Snapshot this rank's KDA shard and install/advance the frontier.
+        """Snapshot this rank's KDA state and install/advance the frontier.
 
         Returns ``None`` when the step is deliberately skipped, by name: the
         prompt does not end on the committed boundary, the frontier is already
         committed at this exact boundary, or the Host pool could not supply
         arena pages. Every other failure is raised by name.
 
-        At G==1 the record is installed here. At G>1 only THIS rank's shard is
-        written and the record is left pending for ``finalize``, which runs
-        after the all-ranks barrier -- by then every rank of the group has
-        written its own window, so the record binds a complete snapshot.
+        At G==1 the record is installed here. At G>1 only THIS rank's unit
+        windows are written and the record is left pending for ``finalize``,
+        which runs after the all-ranks barrier -- by then every rank of the
+        group has written its own windows, so the record binds a complete
+        snapshot.
         """
 
         tokens = tuple(int(token_id) for token_id in frontier_token_ids)
@@ -1620,7 +1815,7 @@ class TrajectoryFrontierCommitter:
         if not self._owns_registry:
             raise SnapshotArenaCorrupt(
                 f"rank {self._rank} does not own its group's frontier "
-                "registry; it writes its shard with write_shard and installs "
+                "registry; it writes its units with write_units and installs "
                 "nothing"
             )
         # 1. The decision table, BEFORE the D2H: a commit with nothing to
@@ -1637,7 +1832,7 @@ class TrajectoryFrontierCommitter:
         #    frontier for this sequence this pass, and that is known BEFORE the
         #    copy, so a missing reservation costs no D2H either.
         reserved_arena = None
-        if self._shard_count > 1:
+        if self._group_size > 1:
             reserved_arena = self._reserved.pop(int(sequence_id), None)
             if reserved_arena is None:
                 self._skip(
@@ -1655,12 +1850,19 @@ class TrajectoryFrontierCommitter:
                 self._decisions.pop(int(sequence_id), None)
                 return None
 
-        # 3. D2H copy of THIS rank's slot shard, in the fixed profile order.
+        # 3. D2H copy of THIS rank's slot shard, in the fixed profile order,
+        #    then the record-layout split: the rank's blob becomes its own
+        #    units' blobs, one per unit window it owns.
         chunks = self._snapshot_reader.read_slot(int(sequence_id))
         self._validate_chunks(chunks)
+        unit_chunks = split_chunks_into_units(
+            chunks,
+            profile=self._rank_layout.profile,
+            unit_count=len(self._unit_indices),
+        )
 
-        if self._shard_count > 1:
-            return self._commit_shard(
+        if self._group_size > 1:
+            return self._commit_units(
                 namespace_digest=namespace_digest,
                 tokens=tokens,
                 page_ids_by_group=page_ids_by_group,
@@ -1668,6 +1870,7 @@ class TrajectoryFrontierCommitter:
                 sequence_id=int(sequence_id),
                 decision=decision,
                 arena=reserved_arena,
+                unit_chunks=unit_chunks,
                 chunks=chunks,
             )
 
@@ -1679,7 +1882,7 @@ class TrajectoryFrontierCommitter:
         arena_pages = self.plan_arena_pages(prefix_page_count=prefix_pages)
         try:
             arena = self._arena_allocator.store(
-                page_count=arena_pages, chunks=chunks
+                page_count=arena_pages, unit_chunks=unit_chunks
             )
         except SnapshotArenaUnavailable as exc:
             self._skip(
@@ -1702,9 +1905,9 @@ class TrajectoryFrontierCommitter:
         snapshot = KDASnapshotDescriptor(
             storage_handle=handle,
             owning_group_id=int(owning_group_id),
-            profile=self._layout.profile,
+            profile=self._unit_layout.profile,
             boundary_tokens=len(tokens),
-            shard_count=self._shard_count,
+            unit_count=self._unit_count,
         )
 
         # 3. Install. ``advance`` references the new record BEFORE releasing the
@@ -1727,7 +1930,7 @@ class TrajectoryFrontierCommitter:
             raise
         return outcome
 
-    def _commit_shard(
+    def _commit_units(
         self,
         *,
         namespace_digest: Sequence[int],
@@ -1737,27 +1940,26 @@ class TrajectoryFrontierCommitter:
         sequence_id: int,
         decision: FrontierInstallDecision,
         arena: SnapshotArena,
+        unit_chunks: Sequence[Sequence[object]],
         chunks: Sequence[object],
     ) -> TrajectoryCommitOutcome:
-        """G>1: write this rank's window and leave the record pending.
+        """G>1: write this rank's unit windows and leave the record pending.
 
         The arena is the one ``commit`` took out of this pass's reservations,
         and the decision is the table's answer for this sequence; both are
         settled before the D2H, so everything here is the write itself.
         """
 
-        written = self._arena_allocator.write_shard(
-            arena, shard_index=self._shard_index, chunks=chunks
-        )
+        written = self._write_rank_units(arena, unit_chunks)
         arena = replace(arena, payload_bytes=written)
         handle = self._allocate_storage_handle()
         arena = replace(arena, storage_handle=handle)
         snapshot = KDASnapshotDescriptor(
             storage_handle=handle,
             owning_group_id=int(owning_group_id),
-            profile=self._layout.profile,
+            profile=self._unit_layout.profile,
             boundary_tokens=len(tokens),
-            shard_count=self._shard_count,
+            unit_count=self._unit_count,
         )
         self._pending[int(sequence_id)] = _PendingFrontier(
             sequence_id=int(sequence_id),
@@ -1771,18 +1973,21 @@ class TrajectoryFrontierCommitter:
             arena=arena,
         )
         self._logger.info(
-            "[%s] rank=%s seq=%s shard=%s/%s written boundary=%s "
-            "arena_pages=%s shard_pages=%s bytes=%s digest=%s; record pending "
+            "[%s] rank=%s seq=%s units=%s/%s written boundary=%s "
+            "arena_pages=%s unit_pages=%s bytes=%s digest=%s; record pending "
             "until the all-ranks barrier",
             PREFIX,
             self._rank,
             int(sequence_id),
-            self._shard_index,
-            self._shard_count,
+            list(self._unit_indices),
+            self._unit_count,
             len(tokens),
             arena.pages_per_group,
-            arena.pages_per_shard,
+            arena.pages_per_unit,
             written,
+            # The digest is over the rank's own slot chunks, the same bytes
+            # the restore-side slot digest reads back, so the two stay
+            # comparable whatever the unit split is.
             snapshot_chunks_digest(chunks),
         )
         return TrajectoryCommitOutcome(
@@ -1794,18 +1999,40 @@ class TrajectoryFrontierCommitter:
             advanced=decision.action == INSTALL_ADVANCE,
             previous_release=None,
             installed=False,
-            shard_index=self._shard_index,
-            shard_bytes=int(written),
+            group_rank=self._group_rank,
+            rank_bytes=int(written),
         )
 
-    def write_shard(
+    def _write_rank_units(
+        self, arena: SnapshotArena, unit_chunks: Sequence[Sequence[object]]
+    ) -> int:
+        """Write this rank's unit blobs into their own windows; total bytes.
+
+        ONE write loop for the leader and the followers, over the unit span
+        ``rank_unit_window`` gave this rank at construction, so the two sides
+        cannot place a unit differently.
+        """
+
+        if len(unit_chunks) != len(self._unit_indices):
+            raise TrajectorySnapshotShapeMismatch(
+                f"rank {self._rank} owns {len(self._unit_indices)} record "
+                f"unit(s) but the split produced {len(unit_chunks)} blob(s)"
+            )
+        written = 0
+        for unit_index, chunks in zip(self._unit_indices, unit_chunks):
+            written += self._arena_allocator.write_unit(
+                arena, unit_index=unit_index, chunks=chunks
+            )
+        return written
+
+    def write_units(
         self,
         *,
         sequence_id: int,
         frontier_token_ids: Sequence[int],
         prompt_token_count: int,
     ) -> int | None:
-        """Write this rank's shard into the leader's arena. Follower-only.
+        """Write this rank's units into the leader's arena. Follower-only.
 
         No registry write, no allocator mutation, no record: the leader owns
         what a frontier IS and this rank owns only its own head shard of the
@@ -1818,7 +2045,7 @@ class TrajectoryFrontierCommitter:
         if self._owns_registry:
             raise SnapshotArenaCorrupt(
                 f"rank {self._rank} owns its group's frontier registry; it "
-                "commits records with commit, not write_shard"
+                "commits records with commit, not write_units"
             )
         tokens = tuple(int(token_id) for token_id in frontier_token_ids)
         if not self.boundary_is_aligned(
@@ -1826,7 +2053,7 @@ class TrajectoryFrontierCommitter:
         ):
             self._skip(
                 SKIP_BOUNDARY_MISALIGNED,
-                "[%s] rank=%s seq=%s SKIPPED shard write: the prefill ran %s "
+                "[%s] rank=%s seq=%s SKIPPED unit write: the prefill ran %s "
                 "token(s) but the boundary is %s",
                 PREFIX,
                 self._rank,
@@ -1839,7 +2066,7 @@ class TrajectoryFrontierCommitter:
         if arena is None:
             self._skip(
                 SKIP_ARENA_MISSING,
-                "[%s] rank=%s seq=%s SKIPPED shard write: its serve-group "
+                "[%s] rank=%s seq=%s SKIPPED unit write: its serve-group "
                 "leader reserved no snapshot arena this pass",
                 PREFIX,
                 self._rank,
@@ -1847,17 +2074,20 @@ class TrajectoryFrontierCommitter:
             )
             return None
         chunks = self._read_chunks(int(sequence_id))
-        written = self._arena_allocator.write_shard(
-            arena, shard_index=self._shard_index, chunks=chunks
+        unit_chunks = split_chunks_into_units(
+            chunks,
+            profile=self._rank_layout.profile,
+            unit_count=len(self._unit_indices),
         )
+        written = self._write_rank_units(arena, unit_chunks)
         self._logger.info(
-            "[%s] rank=%s seq=%s shard=%s/%s written boundary=%s bytes=%s "
+            "[%s] rank=%s seq=%s units=%s/%s written boundary=%s bytes=%s "
             "digest=%s into the leader's arena (pseudo_sid=%s)",
             PREFIX,
             self._rank,
             int(sequence_id),
-            self._shard_index,
-            self._shard_count,
+            list(self._unit_indices),
+            self._unit_count,
             len(tokens),
             written,
             snapshot_chunks_digest(chunks),
@@ -1876,7 +2106,7 @@ class TrajectoryFrontierCommitter:
         """Install every pending record; give back every unused arena.
 
         Runs after the all-ranks barrier, so every rank of every owning group
-        has already written its own shard window: a record installed here binds
+        has already written its own unit windows: a record installed here binds
         a COMPLETE snapshot. Before that barrier no record exists, so a crash,
         a rejected wave or any skip leaves the previously committed frontier
         exactly as it was.
@@ -1915,7 +2145,7 @@ class TrajectoryFrontierCommitter:
                 sequence_id=int(sequence_id),
             )
             if not decision.installs:
-                # A decision, not a failure: the shard bytes are simply not
+                # A decision, not a failure: the written bytes are simply not
                 # needed, so the arena goes back through the same rollback path
                 # a never-committed reservation takes -- before ``retain``, so
                 # the pages were never made prefix-resident in the first place.
@@ -2077,7 +2307,7 @@ class TrajectoryFrontierCommitter:
         self._index_pages(record)
         self._logger.info(
             "[%s] rank=%s seq=%s session=%s %s boundary=%s prefix_pages=%s "
-            "arena_pages=%s shards=%s snapshot_bytes=%s",
+            "arena_pages=%s units=%s snapshot_bytes=%s",
             PREFIX,
             self._rank,
             int(sequence_id),
@@ -2086,7 +2316,7 @@ class TrajectoryFrontierCommitter:
             record.frontier_boundary_tokens,
             record.page_count,
             arena.pages_per_group,
-            arena.shard_count,
+            arena.unit_count,
             arena.payload_bytes,
         )
         return TrajectoryCommitOutcome(
@@ -2098,8 +2328,8 @@ class TrajectoryFrontierCommitter:
                 advance.previous_release if advance is not None else None
             ),
             installed=True,
-            shard_index=self._shard_index,
-            shard_bytes=int(arena.payload_bytes),
+            group_rank=self._group_rank,
+            rank_bytes=int(arena.payload_bytes),
         )
 
     # -- the eviction hook --------------------------------------------------
@@ -2176,7 +2406,7 @@ class TrajectoryFrontierCommitter:
         return self._next_storage_handle
 
     def _validate_chunks(self, chunks: Sequence[object]) -> None:
-        expected = self._layout.chunk_bytes
+        expected = self._rank_layout.chunk_bytes
         if len(chunks) != len(expected):
             raise TrajectorySnapshotShapeMismatch(
                 f"a KDA snapshot is {len(expected)} chunks "

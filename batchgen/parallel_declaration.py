@@ -614,6 +614,48 @@ def read_supported_layouts(parallel_manager) -> Optional[dict]:
     return table
 
 
+def max_supported_attention_group_size(supported: Optional[dict], world_size: int) -> int:
+    """The largest attention shard-group size any implemented layout admits
+    on a server of ``world_size`` ranks.
+
+    This is a property of the MODEL for the life of the server, derived from
+    its ``SUPPORTED_LAYOUTS`` table and nothing else: per attention entry, a
+    non-sharded scheme admits only group size 1, a fixed size admits itself
+    (when it divides the world, since a ``PhaseLayout`` refuses any other), and
+    the ``world``/divisor rules admit up to the world size. State snapshots
+    use it as their record head-unit count, so a record written under one
+    attention group size stays readable under every other implemented one.
+
+    A family that declares no table is refused by name: without the table the
+    set of implemented layouts is unknown, and guessing a maximum would bake a
+    wrong record geometry into every snapshot the server writes.
+    """
+
+    if not supported:
+        raise ParallelDeclarationError(
+            "max_supported_attention_group_size needs the model family's "
+            "SUPPORTED_LAYOUTS table; this family declares none"
+        )
+    world = int(world_size)
+    if world < 1:
+        raise ParallelDeclarationError(
+            f"world_size must be a positive int, got {world_size!r}"
+        )
+    sizes = {1}
+    for phase in LAYOUT_PHASES:
+        for entry in supported[phase]:
+            attention = entry.attention
+            if attention.scheme not in _GROUPED_SCHEMES:
+                continue
+            group = attention.group
+            if _is_fixed_group(group):
+                if world % int(group) == 0:
+                    sizes.add(int(group))
+            elif group in (GROUP_WORLD, GROUP_DIVISOR):
+                sizes.add(world)
+    return max(sizes)
+
+
 def check_layout_supported(model: str, supported: dict, layout: ServerLayout) -> None:
     """Refuse, by name, a layout the model family does not implement."""
     for phase in LAYOUT_PHASES:

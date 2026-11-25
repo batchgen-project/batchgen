@@ -304,3 +304,57 @@ def test_kimi_refuses_a_non_positive_group_size():
     with pytest.raises(ValueError, match="must be positive"):
         _kimi_group(decode_tp=0)
 
+
+
+# --- the record head-unit count (max implemented attention group size) ----- #
+def test_max_attention_group_size_reads_the_kimi_table():
+    from batchgen.parallel_declaration import max_supported_attention_group_size
+
+    table = _kimi_table()
+    # The kimi table admits divisor-rule TP attention, so the maximum on a
+    # world of 8 is 8 and on a world of 2 is 2 (the fixed-8 prefill entry is
+    # not realizable on 2 ranks and must not leak in).
+    assert max_supported_attention_group_size(table, 8) == 8
+    assert max_supported_attention_group_size(table, 2) == 2
+
+
+def test_max_attention_group_size_of_a_pure_dp_family_is_one():
+    from batchgen.parallel_declaration import max_supported_attention_group_size
+
+    table = replicated_prefill_world_ep_decode()
+    assert max_supported_attention_group_size(table, 8) == 1
+
+
+def test_max_attention_group_size_counts_only_realizable_fixed_sizes():
+    from batchgen.parallel_declaration import (
+        RESIDENCY_RESIDENT,
+        SCHEME_DP,
+        SCHEME_EP,
+        SCHEME_TP,
+        max_supported_attention_group_size,
+    )
+
+    table = {
+        PHASE_PREFILL: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_TP, (RESIDENCY_RESIDENT,), 4),
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+            ),
+        ),
+        PHASE_DECODE: (
+            LayoutSupport(
+                ModuleSupport(SCHEME_DP, (RESIDENCY_RESIDENT,)),
+                ModuleSupport(SCHEME_EP, (RESIDENCY_RESIDENT,), GROUP_WORLD),
+            ),
+        ),
+    }
+    assert max_supported_attention_group_size(table, 8) == 4
+    # A fixed size that does not divide the world is not realizable there.
+    assert max_supported_attention_group_size(table, 6) == 1
+
+
+def test_max_attention_group_size_refuses_a_missing_table_by_name():
+    from batchgen.parallel_declaration import max_supported_attention_group_size
+
+    with pytest.raises(ParallelDeclarationError, match="SUPPORTED_LAYOUTS"):
+        max_supported_attention_group_size(None, 8)

@@ -145,6 +145,7 @@ def test_model_without_recurrent_state_reads_as_absent():
                 rank=0,
                 runtime=SimpleNamespace(),
                 group_geometry=(1, 0, True),
+                unit_count=1,
                 host_views_provider=lambda: {},
                 next_pseudo_sid=lambda: -1,
             )
@@ -287,7 +288,7 @@ def test_restore_payload_round_trips_through_arena_from_payload():
 		pages_per_group=2,
 		capacity_bytes=256,
 		payload_bytes=128,
-		shard_count=2,
+		unit_count=2,
 	)
 	store.trajectory_frontier_committer = SimpleNamespace(
 		arena_for=lambda handle: arena
@@ -302,14 +303,14 @@ def test_restore_payload_round_trips_through_arena_from_payload():
 		)
 	}
 	payload = store.restore_payload(
-		shard_count=2, is_leader=True, planned_boundary_for=lambda gid: 64
+		group_size=2, is_leader=True, planned_boundary_for=lambda gid: 64
 	)
 	rebuilt = store.arena_from_payload(payload[5])
 	assert rebuilt.pseudo_sid == arena.pseudo_sid
 	assert rebuilt.page_ids_by_group == arena.page_ids_by_group
 	assert rebuilt.pages_per_group == arena.pages_per_group
 	assert rebuilt.capacity_bytes == arena.capacity_bytes
-	assert rebuilt.shard_count == arena.shard_count
+	assert rebuilt.unit_count == arena.unit_count
 
 
 # A6 item 5: session_summary keeps leader/registry gating and wire fields.
@@ -322,11 +323,11 @@ def test_session_summary_preserves_leader_registry_payload():
 	store.trajectory_frontier_committer = SimpleNamespace(
 		owns_registry=True, registry=Registry()
 	)
-	assert store.session_summary(shard_count=4, is_leader=True, rank=6) == {
+	assert store.session_summary(group_size=4, is_leader=True, rank=6) == {
 		"group_id": 1,
 		"sessions": {"s": [3, 128, "idx"]},
 	}
-	assert store.session_summary(shard_count=4, is_leader=False, rank=6) == {}
+	assert store.session_summary(group_size=4, is_leader=False, rank=6) == {}
 
 
 # A6 item 6: adopt_mirrored_arenas reconstructs and passes each arena onward.
@@ -345,7 +346,7 @@ def test_adopt_mirrored_arenas_rebuilds_each_payload():
 		"pages": {0: [1, 2]},
 		"pages_per_group": 2,
 		"capacity_bytes": 128,
-		"shard_count": 1,
+		"unit_count": 1,
 	}
 	store.adopt_mirrored_arenas({9: entry}, committer=committer)
 	assert len(committer.adopted) == 1
@@ -481,6 +482,7 @@ def test_follower_trajectory_state_unavailable_raises(monkeypatch):
 	worker.rank = 1
 	worker.prefix_cache_runtime_config = SimpleNamespace()
 	worker._trajectory_group_geometry = lambda: (2, 1, False)
+	worker._trajectory_record_unit_count = lambda: 2
 	worker._host_views_by_group = lambda: {}
 	worker._next_pool_segment_sid = lambda: -1
 	worker._get_trajectory_frontier_committer = MethodType(
@@ -490,7 +492,7 @@ def test_follower_trajectory_state_unavailable_raises(monkeypatch):
 		TrajectoryStateUnavailable,
 		match="prefix_trajectory_commit needs a live KDA state pool; this deployment has none",
 	):
-		_worker_method_from_source("_restore_mirrored_trajectory_shards")(worker, [])
+		_worker_method_from_source("_restore_mirrored_trajectory_units")(worker, [])
 
 
 # A3: the migrated re-entry writer keeps the old QueryBook turn ledger.

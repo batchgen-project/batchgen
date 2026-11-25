@@ -31,7 +31,7 @@ The restore therefore only checks that hand-off -- token identity and start
 == boundary -- and treats a failure of either as a broken invariant, raised
 after the attachment is consumed. And because the wave is already built
 around a planned row's start, ANY refusal of a row whose compute starts at
-the boundary (capacity, I/O, shard or group) is raised as
+the boundary (capacity, I/O, unit split or group) is raised as
 ``TrajectoryPlannedRestoreFailed`` after it is counted: that row cannot fall
 back to a recompute inside a fixed wave, and running it would compute its
 suffix on a state that does not hold its prefix.
@@ -69,6 +69,8 @@ from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotLayout,
     TrajectorySnapshotShapeMismatch,
     TrajectoryStateUnavailable,
+    merge_unit_chunks,
+    rank_unit_window,
 )
 from batchgen.prefix_reuse.trajectory_frontier import (
     TrajectoryFrontierRecord,
@@ -195,13 +197,13 @@ class _RestoreDeclined(Exception):
 # Reasons a hit does NOT end in a restore. Strings, not booleans, because the
 # fallback log line and the metrics row both have to say WHICH one happened.
 #
-# ``head_sharded_group`` no longer means "G>1 at all". Slice 1c commits every
-# rank's head shard into one arena, so a G>1 record is restorable; what is NOT
-# restorable is a record whose SHARD COUNT is not this rank's group size. Its
-# windows then describe a different head split, and reading window r of it
-# would bind plausible-looking wrong state. That is the refusal this name now
-# carries.
-DECLINE_HEAD_SHARDED_GROUP = "head_sharded_group"
+# ``record_units_indivisible`` (formerly ``head_sharded_group``): the record
+# splits into a fixed number of equal head units, and a group of g ranks reads
+# it iff g divides that unit count -- rank r then owns units
+# [r*U/g, (r+1)*U/g). A record whose unit count this rank's group size does
+# not divide has no whole-unit split for this group; reading a partial unit
+# would bind plausible-looking wrong state, so it is refused by name.
+DECLINE_RECORD_UNITS_INDIVISIBLE = "record_units_indivisible"
 DECLINE_GROUP_MISMATCH = "group_mismatch"
 # Since the wave planner decides restores, this one is an INVARIANT: it names
 # planner/restore drift and the restore raises after counting it.
@@ -216,7 +218,7 @@ DECLINE_SLOT_WRITE_FAILED = "slot_write_failed"
 DECLINE_NOT_PLANNED = "not_planned"
 
 DECLINE_REASONS = (
-    DECLINE_HEAD_SHARDED_GROUP,
+    DECLINE_RECORD_UNITS_INDIVISIBLE,
     DECLINE_GROUP_MISMATCH,
     DECLINE_SUFFIX_OFFSET,
     DECLINE_ARENA_MISSING,
@@ -363,17 +365,18 @@ class HostKVSnapshotArenaReader:
         arena: SnapshotArena,
         *,
         layout: SnapshotLayout,
-        shard_index: int = 0,
+        unit_index: int = 0,
     ) -> tuple[object, ...]:
-        """The blob's chunks in ``SNAPSHOT_CHUNK_NAMES`` order, as uint8.
+        """One unit blob's chunks in ``SNAPSHOT_CHUNK_NAMES`` order, as uint8.
 
-        ``shard_index`` selects WHICH rank's head shard is read. The window is
-        taken from ``SnapshotArena.shard_window``, the same method the commit
-        side wrote through, so the read and the write cannot derive it
-        differently -- a restore that computed the window itself could read a
-        neighbour's shard and bind state that looks entirely plausible.
-        ``shard_index=0`` of a one-shard arena is the whole arena, so the
-        pure-DP read is unchanged.
+        ``unit_index`` selects WHICH head unit is read and ``layout`` is the
+        byte layout of ONE unit. The window is taken from
+        ``SnapshotArena.unit_window``, the same method the commit side wrote
+        through, so the read and the write cannot derive it differently -- a
+        restore that computed the window itself could read a neighbouring
+        unit's bytes and bind state that looks entirely plausible.
+        ``unit_index=0`` of a one-unit arena is the whole arena, so the
+        pre-unit read is unchanged.
         """
 
         torch = self._torch_module()
@@ -390,7 +393,7 @@ class HostKVSnapshotArenaReader:
                 f"sequence id so it cannot collide with a real sequence, got "
                 f"{pseudo_sid}"
             )
-        window_by_group = arena.shard_window(int(shard_index))
+        window_by_group = arena.unit_window(int(unit_index))
         windows: list[object] = []
         collected = 0
         registered: list[int] = []
@@ -640,7 +643,7 @@ class TrajectoryRestorer:
         arena_reader,
         state_writer,
         attention_group_size: int = 1,
-        shard_index: int = 0,
+        group_rank: int = 0,
         logger=None,
     ) -> None:
         self._rank = int(rank)
@@ -653,15 +656,16 @@ class TrajectoryRestorer:
                 "attention_group_size must be positive, got "
                 f"{attention_group_size}"
             )
-        if not 0 <= int(shard_index) < self._attention_group_size:
+        if not 0 <= int(group_rank) < self._attention_group_size:
             raise TrajectoryRestoreError(
-                f"shard_index {shard_index} is outside a "
+                f"group_rank {group_rank} is outside a "
                 f"{self._attention_group_size}-rank owning group"
             )
-        # WHICH head shard this rank restores: its own position inside the
-        # owning group. The commit side wrote window ``shard_index`` from this
-        # same rank, so the two are the same index by construction.
-        self._shard_index = int(shard_index)
+        # WHICH head slice this rank restores: its own position inside the
+        # owning group. WHICH record units that is depends on each record's
+        # own unit count, so the unit span is derived per restore from the
+        # arena's stamp (``rank_unit_window``), never assumed from the group.
+        self._group_rank = int(group_rank)
         self._logger = logger if logger is not None else logging
         self._live_attachments = 0
         self._lookups = 0
@@ -778,7 +782,7 @@ class TrajectoryRestorer:
         """Release an attachment and say by name why no restore happened.
 
         For a row that recomputes from its own start: the plan-time
-        ``not_planned`` decline, and a shard or group refusal of a row whose
+        ``not_planned`` decline, and a unit-split or group refusal of a row whose
         compute does not start at the boundary. A row whose compute DOES
         start there is never declined -- it fails loud, see
         ``TrajectoryPlannedRestoreFailed``.
@@ -861,7 +865,7 @@ class TrajectoryRestorer:
         reason: str,
         detail: str,
     ) -> None:
-        """A shard or group refusal on the attachment path.
+        """A unit-split or group refusal on the attachment path.
 
         Raised iff the row is planned. ``planned`` is the plan handshake
         itself (compute start == boundary): exactly the rows whose suffix
@@ -893,9 +897,10 @@ class TrajectoryRestorer:
 
         ``None`` means the sequence recomputes from its own start: the
         attachment is released and the reason logged. Only a row whose
-        compute does NOT start at the boundary can get it (a shard or group
-        refusal); such a row does not depend on the snapshot. Every refusal
-        of a row whose compute starts at the boundary -- shard, group, arena,
+        compute does NOT start at the boundary can get it (a unit-split or
+        group refusal); such a row does not depend on the snapshot. Every
+        refusal of a row whose compute starts at the boundary -- unit split,
+        group, arena,
         slot capacity or slot write -- is counted under its name and raised
         as ``TrajectoryPlannedRestoreFailed``, after the attachment is
         consumed: the wave is already built around that start.
@@ -937,21 +942,23 @@ class TrajectoryRestorer:
         # The plan handshake: a row whose compute starts at the boundary is
         # the plan's to restore, and the wave around it is already fixed.
         planned = int(compute_cached_tokens) == attachment.boundary_tokens
-        record_shards = int(attachment.record.shard_count)
-        if record_shards != self._attention_group_size:
-            # Slice 1c commits EVERY rank's head shard into one arena, so a
-            # G>1 record is restorable -- as long as its shard count is this
-            # rank's group size. A record taken at a different G describes a
-            # different head split: window r of it is not this rank's heads,
-            # and binding it would be wrong state no downstream assertion can
-            # see. Refused by name rather than reinterpreted.
+        record_units = int(attachment.record.unit_count)
+        if record_units % self._attention_group_size:
+            # The record splits into ``record_units`` equal head units, and a
+            # group of g ranks reads it iff g divides that count (rank r owns
+            # units [r*U/g, (r+1)*U/g)) -- the record does NOT have to be
+            # written by a group of this size. A unit count this group size
+            # does not divide has no whole-unit split for this rank; reading
+            # a partial unit would bind plausible-looking wrong state, so it
+            # is refused by name rather than reinterpreted.
             self._refuse(
                 attachment,
                 planned=planned,
-                reason=DECLINE_HEAD_SHARDED_GROUP,
+                reason=DECLINE_RECORD_UNITS_INDIVISIBLE,
                 detail=(
-                    f"the record binds {record_shards} head shard(s) but this "
-                    f"rank serves a {self._attention_group_size}-rank group"
+                    f"the record splits into {record_units} head unit(s), "
+                    "which this rank's "
+                    f"{self._attention_group_size}-rank group does not divide"
                 ),
             )
             return None
@@ -999,7 +1006,9 @@ class TrajectoryRestorer:
 
         try:
             slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
-                arena=arena, layout=self._committer.layout, sequence_id=sequence_id
+                arena=arena,
+                layout=self._committer.unit_layout,
+                sequence_id=sequence_id,
             )
         except _RestoreDeclined as declined:
             self._fail_planned(
@@ -1049,7 +1058,14 @@ class TrajectoryRestorer:
     def _read_window_and_bind_slot(
         self, *, arena, layout, sequence_id: int
     ) -> tuple[int, int, bool, str]:
-        """Read THIS rank's window and write it into the sequence's slot.
+        """Read THIS rank's unit windows and write them into the slot.
+
+        ``layout`` is the byte layout of ONE record unit. The rank's unit
+        span comes from the ARENA's own unit count through
+        ``rank_unit_window`` -- the same owner the commit side derives its
+        windows from -- so the read never assumes the record was written by a
+        group of this rank's size. The units are read in unit order and
+        reassembled along the head/channel dimension into this rank's slice.
 
         Returns ``(slot, bytes_written, had_slot, slot_digest)``. Every
         failure leaves the pool exactly as it found it and is raised as
@@ -1060,9 +1076,16 @@ class TrajectoryRestorer:
         """
 
         try:
-            chunks = self._arena_reader.read(
-                arena, layout=layout, shard_index=self._shard_index
+            unit_indices = rank_unit_window(
+                unit_count=int(arena.unit_count),
+                group_size=self._attention_group_size,
+                group_rank=self._group_rank,
             )
+            unit_chunks = [
+                self._arena_reader.read(arena, layout=layout, unit_index=unit)
+                for unit in unit_indices
+            ]
+            chunks = merge_unit_chunks(unit_chunks, unit_profile=layout.profile)
         except Exception as exc:  # noqa: BLE001 - fail-safe by contract
             self._logger.exception(
                 "[%s] rank=%s seq=%s reading the snapshot arena failed",
@@ -1141,7 +1164,7 @@ class TrajectoryRestorer:
 
     # -- the mirrored (follower) restore ------------------------------------
 
-    def restore_mirrored_shard(
+    def restore_mirrored_units(
         self,
         *,
         sequence_id: int,
@@ -1154,7 +1177,7 @@ class TrajectoryRestorer:
         serving_group_id: int,
         compute_cached_tokens: int,
     ) -> TrajectoryRestoreOutcome | None:
-        """Restore this rank's shard from the LEADER's mirrored decision.
+        """Restore this rank's head slice from the LEADER's mirrored decision.
 
         Why a follower has no record of its own: a frontier record's lifetime
         is allocator state -- the arena's pages are retained and released by
@@ -1189,17 +1212,18 @@ class TrajectoryRestorer:
         self._lookups += 1
         self._hits += 1
         planned = int(compute_cached_tokens) == int(boundary_tokens)
-        shards = int(getattr(arena, "shard_count", 1))
-        if shards != self._attention_group_size:
+        record_units = int(getattr(arena, "unit_count", 1))
+        if record_units % self._attention_group_size:
             self._refuse_mirrored(
                 planned=planned,
                 sequence_id=sequence_id,
                 session_key=session_key,
                 boundary_tokens=boundary_tokens,
-                reason=DECLINE_HEAD_SHARDED_GROUP,
+                reason=DECLINE_RECORD_UNITS_INDIVISIBLE,
                 detail=(
-                    f"the mirrored arena holds {shards} head shard(s) but this "
-                    f"rank serves a {self._attention_group_size}-rank group"
+                    f"the mirrored arena holds {record_units} head unit(s), "
+                    "which this rank's "
+                    f"{self._attention_group_size}-rank group does not divide"
                 ),
             )
             return None
@@ -1250,15 +1274,16 @@ class TrajectoryRestorer:
             )
         self._restores += 1
         self._logger.info(
-            "[%s] rank=%s seq=%s session=%s RESTORED shard=%s/%s boundary=%s "
-            "slot=%s bytes=%s digest=%s group=%s allocated_slot=%s; suffix "
-            "prefill resumes at token %s",
+            "[%s] rank=%s seq=%s session=%s RESTORED group_rank=%s/%s "
+            "units=%s boundary=%s slot=%s bytes=%s digest=%s group=%s "
+            "allocated_slot=%s; suffix prefill resumes at token %s",
             PREFIX,
             self._rank,
             int(sequence_id),
             session_key,
-            self._shard_index,
+            self._group_rank,
             self._attention_group_size,
+            int(getattr(arena, "unit_count", 1)),
             int(boundary_tokens),
             slot,
             written,
@@ -1311,7 +1336,7 @@ class TrajectoryRestorer:
         reason: str,
         detail: str,
     ) -> None:
-        """A mirrored shard or group refusal: raised iff the row is planned.
+        """A mirrored unit-split or group refusal: raised iff the row is planned.
 
         The mirrored twin of ``_refuse``, with the same outcome rule.
         """
@@ -1347,7 +1372,7 @@ __all__ = [
     "DECLINE_ARENA_MISSING",
     "DECLINE_ARENA_READ_FAILED",
     "DECLINE_GROUP_MISMATCH",
-    "DECLINE_HEAD_SHARDED_GROUP",
+    "DECLINE_RECORD_UNITS_INDIVISIBLE",
     "DECLINE_NOT_PLANNED",
     "DECLINE_REASONS",
     "DECLINE_SLOTS_EXHAUSTED",
