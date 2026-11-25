@@ -58,6 +58,8 @@ from batchgen.worker.kv_plan import (
     verdict_node_capacity,
 )
 from batchgen.worker.prefill import (
+    PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED,
+    PREFILL_CAP_SCHEDULING_POOL_EMPTY,
     PREFILL_NO_PROGRESS_LIMIT,
     PREFILL_RECLAIM_TARGET_CANDIDATES,
     PrefillAdmissionNoProgress,
@@ -67,9 +69,11 @@ from batchgen.worker.prefill import (
     PrefillProgressGuard,
     PrefillScheduler,
     PrefillSelectionRequest,
+    PrefillWaveCapRecord,
     describe_prefill_blockers,
     prefill_host_reserve_page_deficit,
     prefill_reclaim_target_pages,
+    record_prefill_binding_cap,
 )
 
 
@@ -150,6 +154,11 @@ def _worker_methods(dist):
         "PrefillAdmissionStalled": PrefillAdmissionStalled,
         "PrefillAdmissionStateDivergence": PrefillAdmissionStateDivergence,
         "describe_prefill_blockers": describe_prefill_blockers,
+        "PrefillWaveCapRecord": PrefillWaveCapRecord,
+        "record_prefill_binding_cap": record_prefill_binding_cap,
+        "PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED":
+            PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED,
+        "PREFILL_CAP_SCHEDULING_POOL_EMPTY": PREFILL_CAP_SCHEDULING_POOL_EMPTY,
         "prefill_reclaim_target_pages": prefill_reclaim_target_pages,
         "prefill_host_reserve_page_deficit": prefill_host_reserve_page_deficit,
         "release_query_book_slot": release_query_book_slot,
@@ -464,6 +473,9 @@ class FakeWorker:
         self._prefill_admission_totals = None
         self._prefill_admission_live = False
         self._prefill_reservation_outcome = None
+        # Clause C7 binding-cap record (worker __init__ parity).
+        self._prefill_wave_ordinal = 0
+        self.prefill_binding_cap_counts = {}
         self.shared_prefix_admission = True
         self._prefix.shared_prefix_credit_suspended = False
         self._prefix.shared_prefix_credit_applied = False

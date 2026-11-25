@@ -40,10 +40,14 @@ from batchgen.query_book import (
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
 from batchgen.worker.prefill import (
+    PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED,
+    PREFILL_CAP_SCHEDULING_POOL_EMPTY,
     PrefillAdmissionStalled,
     PrefillAdmissionStateDivergence,
     PrefillScheduler,
+    PrefillWaveCapRecord,
     prefill_reclaim_target_pages,
+    record_prefill_binding_cap,
 )
 
 
@@ -3075,6 +3079,18 @@ class PrefillEngine:
         # previous iteration's verdict into the guard.
         self._prefill_reservation_outcome = None
         if not all_candidates:
+            # Clause C7: nothing offered -- the scheduling pool gave this wave
+            # no QUEUEING or EVICTED candidate. Recorded so an idle formation
+            # is distinguishable from a capacity-bound one in the summary.
+            record_prefill_binding_cap(
+                self,
+                PrefillWaveCapRecord(
+                    cap=PREFILL_CAP_SCHEDULING_POOL_EMPTY,
+                    candidates_offered=0,
+                    candidates_admitted=0,
+                    admitted_prompt_tokens=0,
+                ),
+            )
             return []
 
         num_nodes = self._get_num_nodes()
@@ -3325,17 +3341,45 @@ class PrefillEngine:
         # prompt. Rank-uniform: per_node_host_total is gathered and the
         # candidate snapshot was digest-checked above, so every rank rejects the
         # same uuids with no further collective.
-        if self._reject_unsatisfiable_prefill_requests(
+        rejected_uuids = self._reject_unsatisfiable_prefill_requests(
             selection, per_node_host_total, required_pages
-        ):
+        )
+        if rejected_uuids:
             # The candidate set changed under the snapshot. Rebuild it on the
             # next iteration instead of selecting against removed sequences; the
             # cleared state also resets the no-progress streak, which is correct
             # -- this iteration did make progress.
             self._prefill_admission_state = None
             self._prefill_admission_selection = None
+            # Clause C7: this wave selected nothing because oversized QUEUEING
+            # requests were failed on the per-request channel, not because a
+            # capacity refused the next candidate. Recorded under its own name
+            # so the summary never counts it as a capacity verdict. The
+            # ``available`` field carries the first rejected request's whole
+            # node pool -- the total the rejection compared against.
+            first_rejected = next(
+                candidate
+                for candidate in selection.candidates
+                if candidate.uuid == rejected_uuids[0]
+            )
+            record_prefill_binding_cap(
+                self,
+                PrefillWaveCapRecord(
+                    cap=PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED,
+                    candidates_offered=len(selection.candidates),
+                    candidates_admitted=0,
+                    admitted_prompt_tokens=0,
+                    first_blocked_uuid=first_rejected.uuid,
+                    first_blocked_node=first_rejected.node_id,
+                    first_blocked_needed=required_pages[first_rejected.uuid],
+                    first_blocked_available=int(
+                        per_node_host_total[first_rejected.node_id]
+                    ),
+                ),
+            )
             return []
-        prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+        wave_selection = PrefillScheduler.select_prefill_wave(selection)
+        prefill_batch = list(wave_selection.admitted_uuids)
         # The in-wave prefix pool releases every cross-wave lookup hit and
         # recomputes it (_plan_prefill_pool_wave), so a hit saves no Host pages
         # there: discounting it over-admits, and the allocation fails once the
@@ -3396,9 +3440,10 @@ class PrefillEngine:
                         for index, candidate in enumerate(selection.candidates)
                     ),
                 )
-                prefill_batch = PrefillScheduler.select_prefill_batch(
+                wave_selection = PrefillScheduler.select_prefill_wave(
                     estimated_selection
                 )
+                prefill_batch = list(wave_selection.admitted_uuids)
         # Admission reclaim targets what the persistent sequence-slot limits
         # (Kimi-K3/Kimi-Linear KDA state) would admit with a fully reclaimed
         # Host pool. Without slot limits that is every candidate, i.e. the
@@ -3570,7 +3615,8 @@ class PrefillEngine:
                 per_node_host_free=tuple(per_node_host_free),
                 per_node_host_reclaimable=tuple(per_node_host_reclaimable),
             )
-            prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+            wave_selection = PrefillScheduler.select_prefill_wave(selection)
+            prefill_batch = list(wave_selection.admitted_uuids)
             if not prefill_batch and not self._prefill_admission_live:
                 # Nothing is live on ANY rank, so nothing will decode, complete, or
                 # free a page or a slot: an empty wave here would repeat forever.
@@ -3620,6 +3666,11 @@ class PrefillEngine:
                 f"[PREFILL] Selected {len(prefill_batch)} sequences "
                 f"({n_evicted} recompute from eviction)"
             )
+
+        # Clause C7: record THIS wave's binding cap -- the record of the final
+        # selection the wave actually uses (initial, prefix-estimate, or
+        # post-reclaim), produced by that selection's own exit path.
+        record_prefill_binding_cap(self, wave_selection.cap_record)
 
         return prefill_batch
 

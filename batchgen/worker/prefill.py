@@ -24,6 +24,7 @@ consumes; the handler is pure and deterministic.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
@@ -178,6 +179,107 @@ class PrefillSelectionRequest:
     per_node_host_reclaimable: Optional[Tuple[int, ...]] = None
 
 
+# Binding-cap names (design-contract clause C7): the quantity that stopped
+# wave formation from taking the next candidate, recorded once per wave by
+# the worker. One name per actual exit path -- the two ``_admit`` skip
+# branches, the exhausted-candidates walk, and the two selected-nothing
+# early exits of ``_prepare_prefill_batch``. There is deliberately no
+# token-budget name: no wave-level token budget exists today
+# (``prefill_micro_batch_token_cap`` only splits micro-batches inside an
+# already-cut wave and never stops admission).
+PREFILL_CAP_HOST_KV_PAGES = "host_kv_pages"
+PREFILL_CAP_SEQUENCE_SLOTS = "sequence_slots"
+# The wave admitted every candidate offered. Not a cap at all; named so a
+# run summary can tell "took everything" from every capacity verdict.
+PREFILL_CAP_ALL_CANDIDATES_ADMITTED = "all_candidates_admitted"
+# Wave formation ran with no QUEUEING or EVICTED candidate: the scheduling
+# pool offered this wave nothing.
+PREFILL_CAP_SCHEDULING_POOL_EMPTY = "scheduling_pool_empty"
+# The wave selected nothing because oversized QUEUEING requests were failed
+# on the per-request error channel and the candidate set changed under the
+# snapshot (``_reject_unsatisfiable_prefill_requests``). Not a capacity
+# verdict; the next scheduler iteration rebuilds the wave.
+PREFILL_CAP_OVERSIZED_REQUESTS_REJECTED = "oversized_requests_rejected"
+
+
+@dataclass(frozen=True)
+class PrefillWaveCapRecord:
+    """Why one prefill wave stopped taking the next candidate (clause C7).
+
+    Produced by the selection walk itself at wave formation -- each cap name
+    corresponds to one actual exit path, never re-derived from logs.
+    Observability only: no admission decision reads it.
+
+    ``first_blocked_*`` describe the FIRST candidate (priority order) the
+    binding cap refused: what it needed (Host pages for
+    ``host_kv_pages``, one slot for ``sequence_slots``) and the capacity the
+    refusal saw (``available``). They stay ``None``/-1 for the exhausted
+    cases, where nothing was refused.
+    """
+
+    cap: str
+    candidates_offered: int
+    candidates_admitted: int
+    # Sum of ``prompt_length`` over the admitted candidates (full prompts;
+    # cached prefix tokens are not subtracted here).
+    admitted_prompt_tokens: int
+    first_blocked_uuid: Optional[str] = None
+    first_blocked_node: int = -1
+    first_blocked_needed: int = -1
+    first_blocked_available: int = -1
+
+    def describe(self) -> str:
+        """One-line summary, used verbatim in the per-wave log line."""
+        text = (
+            f"{self.cap} (admitted={self.candidates_admitted}/"
+            f"{self.candidates_offered}, "
+            f"admitted_prompt_tokens={self.admitted_prompt_tokens})"
+        )
+        if self.first_blocked_uuid is not None:
+            text += (
+                f"; first blocked seq {self.first_blocked_uuid[:8]} on node "
+                f"{self.first_blocked_node}: needed={self.first_blocked_needed}, "
+                f"available={self.first_blocked_available}"
+            )
+        return text
+
+
+@dataclass(frozen=True)
+class PrefillWaveSelection:
+    """``select_prefill_wave`` result: admitted uuids plus the cap record."""
+
+    admitted_uuids: Tuple[str, ...]
+    cap_record: PrefillWaveCapRecord
+
+
+def record_prefill_binding_cap(worker, record: PrefillWaveCapRecord) -> None:
+	"""Record one wave's binding cap: a cumulative counter and ONE log line.
+
+	Design-contract clause C7 (gate ``c7-binding-cap-recorded``): every
+	prefill wave records the quantity that stopped it from taking the next
+	candidate. The record is produced by the selection's own exit path at
+	wave formation (``PrefillScheduler._admit`` / the engine's
+	``_prepare_prefill_batch`` early exits), never re-derived from logs.
+	Observability only: nothing reads the counter or the ordinal back into
+	admission.
+
+	``worker._prefill_wave_ordinal`` numbers every wave formation of this
+	worker process; ``worker.prefill_binding_cap_counts`` accumulates waves
+	per cap name (both initialised in the worker ``__init__``). The counter
+	moves on every rank; the line is logged once, on rank 0, like the other
+	per-wave admission lines.
+	"""
+	worker._prefill_wave_ordinal += 1
+	counts = worker.prefill_binding_cap_counts
+	counts[record.cap] = counts.get(record.cap, 0) + 1
+	if worker.rank == 0:
+		logging.info(
+			"[PREFILL] Wave %d binding cap: %s",
+			worker._prefill_wave_ordinal,
+			record.describe(),
+		)
+
+
 class PrefillScheduler:
     """Prefill admission decision — pure, deterministic across ranks."""
 
@@ -270,12 +372,28 @@ class PrefillScheduler:
         worker. Deterministic across ranks (stable sort keys), so every
         rank produces the identical batch without communication.
         """
-        return [
-            candidate.uuid
-            for candidate in PrefillScheduler._admit(
-                req, bound_by_host_pages=True
-            )
-        ]
+        return list(
+            PrefillScheduler.select_prefill_wave(req).admitted_uuids
+        )
+
+    @staticmethod
+    def select_prefill_wave(
+        req: PrefillSelectionRequest,
+    ) -> PrefillWaveSelection:
+        """``select_prefill_batch`` plus the wave's binding-cap record.
+
+        Same walk, same admitted set: the record (clause C7) is produced by
+        the walk's own exit paths, so the caller that logs the wave takes
+        this entry and callers that only need the uuids keep
+        ``select_prefill_batch``.
+        """
+        admitted, cap_record = PrefillScheduler._admit(
+            req, bound_by_host_pages=True
+        )
+        return PrefillWaveSelection(
+            admitted_uuids=tuple(candidate.uuid for candidate in admitted),
+            cap_record=cap_record,
+        )
 
     @staticmethod
     def slot_admissible_candidates(
@@ -291,12 +409,12 @@ class PrefillScheduler:
         with slot limits is not exempt from reclaim (a full pool of retained
         prefixes otherwise starves admission forever).
         """
-        return PrefillScheduler._admit(req, bound_by_host_pages=False)
+        return PrefillScheduler._admit(req, bound_by_host_pages=False)[0]
 
     @staticmethod
     def _admit(
         req: PrefillSelectionRequest, *, bound_by_host_pages: bool
-    ) -> List[PrefillCandidate]:
+    ) -> Tuple[List[PrefillCandidate], PrefillWaveCapRecord]:
         evicted = [c for c in req.candidates if c.is_evicted]
         queueing = [c for c in req.candidates if not c.is_evicted]
         evicted.sort(key=lambda c: (-c.total_decoded_before_eviction, c.global_idx))
@@ -308,7 +426,12 @@ class PrefillScheduler:
         )
         all_candidates = evicted + queueing
         if not all_candidates:
-            return []
+            return [], PrefillWaveCapRecord(
+                cap=PREFILL_CAP_SCHEDULING_POOL_EMPTY,
+                candidates_offered=0,
+                candidates_admitted=0,
+                admitted_prompt_tokens=0,
+            )
 
         if (
             req.per_rank_sequence_free is not None
@@ -352,6 +475,13 @@ class PrefillScheduler:
         rank_sequences_used: dict[int, int] = {}
         node_sequences_used = [0] * req.num_nodes
         admitted: List[PrefillCandidate] = []
+        # Clause C7: the FIRST candidate (priority order) a capacity refused,
+        # as ``(cap_name, candidate, needed, available)``. Each assignment
+        # sits on the exit path it names, so the binding cap is the walk's own
+        # verdict, never re-derived. Later refusals do not overwrite it: the
+        # binding cap is the quantity that stopped the wave from taking the
+        # NEXT candidate.
+        first_blocked: Optional[Tuple[str, PrefillCandidate, int, int]] = None
         # One ledger per node: Host KV is per-node, so a prefix one node holds
         # saves nothing for a candidate admitted on another. A rejected
         # candidate is never charged (the fit test only previews), so skipping
@@ -378,12 +508,28 @@ class PrefillScheduler:
                 and rank_sequences_used.get(c.assigned_rank, 0)
                 >= req.per_rank_sequence_free[c.assigned_rank]
             ):
+                if first_blocked is None:
+                    first_blocked = (
+                        PREFILL_CAP_SEQUENCE_SLOTS,
+                        c,
+                        1,
+                        req.per_rank_sequence_free[c.assigned_rank]
+                        - rank_sequences_used.get(c.assigned_rank, 0),
+                    )
                 continue
             if (
                 req.per_node_sequence_free is not None
                 and node_sequences_used[seq_node]
                 >= req.per_node_sequence_free[seq_node]
             ):
+                if first_blocked is None:
+                    first_blocked = (
+                        PREFILL_CAP_SEQUENCE_SLOTS,
+                        c,
+                        1,
+                        req.per_node_sequence_free[seq_node]
+                        - node_sequences_used[seq_node],
+                    )
                 continue
             if c.host_kv_replication_factor <= 0:
                 raise ValueError(
@@ -415,8 +561,39 @@ class PrefillScheduler:
                     rank_sequences_used.get(c.assigned_rank, 0) + 1
                 )
                 node_sequences_used[seq_node] += 1
+            elif first_blocked is None:
+                # The Host-page check above is the only way to reach here:
+                # ``bound_by_host_pages`` was true and the node lacked
+                # ``req_pages`` of its remaining effective budget.
+                first_blocked = (
+                    PREFILL_CAP_HOST_KV_PAGES,
+                    c,
+                    req_pages,
+                    per_node_effective_free[seq_node]
+                    - node_pages_used[seq_node],
+                )
 
-        return admitted
+        admitted_prompt_tokens = sum(c.prompt_length for c in admitted)
+        if first_blocked is None:
+            cap_record = PrefillWaveCapRecord(
+                cap=PREFILL_CAP_ALL_CANDIDATES_ADMITTED,
+                candidates_offered=len(all_candidates),
+                candidates_admitted=len(admitted),
+                admitted_prompt_tokens=admitted_prompt_tokens,
+            )
+        else:
+            cap, blocked, needed, available = first_blocked
+            cap_record = PrefillWaveCapRecord(
+                cap=cap,
+                candidates_offered=len(all_candidates),
+                candidates_admitted=len(admitted),
+                admitted_prompt_tokens=admitted_prompt_tokens,
+                first_blocked_uuid=blocked.uuid,
+                first_blocked_node=blocked.node_id,
+                first_blocked_needed=needed,
+                first_blocked_available=available,
+            )
+        return admitted, cap_record
 
 
 # Consecutive scheduler iterations that may admit nothing, with nothing live

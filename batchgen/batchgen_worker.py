@@ -1202,6 +1202,14 @@ class BatchGenWorker:
 		# merged batch debug flags.
 		self._prefill_wave_uuids = None
 		self._prefill_wave_debug = {}
+		# Clause C7 observability: per-wave binding-cap record. The ordinal
+		# numbers every wave formation of this worker process; the dict
+		# accumulates waves per binding-cap name (the PREFILL_CAP_* constants
+		# in worker/prefill.py). Written only by
+		# worker/prefill.py record_prefill_binding_cap; admission never reads
+		# either.
+		self._prefill_wave_ordinal = 0
+		self.prefill_binding_cap_counts: Dict[str, int] = {}
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
