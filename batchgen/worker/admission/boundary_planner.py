@@ -371,7 +371,7 @@ class BoundaryPlanner:
                     if seq.current_context_length != expected_ctx:
                         seq.log_event(SeqEvent.CTX_MISMATCH, ctx.facts.rank,
                             f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
-                        seq.current_context_length = expected_ctx
+                        seq.repair_context_identity()
                     try:
                         seq.validate_metadata(
                             f"rank {ctx.facts.rank} _page_boundary_fast/gathered_state",

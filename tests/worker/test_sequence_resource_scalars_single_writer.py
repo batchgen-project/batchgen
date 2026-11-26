@@ -5,11 +5,11 @@ resource scalars this guard protects: the page/capacity counters
 (``gpu_pages_allocated``, ``host_pages_allocated``, ``host_owned_pages``,
 ``host_token_capacity``), the length fields (``current_context_length``,
 ``decoded_length``) and the DP-group pair (``decode_dp_group``,
-``evicted_from_dp_group``).  The acceptance target is one owner per scalar;
-today the worker and the engines still assign them directly.  This test pins
-TODAY's exact set of outside assignment sites as a list that can only shrink:
-it fails when a NEW module/kind of write appears, and it fails when a listed
-offender no longer exists (stale entry), so every removal is deliberate.
+``evicted_from_dp_group``).  The acceptance target is one owner per scalar,
+and it is reached: every outside write goes through the owner's methods, so
+the offender list is empty.  This test pins that end state: it fails when a
+NEW module/kind of write appears, and it fails when a listed offender no
+longer exists (stale entry), so every change is deliberate.
 
 Covered patterns: plain attribute assignment, augmented assignment
 (``seq.decoded_length += 1`` — the target has Store context) and ``del``, on
@@ -145,15 +145,9 @@ def _offences(tree: ast.Module, ambiguous: set):
 # The exact outside writes that exist today (one entry per file and kind of
 # write, no line numbers so the list does not churn).  Entries may only be
 # removed (by moving the write behind the owner's methods), never added.
-KNOWN_OFFENDERS = [
-    "batchgen/batchgen_worker.py: rebinding .current_context_length",
-    "batchgen/batchgen_worker.py: rebinding .decoded_length",
-    "batchgen/worker/admission/boundary_planner.py: rebinding .current_context_length",
-    "batchgen/worker/decode_engine.py: rebinding .current_context_length",
-    "batchgen/worker/decode_engine.py: rebinding .decoded_length",
-    "batchgen/worker/prefill_engine.py: rebinding .current_context_length",
-    "batchgen/worker/prefill_engine.py: rebinding .decoded_length",
-]
+# Stage 5 moved the last writes (decode advance, context repairs, admission
+# bind, re-entry rebase) behind the owner, so the list is EMPTY and stays so.
+KNOWN_OFFENDERS = []
 
 
 def test_only_pinned_modules_assign_sequence_resource_scalars():

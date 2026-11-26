@@ -2073,9 +2073,7 @@ class BatchGenWorker:
 				# intentionally empty so no stale dense view can escape the book.
 				seq.input_ids = None
 				seq.decoded_tokens = None
-				seq.prompt_length = actual_prompt_len
-				seq.original_prompt_length = actual_prompt_len
-				seq.current_context_length = actual_prompt_len
+				seq.bind_admitted_prompt(actual_prompt_len)
 				# Keep the API generation limit and all SequenceEntry invariants in
 				# sync when prompt + requested completion exceeds model context. The
 				# physical QueryBook reservation remains a full model-context chain.
@@ -3592,10 +3590,7 @@ class BatchGenWorker:
 		for seq, live in zip(batch_sequences, row_active):
 			if not live:
 				continue
-			seq.decoded_length += 1
-			seq.current_context_length = (
-				seq.original_prompt_length + seq.decoded_length
-			)
+			seq.advance_one_token()
 		self._decode_tokens_unread = True
 		return PendingDecodeStep(
 			slot=slot,
@@ -4799,7 +4794,7 @@ class BatchGenWorker:
 					)
 					seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
 						f"old={seq.current_context_length}, new={expected_ctx}")
-					seq.current_context_length = expected_ctx
+					seq.repair_context_identity()
 				seq.validate_metadata(f"rank {self.rank} _sync_sequence_metadata/send")
 
 				local_state[uuid] = {
@@ -4906,7 +4901,7 @@ class BatchGenWorker:
 								)
 								seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
 									f"sync_recv old={seq.current_context_length}, new={expected_ctx}")
-								seq.current_context_length = expected_ctx
+								seq.repair_context_identity()
 							seq.validate_metadata(
 								f"rank {self.rank} _sync_sequence_metadata/recv",
 								require_owner_tensors=False,
@@ -9066,7 +9061,7 @@ class BatchGenWorker:
 				old_ctx = seq.current_context_length
 				seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
 					f"config_decode old={old_ctx}, new={expected_ctx}")
-				seq.current_context_length = expected_ctx
+				seq.repair_context_identity()
 				ctx_len_repaired_count += 1
 				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
 					# Only log significant mismatches to avoid log spam
@@ -11830,8 +11825,7 @@ class BatchGenWorker:
 				expected = seq.original_prompt_length + seq.decoded_length
 				ctx_len = seq.current_context_length
 				if ctx_len != expected:
-					seq.current_context_length = expected
-					ctx_len = expected
+					ctx_len = seq.repair_context_identity()
 				cache_seqlens.append(ctx_len)
 			cache_view, position_view = self._bind_decode_attention_metadata(
 				batch_sequences,
@@ -13247,10 +13241,7 @@ class BatchGenWorker:
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
-						seq.decoded_length += 1
-						seq.current_context_length = (
-							seq.original_prompt_length + seq.decoded_length
-						)
+						seq.advance_one_token()
 
 						# Only mark eos_reached if we should stop at EOS
 						token_id = new_tokens[i].item()
@@ -13343,10 +13334,7 @@ class BatchGenWorker:
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
-						seq.decoded_length += 1
-						seq.current_context_length = (
-							seq.original_prompt_length + seq.decoded_length
-						)
+						seq.advance_one_token()
 
 						# Only mark eos_reached if we should stop at EOS
 						token_id = new_tokens[i].item()

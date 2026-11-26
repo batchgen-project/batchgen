@@ -600,13 +600,17 @@ PINS = {
                 # commit_host_reservation, drop_decode_group,
                 # finish_and_release, grant_gpu_pages, grow_host_kv,
                 # rebase_decoded_length, release_all_kv, release_gpu_pages,
-                # share_owned_pages, and the stage-4 mirror/assignment
+                # share_owned_pages, the stage-4 mirror/assignment
                 # methods assign_decode_group, mirror_decode_state,
-                # mirror_host_counters) moved the per-sequence scalar writes
-                # behind the owning entry; see
+                # mirror_host_counters, and the stage-5 length-identity
+                # methods advance_one_token, bind_admitted_prompt,
+                # repair_context_identity) moved the per-sequence scalar
+                # writes behind the owning entry; see
                 # tests/worker/test_sequence_resource_scalars_single_writer.py.
+                "advance_one_token",
                 "assign_decode_group",
                 "begin_eviction",
+                "bind_admitted_prompt",
                 "check_completion",
                 "clamp_decode_to_context",
                 "commit_host_reservation",
@@ -635,6 +639,7 @@ PINS = {
                 "release_all_kv",
                 "release_gpu_pages",
                 "remaining_decode_tokens",
+                "repair_context_identity",
                 "reset_gpu_allocation",
                 "share_owned_pages",
                 "should_check_completion",
