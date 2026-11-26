@@ -34,6 +34,25 @@ import torch
 from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.models.wrappers.expert import ExpertWrapperBase
 
+_SKIP_KV_CALLBACK_WARNED = False
+
+
+def _skip_kv_callback_active() -> bool:
+    """Whether ``debug_state.k3_skip_kv_callback`` skips the dense decode
+    host-KV append callback (one WARNING per process while active)."""
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None)
+    if not isinstance(debug, dict) or not debug.get("k3_skip_kv_callback"):
+        return False
+    global _SKIP_KV_CALLBACK_WARNED
+    if not _SKIP_KV_CALLBACK_WARNED:
+        _SKIP_KV_CALLBACK_WARNED = True
+        logging.getLogger(__name__).warning(
+            "[K3] debug_state.k3_skip_kv_callback is active: the dense "
+            "eager-decode host-KV append callback is skipped; host KV will "
+            "miss the decoded tokens (diagnostic state, not an official run)"
+        )
+    return True
+
 
 class KimiLinearExpertWrapper(ExpertWrapperBase):
     """BF16 routed/shared expert wrapper.
@@ -813,9 +832,8 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             None,
         )
 
-        import os as _os
-        _skip_cb = _os.environ.get("BATCHGEN_SKIP_KV_CALLBACK", "0") == "1"
-        if (not _skip_cb and AttnWrapperBase.kv_append_callback is not None
+        if (not _skip_kv_callback_active()
+                and AttnWrapperBase.kv_append_callback is not None
                 and k_tensor.shape[0] > 0):
             AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
         return attn_output
@@ -825,10 +843,10 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
 
         Host appends mirror the dense path for the latent and add the
         page-split index key + its scale for the auxiliary region, so both
-        Host regions keep every decoded token. The dense path's legacy
-        ``BATCHGEN_SKIP_KV_CALLBACK`` debug switch is deliberately not read
-        here (no new env guards; the decode graph ignores it too): a DSA
-        layer always appends both regions.
+        Host regions keep every decoded token. The dense path's
+        ``debug_state.k3_skip_kv_callback`` key is deliberately not read
+        here (the decode graph ignores it too): a DSA layer always appends
+        both regions.
         """
         from .dsa_decode import dsa_decode_forward
 
