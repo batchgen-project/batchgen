@@ -1177,9 +1177,6 @@ class BatchGenWorker:
 		self._criticality_probe = None
 		self._criticality_probe_request = None
 		self._criticality_probe_recapture = False
-		self._nsys_decode_profile_forward_count = 0
-		self._nsys_decode_profile_started = False
-		self._nsys_decode_profile_stopped = False
 		self._decode_local_count_tensor = None
 		self._decode_all_rank_counts = None
 		self._decode_cache_seqlens_i32 = None
@@ -3673,14 +3670,13 @@ class BatchGenWorker:
 		return _DECODE_WAIT_COMPLETED
 
 	def _warn_sampling_bad_rows(self, residency) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads explicit values.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._warn_sampling_bad_rows(
-			self,
 			residency,
 		)
 
@@ -6184,14 +6180,14 @@ class BatchGenWorker:
 	# ============ Batch Statistics ============
 
 	def _log_batch_statistics(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._log_batch_statistics(
-			self,
+			self._decode_phase_context(),
 		)
 
 	# ============ Main Generation Loop ============
@@ -6248,28 +6244,32 @@ class BatchGenWorker:
 		local_bsz: int,
 		global_bsz: int,
 	) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; the delegator resolves the
+		# server debug flag and passes the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
+		debug = self._debug_values() or {}
 		return engine._nsys_prefill_profile_begin(
-			self,
+			self._decode_phase_context(),
 			local_bsz=local_bsz,
 			global_bsz=global_bsz,
-			debug=self._debug_values() or {},
+			profile_enabled=self._debug_flag_enabled(
+				debug.get("glm5_prefill_nsys_profile")
+			),
 		)
 
 	def _nsys_prefill_profile_end(self, active: bool) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._nsys_prefill_profile_end(
-			self,
+			self._decode_phase_context(),
 			active,
 		)
 
@@ -6280,14 +6280,16 @@ class BatchGenWorker:
 		local_bsz: int,
 		max_rank_bsz: int,
 	) -> Optional[int]:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the capture counters live on the engine; the delegator passes
+		# the worker identity values.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._nsys_decode_profile_begin_forward(
-			self,
+			rank=self.rank,
+			device=self.torch_device,
 			local_iteration=local_iteration,
 			local_bsz=local_bsz,
 			max_rank_bsz=max_rank_bsz,
@@ -6317,15 +6319,17 @@ class BatchGenWorker:
 		return "\n  Profiled: yes (decode timings of this worker generation are not admissible)"
 
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the capture counters live on the engine; the delegator passes
+		# the worker identity values.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._nsys_decode_profile_end_forward(
-			self,
 			forward_idx,
+			rank=self.rank,
+			device=self.torch_device,
 		)
 
 	def _ensure_pynccl_communicator(self) -> None:
@@ -8253,14 +8257,14 @@ class BatchGenWorker:
 		return True, resumed
 
 	def _log_prefill_entry_hbm(self, when: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._log_prefill_entry_hbm(
-			self,
+			self._decode_phase_context(),
 			when,
 		)
 
@@ -8453,14 +8457,16 @@ class BatchGenWorker:
 		)
 
 	def _log_decode_parameter_residency(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; the delegator resolves the
+		# live decode model beside the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._log_decode_parameter_residency(
-			self,
+			self._decode_phase_context(),
+			decode_model=getattr(self, "model", None),
 		)
 
 	def _remap_reused_kv_pool(self) -> None:
@@ -8944,61 +8950,61 @@ class BatchGenWorker:
 		self._snapshot_server_config()
 
 	def _mark_phase_end(self, phase: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the phase-switch clock lives on the engine.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._mark_phase_end(
-			self,
 			phase,
 		)
 
 	def _pause_phase_switch_clock(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the phase-switch clock lives on the engine.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
-		return engine._pause_phase_switch_clock(
-			self,
-		)
+		return engine._pause_phase_switch_clock()
 
 	def _resume_phase_switch_clock(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the phase-switch clock lives on the engine.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
-		return engine._resume_phase_switch_clock(
-			self,
-		)
+		return engine._resume_phase_switch_clock()
 
 	def _log_phase_memory_ledger(self, label: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; the delegator resolves the
+		# live model binding and the switch counter beside the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._log_phase_memory_ledger(
-			self,
+			self._decode_phase_context(),
 			label,
+			decode_model=getattr(self, "model", None),
+			phase_mem_switch_index=getattr(self, "_phase_mem_switch_index", 0),
 		)
 
 	def _log_phase_switch(self, phase: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the phase-switch clock lives on the engine; the delegator
+		# resolves the identity and persistence values.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._log_phase_switch(
-			self,
 			phase,
+			rank=self.rank,
+			persistent_phase=self._persistent_phase_enabled(),
 		)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
@@ -9192,7 +9198,7 @@ class BatchGenWorker:
 		)
 
 	def _emit_prefix_cache_metric(self, phase: str, **fields) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
@@ -9216,7 +9222,7 @@ class BatchGenWorker:
 		)
 
 	def _prefix_host_resource_fields(self) -> dict[str, int]:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
@@ -9227,14 +9233,15 @@ class BatchGenWorker:
 		)
 
 	def _maybe_emit_prefix_drain_metric(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; it reads the frozen context
+		# and latches the drain through the PrefixReuseState owner call.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._maybe_emit_prefix_drain_metric(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _close_prefix_materialization(
@@ -12534,16 +12541,18 @@ class BatchGenWorker:
 	_WHOLE_GRAPH_EAGER_SERVABLE_REASONS = frozenset({"max_seqlen_exceeds_capture"})
 
 	def _warn_decode_graph_span_exceeded(self, step_max_seqlen: int, span: int) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# D2: the engine never receives the worker; the span-warn clock is
+		# written through the GraphRuntime state object the delegator passes.
 		engine = getattr(self, "_step_observability_engine", None)
 		if engine is None:
 			from batchgen.worker.step_observability_engine import StepObservabilityEngine
 			engine = StepObservabilityEngine()
 			self._step_observability_engine = engine
 		return engine._warn_decode_graph_span_exceeded(
-			self,
+			self._decode_phase_context(),
 			step_max_seqlen,
 			span,
+			graph_state=self._graph,
 		)
 
 	def _glm5_whole_graph_path_state(self, max_rank_bsz: int):

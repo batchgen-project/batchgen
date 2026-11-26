@@ -6,10 +6,24 @@ parameter residency, the phase memory ledger, the captured-span warning), the
 Nsight Systems capture windows around prefill and decode forwards, the
 phase-switch clock, and the prefix-cache metrics.
 
-The engine is intentionally stateless, the S5/S8 shape: each operation
-receives the live worker as its collaborator and rebinds ``self`` to it, so the
-moved statements keep their original state access and call spellings. The
-worker keeps a same-name delegator for every moved method.
+The engine never receives the worker (phase D2). It is a small real class
+that owns the observability state the worker used to carry — the Nsight
+decode-capture counters and the phase-switch clock — and every other input
+arrives as a frozen ``DecodePhaseContext`` or as an explicit value the
+worker's same-name delegator resolves. State the worker side still owns is
+reached through the passed state object's own API (the prefix drain latch
+through ``PrefixReuseState.mark_drain_metric_emitted``, the span-warn clock
+through the ``GraphRuntime`` state object), never through the worker.
+
+The engine-owned state is why this stays a class rather than the D1
+module-function shape: a decode capture window and the phase clock persist
+across calls, and their single owner is this engine instance (one per worker,
+built in the worker's ``__init__`` and respawned with the worker pool exactly
+as the former worker attributes were). The context stays the shared
+``DecodePhaseContext`` from ``admission/context.py`` — unlike D1's
+transport-local install inputs, every worker-owned object these methods read
+is already a declared field there, so a module-local context would only
+duplicate that declaration.
 """
 
 from __future__ import annotations
@@ -53,19 +67,26 @@ if BATCHGEN_NSYS_DECODE_PROFILE and not BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_
 
 
 class StepObservabilityEngine:
-    """Stateless step-observability operations; the worker owns all state."""
+    """Step-observability operations; the engine owns its capture/clock state."""
+
+    def __init__(self) -> None:
+        # Nsight decode-forward capture window (formerly worker attributes;
+        # since D2 this engine is their single owner and writer).
+        self._nsys_decode_profile_forward_count = 0
+        self._nsys_decode_profile_started = False
+        self._nsys_decode_profile_stopped = False
+        # Phase-switch clock: [phase, running since (None while idle), busy
+        # seconds so far]; None between _log_phase_switch and _mark_phase_end.
+        self._phase_end: Optional[list] = None
 
     # ---- Logging -----------------------------------------------------------
 
-    def _warn_sampling_bad_rows(self, worker, residency) -> None:
+    def _warn_sampling_bad_rows(self, residency) -> None:
         """Drain the device-side sampling fallback counter and warn on it.
 
         Reads a device counter, so callers must be where the device has caught
         up with the sampling that wrote it (see drain_bad_rows).
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         _bad_rows = residency.drain_bad_rows()
         if _bad_rows:
             logging.warning(
@@ -74,7 +95,7 @@ class StepObservabilityEngine:
                 "fell back to greedy"
             )
 
-    def _log_batch_statistics(self, worker) -> None:
+    def _log_batch_statistics(self, ctx: DecodePhaseContext) -> None:
         """
         Log statistics about the completed batch including:
         - Global batch size
@@ -83,16 +104,13 @@ class StepObservabilityEngine:
 
         Only called from rank 0.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self.global_batch is None:
+        if ctx.sched.pool is None:
             return
 
         # Gather all sequences
         prompt_lengths = []
         decoded_lengths = []
-        for seq in self.global_batch:
+        for seq in ctx.sched.pool:
             prompt_lengths.append(seq.prompt_length)
             decoded_lengths.append(seq.decoded_length)
 
@@ -138,29 +156,25 @@ class StepObservabilityEngine:
             f"{'='*60}"
         )
 
-    def _log_prefill_entry_hbm(self, worker, when: str) -> None:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _log_prefill_entry_hbm(self, ctx: DecodePhaseContext, when: str) -> None:
         if not torch.cuda.is_available():
             return
-        free_mem, _ = torch.cuda.mem_get_info(self.local_rank)
-        allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
-        reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
+        free_mem, _ = torch.cuda.mem_get_info(ctx.facts.local_rank)
+        allocated = torch.cuda.memory_allocated(ctx.facts.local_rank) / 1e9
+        reserved = torch.cuda.memory_reserved(ctx.facts.local_rank) / 1e9
         logging.info(
-            f"[HBM] Rank {self.rank} {when} configure_prefill: "
+            f"[HBM] Rank {ctx.facts.rank} {when} configure_prefill: "
             f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
         )
 
-    def _log_decode_parameter_residency(self, worker) -> None:
+    def _log_decode_parameter_residency(
+        self, ctx: DecodePhaseContext, *, decode_model
+    ) -> None:
         """One-line HBM breakdown of the decode model's resident parameters and
         buffers by top-level module kind (rank 0, once per decode config), so
         the non-expert residency — what competes with KV pool and KDA slots
         for concurrency — is visible next to the resident expert shard line."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        model = getattr(self, "model", None)
+        model = decode_model
         if model is None or not hasattr(model, "named_parameters"):
             return
         try:
@@ -184,13 +198,20 @@ class StepObservabilityEngine:
             items = sorted(by_kind.items(), key=lambda kv: -kv[1])
             logging.info(
                 "[HBM] decode parameters/buffers resident on rank %s: %.2f GiB total | %s",
-                self.rank, total / (1024 ** 3),
+                ctx.facts.rank, total / (1024 ** 3),
                 ", ".join(f"{k}={v / (1024 ** 3):.2f}" for k, v in items[:12]),
             )
         except Exception as e:  # informational only
             logging.debug("parameter residency breakdown failed: %r", e)
 
-    def _log_phase_memory_ledger(self, worker, label: str) -> None:
+    def _log_phase_memory_ledger(
+        self,
+        ctx: DecodePhaseContext,
+        label: str,
+        *,
+        decode_model,
+        phase_mem_switch_index: int,
+    ) -> None:
         """One line per phase-switch stage: who holds device memory right now.
 
         The rebuild path tears a phase instance down and stages the next one, so
@@ -206,29 +227,26 @@ class StepObservabilityEngine:
         on rank 0 only. No synchronize (the callers that need one do it) and no
         ``.item()``.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self.rank != 0 or not torch.cuda.is_available():
+        if ctx.facts.rank != 0 or not torch.cuda.is_available():
             return
-        free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(ctx.facts.local_rank)
         gib = 1024 ** 3
-        pm = getattr(self, "parallel_manager", None)
-        kda_slots, kda_live = self._traj.kda_stats()
-        gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
+        pm = ctx.parallel_manager
+        kda_slots, kda_live = ctx.sched.trajectories.kda_stats()
+        gpu_kv = ctx.gpu_kv
         logging.info(
             "[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
             "driver_total=%.2f torch_alloc=%.2f torch_reserved=%.2f "
             "model=%d pm_model=%d resident_ep=%d sp8_buffer=%d decode_graph=%d "
             "kv_pool_mapped=%s kda_slots=%d kda_live=%d",
-            self.rank,
+            ctx.facts.rank,
             label,
-            getattr(self, "_phase_mem_switch_index", 0),
+            phase_mem_switch_index,
             (total_bytes - free_bytes) / gib,
             total_bytes / gib,
-            torch.cuda.memory_allocated(self.local_rank) / gib,
-            torch.cuda.memory_reserved(self.local_rank) / gib,
-            int(getattr(self, "model", None) is not None),
+            torch.cuda.memory_allocated(ctx.facts.local_rank) / gib,
+            torch.cuda.memory_reserved(ctx.facts.local_rank) / gib,
+            int(decode_model is not None),
             int(getattr(pm, "model", None) is not None),
             int(bool(getattr(pm, "_resident_ep_built", False))),
             int(getattr(pm, "_streamed_sp8_buffer", None) is not None),
@@ -238,22 +256,26 @@ class StepObservabilityEngine:
             kda_live,
         )
 
-    def _warn_decode_graph_span_exceeded(self, worker, step_max_seqlen: int, span: int) -> None:
+    def _warn_decode_graph_span_exceeded(
+        self,
+        ctx: DecodePhaseContext,
+        step_max_seqlen: int,
+        span: int,
+        *,
+        graph_state,
+    ) -> None:
         """Rate-limited WARN naming this step's max_seqlen and the captured span."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         now = time.monotonic()
-        last = self._graph.decode_graph_span_warn_monotonic
+        last = graph_state.decode_graph_span_warn_monotonic
         if last is not None and now - last < _GRAPH_SPAN_WARN_INTERVAL_S:
             return
-        self._graph.decode_graph_span_warn_monotonic = now
+        graph_state.decode_graph_span_warn_monotonic = now
         logging.warning(
             "Rank %s: the whole-model decode graph covers %d context tokens but "
             "this step's max_seqlen is %d; running the step in eager decode. The "
             "span is the deployment context bound trimmed by the graph's "
             "context-proportional statics budget (%d bytes).",
-            self.rank,
+            ctx.facts.rank,
             int(span),
             int(step_max_seqlen),
             GRAPH_CONTEXT_STATICS_BUDGET_BYTES,
@@ -262,23 +284,24 @@ class StepObservabilityEngine:
     # ---- Nsight Systems capture windows ------------------------------------
 
     def _nsys_prefill_profile_begin(
-        self, worker,
+        self, ctx: DecodePhaseContext,
         *,
         local_bsz: int,
         global_bsz: int,
-        debug: dict,
+        profile_enabled: bool,
     ) -> bool:
-        """Start a batch-debug-gated nsys prefill capture window."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
+        """Start a batch-debug-gated nsys prefill capture window.
+
+        ``profile_enabled`` is the worker-resolved value of the
+        ``glm5_prefill_nsys_profile`` server debug flag.
+        """
+        if not profile_enabled:
             return False
 
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(ctx.facts.device)
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        if self.rank == 0:
+        if ctx.facts.rank == 0:
             logging.info(
                 "[NSYS_PREFILL_PROFILE] starting cuda profiler capture "
                 "global_bsz=%s",
@@ -288,39 +311,39 @@ class StepObservabilityEngine:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         torch.cuda.nvtx.range_push(
-            f"BatchGen_prefill_rank_{self.rank}_local_bsz_{local_bsz}"
+            f"BatchGen_prefill_rank_{ctx.facts.rank}_local_bsz_{local_bsz}"
             f"_global_bsz_{global_bsz}"
         )
         return True
 
-    def _nsys_prefill_profile_end(self, worker, active: bool) -> None:
+    def _nsys_prefill_profile_end(self, ctx: DecodePhaseContext, active: bool) -> None:
         """Finish one batch-debug-gated nsys prefill capture window."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if not active:
             return
         torch.cuda.nvtx.range_pop()
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(ctx.facts.device)
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        if self.rank == 0:
+        if ctx.facts.rank == 0:
             logging.info("[NSYS_PREFILL_PROFILE] stopping cuda profiler capture")
             torch.cuda.cudart().cudaProfilerStop()
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
     def _nsys_decode_profile_begin_forward(
-        self, worker,
+        self,
         *,
+        rank: int,
+        device,
         local_iteration: int,
         local_bsz: int,
         max_rank_bsz: int,
     ) -> Optional[int]:
-        """Start an env-gated nsys decode-forward capture window."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+        """Start an env-gated nsys decode-forward capture window.
+
+        The capture counters live on this engine; ``rank`` and ``device`` are
+        the worker identity values its delegator resolves.
+        """
         if not BATCHGEN_NSYS_DECODE_PROFILE:
             return None
         self._nsys_decode_profile_forward_count += 1
@@ -329,14 +352,14 @@ class StepObservabilityEngine:
             return None
 
         if (
-            self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
+            rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
             and not self._nsys_decode_profile_started
         ):
-            torch.cuda.synchronize(self.torch_device)
+            torch.cuda.synchronize(device)
             logging.info(
                 "[NSYS_DECODE_PROFILE] rank=%s starting cuda profiler capture "
                 "limit=%s controller_ranks=%s",
-                self.rank,
+                rank,
                 BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT,
                 sorted(BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS),
             )
@@ -345,34 +368,37 @@ class StepObservabilityEngine:
 
         range_name = (
             f"BatchGen_decode_forward_{forward_idx}"
-            f"_rank_{self.rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
+            f"_rank_{rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
             f"_iter_{local_iteration}"
         )
         torch.cuda.nvtx.range_push(range_name)
         return forward_idx
 
-    def _nsys_decode_profile_end_forward(self, worker, forward_idx: Optional[int]) -> None:
+    def _nsys_decode_profile_end_forward(
+        self,
+        forward_idx: Optional[int],
+        *,
+        rank: int,
+        device,
+    ) -> None:
         """End one env-gated nsys decode-forward range and optionally exit."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if forward_idx is None:
             return
         torch.cuda.nvtx.range_pop()
         if forward_idx < BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT:
             return
 
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(device)
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         if (
-            self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
+            rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
             and not self._nsys_decode_profile_stopped
         ):
             logging.info(
                 "[NSYS_DECODE_PROFILE] rank=%s stopping cuda profiler capture "
                 "after %s decode forwards",
-                self.rank,
+                rank,
                 forward_idx,
             )
             torch.cuda.cudart().cudaProfilerStop()
@@ -386,44 +412,34 @@ class StepObservabilityEngine:
 
             logging.info(
                 "[NSYS_DECODE_PROFILE] rank=%s exiting after %s profiled decode forwards",
-                self.rank,
+                rank,
                 forward_idx,
             )
             exit_process(0, "nsys profile exit")
 
     # ---- Phase clock -------------------------------------------------------
 
-    def _mark_phase_end(self, worker, phase: str) -> None:
+    def _mark_phase_end(self, phase: str) -> None:
         # [phase, running since (None while idle), busy seconds so far]
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         self._phase_end = [phase, time.perf_counter(), 0.0]
 
-    def _pause_phase_switch_clock(self, worker) -> None:
+    def _pause_phase_switch_clock(self) -> None:
         """Stop counting while the pool is idle and waits for new admissions."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        end = getattr(self, "_phase_end", None)
+        end = self._phase_end
         if end is not None and end[1] is not None:
             end[2] += time.perf_counter() - end[1]
             end[1] = None
 
-    def _resume_phase_switch_clock(self, worker) -> None:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        end = getattr(self, "_phase_end", None)
+    def _resume_phase_switch_clock(self) -> None:
+        end = self._phase_end
         if end is not None and end[1] is None:
             end[1] = time.perf_counter()
 
-    def _log_phase_switch(self, worker, phase: str) -> None:
+    def _log_phase_switch(
+        self, phase: str, *, rank: int, persistent_phase: bool
+    ) -> None:
         """Per-rank busy time from the previous phase's compute end to this phase's start."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        previous = getattr(self, "_phase_end", None)
+        previous = self._phase_end
         self._phase_end = None
         if previous is None or previous[0] == phase:
             return
@@ -432,11 +448,11 @@ class StepObservabilityEngine:
             seconds += time.perf_counter() - previous[1]
         logging.info(
             "[PHASE_SWITCH] rank=%d direction=%s_to_%s seconds=%.3f persistent=%s",
-            self.rank,
+            rank,
             previous[0],
             phase,
             seconds,
-            self._persistent_phase_enabled(),
+            persistent_phase,
         )
 
     # ---- Prefix-cache metrics ----------------------------------------------
@@ -454,7 +470,7 @@ class StepObservabilityEngine:
             **fields,
         )
 
-    def _maybe_emit_prefix_drain_metric(self, worker) -> None:
+    def _maybe_emit_prefix_drain_metric(self, ctx: DecodePhaseContext) -> None:
         """Emit one prefix_drain row when the live sequence set drains to empty.
 
         Called from _report_completion, which every completion path runs after
@@ -465,23 +481,21 @@ class StepObservabilityEngine:
         hold or regain an attachment. Edge-triggered: one row per drain,
         re-armed by _admit_sequences_from_message.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
+        if not (ctx.facts.enable_prefix_cache and ctx.facts.prefix_cache_debug_stats):
             return
-        if self._prefix.prefix_drain_metric_emitted:
+        if ctx.sched.prefix.prefix_drain_metric_emitted:
             return
-        if not self.global_batch.all_completed():
+        if not ctx.sched.pool.all_completed():
             return
-        self._prefix.mark_drain_metric_emitted()
+        ctx.sched.prefix.mark_drain_metric_emitted()
         self._emit_prefix_cache_metric(
+            ctx,
             "prefix_drain",
-            **self._prefix_host_resource_fields(),
+            **self._prefix_host_resource_fields(ctx),
             # M3 Slice 2: live attachments must be zero at the drain, beside
             # the coordinator's own active_attachments. Absent on a run that
             # never turned the trajectory flag on.
-            **self._trajectory_restore_fields(),
+            **ctx.sched.trajectories.restore_fields(),
         )
 
     def _prefix_host_resource_fields(
