@@ -40,6 +40,11 @@ class TrajectoryStore:
         self.trajectory_pool_capacity_signature = None
         self.trajectory_frontier_committer = None
         self.trajectory_restorer = None
+        # The per-sequence KDA record store (the DEFAULT host lifecycle,
+        # 方案甲) -- a different store from the frontier committer above,
+        # which serves the optional prefix-reuse channel. None until built,
+        # and permanently None for a model without recurrent state.
+        self.kda_record_store = None
         self.trajectory_attachments = {}
         self.trajectory_arena_payload = {}
         self.trajectory_mirrored_restores = {}
@@ -277,6 +282,72 @@ class TrajectoryStore:
             group_rank=committer.group_rank,
         )
         return self.trajectory_restorer
+
+    def build_kda_record_store(
+        self,
+        *,
+        rank: int,
+        group_geometry: tuple,
+        unit_count: int,
+        host_views_provider: Callable[[], Any],
+        next_pseudo_sid: Callable[[], int],
+        page_tokens: int,
+        host_page_bytes_all_layers: int,
+    ):
+        """Lazily build the per-sequence KDA record store (one per rank).
+
+        ``None`` for a model that keeps no recurrent state: the lifecycle has
+        no state to carry, which is the structural absence of the pools, not
+        a configuration gate.  The store shares the pool-segment negative
+        pseudo-sid namespace and the Host-KV page machinery with the frontier
+        committer, but keeps its own records: lifecycle and prefix reuse
+        never share a record.
+        """
+        if self.kda_record_store is not None:
+            return self.kda_record_store
+        manager = self._owner_state_manager()
+        if manager is None:
+            return None
+        from batchgen.prefix_reuse.kda_record_store import KDARecordStore
+        from batchgen.prefix_reuse.trajectory_commit import (
+            HostKVSnapshotArenaAllocator,
+            KDAStateSnapshotReader,
+            profile_from_kda_state_config,
+        )
+        from batchgen.prefix_reuse.trajectory_restore import (
+            HostKVSnapshotArenaReader,
+            KDAStateSnapshotWriter,
+        )
+
+        group_size, group_rank, _is_leader = group_geometry
+        rank_profile = profile_from_kda_state_config(manager.config)
+        self.kda_record_store = KDARecordStore(
+            rank=int(rank),
+            group_size=int(group_size),
+            group_rank=int(group_rank),
+            unit_count=int(unit_count),
+            rank_profile=rank_profile,
+            host_page_bytes_all_layers=int(host_page_bytes_all_layers),
+            arena_allocator=HostKVSnapshotArenaAllocator(
+                host_views_provider=host_views_provider,
+                page_tokens=int(page_tokens),
+                host_page_bytes_all_layers=int(host_page_bytes_all_layers),
+                next_pseudo_sid=next_pseudo_sid,
+            ),
+            arena_reader=HostKVSnapshotArenaReader(
+                host_views_provider=host_views_provider,
+                next_pseudo_sid=next_pseudo_sid,
+            ),
+            snapshot_reader=KDAStateSnapshotReader(
+                state_manager_provider=self._owner_state_manager,
+                profile=rank_profile,
+            ),
+            state_writer=KDAStateSnapshotWriter(
+                state_manager_provider=self._owner_state_manager,
+                profile=rank_profile,
+            ),
+        )
+        return self.kda_record_store
 
     def arena_from_payload(self, entry: dict):
         from batchgen.prefix_reuse.trajectory_commit import SnapshotArena

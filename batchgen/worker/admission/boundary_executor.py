@@ -289,6 +289,19 @@ class BoundaryExecutor:
                         for view in kv._host_views_by_group(ctx).values():
                             view.unregister_sequences(mirrored_global_ids)
                         kv._release_prefix_cache_attachments(ctx, mirrored_global_ids)
+                    # 方案甲: eviction releases the row's per-sequence KDA
+                    # record pages together with its KV chain -- which is
+                    # exactly the ``kda_record_pages`` benefit the eviction
+                    # formula counted when it picked this victim. The
+                    # follower ranks drop their adopted mirrors.
+                    from batchgen.worker import kda_lifecycle
+                    kda_lifecycle.release_records(
+                        ctx.sched.trajectories.kda_record_store,
+                        evicted_global_ids,
+                        mirrored_global_ids,
+                        rank=ctx.facts.rank,
+                        where="host growth eviction",
+                    )
 
             # All-ranks: update scalar metadata deterministically. The retained
             # trajectory length is original_prompt_length + decoded_length; the

@@ -125,6 +125,13 @@ class SequenceEntry:
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
         'host_owned_pages',      # Pages in this sequence's own Host chain (what release frees)
+        # Host pages of this sequence's KDA state record (combined host
+        # budget, 表 B): the record's FrontierCharge.arena_host_pages while a
+        # per-sequence host record exists, else 0 (always 0 for a model
+        # without recurrent state). Released together with the host chain —
+        # eviction/completion must never leave a half-state (KV gone, record
+        # kept).
+        'kda_record_pages',
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -208,6 +215,9 @@ class SequenceEntry:
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
         self.host_owned_pages: int = 0
+        # KDA state record pages in the combined host budget; 0 until a
+        # per-sequence host record exists for this sequence.
+        self.kda_record_pages: int = 0
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None
@@ -360,6 +370,7 @@ class SequenceEntry:
             f"host_owned_pages={self.host_owned_pages} must be within [0, host_pages_allocated={self.host_pages_allocated}]",
         )
         require(self.host_token_capacity >= 0, f"host_token_capacity must be non-negative, got {self.host_token_capacity}")
+        require(self.kda_record_pages >= 0, f"kda_record_pages must be non-negative, got {self.kda_record_pages}")
         require(self.gpu_pages_allocated >= 0, f"gpu_pages_allocated must be non-negative, got {self.gpu_pages_allocated}")
         if self.host_pages_allocated:
             expected_host_capacity = self.host_pages_allocated * self.PAGE_SIZE
@@ -673,11 +684,17 @@ class SequenceEntry:
         self.gpu_pages_allocated = 0
 
     def release_all_kv(self) -> None:
-        """Zero every KV page/capacity counter once GPU and host pages are freed."""
+        """Zero every KV page/capacity counter once GPU and host pages are freed.
+
+        ``kda_record_pages`` is zeroed with the host chain: releasing a row's
+        host KV while keeping its state record would be the forbidden
+        half-state (KV gone, record kept).
+        """
         self.gpu_pages_allocated = 0
         self.host_pages_allocated = 0
         self.host_owned_pages = 0
         self.host_token_capacity = 0
+        self.kda_record_pages = 0
 
     def finish_and_release(self) -> None:
         """Zero a completed sequence's resource scalars on every rank.

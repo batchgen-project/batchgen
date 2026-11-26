@@ -1434,6 +1434,17 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
 			prefix_host_config, prefix_aux_config = worker_kv_config, None
 
+		# Host-page geometry for the per-sequence KDA record store (方案甲).
+		# The store charges and sizes its arenas in the SAME page unit as KV
+		# on EVERY deployment -- prefix cache on or off -- so the figures are
+		# captured here from the exact configs the host regions were built
+		# from, not from the optional prefix-cache runtime config.
+		from batchgen.prefix_reuse.config import host_kv_page_bytes_all_layers
+		self._host_kv_page_bytes_all_layers = host_kv_page_bytes_all_layers(
+			prefix_host_config, prefix_aux_config
+		)
+		self._host_kv_page_tokens = int(prefix_host_config.page_size_tokens)
+
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				build_prefix_cache_runtime_config,
@@ -2413,6 +2424,12 @@ class BatchGenWorker:
 				# rank of the group offloads the segment rows it computed, so the
 				# followers need the pages those rows must land on.
 				"segments": segments,
+				# 方案甲, UNGATED: every admitted sequence's per-sequence KDA
+				# record arena (reserved by the leader at admission) rides
+				# this same gather, so each follower can address its own unit
+				# windows at the wave's prefill end. Empty for a model
+				# without recurrent state.
+				"kda_records": self._kda_record_mirror_payload(uuids),
 				# M3 Slice 1c rides THIS gather rather than adding one: the
 				# G-wide snapshot arena's page ids (so every rank can address
 				# its own shard window at the commit boundary) and the leader's
@@ -2495,6 +2512,10 @@ class BatchGenWorker:
 			)
 			prefix_states[global_id] = state
 			self._prefix.prefix_sequence_states[global_id] = state
+		# 方案甲 follower side, ungated: adopt the leader's per-sequence
+		# record arenas so this rank's unit writes at the prefill end land
+		# in the right windows.
+		self._adopt_kda_record_mirror(entry.get("kda_records") or {})
 		if trajectory:
 			# M3 Slice 1c, follower side. Both halves come from the leader: the
 			# arena this rank writes its own units into, and the hit it must
@@ -4793,6 +4814,10 @@ class BatchGenWorker:
 					'original_max_decode_length': seq.original_max_decode_length,
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_owned_pages': seq.host_owned_pages,
+					# KDA state record pages in the combined host budget
+					# (表 B); a Host chain counter like host_owned_pages,
+					# with the same single writer (the host-KV owner).
+					'kda_record_pages': seq.kda_record_pages,
 					'host_token_capacity': seq.host_token_capacity,
 					# G>1: names the serve group, whose leader's Host counters
 					# are the canonical ones (host_kv_owner_reports).
@@ -4866,6 +4891,7 @@ class BatchGenWorker:
 								host_state['host_owned_pages'],
 								host_state['host_token_capacity'],
 							)
+							seq.kda_record_pages = host_state['kda_record_pages']
 							# Eviction-related fields
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
@@ -4907,6 +4933,7 @@ class BatchGenWorker:
 				host_state['host_owned_pages'],
 				host_state['host_token_capacity'],
 			)
+			seq.kda_record_pages = host_state['kda_record_pages']
 			seq.validate_metadata(
 				f"rank {self.rank} _sync_sequence_metadata/host_kv_owner"
 			)
@@ -5067,6 +5094,7 @@ class BatchGenWorker:
 			self,
 			owner_requests,
 			local_error,
+			kda_record_pages_per_sequence=self._kda_record_pages_per_sequence(),
 		)
 
 	def _reclaim_host_prefix_pages_collective(
@@ -5362,6 +5390,12 @@ class BatchGenWorker:
 								)
 				if allocation_requests:
 					host_view.allocate_pages_for_sequences(allocation_requests)
+				# 方案甲: each owned sequence's KDA record pages leave the
+				# free pool here, in the SAME transaction as its KV pages.
+				# The selection and the preflight charged them exactly, so a
+				# named refusal below fails the transaction collectively and
+				# the wave stays queueing.
+				self._reserve_kda_records([uuid for uuid, _ in owner_requests])
 		except Exception:
 			local_success = False
 			logging.exception(
@@ -5396,6 +5430,13 @@ class BatchGenWorker:
 						"Rank %s: failed to rollback host-KV prefill registrations",
 						self.rank,
 					)
+				try:
+					self._rollback_kda_record_reservations(global_ids)
+				except Exception:
+					logging.exception(
+						"Rank %s: failed to rollback KDA record reservations",
+						self.rank,
+					)
 			if self._prefill_pool_wave is not None:
 				wave = self._prefill_pool_wave
 				# Members release first (their rows merely reference segment
@@ -5422,9 +5463,16 @@ class BatchGenWorker:
 			return False
 
 		# Commit scalar reservation metadata only after every allocator agrees.
+		kda_record_pages = self._kda_record_pages_per_sequence()
 		for uuid, (pages, tokens) in reservations.items():
 			seq = self.global_batch.get_sequence(uuid)
 			seq.commit_host_reservation(pages, tokens, pages)
+			# 表B producer: the record's pages were reserved above, in this
+			# same transaction, so the eviction formula sees the real count
+			# from this point on. The count is a model constant at fixed U,
+			# replicated on every rank like the other reservation scalars;
+			# a model without recurrent state keeps 0.
+			seq.kda_record_pages = kda_record_pages
 			# Attached prefix pages never enter the sequence's own chain, so
 			# sharing deducts them and releasing the row returns only the
 			# private remainder. Only the host-KV owner holds the prefix state
@@ -5813,6 +5861,7 @@ class BatchGenWorker:
 			per_rank_sequence_free=per_rank_sequence_free,
 			per_node_sequence_free=per_node_sequence_free,
 			per_node_host_reclaimable=per_node_host_reclaimable,
+			kda_record_pages=self._kda_record_pages_per_sequence(),
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
@@ -6980,6 +7029,14 @@ class BatchGenWorker:
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
 						)
+						# 方案甲: the wave's REAL prefill end. Every rank
+						# writes its rows' state into their per-sequence
+						# records (reserved at admission) and frees the GPU
+						# KDA slots. After the prefix-reuse commit boundary
+						# above, which still reads the live slots.
+						self._offload_kda_states_at_prefill_end(
+							local_prefill_indices
+						)
 						if num_retired:
 							# Every rank logs: r28 showed node 1 entering the first
 							# decode configure ~30 s after node 0 with nothing in
@@ -7058,6 +7115,10 @@ class BatchGenWorker:
 					# This is also where an arena no commit consumed gives its
 					# Host pages back.
 					self._finalize_trajectory_frontiers()
+					# 方案甲, same ordering point: every rank of every serve
+					# group has returned from its own record unit writes, so
+					# the owner can retain each written record's pages.
+					self._retain_kda_records_at_prefill_end()
 					if pool_wave_start is not None:
 						logging.info("[METRICS] %s", json.dumps({
 							"component": "prefix_pool",
@@ -7245,6 +7306,11 @@ class BatchGenWorker:
 					self._check_local_binding_matches_group(
 						decode_uuids, "decode entry"
 					)
+					# 方案甲: decode admission acquires a slot of the decode
+					# layout for every first-entry row and restores its state
+					# from the per-sequence record; rows holding a live slot
+					# (ON_HOLD re-entry, continuing decode) are left alone.
+					self._restore_kda_states_for_decode(decode_uuids)
 					local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 					global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 					self._adopt_debug_state("decode")
@@ -10036,6 +10102,159 @@ class BatchGenWorker:
 		return max_supported_attention_group_size(
 			read_supported_layouts(self.parallel_manager),
 			int(self.world_size),
+		)
+
+	# ============ Per-sequence KDA record lifecycle (方案甲) ============
+	# The DEFAULT host lifecycle: every sequence of a model with recurrent
+	# state goes through the host on ONE path, with no gate. Reservation at
+	# prefill admission, write + GPU-slot free at the real prefill end,
+	# restore at decode admission, release with the host KV at eviction and
+	# completion. The prefix-reuse frontier channel above stays a separate,
+	# debug-gated store for cross-request reuse; the two never share records.
+
+	def _get_kda_record_store(self):
+		"""The per-sequence KDA record store, or None for a stateless model.
+
+		Built on first use like the frontier committer, but gate-free: it
+		exists on every deployment whose model keeps recurrent state, prefix
+		cache or not, so its page geometry comes from the host KV configs
+		captured at init rather than the prefix-cache runtime config. It
+		shares the negative pseudo-sid namespace and the Host-page machinery
+		with the frontier committer, never its records.
+		"""
+		return self._traj.build_kda_record_store(
+			rank=self.rank,
+			group_geometry=self._trajectory_group_geometry(),
+			unit_count=self._trajectory_record_unit_count(),
+			host_views_provider=self._host_views_by_group,
+			next_pseudo_sid=self._next_pool_segment_sid,
+			page_tokens=self._host_kv_page_tokens,
+			host_page_bytes_all_layers=self._host_kv_page_bytes_all_layers,
+		)
+
+	def _kda_record_pages_per_sequence(self) -> int:
+		"""Host pages ONE sequence's record reserves -- a model constant at
+		fixed U; exactly 0 for a model without recurrent state."""
+		store = self._get_kda_record_store()
+		return 0 if store is None else int(store.record_pages)
+
+	def _reserve_kda_records(self, owner_uuids) -> None:
+		"""Admission: reserve each owned sequence's record pages, exactly.
+
+		Runs inside the host-KV reservation transaction, on the host-KV owner
+		of each sequence, after the KV pages allocated. The pure selection
+		and the capacity preflight already charged these pages, so a refusal
+		here (``KDARecordReservationUnavailable``, named) is an accounting
+		bug surfacing -- it fails the transaction collectively and the wave
+		stays queueing; a committed write can then never hit out-of-space.
+		"""
+		store = self._get_kda_record_store()
+		if store is None:
+			return
+		for uuid in owner_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			store.reserve(int(seq.global_idx))
+
+	def _rollback_kda_record_reservations(self, global_ids) -> None:
+		"""Give back this wave's record reservations after a failed admission."""
+		store = self._traj.kda_record_store
+		if store is None:
+			return
+		store.rollback_reserved([int(gid) for gid in global_ids])
+
+	def _kda_record_mirror_payload(self, uuids) -> dict:
+		"""The owner's record arenas for the G>1 host-KV mirror."""
+		store = self._traj.kda_record_store
+		if store is None:
+			return {}
+		return store.mirror_payload([
+			int(self.global_batch.get_sequence(uuid).global_idx)
+			for uuid in uuids
+		])
+
+	def _adopt_kda_record_mirror(self, payload: dict) -> None:
+		"""Follower side of the mirror: install the owner's record arenas."""
+		if not payload:
+			return
+		store = self._get_kda_record_store()
+		if store is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: the serve-group leader mirrored "
+				f"{len(payload)} KDA record arena(s) but this rank has no "
+				"KDA state pool to serve them with"
+			)
+		store.adopt(payload)
+
+	def _offload_kda_states_at_prefill_end(self, local_sequence_ids) -> None:
+		"""Write every prefilled row's state into its record; free the slots.
+
+		The sequence's REAL prefill end: after the prefix-reuse commit
+		boundary (which still reads live slots) and before the wave's status
+		flips to PREFILLED. Every rank of an owning group writes its own
+		unit windows (synchronous pageable D2H, the snapshot reader's
+		existing mechanism; no new stream machinery), then frees its rows'
+		GPU slots -- which is what ends the slot's prefill-wave occupancy.
+		"""
+		from batchgen.worker import kda_lifecycle
+		store = self._get_kda_record_store()
+		if store is None or not local_sequence_ids:
+			return
+		sequences = []
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			sequences.append((int(seq.global_idx), int(seq.prompt_length)))
+		kda_lifecycle.offload_prefill_states(
+			store,
+			self._traj.free_kda_sequences,
+			sequences,
+			rank=self.rank,
+		)
+
+	def _retain_kda_records_at_prefill_end(self) -> None:
+		"""Post-barrier: the owner makes every written record resident.
+
+		Runs right after the pass's unconditional ``dist.barrier()`` -- the
+		same ordering point the frontier finalize uses -- so every rank of a
+		serve group has returned from its own unit writes before the pages
+		outlive their pseudo row. Mirrored records are the owner's to
+		retain, so a follower retains nothing.
+		"""
+		store = self._traj.kda_record_store
+		if store is None:
+			return
+		store.retain_written()
+
+	def _restore_kda_states_for_decode(self, decode_uuids) -> None:
+		"""Decode admission: restore first-entry rows from their records.
+
+		A row still holding a live slot (ON_HOLD re-entry, continuing decode)
+		carries newer state than its record and is left alone; a first entry
+		from PREFILLED holds no slot and restores into a slot of the decode
+		layout. A row with neither is state loss and raises by name.
+		"""
+		from batchgen.worker import kda_lifecycle
+		store = self._get_kda_record_store()
+		if store is None:
+			return
+		group_size, group_rank, _is_leader = self._trajectory_group_geometry()
+		sequence_ids = [
+			int(self.global_batch.get_sequence(uuid).global_idx)
+			for uuid in decode_uuids
+			if uuid in self._uuid_to_local_map
+		]
+		kda_lifecycle.restore_decode_states(
+			store,
+			sequence_ids,
+			group_size=group_size,
+			group_rank=group_rank,
+			rank=self.rank,
 		)
 
 	def _trajectory_frontier_eviction_hook(self):

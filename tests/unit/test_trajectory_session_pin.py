@@ -510,6 +510,10 @@ def _mirror_rank(
         _reserve_trajectory_arenas=lambda uuids: {},
         _trajectory_restore_payload=lambda: {},
         _adopt_mirrored_trajectory_arenas=lambda arenas: None,
+        # 方案甲: the mirror now carries the per-sequence KDA record arenas;
+        # these fakes model a deployment without recurrent state.
+        _kda_record_mirror_payload=lambda uuids: {},
+        _adopt_kda_record_mirror=lambda payload: None,
     )
     attach_identity(
         worker,
