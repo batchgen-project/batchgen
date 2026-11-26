@@ -29,6 +29,7 @@ import time
 import torch
 
 from batchgen.phase_lifecycle import PHASES, verify_phase_contract
+from batchgen.query_book import reset_query_book
 from batchgen.worker import startup_transient as _startup_transient
 from batchgen.worker.rank_context import RankContext
 
@@ -120,7 +121,7 @@ class WorkerLifecycleEngine:
             self.input_arguments.num_queries = num_queries
     
         # Reset per-batch state
-        self.query_book = None
+        reset_query_book(self)
         self.model_batch_book = {}
     
         logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")

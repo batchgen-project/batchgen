@@ -1147,6 +1147,57 @@ def release_query_book_slot(
     return local_idx
 
 
+def refresh_query_book_entry(
+    uuid: str,
+    sequence,
+    *,
+    query_book: MutableMapping[int, QueryBookEntry],
+    local_of,
+) -> int:
+    """Rebuild the query-book entry for an ALREADY-BOUND sequence.
+
+    ``bind_query_book_slot`` creates a slot binding together with its first
+    entry; this is the owner path for every later rebuild of the same slot's
+    entry (migration receive, ON_HOLD resume, evicted re-entry).  A rebuild
+    must never create a binding: a sequence without a bound local slot here
+    means the caller skipped admission, so this raises instead of binding.
+    ``local_of`` is the caller's slot resolver (``SequenceTable.local_of`` or
+    an equivalent uuid -> slot lookup): the owner refuses an unbound uuid
+    whichever view the caller holds, without reaching for worker state the
+    caller does not already own.  Returns the slot whose entry was rebuilt.
+    """
+    if sequence is None:
+        raise KeyError(f"Sequence with UUID {uuid} not found in global_batch")
+    local_idx = local_of(uuid)
+    if local_idx is None:
+        raise KeyError(f"sequence has no bound local slot: {uuid}")
+    query_book[local_idx] = make_query_book_entry(sequence)
+    return local_idx
+
+
+def ensure_query_book(worker) -> MutableMapping[int, QueryBookEntry]:
+    """Build the holder's empty query book on the first bind of a batch.
+
+    The holder's ``query_book`` attribute lifecycle (``None`` <-> dict) is
+    owned here: construction and the per-batch reset go through
+    ``reset_query_book``, and the first bind creates the dict through this
+    function.  Returns the live mapping.
+    """
+    if worker.query_book is None:
+        worker.query_book = {}
+    return worker.query_book
+
+
+def reset_query_book(worker) -> None:
+    """Return the holder to the unbuilt state (construction/per-batch reset).
+
+    ``None`` rather than ``{}`` deliberately: readers distinguish "no query
+    book was built for this batch yet" from "a built book with no live
+    entries", and ``ensure_query_book`` is the only builder.
+    """
+    worker.query_book = None
+
+
 def bind_local_sequence_to_query_book(
     uuid: str,
     sequence,

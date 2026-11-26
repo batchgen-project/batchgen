@@ -1,15 +1,17 @@
 """Source guard: the query book is mutated directly only where pinned.
 
 The worker's ``query_book`` dict (local slot -> ``QueryBookEntry``) is owned
-by ``batchgen/query_book.py``: its binding/release helpers
+by ``batchgen/query_book.py``: its binding/release/refresh helpers
 (``bind_query_book_slot``, ``release_query_book_slot``,
-``bind_local_sequence_to_query_book``, ``release_local_query_slot``,
-``make_query_book_entry``) and the ``QueryBook`` classes are the intended
-write path, so every mutation inside that module is an owner write.  This
-test pins TODAY's exact set of direct mutations outside the owner module as a
-list that can only shrink: it fails when a NEW outside mutation appears, and
-it fails when a listed offender no longer exists (stale entry), so every
-removal is deliberate.
+``refresh_query_book_entry``, ``bind_local_sequence_to_query_book``,
+``release_local_query_slot``, ``make_query_book_entry``), the attribute
+lifecycle pair (``ensure_query_book``, ``reset_query_book``) and the
+``QueryBook`` classes are the intended write path, so every mutation inside
+that module is an owner write.  The offender list reached EMPTY on
+2026-11-26 (every direct outside mutation was routed through the owner
+helpers), and it may never grow again: any entry appearing here is a
+regression, and the fix is to route the new write through an owner helper,
+not to extend the list.
 
 Covered patterns, on any receiver whose final spelling is ``query_book``
 (``self.query_book``, ``req.query_book``, a bare local/parameter named
@@ -70,17 +72,11 @@ def _offences(path: Path):
     return found
 
 
-# The exact outside mutations that exist today (one entry per file and kind
-# of mutation, no line numbers so the list does not churn).  Entries may only
-# be removed (by moving the mutation behind the query_book helpers), never
-# added.
-KNOWN_OFFENDERS = [
-    "batchgen/batchgen_worker.py: rebinding .query_book",
-    "batchgen/worker/kv_capacity_engine.py: item write on query_book",
-    "batchgen/worker/kv_capacity_engine.py: query_book.pop(",
-    "batchgen/worker/prefill_engine.py: item write on query_book",
-    "batchgen/worker/worker_lifecycle_engine.py: rebinding .query_book",
-]
+# The exact outside mutations that exist today.  The list reached empty on
+# 2026-11-26; it must stay empty.  A new direct mutation outside the owner
+# module is routed through a ``batchgen/query_book.py`` helper, never added
+# here.
+KNOWN_OFFENDERS: list = []
 
 
 def test_the_query_book_is_mutated_only_where_pinned():
