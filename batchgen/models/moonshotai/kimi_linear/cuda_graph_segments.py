@@ -623,12 +623,17 @@ class KimiLinearSpanSegment:
 
 
 class KimiLinearDecodeGraph:
-    """Phase-A CUDA-graph decode driver for Kimi-Linear.
+    """Phase-A CUDA-graph decode step policy for Kimi-Linear.
 
-    Installs itself on the model (one patched forward per decoder layer plus a
-    step hook on `KimiLinearModel.forward`) instead of going through the
-    worker's `ModelCudaGraphAdapter` allowlist, which would need a core edit
-    (`batchgen_worker.py`); the model-side contract is otherwise the same.
+    The worker's decode driver (``decode_engine.DecoupledGpuDecode.run``) owns
+    the per-step dispatch: it calls ``begin_decode_step`` before the forward,
+    replays the whole-model graph through ``replay_whole_model_step`` when the
+    step is armed, otherwise runs the plain eager model forward, and always
+    calls ``end_decode_step``. The former ``KimiLinearModel.forward`` patch
+    that hid this dispatch inside the model is retired. ``install()`` still
+    patches each decoder ``layer.forward`` (plus ``_new_block_residual``):
+    that is the kept per-layer legacy/compare arm, which replays one span per
+    layer from inside the eager model loop while the step is armed.
 
     Lifecycle: constructed + installed by the PSM at `configure_decoding` when
     the planner asks for it, and released with the decode instance that owns
@@ -706,7 +711,6 @@ class KimiLinearDecodeGraph:
         )
         self._max_aux_pages = 0
         self._aux_page_size_tokens = 0
-        self._orig_model_forward = None
         self._orig_new_block_residual = None
         self._orig_layer_forwards: Dict[int, object] = {}
         self._fallbacks_logged: dict = {}
@@ -790,7 +794,13 @@ class KimiLinearDecodeGraph:
         return self._ladder_captured
 
     def install(self) -> None:
-        """Patch the decode forwards (idempotent)."""
+        """Patch the per-layer decode forwards (idempotent).
+
+        The model-level forward is NOT patched: the worker's decode driver
+        invokes this object's step API directly. Only the per-layer legacy
+        arm (layer spans replayed from inside the eager model loop) installs
+        its layer hooks here.
+        """
         if self._installed:
             return
         slot_manager = KimiLinearKDAWrapper.slot_manager
@@ -806,8 +816,6 @@ class KimiLinearDecodeGraph:
         # KDA pool.
         self._scratch_slot = slot_manager.alloc(GRAPH_SCRATCH_SEQ_ID)
         inner = self.model.model
-        self._orig_model_forward = inner.forward
-        inner.forward = self._make_model_forward(self._orig_model_forward)
         if self._uses_block_residual:
             self._orig_new_block_residual = inner._new_block_residual
             inner._new_block_residual = self._make_new_block_residual(
@@ -827,10 +835,9 @@ class KimiLinearDecodeGraph:
             )
 
     def release(self) -> None:
-        """Restore the eager forwards and drop every captured bucket."""
+        """Restore the eager layer forwards and drop every captured bucket."""
         if self._installed:
             inner = self.model.model
-            inner.forward = self._orig_model_forward
             if self._orig_new_block_residual is not None:
                 inner._new_block_residual = self._orig_new_block_residual
                 self._orig_new_block_residual = None
@@ -859,36 +866,58 @@ class KimiLinearDecodeGraph:
         return stats
 
     # ------------------------------------------------------------------ #
-    #  Patched forwards                                                   #
+    #  Decode-driver step API (the worker's decode loop calls these)      #
     # ------------------------------------------------------------------ #
 
-    def _make_model_forward(self, orig_forward):
-        def forward(*args, **kwargs):
-            self._begin_step()
-            try:
-                if self._whole_step_active:
-                    input_ids = kwargs.get("input_ids")
-                    if input_ids is None and args:
-                        input_ids = args[0]
-                    if (
-                        not isinstance(input_ids, torch.Tensor)
-                        or input_ids.dim() != 2
-                        or input_ids.shape[1] != 1
-                        or input_ids.shape[0] != self._bsz
-                    ):
-                        self._fallback(
-                            "whole-model graph requires decode input_ids [local_bsz, 1]"
-                        )
-                        self._whole_step_active = False
-                        self._step_active = False
-                    else:
-                        return self._run_whole_model(input_ids)
-                return orig_forward(*args, **kwargs)
-            finally:
-                self._step_active = False
-                self._moe_step_active = False
+    def begin_decode_step(self, input_ids) -> bool:
+        """Decide this decode step's path; the worker's decode driver calls
+        this immediately before the step's forward.
+
+        Runs ``_begin_step`` (the per-step path decision and static-buffer
+        refresh) and, when the whole-model replay is armed, validates
+        ``input_ids`` exactly as the retired ``KimiLinearModel.forward`` hook
+        did. Returns whether the driver must replay the whole-model graph
+        through ``replay_whole_model_step``; ``False`` means the driver runs
+        the plain eager model forward, during which the patched layer
+        forwards replay per-layer spans while the step stays armed. The
+        driver must pair every call with ``end_decode_step`` after the
+        step's forward, replayed or eager.
+        """
+        self._begin_step()
+        if self._whole_step_active:
+            if (
+                not isinstance(input_ids, torch.Tensor)
+                or input_ids.dim() != 2
+                or input_ids.shape[1] != 1
+                or input_ids.shape[0] != self._bsz
+            ):
+                self._fallback(
+                    "whole-model graph requires decode input_ids [local_bsz, 1]"
+                )
                 self._whole_step_active = False
-        return forward
+                self._step_active = False
+        return self._whole_step_active
+
+    def replay_whole_model_step(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Replay the captured transformer body and apply the LM head.
+
+        The retired model-forward hook returned ``_run_whole_model``'s hidden
+        states to the outer CausalLM, which applied ``lm_head``; this driver
+        call keeps that exact pair, so the step's logits are unchanged.
+        Returns ``[local_bsz, 1, vocab]`` logits.
+        """
+        hidden_states = self._run_whole_model(input_ids)
+        return self.model.lm_head(hidden_states)
+
+    def end_decode_step(self) -> None:
+        """Disarm the step (the retired model-forward hook's ``finally``)."""
+        self._step_active = False
+        self._moe_step_active = False
+        self._whole_step_active = False
+
+    # ------------------------------------------------------------------ #
+    #  Patched forwards (the kept per-layer legacy/compare arm)           #
+    # ------------------------------------------------------------------ #
 
     def _make_new_block_residual(self, orig_new):
         def new_block_residual(hidden_states):
@@ -1460,9 +1489,10 @@ class KimiLinearDecodeGraph:
                 self._refresh_statics(
                     whole_bucket, bsz, seq_ids, page_table, aux_page_table
                 )
-                # ``_run_whole_model`` is entered from the patched model
-                # forward, while ``_bucket`` is also used by the legacy
-                # layer hook.  Keep a dedicated whole-bucket field: the
+                # ``_run_whole_model`` is entered from the decode driver's
+                # ``replay_whole_model_step``, while ``_bucket`` is also used
+                # by the legacy layer hook.  Keep a dedicated whole-bucket
+                # field: the
                 # outer graph bucket can be larger than this rank's local
                 # attention batch when another DP group has more rows.
                 self._whole_bucket = whole_bucket

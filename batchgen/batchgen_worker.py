@@ -12908,6 +12908,18 @@ class BatchGenWorker:
 			getattr(AttnWrapperBase, 'kv_append_callback_aux', None),
 		)
 
+	def _read_decode_step_graph(self):
+		"""The model-owned decode-graph step policy, or None.
+
+		Declared accessor on the strategy manager (``decode_step_graph``):
+		the decode driver reads it once per decode round and drives each
+		step through ``begin_decode_step`` / ``replay_whole_model_step`` /
+		``end_decode_step``. A model without one decodes through the plain
+		eager forward or the worker-owned whole-model graph arms.
+		"""
+		accessor = getattr(self.parallel_manager, "decode_step_graph", None)
+		return accessor() if accessor is not None else None
+
 	def _teardown_decode_model_state(self):
 		phase_state.bind_kv_append(Attn_Wrapper, kv_append_callback=None)
 		phase_state.bind_decode_entry(
