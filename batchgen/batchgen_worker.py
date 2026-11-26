@@ -1305,11 +1305,6 @@ class BatchGenWorker:
 		)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
-		# Edge trigger for the prefix_drain metric: set when the row is
-		# emitted, cleared when admission adds new sequences.
-		self._prefix.prefix_drain_metric_emitted = False
-		self._prefix.prefix_sequence_states = {}
-		self._prefix.active_prefix_materializations = []
 		self._prefill_pool_wave = None
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
@@ -1337,24 +1332,6 @@ class BatchGenWorker:
 		# outcome, folded into the guard state so a rejected transaction is
 		# not mistaken for a wave that selected nothing.
 		self._prefill_reservation_outcome = None
-		# Shared-prefix admission credit: charge an in-wave shared prefix once
-		# per node instead of once per row. Suspended for the NEXT admission
-		# round whenever a credited wave is rejected by the reservation
-		# transaction -- the wave planner may decline to pool (a budget too
-		# small for the chain, the threshold ladder), and then each member
-		# really does compute and allocate its own prefix. Re-admitting the
-		# same credited wave would then repeat the same rejection forever, so
-		# the retry falls back to the full charge, makes progress, and the
-		# latch clears on the next committed reservation. Rank-uniform: both
-		# the rejection and the commit are decided by a collective.
-		self._prefix.shared_prefix_credit_suspended = False
-		self._prefix.shared_prefix_credit_applied = False
-		# global_idx -> cumulative per-page prompt digests, one entry per
-		# SHAREABLE page (a prompt's last page is private by construction, so
-		# every row keeps a tail). Cached because a digest is a property of the
-		# prompt, not of the round: recomputing it on every scheduler iteration
-		# would re-hash the whole candidate set each time.
-		self._prefix.prefix_page_digest_cache = {}
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
 		self._traj.trajectory_frontier_committer = None
 		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
@@ -1923,7 +1900,7 @@ class BatchGenWorker:
 				"admitted sequence must carry its own decode budget"
 			)
 		# New live work: the next drain is a new edge for the prefix_drain row.
-		self._prefix.prefix_drain_metric_emitted = False
+		self._prefix.rearm_drain_metric()
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -5488,7 +5465,7 @@ class BatchGenWorker:
 		self._prefill_reservation_outcome = "committed"
 		# A committed wave proves the credit (if any) matched what the
 		# allocator consumed, so the next round may credit again.
-		self._prefix.shared_prefix_credit_suspended = False
+		self._prefix.resume_shared_prefix_credit()
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(

@@ -61,7 +61,7 @@ def _make_prefill_selection_request(
     kda_record_pages: int = 0,
 ) -> PrefillSelectionRequest:
     """Snapshot the candidate metadata `select_prefill_batch` consumes."""
-    ctx.prefix.shared_prefix_credit_applied = bool(shared_segments)
+    ctx.prefix.note_wave_credit(bool(shared_segments))
     candidates = []
     for uuid in all_candidates:
         seq = ctx.sched.pool.get_sequence(uuid)

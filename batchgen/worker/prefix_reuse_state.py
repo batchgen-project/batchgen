@@ -24,6 +24,9 @@ class PrefixReuseState:
     def __init__(self, *, rank: int = 0, world_size: int = 1) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
+        # Edge trigger for the prefix_drain metric: set when the row is
+        # emitted (``mark_drain_metric_emitted``), cleared when admission adds
+        # new sequences (``rearm_drain_metric``).
         self.prefix_drain_metric_emitted = False
         self.prefix_sequence_states = {}
         self.active_prefix_materializations = []
@@ -32,8 +35,24 @@ class PrefixReuseState:
         self.pool_sid_counter = time.time_ns() // 1000
         self.pool_sid_members = {}
         self.pool_member_sids = {}
+        # Shared-prefix admission credit: charge an in-wave shared prefix once
+        # per node instead of once per row. Suspended for the NEXT admission
+        # round whenever a credited wave is rejected by the reservation
+        # transaction -- the wave planner may decline to pool (a budget too
+        # small for the chain, the threshold ladder), and then each member
+        # really does compute and allocate its own prefix. Re-admitting the
+        # same credited wave would then repeat the same rejection forever, so
+        # the retry falls back to the full charge, makes progress, and the
+        # latch clears on the next committed reservation
+        # (``resume_shared_prefix_credit``). Rank-uniform: both the rejection
+        # and the commit are decided by a collective.
         self.shared_prefix_credit_suspended = False
         self.shared_prefix_credit_applied = False
+        # global_idx -> cumulative per-page prompt digests, one entry per
+        # SHAREABLE page (a prompt's last page is private by construction, so
+        # every row keeps a tail). Cached because a digest is a property of the
+        # prompt, not of the round: recomputing it on every scheduler iteration
+        # would re-hash the whole candidate set each time.
         self.prefix_page_digest_cache = {}
 
     def next_pool_segment_sid(self) -> int:
@@ -46,6 +65,31 @@ class PrefixReuseState:
         from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
         return PrefixCacheSequenceState(**kwargs)
+
+    def rearm_drain_metric(self) -> None:
+        """Re-arm the prefix_drain edge trigger: newly admitted live work
+        makes the next drain a new edge, so the row may be emitted again."""
+        self.prefix_drain_metric_emitted = False
+
+    def mark_drain_metric_emitted(self) -> None:
+        """Latch the prefix_drain edge trigger: one row per drain, until
+        admission re-arms it."""
+        self.prefix_drain_metric_emitted = True
+
+    def note_wave_credit(self, applied: bool) -> None:
+        """Record whether this wave's selection applied the shared-prefix credit.
+
+        A bare setter by design: the value is derived from the rank-identical
+        selection request (collective-sourced), written once per rank per
+        admission round, so there is nothing local to validate it against.
+        """
+        self.shared_prefix_credit_applied = applied
+
+    def resume_shared_prefix_credit(self) -> None:
+        """Clear the one-round credit latch; pair of
+        ``suspend_shared_prefix_credit``. The caller decides the round
+        boundary (a committed reservation)."""
+        self.shared_prefix_credit_suspended = False
 
     def suspend_shared_prefix_credit(self, reason: str, *, rank: Optional[int] = None) -> bool:
         """Trip the one-round credit latch; return whether it changed state."""

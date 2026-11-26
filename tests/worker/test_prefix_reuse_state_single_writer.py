@@ -195,17 +195,9 @@ KNOWN_OFFENDERS = [
     "batchgen/batchgen_worker.py: .pool_member_sids.pop(",
     "batchgen/batchgen_worker.py: .pool_sid_members.pop(",
     "batchgen/batchgen_worker.py: item write on .prefix_sequence_states",
-    "batchgen/batchgen_worker.py: rebinding .active_prefix_materializations",
-    "batchgen/batchgen_worker.py: rebinding .prefix_drain_metric_emitted",
-    "batchgen/batchgen_worker.py: rebinding .prefix_page_digest_cache",
-    "batchgen/batchgen_worker.py: rebinding .prefix_sequence_states",
-    "batchgen/batchgen_worker.py: rebinding .shared_prefix_credit_applied",
-    "batchgen/batchgen_worker.py: rebinding .shared_prefix_credit_suspended",
-    "batchgen/worker/admission/prefill_selection.py: rebinding .shared_prefix_credit_applied",
     "batchgen/worker/prefill_engine.py: .active_prefix_materializations.append(",
     "batchgen/worker/prefill_engine.py: .active_prefix_materializations.remove(",
     "batchgen/worker/prefill_engine.py: item write on .prefix_sequence_states",
-    "batchgen/worker/step_observability_engine.py: rebinding .prefix_drain_metric_emitted",
 ]
 
 
