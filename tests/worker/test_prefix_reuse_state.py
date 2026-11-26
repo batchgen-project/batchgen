@@ -7,7 +7,11 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pytest
 
-from batchgen.worker.prefix_reuse_state import PrefixReuseState, release_pool_segments
+from batchgen.worker.prefix_reuse_state import (
+    PrefixReuseState,
+    PrefixSequenceStateMissingError,
+    release_pool_segments,
+)
 from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 
 
@@ -442,3 +446,70 @@ def test_attach_helpers_raise_on_unknown_override():
 		attach_trajectory_state(worker, unknown_trajectory_field=1)
 	with pytest.raises(AttributeError):
 		attach_prefix_state(worker, unknown_prefix_field=1)
+
+
+def test_install_state_is_a_bare_setter_and_overwrite_is_legal():
+    store = PrefixReuseState()
+    first, second = object(), object()
+    store.install_state(7, first)
+    assert store.prefix_sequence_states == {7: first}
+    # Overwrite without validation is the contract: the pool
+    # lookup-replacement path releases the old handles at its call site
+    # before overwriting, and the G>1 mirror installs wire values a rank
+    # cannot validate locally.
+    store.install_state(7, second)
+    assert store.prefix_sequence_states == {7: second}
+
+
+def test_append_commit_handle_appends_and_missing_state_raises_named_error():
+    store = PrefixReuseState()
+    store.install_state(
+        3,
+        store.new_sequence_state(
+            lookup_result=None, attached_tokens=0, compute_cached_tokens=0
+        ),
+    )
+    store.append_commit_handle(3, 11)
+    store.append_commit_handle(3, 12)
+    assert store.prefix_sequence_states[3].commit_attachment_handles == (11, 12)
+    with pytest.raises(PrefixSequenceStateMissingError):
+        store.append_commit_handle(4, 13)
+    assert 4 not in store.prefix_sequence_states
+
+
+def test_materialization_begin_end_and_lazy_drain():
+    store = PrefixReuseState()
+    first, second, third = object(), object(), object()
+    store.begin_materialization(first)
+    store.begin_materialization(second)
+    store.end_materialization(second)
+    assert store.active_prefix_materializations == [first]
+    # Fail-loud: ending something never begun breaks the pairing.
+    with pytest.raises(ValueError):
+        store.end_materialization(third)
+    store.begin_materialization(third)
+    drain = store.drain_materializations()
+    # Lazy: creating the iterator pops nothing.
+    assert store.active_prefix_materializations == [first, third]
+    assert next(drain) is third
+    # Each item leaves the list BEFORE it is yielded.
+    assert store.active_prefix_materializations == [first]
+    assert list(drain) == [first]
+    assert store.active_prefix_materializations == []
+    assert list(store.drain_materializations()) == []
+
+
+def test_drop_wave_refs_yields_each_sid_once_and_keeps_other_waves():
+    store = PrefixReuseState()
+    store.add_pool_member_refs(1, (-5, -6))
+    store.add_pool_member_refs(2, (-6,))
+    store.add_pool_member_refs(9, (-7,))  # another wave's member
+    drop = store.drop_wave_refs([1, 2], [-5, -6, -6])
+    # Lazy iterator: nothing is popped until it is consumed.
+    assert store.pool_member_sids == {1: (-5, -6), 2: (-6,), 9: (-7,)}
+    yielded = list(drop)
+    # Each sid exactly once, duplicates collapsed, and the drop is
+    # unconditional: -6 still had a second member (gid 2) in this same wave.
+    assert sorted(yielded) == [-6, -5]
+    assert store.pool_member_sids == {9: (-7,)}
+    assert store.pool_sid_members == {-7: 1}

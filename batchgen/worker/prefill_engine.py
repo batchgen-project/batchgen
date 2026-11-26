@@ -1231,7 +1231,7 @@ class PrefillEngine:
                 trajectory_restore_boundary=restore,
             )
             prefix_states[seq.global_idx] = state
-            self._prefix.prefix_sequence_states[seq.global_idx] = state
+            self._prefix.install_state(seq.global_idx, state)
 
     def _settle_trajectory_restore_plan(self, worker, seqs, drops, default_reason) -> None:
         """Decline, at plan time, every live attachment the plan does not restore.
@@ -1328,7 +1328,11 @@ class PrefillEngine:
                 },
             )
             prefix_states[global_id] = state
-            self._prefix.prefix_sequence_states[global_id] = state
+            # ``install_state`` of the replaced value, not a dedicated
+            # replace-setter: the call site needs the replaced state anyway
+            # for its wave-local ``prefix_states`` map, so the owner would
+            # otherwise duplicate the ``replace`` the caller already did.
+            self._prefix.install_state(global_id, state)
             # A segment's Host pages live until its last member releases. A
             # materialized segment has no pseudo sequence to refcount: its
             # pages are the prefix cache's, kept by this sequence's own
@@ -1878,10 +1882,7 @@ class PrefillEngine:
                     self.prefix_cache_coordinator.release_attachment(handle)
             for index, handle in member_handles.items():
                 global_id = wave.global_ids[index]
-                state = self._prefix.prefix_sequence_states[global_id]
-                self._prefix.prefix_sequence_states[global_id] = replace(
-                    state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
-                )
+                self._prefix.append_commit_handle(global_id, handle)
         finally:
             # Success or failure, the wave object is done. Segment Host pages
             # stay tracked in _pool_sid_members/_pool_member_sids, so after a
@@ -2368,9 +2369,7 @@ class PrefillEngine:
                             .host_page_bytes_all_layers
                         ),
                     )
-                    self._prefix.active_prefix_materializations.append(
-                        prefix_materialization
-                    )
+                    self._prefix.begin_materialization(prefix_materialization)
 
                 # Set up the attention wrappers for this micro-batch.
                 # These class attrs are the per-step worker->model contract read
@@ -2599,9 +2598,7 @@ class PrefillEngine:
                         prefix_materialization,
                         empty_cuda_cache=True,
                     )
-                    self._prefix.active_prefix_materializations.remove(
-                        prefix_materialization
-                    )
+                    self._prefix.end_materialization(prefix_materialization)
                     self._clear_prefill_prefix_materialization()
 
 
