@@ -59,6 +59,10 @@ class HostReservationCommitError(RuntimeError):
     """A host-KV reservation commit broke the page/token/ownership contract."""
 
 
+class AdmittedPromptRebindError(RuntimeError):
+    """An admitted-prompt bind reached a sequence that has already decoded."""
+
+
 def host_owned_pages_after_sharing(
     *,
     chain_pages: int,
@@ -765,12 +769,64 @@ class SequenceEntry:
             where=where,
         )
 
+    def bind_admitted_prompt(self, actual_prompt_len: int) -> None:
+        """Bind the admitted prompt's tokenized length as the length identity.
+
+        Admission stamps the effective prompt, the original prompt and the
+        context length together, exactly once, before the first decode.  A
+        sequence that has already decoded must never pass through this bind:
+        an eviction re-entry rewrites ``prompt_length`` via
+        ``begin_eviction`` and restores the counters via
+        ``rebase_decoded_length`` instead, so a non-zero ``decoded_length``
+        here is a lifecycle bug and is refused by name.
+        """
+        if self.decoded_length != 0:
+            raise AdmittedPromptRebindError(
+                f"admitted-prompt bind for sequence {self.global_idx}: "
+                f"decoded_length={self.decoded_length} != 0; rebinding the "
+                "prompt of a sequence that already decoded would erase its "
+                "context identity"
+            )
+        self.prompt_length = actual_prompt_len
+        self.original_prompt_length = actual_prompt_len
+        self.current_context_length = actual_prompt_len
+
+    def advance_one_token(self) -> None:
+        """Advance the length pair by the one token a decode step produced.
+
+        The owning rank calls this once per live row per step (the hot
+        decode loop), keeping the context identity
+        ``current_context_length == original_prompt_length +
+        decoded_length`` in lockstep with the counter.
+        """
+        self.decoded_length += 1
+        self.current_context_length = (
+            self.original_prompt_length + self.decoded_length
+        )
+
+    def repair_context_identity(self) -> int:
+        """Re-derive ``current_context_length`` from the context identity.
+
+        ``current_context_length == original_prompt_length +
+        decoded_length`` is always the correct value; a repair site that
+        found its mirror stale re-stamps it from the identity and gets the
+        repaired value back.  No validation and no logging here by design:
+        the call sites gate on the mismatch and keep their own
+        observability (warnings, log_event, lifespan dumps, counters).
+        """
+        self.current_context_length = (
+            self.original_prompt_length + self.decoded_length
+        )
+        return self.current_context_length
+
     def rebase_decoded_length(self, decoded_length: int) -> None:
         """Re-stamp the length pair from a restored decoded length.
 
         The migration receiver restores the trajectory it was sent and then
         re-establishes the context identity ``current_context_length ==
         original_prompt_length + decoded_length`` from the received value.
+        The prefill re-entry path rebases the counter the same way from the
+        reconstructed history length.
         """
         self.decoded_length = decoded_length
         self.current_context_length = self.original_prompt_length + decoded_length

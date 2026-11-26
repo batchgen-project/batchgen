@@ -15,7 +15,11 @@ not the re-entry length), and the fields each method must NOT touch.
 
 import pytest
 
-from batchgen.sequence import HostReservationCommitError, SequenceEntry
+from batchgen.sequence import (
+    AdmittedPromptRebindError,
+    HostReservationCommitError,
+    SequenceEntry,
+)
 
 PAGE = SequenceEntry.PAGE_SIZE
 
@@ -415,3 +419,91 @@ def test_rebase_decoded_length_uses_original_prompt_after_reentry():
     seq.rebase_decoded_length(30)
     assert seq.prompt_length == 120
     assert seq.current_context_length == 100 + 30
+
+
+# --------------------------------------------------------------------------- #
+#  bind_admitted_prompt                                                        #
+# --------------------------------------------------------------------------- #
+
+def test_bind_admitted_prompt_stamps_the_three_length_fields():
+    # Admission binds the tokenized length over the pre-tokenization guess.
+    seq = _entry()
+    seq.bind_admitted_prompt(93)
+    assert seq.prompt_length == 93
+    assert seq.original_prompt_length == 93
+    assert seq.current_context_length == 93
+    # Not a counter or resource write.
+    assert seq.decoded_length == 0
+    assert seq.gpu_pages_allocated == 0
+    assert seq.host_pages_allocated == 0
+
+
+def test_bind_admitted_prompt_refuses_a_sequence_that_already_decoded():
+    seq = _entry(decoded_length=3, current_context_length=103)
+    with pytest.raises(AdmittedPromptRebindError, match="decoded_length=3"):
+        seq.bind_admitted_prompt(93)
+    # Refused before any write.
+    assert seq.prompt_length == 100
+    assert seq.original_prompt_length == 100
+    assert seq.current_context_length == 103
+
+
+# --------------------------------------------------------------------------- #
+#  advance_one_token                                                           #
+# --------------------------------------------------------------------------- #
+
+def test_advance_one_token_increments_and_rebuilds_the_identity():
+    seq = _entry(decoded_length=4, current_context_length=104)
+    seq.advance_one_token()
+    assert seq.decoded_length == 5
+    assert seq.current_context_length == 100 + 5
+    seq.advance_one_token()
+    assert seq.decoded_length == 6
+    assert seq.current_context_length == 100 + 6
+    # Not a prompt or resource write.
+    assert seq.prompt_length == 100
+    assert seq.original_prompt_length == 100
+    assert seq.gpu_pages_allocated == 0
+
+
+def test_advance_one_token_anchors_on_the_original_prompt_after_reentry():
+    # After an eviction cycle prompt_length holds the re-entry length; the
+    # advance rebuilds the identity from original_prompt_length, exactly as
+    # every decode-step site computed it.
+    seq = _entry(decoded_length=30, current_context_length=130)
+    seq.begin_eviction(120)
+    seq.advance_one_token()
+    assert seq.decoded_length == 31
+    assert seq.current_context_length == 100 + 31
+    assert seq.prompt_length == 120
+
+
+# --------------------------------------------------------------------------- #
+#  repair_context_identity                                                     #
+# --------------------------------------------------------------------------- #
+
+def test_repair_context_identity_rebuilds_and_returns_the_repaired_value():
+    seq = _entry(decoded_length=7, current_context_length=0)  # stale mirror
+    repaired = seq.repair_context_identity()
+    assert repaired == 100 + 7
+    assert seq.current_context_length == 100 + 7
+    # Not a counter or prompt write.
+    assert seq.decoded_length == 7
+    assert seq.prompt_length == 100
+    assert seq.original_prompt_length == 100
+
+
+def test_repair_context_identity_is_a_no_op_on_a_consistent_row():
+    seq = _entry(decoded_length=7, current_context_length=107)
+    assert seq.repair_context_identity() == 107
+    assert seq.current_context_length == 107
+
+
+def test_repair_context_identity_anchors_on_the_original_prompt():
+    # prompt_length holds the re-entry length after an eviction; the repair
+    # uses original_prompt_length, never prompt_length.
+    seq = _entry(decoded_length=30, current_context_length=130)
+    seq.begin_eviction(120)
+    seq.current_context_length = 0  # corrupt the mirror
+    assert seq.repair_context_identity() == 100 + 30
+    assert seq.prompt_length == 120

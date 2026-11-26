@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from batchgen.query_book import QueryBook
+from batchgen.sequence import SequenceEntry
 from tests.worker.worker_fakes import attach_prefix_state, attach_trajectory_state
 from tests.worker_method_source import (
     WORKER_SOURCE,
@@ -47,8 +48,17 @@ class _Sequence:
         self._buffer_slot = -1
         self.original_prompt_length = 0
         self.current_context_length = 0
+        # The admitted-prompt bind refuses a decoding sequence by name, so the
+        # stand-in carries the counter the real owner method reads.
+        self.decoded_length = 0
+        self.global_idx = 0
         self.input_ids = "stale"
         self.decoded_tokens = "stale"
+        # The real owner bind (never re-implemented in tests): admission
+        # stamps the three length fields through the entry.
+        self.bind_admitted_prompt = types.MethodType(
+            SequenceEntry.bind_admitted_prompt, self
+        )
 
     def clamp_decode_to_context(self, prompt_len, context_len):
         max_decode = max(0, min(self.original_max_decode_length, context_len - prompt_len))

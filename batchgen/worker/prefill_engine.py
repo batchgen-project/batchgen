@@ -2019,8 +2019,7 @@ class PrefillEngine:
         for i, local_idx in enumerate(batch):
             uuid = self._local_to_uuid_map[local_idx]
             seq = self.global_batch.get_sequence(uuid)
-            seq.decoded_length += 1
-            seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+            seq.advance_one_token()
 
             # MODIFIED: Check for EOS respecting ignore_eos flag
             if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
@@ -3026,8 +3025,7 @@ class PrefillEngine:
             self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
             # The unified book owns the append position. Keep the scalar
             # completion counter in lockstep for fresh prefill and KV re-entry.
-            seq.decoded_length += 1
-            seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+            seq.advance_one_token()
 
             # Check for EOS respecting ignore_eos flag
             if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
@@ -3819,7 +3817,20 @@ class PrefillEngine:
                 seq.prompt_length, seq.original_prompt_length,
                 seq.original_max_decode_length,
             )
-            seq.decoded_length = n_old
+            # Fail loud where the corrupted state is produced: the rebase
+            # below rebuilds the context identity from n_old, so a history
+            # length that does not match the reconstructed prompt would be
+            # silently absorbed here and only surface later in
+            # validate_metadata, far from the cause.
+            if n_old != seq.prompt_length - seq.original_prompt_length:
+                raise ValueError(
+                    f"[REENTRY_HISTORY] sequence {uuid}: reconstructed "
+                    f"history length {n_old} != prompt_length "
+                    f"({seq.prompt_length}) - original_prompt_length "
+                    f"({seq.original_prompt_length}) = "
+                    f"{seq.prompt_length - seq.original_prompt_length}"
+                )
+            seq.rebase_decoded_length(n_old)
             seq.reentry_decoded_baseline = n_old
 
             # decoded_length is cumulative across eviction/re-entry cycles, so

@@ -89,6 +89,9 @@ class FakeSeq:
         self.mirror_host_counters = types.MethodType(
             SequenceEntry.mirror_host_counters, self
         )
+        self.repair_context_identity = types.MethodType(
+            SequenceEntry.repair_context_identity, self
+        )
 
     def validate_metadata(self, context, require_owner_tensors=True,
                           allow_terminal_capacity_gap=False):

@@ -609,8 +609,7 @@ class DecoupledGpuDecode:
                             seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
                                 f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
                             lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
-                            seq.current_context_length = expected
-                            ctx_len = expected
+                            ctx_len = seq.repair_context_identity()
                         cache_seqlens.append(ctx_len)
 
                     max_ctx = max(cache_seqlens)
@@ -1303,10 +1302,7 @@ class DecoupledGpuDecode:
                 if not _row_active[i]:
                     continue
 
-                seq.decoded_length += 1
-                seq.current_context_length = (
-                    seq.original_prompt_length + seq.decoded_length
-                )
+                seq.advance_one_token()
 
                 # Already on the host from this step's single tolist()
                 token_id = new_token_ids[i]

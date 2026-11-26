@@ -29,6 +29,7 @@ from typing import List, Optional, Sequence
 import pytest
 import torch
 
+from batchgen.sequence import SequenceEntry
 from batchgen.worker.completion import CompletionContext, CompletionHandler
 from batchgen.worker.deferred_readback import (
     DeferredTokenReadbackError,
@@ -252,6 +253,11 @@ class Seq:
         self._rep_last_token = None
         self._rep_count = 0
         self._lifespan_log = []
+        # The real owner advance (never re-implemented in tests): the lifted
+        # step tails advance live rows through the entry.
+        self.advance_one_token = types.MethodType(
+            SequenceEntry.advance_one_token, self
+        )
 
     def log_event(self, *a, **k):
         pass
@@ -441,8 +447,7 @@ def _drive(mode, *, interval=4, ns=None):
         for i, seq in enumerate(batch_sequences):
             if not _row_active[i]:
                 continue
-            seq.decoded_length += 1
-            seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+            seq.advance_one_token()
             worker._apply_decode_row_token(seq, new_token_ids[i], i, local_iteration)
 
     assert pending is None, "loop left with a deferred step unread"
