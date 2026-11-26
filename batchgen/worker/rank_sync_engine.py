@@ -5,10 +5,9 @@ the cohort-shutdown probe and the bounded LOCAL quiesce (with its self-exit),
 the gloo / PyNccl / NVSHMEM communicator handles, the ``SyncCoordinator``
 facade, and the per-step MoE token-count agreement.
 
-The engine is intentionally stateless, the S5 ``PrefillEngine`` shape: each
-operation receives the live worker as its collaborator and rebinds ``self``
-to it, so the moved statements keep their original state access and call
-spellings. The worker keeps a same-name delegator for every moved method.
+The engine owns its communicator handles and shutdown probe. Frozen contexts
+carry input values; helpers are keyword-only call arguments. Values retained
+by the caller return in frozen outcomes. Process exit stays with the caller.
 """
 
 from __future__ import annotations
@@ -18,7 +17,8 @@ import logging
 import os
 import socket
 import time
-from typing import List, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -99,12 +99,68 @@ def _find_available_port(host: str, start_port: int, max_attempts: int = 100) ->
     raise RuntimeError(f"No available port found in range [{start_port}, {start_port + max_attempts})")
 
 
+@dataclass(frozen=True)
+class QuiesceContext:
+    rank: int
+    torch_device: Any
+    pending_kv_append_tasks: Any = ()
+
+
+@dataclass(frozen=True)
+class PortRangeContext:
+    pynccl_port_base: int
+    pynccl_port_span: int
+
+
+@dataclass(frozen=True)
+class CommunicatorContext:
+    rank: int
+    world_size: int
+    local_rank: int
+    torch_device: Any
+    pynccl_port_base: int
+    pynccl_port_span: int
+
+
+@dataclass(frozen=True)
+class PrefillMoeContext:
+    rank: int
+    world_size: int
+    torch_device: Any
+    parallel_manager: Any
+
+
+@dataclass(frozen=True)
+class CommunicatorOutcome:
+    comm: Any
+    healthy: bool = True
+
+
+@dataclass(frozen=True)
+class QuiesceOutcome:
+    self_exit_required: bool
+
+
+@dataclass(frozen=True)
+class SelfExitOutcome:
+    exit_code: int
+
+
 class RankSyncEngine:
-    """Stateless rank-sync operations; the worker owns all mutable state."""
+    """Cross-rank coordination and its communication-service lifecycle."""
+
+    def __init__(self, *, nccl_port: int = 0) -> None:
+        self._nccl_group = None
+        self._nccl_port = nccl_port
+        self.comm = None
+        self._sync_coordinator = None
+        self._gloo_migration_group = None
+        self._nvshmem_initialized_this_run = False
+        self._cohort_shutdown_probe_value = None
 
     # ---- Cohort shutdown and the bounded local quiesce ---------------------
 
-    def set_cohort_shutdown_probe(self, worker, probe) -> None:
+    def set_cohort_shutdown_probe(self, *, probe) -> None:
         """Install the zero-argument cohort-teardown probe.
 
         ``probe()`` answers one question -- has this cohort's teardown begun --
@@ -113,12 +169,9 @@ class RankSyncEngine:
         the flag's shape, and the no-handshake contract that goes with it, out
         of this class.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        self._cohort_shutdown_probe = probe
+        self._cohort_shutdown_probe_value = probe
 
-    def _cohort_shutdown_requested(self, worker) -> bool:
+    def _cohort_shutdown_requested(self) -> bool:
         """Has this cohort's teardown begun?
 
         Called once per decode step on the hot path, so it stays a single
@@ -126,13 +179,10 @@ class RankSyncEngine:
         no lock, no allocation, no logging.  Unarmed (no supervisor, or a code
         path that never serves a pool) it is a ``None`` test and nothing else.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        probe = self._cohort_shutdown_probe
+        probe = self._cohort_shutdown_probe_value
         return probe is not None and probe()
 
-    def _poll_until(self, worker, ready, deadline) -> bool:
+    def _poll_until(self, *, rank: int, ready: Callable[[], bool], deadline: float) -> bool:
         """Poll one NON-BLOCKING readiness probe until the shared deadline.
 
         ``ready()`` must answer "is this work finished?" without waiting:
@@ -156,9 +206,6 @@ class RankSyncEngine:
         process rather than unwind.  It never raises, for the same reason the
         quiesce itself never raises.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         try:
             while True:
                 if ready():
@@ -170,12 +217,12 @@ class RankSyncEngine:
             logging.warning(
                 "Rank %s: probing a decode teardown quiesce wait failed; "
                 "treating it as not quiesced",
-                self.rank,
+                rank,
                 exc_info=True,
             )
             return False
 
-    def _pending_kv_appends_done(self, worker) -> bool:
+    def _pending_kv_appends_done(self, *, pending_tasks) -> bool:
         """Has every pending host-KV append task finished?  Never waits.
 
         ``done()`` is ``future_.wait_for(0s) == ready`` in the native task
@@ -185,18 +232,15 @@ class RankSyncEngine:
         skips them, and a worker that never created the list (the drain's own
         ``hasattr`` guard admits that case) has nothing in flight.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        for task in getattr(self, "_pending_kv_append_tasks", ()):
+        for task in pending_tasks:
             if task is not None and not task.done():
                 return False
         return True
 
-    def _record_quiesce_device_event(self, worker):
+    def _record_quiesce_device_event(self, context: QuiesceContext):
         """A non-blocking probe for the device work this rank already queued.
 
-        This replaces the ``torch.cuda.synchronize(self.torch_device)`` the load
+        This replaces the ``torch.cuda.synchronize(context.torch_device)`` the load
         drain used to end in: on an abandoned step that sync is unbounded, and
         it is the last thing standing between the teardown and the unwakeable
         state one level down.  An event recorded on the worker's current stream
@@ -207,23 +251,20 @@ class RankSyncEngine:
         Returns the event, or ``None`` if it could not even be recorded, which
         the caller treats as "the device state cannot be proven" and self-exits.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         try:
             event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.torch_device))
+            event.record(torch.cuda.current_stream(context.torch_device))
             return event
         except BaseException:
             logging.warning(
                 "Rank %s: recording the decode teardown quiesce device probe "
                 "failed; treating it as not quiesced",
-                self.rank,
+                context.rank,
                 exc_info=True,
             )
             return None
 
-    def _self_exit_on_quiesce_deadline(self, worker) -> None:
+    def _self_exit_on_quiesce_deadline(self, *, rank: int) -> SelfExitOutcome:
         """End this process instead of unwinding past a quiesce that did not land.
 
         The ordered teardown releases the very mappings the parked waits hold
@@ -242,9 +283,6 @@ class RankSyncEngine:
         protocol the supervisor uses too; both take them from
         ``batchgen.eventlog.process``, so there is one definition of each.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         from batchgen.eventlog.process import (
             EXIT_PATH_SELF_EXIT,
             WORKER_SELF_EXIT_CODE,
@@ -255,15 +293,19 @@ class RankSyncEngine:
         logging.error(
             "[shutdown] worker exit path=%s rank=%s pid=%s reason=%s",
             EXIT_PATH_SELF_EXIT,
-            self.rank,
+            rank,
             os.getpid(),
             _COHORT_QUIESCE_DEADLINE_REASON,
         )
         flush_logs_before_exit()
         record_exit(WORKER_SELF_EXIT_CODE, _COHORT_QUIESCE_DEADLINE_REASON)
-        os._exit(WORKER_SELF_EXIT_CODE)
+        return SelfExitOutcome(exit_code=WORKER_SELF_EXIT_CODE)
 
-    def _quiesce_decode_for_cohort_shutdown(self, worker, pending_async_task=None) -> None:
+    def _quiesce_decode_for_cohort_shutdown(
+        self, context: QuiesceContext, *, pending_async_task=None,
+        wait_pending_kv_append_tasks: Callable[..., Any],
+        disable_decode_watchdog: Callable[[], None],
+    ) -> QuiesceOutcome:
         """Let LOCAL in-flight decode work finish before the ordered teardown.
 
         Called on the decode loop's teardown exits.  Everything waited on here
@@ -309,29 +351,32 @@ class RankSyncEngine:
         reason recorded, inside ~5 s instead of the supervisor's grace window.
         On the healthy clean-restart exits all three probes answer immediately.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         deadline = time.perf_counter() + _COHORT_QUIESCE_DEADLINE_S
-        device_event = self._record_quiesce_device_event()
+        device_event = self._record_quiesce_device_event(context)
 
-        quiesced = self._poll_until(self._pending_kv_appends_done, deadline)
+        quiesced = self._poll_until(
+            rank=context.rank,
+            ready=lambda: self._pending_kv_appends_done(
+                pending_tasks=context.pending_kv_append_tasks
+            ),
+            deadline=deadline,
+        )
         if quiesced and pending_async_task is not None:
-            quiesced = self._poll_until(lambda: pending_async_task.done(), deadline)
+            quiesced = self._poll_until(rank=context.rank, ready=lambda: pending_async_task.done(), deadline=deadline)
         if quiesced:
             quiesced = device_event is not None and self._poll_until(
-                device_event.query, deadline
+                rank=context.rank, ready=device_event.query, deadline=deadline
             )
 
         if quiesced:
             try:
-                if self._pending_kv_append_tasks:
-                    self._wait_pending_kv_append_tasks(defer_errors=True)
+                if context.pending_kv_append_tasks:
+                    wait_pending_kv_append_tasks(defer_errors=True)
             except BaseException:
                 logging.warning(
                     "Rank %s: draining host-KV appends at the decode teardown "
                     "boundary failed; continuing the ordered teardown",
-                    self.rank,
+                    context.rank,
                     exc_info=True,
                 )
             try:
@@ -341,17 +386,16 @@ class RankSyncEngine:
                 logging.warning(
                     "Rank %s: draining the pending async KV load at the decode "
                     "teardown boundary failed; continuing the ordered teardown",
-                    self.rank,
+                    context.rank,
                     exc_info=True,
                 )
 
-        self.disable_decode_watchdog()
-        if not quiesced:
-            self._self_exit_on_quiesce_deadline()
+        disable_decode_watchdog()
+        return QuiesceOutcome(self_exit_required=not quiesced)
 
     # ---- Communicator handles ----------------------------------------------
 
-    def _get_or_create_gloo_group(self, worker):
+    def _get_or_create_gloo_group(self, *, rank: int, world_size: int):
         """Get or create a Gloo process group for CPU tensor migrations.
 
         Gloo backend supports CPU tensors and can use RDMA if available.
@@ -360,20 +404,17 @@ class RankSyncEngine:
         Returns:
             The Gloo process group for CPU tensor operations.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if not hasattr(self, '_gloo_migration_group') or self._gloo_migration_group is None:
-            logging.debug(f"Rank {self.rank}: Creating Gloo process group for CPU migrations")
+            logging.debug(f"Rank {rank}: Creating Gloo process group for CPU migrations")
             # Create a new group with Gloo backend including all ranks
             self._gloo_migration_group = dist.new_group(
-                ranks=list(range(self.world_size)),
+                ranks=list(range(world_size)),
                 backend="gloo"
             )
-            logging.debug(f"Rank {self.rank}: Gloo process group created")
+            logging.debug(f"Rank {rank}: Gloo process group created")
         return self._gloo_migration_group
 
-    def _ensure_pynccl_communicator(self, worker) -> None:
+    def _ensure_pynccl_communicator(self, context: CommunicatorContext) -> CommunicatorOutcome:
         """Create the PyNccl communicator unless every rank already holds one.
 
         Collective and idempotent: the need-init vote, the port broadcast and
@@ -381,37 +422,34 @@ class RankSyncEngine:
         rank must call this together. Once all ranks have a communicator the
         vote fails and nothing is created.
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") != "0":
-            return
+            return CommunicatorOutcome(comm=self.comm)
 
         # Verify rank consistency
         if dist.is_initialized():
-            assert self.rank == dist.get_rank(), \
-                f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
+            assert context.rank == dist.get_rank(), \
+                f"Rank mismatch: self.rank={context.rank}, dist.get_rank()={dist.get_rank()}"
 
         # Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
-        if self.world_size == 1:
+        if context.world_size == 1:
             logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
-            return
+            return CommunicatorOutcome(comm=self.comm)
 
         comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 
         # Coordinate PyNccl initialization across all ranks
         # Use all_reduce to check if ANY rank needs to (re)init the communicator
         need_init = 1 if self.comm is None else 0
-        need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+        need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=context.torch_device)
         dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
         any_rank_needs_init = need_init_tensor.item() > 0
 
         if not any_rank_needs_init:
-            return
+            return CommunicatorOutcome(comm=self.comm)
 
         # All ranks must participate in init - destroy any existing comm first
         if self.comm is not None:
-            logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
+            logging.info(f"Rank {context.rank}: Destroying existing comm for coordinated reinit")
             try:
                 self.comm.destroy()
             except Exception:
@@ -421,18 +459,19 @@ class RankSyncEngine:
                 del self._nccl_group
                 self._nccl_group = None
 
-        device = torch.device("cuda", self.local_rank)
+        device = torch.device("cuda", context.local_rank)
 
         if comm_master_addr is None:
-            logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+            logging.warning(f"Rank {context.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
         elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
             # Rank 0 finds an available port, then broadcasts to all ranks
             selected_port = self._nccl_port
-            if self.rank == 0:
+            if context.rank == 0:
                 try:
                     selected_port = self._find_available_pynccl_port(
-                        comm_master_addr,
-                        self._nccl_port,
+                        PortRangeContext(context.pynccl_port_base, context.pynccl_port_span),
+                        host=comm_master_addr,
+                        start_port=self._nccl_port,
                     )
                     logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl")
                 except RuntimeError as e:
@@ -440,7 +479,7 @@ class RankSyncEngine:
                     selected_port = -1
 
             # Broadcast the chosen port from rank 0 to all ranks
-            port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
+            port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=context.torch_device)
             dist.broadcast(port_tensor, src=0)
             self._nccl_port = port_tensor.item()
             if self._nccl_port < 0:
@@ -451,18 +490,18 @@ class RankSyncEngine:
             # CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
             # is ready before other ranks try to connect. Different ranks may reach
             # this point at very different times due to tokenization workload.
-            logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+            logging.debug(f"Rank {context.rank}: Waiting for all ranks before PyNccl init...")
             dist.barrier()
 
             try:
-                logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+                logging.debug(f"Rank {context.rank}: Creating PyNccl communicator on port {self._nccl_port}")
 
                 # Store group separately so we can properly destroy it on reinit
                 self._nccl_group = StatelessProcessGroup.create(
                     host=comm_master_addr,
                     port=self._nccl_port,
-                    rank=self.rank,
-                    world_size=self.world_size,
+                    rank=context.rank,
+                    world_size=context.world_size,
                     data_expiration_seconds=36000,  # 10 hours
                 )
                 self.comm = PyNcclCommunicator(
@@ -470,72 +509,68 @@ class RankSyncEngine:
                     device=device
                 )
                 # Only rank 0 logs at INFO level to reduce verbosity
-                if self.rank == 0:
+                if context.rank == 0:
                     logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
                 else:
-                    logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+                    logging.debug(f"Rank {context.rank}: PyNccl communicator initialized on port {self._nccl_port}")
             except Exception as e:
-                logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-                raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+                logging.error(f"Rank {context.rank}: PyNccl communicator initialization failed - {e}")
+                raise RuntimeError(f"Rank {context.rank}: PyNccl communicator initialization failed - {e}")
 
-    def _find_available_pynccl_port(self, worker, host: str, start_port: int) -> int:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        end_port = self.pynccl_port_base + self.pynccl_port_span
-        start_port = max(start_port, self.pynccl_port_base)
+        return CommunicatorOutcome(comm=self.comm)
+
+    def _find_available_pynccl_port(self, context: PortRangeContext, *, host: str, start_port: int) -> int:
+        end_port = context.pynccl_port_base + context.pynccl_port_span
+        start_port = max(start_port, context.pynccl_port_base)
         remaining = end_port - start_port
         if remaining <= 0:
             raise RuntimeError(
                 "PyNccl port range exhausted: "
-                f"[{self.pynccl_port_base}, {end_port})"
+                f"[{context.pynccl_port_base}, {end_port})"
             )
         return _find_available_port(host, start_port, remaining)
 
-    def _check_and_reinit_pynccl(self, worker) -> bool:
+    def _check_and_reinit_pynccl(self, context: CommunicatorContext) -> CommunicatorOutcome:
         """
         Check if PyNccl communicator is healthy. If not, attempt to reinitialize.
         Returns True if communicator is healthy (or was successfully reinitialized).
         """
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if self.comm is None:
             # Will be lazily initialized in generate()
-            return True
+            return CommunicatorOutcome(comm=self.comm, healthy=True)
 
         # Skip health check if communicator is not available (e.g., single GPU)
         if not self.comm.available:
-            logging.debug(f"Rank {self.rank}: PyNccl communicator not available, skipping health check")
-            return True
+            logging.debug(f"Rank {context.rank}: PyNccl communicator not available, skipping health check")
+            return CommunicatorOutcome(comm=self.comm, healthy=True)
 
         try:
             # Quick health check using PyNccl all_reduce
             # CRITICAL: Must enable the communicator first - it's disabled by default after init
-            health_tensor = torch.ones(1, device=self.torch_device, dtype=torch.float32)
+            health_tensor = torch.ones(1, device=context.torch_device, dtype=torch.float32)
             with self.comm.change_state(enable=True):
                 self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
-            torch.cuda.synchronize(self.torch_device)
+            torch.cuda.synchronize(context.torch_device)
 
-            expected = float(self.world_size)
+            expected = float(context.world_size)
             if abs(health_tensor.item() - expected) > 1e-6:
                 raise RuntimeError(f"PyNccl health check mismatch: got {health_tensor.item()}, expected {expected}")
 
-            logging.debug(f"Rank {self.rank}: PyNccl health check passed")
-            return True
+            logging.debug(f"Rank {context.rank}: PyNccl health check passed")
+            return CommunicatorOutcome(comm=self.comm, healthy=True)
         
         except Exception as e:
-            logging.warning(f"Rank {self.rank}: PyNccl health check failed: {e}")
-            logging.info(f"Rank {self.rank}: Attempting to reinitialize PyNccl communicator...")
+            logging.warning(f"Rank {context.rank}: PyNccl health check failed: {e}")
+            logging.info(f"Rank {context.rank}: Attempting to reinitialize PyNccl communicator...")
 
             # Destroy old communicator
             try:
                 if self.comm is not None:
                     self.comm.destroy()
                     self.comm = None
-                    logging.info(f"Rank {self.rank}: NCCL communicator destroyed successfully")
+                    logging.info(f"Rank {context.rank}: NCCL communicator destroyed successfully")
             except Exception as destroy_e:
-                logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {destroy_e}")
+                logging.warning(f"Rank {context.rank}: Error destroying PyNccl communicator: {destroy_e}")
                 self.comm = None
 
             # Destroy old group (releases TCPStore and port)
@@ -546,9 +581,9 @@ class RankSyncEngine:
                     self._nccl_group = None
                     # Force garbage collection to release TCPStore socket
                     gc.collect()
-                    logging.info(f"Rank {self.rank}: NCCL group destroyed successfully")
+                    logging.info(f"Rank {context.rank}: NCCL group destroyed successfully")
             except Exception as group_e:
-                logging.warning(f"Rank {self.rank}: Error destroying NCCL group: {group_e}")
+                logging.warning(f"Rank {context.rank}: Error destroying NCCL group: {group_e}")
                 self._nccl_group = None
 
             # Synchronize all ranks before any tries to recreate (uses torch.distributed)
@@ -557,55 +592,53 @@ class RankSyncEngine:
             try:
                 if dist.is_initialized():
                     dist.barrier()
-                    logging.debug(f"Rank {self.rank}: Barrier after NCCL cleanup passed")
+                    logging.debug(f"Rank {context.rank}: Barrier after NCCL cleanup passed")
             except Exception as barrier_e:
-                logging.warning(f"Rank {self.rank}: Barrier after NCCL cleanup failed: {barrier_e}")
+                logging.warning(f"Rank {context.rank}: Barrier after NCCL cleanup failed: {barrier_e}")
 
             # Find next available port for reinitialization
             # Rank 0 finds the port, then broadcasts to all ranks
             comm_master_addr = os.getenv("COMM_MASTER_ADDR", "127.0.0.1")
             selected_port = self._nccl_port
-            if self.rank == 0:
+            if context.rank == 0:
                 try:
                     selected_port = self._find_available_pynccl_port(
-                        comm_master_addr,
-                        self._nccl_port + 1,
+                        PortRangeContext(context.pynccl_port_base, context.pynccl_port_span),
+                        host=comm_master_addr,
+                        start_port=self._nccl_port + 1,
                     )
                     logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl reinit")
                 except RuntimeError as e:
                     logging.error(f"Rank 0: Failed to find available port: {e}")
                     selected_port = -1
             # Broadcast port to all ranks
-            port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
+            port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=context.torch_device)
             dist.broadcast(port_tensor, src=0)
             self._nccl_port = port_tensor.item()
             if self._nccl_port < 0:
-                return False
-            logging.debug(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
+                return CommunicatorOutcome(comm=self.comm, healthy=False)
+            logging.debug(f"Rank {context.rank}: Next PyNccl port will be {self._nccl_port}")
 
             # Delay to allow OS to fully release resources
             # Rank 0 needs extra time since it's the TCPStore server
-            if self.rank == 0:
+            if context.rank == 0:
                 time.sleep(1.0)
             else:
                 time.sleep(0.5)
 
             # Will be reinitialized lazily in generate()
-            return True
+            return CommunicatorOutcome(comm=self.comm, healthy=True)
 
-    def init_nvshmem(self, worker):
+    def init_nvshmem(self, *, rank: int):
         """Initialize NVSHMEM only once per batch, not per decode iteration."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
-            if self.rank == 0:
+            if rank == 0:
                 logging.debug("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled")
             return
     
         # Check if already initialized this run
         if getattr(self, '_nvshmem_initialized_this_run', False):
-            logging.debug(f"Rank {self.rank}: NVSHMEM already initialized this run, skipping")
+            logging.debug(f"Rank {rank}: NVSHMEM already initialized this run, skipping")
             return
         
         import nvshmem.core as nvshmem
@@ -629,45 +662,33 @@ class RankSyncEngine:
 
     # ---- SyncCoordinator facade --------------------------------------------
 
-    def _make_sync_coordinator(self, worker) -> SyncCoordinator:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _make_sync_coordinator(self) -> SyncCoordinator:
         if self._sync_coordinator is None:
             self._sync_coordinator = SyncCoordinator(backend=TorchDistCollectiveBackend())
         return self._sync_coordinator
 
-    def _make_sync_context(self, worker) -> SyncContext:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _make_sync_context(self, context: SyncContext) -> SyncContext:
         return SyncContext(
-            rank=self.rank,
-            uuid_to_local=self._uuid_to_local_map,
-            global_batch=self.global_batch,
-            torch_device=self.torch_device,
+            rank=context.rank,
+            uuid_to_local=context.uuid_to_local,
+            global_batch=context.global_batch,
+            torch_device=context.torch_device,
         )
 
     def _sync_completion_status_tensor(
-        self, worker,
+        self, context: SyncContext, *,
         decode_uuids: List[str],
     ) -> Tuple[Set[str], List[str]]:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         return self._make_sync_coordinator().sync_completion_status_tensor(
-            self._make_sync_context(), decode_uuids
+            self._make_sync_context(context), decode_uuids
         )
 
     def _sync_decode_uuids_tensor(
-        self, worker,
+        self, context: SyncContext, *,
         decode_uuids: List[str],
     ) -> List[str]:
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         return self._make_sync_coordinator().sync_decode_uuids_tensor(
-            self._make_sync_context(), decode_uuids
+            self._make_sync_context(context), decode_uuids
         )
 
     # ---- Rank agreement on per-step MoE token counts -----------------------
@@ -758,24 +779,22 @@ class RankSyncEngine:
         )
 
     def _sync_prefill_moe_rank_counts(
-        self, worker, local_token_count: int, *, reason: str
+        self, context: PrefillMoeContext, *, local_token_count: int, reason: str,
+        decode_attn_tp_size: Callable[[], int],
     ) -> int:
         """Size resident-EP prefill collectives after TP-group row scattering."""
-        # Moved VERBATIM from batchgen_worker.py (S8); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         local = torch.tensor(
             [int(local_token_count)],
             dtype=torch.int64,
-            device=self.torch_device,
+            device=context.torch_device,
         )
         counts = torch.empty(
-            (self.world_size,), dtype=torch.int64, device=self.torch_device
+            (context.world_size,), dtype=torch.int64, device=context.torch_device
         )
         dist.all_gather_into_tensor(counts, local)
-        G = self._decode_attn_tp_size()
+        G = decode_attn_tp_size()
         counts_list = [int(value) for value in counts.cpu().tolist()]
-        for start in range(0, self.world_size, G):
+        for start in range(0, context.world_size, G):
             group = counts_list[start:start + G]
             if len(set(group)) != 1:
                 raise RuntimeError(
@@ -785,13 +804,13 @@ class RankSyncEngine:
         max_group_tokens = max(counts_list)
         from batchgen.decode_dp_group import moe_ntp_from_group_max
         moe_ntp = moe_ntp_from_group_max(max_group_tokens, G)
-        self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
-        if self.rank == 0:
+        context.parallel_manager.set_num_tokens_per_rank(moe_ntp)
+        if context.rank == 0:
             logging.info(
                 "[K3_PREFILL_MOE] reason=%s group_token_counts=%s "
                 "post_scatter_ntp=%s",
                 reason,
-                [counts_list[start] for start in range(0, self.world_size, G)],
+                [counts_list[start] for start in range(0, context.world_size, G)],
                 moe_ntp,
             )
         return moe_ntp

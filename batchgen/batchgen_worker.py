@@ -206,7 +206,13 @@ from batchgen.worker.decode_engine import (
 from batchgen.worker.prefill_engine import PrefillEngine
 from batchgen.worker.worker_lifecycle_engine import WorkerLifecycleEngine
 from batchgen.worker.step_observability_engine import StepObservabilityEngine
-from batchgen.worker.rank_sync_engine import RankSyncEngine
+from batchgen.worker.rank_sync_engine import (
+    CommunicatorContext,
+    PortRangeContext,
+    PrefillMoeContext,
+    QuiesceContext,
+    RankSyncEngine,
+)
 
 
 from batchgen.worker.rank_context import RankContext, node_of_rank
@@ -1106,7 +1112,6 @@ class BatchGenWorker:
 		# Cohort teardown probe, set by the worker supervisor before the main
 		# loop (see set_cohort_shutdown_probe).  None until then, and on every
 		# path that never serves a pool, so every call site must tolerate it.
-		self._cohort_shutdown_probe = None
 		# Latched by the decode-step boundary check so the supervisor can name
 		# the exit path this rank actually took.  Never cleared: a cohort
 		# teardown is terminal for this process.
@@ -1136,7 +1141,6 @@ class BatchGenWorker:
 		self._prefix = PrefixReuseState(rank=self.rank, world_size=self.world_size)
 		self.pynccl_port_base = args.pynccl_port_base
 		self.pynccl_port_span = args.pynccl_port_span
-		self._nccl_port = self.pynccl_port_base
 		self.gpu_arch = args.gpu_arch
 		self.kv_dtype = args.kv_dtype
 		self.device = args.device
@@ -1159,10 +1163,7 @@ class BatchGenWorker:
 		self._kv_capacity_engine = KVCapacityEngine()
 		self._worker_lifecycle_engine = WorkerLifecycleEngine()
 		self._step_observability_engine = StepObservabilityEngine()
-		self._rank_sync_engine = RankSyncEngine()
-		# SyncCoordinator instantiated lazily on first use so we don't
-		# touch torch.distributed before it's initialized.
-		self._sync_coordinator: Optional[SyncCoordinator] = None
+		self._rank_sync_engine = RankSyncEngine(nccl_port=self.pynccl_port_base)
 		# Phase 5.1b of worker decouple (issue #175): dual-path gate for the
 		# KVCacheManager stats tier. NATIVE=1 routes the 3 read-only stat
 		# helpers through `batchgen.worker.kv_manager.KVCacheManager`.
@@ -1538,12 +1539,10 @@ class BatchGenWorker:
 
 		# 9. Initialization Flags
 		self._core_initialized = False
-		self._nvshmem_initialized_this_run = False
 		
 		# 10. Distributed Communication Info
 		self.dist_init_addr = args.dist_init_addr
 		self.comm = None  # Initialized lazily or in Init()
-		self._nccl_group = None  # StatelessProcessGroup for PyNccl (stores TCPStore)
 
 		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
@@ -3433,28 +3432,25 @@ class BatchGenWorker:
 			name,
 		)
 
-	def set_cohort_shutdown_probe(self, probe) -> None:
-		# The engine receives this worker as its sole state collaborator.
+	@property
+	def _cohort_shutdown_probe(self):
+		"""The engine-owned probe shared with the decode loop."""
+		engine = getattr(self, "_rank_sync_engine", None)
+		return None if engine is None else engine._cohort_shutdown_probe_value
+
+	@_cohort_shutdown_probe.setter
+	def _cohort_shutdown_probe(self, probe):
 		engine = getattr(self, "_rank_sync_engine", None)
 		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
 			engine = RankSyncEngine()
 			self._rank_sync_engine = engine
-		return engine.set_cohort_shutdown_probe(
-			self,
-			probe,
-		)
+		engine.set_cohort_shutdown_probe(probe=probe)
+
+	def set_cohort_shutdown_probe(self, probe) -> None:
+		self._cohort_shutdown_probe = probe
 
 	def _cohort_shutdown_requested(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._cohort_shutdown_requested(
-			self,
-		)
+		return self._rank_sync_engine._cohort_shutdown_requested()
 
 	def _wait_decode_tokens(self, event) -> str:
 		"""Wait for a decode step's sampled-token readback, pollably.
@@ -3685,62 +3681,36 @@ class BatchGenWorker:
 		)
 
 	def _poll_until(self, ready, deadline) -> bool:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._poll_until(
-			self,
-			ready,
-			deadline,
+		return self._rank_sync_engine._poll_until(
+			rank=self.rank, ready=ready, deadline=deadline,
 		)
 
 	def _pending_kv_appends_done(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._pending_kv_appends_done(
-			self,
+		return self._rank_sync_engine._pending_kv_appends_done(
+			pending_tasks=getattr(self, "_pending_kv_append_tasks", ()),
 		)
 
 	def _record_quiesce_device_event(self):
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._record_quiesce_device_event(
-			self,
+		return self._rank_sync_engine._record_quiesce_device_event(
+			QuiesceContext(rank=self.rank, torch_device=self.torch_device),
 		)
 
 	def _self_exit_on_quiesce_deadline(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._self_exit_on_quiesce_deadline(
-			self,
-		)
+		outcome = self._rank_sync_engine._self_exit_on_quiesce_deadline(rank=self.rank)
+		os._exit(outcome.exit_code)
 
 	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._quiesce_decode_for_cohort_shutdown(
-			self,
-			pending_async_task,
+		outcome = self._rank_sync_engine._quiesce_decode_for_cohort_shutdown(
+			QuiesceContext(
+				rank=self.rank, torch_device=self.torch_device,
+				pending_kv_append_tasks=getattr(self, "_pending_kv_append_tasks", ()),
+			),
+			pending_async_task=pending_async_task,
+			wait_pending_kv_append_tasks=self._wait_pending_kv_append_tasks,
+			disable_decode_watchdog=self.disable_decode_watchdog,
 		)
+		if outcome.self_exit_required:
+			self._self_exit_on_quiesce_deadline()
 
 	@property
 	def cohort_shutdown_observed(self) -> bool:
@@ -4556,14 +4526,8 @@ class BatchGenWorker:
 		)
 
 	def _get_or_create_gloo_group(self):
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._get_or_create_gloo_group(
-			self,
+		return self._rank_sync_engine._get_or_create_gloo_group(
+			rank=self.rank, world_size=self.world_size,
 		)
 
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
@@ -4939,55 +4903,38 @@ class BatchGenWorker:
 	# process group is initialized.
 
 	def _make_sync_coordinator(self) -> SyncCoordinator:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._make_sync_coordinator(
-			self,
-		)
+		return self._rank_sync_engine._make_sync_coordinator()
 
 	def _make_sync_context(self) -> SyncContext:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._make_sync_context(
-			self,
+		return self._rank_sync_engine._make_sync_context(
+			SyncContext(
+				rank=self.rank, uuid_to_local=self._uuid_to_local_map,
+				global_batch=self.global_batch, torch_device=self.torch_device,
+			),
 		)
 
 	def _sync_completion_status_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> Tuple[Set[str], List[str]]:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._sync_completion_status_tensor(
-			self,
-			decode_uuids,
+		return self._rank_sync_engine._sync_completion_status_tensor(
+			SyncContext(
+				rank=self.rank, uuid_to_local=self._uuid_to_local_map,
+				global_batch=self.global_batch, torch_device=self.torch_device,
+			),
+			decode_uuids=decode_uuids,
 		)
 
 	def _sync_decode_uuids_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> List[str]:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._sync_decode_uuids_tensor(
-			self,
-			decode_uuids,
+		return self._rank_sync_engine._sync_decode_uuids_tensor(
+			SyncContext(
+				rank=self.rank, uuid_to_local=self._uuid_to_local_map,
+				global_batch=self.global_batch, torch_device=self.torch_device,
+			),
+			decode_uuids=decode_uuids,
 		)
 
 	# ============ QueryBook Buffer Pool ============
@@ -6329,27 +6276,20 @@ class BatchGenWorker:
 		)
 
 	def _ensure_pynccl_communicator(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._ensure_pynccl_communicator(
-			self,
+		outcome = self._rank_sync_engine._ensure_pynccl_communicator(
+			CommunicatorContext(
+				rank=self.rank, world_size=self.world_size,
+				local_rank=self.local_rank, torch_device=self.torch_device,
+				pynccl_port_base=self.pynccl_port_base,
+				pynccl_port_span=self.pynccl_port_span,
+			),
 		)
+		self.comm = outcome.comm
 
 	def _find_available_pynccl_port(self, host: str, start_port: int) -> int:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._find_available_pynccl_port(
-			self,
-			host,
-			start_port,
+		return self._rank_sync_engine._find_available_pynccl_port(
+			PortRangeContext(self.pynccl_port_base, self.pynccl_port_span),
+			host=host, start_port=start_port,
 		)
 
 	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
@@ -12001,13 +11941,7 @@ class BatchGenWorker:
 					manager.rebuild_page_table(cur_batch)
 
 	def _sync_decode_moe_rank_counts(self, batch: List[int], *, reason: str) -> int:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		outcome = engine._sync_decode_moe_rank_counts(
+		outcome = self._rank_sync_engine._sync_decode_moe_rank_counts(
 			self._decode_phase_context(),
 			batch,
 			reason=reason,
@@ -12027,16 +11961,13 @@ class BatchGenWorker:
 	def _sync_prefill_moe_rank_counts(
 		self, local_token_count: int, *, reason: str
 	) -> int:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._sync_prefill_moe_rank_counts(
-			self,
-			local_token_count,
-			reason=reason,
+		return self._rank_sync_engine._sync_prefill_moe_rank_counts(
+			PrefillMoeContext(
+				rank=self.rank, world_size=self.world_size,
+				torch_device=self.torch_device, parallel_manager=self.parallel_manager,
+			),
+			local_token_count=local_token_count, reason=reason,
+			decode_attn_tp_size=self._decode_attn_tp_size,
 		)
 
 	def _warmup_cuda_graphs(self):
@@ -13530,26 +13461,19 @@ class BatchGenWorker:
 			self._append_trajectory_token(seq, int(new_tokens[idx].item()))
 
 	def init_nvshmem(self):
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine.init_nvshmem(
-			self,
-		)
+		return self._rank_sync_engine.init_nvshmem(rank=self.rank)
 
 	def _check_and_reinit_pynccl(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_rank_sync_engine", None)
-		if engine is None:
-			from batchgen.worker.rank_sync_engine import RankSyncEngine
-			engine = RankSyncEngine()
-			self._rank_sync_engine = engine
-		return engine._check_and_reinit_pynccl(
-			self,
+		outcome = self._rank_sync_engine._check_and_reinit_pynccl(
+			CommunicatorContext(
+				rank=self.rank, world_size=self.world_size,
+				local_rank=self.local_rank, torch_device=self.torch_device,
+				pynccl_port_base=self.pynccl_port_base,
+				pynccl_port_span=self.pynccl_port_span,
+			),
 		)
+		self.comm = outcome.comm
+		return outcome.healthy
 
 	def _unregister_fp8_weights(self):
 		# The engine receives this worker as its sole state collaborator.
