@@ -54,7 +54,6 @@ from typing import Mapping, Sequence
 
 from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotArena,
-    SnapshotArenaCorrupt,
     SnapshotArenaUnavailable,
     SnapshotLayout,
     merge_unit_chunks,

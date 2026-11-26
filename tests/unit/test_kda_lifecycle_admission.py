@@ -8,8 +8,6 @@ ledger never discounts them -- the record is per sequence, never shared.
 
 import math
 
-import pytest
-
 from batchgen.worker.kv_plan import prefill_owner_demand_pages
 from batchgen.worker.prefill import (
     PREFILL_CAP_HOST_KV_PAGES,
