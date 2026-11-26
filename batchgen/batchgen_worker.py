@@ -12703,13 +12703,57 @@ class BatchGenWorker:
 		)
 
 	def _setup_cuda_graphs(self, gpu_manager):
-		"""Capture CUDA graphs for decode: full attention block per layer.
+		"""Capture from values and live helpers, then bind the final outcome.
 
-		Moved verbatim to ``GraphRuntime._setup_cuda_graphs``; this stub
-		delegates with the worker passed in as the engine's sole state
-		collaborator.
+		On an exception no outcome fields are bound, even where the original
+		method had already assigned them. Explicit helpers and graph/model/KV
+		mutations stay live; a caught OOM that returns normally binds its outcome.
 		"""
-		return self._graph._setup_cuda_graphs(self, gpu_manager)
+		from batchgen.worker.graph_runtime import GRAPH_SETUP_UNCHANGED, GraphSetupContext
+
+		ctx = GraphSetupContext(
+			_graph=self._graph,
+			model_name=self.model_name,
+			args=self.args,
+			torch_device=self.torch_device,
+			model_config=self.model_config,
+			model=self.model,
+			core_engine=self.core_engine,
+			rank=self.rank,
+			world_size=self.world_size,
+			disable_decode_host_kv_staging=self.glm5_disable_decode_host_kv_staging,
+			_decode_graph_ladder_logged=getattr(self, "_decode_graph_ladder_logged", False),
+			_current_decode_local_batch_size=getattr(self, "_current_decode_local_batch_size", 0),
+			_current_decode_max_rank_batch_size=getattr(self, "_current_decode_max_rank_batch_size", 0),
+			_current_decode_rank_token_counts=getattr(self, "_current_decode_rank_token_counts", None),
+			_criticality_probe_recapture=getattr(self, "_criticality_probe_recapture", False),
+			_criticality_probe_request=getattr(self, "_criticality_probe_request", None),
+		)
+		outcome = self._graph._setup_cuda_graphs(
+			ctx, gpu_manager,
+			_decode_graph_bucket_sizes=self._decode_graph_bucket_sizes,
+			_max_decode_rank_bsz=self._max_decode_rank_bsz,
+			_assert_decode_graph_capture_allowed=self._assert_decode_graph_capture_allowed,
+			_bind_graph_capture_kv_manager=self._bind_graph_capture_kv_manager,
+			_bind_graph_capture_kv_managers=self._bind_graph_capture_kv_managers,
+			_record_decode_graph_capture=self._record_decode_graph_capture,
+			_glm5_whole_model_graph_requested_for_current_batch=self._glm5_whole_model_graph_requested_for_current_batch,
+			_glm5_whole_model_graph_capture_signature=self._glm5_whole_model_graph_capture_signature,
+			_glm5_whole_model_graph_timing_requested_for_current_batch=self._glm5_whole_model_graph_timing_requested_for_current_batch,
+			_glm5_dsa_graph_score_capacity_tokens=self._glm5_dsa_graph_score_capacity_tokens,
+			_deployment_context_bound_tokens=self._deployment_context_bound_tokens,
+			_warn_decode_graph_span_exceeded=self._warn_decode_graph_span_exceeded,
+			_glm5_dsa_graph_required_tokens=self._glm5_dsa_graph_required_tokens,
+			_release_glm5_whole_model_graph_state=self._release_glm5_whole_model_graph_state,
+			_glm5_whole_model_graph_probe_layers=self._glm5_whole_model_graph_probe_layers,
+			_make_glm5_whole_model_capture_inputs=self._make_glm5_whole_model_capture_inputs,
+		)
+		if outcome._decode_graph_ladder_logged is not GRAPH_SETUP_UNCHANGED:
+			self._decode_graph_ladder_logged = outcome._decode_graph_ladder_logged
+		if outcome._criticality_probe is not GRAPH_SETUP_UNCHANGED:
+			self._criticality_probe = outcome._criticality_probe
+		if outcome._criticality_probe_recapture is not GRAPH_SETUP_UNCHANGED:
+			self._criticality_probe_recapture = outcome._criticality_probe_recapture
 
 	def _bind_graph_capture_kv_managers(self, primary_manager, aux_manager) -> None:
 		"""Binder for graph capture: bind the primary and aux KV managers."""

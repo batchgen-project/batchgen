@@ -165,6 +165,9 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
     Worker = type("Worker", (), dict(methods))
     worker = Worker()
 
+    def unexpected_capture_helper(*args, **kwargs):
+        raise AssertionError("retained-instance setup must return or refuse before calling capture helpers")
+
     def setup(gpu_manager):
         worker.setup_calls += 1
         events.append("graph_setup")
@@ -231,6 +234,17 @@ def _worker(model_name, *, retains_decode, graphs, cuda=None, dist=None,
         _finalize_gpu_kv_pool_after_capture=lambda gpu_manager: events.append("pool_finalized"),
         _setup_cuda_graphs=setup,
         model_config=SimpleNamespace(),
+        model=None, core_engine=None, glm5_disable_decode_host_kv_staging=False,
+        _bind_graph_capture_kv_manager=unexpected_capture_helper,
+        _bind_graph_capture_kv_managers=unexpected_capture_helper,
+        _glm5_whole_model_graph_timing_requested_for_current_batch=lambda: False,
+        _glm5_dsa_graph_score_capacity_tokens=unexpected_capture_helper,
+        _deployment_context_bound_tokens=unexpected_capture_helper,
+        _warn_decode_graph_span_exceeded=unexpected_capture_helper,
+        _glm5_dsa_graph_required_tokens=unexpected_capture_helper,
+        _release_glm5_whole_model_graph_state=unexpected_capture_helper,
+        _glm5_whole_model_graph_probe_layers=unexpected_capture_helper,
+        _make_glm5_whole_model_capture_inputs=unexpected_capture_helper,
         _glm5_whole_model_graph_capture_signature=lambda bucket=None: ("page-tables", None),
         _decode_graph_bucket_sizes=lambda: list(BUCKETS),
         _max_decode_rank_bsz=lambda: 8,
