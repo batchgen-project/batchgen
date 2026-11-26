@@ -289,6 +289,55 @@ def test_credit_latch_transitions():
 	)
 
 
+# P3: resume is the pair of suspend — it clears only the suspension latch and
+# leaves the per-wave applied latch to note_wave_credit.
+def test_resume_shared_prefix_credit_clears_only_the_suspension_latch():
+	store = PrefixReuseState()
+	store.note_wave_credit(True)
+	assert store.suspend_shared_prefix_credit("credited-wave", rank=0)
+	assert store.shared_prefix_credit_suspended
+	store.resume_shared_prefix_credit()
+	assert not store.shared_prefix_credit_suspended
+	assert not store.shared_prefix_credit_applied
+	assert store.shared_prefix_credit_enabled(
+		shared_prefix_admission=True,
+		enable_prefix_cache=True,
+		pool_enabled=True,
+		prefill_pool_page_budget=1,
+	)
+	# Idempotent: resuming an unsuspended latch stays clear.
+	store.resume_shared_prefix_credit()
+	assert not store.shared_prefix_credit_suspended
+
+
+# P3: note_wave_credit is a bare per-round setter of the applied latch; the
+# value is collective-sourced, so each round's note overwrites the last.
+def test_note_wave_credit_records_each_rounds_value():
+	store = PrefixReuseState()
+	assert not store.shared_prefix_credit_applied
+	store.note_wave_credit(True)
+	assert store.shared_prefix_credit_applied is True
+	store.note_wave_credit(False)
+	assert store.shared_prefix_credit_applied is False
+	assert not store.shared_prefix_credit_suspended
+
+
+# P2: the prefix_drain metric latch is edge-triggered — marked once per drain,
+# re-armed by admission.
+def test_drain_metric_latch_mark_and_rearm():
+	store = PrefixReuseState()
+	assert store.prefix_drain_metric_emitted is False
+	store.mark_drain_metric_emitted()
+	assert store.prefix_drain_metric_emitted is True
+	# Idempotent until re-armed.
+	store.mark_drain_metric_emitted()
+	assert store.prefix_drain_metric_emitted is True
+	store.rearm_drain_metric()
+	assert store.prefix_drain_metric_emitted is False
+	store.rearm_drain_metric()
+	assert store.prefix_drain_metric_emitted is False
+
+
 # D-E/A6: add and release paths keep pool sid refcounts until the last member.
 def test_refcount_add_release_paths():
 	store = PrefixReuseState()

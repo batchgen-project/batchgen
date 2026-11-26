@@ -474,7 +474,7 @@ class StepObservabilityEngine:
             return
         if not self.global_batch.all_completed():
             return
-        self._prefix.prefix_drain_metric_emitted = True
+        self._prefix.mark_drain_metric_emitted()
         self._emit_prefix_cache_metric(
             "prefix_drain",
             **self._prefix_host_resource_fields(),
