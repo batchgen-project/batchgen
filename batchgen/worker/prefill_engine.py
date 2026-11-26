@@ -2580,7 +2580,8 @@ class PrefillEngine:
                 _memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
                 _memprof_probe = None
                 if _memprof_layers:
-                    def _memprof_probe(layer_idx, decoder_layer, block_residual):
+                    def _memprof_probe(layer_idx, decoder_layer, block_residual,
+                                       _stop_layer=_memprof_stop_layer):
                         logging.info(
                             f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
                             f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
@@ -2589,7 +2590,7 @@ class PrefillEngine:
                             f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
                             f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
                         )
-                        if layer_idx == _memprof_stop_layer:
+                        if layer_idx == _stop_layer:
                             _p = os.path.join(
                                 os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
                                 f"memprof_rank{self.rank}_thru_layer{layer_idx}_{int(time.time())}.pickle",
