@@ -375,7 +375,7 @@ def test_the_capture_loop_filters_against_the_runtimes_failed_set():
     # pin reads the delegated engine body (verbatim worker spelling).
     src = delegated_method_source("_setup_cuda_graphs")
     assert (
-        "failed_buckets = self._graph.glm5_whole_model_graph_failed_buckets" in src
+        "failed_buckets = ctx._graph.glm5_whole_model_graph_failed_buckets" in src
     )
 
 
@@ -617,3 +617,83 @@ def test_the_ordered_shutdown_calls_the_runtime_instead_of_five_setattrs():
         '"_whole_model_segment"',
     ):
         assert old not in loop, old
+
+
+def test_graph_runtime_never_names_worker():
+    """The real runtime accepts values, never a worker or a worker rebind.
+
+    GraphRuntime's existing state methods may name ``self``. The setup
+    body may not: its input is the frozen context, not either kind of owner.
+    """
+    path = _ROOT / "batchgen" / "worker" / "graph_runtime.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            assert node.arg != "worker", ast.dump(node)
+        if isinstance(node, ast.Name):
+            assert node.id not in {"worker", "BatchGenWorker"}, node.lineno
+            if node.id == "self":
+                assert isinstance(node.ctx, ast.Load), node.lineno
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "self":
+                assert node.attr in INITIAL, (node.lineno, node.attr)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            assert "batchgen_worker" not in ast.unparse(node), node.lineno
+    setup = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_setup_cuda_graphs"
+    )
+    assert [arg.arg for arg in setup.args.args] == ["ctx", "gpu_manager"]
+    assert not setup.args.posonlyargs
+    assert setup.args.vararg is None and setup.args.kwarg is None
+    expected_helpers = {
+        "_decode_graph_bucket_sizes", "_max_decode_rank_bsz",
+        "_assert_decode_graph_capture_allowed", "_bind_graph_capture_kv_manager",
+        "_bind_graph_capture_kv_managers", "_record_decode_graph_capture",
+        "_glm5_whole_model_graph_requested_for_current_batch",
+        "_glm5_whole_model_graph_capture_signature",
+        "_glm5_whole_model_graph_timing_requested_for_current_batch",
+        "_glm5_dsa_graph_score_capacity_tokens",
+        "_deployment_context_bound_tokens",
+        "_warn_decode_graph_span_exceeded",
+        "_glm5_dsa_graph_required_tokens",
+        "_release_glm5_whole_model_graph_state",
+        "_glm5_whole_model_graph_probe_layers",
+        "_make_glm5_whole_model_capture_inputs",
+    }
+    assert {arg.arg for arg in setup.args.kwonlyargs} == expected_helpers
+    assert all(ast.unparse(arg.annotation) == "Callable" for arg in setup.args.kwonlyargs)
+    assert all(default is None for default in setup.args.kw_defaults)
+    assert not any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in ast.walk(setup))
+    context = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GraphSetupContext")
+    for field in context.body:
+        if isinstance(field, ast.AnnAssign):
+            assert not {"Callable", "callable", "Protocol"} & {
+                n.id for n in ast.walk(field.annotation) if isinstance(n, ast.Name)
+            }
+            assert not any(
+                isinstance(n, ast.Attribute) and n.attr in {"Callable", "Protocol"}
+                for n in ast.walk(field.annotation)
+            )
+    # Inspect actual defaults too: a name, lambda or default_factory can hide
+    # a callable even when the annotation is Any.
+    import dataclasses
+    from batchgen.worker.graph_runtime import GraphSetupContext
+    for field in dataclasses.fields(GraphSetupContext):
+        assert field.name not in expected_helpers
+        if field.default is not dataclasses.MISSING:
+            assert not callable(field.default)
+        assert field.default_factory is dataclasses.MISSING
+    assert not any(
+        isinstance(node, ast.Name) and node.id in {"self", "worker"}
+        for node in ast.walk(setup)
+    )
+    for node in ast.walk(setup):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            assert ast.unparse(node.value) != "ctx", node.lineno
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"setattr", "delattr", "vars"}:
+                assert not any(
+                    isinstance(arg, ast.Name) and arg.id == "ctx"
+                    for arg in node.args
+                ), node.lineno

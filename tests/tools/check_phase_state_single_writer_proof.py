@@ -200,6 +200,12 @@ def delegated_call(node):
     """``self._binder(arg, ...)`` for a registered delegated binder."""
     if (
         isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in DELEGATED_BINDERS
+    ):
+        return node.func.id
+    if (
+        isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
