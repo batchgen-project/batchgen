@@ -164,7 +164,7 @@ import gc
 import numpy as np
 from datetime import timedelta
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -1314,9 +1314,6 @@ class BatchGenWorker:
 		self._prefill_prefix_kv_budget_bytes = None
 		# (allocated, reserved, device use outside the allocator) once the pool is up
 		self._prefill_pool_base = (0, 0, 0)
-		# Pseudo Host ids must not collide with entries a previous worker of
-		# this node left in the shared Host KV region (hot reload).
-		# ``PrefixReuseState`` seeded and initialized these fields eagerly.
 		# Scheduler-loop hard guard against identical empty prefill waves with
 		# nothing live; _prepare_prefill_batch publishes the rank-identical
 		# admission state (and its selection snapshot) the guard compares.
@@ -2486,7 +2483,7 @@ class BatchGenWorker:
 				trajectory_restore_boundary=int(restore),
 			)
 			prefix_states[global_id] = state
-			self._prefix.prefix_sequence_states[global_id] = state
+			self._prefix.install_state(global_id, state)
 		# 方案甲 follower side, ungated: adopt the leader's per-sequence
 		# record arenas so this rank's unit writes at the prefill end land
 		# in the right windows.
@@ -5176,7 +5173,7 @@ class BatchGenWorker:
 					attached_tokens=int(attached),
 					compute_cached_tokens=int(compute_cached),
 				)
-				self._prefix.prefix_sequence_states[seq.global_idx] = state
+				self._prefix.install_state(seq.global_idx, state)
 				prefix_states[seq.global_idx] = state
 		# M3 Slice 2, SAME debug-state key as the commit side: one flag
 		# governs the whole trajectory path, so lookups cannot be on while
@@ -5412,12 +5409,12 @@ class BatchGenWorker:
 			if self._prefill_pool_wave is not None:
 				wave = self._prefill_pool_wave
 				# Members release first (their rows merely reference segment
-				# pages), then each pseudo-sid frees and unregisters. Pop only
-				# THIS wave's entries: earlier waves' members still hold refs.
-				for gid in wave.global_ids:
-					self._prefix.pool_member_sids.pop(gid, None)
-				for sid in set(wave.segment_sids.values()):
-					self._prefix.pool_sid_members.pop(sid, None)
+				# pages), then each pseudo-sid frees and unregisters. The owner
+				# drops only THIS wave's entries: earlier waves' members still
+				# hold refs.
+				for sid in self._prefix.drop_wave_refs(
+					wave.global_ids, wave.segment_sids.values()
+				):
 					try:
 						host_view.release_sequence_pages([sid])
 					except Exception:
@@ -9247,8 +9244,7 @@ class BatchGenWorker:
 				"Rank %s failed to retire prefix prefill offloads",
 				self.rank,
 			)
-		while self._prefix.active_prefix_materializations:
-			materialization = self._prefix.active_prefix_materializations.pop()
+		for materialization in self._prefix.drain_materializations():
 			try:
 				self._close_prefix_materialization(
 					materialization,
@@ -10906,12 +10902,7 @@ class BatchGenWorker:
 					raise RuntimeError(
 						"prefix commit has no active sequence state"
 					)
-				self._prefix.prefix_sequence_states[seq.global_idx] = replace(
-					state,
-					commit_attachment_handles=(
-						*state.commit_attachment_handles, commit_handle
-					),
-				)
+				self._prefix.append_commit_handle(seq.global_idx, commit_handle)
 			retained = retain_inserted_prefix_pages(
 				commit_result=result,
 				request=request,

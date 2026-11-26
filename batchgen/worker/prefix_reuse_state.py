@@ -13,9 +13,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from dataclasses import replace
 from typing import Callable, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
+
+
+class PrefixSequenceStateMissingError(KeyError):
+    """A prefix commit handle arrived for a global id with no installed state.
+
+    Raised by ``PrefixReuseState.append_commit_handle``.  The prefix-cache
+    coordinator call site keeps its own get()+release+raise precheck (it must
+    release the handle it holds before failing); this named error is the
+    owner-side backstop for every other appender.
+    """
 
 
 class PrefixReuseState:
@@ -207,6 +218,85 @@ class PrefixReuseState:
 
     def pop_state(self, global_id: int):
         return self.prefix_sequence_states.pop(int(global_id), None)
+
+    def install_state(self, global_id: int, state) -> None:
+        """Install (or overwrite) one sequence's prefix-cache state.
+
+        A bare item setter by design, with NO validation: overwriting an
+        existing entry is LEGAL.  The pool lookup-replacement path releases
+        the old state's attachment handles at its call site before
+        overwriting, and the G>1 mirror installs wire values from the
+        serve-group leader that this rank cannot validate locally.
+        """
+        self.prefix_sequence_states[int(global_id)] = state
+
+    def append_commit_handle(self, global_id: int, handle: int) -> None:
+        """Append one commit attachment handle to an installed state.
+
+        Raises ``PrefixSequenceStateMissingError`` when no state is installed
+        for ``global_id``: a commit handle without a live sequence state has
+        no release lane.  A call site that holds the handle itself keeps its
+        own get()+release+raise precheck; this error is the backstop.
+        """
+        gid = int(global_id)
+        state = self.prefix_sequence_states.get(gid)
+        if state is None:
+            raise PrefixSequenceStateMissingError(gid)
+        self.prefix_sequence_states[gid] = replace(
+            state,
+            commit_attachment_handles=(
+                *state.commit_attachment_handles, handle
+            ),
+        )
+
+    def begin_materialization(self, materialization) -> None:
+        """Track one live prefix materialization until it is closed."""
+        self.active_prefix_materializations.append(materialization)
+
+    def end_materialization(self, materialization) -> None:
+        """Stop tracking a materialization that was closed in place.
+
+        ``list.remove`` raising ``ValueError`` on an untracked object is the
+        fail-loud contract: ending something this owner never began means the
+        begin/end pairing is broken.
+        """
+        self.active_prefix_materializations.remove(materialization)
+
+    def drain_materializations(self) -> Iterator[object]:
+        """Hand out every tracked materialization, newest first.
+
+        Each item is removed from the tracking list BEFORE it is yielded, so
+        a close that raises cannot see the same materialization again on the
+        next drain.
+
+        It is an iterator: nothing is popped until it is consumed.
+        """
+        while self.active_prefix_materializations:
+            yield self.active_prefix_materializations.pop()
+
+    def drop_wave_refs(
+        self, global_ids: Iterable[int], segment_sids: Iterable[int]
+    ) -> Iterator[int]:
+        """Unconditionally drop one failed wave's member chains and segments.
+
+        The rollback counterpart of ``release_pool_segment_refs``, and
+        deliberately distinct from it: release decrements one member's counts
+        and frees a segment only when its last member leaves, while this drop
+        removes the given member chains and segment entries OUTRIGHT -- the
+        wave never committed, so only this wave's members can reference its
+        segments, and other waves' entries survive because only the given ids
+        are popped.  All member chains are popped first, then each segment
+        sid is yielded exactly once (after its count entry is popped) so the
+        caller can release and unregister that segment's Host pages before
+        the next one.
+
+        It is an iterator: nothing happens until it is consumed.
+        """
+        for global_id in global_ids:
+            self.pool_member_sids.pop(int(global_id), None)
+        for sid in set(segment_sids):
+            self.pool_sid_members.pop(sid, None)
+            yield sid
 
     def add_pool_member_refs(self, global_id: int, sids: Iterable[int]) -> None:
         """Record one member's pseudo-sid chain and increment each refcount."""

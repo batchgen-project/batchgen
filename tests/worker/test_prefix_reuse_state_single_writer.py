@@ -5,9 +5,9 @@ prefix sequence states, the pool pseudo-sid namespace/refcounts, the digest
 cache and the credit latches; everything else must go through its methods.
 The worker holds it as ``self._prefix`` and hands it to the admission
 contexts as ``prefix`` (``ctx.prefix``, ``ctx.sched.prefix``).  This test
-pins TODAY's exact set of outside writes as a list that can only shrink: it
-fails when a NEW module/kind of write appears, and it fails when a listed
-offender no longer exists (stale entry), so every removal is deliberate.
+pins the exact set of outside writes as a list that could only shrink; the
+migration is COMPLETE and the list is empty, so it fails when any outside
+write appears: every write must go through an owner method.
 
 The field names are derived from the owner class's AST (every attribute it
 assigns on ``self``), so new fields are guarded automatically.  AST carries
@@ -187,18 +187,10 @@ def _offences(tree: ast.Module, fields: set, ambiguous: set):
     return found
 
 
-# The exact outside writes that exist today (one entry per file and kind of
-# write, no line numbers so the list does not churn).  Entries may only be
-# removed (by moving the write behind a PrefixReuseState method), never added.
-KNOWN_OFFENDERS = [
-    "batchgen/batchgen_worker.py: .active_prefix_materializations.pop(",
-    "batchgen/batchgen_worker.py: .pool_member_sids.pop(",
-    "batchgen/batchgen_worker.py: .pool_sid_members.pop(",
-    "batchgen/batchgen_worker.py: item write on .prefix_sequence_states",
-    "batchgen/worker/prefill_engine.py: .active_prefix_materializations.append(",
-    "batchgen/worker/prefill_engine.py: .active_prefix_materializations.remove(",
-    "batchgen/worker/prefill_engine.py: item write on .prefix_sequence_states",
-]
+# Every outside write has been moved behind a PrefixReuseState method
+# (entries were one per file and kind of write while the migration ran).
+# The list stays empty: a new entry may never be added.
+KNOWN_OFFENDERS = []
 
 
 def test_only_the_prefix_reuse_state_writes_its_fields():
