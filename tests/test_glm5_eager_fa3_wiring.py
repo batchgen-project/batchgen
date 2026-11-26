@@ -254,17 +254,27 @@ def test_selected_fa3_call_matches_the_graph_segment_shape() -> None:
     assert "cache_batch_idx" not in kw
 
 
-def test_eager_fa3_shape_matches_the_whole_model_graph_segment() -> None:
+def test_whole_model_graph_segment_delegates_to_the_one_fa3_spelling() -> None:
+    # The FA3 call exists once per branch, here in the selector; the
+    # whole-model graph segment's helpers bind the segment's static tables
+    # and buffers to the SAME functions instead of respelling the call.
     segment_src = _REPO_ROOT / "batchgen/models/glm/glm5/cuda_graph_segments.py"
-    seg = _function(_tree(segment_src), "_run_selected_fa3")
-    seg_kw = _kwargs(_calls_to(seg, "_fa3_with_kvcache")[0])
-    eager_kw = _kwargs(
-        _calls_to(_function(_selector(), "_run_selected_fa3"), "fa3")[0]
-    )
-    # Shared keyword surface: graph and eager must use one backend contract.
-    assert set(seg_kw) == set(eager_kw)
-    for scalar in ("softmax_scale", "causal", "num_splits", "return_softmax_lse"):
-        assert seg_kw[scalar] == eager_kw[scalar]
+    segment_tree = _tree(segment_src)
+    for runner in ("_run_selected_fa3", "_run_all_short_fa3"):
+        seg = _function(segment_tree, runner)
+        assert not _calls_to(seg, "_fa3_with_kvcache"), (
+            f"{runner}: the graph segment must not respell the FA3 call"
+        )
+        delegations = _calls_to(seg, runner)
+        assert len(delegations) == 1
+        imports = [
+            sub
+            for sub in ast.walk(seg)
+            if isinstance(sub, ast.ImportFrom)
+            and sub.module == "batchgen.attention.dsa.glm5_decode_selector"
+            and [alias.name for alias in sub.names] == [runner]
+        ]
+        assert len(imports) == 1
 
 
 def test_q_absorb_feeds_fa3_qv_directly() -> None:

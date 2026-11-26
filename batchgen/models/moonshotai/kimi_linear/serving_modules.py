@@ -381,6 +381,127 @@ def dsa_materialize_pool_segment_index_keys(
     return total_tokens
 
 
+def _project(module, hidden_flat: torch.Tensor):
+    """``(q_a, q_nope [B, H, nope], q_pe [B, H, rope], offload_kv [B, 1, 576])``
+    — the dense NoPE-MLA decode projections, shared statement for statement by
+    the eager step, the captured span, and the K3.1 DSA steps (NoPE: ``k_pe``
+    is carried unrotated). ``q_a`` is None on the ``q_lora_rank=None`` direct
+    path (no low-rank query for an indexer to consume)."""
+    bsz = hidden_flat.shape[0]
+    if module.q_lora_rank is not None:
+        q_a = F.linear(hidden_flat, module.q_a_proj.weight)
+        q_a = module.q_a_layernorm(q_a)
+        q = F.linear(q_a, module.q_b_proj.weight)
+    else:
+        q_a = None
+        q = F.linear(hidden_flat, module.q_proj.weight)
+    new_compressed_kv = F.linear(
+        hidden_flat, module.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
+    q = q.view(bsz, 1, module.num_heads, module.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+        q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
+    kv, k_pe = torch.split(
+        new_compressed_kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
+    normed_kv = module.kv_a_layernorm(kv)
+    offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
+    return q_a, q_nope.squeeze(2), q_pe.squeeze(2), offload_kv
+
+
+def _absorb(module, q_nope: torch.Tensor):
+    """``(absorbed_q [B, H, kv_lora_rank], out_absorb [H, v, kv_lora_rank])``."""
+    kv_b_proj = module.kv_b_proj.weight.data.view(module.num_heads, -1, module.kv_lora_rank)
+    q_absorb = kv_b_proj[:, : module.qk_nope_head_dim, :]
+    out_absorb = kv_b_proj[:, module.qk_nope_head_dim:, :]
+    return torch.einsum("bhd,hdc->bhc", q_nope, q_absorb), out_absorb
+
+
+def _finish(module, attn_out: torch.Tensor, out_absorb: torch.Tensor,
+            hidden_flat: torch.Tensor) -> torch.Tensor:
+    """Out-absorb, sigmoid output gate, ``o_proj``, TP reduce: ``[B, hidden]``."""
+    bsz = hidden_flat.shape[0]
+    attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, module.num_heads * module.v_head_dim)
+    if module.use_output_gate:
+        gate = F.linear(hidden_flat, module.g_proj.weight).sigmoid()
+        attn_output = attn_output * gate
+    attn_output = F.linear(attn_output, module.o_proj.weight)
+    return _reduce_mla_tp_output(module, attn_output)
+
+
+def mla_decode_nope_core(
+    attn,
+    hidden_states: torch.Tensor,
+    *,
+    cache_seqlens: torch.Tensor,
+    bind_kv_write,
+    mla_schedule=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The ONE dense NoPE-MLA decode step, graph-safe by construction.
+
+    Identical math for the eager step and the captured span; the ONLY seam
+    where the two spellings differ — how the step's new latent token reaches
+    the paged KV and which block table the dense decode reads — is injected:
+
+        ``bind_kv_write(k_tensor) -> (blocked_k, block_table, k_tensor)``
+
+    The eager binding writes through the manager
+    (``update_layer_decode_new_token``) and returns its live block table; the
+    captured binding writes with the fused static-table kernel (padding rows
+    dropped by ``num_valid_tokens``) and returns the bucket's static table,
+    whose address a graph may bake in. The dense paged decode itself goes
+    through the capability-selected seam
+    (``batchgen.attention.mla.paged_decode``): flash_mla on Hopper, flashinfer
+    trtllm-gen on Blackwell. It avoids the legacy BatchGen MLA backend, which
+    would import fa3_backend and DeepGEMM for nothing.
+
+    Args:
+        attn: KimiMLAAttention module (unwrapped).
+        hidden_states: (bsz, 1, hidden) post-input_layernorm activations.
+        cache_seqlens: (bsz,) int32 context length including the new token.
+        bind_kv_write: the KV write/table seam described above.
+        mla_schedule: the step's ``paged_decode.DecodeSchedule`` shared by
+            every MLA layer (whole-model graph), or None, which records one
+            inside the seam.
+
+    Returns:
+        (attn_output (bsz, 1, hidden), k_tensor (bsz, 1, 1, kv_dim)).
+    """
+    from batchgen.attention.mla.paged_decode import mla_paged_decode
+
+    bsz = hidden_states.shape[0]
+    hidden_2d = hidden_states.squeeze(1)
+
+    _, q_nope, q_pe, offload_kv = _project(attn, hidden_2d)
+    k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+    blocked_k, block_table, k_tensor = bind_kv_write(k_tensor)
+
+    absorbed_q, out_absorb = _absorb(attn, q_nope)
+    qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+    query_states = torch.empty(
+        bsz, attn.num_heads, 1, qk_head_dim,
+        dtype=blocked_k.dtype, device=blocked_k.device,
+    )
+    query_states[:, :, :, : attn.kv_lora_rank] = absorbed_q.view(
+        bsz, attn.num_heads, 1, attn.kv_lora_rank
+    )
+    query_states[:, :, :, attn.kv_lora_rank :] = q_pe.unsqueeze(2)
+    query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
+
+    attn_out = mla_paged_decode(
+        query_states,
+        blocked_k,
+        block_table,
+        cache_seqlens,
+        attn.kv_lora_rank,
+        attn.scaling,
+        schedule=mla_schedule,
+    )
+
+    attn_output = _finish(attn, attn_out, out_absorb, hidden_2d)
+    return attn_output.view(bsz, 1, -1), k_tensor
+
+
 def mla_decoding_nope_with_pagekv(
     self,
     hidden_states: torch.Tensor,
@@ -392,17 +513,16 @@ def mla_decoding_nope_with_pagekv(
     layer_idx: int = 0,
     batch_slice: Optional[tuple] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """NoPE MLA decode over paged KV (FlashMLA), adapted from
-    mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv with RoPE removed.
+    """NoPE MLA decode over paged KV: the eager binding of
+    ``mla_decode_nope_core`` (adapted long ago from
+    mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, RoPE removed).
+    The manager owns the paged write and the live block table; the math is
+    the core's, shared with the captured span.
 
     Returns:
         attn_output: (bsz, 1, hidden)
         k_tensor: (bsz, 1, 1, 576) new KV (already written into pages)
     """
-    # The dense paged decode itself goes through the capability-selected seam
-    # (batchgen.attention.mla.paged_decode): flash_mla on Hopper, flashinfer
-    # trtllm-gen on Blackwell. It avoids the legacy BatchGen MLA backend, which
-    # would import fa3_backend and DeepGEMM for nothing.
     if gpu_paged_kv_manager is None:
         raise ValueError("gpu_paged_kv_manager must be provided")
     bsz, q_len, _ = hidden_states.size()
@@ -414,87 +534,37 @@ def mla_decoding_nope_with_pagekv(
     if q_len != 1:
         raise ValueError("decode path only supports q_len=1")
 
-    hidden_states = hidden_states.squeeze(1)  # (bsz, hidden)
-
-    # ---- projections (q_lora_rank=None direct path) ----
-    if self.q_lora_rank is not None:
-        q = F.linear(hidden_states, self.q_a_proj.weight)
-        q = self.q_a_layernorm(q)
-        q = F.linear(q, self.q_b_proj.weight)
-    else:
-        q = F.linear(hidden_states, self.q_proj.weight)
-    new_compressed_kv = F.linear(
-        hidden_states, self.kv_a_proj_with_mqa.weight
-    ).view(bsz, 1, -1)
-
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(
-        q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-    )
-
-    # ---- KV cache update (NoPE: no rotation on k_pe) ----
-    kv, k_pe = torch.split(
-        new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-    )
-    normed_kv = self.kv_a_layernorm(kv)
-    offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
-
     manager_device = gpu_paged_kv_manager.device
-    k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
     sequence_lengths = q_position_ids.squeeze(-1).to(
         dtype=torch.int32, device=manager_device
     )
-    gpu_paged_kv_manager.update_layer_decode_new_token(
-        k_tensor=k_tensor,
-        v_tensor=None,
-        sequence_lengths=sequence_lengths,
-        layer_idx=layer_idx,
-        batch_slice=batch_slice,
+
+    def bind_kv_write(k_tensor):
+        # NoPE: no rotation on k_pe; the manager assigns the slot and writes.
+        k_tensor = k_tensor.to(manager_device)
+        gpu_paged_kv_manager.update_layer_decode_new_token(
+            k_tensor=k_tensor,
+            v_tensor=None,
+            sequence_lengths=sequence_lengths,
+            layer_idx=layer_idx,
+            batch_slice=batch_slice,
+        )
+        blocked_k, _, block_table = (
+            gpu_paged_kv_manager.get_layer_kv_with_page_table(
+                layer_idx=layer_idx
+            )
+        )
+        if batch_slice is not None:
+            start_idx, end_idx = batch_slice
+            block_table = block_table[start_idx:end_idx]
+        return blocked_k, block_table, k_tensor
+
+    return mla_decode_nope_core(
+        self,
+        hidden_states,
+        cache_seqlens=cache_seqlens,
+        bind_kv_write=bind_kv_write,
     )
-    blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
-        layer_idx=layer_idx
-    )
-    if batch_slice is not None:
-        start_idx, end_idx = batch_slice
-        block_table = block_table[start_idx:end_idx]
-
-    # ---- absorbed query ----
-    kv_b_proj = self.kv_b_proj.weight.data.view(self.num_heads, -1, self.kv_lora_rank)
-    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
-    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
-
-    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-    query_states = torch.empty(
-        bsz, self.num_heads, 1, qk_head_dim,
-        dtype=blocked_k.dtype, device=blocked_k.device,
-    )
-    q_nope = q_nope.squeeze(2)
-    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum(
-        "bhd,hdc->bhc", q_nope, q_absorb
-    ).view(bsz, self.num_heads, 1, self.kv_lora_rank)
-    query_states[:, :, :, self.kv_lora_rank :] = q_pe
-    query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
-
-    from batchgen.attention.mla.paged_decode import mla_paged_decode
-
-    attn_out = mla_paged_decode(
-        query_states,
-        blocked_k,
-        block_table,
-        cache_seqlens,
-        self.kv_lora_rank,
-        self.scaling,
-    )
-
-    attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
-    if self.use_output_gate:
-        gate = F.linear(hidden_states, self.g_proj.weight).sigmoid()
-        attn_output = attn_output * gate
-    attn_output = F.linear(attn_output, self.o_proj.weight)
-    attn_output = _reduce_mla_tp_output(self, attn_output)
-    return attn_output.view(bsz, 1, -1), k_tensor
 
 
 # ============================================================================

@@ -514,20 +514,32 @@ def test_kimi_k3_startup_fails_closed_on_an_invalid_flash_mla(monkeypatch, symbo
 def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
     path, function_name
 ):
-    decode = _function(path, function_name)
-    # Both K3 dense decodes (eager and graph) reach the kernel only through
-    # the capability-selected seam, never a kernel package directly.
+    # The dense decode math exists once: both spellings (eager and graph)
+    # are bindings of `serving_modules.mla_decode_nope_core`, and only the
+    # core reaches the kernel — through the capability-selected seam, never
+    # a kernel package directly.
+    binding = _function(path, function_name)
+    assert [
+        node.func.id
+        for node in ast.walk(binding)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "mla_decode_nope_core"
+    ] == ["mla_decode_nope_core"]
+
+    decode = _function(KIMI_LINEAR_SERVING, "mla_decode_nope_core")
     assert any(
         isinstance(node, ast.ImportFrom)
         and node.module == "batchgen.attention.mla.paged_decode"
         and [alias.name for alias in node.names] == ["mla_paged_decode"]
         for node in ast.walk(decode)
     )
-    assert not any(
-        isinstance(node, ast.ImportFrom)
-        and (node.module or "").split(".")[0] in ("flash_mla", "flashinfer")
-        for node in ast.walk(decode)
-    )
+    for function in (binding, decode):
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in ("flash_mla", "flashinfer")
+            for node in ast.walk(function)
+        )
     seam = ast.parse(
         (ROOT / "batchgen" / "attention" / "mla" / "paged_decode.py").read_text()
     )
@@ -559,20 +571,33 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
 
 
 def test_kimi_k3_graph_mla_preserves_the_tp_output_reduce():
-    graph_decode = _function(KIMI_LINEAR_GRAPH, "_mla_decode_graph_safe")
+    # The TP output reduce lives in the shared `_finish` (o_proj first, the
+    # all-reduce after), and the one dense decode core runs it exactly once —
+    # so the captured spelling, which binds the core, keeps the reduce.
+    finish = _function(KIMI_LINEAR_SERVING, "_finish")
     calls = [
         node
-        for node in ast.walk(graph_decode)
+        for node in ast.walk(finish)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "_reduce_mla_tp_output"
     ]
     assert len(calls) == 1
 
-    source = _body_source(graph_decode)
-    assert source.index("F.linear(attn_output, attn.o_proj.weight)") < source.index(
-        "_reduce_mla_tp_output(attn, attn_output)"
-    )
+    source = _body_source(finish)
+    assert source.index(
+        "F.linear(attn_output, module.o_proj.weight)"
+    ) < source.index("_reduce_mla_tp_output(module, attn_output)")
+
+    core = _function(KIMI_LINEAR_SERVING, "mla_decode_nope_core")
+    finishes = [
+        node
+        for node in ast.walk(core)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_finish"
+    ]
+    assert len(finishes) == 1
 
 
 def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs(

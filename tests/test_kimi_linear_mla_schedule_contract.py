@@ -102,6 +102,8 @@ def test_whole_model_reuses_one_static_kda_cu_vector_per_bucket():
 def test_layer_graph_decodes_through_the_seam_with_an_optional_schedule():
     source = (_MODEL_ROOT / "cuda_graph_segments.py").read_text()
     tree = ast.parse(source)
+    serving_source = (_MODEL_ROOT / "serving_modules.py").read_text()
+    serving_tree = ast.parse(serving_source)
     mla = _method(tree, "KimiLinearSpanSegment", "_graph_attention")
     mla_safe = next(
         node
@@ -109,16 +111,30 @@ def test_layer_graph_decodes_through_the_seam_with_an_optional_schedule():
         if isinstance(node, ast.FunctionDef)
         and node.name == "_mla_decode_graph_safe"
     )
+    core = next(
+        node
+        for node in serving_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "mla_decode_nope_core"
+    )
 
     # The whole-model path hands its shared schedule through; a standalone
-    # per-layer capture passes None and the seam records its own.
+    # per-layer capture passes None and the seam records its own. The dense
+    # decode exists once (the core); the captured spelling binds it and
+    # forwards the schedule.
     assert any(
         isinstance(node, ast.Name) and node.id == "mla_schedule"
         for node in ast.walk(mla)
     )
-    (decode,) = _call_names(mla_safe, "mla_paged_decode")
+    (binding,) = _call_names(mla_safe, "mla_decode_nope_core")
+    assert "mla_schedule" in {kw.arg for kw in binding.keywords}
+    (decode,) = _call_names(core, "mla_paged_decode")
     assert [kw.arg for kw in decode.keywords] == ["schedule"]
+    assert ast.unparse(decode.keywords[0].value) == "mla_schedule"
     # Golden rule 7: the seam alone picks the kernel by capability.
     assert "get_device_capability" not in source
+    assert "get_device_capability" not in serving_source
     assert _kernel_imports(tree) == set()
+    assert _kernel_imports(serving_tree) == set()
     assert "NotImplementedError" not in ast.unparse(mla_safe)
+    assert "NotImplementedError" not in ast.unparse(core)
