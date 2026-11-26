@@ -8,14 +8,34 @@ dtype. ``tanh`` is evaluated as ``1 - 2 / (exp(2x) + 1)``, which agrees with
 libdevice to fp32 rounding; the row layout ([rows, 2d] -> [rows, d]) is the
 module's contract.
 """
+import logging
+
 import torch
+
+_TRITON_IMPORT_ERROR = None
+_FALLBACK_WARNED = False
 
 try:  # pragma: no cover - environment dependent
     import triton
     import triton.language as tl
     _TRITON_OK = True
-except Exception:  # noqa: BLE001
+except Exception as _exc:  # noqa: BLE001
     _TRITON_OK = False
+    _TRITON_IMPORT_ERROR = _exc
+
+
+def warn_situ_eager_fallback_once() -> None:
+    """One WARNING when a CUDA SiTU-and-mul runs the eager ~10-kernel form."""
+    global _FALLBACK_WARNED
+    if _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED = True
+    logging.getLogger(__name__).warning(
+        "[K3] Triton situ_and_mul unavailable on CUDA; using the eager "
+        "~10-kernel form: %s",
+        _TRITON_IMPORT_ERROR if _TRITON_IMPORT_ERROR is not None
+        else "triton imported but the kernel is disabled",
+    )
 
 
 if _TRITON_OK:

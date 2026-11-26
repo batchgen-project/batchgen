@@ -45,27 +45,19 @@ from .config import GLM5Config as Glm5Config, dsa_layer_skips_topk
 # padded [E, mtp, dim] path; the buffer layout is now compact (moe_ragged.py).
 # ============================================================================
 # The MoE decode path uses `dispatch_scatter_ragged` (moe_ragged.py) +
-# `grouped_fp8_blockwise_*` + `reduce_weighted_scatter`. Falls back to
-# `_triton_compute` only if the dispatch/reduce kernels aren't available at
-# all; there is no padded-layout fallback inside the ragged path.
+# `grouped_fp8_blockwise_*` + `reduce_weighted_scatter`. These modules are
+# required: a missing module fails the import of this file (FAIL FAST, like
+# the grouped-prefill side); there is no padded-layout fallback inside the
+# ragged path.
 
-try:
-    from batchgen.moe.grouped_fp8_blockwise_moe import (
-        grouped_fp8_blockwise_fused_s1,
-        grouped_fp8_blockwise_fused_s1_ptrs,
-        grouped_fp8_blockwise_s3,
-        grouped_fp8_blockwise_s3_ptrs,
-        require_grouped_fp8_blockwise_ptr_kernels,
-    )
-    _GLM5_HAS_FP8_BLOCKWISE = True
-except ImportError:
-    _GLM5_HAS_FP8_BLOCKWISE = False
-
-try:
-    from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
-    _GLM5_HAS_DISPATCH_3D = True
-except ImportError:
-    _GLM5_HAS_DISPATCH_3D = False
+from batchgen.moe.grouped_fp8_blockwise_moe import (
+    grouped_fp8_blockwise_fused_s1,
+    grouped_fp8_blockwise_fused_s1_ptrs,
+    grouped_fp8_blockwise_s3,
+    grouped_fp8_blockwise_s3_ptrs,
+    require_grouped_fp8_blockwise_ptr_kernels,
+)
+from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
 
 from .moe_ragged import (
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
@@ -344,11 +336,16 @@ def apply_rotary_pos_emb_split(
 # DSA Indexer
 # ============================================================================
 
-# Resolve hadamard kernels once at import time (triggers JIT compilation)
+# Resolve hadamard kernels once at import time (triggers JIT compilation).
+# Only the errors an import/JIT load can legitimately raise are caught; the
+# reason is kept and logged once when the dense H-matrix matmul form is
+# first used (_hadamard_transform).
 try:
     from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
-except (ImportError, Exception):
+    _HADAMARD_IMPORT_ERROR = None
+except (ImportError, OSError, RuntimeError) as _e:
     _hadamard_cuda_fn = None
+    _HADAMARD_IMPORT_ERROR = _e
 
 # Fused RoPE+Hadamard kernel — validated: 99/99 tests passed, 16.5x speedup over separate ops.
 try:
@@ -382,10 +379,28 @@ def _get_hadamard_matrix(dim: int, device: torch.device, dtype: torch.dtype) -> 
     return _hadamard_matrix_cache[key]
 
 
+_warned_hadamard_matmul_fallback = False
+
+
+def _warn_hadamard_matmul_fallback_once() -> None:
+    """One WARNING when the CUDA hadamard_transform kernel is unavailable
+    and the dense H-matrix matmul form serves the DSA indexer scoring path."""
+    global _warned_hadamard_matmul_fallback
+    if _warned_hadamard_matmul_fallback:
+        return
+    _warned_hadamard_matmul_fallback = True
+    logging.warning(
+        "[Glm5Indexer] CUDA hadamard_transform kernel unavailable; using the "
+        "dense H-matrix matmul form (correct but slower): %s",
+        _HADAMARD_IMPORT_ERROR,
+    )
+
+
 def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Hadamard transform with 1/sqrt(dim) scaling. x last dim must be power of 2."""
     if _hadamard_cuda_fn is not None:
         return _hadamard_cuda_fn(x.contiguous(), scale=x.shape[-1] ** -0.5)
+    _warn_hadamard_matmul_fallback_once()
     dim = x.shape[-1]
     assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
     H = _get_hadamard_matrix(dim, x.device, x.dtype)
@@ -1712,11 +1727,6 @@ class Glm5MoE(nn.Module):
         device: torch.device,
     ) -> None:
         """Allocate and compile the fixed-window grouped prefill workspace."""
-        if not _GLM5_HAS_FP8_BLOCKWISE or not _GLM5_HAS_DISPATCH_3D:
-            raise RuntimeError(
-                "GLM-5 grouped prefill requires FP8 grouped GEMM and compact "
-                "dispatch/reduce kernels"
-            )
         require_grouped_fp8_blockwise_ptr_kernels()
         _glm5_require_ragged_kernels()
         cls._prefill_buf = Glm5PrefillMoEBuffers(
@@ -1846,7 +1856,6 @@ class Glm5MoE(nn.Module):
         # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
         if (
             self.use_3d_moe
-            and _GLM5_HAS_DISPATCH_3D
             and Glm5MoE._3d_buf is None
             and _glm5_moe_3d_blockwise_supported(
                 self.experts_per_rank,
@@ -1968,7 +1977,7 @@ class Glm5MoE(nn.Module):
 
         # K2.5 3D-MoE weight stacking (per-layer) — mirror
         # MiniMaxM25MoE._init_fp8_blockwise_weights at model.py:874-926.
-        if self.use_3d_moe and _GLM5_HAS_FP8_BLOCKWISE:
+        if self.use_3d_moe:
             if not _glm5_moe_3d_blockwise_supported(
                 self.experts_per_rank,
                 n_persistent,
@@ -2300,7 +2309,7 @@ class Glm5MoE(nn.Module):
         # The only per-layer MoE decode implementation is the eager one;
         # whole-model graph capture one level up captures this path.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
-                Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
+                Glm5MoE._3d_buf is not None):
             _record_glm5_moe_dispatch(
                 "eager",
                 layer_idx=self.layer_idx,

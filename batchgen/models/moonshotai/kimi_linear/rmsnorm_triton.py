@@ -10,12 +10,20 @@ Numerics match the CUDA kernel (fp32 sum of squares, fp32 scale, one rounding).
 """
 import torch
 
+_TRITON_IMPORT_ERROR = None
+
 try:  # pragma: no cover - environment dependent
     import triton
     import triton.language as tl
     _TRITON_OK = True
-except Exception:  # noqa: BLE001
+except Exception as _exc:  # noqa: BLE001
     _TRITON_OK = False
+    _TRITON_IMPORT_ERROR = _exc
+
+
+def triton_import_error():
+    """The exception that disabled the Triton kernels here, or None."""
+    return _TRITON_IMPORT_ERROR
 
 
 if _TRITON_OK:

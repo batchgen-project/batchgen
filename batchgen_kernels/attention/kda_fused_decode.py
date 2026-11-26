@@ -50,7 +50,7 @@ def _get_ext():
     return _ext
 
 
-def covered(
+def coverage_gap(
     mixed_qkv: torch.Tensor,
     forget_gate: torch.Tensor,
     beta: torch.Tensor,
@@ -69,89 +69,116 @@ def covered(
     onorm_weight: torch.Tensor,
     state: torch.Tensor,
     state_indices: torch.Tensor,
-) -> bool:
-    """Return whether the AOT kernel can consume these native K3 tensors."""
+) -> Optional[str]:
+    """The first failing coverage check as a message, or None when the AOT
+    kernel can consume these native K3 tensors."""
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[1] % (3 * _HEAD_DIM):
-        return False
+        return (f"mixed_qkv shape {tuple(mixed_qkv.shape)} is not "
+                f"[batch, heads * 3 * {_HEAD_DIM}]")
     heads = mixed_qkv.shape[1] // (3 * _HEAD_DIM)
     if heads not in _SUPPORTED_HEADS:
-        return False
+        return (f"local head count {heads} not in "
+                f"{sorted(_SUPPORTED_HEADS)}")
     batch = mixed_qkv.shape[0]
     segment = heads * _HEAD_DIM
-    if (
-        forget_gate.shape != (batch, segment)
-        or beta.shape != (batch, heads)
-        or onorm_gate.shape != (batch, segment)
-        or state.ndim != 4
-        or state.shape[1:] != (heads, _HEAD_DIM, _HEAD_DIM)
-        or state_indices.shape != (batch,)
-    ):
-        return False
-    if any(
-        tensor.shape != (state.shape[0], segment, _CONV_WIDTH - 1)
-        for tensor in (conv_q, conv_k, conv_v)
-    ):
-        return False
-    if any(
-        tensor.shape != (segment, _CONV_WIDTH)
-        for tensor in (weight_q, weight_k, weight_v)
-    ):
-        return False
-    if any(
-        bias is not None and bias.shape != (segment,)
-        for bias in (bias_q, bias_k, bias_v)
-    ):
-        return False
+    if forget_gate.shape != (batch, segment):
+        return (f"forget_gate shape {tuple(forget_gate.shape)} != "
+                f"{(batch, segment)}")
+    if beta.shape != (batch, heads):
+        return f"beta shape {tuple(beta.shape)} != {(batch, heads)}"
+    if onorm_gate.shape != (batch, segment):
+        return (f"onorm_gate shape {tuple(onorm_gate.shape)} != "
+                f"{(batch, segment)}")
+    if state.ndim != 4 or state.shape[1:] != (heads, _HEAD_DIM, _HEAD_DIM):
+        return (f"state shape {tuple(state.shape)} is not "
+                f"[slots, {heads}, {_HEAD_DIM}, {_HEAD_DIM}]")
+    if state_indices.shape != (batch,):
+        return (f"state_indices shape {tuple(state_indices.shape)} != "
+                f"{(batch,)}")
+    for name, tensor in (("conv_q", conv_q), ("conv_k", conv_k),
+                         ("conv_v", conv_v)):
+        if tensor.shape != (state.shape[0], segment, _CONV_WIDTH - 1):
+            return (f"{name} shape {tuple(tensor.shape)} != "
+                    f"{(state.shape[0], segment, _CONV_WIDTH - 1)}")
+    for name, tensor in (("weight_q", weight_q), ("weight_k", weight_k),
+                         ("weight_v", weight_v)):
+        if tensor.shape != (segment, _CONV_WIDTH):
+            return (f"{name} shape {tuple(tensor.shape)} != "
+                    f"{(segment, _CONV_WIDTH)}")
+    for name, bias in (("bias_q", bias_q), ("bias_k", bias_k),
+                       ("bias_v", bias_v)):
+        if bias is not None and bias.shape != (segment,):
+            return f"{name} shape {tuple(bias.shape)} != {(segment,)}"
     if a_log.ndim != 1 or a_log.shape[0] < heads:
-        return False
-    if dt_bias.shape != (segment,) or onorm_weight.shape != (_HEAD_DIM,):
-        return False
+        return (f"a_log shape {tuple(a_log.shape)} is not [>= {heads}] "
+                f"1-D")
+    if dt_bias.shape != (segment,):
+        return f"dt_bias shape {tuple(dt_bias.shape)} != {(segment,)}"
+    if onorm_weight.shape != (_HEAD_DIM,):
+        return (f"onorm_weight shape {tuple(onorm_weight.shape)} != "
+                f"{(_HEAD_DIM,)}")
     if mixed_qkv.dtype is not torch.bfloat16:
-        return False
-    if any(
-        tensor.dtype is not torch.bfloat16
-        for tensor in (forget_gate, beta, conv_q, conv_k, conv_v, onorm_gate)
-    ):
-        return False
-    if any(
-        tensor.dtype is not torch.float32
-        for tensor in (weight_q, weight_k, weight_v, a_log, dt_bias, onorm_weight)
-    ):
-        return False
-    if any(bias is not None and bias.dtype is not torch.float32
-           for bias in (bias_q, bias_k, bias_v)):
-        return False
-    if state.dtype is not torch.float32 or state_indices.dtype is not torch.int32:
-        return False
-    if any(
-        tensor.stride(-1) != 1
-        for tensor in (mixed_qkv, forget_gate, beta, onorm_gate,
-                       weight_q, weight_k, weight_v)
-    ):
-        return False
-    if any(tensor.stride(-1) != 1 for tensor in (conv_q, conv_k, conv_v)):
-        return False
+        return f"mixed_qkv dtype {mixed_qkv.dtype} is not bfloat16"
+    for name, tensor in (("forget_gate", forget_gate), ("beta", beta),
+                         ("conv_q", conv_q), ("conv_k", conv_k),
+                         ("conv_v", conv_v), ("onorm_gate", onorm_gate)):
+        if tensor.dtype is not torch.bfloat16:
+            return f"{name} dtype {tensor.dtype} is not bfloat16"
+    for name, tensor in (("weight_q", weight_q), ("weight_k", weight_k),
+                         ("weight_v", weight_v), ("a_log", a_log),
+                         ("dt_bias", dt_bias),
+                         ("onorm_weight", onorm_weight)):
+        if tensor.dtype is not torch.float32:
+            return f"{name} dtype {tensor.dtype} is not float32"
+    for name, bias in (("bias_q", bias_q), ("bias_k", bias_k),
+                       ("bias_v", bias_v)):
+        if bias is not None and bias.dtype is not torch.float32:
+            return f"{name} dtype {bias.dtype} is not float32"
+    if state.dtype is not torch.float32:
+        return f"state dtype {state.dtype} is not float32"
+    if state_indices.dtype is not torch.int32:
+        return f"state_indices dtype {state_indices.dtype} is not int32"
+    for name, tensor in (("mixed_qkv", mixed_qkv),
+                         ("forget_gate", forget_gate), ("beta", beta),
+                         ("onorm_gate", onorm_gate), ("weight_q", weight_q),
+                         ("weight_k", weight_k), ("weight_v", weight_v),
+                         ("conv_q", conv_q), ("conv_k", conv_k),
+                         ("conv_v", conv_v)):
+        if tensor.stride(-1) != 1:
+            return (f"{name} last-axis stride {tensor.stride(-1)} != 1 "
+                    f"(not row-contiguous)")
     if state.stride(-1) != 1 or state.stride(-2) != _HEAD_DIM:
-        return False
+        return (f"state inner strides {state.stride()} are not the dense "
+                f"[..., {_HEAD_DIM}, 1] layout")
     if state.stride(-3) != _HEAD_DIM * _HEAD_DIM:
-        return False
+        return (f"state head stride {state.stride(-3)} != "
+                f"{_HEAD_DIM * _HEAD_DIM}")
     # The kernel moves the state in float4 units.
     if state.stride(0) % 4 or state.data_ptr() % 16:
-        return False
+        return (f"state slot stride {state.stride(0)} or base address is "
+                f"not float4-aligned")
     if not state_indices.is_contiguous():
-        return False
-    return all(
-        tensor.device == mixed_qkv.device
-        for tensor in (
-            forget_gate, beta, conv_q, conv_k, conv_v,
-            weight_q, weight_k, weight_v, a_log, dt_bias,
-            onorm_gate, onorm_weight, state, state_indices,
-        )
-        if tensor is not None
-    ) and all(
-        bias is None or bias.device == mixed_qkv.device
-        for bias in (bias_q, bias_k, bias_v)
+        return "state_indices is not contiguous"
+    named = (
+        ("forget_gate", forget_gate), ("beta", beta), ("conv_q", conv_q),
+        ("conv_k", conv_k), ("conv_v", conv_v), ("weight_q", weight_q),
+        ("weight_k", weight_k), ("weight_v", weight_v), ("a_log", a_log),
+        ("dt_bias", dt_bias), ("onorm_gate", onorm_gate),
+        ("onorm_weight", onorm_weight), ("state", state),
+        ("state_indices", state_indices), ("bias_q", bias_q),
+        ("bias_k", bias_k), ("bias_v", bias_v),
     )
+    for name, tensor in named:
+        if tensor is not None and tensor.device != mixed_qkv.device:
+            return (f"{name} device {tensor.device} != mixed_qkv device "
+                    f"{mixed_qkv.device}")
+    return None
+
+
+def covered(*args, **kwargs) -> bool:
+    """Return whether the AOT kernel can consume these native K3 tensors
+    (see :func:`coverage_gap` for the first failing check)."""
+    return coverage_gap(*args, **kwargs) is None
 
 
 def kda_fused_decode(

@@ -60,6 +60,37 @@ def test_glm5_planner_keeps_full_persistent_single_node_h200_decode():
 
 
 
+def test_glm5_planner_memory_query_failure_raises(monkeypatch):
+    """A failed device query raises instead of planning on a hardcoded
+    96 GB (silent-fallback audit 2026-11-26, C7)."""
+    import torch
+
+    planner = GLM5Planner("zai-org/GLM-5-FP8")
+    planner.config = types.SimpleNamespace(
+        Basic_Config=types.SimpleNamespace(device_torch=0)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def _boom(device):
+        raise RuntimeError("device handle is invalid")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _boom)
+    with pytest.raises(RuntimeError, match=r"get_device_properties\(0\)"):
+        planner._available_gpu_memory_gb()
+
+
+def test_glm5_planner_without_cuda_raises(monkeypatch):
+    import torch
+
+    planner = GLM5Planner("zai-org/GLM-5-FP8")
+    planner.config = types.SimpleNamespace(
+        Basic_Config=types.SimpleNamespace(device_torch=None)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="is_available"):
+        planner._available_gpu_memory_gb()
+
+
 def test_glm5_planner_keeps_full_persistent_two_node_decode():
     config = _plan(world_size=16)
 
