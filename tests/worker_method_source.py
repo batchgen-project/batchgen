@@ -72,9 +72,10 @@ GRAPH_RUNTIME_SOURCE = (
 GRAPH_RUNTIME_CLASS = "GraphRuntime"
 # The worker-seam engines (S8, S7, S9, S10a, repatriation) whose methods the
 # worker reaches through same-name canonical delegators. Only an engine method
-# in the delegated shape ``(self, worker, ...)`` is a delegator; engines that
-# also carry their own state API (GraphRuntime) keep those methods out of the
-# delegation scan via that shape filter.
+# in the delegated shape ``(self, worker, ...)`` or ``(self, ctx, ...)`` is a
+# delegator; engines that also carry their own state API (GraphRuntime, and
+# since D2 the StepObservabilityEngine capture/clock methods) keep those
+# methods out of the delegation scan via that shape filter.
 DELEGATED_ENGINES = (
     (RANK_SYNC_SOURCE, RANK_SYNC_CLASS),
     (STEP_OBSERVABILITY_SOURCE, STEP_OBSERVABILITY_CLASS),
@@ -179,6 +180,17 @@ class _ContextToWorker(ast.NodeTransformer):
                 "decode_local_count_tensor": "self._decode_local_count_tensor",
                 "decode_all_rank_counts": "self._decode_all_rank_counts",
                 "previous_max": "getattr(self, '_current_decode_max_rank_batch_size', 0) or 0",
+                # D2 step-observability value parameters: the worker's
+                # delegator resolves these beside the frozen context, so the
+                # worker spelling is the delegator's own resolution.
+                "decode_model": "getattr(self, 'model', None)",
+                "phase_mem_switch_index": "getattr(self, '_phase_mem_switch_index', 0)",
+                "graph_state": "self._graph",
+                "persistent_phase": "self._persistent_phase_enabled()",
+                "profile_enabled": (
+                    "self._debug_flag_enabled((self._debug_values() or {})"
+                    ".get('glm5_prefill_nsys_profile'))"
+                ),
             }
             replacement = replacements.get(node.id)
             if replacement is not None:

@@ -48,8 +48,6 @@ exec(compile(ast.fix_missing_locations(ast.Module(
     body=[
         copy.deepcopy(_method(name)) for name in (
             "_report_completion",
-            "_maybe_emit_prefix_drain_metric",
-            "_trajectory_restore_fields",
             "_admit_sequences_from_message",
             "_admitted_prompt_ids",
         )
@@ -58,13 +56,16 @@ exec(compile(ast.fix_missing_locations(ast.Module(
 )), str(WORKER), "exec"), _NAMESPACE)
 # Completion split: `_report_completion` now orchestrates the outlet pair
 # (worker) and the two engine release methods; the engine bodies compile back
-# in worker shape so the fake drives the statements that actually run.
+# in worker shape so the fake drives the statements that actually run. D2
+# moved the drain body onto the step-observability engine as a function of
+# the frozen context, so it compiles back the same way.
 _NAMESPACE.update(load_worker_shaped_methods(
     [
         "_completion_outlet_read",
         "_completion_outlet_send",
         "_release_completed_trajectory_slot",
         "_release_completed_slot_index",
+        "_maybe_emit_prefix_drain_metric",
     ],
     _NAMESPACE,
 ))
@@ -83,7 +84,6 @@ class _Worker:
     _release_completed_trajectory_slot = _NAMESPACE["_release_completed_trajectory_slot"]
     _release_completed_slot_index = _NAMESPACE["_release_completed_slot_index"]
     _maybe_emit_prefix_drain_metric = _NAMESPACE["_maybe_emit_prefix_drain_metric"]
-    _trajectory_restore_fields = _NAMESPACE["_trajectory_restore_fields"]
     _admit_sequences_from_message = _NAMESPACE["_admit_sequences_from_message"]
 
     def __init__(self, *, enable_prefix_cache=True, debug_stats=True):
