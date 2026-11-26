@@ -46,7 +46,7 @@ STRINGS = _string_constants()
 
 def test_the_declaration_files_exist_and_are_the_registry():
     assert all(path.is_file() for path in DECLARATIONS)
-    assert len(DEBUG_KEY_REGISTRY.keys) == 35
+    assert len(DEBUG_KEY_REGISTRY.keys) == 36
 
 
 @pytest.mark.parametrize("name", sorted(DEBUG_KEY_REGISTRY.keys))

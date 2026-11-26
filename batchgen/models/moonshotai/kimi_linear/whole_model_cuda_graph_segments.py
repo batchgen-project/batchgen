@@ -37,6 +37,7 @@ from typing import Dict, Iterable, Mapping, Optional
 import torch
 
 from .row_gather_triton import (
+    warn_row_gather_fallback_once as _warn_row_gather_fallback_once,
     add_gathered_rows_masked,
     gather_rows_masked,
     row_gather_triton_available as _row_gather_available,
@@ -315,6 +316,8 @@ class KimiLinearWholeModelSegment:
         # Fused masked row gathers (one Triton launch each) on CUDA; the
         # index_select / mask / add form elsewhere.
         fused_rows = hidden_states.is_cuda and _row_gather_available()
+        if hidden_states.is_cuda and not fused_rows:
+            _warn_row_gather_fallback_once()
         if fused_rows:
             padded_valid_i32 = padded_valid.to(torch.int32)
             original_valid_i32 = original_valid.to(torch.int32)

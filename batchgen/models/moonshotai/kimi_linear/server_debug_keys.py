@@ -16,6 +16,8 @@ DEBUG_KEYS = (
     key("kimi_decode_graph_mode", "kimi_linear", "decode", parse_choice("graph", "eager", "compare"),
          "run decode from captured graphs, eagerly, or both and compare",
          tier=TIER_REWARM),
+    key("k3_skip_kv_callback", "kimi_linear", "decode", parse_bool,
+         "skip the dense eager-decode host-KV append callback"),
 )
 
 RETIRED_DEBUG_KEYS = {

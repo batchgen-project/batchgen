@@ -821,6 +821,12 @@ def prewarm_k3_triton_kernels(model, config, *, decode_buckets,
             part_count=part_count, barrier=barrier, rank=rank,
         )
     _clear_plan_caches()
+    # The kda_decode entries above ran kda_decode_serving with the live
+    # module and state pools, so the fused-KDA-decode coverage outcome is
+    # now recorded; log it so a startup coverage miss is never silent.
+    from .serving_modules import log_kda_fused_decode_startup_coverage
+
+    log_kda_fused_decode_startup_coverage(rank=rank)
     torch.cuda.empty_cache()
     if active is not None:
         for kernel, (compiled, loaded) in sorted(active.per_kernel().items()):

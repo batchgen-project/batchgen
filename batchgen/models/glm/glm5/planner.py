@@ -70,17 +70,26 @@ class GLM5Planner(BasePlanner):
         return "0.1.0"
 
     def _available_gpu_memory_gb(self) -> float:
-        """Return usable memory for the configured device, with H20 fallback."""
+        """Usable memory for the configured device: DEFAULT_MEM_FRAC of the
+        queried total. A failed device query raises (FAIL FAST): planning
+        against a guessed capacity silently mis-sizes every budget."""
         device = getattr(self.config.Basic_Config, "device_torch", None)
-        if torch.cuda.is_available():
-            try:
-                if device is None:
-                    device = torch.cuda.current_device()
-                total = torch.cuda.get_device_properties(device).total_memory
-                return float(total) / (1024 ** 3) * self.DEFAULT_MEM_FRAC
-            except (AssertionError, RuntimeError, TypeError, ValueError):
-                pass
-        return 96 * self.DEFAULT_MEM_FRAC
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "GLM5Planner cannot size the plan: torch.cuda.is_available() "
+                "returned False, so torch.cuda.get_device_properties has no "
+                "device to query"
+            )
+        if device is None:
+            device = torch.cuda.current_device()
+        try:
+            total = torch.cuda.get_device_properties(device).total_memory
+        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "GLM5Planner cannot size the plan: "
+                f"torch.cuda.get_device_properties({device!r}) failed: {exc}"
+            ) from exc
+        return float(total) / (1024 ** 3) * self.DEFAULT_MEM_FRAC
 
     def _adjust_config_for_model(self):
         """GLM-5 specific config adjustments."""

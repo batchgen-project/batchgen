@@ -7,14 +7,36 @@ kernel here instead of gather + mul (+ add) launches (3 fewer graph nodes per
 layer). Rows with ``valid == 0`` are written as zeros without reading the
 source row, so the index of an invalid row may be anything in range.
 """
+import logging
+
 import torch
+
+_TRITON_IMPORT_ERROR = None
+_FALLBACK_WARNED = False
 
 try:  # pragma: no cover - environment dependent
     import triton
     import triton.language as tl
     _TRITON_OK = True
-except Exception:  # noqa: BLE001
+except Exception as _exc:  # noqa: BLE001
     _TRITON_OK = False
+    _TRITON_IMPORT_ERROR = _exc
+
+
+def warn_row_gather_fallback_once() -> None:
+    """One WARNING when the CUDA whole-model graph path falls back to the
+    per-layer index_select / mask / add row-gather form."""
+    global _FALLBACK_WARNED
+    if _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED = True
+    logging.getLogger(__name__).warning(
+        "[K3] Triton fused row gathers unavailable on CUDA; the whole-model "
+        "graph uses the index_select/mask/add form (3 extra graph nodes per "
+        "MoE layer): %s",
+        _TRITON_IMPORT_ERROR if _TRITON_IMPORT_ERROR is not None
+        else "triton imported but the kernels are disabled",
+    )
 
 
 if _TRITON_OK:

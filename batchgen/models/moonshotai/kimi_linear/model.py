@@ -80,9 +80,16 @@ class SituAndMul(nn.Module):
         if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
             # One Triton launch instead of ~10 elementwise kernels (the K3
             # decode graph runs this once per MoE layer for the shared expert).
-            from .situ_triton import situ_and_mul_triton, situ_triton_available
+            from .situ_triton import (
+                situ_and_mul_triton,
+                situ_triton_available,
+                warn_situ_eager_fallback_once,
+            )
             if situ_triton_available():
                 return situ_and_mul_triton(x, self.beta, self.linear_beta)
+            # The startup Triton prewarm runs this module, so the one-time
+            # fallback warning also surfaces at server startup.
+            warn_situ_eager_fallback_once()
         return self._forward_eager(x)
 
     def _forward_eager(self, x: torch.Tensor) -> torch.Tensor:
@@ -137,11 +144,26 @@ def _fused_rmsnorm_op():
         try:
             # Triton row kernel first (~2-3 us per decode-shaped call); the
             # CUDA extension (one launch, scalar loads, ~12 us) second.
-            from .rmsnorm_triton import triton_rmsnorm, triton_rmsnorm_available
+            from .rmsnorm_triton import (
+                triton_import_error,
+                triton_rmsnorm,
+                triton_rmsnorm_available,
+            )
             if triton_rmsnorm_available():
                 _FUSED_RMSNORM = triton_rmsnorm
-        except Exception:  # pragma: no cover - environment dependent
-            pass
+            else:
+                import logging
+                logging.warning(
+                    "[K3] Triton fused RMSNorm unavailable, trying the CUDA "
+                    "extension (one launch, ~12 us vs ~2-3 us): %s",
+                    triton_import_error(),
+                )
+        except Exception as exc:  # pragma: no cover - environment dependent
+            import logging
+            logging.warning(
+                "[K3] Triton fused RMSNorm unavailable, trying the CUDA "
+                "extension (one launch, ~12 us vs ~2-3 us): %s", exc,
+            )
     if _FUSED_RMSNORM is None:
         try:
             from batchgen.attention.fused_kernels.ops import cuda_rmsnorm

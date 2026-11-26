@@ -47,6 +47,64 @@ from .wrappers import KimiLinearExpertWrapper
 logger = logging.getLogger(__name__)
 _KDA_FUSED_DECODE_IMPORT_FAILED = False
 
+# Outcome of the first ``_kda_fused_decode`` resolution in this process. The
+# startup Triton prewarm's ``kda_decode`` entries run that switch with the
+# live module and state pools, so the recorded outcome reflects the
+# production dtypes/shapes/strides; ``log_kda_fused_decode_startup_coverage``
+# logs it once after the prewarm.
+_KDA_FUSED_DECODE_STATUS = {"outcome": None, "reason": None}
+_KDA_FUSED_COVERAGE_WARNED = False
+
+
+def _record_kda_fused_decode_outcome(outcome, reason) -> None:
+    """Keep the first resolved outcome (``fused`` / ``fla-*``)."""
+    if _KDA_FUSED_DECODE_STATUS["outcome"] is None:
+        _KDA_FUSED_DECODE_STATUS["outcome"] = outcome
+        _KDA_FUSED_DECODE_STATUS["reason"] = reason
+
+
+def _warn_kda_fused_coverage_miss_once(reason: str) -> None:
+    """One WARNING when a K3 decode step misses the AOT kernel's coverage
+    and re-runs the FLA chain."""
+    global _KDA_FUSED_COVERAGE_WARNED
+    if _KDA_FUSED_COVERAGE_WARNED:
+        return
+    _KDA_FUSED_COVERAGE_WARNED = True
+    logger.warning(
+        "K3 fused KDA decode coverage miss; using FLA chain: %s", reason
+    )
+
+
+def log_kda_fused_decode_startup_coverage(*, rank=0) -> None:
+    """Log the fused-KDA-decode outcome recorded during startup.
+
+    Called after the Triton prewarm, whose ``kda_decode`` entries exercised
+    ``_kda_fused_decode`` with the live dtypes/shapes/strides; a miss is
+    recorded loudly so the FLA chain cannot be mistaken for the optimized
+    path on production K3.
+    """
+    outcome = _KDA_FUSED_DECODE_STATUS["outcome"]
+    reason = _KDA_FUSED_DECODE_STATUS["reason"]
+    if outcome == "fused":
+        logger.info(
+            "[K3] rank=%s fused KDA decode coverage: PASS "
+            "(AOT kernel serves decode)", rank,
+        )
+    elif outcome == "fla-non-k3":
+        logger.info(
+            "[K3] rank=%s KDA decode uses the FLA chain (%s)", rank, reason,
+        )
+    elif outcome is None:
+        logger.warning(
+            "[K3] rank=%s fused KDA decode coverage was not exercised at "
+            "startup (no KDA decode prewarm ran)", rank,
+        )
+    else:
+        logger.warning(
+            "[K3] rank=%s fused KDA decode coverage: MISS (%s: %s); the FLA "
+            "chain serves every decode step", rank, outcome, reason,
+        )
+
 # ============================================================================
 #  NoPE-MLA
 # ============================================================================
@@ -743,18 +801,26 @@ def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
 
     ``None`` means the established FLA chain must be used.  The fallback is
     intentionally retained for non-K3 variants and for installations whose
-    wheel predates this optional kernel; production K3 startup still records
-    the fallback so it cannot be mistaken for the optimized path.
+    wheel predates this optional kernel.  Production K3 startup records the
+    outcome: the Triton prewarm's ``kda_decode`` entries run this switch with
+    the live dtypes/shapes/strides, and
+    :func:`log_kda_fused_decode_startup_coverage` logs the recorded result
+    after the prewarm; any coverage miss here also logs one WARNING naming
+    the first failing check, so the FLA chain cannot be mistaken for the
+    optimized path.
     """
     global _KDA_FUSED_DECODE_IMPORT_FAILED
     if mixed_qkv is None or not bool(getattr(self, "use_full_rank_gate", False)):
+        _record_kda_fused_decode_outcome(
+            "fla-non-k3", "no full-rank gate / no fused qkv projection")
         return None
     try:
         from batchgen_kernels.attention.kda_fused_decode import (
-            covered,
+            coverage_gap,
             kda_fused_decode,
         )
     except (ImportError, ModuleNotFoundError) as exc:
+        _record_kda_fused_decode_outcome("fla-extension-missing", str(exc))
         if not _KDA_FUSED_DECODE_IMPORT_FAILED:
             logger.warning(
                 "K3 fused KDA decode extension unavailable; using FLA chain: %s",
@@ -767,23 +833,36 @@ def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
     k_args = _kda_fused_conv_args(self.k_conv1d)
     v_args = _kda_fused_conv_args(self.v_conv1d)
     if q_args is None or k_args is None or v_args is None:
+        missing = ", ".join(
+            name for name, args in (
+                ("q_conv1d", q_args), ("k_conv1d", k_args),
+                ("v_conv1d", v_args),
+            ) if args is None
+        )
+        reason = (f"{missing} weight/bias not in the fused kernel's native "
+                  f"fp32 [channels, 4] layout")
+        _record_kda_fused_decode_outcome("fla-coverage-miss", reason)
+        _warn_kda_fused_coverage_miss_once(reason)
         return None
     q_weight, q_bias = q_args
     k_weight, k_bias = k_args
     v_weight, v_bias = v_args
     f_flat = f.reshape(f.shape[0], -1)
     z_flat = z.reshape(z.shape[0], -1)
-    if not covered(
+    gap = coverage_gap(
         mixed_qkv, f_flat, beta,
         kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
         q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
         self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
         kda_state.recurrent_pool, slot_ids,
-    ):
+    )
+    if gap is not None:
+        _record_kda_fused_decode_outcome("fla-coverage-miss", gap)
+        _warn_kda_fused_coverage_miss_once(gap)
         return None
     onorm_eps = _kda_o_norm_eps(self)
     try:
-        return kda_fused_decode(
+        output = kda_fused_decode(
             mixed_qkv, f_flat, beta,
             kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
             q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
@@ -796,12 +875,15 @@ def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
     except ImportError as exc:
         # AOT import can succeed while the extension's transitive CUDA image
         # is absent from an old wheel. Do not repeatedly probe every KDA layer.
+        _record_kda_fused_decode_outcome("fla-extension-missing", str(exc))
         if not _KDA_FUSED_DECODE_IMPORT_FAILED:
             logger.warning(
                 "K3 fused KDA decode failed to load; using FLA chain: %s", exc
             )
             _KDA_FUSED_DECODE_IMPORT_FAILED = True
         return None
+    _record_kda_fused_decode_outcome("fused", None)
+    return output
 
 
 def _conv_weights(conv, dtype):

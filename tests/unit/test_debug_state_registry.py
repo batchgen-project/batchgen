@@ -10,7 +10,7 @@ EMPTY = REGISTRY.empty
 
 
 def test_every_key_declares_owner_phase_tier_and_summary():
-    assert len(REGISTRY.keys) == 35
+    assert len(REGISTRY.keys) == 36
     for name, key in REGISTRY.keys.items():
         assert key.name == name
         assert key.owner in ("core", "kimi_linear", "glm5"), name
