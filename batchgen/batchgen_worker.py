@@ -185,7 +185,9 @@ from batchgen.query_book import (
 	QueryBook,
 	QueryBookPoolCapacityError,
 	bind_query_book_slot,
+	ensure_query_book,
 	release_query_book_slot,
+	reset_query_book,
 )
 from batchgen.config.decode_strategy import DecodeStrategy, strategy_for
 from batchgen.config.legacy_kv_accounting import legacy_past_kv_byte_size
@@ -1502,7 +1504,10 @@ class BatchGenWorker:
 		
 		# 7. Batch State Placeholders
 		self.global_batch: Optional[SequenceBatch] = None
-		self.query_book: Optional[Dict] = None
+		# Optional[Dict[int, QueryBookEntry]]; the attribute's None <-> dict
+		# lifecycle is owned by batchgen.query_book (reset_query_book builds
+		# the unbuilt state, ensure_query_book the dict).
+		reset_query_book(self)
 		self.model_batch_book: Dict = {}
 		# Local slot binding (both maps) and its free-slot allocator live in
 		# ONE owner; `_local_to_uuid_map` / `_uuid_to_local_map` below are
@@ -2847,12 +2852,10 @@ class BatchGenWorker:
 	) -> int:
 		"""Bind a sequence UUID to a local slot and refresh its query_book entry."""
 		seq = self.global_batch.get_sequence(uuid)
-		if self.query_book is None:
-			self.query_book = {}
 		return bind_query_book_slot(
 			uuid,
 			seq,
-			query_book=self.query_book,
+			query_book=ensure_query_book(self),
 			table=self.seq_table,
 			local_idx=local_idx,
 		)
@@ -3982,7 +3985,7 @@ class BatchGenWorker:
 		self.host_kv_cache_size = self.args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = self.args.global_host_kv_cache_size_gb
 
-		self.query_book = None
+		reset_query_book(self)
 		self.model_batch_book = {}
 		self.token_k_cache_byte_size = 2048
 		self.num_k_storage_tokens = math.floor(50 * (1024**3) / 32 / 2048)

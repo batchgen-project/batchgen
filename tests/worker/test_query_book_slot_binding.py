@@ -12,11 +12,16 @@ import torch
 
 import pytest
 
+from types import SimpleNamespace
+
 from batchgen.query_book import (
     bind_local_sequence_to_query_book,
     bind_query_book_slot,
+    ensure_query_book,
+    refresh_query_book_entry,
     release_local_query_slot,
     release_query_book_slot,
+    reset_query_book,
 )
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.sequence_table import SequenceTable
@@ -115,6 +120,62 @@ def test_the_pinned_raw_container_helpers_agree_with_the_table_form():
     assert raw_forward == dict(table.uuid_to_local) == {}
     assert raw_free == set(table.free_local_indices) == {0}
     assert raw_book == book == {}
+
+
+def test_refresh_rebuilds_the_entry_for_a_bound_sequence():
+    table, query_book = SequenceTable(), {}
+    bind_query_book_slot("a", _sequence("a"), query_book=query_book, table=table)
+    stale = query_book[0]
+
+    fresh = _sequence("a", token_offset=30)
+    local_idx = refresh_query_book_entry(
+        "a", fresh, query_book=query_book, local_of=table.local_of
+    )
+
+    assert local_idx == 0
+    assert query_book[0] is not stale
+    assert query_book[0].encoded["input_ids"].data_ptr() == fresh.input_ids.data_ptr()
+    assert query_book[0].decoded_tokens.data_ptr() == fresh.decoded_tokens.data_ptr()
+    assert dict(table.uuid_to_local) == {"a": 0}, "a refresh never rebinds"
+
+
+def test_refresh_refuses_an_unbound_sequence():
+    """A rebuild must never create a binding: unbound means admission was
+    skipped, so the owner raises instead of binding."""
+    table, query_book = SequenceTable(), {}
+    with pytest.raises(KeyError, match="no bound local slot"):
+        refresh_query_book_entry(
+            "gone", _sequence("gone"), query_book=query_book,
+            local_of=table.local_of,
+        )
+    assert len(table) == 0 and query_book == {}
+
+
+def test_refresh_refuses_a_missing_sequence_by_name():
+    table, query_book = SequenceTable(), {}
+    bind_query_book_slot("a", _sequence("a"), query_book=query_book, table=table)
+    entry = query_book[0]
+    with pytest.raises(KeyError, match="not found in global_batch"):
+        refresh_query_book_entry("a", None, query_book=query_book, local_of=table.local_of)
+    assert query_book[0] is entry, "a refused refresh changes nothing"
+
+
+def test_the_attribute_lifecycle_pair_owns_none_and_dict_states():
+    holder = SimpleNamespace()
+
+    reset_query_book(holder)
+    assert holder.query_book is None, "construction state is None, not {}"
+
+    book = ensure_query_book(holder)
+    assert book == {} and holder.query_book is book
+
+    book[0] = "entry"
+    assert ensure_query_book(holder) is book, (
+        "ensure never replaces a built book"
+    )
+
+    reset_query_book(holder)
+    assert holder.query_book is None
 
 
 def test_adopting_mutates_the_callers_own_containers():

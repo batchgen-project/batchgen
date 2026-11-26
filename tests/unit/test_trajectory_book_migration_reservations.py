@@ -31,7 +31,12 @@ import torch
 
 from batchgen.lifespan import SeqEvent
 from batchgen.worker.kv_migration_types import MigrationOp
-from batchgen.query_book import QueryBook, make_query_book_entry
+from batchgen.query_book import (
+    QueryBook,
+    make_query_book_entry,
+    refresh_query_book_entry,
+    release_query_book_slot,
+)
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.gpu_residency import GpuResidencySet
 from batchgen.worker.host_rebalancer import HostKVRebalancer
@@ -110,6 +115,8 @@ def _load_worker_shell(fake_dist):
         "dist": fake_dist,
         "logging": logging,
         "make_query_book_entry": make_query_book_entry,
+        "refresh_query_book_entry": refresh_query_book_entry,
+        "release_query_book_slot": release_query_book_slot,
         "time": time,
         "torch": torch,
     })

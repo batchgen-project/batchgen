@@ -49,7 +49,7 @@ from batchgen.native_loader import core_engine
 from batchgen.query_book import (
     QueryBook,
     QueryBookPoolCapacityError,
-    make_query_book_entry,
+    refresh_query_book_entry,
     release_query_book_slot,
 )
 from batchgen.worker.admission.plan import (
@@ -3837,17 +3837,18 @@ class KVCapacityEngine:
 
             # Update local mappings on source rank (remove)
             if self.rank == old_rank:
-                # unbind drops both directions and returns the slot to the
-                # free list for O(1) reuse.
-                local_idx = self.seq_table.unbind(uuid)
+                # The owner helper unbinds both slot directions, returns the
+                # slot to the free list for O(1) reuse, and drops the slot's
+                # query-book entry.
+                local_idx = release_query_book_slot(
+                    uuid, query_book=self.query_book, table=self.seq_table,
+                )
                 if local_idx is not None:
                     # A remap can leave `batch` byte-identical while changing
                     # which sequence a row resolves to, so row-keyed state must
                     # be invalidated here and not only where `batch` is rebound.
                     self._bump_decode_row_epoch()
                     self._sequences_with_gpu_kv.drop(uuid)
-                    # Remove query_book entry
-                    self.query_book.pop(local_idx, None)
                     logging.debug(
                         f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
                         f"{uuid[:8]} (local_idx={local_idx}, from_rank={old_rank}, "
@@ -3893,7 +3894,11 @@ class KVCapacityEngine:
                     seq._buffer_slot = destination_slot
                     seq.prompt_length = pending['prompt_length']
                     seq.rebase_decoded_length(pending['decoded_length'])
-                    self.query_book[new_local_idx] = make_query_book_entry(seq)
+                    refresh_query_book_entry(
+                        uuid, seq,
+                        query_book=self.query_book,
+                        local_of=self.seq_table.local_of,
+                    )
                     logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
                 else:
                     logging.error(f"Rank {self.rank}: No pending query_book data for migrated {uuid[:8]}...")
@@ -4144,7 +4149,11 @@ class KVCapacityEngine:
             )
             # Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
             if local_idx in query_book:
-                query_book[local_idx] = make_query_book_entry(seq)
+                refresh_query_book_entry(
+                    uuid, seq,
+                    query_book=query_book,
+                    local_of=ctx.sched.seq_table.local_of,
+                )
 
         if async_load_tensors_ref is not None:
             async_load_tensors_ref[0] = None

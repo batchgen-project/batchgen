@@ -35,7 +35,7 @@ from batchgen.native_loader import core_engine
 from batchgen.phase_lifecycle import AdmitContext
 from batchgen.query_book import (
     QueryBookPoolCapacityError,
-    make_query_book_entry,
+    refresh_query_book_entry,
 )
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.decode_engine import BATCHGEN_CB_DEBUG
@@ -3888,8 +3888,11 @@ class PrefillEngine:
             # lost is already restored by the _assign_decode_dp_groups call at the
             # top of this method. G==1: the same single rank as before.
             if self._owns_local_sequence(seq) and uuid in self._uuid_to_local_map:
-                local_idx = self._uuid_to_local_map[uuid]
-                self.query_book[local_idx] = make_query_book_entry(seq)
+                refresh_query_book_entry(
+                    uuid, seq,
+                    query_book=self.query_book,
+                    local_of=self._uuid_to_local_map.get,
+                )
 
             logging.info(
                 f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
