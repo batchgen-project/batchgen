@@ -13,6 +13,11 @@ store, the trajectory store, the sequence ids) and hand it in.  A model that
 keeps no recurrent state has no record store (``store is None``) and every
 step is structurally empty -- that is the absence of the state itself, not a
 configuration gate.
+
+One step runs before any store exists: ``release_restart_orphans``, the pool
+startup sweep over the durable record map that releases the records a dead
+worker cohort left behind (its ``shared_map is None`` case is the same
+structural absence).
 """
 
 from __future__ import annotations
@@ -93,6 +98,84 @@ def restore_decode_states(
             len(restored),
         )
     return tuple(restored)
+
+
+def release_restart_orphans(
+    shared_map,
+    arena_allocator,
+    live_sequence_ids: Iterable[int] = (),
+    *,
+    rank: int,
+    logger=logging,
+) -> int:
+    """Pool startup: release the records a dead worker cohort left behind.
+
+    ``shared_map`` is the node's durable sequence-id -> pages map read back
+    from the shared region (``None`` when nothing was ever persisted -- a
+    first cohort, or a model without recurrent state).  Runs on ONE rank
+    per node, after the host KV views attach and before any admission; the
+    server's readiness barrier orders it before every rank's store build.
+
+    The sweep first opens a new cohort generation, then walks every entry
+    of the previous ones:
+
+    * a sequence in ``live_sequence_ids`` keeps its entry -- the new
+      cohort's stores rehydrate it, so its record stays readable.  The
+      restart route today fails every in-flight batch (#490 semantics), so
+      the live set is empty; the parameter is the seam a future
+      keep-sequences restart passes its survivors through.
+    * a dead sequence with a RETAINED record is the orphan this sweep
+      exists for: its pages are prefix-resident and named by the map
+      alone, so they are released back to the Host pool here, exactly
+      ``pages_per_group`` per record per group.
+    * a dead sequence with an unretained record only drops its entry: its
+      pages were still chain-owned by the arena's pseudo row, which the
+      server's cohort reconcile (``release_all_sequences``) already
+      recovered before this cohort spawned -- releasing them again here
+      would double-free.
+
+    Returns the resident pages released (per group, the same unit the
+    store's ``release`` reports).
+    """
+
+    if shared_map is None:
+        return 0
+    live = {int(sequence_id) for sequence_id in live_sequence_ids}
+    generation = shared_map.bump_generation()
+    released_pages = 0
+    released: list[int] = []
+    dropped: list[int] = []
+    kept: list[int] = []
+    for sid, entry in sorted(shared_map.entries().items()):
+        if int(entry.generation) == int(generation):
+            # Written after the bump: not this sweep's to judge.
+            continue
+        if int(sid) in live:
+            kept.append(int(sid))
+            continue
+        if entry.retained:
+            arena_allocator.release(entry.to_arena())
+            released_pages += int(entry.pages_per_group)
+            released.append(int(sid))
+        else:
+            dropped.append(int(sid))
+        shared_map.remove(int(sid))
+    if released or dropped or kept:
+        logger.info(
+            "[KDA_RECORD] rank=%s pool restart recovery: released %s "
+            "orphaned record page(s) of %s dead sequence(s) %s; dropped %s "
+            "unretained entry/entries %s (pages already recovered by the "
+            "cohort reconcile); kept %s surviving record(s) %s",
+            rank,
+            released_pages,
+            len(released),
+            released,
+            len(dropped),
+            dropped,
+            len(kept),
+            kept,
+        )
+    return released_pages
 
 
 def release_records(

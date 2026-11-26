@@ -267,8 +267,15 @@ def install_serving_wrappers(model, cfg):
 # ---------------------------------------------------------------------------
 #  Decode driver
 # ---------------------------------------------------------------------------
-def decode_step(model, kv, seq_ids, tokens, contexts):
-    """One decode step with the worker's per-step wrapper bindings."""
+def decode_step(model, kv, seq_ids, tokens, contexts, adapter=None):
+    """One decode step with the worker's per-step wrapper bindings.
+
+    Driver-unified dispatch (decode_engine.DecoupledGpuDecode.run): this
+    harness, as the decode driver, arms the step through the adapter's step
+    API, replays the whole-model graph when armed, otherwise runs the eager
+    model forward (during which the adapter's per-layer hooks may replay
+    layer spans), and always disarms the step.
+    """
     AttnWrapperBase.phase = "decode"
     AttnWrapperBase.attention_mask = None
     AttnWrapperBase.cur_batch = list(seq_ids)
@@ -282,13 +289,21 @@ def decode_step(model, kv, seq_ids, tokens, contexts):
     AttnWrapperBase.cache_seqlens = cache_seqlens
     AttnWrapperBase.position_ids = position_ids
     AttnWrapperBase.max_seqlen = int(cache_seqlens.max().item())
-    logits = model(input_ids=tokens, position_ids=position_ids)
+    armed = adapter is not None and adapter.begin_decode_step(tokens)
+    try:
+        if armed:
+            logits = adapter.replay_whole_model_step(tokens)
+        else:
+            logits = model(input_ids=tokens, position_ids=position_ids)
+    finally:
+        if adapter is not None:
+            adapter.end_decode_step()
     for s in seq_ids:
         contexts[s] += 1
     return logits
 
 
-def run_schedule(model, kv, mode, live, token_plan, base_contexts):
+def run_schedule(model, kv, mode, live, token_plan, base_contexts, adapter=None):
     """Run BSZ_SCHEDULE decode steps in `mode`; return per-step logits."""
     AttnWrapperBase.batchgen_debug = {"kimi_decode_graph_mode": mode}
     contexts = dict(base_contexts)
@@ -296,7 +311,9 @@ def run_schedule(model, kv, mode, live, token_plan, base_contexts):
     for step, bsz in enumerate(BSZ_SCHEDULE):
         seq_ids = live[:bsz]
         kv.set_batch_order(seq_ids)
-        logits = decode_step(model, kv, seq_ids, token_plan[step][:bsz], contexts)
+        logits = decode_step(
+            model, kv, seq_ids, token_plan[step][:bsz], contexts, adapter=adapter
+        )
         outs.append(logits.float().clone())
     torch.cuda.synchronize()
     AttnWrapperBase.batchgen_debug = None
@@ -385,7 +402,7 @@ def main():
 
     # ---- pass 1: graphs ---------------------------------------------------
     graph_outs = run_schedule(model, kv, "graph", live, token_plan,
-                              base_contexts)
+                              base_contexts, adapter=adapter)
     graph_pools = pool_snapshot(mgr)
     graph_kv = kv.snapshot()
     graph_appends = len(kv_appends)
@@ -444,7 +461,7 @@ def main():
     kv.restore(kv_snap)
     kv_appends.clear()
     eager_outs = run_schedule(model, kv, "eager", live, token_plan,
-                              base_contexts)
+                              base_contexts, adapter=adapter)
     eager_pools = pool_snapshot(mgr)
     eager_kv = kv.snapshot()
     report("eager mode replayed nothing (adapter step counter frozen)",
@@ -500,7 +517,8 @@ def main():
     for step, bsz in enumerate(BSZ_SCHEDULE[:8]):
         seq_ids = live[:bsz]
         kv.set_batch_order(seq_ids)
-        decode_step(model, kv, seq_ids, token_plan[step][:bsz], contexts)
+        decode_step(model, kv, seq_ids, token_plan[step][:bsz], contexts,
+                    adapter=adapter)
     torch.cuda.synchronize()
     AttnWrapperBase.batchgen_debug = None
 
@@ -561,14 +579,16 @@ def main():
            adapter._signature(kv)[1] == adapter._tensor_signature(shrunk))
 
     geo_snap = kv.snapshot()
-    geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts)
+    geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts,
+                             adapter=adapter)
     report("graphs were re-captured after the geometry change",
            len(adapter._captured) > 0,
            f"captured={sorted(adapter._captured)}")
 
     pool_restore(mgr, kda_snap)
     kv.restore(geo_snap)
-    geo_eager = run_schedule(model, kv, "eager", live, token_plan, base_contexts)
+    geo_eager = run_schedule(model, kv, "eager", live, token_plan, base_contexts,
+                             adapter=adapter)
     worst_geo = max((g - e).abs().max().item()
                     for g, e in zip(geo_graph, geo_eager))
     reuse_note = (
