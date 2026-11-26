@@ -43,6 +43,7 @@ from batchgen.worker.step_timing import (
     new_decode_step_split,
 )
 from tests.worker.worker_fakes import attach_trajectory_state
+from tests.test_rank_sync_engine_source import load_rank_sync
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -136,6 +137,16 @@ def _namespace(**overrides):
     ns.update(overrides)
     for name in _METHODS:
         exec(compile(_source_of(_method_node(name)), str(WORKER), "exec"), ns)
+    load_rank_sync(ns)
+    ns["SimpleNamespace"] = SimpleNamespace
+    probe_class = ast.ClassDef(
+        name="_ProbeWorker", bases=[ast.Name(id="SimpleNamespace", ctx=ast.Load())],
+        keywords=[], decorator_list=[],
+        body=[node for node in WORKER_CLASS.body
+              if isinstance(node, ast.FunctionDef) and node.name == "_cohort_shutdown_probe"],
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[probe_class], type_ignores=[])),
+                 str(WORKER), "exec"), ns)
     return ns
 
 
@@ -294,18 +305,18 @@ def _make_worker(ns, seqs, stream, log):
     book = Book(seqs, first_token=lambda s: 3 + s.global_idx)
     by_uuid = {s.uuid: s for s in seqs}
     kv_waits = []
-    worker = SimpleNamespace(
+    worker = ns["_ProbeWorker"](
         rank=0,
         eos_token_ids=[EOS],
         model_context_length=10_000,
         torch_device="cpu",
         _local_to_uuid_map={i: s.uuid for i, s in enumerate(seqs)},
         global_batch=SimpleNamespace(get_sequence=by_uuid.get),
-        _cohort_shutdown_probe=None,
         _decode_tokens_unread=False,
         _pending_kv_append_tasks=[],
         kv_waits=kv_waits,
     )
+    worker._cohort_shutdown_probe = None
     attach_trajectory_state(worker, trajectory_book=book)
 
     def wait_kv(**kwargs):
