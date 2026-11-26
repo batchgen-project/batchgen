@@ -21,11 +21,18 @@ What these tests defend (the approved seam's four anti-properties):
 import pytest
 import torch
 
+from batchgen.prefix_reuse.kda_record_map import (
+    KDARecordMapFull,
+    KDARecordMapGeometry,
+    KDARecordMapLayoutMismatch,
+    KDARecordSharedMap,
+)
 from batchgen.prefix_reuse.kda_record_store import (
     KDARecordMissing,
     KDARecordReservationUnavailable,
     KDARecordStateInvalid,
     KDARecordStore,
+    record_page_count,
 )
 from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotArenaUnavailable,
@@ -215,6 +222,38 @@ class _StateWriter:
         return self.slots[int(sequence_id)], len(data)
 
 
+def _record_pages() -> int:
+    """The model constant every map geometry and store must agree on."""
+
+    return record_page_count(
+        rank_profile=_full_profile(),
+        group_size=1,
+        unit_count=UNIT_COUNT,
+        host_page_bytes_all_layers=HOST_PAGE_BYTES,
+    )
+
+
+def _map_geometry(capacity: int = 32) -> KDARecordMapGeometry:
+    return KDARecordMapGeometry(
+        capacity=capacity,
+        group_ids=(0,),
+        pages_per_group=_record_pages(),
+        unit_count=UNIT_COUNT,
+        host_page_bytes_all_layers=HOST_PAGE_BYTES,
+    )
+
+
+def _region(capacity: int = 32) -> bytearray:
+    """A fresh 'shared region' for the durable map (what outlives stores)."""
+
+    return bytearray(KDARecordSharedMap.required_bytes(_map_geometry(capacity)))
+
+
+def _shared_map(region=None, *, capacity: int = 32) -> KDARecordSharedMap:
+    region = _region(capacity) if region is None else region
+    return KDARecordSharedMap(region, geometry=_map_geometry(capacity))
+
+
 def _store(
     *,
     arena: _PageArena,
@@ -222,6 +261,8 @@ def _store(
     group_rank: int,
     full_chunks=None,
     state_writer=None,
+    shared_map=None,
+    rank=None,
 ) -> KDARecordStore:
     chunks = (
         _shard_chunks(full_chunks, group_size, group_rank)
@@ -229,7 +270,7 @@ def _store(
         else ()
     )
     return KDARecordStore(
-        rank=group_rank,
+        rank=group_rank if rank is None else rank,
         group_size=group_size,
         group_rank=group_rank,
         unit_count=UNIT_COUNT,
@@ -239,6 +280,7 @@ def _store(
         arena_reader=arena,
         snapshot_reader=_SnapshotReader(chunks),
         state_writer=state_writer or _StateWriter(),
+        shared_map=shared_map if shared_map is not None else _shared_map(),
     )
 
 
@@ -553,6 +595,213 @@ def test_release_before_retain_rolls_the_allocation_back():
 
 
 # ---------------------------------------------------------------------------
+# Durable map: the sequence-id -> pages map survives a pool respawn (方案甲
+# orphan fix). "The shared region" is the bytearray the map objects share;
+# a respawn is a NEW map/store object over the same bytes.
+# ---------------------------------------------------------------------------
+
+
+def test_map_entry_tracks_the_owner_lifecycle_and_clears_on_release():
+    region = _region()
+    smap = _shared_map(region)
+    arena = _PageArena()
+    full = _full_chunks(seed=4)
+    store = _store(
+        arena=arena, group_size=1, group_rank=0, full_chunks=full,
+        shared_map=smap,
+    )
+    store.reserve(51)
+    entry = smap.get(51)
+    assert entry is not None and not entry.written and not entry.retained
+    assert dict(entry.page_ids_by_group) == dict(
+        store.record_for(51).arena.page_ids_by_group
+    )
+    store.write_rank_units(51, token_count=UNALIGNED_TOKENS)
+    entry = smap.get(51)
+    assert entry.written and entry.token_count == UNALIGNED_TOKENS
+    assert not entry.retained
+    store.retain_written()
+    assert smap.get(51).retained
+    store.release(51)
+    assert smap.get(51) is None and len(smap) == 0
+
+
+def test_admission_rollback_clears_the_map_entry():
+    smap = _shared_map()
+    arena = _PageArena()
+    store = _store(
+        arena=arena, group_size=1, group_rank=0, shared_map=smap
+    )
+    store.reserve(52)
+    assert smap.get(52) is not None
+    store.rollback_reserved([52])
+    assert smap.get(52) is None and len(smap) == 0
+
+
+def test_followers_never_write_the_map():
+    region = _region()
+    arena = _PageArena()
+    full = _full_chunks(seed=6)
+    owner = _store(
+        arena=arena, group_size=2, group_rank=0, full_chunks=full,
+        shared_map=_shared_map(region),
+    )
+    owner.reserve(53)
+    follower = _store(
+        arena=arena, group_size=2, group_rank=1, full_chunks=full,
+        shared_map=KDARecordSharedMap(region, geometry=_map_geometry()),
+        rank=1,
+    )
+    follower.adopt(owner.mirror_payload([53]))
+    follower.write_rank_units(53, token_count=UNALIGNED_TOKENS)
+    # The entry mirrors the OWNER's lifecycle alone: the follower's unit
+    # write did not stamp it.
+    entry = owner.shared_map.get(53)
+    assert entry.owner_rank == 0 and not entry.written
+    owner.write_rank_units(53, token_count=UNALIGNED_TOKENS)
+    assert owner.shared_map.get(53).written
+
+
+def test_current_cohort_entries_are_not_rehydrated_by_sibling_stores():
+    """A store built while its node siblings already wrote entries must not
+    install them: those mirrors arrive through ``adopt`` exactly as before."""
+
+    region = _region()
+    arena = _PageArena()
+    owner = _store(
+        arena=arena, group_size=2, group_rank=0,
+        shared_map=_shared_map(region),
+    )
+    owner.reserve(54)
+    follower = _store(
+        arena=arena, group_size=2, group_rank=1,
+        shared_map=KDARecordSharedMap(region, geometry=_map_geometry()),
+        rank=1,
+    )
+    assert not follower.has_record(54)
+    follower.adopt(owner.mirror_payload([54]))  # must not raise
+    assert follower.record_for(54).mirrored
+
+
+def test_pool_respawn_releases_dead_records_and_keeps_survivors():
+    """The orphan fix end to end: a simulated pool respawn (new objects over
+    the same shared region) releases the records of DEAD sequences exactly
+    and keeps the SURVIVOR's record readable, with exact page accounting."""
+
+    region = _region()
+    arena = _PageArena(free_pages=1000)
+    full = _full_chunks(seed=5)
+    store = _store(
+        arena=arena, group_size=1, group_rank=0, full_chunks=full,
+        shared_map=_shared_map(region),
+    )
+    before = arena.free_pages
+    pages = store.record_pages
+    for sid in (41, 42):
+        store.reserve(sid)
+        store.write_rank_units(sid, token_count=UNALIGNED_TOKENS)
+    store.retain_written()
+    store.reserve(43)  # reserved, never written: still under its pseudo row
+    assert arena.free_pages == before - 3 * pages
+    unretained_arena = store.record_for(43).arena
+
+    # The pool dies. The server's cohort reconcile (release_all_sequences)
+    # returns every page still chain-owned by a pseudo row -- 43's -- and
+    # cannot name the prefix-resident ones (41's and 42's).
+    arena.rollback(unretained_arena)
+    assert arena.free_pages == before - 2 * pages
+
+    # Recovery sweep on the new cohort's node leader: 42 is still alive
+    # server-side, 41 and 43 are not.
+    recovery_map = KDARecordSharedMap(region, geometry=_map_geometry())
+    released = kda_lifecycle.release_restart_orphans(
+        recovery_map, arena, [42], rank=0
+    )
+    assert released == pages  # 41's resident pages, exactly once
+    assert arena.free_pages == before - pages  # only 42's record remains
+    assert sorted(recovery_map.entries()) == [42]
+
+    # The new cohort's store over the same region sees the survivor...
+    writer = _StateWriter()
+    store2 = _store(
+        arena=arena, group_size=1, group_rank=0, state_writer=writer,
+        shared_map=KDARecordSharedMap(region, geometry=_map_geometry()),
+    )
+    assert store2.has_record(42) and store2.is_written(42)
+    assert not store2.has_record(41) and not store2.has_record(43)
+    assert not store2.record_for(42).mirrored
+    assert store2.record_for(42).token_count == UNALIGNED_TOKENS
+
+    # ...and its record restores byte-identically.
+    store2.restore_rank_units(42, group_size=1, group_rank=0)
+    assert writer.written[42] == _chunk_bytes(full)
+
+    # Release accounts exactly, and a double release still raises by name.
+    assert store2.release(42) == pages
+    assert arena.free_pages == before
+    with pytest.raises(KDARecordMissing):
+        store2.release(42)
+    assert len(recovery_map) == 0
+
+
+def test_respawn_on_another_rank_rehydrates_the_survivor_as_a_mirror():
+    region = _region()
+    arena = _PageArena()
+    full = _full_chunks(seed=7)
+    store = _store(
+        arena=arena, group_size=1, group_rank=0, full_chunks=full,
+        shared_map=_shared_map(region),
+    )
+    store.reserve(45)
+    store.write_rank_units(45, token_count=UNALIGNED_TOKENS)
+    store.retain_written()
+    kda_lifecycle.release_restart_orphans(
+        KDARecordSharedMap(region, geometry=_map_geometry()),
+        arena,
+        [45],
+        rank=0,
+    )
+    writer = _StateWriter()
+    other_rank = _store(
+        arena=arena, group_size=1, group_rank=0, state_writer=writer,
+        shared_map=KDARecordSharedMap(region, geometry=_map_geometry()),
+        rank=1,
+    )
+    record = other_rank.record_for(45)
+    assert record.mirrored and record.written
+    other_rank.restore_rank_units(45, group_size=1, group_rank=0)
+    assert writer.written[45] == _chunk_bytes(full)
+    with pytest.raises(KDARecordStateInvalid):
+        other_rank.release(45)  # pages stay the owner's, exactly as before
+
+
+def test_reserve_hands_the_pages_back_when_the_map_is_full():
+    arena = _PageArena()
+    store = _store(
+        arena=arena, group_size=1, group_rank=0,
+        shared_map=_shared_map(capacity=1),
+    )
+    store.reserve(61)
+    before = arena.free_pages
+    with pytest.raises(KDARecordMapFull):
+        store.reserve(62)
+    assert arena.free_pages == before  # the second arena went straight back
+    assert not store.has_record(62)
+    assert store.has_record(61)
+
+
+def test_map_layout_mismatch_is_refused_by_name():
+    from batchgen.prefix_reuse.kda_record_map import KDARecordMapCorrupt
+
+    region = _region(capacity=32)
+    _shared_map(region)  # initializes the header at capacity 32
+    with pytest.raises(KDARecordMapLayoutMismatch):
+        KDARecordSharedMap(region, geometry=_map_geometry(capacity=16))
+    with pytest.raises(KDARecordMapCorrupt):
+        KDARecordSharedMap.from_existing(bytearray(1024))
+
+
+# ---------------------------------------------------------------------------
 # A model without recurrent state: every lifecycle step is structurally empty
 # ---------------------------------------------------------------------------
 
@@ -567,4 +816,9 @@ def test_stateless_model_has_no_store_and_every_step_is_empty():
     ) == ()
     assert kda_lifecycle.release_records(
         None, [1], rank=0, where="completion host release"
+    ) == 0
+    # Nothing persisted, nothing to recover: the startup sweep is the same
+    # structural absence (a stateless model never sizes the map region).
+    assert kda_lifecycle.release_restart_orphans(
+        None, _PageArena(), (), rank=0
     ) == 0
