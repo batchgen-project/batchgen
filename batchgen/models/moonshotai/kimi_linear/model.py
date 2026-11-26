@@ -50,32 +50,12 @@ from .block_residual import (
 )
 from .block_residual import apply_attn_res as _block_residual_apply_attn_res
 from .config import KimiLinearConfig
-
-
-def _view_rows_as_bsh(t, batch_size, seq_len, hidden_size):
-    """``(rows, H)`` -> ``(B, rows // B, H)``, valid when the batch is EMPTY.
-
-    ``view(batch_size, -1, hidden_size)`` cannot infer ``-1`` from a 0-element
-    tensor and raises "cannot reshape tensor of 0 elements ... is ambiguous".
-    A decode batch drains to zero rows whenever the last sequences of a run
-    complete, which killed a 512-request decode run at 506/512.
-
-    ONLY the empty case is special-cased; a non-empty tensor keeps exactly the
-    shape ``-1`` inferred. That matters: the row count here is NOT the caller's
-    entry ``seq_len`` -- ``scatter_rows`` shards rows across the TP group -- so
-    hoisting a fixed seq_len for the NON-empty case breaks prefill with
-    "shape '[1, N, H]' is invalid for input of size ...".
-
-    The empty case must reuse the caller's entry ``seq_len``, not 0. ``numel()
-    == 0`` means ``B == 0`` or ``seq_len == 0``, so every ``(B, seq_len, H)``
-    holds 0 elements and no sharding can invalidate the choice -- but the
-    residual that stays behind keeps the ENTRY shape, so emitting ``(B, 0, H)``
-    here makes ``prefix_sum.add_(hidden_states)`` fail with "output with shape
-    [0, 1, H] doesn't match the broadcast shape [0, 0, H]".
-    """
-    if t.numel() == 0:
-        return t.view(batch_size, seq_len, hidden_size)
-    return t.view(batch_size, -1, hidden_size)
+from .layer_body import (
+    KimiLayerBodyOps,
+    run_kimi_block_residual_layer_body,
+    run_kimi_layer_body,
+)
+from .layer_body import view_rows_as_bsh as _view_rows_as_bsh
 
 
 # ============================================================================
@@ -1122,135 +1102,104 @@ class KimiDecoderLayer(nn.Module):
                 cu_seqlens, block_residual, **kwargs
             )
 
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._run_attn(
-            hidden_states, attention_mask, position_ids, past_key_values, cu_seqlens, **kwargs
-        )
-        hidden_states = residual + hidden_states
+        # The eager operator set for the ONE shared plain body
+        # (run_kimi_layer_body): attention and FFN are the production eager
+        # modules, no extras ride along, and the merges are the body's own
+        # out-of-place adds, so the body reduces to exactly the historical
+        # eager sequence.
+        def _eager_attn(normed):
+            return self._run_attn(
+                normed, attention_mask, position_ids, past_key_values,
+                cu_seqlens, **kwargs
+            ), {}
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._run_ffn(hidden_states)
-        hidden_states = residual + hidden_states
+        out = run_kimi_layer_body(
+            layer=self,
+            ops=KimiLayerBodyOps(attn=_eager_attn, ffn=self._run_ffn),
+            hidden_states=hidden_states,
+        )
         # Return a 1-tuple so the BatchGen worker's prepack loop can index
         # layer_outputs[0]; the model's own forward unpacks [0] too.
-        return (hidden_states,)
+        return (out["hidden"],)
 
     def _forward_attn_residual(
         self, hidden_states, attention_mask, position_ids, past_key_values,
         cu_seqlens, block_residual, **kwargs
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
-        self._record_prefill_finite("entry", hidden_states)
-        prefix_sum = hidden_states
 
-        if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states = _view_rows_as_bsh(
-                _apply_attn_res(
+        # The eager operator set for the ONE shared Block-Attention-Residual
+        # body (run_kimi_block_residual_layer_body). The bindings reproduce
+        # the historical eager sequence exactly: production attention/FFN, the
+        # streamed-SP8 finite probes, in-place prefix merges (896 MiB per
+        # avoided full hidden tensor at exact-64K K3), the growing
+        # BlockResidualBuffer boundary append, and the streamed-SP8 carry
+        # hooks, all of which the graph operator sets leave unbound.
+        def _eager_attn(normed):
+            return self._run_attn(
+                normed, attention_mask, position_ids, past_key_values,
+                cu_seqlens, **kwargs
+            ), {}
+
+        def _append_boundary(flat_prefix, active):
+            # Boundary: snapshot the PRE-mix prefix_sum. Value-for-value the
+            # old torch.cat([block_residual, prefix.unsqueeze(1)], dim=1) but
+            # written into a column of the pass's preallocated buffer, so the
+            # (S,nb,H) and (S,nb+1,H) tensors are never co-live — 12.25 GiB
+            # of transient at the last K3 boundary. What comes back is the
+            # NARROWED (S,nb+1,H) view, so shape[1] still counts boundaries.
+            snapshot = gather_attn_residual_rows(
+                flat_prefix, active, self.self_attention_res_norm
+            )
+            return BlockResidualBuffer.append(active, snapshot)
+
+        def _reshard_prefix(prefix_sum):
+            # Attention returned this rank's streamed-SP8 row shard; scatter
+            # the carried full-row prefix to the same rows before the merge.
+            row_group = getattr(
+                self.mlp_res_norm, "_streamed_sp8_row_group", None
+            )
+            if row_group is None:
+                raise ValueError(
+                    "attention returned a row shard without streamed-SP8"
+                )
+            from .moe_tp_reshard import scatter_rows
+
+            group_size, group_rank, _ = row_group
+            return _view_rows_as_bsh(
+                scatter_rows(
                     prefix_sum.view(-1, hidden_size),
-                    block_residual,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
+                    group_size,
+                    group_rank,
                 ),
                 batch_size,
                 seq_len,
                 hidden_size,
             )
-            self._record_prefill_finite(
-                "post_input_depth_mix", hidden_states
-            )
 
-        if self.layer_idx % self.attn_res_block_size == 0:
-            # Boundary: snapshot the PRE-mix prefix_sum, then RESET (assignment,
-            # not add). Value-for-value the old
-            #   torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
-            # but written into a column of the pass's preallocated buffer, so
-            # the (S,nb,H) and (S,nb+1,H) tensors are never co-live — 12.25 GiB
-            # of transient at the last K3 boundary. What comes back is the
-            # NARROWED (S,nb+1,H) view, so shape[1] still counts boundaries.
-            snapshot = gather_attn_residual_rows(
-                prefix_sum.view(-1, hidden_size),
-                block_residual,
-                self.self_attention_res_norm,
-            )
-            block_residual = BlockResidualBuffer.append(
-                block_residual, snapshot
-            )
-            prefix_sum = None
+        def _pre_ffn(active):
+            moe = getattr(self, "block_sparse_moe", None)
+            if (
+                moe is not None
+                and getattr(moe, "_streamed_sp8_sharded_carry", False)
+            ):
+                moe._streamed_sp8_global_rows = active.shape[0]
 
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._run_attn(
-            hidden_states, attention_mask, position_ids, past_key_values, cu_seqlens, **kwargs
-        )
-        self._record_prefill_finite("post_attention", hidden_states)
-
-        if prefix_sum is not None:
-            if prefix_sum.numel() != hidden_states.numel():
-                row_group = getattr(
-                    self.mlp_res_norm, "_streamed_sp8_row_group", None
-                )
-                if row_group is None:
-                    raise ValueError(
-                        "attention returned a row shard without streamed-SP8"
-                    )
-                from .moe_tp_reshard import scatter_rows
-
-                group_size, group_rank, _ = row_group
-                prefix_sum = _view_rows_as_bsh(
-                    scatter_rows(
-                        prefix_sum.view(-1, hidden_size),
-                        group_size,
-                        group_rank,
-                    ),
-                    batch_size,
-                    seq_len,
-                    hidden_size,
-                )
-            # The pre-attention prefix is the surviving residual buffer and
-            # the attention output is dead after this merge. Exact-64K K3 is
-            # 896 MiB per full hidden tensor, so update the prefix in place
-            # instead of materializing a third tensor before the depth mix.
-            prefix_sum.add_(hidden_states)
-        else:
-            prefix_sum = hidden_states
-        self._record_prefill_finite("post_attention_residual", prefix_sum)
-
-        hidden_states = _view_rows_as_bsh(
-            _apply_attn_res(
-                prefix_sum.view(-1, hidden_size),
-                block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
+        out = run_kimi_block_residual_layer_body(
+            layer=self,
+            ops=KimiLayerBodyOps(
+                attn=_eager_attn,
+                ffn=self._run_ffn,
+                append_boundary=_append_boundary,
+                residual_add_in_place=True,
+                reshard_prefix=_reshard_prefix,
+                record_finite=self._record_prefill_finite,
+                pre_ffn=_pre_ffn,
             ),
-            batch_size,
-            seq_len,
-            hidden_size,
+            hidden_states=hidden_states,
+            block_residual=block_residual,
         )
-        self._record_prefill_finite("post_mlp_depth_mix", hidden_states)
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        self._record_prefill_finite("post_mlp_norm", hidden_states)
-        moe = getattr(self, "block_sparse_moe", None)
-        if (
-            moe is not None
-            and getattr(moe, "_streamed_sp8_sharded_carry", False)
-        ):
-            moe._streamed_sp8_global_rows = block_residual.shape[0]
-        hidden_states = self._run_ffn(hidden_states)
-        self._record_prefill_finite("post_ffn", hidden_states)
-
-        if prefix_sum is None:
-            prefix_sum = hidden_states
-        else:
-            # The FFN output is dead after this residual merge. Reuse the
-            # surviving prefix buffer instead of allocating another full
-            # (tokens, hidden) tensor; exact-64K K3 is 896 MiB per rank here.
-            prefix_sum.add_(hidden_states)
-
-        self._record_prefill_finite("output", prefix_sum)
-
-        return prefix_sum, block_residual
+        return out["hidden"], out["block_residual"]
 
 
 # ============================================================================
