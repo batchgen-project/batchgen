@@ -43,6 +43,14 @@ The state's byte size does not depend on the token count, so the count is the
 same for every sequence of the model; the token count still stamps the record
 so a restore can assert what boundary the state describes.
 
+Restart survival: the owner's sequence-id -> pages map is persisted in the
+node's shared region (``kda_record_map.KDARecordSharedMap``, a server-owned
+memfd) in the same step as every owner-side lifecycle transition, so a
+worker-pool restart cannot orphan record pages: the recovery sweep
+(``kda_lifecycle.release_restart_orphans``) releases the records of
+sequences that no longer exist server-side, and a store built by the new
+cohort rehydrates the survivors' records from the map.
+
 This module never imports model-family code.
 """
 
@@ -52,6 +60,7 @@ import logging
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from batchgen.prefix_reuse.kda_record_map import KDARecordSharedMap
 from batchgen.prefix_reuse.trajectory_commit import (
     SnapshotArena,
     SnapshotArenaUnavailable,
@@ -67,6 +76,39 @@ from batchgen.prefix_reuse.trajectory_frontier import (
 )
 
 PREFIX = "KDA_RECORD"
+
+
+def record_page_count(
+    *,
+    rank_profile: KDASnapshotProfile,
+    group_size: int,
+    unit_count: int,
+    host_page_bytes_all_layers: int,
+) -> int:
+    """Host pages ONE sequence's record costs -- a model constant at U.
+
+    ``FrontierCharge`` stays the one owner of "state bytes -> whole Host
+    pages": U units, each rounded up to whole pages independently, with no
+    prefix pages in the charge (``page_count=0``).  Module-level so the
+    durable map region can be sized to exactly this figure before a store
+    exists; ``KDARecordStore.record_pages`` delegates here.
+    """
+
+    layout = SnapshotLayout(
+        profile=unit_profile(
+            rank_profile,
+            group_size=int(group_size),
+            unit_count=int(unit_count),
+        )
+    )
+    return int(
+        FrontierCharge(
+            page_count=0,
+            host_page_bytes_all_layers=int(host_page_bytes_all_layers),
+            snapshot_bytes=layout.total_bytes,
+            unit_count=int(unit_count),
+        ).arena_host_pages
+    )
 
 
 class KDARecordStoreError(RuntimeError):
@@ -134,6 +176,7 @@ class KDARecordStore:
         arena_reader,
         snapshot_reader,
         state_writer,
+        shared_map: KDARecordSharedMap,
         logger=logging,
     ) -> None:
         if int(host_page_bytes_all_layers) <= 0:
@@ -166,6 +209,75 @@ class KDARecordStore:
             group_size=self._group_size,
             group_rank=self._group_rank,
         )
+        # The DURABLE sequence-id -> pages map in the node's shared region.
+        # ``_records`` stays this process's working view; the shared map is
+        # what a respawned pool reads back, so the records of failed
+        # sequences can be released instead of orphaning their pages.
+        if shared_map is None:
+            raise KDARecordStateInvalid(
+                "KDARecordStore needs the node's durable record map; a model "
+                "without recurrent state keeps store=None instead"
+            )
+        if int(shared_map.pages_per_group) != self.record_pages:
+            raise KDARecordStateInvalid(
+                f"durable record map holds {shared_map.pages_per_group} "
+                f"page(s) per group, this store's records cost exactly "
+                f"{self.record_pages}"
+            )
+        if int(shared_map.unit_count) != self._unit_count:
+            raise KDARecordStateInvalid(
+                f"durable record map records {shared_map.unit_count} "
+                f"unit(s), this store splits into {self._unit_count}"
+            )
+        if (
+            int(shared_map.host_page_bytes_all_layers)
+            != self._host_page_bytes_all_layers
+        ):
+            raise KDARecordStateInvalid(
+                f"durable record map pages are "
+                f"{shared_map.host_page_bytes_all_layers} B, this store's "
+                f"are {self._host_page_bytes_all_layers} B"
+            )
+        self._shared_map = shared_map
+        self._rehydrate_from_shared_map()
+
+    def _rehydrate_from_shared_map(self) -> None:
+        """Install the entries that survived a worker-pool restart.
+
+        Entries whose generation differs from the map's current one were
+        written by a PREVIOUS cohort and survived the recovery sweep (the
+        sweep released every dead sequence's record and bumped the
+        generation before any store of this cohort was built).  They are
+        re-owned by the rank that owned them before the restart and
+        mirrored everywhere else, so the records stay readable and their
+        pages stay named exactly once.  Entries AT the current generation
+        were written by live ranks of THIS cohort: they are skipped here,
+        because their mirrors arrive through ``adopt`` as always.
+        """
+
+        current = int(self._shared_map.generation)
+        restored = 0
+        for sid, entry in sorted(self._shared_map.entries().items()):
+            if int(entry.generation) == current:
+                continue
+            self._records[int(sid)] = KDASequenceRecord(
+                sequence_id=int(sid),
+                arena=entry.to_arena(),
+                mirrored=int(entry.owner_rank) != self._rank,
+                retained=bool(entry.retained),
+                token_count=int(entry.token_count),
+                written=bool(entry.written),
+            )
+            restored += 1
+        if restored:
+            self._logger.info(
+                "[%s] rank=%s rehydrated %s surviving sequence record(s) "
+                "from the durable map (generation %s)",
+                PREFIX,
+                self._rank,
+                restored,
+                current,
+            )
 
     # ------------------------------------------------------------- geometry
 
@@ -181,19 +293,22 @@ class KDARecordStore:
     def record_pages(self) -> int:
         """Host pages ONE sequence's record costs -- a model constant at U.
 
-        ``FrontierCharge`` stays the one owner of "state bytes -> whole Host
-        pages": U units, each rounded up to whole pages independently, with no
-        prefix pages in the charge (``page_count=0``).
+        Delegates to module-level ``record_page_count`` -- the same figure
+        the durable map region is sized from -- so the two cannot drift.
         """
 
-        return int(
-            FrontierCharge(
-                page_count=0,
-                host_page_bytes_all_layers=self._host_page_bytes_all_layers,
-                snapshot_bytes=self._unit_layout.total_bytes,
-                unit_count=self._unit_count,
-            ).arena_host_pages
+        return record_page_count(
+            rank_profile=self._rank_profile,
+            group_size=self._group_size,
+            unit_count=self._unit_count,
+            host_page_bytes_all_layers=self._host_page_bytes_all_layers,
         )
+
+    @property
+    def shared_map(self) -> KDARecordSharedMap:
+        """The node's durable sequence-id -> pages map this store writes."""
+
+        return self._shared_map
 
     # -------------------------------------------------------------- lookups
 
@@ -250,6 +365,22 @@ class KDARecordStore:
         record = KDASequenceRecord(
             sequence_id=sid, arena=arena, mirrored=False
         )
+        try:
+            # The durable map names the pages from the moment they leave the
+            # free pool; a map that cannot take the entry is a capacity bug
+            # (it is sized for every sequence the node holds at once), and
+            # the reservation is handed back so no page goes nameless.
+            self._shared_map.put(
+                sequence_id=sid,
+                arena=arena,
+                owner_rank=self._rank,
+                written=False,
+                retained=False,
+                token_count=0,
+            )
+        except Exception:
+            self._arena_allocator.rollback(arena)
+            raise
         self._records[sid] = record
         return record
 
@@ -357,6 +488,16 @@ class KDARecordStore:
         record.token_count = int(token_count)
         record.written_bytes = written
         record.written = True
+        if not record.mirrored:
+            # Owner only: the entry is the owner's, exactly like the pages.
+            self._shared_map.put(
+                sequence_id=sid,
+                arena=record.arena,
+                owner_rank=self._rank,
+                written=True,
+                retained=record.retained,
+                token_count=int(token_count),
+            )
         self._logger.info(
             "[%s] rank=%s seq=%s wrote units=%s/%s bytes=%s tokens=%s into "
             "its per-sequence record (pseudo_sid=%s)",
@@ -387,6 +528,16 @@ class KDARecordStore:
                 continue
             self._arena_allocator.retain(record.arena)
             record.retained = True
+            # Retained is the state the restart recovery keys on: resident
+            # pages are named by this map alone once the pseudo row is gone.
+            self._shared_map.put(
+                sequence_id=sid,
+                arena=record.arena,
+                owner_rank=self._rank,
+                written=True,
+                retained=True,
+                token_count=int(record.token_count),
+            )
             retained.append(sid)
         return tuple(retained)
 
@@ -491,6 +642,7 @@ class KDARecordStore:
         else:
             self._arena_allocator.rollback(record.arena)
         del self._records[sid]
+        self._shared_map.remove(sid)
         return int(record.arena.pages_per_group)
 
     def drop_mirror(self, sequence_id: int) -> bool:
@@ -534,5 +686,6 @@ class KDARecordStore:
                 )
             self._arena_allocator.rollback(record.arena)
             del self._records[int(sequence_id)]
+            self._shared_map.remove(int(sequence_id))
             rolled_back.append(int(sequence_id))
         return tuple(rolled_back)

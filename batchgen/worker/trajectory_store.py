@@ -293,6 +293,7 @@ class TrajectoryStore:
         next_pseudo_sid: Callable[[], int],
         page_tokens: int,
         host_page_bytes_all_layers: int,
+        shared_map_factory: Callable[[int], Any],
     ):
         """Lazily build the per-sequence KDA record store (one per rank).
 
@@ -302,13 +303,21 @@ class TrajectoryStore:
         pseudo-sid namespace and the Host-KV page machinery with the frontier
         committer, but keeps its own records: lifecycle and prefix reuse
         never share a record.
+
+        ``shared_map_factory(record_pages)`` attaches the node's durable
+        sequence-id -> pages map (the restart-survival home of the store's
+        map), sized to exactly ``record_pages`` Host pages per record; it is
+        called only here, after the model proved it keeps recurrent state.
         """
         if self.kda_record_store is not None:
             return self.kda_record_store
         manager = self._owner_state_manager()
         if manager is None:
             return None
-        from batchgen.prefix_reuse.kda_record_store import KDARecordStore
+        from batchgen.prefix_reuse.kda_record_store import (
+            KDARecordStore,
+            record_page_count,
+        )
         from batchgen.prefix_reuse.trajectory_commit import (
             HostKVSnapshotArenaAllocator,
             KDAStateSnapshotReader,
@@ -321,6 +330,14 @@ class TrajectoryStore:
 
         group_size, group_rank, _is_leader = group_geometry
         rank_profile = profile_from_kda_state_config(manager.config)
+        shared_map = shared_map_factory(
+            record_page_count(
+                rank_profile=rank_profile,
+                group_size=int(group_size),
+                unit_count=int(unit_count),
+                host_page_bytes_all_layers=int(host_page_bytes_all_layers),
+            )
+        )
         self.kda_record_store = KDARecordStore(
             rank=int(rank),
             group_size=int(group_size),
@@ -346,6 +363,7 @@ class TrajectoryStore:
                 state_manager_provider=self._owner_state_manager,
                 profile=rank_profile,
             ),
+            shared_map=shared_map,
         )
         return self.kda_record_store
 
