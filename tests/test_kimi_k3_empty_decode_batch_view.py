@@ -1,13 +1,21 @@
-"""Regression: the attn-residual views must survive a ZERO-row decode batch."""
+"""Regression: the attn-residual views must survive a ZERO-row decode batch.
+
+The Block-Attention-Residual body lives in ``layer_body.py`` (one shared body
+for eager, captured and compare paths); ``view_rows_as_bsh`` lives beside it.
+``model.py``'s ``_forward_attn_residual`` is still scanned: it must not grow a
+view of its own back.
+"""
 import ast
 from pathlib import Path
 
-MODEL = (Path(__file__).resolve().parents[1] / "batchgen" / "models" / "moonshotai"
-         / "kimi_linear" / "model.py")
+_KIMI = (Path(__file__).resolve().parents[1] / "batchgen" / "models"
+         / "moonshotai" / "kimi_linear")
+MODEL = _KIMI / "model.py"
+LAYER_BODY = _KIMI / "layer_body.py"
 
 
-def _fn(name):
-    tree = ast.parse(MODEL.read_text())
+def _fn(path, name):
+    tree = ast.parse(path.read_text())
     return next(
         n for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == name
@@ -24,47 +32,53 @@ def test_attn_residual_views_do_not_infer_from_empty_batch():
     middle dimension must be explicit. Deliberately NOT fixed with an early
     return: under G>1 every rank must keep reaching the collectives below.
     """
-    fn = _fn("_forward_attn_residual")
     bad = []
-    for node in ast.walk(fn):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr != "view" or len(node.args) != 3:
-            continue
-        mid = node.args[1]
-        is_neg_one = (
-            isinstance(mid, ast.UnaryOp)
-            and isinstance(mid.op, ast.USub)
-            and isinstance(mid.operand, ast.Constant)
-            and mid.operand.value == 1
-        )
-        if is_neg_one:
-            bad.append(node.lineno)
+    for path, name in (
+        (LAYER_BODY, "run_kimi_block_residual_layer_body"),
+        (MODEL, "_forward_attn_residual"),
+    ):
+        fn = _fn(path, name)
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "view" or len(node.args) != 3:
+                continue
+            mid = node.args[1]
+            is_neg_one = (
+                isinstance(mid, ast.UnaryOp)
+                and isinstance(mid.op, ast.USub)
+                and isinstance(mid.operand, ast.Constant)
+                and mid.operand.value == 1
+            )
+            if is_neg_one:
+                bad.append((path.name, node.lineno))
     assert not bad, (
-        f"3-arg view(..., -1, ...) at model.py lines {bad} cannot infer the "
-        "middle dimension when the decode batch drains to zero rows; pass the "
-        "sequence length explicitly"
+        f"3-arg view(..., -1, ...) at {bad} cannot infer the middle dimension "
+        "when the decode batch drains to zero rows; pass the sequence length "
+        "explicitly"
     )
 
 
 def _load_view_helper():
-    """Exec ONLY `_view_rows_as_bsh` from model.py.
+    """Exec ONLY `view_rows_as_bsh` from layer_body.py.
 
-    Importing the module pulls fla/einops and the whole K3 stack; the helper
-    is a pure tensor-shape function, so run its real source in isolation.
+    Importing through the package pulls the whole batchgen init chain (which
+    JIT-builds a CUDA op on some machines); the helper is a pure tensor-shape
+    function, so run its real source in isolation.
     """
     import pytest
     pytest.importorskip("torch")
     import torch
 
-    tree = ast.parse(MODEL.read_text())
+    tree = ast.parse(LAYER_BODY.read_text())
     fn = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_view_rows_as_bsh"
+        if isinstance(n, ast.FunctionDef) and n.name == "view_rows_as_bsh"
     )
     ns = {"torch": torch}
-    exec(compile(ast.Module([fn], []), str(MODEL), "exec"), ns)
-    return torch, ns["_view_rows_as_bsh"]
+    exec(compile(ast.Module([fn], []), str(LAYER_BODY), "exec"), ns)
+    return torch, ns["view_rows_as_bsh"]
 
 
 def test_empty_decode_batch_view_matches_the_surviving_residual_shape():
@@ -73,8 +87,8 @@ def test_empty_decode_batch_view_matches_the_surviving_residual_shape():
     Regression for a 512-request decode run that died at 480/512 with
       RuntimeError: output with shape [0, 1, 7168] doesn't match the
       broadcast shape [0, 0, 7168]
-    `_forward_attn_residual` keeps `prefix_sum` at the entry shape (B, S, H)
-    while re-viewing `hidden_states` through `_view_rows_as_bsh`. Emitting
+    The block-residual body keeps `prefix_sum` at the entry shape (B, S, H)
+    while re-viewing `hidden_states` through `view_rows_as_bsh`. Emitting
     (B, 0, H) for the empty batch desynchronises the two, and the in-place
     residual merge `prefix_sum.add_(hidden_states)` then fails to broadcast.
     """
@@ -83,7 +97,7 @@ def test_empty_decode_batch_view_matches_the_surviving_residual_shape():
     hidden = 8
     entry = torch.zeros(0, 1, hidden)      # 0 sequences, decode seq-dim 1
     prefix_sum = entry                     # residual that survives the layer
-    sharded_rows = torch.zeros(0, hidden)  # _apply_attn_res / scatter_rows out
+    sharded_rows = torch.zeros(0, hidden)  # apply_attn_res / scatter_rows out
 
     viewed = view_rows_as_bsh(
         sharded_rows, entry.shape[0], entry.shape[1], hidden
@@ -120,7 +134,7 @@ def test_empty_branch_returns_a_parameter_not_a_constant_middle_dim():
     above, yet it is exactly what desynchronised the residual pair. Pin the
     defect class directly: the 0-element branch must forward a name.
     """
-    fn = _fn("_view_rows_as_bsh")
+    fn = _fn(LAYER_BODY, "view_rows_as_bsh")
     empty_branch = next(n for n in fn.body if isinstance(n, ast.If))
     ret = next(n for n in ast.walk(empty_branch) if isinstance(n, ast.Return))
     mid = ret.value.args[1]
