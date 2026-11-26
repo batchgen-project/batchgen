@@ -32,8 +32,13 @@ FLAG = "glm5_lmhead_fp32"
 LOCAL = "_lmhead_fp32"
 
 
+_ENGINE_METHODS = {
+    "prefill_prepacked", "_prefill_prepacked_pool", "_prefill_model_pass",
+}
+
+
 def _method(name: str) -> ast.FunctionDef:
-    tree = ENGINE_TREE if name == "prefill_prepacked" else TREE
+    tree = ENGINE_TREE if name in _ENGINE_METHODS else TREE
     return next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == name
@@ -69,16 +74,48 @@ def test_the_flag_is_read_once_per_prefill_from_the_batch_debug_dict():
     assert len(all_assigns) == 1, all_assigns
 
 
-def test_the_fp32_cast_branches_on_that_local():
+def test_the_fp32_cast_branches_on_the_passed_flag_in_the_one_model_pass():
+    """Step 4: the lm_head epilogue lives once, in ``_prefill_model_pass``;
+    the cast branches on its ``lmhead_fp32`` parameter."""
+
+    model_pass = _method("_prefill_model_pass")
+    params = [arg.arg for arg in (
+        model_pass.args.args + model_pass.args.kwonlyargs
+    )]
+    assert "lmhead_fp32" in params
     branches = [
-        node for node in ast.walk(_method("prefill_prepacked"))
+        node for node in ast.walk(model_pass)
         if isinstance(node, ast.If)
         and isinstance(node.test, ast.Name)
-        and node.test.id == LOCAL
+        and node.test.id == "lmhead_fp32"
     ]
     assert len(branches) == 1, branches
     # The branch it guards is the FP32-cast matmul, not something else.
     assert ".float()" in ast.unparse(branches[0].body[0])
+    # No second lm_head epilogue survives in either driver.
+    for driver in ("prefill_prepacked", "_prefill_prepacked_pool"):
+        assert not [
+            node for node in ast.walk(_method(driver))
+            if isinstance(node, ast.Attribute) and node.attr == "lm_head"
+        ], driver
+
+
+def test_the_unpooled_driver_hands_its_read_to_the_pass_and_the_pool_keeps_false():
+    """Behaviour-preserving step 4: the unpooled driver passes its one read
+    of the flag into the pass; the pooled wave has never honored the key and
+    keeps passing False (kept, reported -- not resolved here)."""
+
+    expected = {"prefill_prepacked": LOCAL, "_prefill_prepacked_pool": "False"}
+    for driver, value in expected.items():
+        calls = [
+            node for node in ast.walk(_method(driver))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_prefill_model_pass"
+        ]
+        assert len(calls) == 1, driver
+        kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+        assert kwargs.get("lmhead_fp32") == value, (driver, kwargs)
 
 
 def test_no_lmhead_env_guard_survives_in_the_worker():
