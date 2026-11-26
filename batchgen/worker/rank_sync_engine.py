@@ -515,7 +515,7 @@ class RankSyncEngine:
                     logging.debug(f"Rank {context.rank}: PyNccl communicator initialized on port {self._nccl_port}")
             except Exception as e:
                 logging.error(f"Rank {context.rank}: PyNccl communicator initialization failed - {e}")
-                raise RuntimeError(f"Rank {context.rank}: PyNccl communicator initialization failed - {e}")
+                raise RuntimeError(f"Rank {context.rank}: PyNccl communicator initialization failed - {e}") from e
 
         return CommunicatorOutcome(comm=self.comm)
 
