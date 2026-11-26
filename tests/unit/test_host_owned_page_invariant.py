@@ -161,6 +161,7 @@ def _row(*, owned, growth, completed=False, decoded_length=10):
         "gpu_pages_allocated": 4,
         "host_pages_allocated": max(owned, 1),
         "host_owned_pages": owned,
+        "kda_record_pages": 0,
         "needs_host_growth": growth > 0,
         "host_growth_pages": growth,
         "current_context_length": 100,

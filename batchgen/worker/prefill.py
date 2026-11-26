@@ -156,6 +156,12 @@ class PrefillSelectionRequest:
     # reserve-time reclaim. ``None`` means "do not count them" and keeps every
     # non-prefix caller on physical free pages alone.
     per_node_host_reclaimable: Optional[Tuple[int, ...]] = None
+    # Host pages ONE sequence's per-sequence KDA state record reserves at
+    # admission (方案甲), in the SAME combined host budget as KV. A model
+    # constant at fixed unit count; exactly 0 for a model without recurrent
+    # state. Never shared between sequences, so the shared-prefix ledger
+    # must not discount it.
+    kda_record_pages: int = 0
 
 
 # Binding-cap names (design-contract clause C7): the quantity that stopped
@@ -285,9 +291,13 @@ class PrefillScheduler:
                 f"candidate {candidate.uuid} has invalid cached_prefix_pages="
                 f"{candidate.cached_prefix_pages} for reservation {pages_per_replica}"
             )
+        # The per-sequence KDA record is reserved once per sequence in the
+        # same host budget (方案甲): it joins the standalone cost here, so
+        # the "can this ever fit" rejection, the reclaim target and the
+        # blocker text all see it.
         return (
             pages_per_replica - candidate.cached_prefix_pages
-        ) * candidate.host_kv_replication_factor
+        ) * candidate.host_kv_replication_factor + int(req.kda_record_pages)
 
     @staticmethod
     def marginal_host_pages(
@@ -317,8 +327,11 @@ class PrefillScheduler:
         standalone = PrefillScheduler.required_host_pages(candidate, req)
         if not candidate.shared_prefix_segments:
             return standalone
+        # The KDA record is per sequence, never shared: it stays OUTSIDE the
+        # shared-prefix ledger preview and is re-added to the marginal cost.
+        record_pages = int(req.kda_record_pages)
         factor = candidate.host_kv_replication_factor
-        per_replica = standalone // factor
+        per_replica = (standalone - record_pages) // factor
         if per_replica <= 0:
             # The cross-wave estimate already discounted the whole
             # reservation; there is nothing left for sharing to credit.
@@ -327,7 +340,7 @@ class PrefillScheduler:
             total_pages=per_replica,
             segments=segments_from_pairs(candidate.shared_prefix_segments),
         )
-        return result.marginal_pages * factor
+        return result.marginal_pages * factor + record_pages
 
     @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:

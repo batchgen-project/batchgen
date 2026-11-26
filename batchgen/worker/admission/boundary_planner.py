@@ -163,6 +163,10 @@ class BoundaryPlanner:
                     'host_growth_pages': seq.get_host_growth_pages(chunk_size),
                     'host_pages_allocated': seq.host_pages_allocated,
                     'host_owned_pages': seq.host_owned_pages,
+                    # KDA state record pages in the combined host budget
+                    # (表 B): joins the eviction benefit next to
+                    # host_owned_pages. 0 when no per-sequence record exists.
+                    'kda_record_pages': seq.kda_record_pages,
                     'host_token_capacity': seq.host_token_capacity,
                     # prompt_length: required so Phase 4.C can compute the
                     # re-entry reconstruction length on ALL ranks deterministically,
@@ -341,6 +345,7 @@ class BoundaryPlanner:
                     # Sync host KV fields to keep all ranks consistent for migration planning
                     seq.host_pages_allocated = state['host_pages_allocated']
                     seq.host_owned_pages = state['host_owned_pages']
+                    seq.kda_record_pages = state['kda_record_pages']
                     seq.host_token_capacity = state['host_token_capacity']
                     # Sync prompt_length (may have been rewritten by a prior
                     # eviction on the owner) and total_decoded_before_eviction

@@ -211,6 +211,10 @@ def _rank(rank, *, attn_tp_size, world_size, seqs, views, fake_dist,
         _server_layout=attention_group_layout(attn_tp_size),
         global_batch=SimpleNamespace(get_sequence=seqs.get),
         _host_views_by_group=lambda: views,
+        # 方案甲: the mirror now carries the per-sequence KDA record arenas;
+        # these fakes model a deployment without recurrent state.
+        _kda_record_mirror_payload=lambda uuids: {},
+        _adopt_kda_record_mirror=lambda payload: None,
     )
     attach_identity(
         worker,
@@ -531,6 +535,9 @@ def _selection_request(attn_tp_size, monkeypatch):
         # report no shared segment so the candidate keeps its standalone
         # reservation and the factor is the only thing under test.
         _admission_shared_prefix_segments=lambda uuids: {},
+        # 方案甲: the delegator also resolves the per-sequence KDA record
+        # page constant; this fake models a stateless deployment.
+        _kda_record_pages_per_sequence=lambda: 0,
     )
     attach_identity(
         worker,

@@ -221,6 +221,20 @@ class BoundaryHandler:
                 )
             return int(state['host_owned_pages'])
 
+        def kda_record_pages(uuid: str) -> int:
+            """Host pages of ``uuid``'s KDA state record that its eviction also
+            releases (combined host budget). Exactly 0 for a model without
+            recurrent state and for a row holding no record; the producer is
+            the owner's ``SequenceEntry.kda_record_pages`` (the record's
+            ``FrontierCharge.arena_host_pages``), gathered like
+            ``host_owned_pages``."""
+            state = global_seq_state[uuid]
+            if 'kda_record_pages' not in state:
+                raise RuntimeError(
+                    f"sequence {uuid} has no kda_record_pages in boundary state"
+                )
+            return int(state['kda_record_pages'])
+
         # Identify completed sequences
         completed_uuids = []
         active_uuids = []
@@ -315,6 +329,7 @@ class BoundaryHandler:
                                 'decoded_length': state['decoded_length'],
                                 'host_owned_pages': host_owned_pages(uuid),
                                 'growth_pages': growth_pages_by_uuid.get(uuid, 0),
+                                'kda_record_pages': kda_record_pages(uuid),
                                 'recompute_tokens': recompute_tokens(uuid),
                                 'global_idx': meta_global_idx(uuid),
                                 'priority': meta_priority(uuid),

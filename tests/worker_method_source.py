@@ -527,14 +527,17 @@ def context_function_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         )
     method.args = copy.deepcopy(worker_method.args)
     if node.name == "_make_prefill_selection_request":
-        # The worker delegator resolves the shared-prefix segments and passes
-        # the VALUE (the context never carries a bound worker method). The
-        # worker-shaped body restores that resolution as its first statement
-        # after the docstring, which is exactly where the pre-move method ran
-        # it.
+        # The worker delegator resolves the shared-prefix segments and the
+        # per-sequence KDA record page constant and passes the VALUES (the
+        # context never carries a bound worker method). The worker-shaped
+        # body restores those resolutions as its first statements after the
+        # docstring, which is exactly where the pre-move method ran them.
         method.body.insert(1, ast.parse(
             "shared_segments = "
             "self._admission_shared_prefix_segments(all_candidates)"
+        ).body[0])
+        method.body.insert(2, ast.parse(
+            "kda_record_pages = self._kda_record_pages_per_sequence()"
         ).body[0])
     ast.fix_missing_locations(method)
     return method

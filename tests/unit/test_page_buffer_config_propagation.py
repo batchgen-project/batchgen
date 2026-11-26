@@ -197,6 +197,9 @@ def test_prefill_selection_request_uses_the_configured_initial_buffer():
         # not about shared-prefix credit: report no shared segment so every
         # candidate keeps its standalone reservation.
         _admission_shared_prefix_segments=lambda uuids: {},
+        # 方案甲: the delegator also resolves the per-sequence KDA record
+        # page constant; this fake models a stateless deployment.
+        _kda_record_pages_per_sequence=lambda: 0,
     )
     attach_identity(worker, rank=0, world_size=8, local_world_size=8)
     attach_prefix_state(worker, prefix_sequence_states={}, shared_prefix_credit_applied=False)

@@ -522,6 +522,11 @@ class FakeWorker:
     def _decode_attn_tp_size(self):
         return 1
 
+    def _kda_record_pages_per_sequence(self):
+        # 方案甲: admission now charges each sequence's KDA record pages;
+        # these fakes model a deployment without recurrent state.
+        return 0
+
     def _prefill_prefix_pool_enabled(self):
         return self._pool_mode
 

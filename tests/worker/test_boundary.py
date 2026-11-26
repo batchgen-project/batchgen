@@ -35,6 +35,7 @@ def _state(
     additional_pages_needed=0, gpu_pages_allocated=4, host_pages_allocated=2,
     needs_host_growth=False, host_growth_pages=0,
     current_context_length=100, host_token_capacity=4096, decode_dp_group=None,
+    kda_record_pages=0,
 ):
     return {
         "completed": completed,
@@ -45,6 +46,7 @@ def _state(
         "gpu_pages_allocated": gpu_pages_allocated,
         "host_pages_allocated": host_pages_allocated,
         "host_owned_pages": host_pages_allocated,  # prefix-free row
+        "kda_record_pages": kda_record_pages,
         "needs_host_growth": needs_host_growth,
         "host_growth_pages": host_growth_pages,
         "current_context_length": current_context_length,
@@ -675,6 +677,43 @@ def test_boundary_victims_are_cost_aware_on_seq_meta_context():
     )
     assert plan.host_evicted_uuids == ["short"]
     assert plan.host_growth_uuids == ["grow"]
+
+
+def test_boundary_wires_kda_record_pages_into_the_eviction_benefit():
+    # 表 B: two bystanders identical except for kda_record_pages. The record
+    # holder's eviction returns owned + record pages of the ONE combined
+    # host budget, so it is the better victim (16/ctx beats 8/ctx) although
+    # plain-first ordering (global_idx) would pick the other.
+    state = {
+        "grow": _state(assigned_rank=0, needs_host_growth=True,
+                       host_growth_pages=1, host_pages_allocated=1),
+        "plain": _state(assigned_rank=0, host_pages_allocated=8),
+        "record": _state(assigned_rank=0, host_pages_allocated=8,
+                         kda_record_pages=8),
+    }
+    seq_meta = {
+        "grow": _meta(0, ctx=50_000),
+        "plain": _meta(1, ctx=2_000),
+        "record": _meta(2, ctx=2_000),
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _growth_req(state, free=0, seq_meta=seq_meta)
+    )
+    assert plan.host_evicted_uuids == ["record"]
+    assert plan.host_growth_uuids == ["grow"]
+
+
+def test_boundary_candidate_without_kda_record_pages_fails_loud():
+    # The field is produced for every gathered row; a candidate without it
+    # means the producer was not wired, never "0".
+    state = {
+        "grow": _state(assigned_rank=0, needs_host_growth=True,
+                       host_growth_pages=6),
+        "bare": _state(assigned_rank=0, host_pages_allocated=8),
+    }
+    del state["bare"]["kda_record_pages"]
+    with pytest.raises(RuntimeError, match="bare has no kda_record_pages"):
+        BoundaryHandler.compute_decisions(_growth_req(state, free=0))
 
 
 def test_boundary_candidate_without_seq_meta_fails_loud():

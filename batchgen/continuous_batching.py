@@ -553,19 +553,28 @@ class HostKVGrowthEvictionPlan:
 def _growth_cost_aware_key(item: Tuple[str, Dict[str, Any]], page_key: str):
     """Sort key: most deficit pages closed per recompute token first.
 
-    benefit = owned pages the eviction returns + growth debt it retires;
-    cost = tokens the row's re-prefill recomputes (>= 1). Both are exact
-    integers, so the Fraction ordering is exact and identical on every rank.
-    Scores do not depend on which other rows are evicted, so one sort equals
-    greedy re-scoring after every pick.
+    benefit = owned pages the eviction returns + growth debt it retires
+    + the Host pages of the row's KDA state record that the eviction also
+    releases (``kda_record_pages``; exactly 0 for a model without recurrent
+    state, and for a row holding no record). KDA records live in the SAME
+    host page pool as KV (one combined host budget), so a victim's record
+    pages are deficit pages the eviction closes, like its owned KV pages;
+    cost = tokens the row's re-prefill recomputes (>= 1). All terms are
+    exact integers, so the Fraction ordering is exact and identical on
+    every rank. Scores do not depend on which other rows are evicted, so
+    one sort equals greedy re-scoring after every pick.
     """
     uuid, state = item
-    for key in ("growth_pages", "recompute_tokens"):
+    for key in ("growth_pages", "recompute_tokens", "kda_record_pages"):
         if key not in state:
             raise ValueError(
                 f"GROWTH_COST_AWARE eviction candidate {uuid} has no {key!r}"
             )
-    benefit = int(state.get(page_key, 0) or 0) + int(state["growth_pages"])
+    benefit = (
+        int(state.get(page_key, 0) or 0)
+        + int(state["growth_pages"])
+        + int(state["kda_record_pages"])
+    )
     cost = max(1, int(state["recompute_tokens"]))
     return (
         state.get("priority", 0),
