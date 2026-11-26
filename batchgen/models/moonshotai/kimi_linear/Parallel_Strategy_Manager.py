@@ -1792,6 +1792,17 @@ class KimiLinearParallelStrategyManager:
             time.perf_counter() - t0)
         return True
 
+    def decode_step_graph(self):
+        """The decode driver's per-step graph policy handle, or ``None``.
+
+        The worker's decode loop (``decode_engine.DecoupledGpuDecode.run``)
+        reads this once per decode round and drives each step through
+        ``begin_decode_step`` / ``replay_whole_model_step`` /
+        ``end_decode_step``. ``None`` (graph mode "off", or before the first
+        decode configure) means every step runs the plain eager forward.
+        """
+        return self._decode_graph
+
     def prewarm_decode_graphs(self, gpu_manager=None, decode_buckets=None):
         """Capture the decode graph adapter's whole bucket ladder, once.
 
