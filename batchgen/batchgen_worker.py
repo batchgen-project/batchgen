@@ -7781,15 +7781,52 @@ class BatchGenWorker:
 		self._cross_comm_thread = None
 
 	def _install_replica_transport(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
-		engine = getattr(self, "_replica_transport_engine", None)
-		if engine is None:
-			from batchgen.worker.replica_transport_engine import ReplicaTransportEngine
-			engine = ReplicaTransportEngine()
-			self._replica_transport_engine = engine
-		return engine._install_replica_transport(
-			self,
+		# The engine reads a frozen context and returns what to bind (D1):
+		# this delegator resolves the worker-computed values into the
+		# context and performs the binds the install reports back.
+		from batchgen.worker.replica_transport_engine import (
+			ReplicaTransportContext,
+			_install_replica_transport,
 		)
+
+		ctx = ReplicaTransportContext(
+			rank=self.rank,
+			world_size=self.world_size,
+			local_rank=self.local_rank,
+			local_world_size=self.local_world_size,
+			parallel_manager=self.parallel_manager,
+			daemon_weight_source=bool(
+				getattr(self.args, "distributed_weight_config", None)
+			),
+			cross_node_broadcast_plan=getattr(
+				self, "_cross_node_broadcast_plan", None
+			),
+			weight_copy_task=self.weight_copy_task,
+			weight_copy_fingerprint=str(
+				self._weight_copy_task_fingerprint(
+					{
+						module_type: sorted(names)
+						for module_type, names in (
+							self.weight_copy_task or {}
+						).items()
+					}
+				)
+			),
+			core_engine=self.core_engine,
+			num_prefill_module_buffer=(
+				self.engine_config.GPU_Buffer_Config
+				.num_prefill_module_buffer
+			),
+			replica_block_cache=self._replica_block_cache,
+			shm_prefix=self._query_book_shm_prefix,
+		)
+		outcome = _install_replica_transport(
+			ctx, exchange=self._exchange_node_memfd_identity
+		)
+		if outcome.staggered_weight_copy_task is not None:
+			self.weight_copy_task = outcome.staggered_weight_copy_task
+		if outcome.replica_plan_installed:
+			self._replica_plan_installed = True
 
 	def _install_prefill_weight_copy_pipeline(self, k3_prefill_profile: bool) -> None:
 		"""Point the H2D copy engine at the prefill weight-copy schedule.

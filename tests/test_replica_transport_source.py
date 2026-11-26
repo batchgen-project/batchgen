@@ -7,15 +7,27 @@ over the per-owner stream after barrier A. The uninstalled engine is the
 single-member group, and no code path branches on group size at copy time.
 """
 
+import ast
+import dataclasses
+import logging
+import os
+import socket
+import sys
+import time
+import types
 from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "core/HtoD_Engine/HtoD_Engine.cu"
 BUFFER = ROOT / "core/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp"
 WORKER = ROOT / "batchgen/batchgen_worker.py"
-# The install body lives on the stateless engine since the repatriation move;
-# the worker keeps a same-name delegator.
+# The install body is a module-level function of a frozen context since D1;
+# the worker keeps a same-name delegator that builds the context and binds
+# the returned outcome.
 TRANSPORT_ENGINE = ROOT / "batchgen/worker/replica_transport_engine.py"
 
 
@@ -188,3 +200,217 @@ def test_produce_only_pass_alignment_is_wired():
     assert 'replica = getattr(self, "_replica_plan_installed", False)' in worker
     assert "produce_only=replica_padding" in worker
     assert "cannot" in worker and "_carried_produce_only" in worker
+
+
+# --------------------------------------------------------------------------- #
+#  D1: the install is a function of its frozen context (no stand-in worker)
+# --------------------------------------------------------------------------- #
+
+CONTEXT_FIELDS = {
+    "rank",
+    "world_size",
+    "local_rank",
+    "local_world_size",
+    "parallel_manager",
+    "daemon_weight_source",
+    "cross_node_broadcast_plan",
+    "weight_copy_task",
+    "weight_copy_fingerprint",
+    "core_engine",
+    "num_prefill_module_buffer",
+    "replica_block_cache",
+    "shm_prefix",
+}
+
+
+def _load_transport(dist):
+    """Compile the context, the outcome and the install from the real source.
+
+    The engine module imports torch and the native core engine at module
+    scope, so a CPU test lifts the three definitions by AST instead; the
+    ``dist`` stub stands in for ``torch.distributed`` and ``torch`` itself is
+    never reached on the decline paths these tests drive.
+    """
+    tree = ast.parse(TRANSPORT_ENGINE.read_text(), filename=str(TRANSPORT_ENGINE))
+    wanted = {
+        "ReplicaTransportContext",
+        "ReplicaTransportInstallOutcome",
+        "_install_replica_transport",
+    }
+    nodes = [node for node in tree.body if getattr(node, "name", None) in wanted]
+    assert {node.name for node in nodes} == wanted
+    namespace = {
+        "dataclass": dataclasses.dataclass,
+        "Any": Any,
+        "Callable": Callable,
+        "Optional": Optional,
+        "Tuple": Tuple,
+        "logging": logging,
+        "os": os,
+        "socket": socket,
+        "time": time,
+        "torch": None,
+        "dist": dist,
+        "core_engine": None,
+    }
+    module = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(TRANSPORT_ENGINE), "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+@pytest.fixture
+def fake_worker_module(monkeypatch):
+    """The install's late ``allocate_node_shared_tensor`` import, unreachable
+    on every decline path these CPU tests drive."""
+    import batchgen  # noqa: F401  (parent package; CPU-importable)
+
+    module = types.ModuleType("batchgen.batchgen_worker")
+
+    def allocate_node_shared_tensor(**_kwargs):
+        raise AssertionError("decline paths never allocate the control block")
+
+    module.allocate_node_shared_tensor = allocate_node_shared_tensor
+    monkeypatch.setitem(sys.modules, "batchgen.batchgen_worker", module)
+
+
+def _context(namespace, **overrides):
+    values = dict(
+        rank=0,
+        world_size=2,
+        local_rank=0,
+        local_world_size=2,
+        parallel_manager=types.SimpleNamespace(
+            _distributed_weight_transport=None
+        ),
+        daemon_weight_source=False,
+        cross_node_broadcast_plan=None,
+        weight_copy_task={"attention": ["layers.0.attn"]},
+        weight_copy_fingerprint="fp",
+        core_engine=None,
+        num_prefill_module_buffer={},
+        replica_block_cache={},
+        shm_prefix="t_",
+    )
+    values.update(overrides)
+    return namespace["ReplicaTransportContext"](**values)
+
+
+def _no_exchange(_pid, _fd):
+    raise AssertionError("decline paths never exchange a memfd identity")
+
+
+def test_install_declines_without_distributed(fake_worker_module, caplog):
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: False)
+    )
+    ctx = _context(namespace)
+    with caplog.at_level(logging.INFO):
+        outcome = namespace["_install_replica_transport"](ctx, _no_exchange)
+    assert outcome.replica_plan_installed is False
+    assert outcome.staggered_weight_copy_task is None
+    assert "torch.distributed is not initialized" in caplog.text
+
+
+def test_install_declines_daemon_weight_source(fake_worker_module):
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: True)
+    )
+    ctx = _context(namespace, daemon_weight_source=True)
+    outcome = namespace["_install_replica_transport"](ctx, _no_exchange)
+    assert outcome.replica_plan_installed is False
+    assert outcome.staggered_weight_copy_task is None
+
+
+def test_install_declines_hierarchical_source_without_seam(fake_worker_module):
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: True)
+    )
+    ctx = _context(
+        namespace,
+        parallel_manager=types.SimpleNamespace(
+            _distributed_weight_transport="hierarchical_gdr"
+        ),
+    )
+    outcome = namespace["_install_replica_transport"](ctx, _no_exchange)
+    assert outcome.replica_plan_installed is False
+
+
+def test_install_declines_task_outside_the_layer_grammar(fake_worker_module):
+    # Real grammar, real decline: an empty task has no frame plan.
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: True)
+    )
+    ctx = _context(namespace, weight_copy_task={})
+    outcome = namespace["_install_replica_transport"](ctx, _no_exchange)
+    assert outcome.replica_plan_installed is False
+
+
+def test_seam_requested_without_a_plan_raises(fake_worker_module):
+    # Under the seam a silent decline would strand peers on records this
+    # member never fetches, so the install fails loud instead.
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: False)
+    )
+    ctx = _context(
+        namespace,
+        parallel_manager=types.SimpleNamespace(
+            _distributed_weight_transport="hierarchical_gdr",
+            cross_seam_enabled=lambda: True,
+        ),
+        cross_node_broadcast_plan=None,
+    )
+    with pytest.raises(RuntimeError, match="cross-node replica seam requested"):
+        namespace["_install_replica_transport"](ctx, _no_exchange)
+
+
+def test_context_is_frozen_and_declares_exactly_the_install_reads(
+    fake_worker_module,
+):
+    namespace = _load_transport(
+        types.SimpleNamespace(is_initialized=lambda: False)
+    )
+    context_type = namespace["ReplicaTransportContext"]
+    assert {f.name for f in dataclasses.fields(context_type)} == CONTEXT_FIELDS
+    ctx = _context(namespace)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ctx.rank = 1
+    outcome_type = namespace["ReplicaTransportInstallOutcome"]
+    assert {f.name for f in dataclasses.fields(outcome_type)} == {
+        "replica_plan_installed",
+        "staggered_weight_copy_task",
+    }
+
+
+def test_engine_file_never_names_self_or_worker():
+    """D1 permanence: the engine reads a context, never a worker.
+
+    The boundary checker enforces the same property repo-wide; this local
+    guard fails the suite the moment a ``self``/``worker`` parameter or a
+    ``self = worker`` rebinding comes back to this file.
+    """
+    tree = ast.parse(TRANSPORT_ENGINE.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            assert node.arg not in {"self", "worker"}, ast.dump(node)
+        if isinstance(node, ast.Name):
+            assert node.id not in {"self", "worker"}, node.lineno
+
+
+def test_worker_delegator_builds_the_context_and_binds_the_outcome():
+    source = WORKER.read_text()
+    body = source[source.index("def _install_replica_transport"):]
+    body = body[:body.index("\n\tdef ")]
+    build = body.index("ReplicaTransportContext(")
+    call = body.index("outcome = _install_replica_transport(")
+    assert build < call
+    # The one value the engine needs mid-install travels as an explicit
+    # argument, never as a context field holding a bound worker method.
+    assert "exchange=self._exchange_node_memfd_identity" in body
+    # The delegator performs exactly the binds the worker method used to:
+    # the staggered schedule and the installed flag.
+    stagger_bind = body.index(
+        "self.weight_copy_task = outcome.staggered_weight_copy_task"
+    )
+    flag_bind = body.index("self._replica_plan_installed = True")
+    assert call < stagger_bind < flag_bind
