@@ -44,7 +44,11 @@ PREFILL_ENGINE_CLASS = next(
 )
 # S5b: the prefill forwards moved verbatim to PrefillEngine (self = worker);
 # their weight-pass statements are the same statements in the same order.
-PREFILL_ENGINE_FORWARDS = ("prefill", "prefill_prepacked", "_prefill_prepacked_pool")
+# Step 4: the one model pass both drivers share lives beside them.
+PREFILL_ENGINE_FORWARDS = (
+    "prefill", "prefill_prepacked", "_prefill_prepacked_pool",
+    "_prefill_model_pass",
+)
 
 
 def _load_weight_passes():
@@ -524,18 +528,31 @@ def _assert_called_in_scope(caller, callee, phase):
 
 
 def test_every_prefill_forward_runs_inside_a_weight_pass():
-    for name in ("prefill", "prefill_prepacked"):
-        calls = _forward_calls(_method(name), _is_model_forward)
-        assert calls, name
-        for call in calls:
-            _assert_in_a_pass(_method(name), call, phase="prefill")
+    calls = _forward_calls(_method("prefill"), _is_model_forward)
+    assert calls, "prefill"
+    for call in calls:
+        _assert_in_a_pass(_method("prefill"), call, phase="prefill")
+
+    # Step 4 of the three-step extraction: the prepacked and pooled drivers
+    # share ONE model pass. The decoder-layer drives live there (and only
+    # there), while each driver's loop still begins and ends a weight pass
+    # around its one pass call.
+    model_pass = _method("_prefill_model_pass")
+    layer_calls = _forward_calls(model_pass, lambda func: func == "decoder_layer")
+    assert len(layer_calls) == 2
+    assert not [n for n in ast.walk(model_pass) if _is_pass_call(n, "begin")]
+    assert not [n for n in ast.walk(model_pass) if _is_pass_call(n, "end")]
+
+    prepacked = _method("prefill_prepacked")
+    calls = _forward_calls(prepacked, lambda func: func == "self._prefill_model_pass")
+    assert len(calls) == 1
+    _assert_in_a_pass(prepacked, calls[0], phase="prefill")
 
     pool = _method("_prefill_prepacked_pool")
-    calls = _forward_calls(pool, lambda func: func == "decoder_layer")
-    assert len(calls) == 2
-    for call in calls:
-        # The pooled wave's scope is opened by its only caller.
-        assert _assert_in_a_pass(pool, call) == []
+    calls = _forward_calls(pool, lambda func: func == "self._prefill_model_pass")
+    assert len(calls) == 1
+    # The pooled wave's scope is opened by its only caller.
+    assert _assert_in_a_pass(pool, calls[0]) == []
     _assert_called_in_scope("prefill_prepacked", "_prefill_prepacked_pool", "prefill")
 
 
@@ -616,8 +633,11 @@ def test_no_other_model_forward_escapes_the_weight_passes():
     """Every eager model forward or decoder-layer drive is one of the wrapped
     sites or a listed unstreamed one; ``_glm5_decode_model_forward`` is the
     forward itself."""
+    # Step 4: the prepacked and pooled drivers hold no model forward of
+    # their own any more; the one model pass they share is the wrapped site
+    # (its callers begin/end the pass around the call).
     wrapped = {
-        "prefill", "prefill_prepacked", "_prefill_prepacked_pool",
+        "prefill", "_prefill_model_pass",
         "_decoding_legacy_modes", "_glm5_decode_model_forward",
     }
     found = set()

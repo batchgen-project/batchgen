@@ -73,6 +73,10 @@ def test_model_seam_releases_through_the_buffer_reset():
 
 
 def test_every_serving_loop_that_seeds_also_releases():
+    # Step 4 of the three-step extraction: the two prefill drivers share ONE
+    # model pass, so exactly one function seeds the buffer -- and it is the
+    # one that releases it, unconditionally on both the tail and the
+    # segments-only arm.
     tree = ast.parse(ENGINE.read_text())
     seeding = [
         node for node in ast.walk(tree)
@@ -85,7 +89,7 @@ def test_every_serving_loop_that_seeds_also_releases():
             for inner in ast.walk(node)
         )
     ]
-    assert len(seeding) == 2, [node.name for node in seeding]
+    assert [node.name for node in seeding] == ["_prefill_model_pass"]
     for function in seeding:
         seeds = _attr_calls(function, "_new_block_residual")
         releases = _attr_calls(function, "_release_block_residual")

@@ -57,8 +57,11 @@ _ENGINE_METHODS = {
     "_new_pool_offload_check_recorder",
 }
 # S5b: the two prefill forwards moved verbatim to PrefillEngine; they are only
-# read structurally here, never exec-lifted.
-_ENGINE_FORWARDS = {"_prefill_prepacked_pool", "prefill_prepacked"}
+# read structurally here, never exec-lifted. Step 4 of the three-step
+# extraction: their shared epilogue lives in the one model pass.
+_ENGINE_FORWARDS = {
+    "_prefill_prepacked_pool", "prefill_prepacked", "_prefill_model_pass",
+}
 
 
 def _method(name: str) -> ast.FunctionDef:
@@ -322,31 +325,53 @@ def _record_gather_calls(function_name: str) -> list:
     ]
 
 
-@pytest.mark.parametrize(
-    "function_name", ["_prefill_prepacked_pool", "prefill_prepacked"]
-)
-def test_both_prefill_paths_forward_the_tracer_into_the_real_gather(
-    function_name,
-):
-    calls = _gather_calls(function_name)
-    assert len(calls) == 1, f"{function_name}: {len(calls)} gather calls"
+def test_the_one_model_pass_forwards_the_tracer_into_the_real_gather():
+    """Step 4: the gather epilogue exists once, in ``_prefill_model_pass``,
+    and it forwards the armed tracer into the real gather."""
+
+    for driver in ("_prefill_prepacked_pool", "prefill_prepacked"):
+        assert _gather_calls(driver) == [], (
+            f"{driver} must drive the gather through the one model pass"
+        )
+    calls = _gather_calls("_prefill_model_pass")
+    assert len(calls) == 1, f"_prefill_model_pass: {len(calls)} gather calls"
     expansions = [
         ast.unparse(keyword.value) for keyword in calls[0].keywords
         if keyword.arg is None
     ]
-    assert len(expansions) == 1, f"{function_name}: {expansions}"
+    assert len(expansions) == 1, expansions
     assert "'trace'" in expansions[0]
-    assert "_trace" in expansions[0]
+    assert "trace" in expansions[0]
 
 
 @pytest.mark.parametrize(
-    "function_name", ["_prefill_prepacked_pool", "prefill_prepacked"]
+    "function_name",
+    ["_prefill_prepacked_pool", "prefill_prepacked", "_prefill_model_pass"],
 )
-def test_neither_prefill_path_hand_writes_a_gather_record(function_name):
+def test_no_prefill_path_hand_writes_a_gather_record(function_name):
     """A hand-written ``tp=0/1, owned`` record is only legal behind the
     asserted helper, never inline in a prefill loop."""
 
     assert _record_gather_calls(function_name) == []
+
+
+@pytest.mark.parametrize(
+    "function_name,tracer_local",
+    [("_prefill_prepacked_pool", "epilogue_trace"),
+     ("prefill_prepacked", "unpooled_trace")],
+)
+def test_both_drivers_hand_their_tracer_to_the_one_model_pass(
+    function_name, tracer_local,
+):
+    passes = [
+        node for node in ast.walk(_method(function_name))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_prefill_model_pass"
+    ]
+    assert len(passes) == 1, f"{function_name}: {len(passes)} pass calls"
+    trace_kw = {kw.arg: ast.unparse(kw.value) for kw in passes[0].keywords}
+    assert trace_kw.get("trace") == tracer_local
 
 
 def test_record_unsharded_gather_refuses_a_sharded_manager():

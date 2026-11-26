@@ -2028,6 +2028,182 @@ class PrefillEngine:
 
         return new_tokens
 
+    def _prefill_model_pass(
+        self,
+        worker,
+        input_ids: torch.Tensor,
+        tail_rows,
+        *,
+        lmhead_fp32: bool,
+        trace=None,
+        layer_probe=None,
+    ):
+        """One prefill model pass: embed -> layers -> depth-mix -> norm ->
+        tail gather -> lm_head.
+
+        The ONE model loop both prefill drivers run (step 4 of the three-step
+        extraction): ``prefill_prepacked`` drives it once per prepacked
+        micro-batch and ``_prefill_prepacked_pool`` once per pooled chunk.
+        The drivers keep their own batch assembly, worker->model state
+        binding (``_install_prefill_prepack_metadata`` /
+        ``_install_prefill_pool_rows``), token selection, trace emission and
+        metrics; this pass owns everything between the bound state and the
+        logits, and nothing else drives decoder layers for prefill.
+
+        Args:
+            input_ids: flat ``[total_tokens]`` int64 token ids, already on
+                the device the model runs on.
+            tail_rows: index tensor of the rows whose logits the driver
+                decodes (one per sequence that ends in this pass), or
+                ``None`` for a pooled chunk that computes shared segments
+                only -- the layers still run (their KV offloads are the
+                product) and the pass returns ``None``.
+            lmhead_fp32: the driver's one read of the lm_head FP32 debug
+                key. The pooled driver has never read that key and passes
+                ``False``; this step is behaviour-preserving, so the
+                asymmetry is kept at the call sites, not resolved here.
+            trace: epilogue tracer, or ``None``. The gather-side record is
+                written from inside the real gather (``trace=``) or by the
+                asserted unsharded helper; the drivers keep chunk begin and
+                row emission.
+            layer_probe: optional observation callback
+                ``(layer_idx, decoder_layer, block_residual) -> None`` run
+                after every layer; the prepacked driver's env-gated memory
+                profile. Observation only -- it must not touch the tensors.
+        """
+        # The moved statements are kept VERBATIM from the two former inline
+        # loops where they agreed: source pins depend on the ``self.``
+        # spellings. Rebinding self to the worker preserves those spellings;
+        # this engine instance remains stateless.
+        self = worker
+
+        # The unsqueeze is a VIEW, so binding only ``hidden_states`` keeps
+        # the embedding storage alive exactly as long as layer 0 needs it; a
+        # second local pinning that storage for the whole stack cost 1.75 GiB
+        # dead across layers 1-92 at S=131,072 / H=7168 / bf16
+        # (batchgen_design/model_support/kimi_k3/PREFILL_MEMORY_AUDIT.md
+        # section 7, fix 4).
+        hidden_states = self.model.model.embed_tokens(input_ids).unsqueeze(0)
+
+        # Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
+        # classic residual body, so the per-layer state has to be carried
+        # here. Without it every layer sees a zero-width residual and the
+        # model runs happily while computing something that is not K3 --
+        # wrong text, no error. Mirrors KimiLinearModel.forward
+        # (kimi_linear/model.py:880-910), which is the eager reference.
+        use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
+        block_residual = None
+        if use_attn_res:
+            # Zero-column view of a buffer preallocated for ALL the
+            # stack's block boundaries, so the per-boundary `cat` never
+            # holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
+            # GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
+            block_residual = self.model.model._new_block_residual(hidden_states)
+
+        for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+            if use_attn_res:
+                hidden_states, block_residual = decoder_layer(
+                    hidden_states,
+                    attention_mask=None,
+                    position_ids=None,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                    block_residual=block_residual,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=None,
+                    position_ids=None,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+                hidden_states = layer_outputs[0]
+            if layer_probe is not None:
+                layer_probe(layer_idx, decoder_layer, block_residual)
+
+        # Output depth-mix, then norm -- that ORDER is load-bearing
+        # (kimi_linear/model.py:904-913). A pooled chunk with no tail rows
+        # skips the mix: nothing downstream consumes the mixed hidden state.
+        if use_attn_res and tail_rows is not None:
+            hidden_dim = hidden_states.shape[2]
+            batch_sz, seq_sz = hidden_states.shape[:2]
+            hidden_states = self.model.model._apply_output_attn_res(
+                hidden_states.view(-1, hidden_dim), block_residual
+            ).view(batch_sz, seq_sz, hidden_dim)
+        if use_attn_res:
+            # The pass is over for the residual: the buffer behind the view
+            # is model class state and outlives the local, so it is released
+            # here rather than left pinned until the next seed
+            # (PREFILL_MEMORY_AUDIT.md fix 3).
+            block_residual = None
+            self.model.model._release_block_residual()
+
+        if tail_rows is None:
+            return None
+
+        gather_last_token_hidden = getattr(
+            self.parallel_manager,
+            "gather_prefill_last_token_hidden",
+            None,
+        )
+        if gather_last_token_hidden is None:
+            # Final norm over the tail rows only: RMSNorm is per-row, so
+            # norming the gathered rows equals gathering the normed rows.
+            last_token_hidden = self.model.model.norm(
+                hidden_states[:, tail_rows, :]
+            )[0]
+            if trace is not None:
+                # Genuinely single-rank: this manager has no gather, so
+                # the rank holds every row. Asserted inside, not
+                # assumed - see _record_unsharded_epilogue_gather.
+                self._record_unsharded_epilogue_gather(
+                    trace,
+                    last_token_hidden,
+                    num_global_rows=int(input_ids.numel()),
+                )
+        else:
+            # The tracer goes INTO the real gather: under streamed-SP8 this
+            # rank holds only a row shard, and the shard bounds, the owned
+            # mask and the norms either side of the all-reduce are visible
+            # only in there. Writing a tp=0/1 record out here instead would
+            # report a broken multi-rank gather as healthy.
+            last_token_hidden = gather_last_token_hidden(
+                self.model.model.norm(hidden_states),
+                tail_rows,
+                int(input_ids.numel()),
+                **(
+                    {"trace": trace}
+                    if trace is not None
+                    else {}
+                ),
+            )
+
+        # lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
+        # The FP32 cast rides the driver's debug-state read (a debug-state
+        # key; no env guard).
+        if getattr(self.model.lm_head, "tp_size", 1) > 1:
+            # vocab-parallel head (K3 TP8): the module all_gathers the
+            # full logits; the raw shard weight must not be used here.
+            # .forward skips the decode-only pre-hook (``[:, -1, :]``
+            # expects [bsz, seq, H]; this input is the gathered [n, H]).
+            logits = self.model.lm_head.forward(last_token_hidden).float()
+        elif lmhead_fp32:
+            logits = torch.nn.functional.linear(
+                last_token_hidden.float(),
+                self.model.lm_head.weight.float(),
+                self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+            )
+        else:
+            logits = torch.nn.functional.linear(
+                last_token_hidden,
+                self.model.lm_head.weight,
+                self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+            ).float()
+        return logits
+
     def prefill_prepacked(self, worker, batch: list[int], *, token_cap: int):
         """
         Handle prefill for a batch using prepack optimization.
@@ -2041,6 +2217,7 @@ class PrefillEngine:
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
+        _engine = self
         self = worker
         # Bind the attention wrappers' host_paged_kv_worker_view_aux BEFORE the decoder
         # loop. Without this binding, GLM-5's prefill indexer-K offload at
@@ -2388,40 +2565,6 @@ class PrefillEngine:
                     batch_attached_tokens,
                 )
 
-                # Embed tokens
-                inputs_embeds = self.model.model.embed_tokens(
-                    batch_input_ids_flat.to(self.torch_device, dtype=torch.int64)
-                )
-
-                # Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-                hidden_states = inputs_embeds.unsqueeze(0)
-                # unsqueeze is a VIEW, so `hidden_states` already keeps the
-                # embedding storage alive for exactly as long as layer 0 needs
-                # it. Keeping `inputs_embeds` bound as well pins that storage
-                # for the WHOLE stack instead -- 1.75 GiB dead across layers
-                # 1-92 at S=131,072 / H=7168 / bf16
-                # (batchgen_design/model_support/kimi_k3/
-                #  PREFILL_MEMORY_AUDIT.md section 7, fix 4).
-                del inputs_embeds
-
-                # Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
-                # classic residual body, so the per-layer state has to be carried
-                # here. Without it every layer sees a zero-width residual and the
-                # model runs happily while computing something that is not K3 --
-                # wrong text, no error. Mirrors KimiLinearModel.forward
-                # (kimi_linear/model.py:880-910), which is the eager reference.
-                use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-                block_residual = None
-                if use_attn_res:
-                    # Zero-column view of a buffer preallocated for ALL the
-                    # stack's block boundaries, so the per-boundary `cat` never
-                    # holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
-                    # GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
-                    # `block_residual = None` above is load-bearing: it drops
-                    # the previous micro-batch's view before the next buffer is
-                    # allocated.
-                    block_residual = self.model.model._new_block_residual(hidden_states)
-
                 # DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
                 # bookkeeping is CPU-side, no sync) and independent of the
                 # allocator-history trace, so it still localises the peak layer
@@ -2435,29 +2578,9 @@ class PrefillEngine:
                 # after layer N: a short, wrap-free trace of the window that
                 # actually contains the peak.
                 _memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
-
-                for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-                    if use_attn_res:
-                        hidden_states, block_residual = decoder_layer(
-                            hidden_states,
-                            attention_mask=None,
-                            position_ids=None,
-                            past_key_value=None,
-                            output_attentions=False,
-                            use_cache=False,
-                            block_residual=block_residual,
-                        )
-                    else:
-                        layer_outputs = decoder_layer(
-                            hidden_states,
-                            attention_mask=None,
-                            position_ids=None,
-                            past_key_value=None,
-                            output_attentions=False,
-                            use_cache=False,
-                        )
-                        hidden_states = layer_outputs[0]
-                    if _memprof_layers:
+                _memprof_probe = None
+                if _memprof_layers:
+                    def _memprof_probe(layer_idx, decoder_layer, block_residual):
                         logging.info(
                             f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
                             f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
@@ -2478,85 +2601,23 @@ class PrefillEngine:
                                 f"(peak_alloc so far={torch.cuda.max_memory_allocated()/2**30:.3f}GiB)"
                             )
 
-                # Output depth-mix, then norm -- that ORDER is load-bearing
-                # (kimi_linear/model.py:904-913).
-                if use_attn_res:
-                    hidden_dim = hidden_states.shape[2]
-                    batch_sz, seq_sz = hidden_states.shape[:2]
-                    hidden_states = self.model.model._apply_output_attn_res(
-                        hidden_states.view(-1, hidden_dim), block_residual
-                    ).view(batch_sz, seq_sz, hidden_dim)
-                    # The pass is over: the buffer behind this view is model
-                    # class state and outlives the local, so it is released
-                    # here rather than left pinned until the next seed.
-                    block_residual = None
-                    self.model.model._release_block_residual()
-
-                # Final norm
-                hidden_states = self.model.model.norm(hidden_states)
-
-                # Extract last token hidden states for each sequence
+                # Last-token row of each sequence in this micro-batch.
                 last_token_indices = batch_cu_seqlens[1:] - 1
-                gather_last_token_hidden = getattr(
-                    self.parallel_manager,
-                    "gather_prefill_last_token_hidden",
-                    None,
+                if unpooled_trace is not None:
+                    # Opens the chunk's gather-side record; the record itself
+                    # is written inside the model pass (from the real gather,
+                    # or by the asserted unsharded helper).
+                    unpooled_trace.begin_chunk(batch_idx)
+                # The ONE model loop (embed -> layers -> depth-mix -> norm ->
+                # tail gather -> lm_head), shared with the pooled driver.
+                logits = _engine._prefill_model_pass(
+                    self,
+                    batch_input_ids_flat.to(self.torch_device, dtype=torch.int64),
+                    last_token_indices,
+                    lmhead_fp32=_lmhead_fp32,
+                    trace=unpooled_trace,
+                    layer_probe=_memprof_probe,
                 )
-                if gather_last_token_hidden is None:
-                    last_token_hidden = hidden_states[
-                        0, last_token_indices, :
-                    ]
-                    if unpooled_trace is not None:
-                        # Genuinely single-rank: this manager has no gather, so
-                        # the rank holds every row. Asserted inside, not
-                        # assumed - see _record_unsharded_epilogue_gather.
-                        unpooled_trace.begin_chunk(batch_idx)
-                        self._record_unsharded_epilogue_gather(
-                            unpooled_trace,
-                            last_token_hidden,
-                            num_global_rows=int(hidden_states.shape[1]),
-                        )
-                else:
-                    # The tracer goes INTO the real gather, exactly as on the
-                    # pooled path: under streamed-SP8 this rank holds only a
-                    # row shard, and the shard bounds, the owned mask and the
-                    # norms either side of the all-reduce are visible only in
-                    # there. Writing a tp=0/1 record out here instead would
-                    # report a broken multi-rank gather as healthy.
-                    if unpooled_trace is not None:
-                        unpooled_trace.begin_chunk(batch_idx)
-                    last_token_hidden = gather_last_token_hidden(
-                        hidden_states,
-                        last_token_indices,
-                        batch_input_ids_flat.numel(),
-                        **(
-                            {"trace": unpooled_trace}
-                            if unpooled_trace is not None
-                            else {}
-                        ),
-                    )
-
-                # lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-                # Opt into FP32-cast via debug_state.glm5_lmhead_fp32 for
-                # debugging (a debug-state key; no env guard).
-                if getattr(self.model.lm_head, "tp_size", 1) > 1:
-                    # vocab-parallel head (K3 TP8): the module all_gathers the
-                    # full logits; the raw shard weight must not be used here.
-                    # .forward skips the decode-only pre-hook (``[:, -1, :]``
-                    # expects [bsz, seq, H]; this input is the gathered [n, H]).
-                    logits = self.model.lm_head.forward(last_token_hidden).float()
-                elif _lmhead_fp32:
-                    logits = torch.nn.functional.linear(
-                        last_token_hidden.float(),
-                        self.model.lm_head.weight.float(),
-                        self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-                    )
-                else:
-                    logits = torch.nn.functional.linear(
-                        last_token_hidden,
-                        self.model.lm_head.weight,
-                        self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-                    ).float()
                 if _k3_profile_enabled:
                     _k3_profile_logits.append(logits.detach())
 
@@ -2709,6 +2770,7 @@ class PrefillEngine:
         # The moved body is kept VERBATIM from batchgen_worker.py: source pins
         # depend on its original self. spellings. Rebinding self to the worker
         # preserves those spellings; this engine instance remains stateless.
+        _engine = self
         self = worker
         from batchgen.prefix_reuse.wave_plan import prefill_plan_work
 
@@ -2724,17 +2786,10 @@ class PrefillEngine:
         workspace = int(
             self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
         )
-        lm_weight = self.model.lm_head.weight
-        lm_bias = getattr(self.model.lm_head, "bias", None)
-        # The three model seams prefill_prepacked also goes through, duck-typed
-        # so they collapse to the plain path: K3 carries a per-layer block
-        # residual and ends on a depth mix, streamed-SP8 keeps only a row shard
-        # of the final hidden state, and its lm_head is vocab-parallel.
-        use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
-        gather_last_token_hidden = getattr(
-            self.parallel_manager, "gather_prefill_last_token_hidden", None
-        )
-        vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
+        # The model seams prefill_prepacked also goes through (K3 block
+        # residual + depth mix, streamed-SP8 row-shard gather, vocab-parallel
+        # lm_head) live in the shared ``_prefill_model_pass``, duck-typed so
+        # they collapse to the plain path.
         # Batch-level ``prefix_pool_epilogue_trace``: None in production.
         epilogue_trace = self._new_pool_epilogue_tracer(wave)
         if epilogue_trace is not None:
@@ -2789,74 +2844,21 @@ class PrefillEngine:
                 materialized_tokens += self._load_materialized_segments(
                     wave, rows, materialized_loader
                 )
-                hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
-                block_residual = (
-                    self.model.model._new_block_residual(hidden_states)
-                    if use_attn_res else None
+                # The ONE model loop (embed -> layers -> depth-mix -> norm ->
+                # tail gather -> lm_head), shared with the prepacked driver.
+                # A chunk with no tail rows computes pooled segments only:
+                # the pass runs every layer (the KV offloads are the product)
+                # and returns None. The pooled wave has never read the
+                # unpooled driver's lm_head FP32 debug key; this step is
+                # behaviour-preserving, so it keeps passing False.
+                logits = _engine._prefill_model_pass(
+                    self,
+                    rows.input_ids,
+                    rows.tail_rows if rows.tail_wave_indices else None,
+                    lmhead_fp32=False,
+                    trace=epilogue_trace,
                 )
-                for decoder_layer in self.model.model.layers:
-                    if use_attn_res:
-                        hidden_states, block_residual = decoder_layer(
-                            hidden_states,
-                            attention_mask=None,
-                            position_ids=None,
-                            past_key_value=None,
-                            output_attentions=False,
-                            use_cache=False,
-                            block_residual=block_residual,
-                        )
-                    else:
-                        hidden_states = decoder_layer(
-                            hidden_states,
-                            attention_mask=None,
-                            position_ids=None,
-                            past_key_value=None,
-                            output_attentions=False,
-                            use_cache=False,
-                        )[0]
                 if rows.tail_wave_indices:
-                    if use_attn_res:
-                        # Mix-then-norm over every row: the depth mix needs each
-                        # row's own residual (kimi_linear/model.py:904-913).
-                        hidden_dim = hidden_states.shape[2]
-                        batch_sz, seq_sz = hidden_states.shape[:2]
-                        hidden_states = self.model.model._apply_output_attn_res(
-                            hidden_states.view(-1, hidden_dim), block_residual
-                        ).view(batch_sz, seq_sz, hidden_dim)
-                    if gather_last_token_hidden is None:
-                        last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
-                        if epilogue_trace is not None:
-                            # No gather exists on this manager, so the rank
-                            # holds every row. record_unsharded_gather asserts
-                            # that against the manager instead of trusting
-                            # this branch: a hand-written single-rank record on
-                            # a sharded path would report a broken multi-rank
-                            # gather as healthy.
-                            self._record_unsharded_epilogue_gather(
-                                epilogue_trace,
-                                last_hidden,
-                                num_global_rows=int(rows.input_ids.numel()),
-                            )
-                    else:
-                        # Streamed-SP8 holds only this rank's row shard, so the
-                        # tail rows are reassembled over the group.
-                        last_hidden = gather_last_token_hidden(
-                            self.model.model.norm(hidden_states),
-                            rows.tail_rows,
-                            int(rows.input_ids.numel()),
-                            **(
-                                {"trace": epilogue_trace}
-                                if epilogue_trace is not None
-                                else {}
-                            ),
-                        )
-                    logits = (
-                        self.model.lm_head.forward(last_hidden).float()
-                        if vocab_parallel_head
-                        else torch.nn.functional.linear(
-                            last_hidden, lm_weight, lm_bias
-                        ).float()
-                    )
                     selected = self._select_tokens(
                         logits,
                         [self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
@@ -2882,14 +2884,9 @@ class PrefillEngine:
                             # head all-gathers before returning).
                             logits=logits,
                         )
-                del hidden_states
-                # The pass is over. Dropping the local view is not enough: the
-                # buffer behind it is model class state, and left alone it
-                # stays allocated through everything the next wave does
-                # before it seeds its own (PREFILL_MEMORY_AUDIT.md fix 3).
-                block_residual = None
-                if use_attn_res:
-                    self.model.model._release_block_residual()
+                # The chunk's hidden state and the K3 block-residual buffer
+                # were dropped/released inside the model pass before it
+                # returned (PREFILL_MEMORY_AUDIT.md fix 3).
                 self._weight_passes.end()
                 executed += int(rows.input_ids.numel())
                 wave.executor.finish(chunk)
