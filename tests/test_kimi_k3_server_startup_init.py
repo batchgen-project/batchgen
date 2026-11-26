@@ -131,9 +131,12 @@ def test_kimi_k3_startup_runs_before_the_all_worker_barrier_and_ready_signal():
     ready = calls["_signal_local_worker_manager_ready"]
     assert len(startup) == 1 and len(ready) == 1
 
-    # The watchdog must already be attached: the model build below is the
-    # longest single stretch of work the worker ever does unsupervised.
-    assert max(calls["set_watchdog"]) < startup[0]
+    # The hang watchdog arms at the READINESS boundary, never at spawn: the
+    # model/weight build below legitimately exceeds watchdog_timeout with no
+    # heartbeats, and startup is supervised by its own guards (the server's
+    # startup-phase watchdog, --startup-timeout, the restart coordinator).
+    # Behaviour: tests/unit/test_watchdog_readiness_arming.py.
+    assert min(calls["set_watchdog"]) > ready[0]
 
     # ...and the readiness event, plus the all-worker barrier that guards it,
     # must both trail it, so no rank reports ready with the build outstanding.
