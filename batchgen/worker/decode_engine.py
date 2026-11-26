@@ -87,6 +87,7 @@ class DecodeModelStateBinder(Protocol):
     def _read_decode_position_ids(self): ...
     def _read_decode_attention_mask(self): ...
     def _read_decode_kv_append_callbacks(self): ...
+    def _read_decode_step_graph(self): ...
     def _teardown_decode_model_state(self) -> None: ...
 
 
@@ -266,6 +267,15 @@ class DecoupledGpuDecode:
         _probe_mismatch_logged = False
         if _probe is not None:
             _probe.begin_round()
+
+        # Model-owned decode-graph step policy (None for a model without
+        # one). The strategy manager rebuilds it only at a decode configure,
+        # never mid-round, so one read per round is the live handle. The
+        # driver owns the per-step dispatch below: arm the step, replay the
+        # whole-model graph when the policy says so, otherwise run the same
+        # eager forward (the policy's per-layer hooks may then replay layer
+        # spans while the step stays armed).
+        _decode_step_graph = binder._read_decode_step_graph()
 
         # Main decode loop — enable decode watchdog for monitoring
         self.enable_decode_watchdog()
@@ -1110,15 +1120,37 @@ class DecoupledGpuDecode:
                             _glm5_whole_compare,
                         )
                 else:
-                    # Per-layer graph or eager forward
+                    # Model-policy whole-graph replay, per-layer graph, or
+                    # eager forward.
                     # CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
                     # Without this, the model generates position_ids = [[0]] for all decode steps,
                     # causing RoPE to be applied at position 0 instead of the actual token position.
-                    # Graph replays above stream nothing; an eager step is one
+                    # Graph replays stream nothing; an eager step is one
                     # weight pass and carries the next step's while decode runs.
                     self._weight_passes.begin(carry=True)
-                    outputs = self._glm5_decode_model_forward(new_tokens)
-                    new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+                    _wm_step_armed = (
+                        _decode_step_graph is not None
+                        and _decode_step_graph.begin_decode_step(new_tokens)
+                    )
+                    try:
+                        if _wm_step_armed:
+                            # Whole-model replay through the step policy
+                            # (replay + lm_head), the dispatch the retired
+                            # model.forward patch used to hide inside the
+                            # model.
+                            step_logits = _decode_step_graph.replay_whole_model_step(
+                                new_tokens
+                            )
+                        else:
+                            step_logits = self._glm5_decode_model_forward(
+                                new_tokens
+                            ).logits
+                    finally:
+                        # The retired hook's finally: the step disarms however
+                        # the forward exits.
+                        if _decode_step_graph is not None:
+                            _decode_step_graph.end_decode_step()
+                    new_tokens_out = self._select_tokens(step_logits[:, -1, :], batch_sequences)
                     self._weight_passes.end()
                 self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 

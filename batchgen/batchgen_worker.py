@@ -974,6 +974,13 @@ class BatchGenWorkerArgs:
 	# Prefix-cache coordinator region (anonymous memfd owned by the server).
 	prefix_memfd_pid: int = -1
 	prefix_memfd_fd: int = -1
+	# Durable KDA record map region (anonymous memfd owned by the server):
+	# the per-sequence record store's sequence-id -> pages map lives there so
+	# a worker-pool restart cannot orphan record pages. Created empty; the
+	# first cohort that builds the record store sizes it, so a model without
+	# recurrent state leaves it at size zero.
+	kda_record_map_memfd_pid: int = -1
+	kda_record_map_memfd_fd: int = -1
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
 	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
@@ -1418,6 +1425,21 @@ class BatchGenWorker:
 			prefix_host_config, prefix_aux_config
 		)
 		self._host_kv_page_tokens = int(prefix_host_config.page_size_tokens)
+
+		# The durable KDA record map region (server-owned memfd, like the
+		# host KV regions above). Attached lazily: the recovery sweep below
+		# reads it back, the record store's build sizes and writes it.
+		self._kda_record_map_memfd_identity = (
+			int(getattr(args, "kda_record_map_memfd_pid", -1)),
+			int(getattr(args, "kda_record_map_memfd_fd", -1)),
+		)
+		# 方案甲 restart recovery: a respawned pool reads the persisted
+		# sequence-id -> pages map back and releases the records of
+		# sequences that no longer exist server-side, which would otherwise
+		# orphan their prefix-resident Host pages until a cold restart.
+		# Right here because the host KV views above are the first thing
+		# the release needs and every capacity read must come after it.
+		self._recover_kda_record_orphans()
 
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
@@ -10098,7 +10120,123 @@ class BatchGenWorker:
 			next_pseudo_sid=self._next_pool_segment_sid,
 			page_tokens=self._host_kv_page_tokens,
 			host_page_bytes_all_layers=self._host_kv_page_bytes_all_layers,
+			shared_map_factory=self._kda_record_shared_map,
 		)
+
+	def _kda_record_shared_map(self, record_pages: int):
+		"""Attach the node's durable KDA record map, sized exactly.
+
+		The region is a server-owned memfd (it survives every pool
+		restart); the first cohort whose model keeps recurrent state sizes
+		it here to the exact figure its geometry needs, later cohorts
+		validate that the persisted header matches theirs.  Capacity is the
+		node's sequence capacity -- every sequence that can hold a record
+		at once -- so a full map is an accounting bug by name, never a
+		growth path.
+		"""
+		from batchgen.prefix_reuse.kda_record_map import (
+			KDARecordMapGeometry,
+			KDARecordSharedMap,
+			attach_kda_record_map_region,
+		)
+
+		creator_pid, memfd_fd = self._kda_record_map_memfd_identity
+		if self._traj.trajectory_book is None:
+			raise RuntimeError(
+				"the KDA record map is sized from the trajectory book's "
+				"sequence capacity, which must exist before the first "
+				"record store build"
+			)
+		geometry = KDARecordMapGeometry(
+			capacity=int(
+				self._traj.trajectory_book.reservation_total_capacity(
+					self.model_context_length
+				)
+			),
+			group_ids=tuple(
+				sorted(int(g) for g in self._host_views_by_group())
+			),
+			pages_per_group=int(record_pages),
+			unit_count=int(self._trajectory_record_unit_count()),
+			host_page_bytes_all_layers=int(
+				self._host_kv_page_bytes_all_layers
+			),
+		)
+		region = attach_kda_record_map_region(
+			creator_pid=creator_pid,
+			memfd_fd=memfd_fd,
+			required_bytes=KDARecordSharedMap.required_bytes(geometry),
+		)
+		return KDARecordSharedMap(
+			region.buffer, geometry=geometry, lock=region
+		)
+
+	def _recover_kda_record_orphans(self) -> None:
+		"""Pool startup: release the records a dead cohort left behind.
+
+		The orphan this repairs: a record RETAINED before the restart has
+		prefix-resident Host pages named only by the persisted map -- the
+		cohort reconcile (``release_all_sequences``) recovers chain-owned
+		pages but cannot name resident ones, and the host budget is one
+		combined pool, so every orphan shrinks usable host KV until a cold
+		restart.
+
+		Runs on the node's local leader only, immediately after the host KV
+		views attach and before any capacity read; the readiness barrier
+		orders it before every rank's record-store build, so the stores
+		rehydrate exactly the surviving entries.  The restart route fails
+		every in-flight batch (#490), so the live set handed to the sweep
+		is empty; a future keep-sequences restart passes its survivors
+		through the same parameter.
+		"""
+		if self.local_rank != 0:
+			return
+		creator_pid, memfd_fd = self._kda_record_map_memfd_identity
+		if memfd_fd < 0:
+			# No server-owned region was published (a directly constructed
+			# worker outside the server); there is nothing persisted to
+			# recover and the store build will refuse to run without the
+			# region if the model keeps recurrent state.
+			return
+		from batchgen.prefix_reuse.kda_record_map import (
+			KDARecordSharedMap,
+			attach_kda_record_map_region,
+		)
+		from batchgen.prefix_reuse.trajectory_commit import (
+			HostKVSnapshotArenaAllocator,
+		)
+		from batchgen.worker import kda_lifecycle
+
+		region = attach_kda_record_map_region(
+			creator_pid=creator_pid, memfd_fd=memfd_fd
+		)
+		if region is None:
+			# Size zero: nothing was ever persisted (first cohort, or a
+			# model without recurrent state).
+			return
+		try:
+			shared_map = KDARecordSharedMap.from_existing(
+				region.buffer, lock=region
+			)
+			view = self.host_paged_kv_worker_view
+			views = (
+				view.views_by_group()
+				if isinstance(view, DualHostKVCoordinator)
+				else {0: view}
+			)
+			allocator = HostKVSnapshotArenaAllocator(
+				host_views_provider=lambda: views,
+				page_tokens=self._host_kv_page_tokens,
+				host_page_bytes_all_layers=(
+					self._host_kv_page_bytes_all_layers
+				),
+				next_pseudo_sid=self._next_pool_segment_sid,
+			)
+			kda_lifecycle.release_restart_orphans(
+				shared_map, allocator, (), rank=self.rank
+			)
+		finally:
+			region.close()
 
 	def _kda_record_pages_per_sequence(self) -> int:
 		"""Host pages ONE sequence's record reserves -- a model constant at
@@ -12874,6 +13012,18 @@ class BatchGenWorker:
 			getattr(AttnWrapperBase, 'kv_append_callback', None),
 			getattr(AttnWrapperBase, 'kv_append_callback_aux', None),
 		)
+
+	def _read_decode_step_graph(self):
+		"""The model-owned decode-graph step policy, or None.
+
+		Declared accessor on the strategy manager (``decode_step_graph``):
+		the decode driver reads it once per decode round and drives each
+		step through ``begin_decode_step`` / ``replay_whole_model_step`` /
+		``end_decode_step``. A model without one decodes through the plain
+		eager forward or the worker-owned whole-model graph arms.
+		"""
+		accessor = getattr(self.parallel_manager, "decode_step_graph", None)
+		return accessor() if accessor is not None else None
 
 	def _teardown_decode_model_state(self):
 		phase_state.bind_kv_append(Attn_Wrapper, kv_append_callback=None)
