@@ -135,24 +135,27 @@ except (ImportError, Exception):
 # WP4: Fused indexer scoring (CUDA WGMMA + CUDA RoPE/Hadamard + Triton).
 # This is required by the production GLM-5 DSA path; import failures must
 # preserve the original exception instead of silently disabling the kernel.
-    from batchgen_kernels.attention.dsa.fused_indexer_score import (
-        FP8WqbWeightsCUDA,
-        cuda_wq_b_proj_out,
-        fused_score_pipeline,
-        fused_score_and_topk,
-        fused_score_and_topk_out,
-        fused_paged_score_and_topk_out,
-        rope_hadamard_q_out,
-    )
+# (No try/except, by design — and the block was previously indented into the
+# WP2 except-suite above, so it only ran when WP2 had FAILED while __all__
+# still advertised the names unconditionally.)
+from batchgen_kernels.attention.dsa.fused_indexer_score import (
+    FP8WqbWeightsCUDA,
+    cuda_wq_b_proj_out,
+    fused_score_pipeline,
+    fused_score_and_topk,
+    fused_score_and_topk_out,
+    fused_paged_score_and_topk_out,
+    rope_hadamard_q_out,
+)
 __all__ += [
-        "FP8WqbWeightsCUDA",
-        "cuda_wq_b_proj_out",
-        "fused_score_and_topk",
-        "fused_score_and_topk_out",
-        "fused_paged_score_and_topk_out",
-        "fused_score_pipeline",
-        "rope_hadamard_q_out",
-    ]
+    "FP8WqbWeightsCUDA",
+    "cuda_wq_b_proj_out",
+    "fused_score_and_topk",
+    "fused_score_and_topk_out",
+    "fused_paged_score_and_topk_out",
+    "fused_score_pipeline",
+    "rope_hadamard_q_out",
+]
 
 # WP5: FP8 absorb (Triton WGMMA)
 try:
