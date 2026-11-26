@@ -336,17 +336,21 @@ class BoundaryPlanner:
             if uuid not in ctx.sched.seq_table.uuid_to_local:
                 seq = ctx.sched.pool.get_sequence(uuid)
                 if seq is not None:
-                    seq.decoded_length = state['decoded_length']
-                    seq.current_context_length = state['current_context_length']
-                    seq.gpu_pages_allocated = state['gpu_pages_allocated']
+                    seq.mirror_decode_state(
+                        state['decoded_length'],
+                        state['current_context_length'],
+                        state['gpu_pages_allocated'],
+                    )
                     seq.eos_reached = state['eos_reached']
                     if state.get('rep_detected', False):
                         seq._rep_detected = True
                     # Sync host KV fields to keep all ranks consistent for migration planning
-                    seq.host_pages_allocated = state['host_pages_allocated']
-                    seq.host_owned_pages = state['host_owned_pages']
+                    seq.mirror_host_counters(
+                        state['host_pages_allocated'],
+                        state['host_owned_pages'],
+                        state['host_token_capacity'],
+                    )
                     seq.kda_record_pages = state['kda_record_pages']
-                    seq.host_token_capacity = state['host_token_capacity']
                     # Sync prompt_length (may have been rewritten by a prior
                     # eviction on the owner) and total_decoded_before_eviction
                     # so Phase 4 mutations can be computed deterministically on

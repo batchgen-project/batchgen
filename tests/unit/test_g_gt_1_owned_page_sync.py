@@ -24,6 +24,7 @@ from batchgen.continuous_batching import (
     host_kv_owner_reports,
     validate_boundary_payload_alignment,
 )
+from batchgen.sequence import SequenceEntry
 from tests.worker.worker_fakes import attach_identity, attach_trajectory_state
 from tests.worker_method_source import WORKER_SOURCE, load_worker_methods, attention_group_layout
 
@@ -80,6 +81,14 @@ class FakeSeq:
         self.host_token_capacity = HOST_PAGES * PAGE_TOKENS
         self.total_decoded_before_eviction = 0
         self.validated = []
+        # The real owner mirror methods (never re-implemented in tests): the
+        # sync under test adopts the owner's counters through the entry.
+        self.mirror_decode_state = types.MethodType(
+            SequenceEntry.mirror_decode_state, self
+        )
+        self.mirror_host_counters = types.MethodType(
+            SequenceEntry.mirror_host_counters, self
+        )
 
     def validate_metadata(self, context, require_owner_tensors=True,
                           allow_terminal_capacity_gap=False):

@@ -636,6 +636,17 @@ class SequenceEntry:
             self.evicted_from_dp_group = self.decode_dp_group
         self.decode_dp_group = None
 
+    def assign_decode_group(self, group: int) -> None:
+        """Stamp the serve group the placement plan chose for this sequence.
+
+        Symmetric to ``drop_decode_group``: grouped again, the eviction
+        record has served its purpose (a re-entry returns to the group it
+        decoded on through this same call), so it is cleared; a later
+        eviction records the then-current group afresh.
+        """
+        self.decode_dp_group = group
+        self.evicted_from_dp_group = None
+
     def grow_host_kv(self, growth_pages: int) -> None:
         """Commit a host-KV growth of ``growth_pages`` pages.
 
@@ -763,6 +774,36 @@ class SequenceEntry:
         """
         self.decoded_length = decoded_length
         self.current_context_length = self.original_prompt_length + decoded_length
+
+    def mirror_decode_state(self, decoded_length: int,
+                            current_context_length: int,
+                            gpu_pages_allocated: int) -> None:
+        """Adopt the owning rank's decode-state triple on a non-owning rank.
+
+        Plain assignments by design: at mirror time other local fields (e.g.
+        ``prompt_length``) may still be stale, so nothing is validated or
+        asserted here.  The call sites repair the context identity from
+        ``original_prompt_length`` and run ``validate_metadata`` once the
+        rest of the row is synced.
+        """
+        self.decoded_length = decoded_length
+        self.current_context_length = current_context_length
+        self.gpu_pages_allocated = gpu_pages_allocated
+
+    def mirror_host_counters(self, host_pages_allocated: int,
+                             host_owned_pages: int,
+                             host_token_capacity: int) -> None:
+        """Adopt the host-KV owner's counters on a rank that never writes them.
+
+        Plain assignments by design, NOT ``commit_host_reservation``: that
+        commit refuses a broken capacity identity, but a terminal row the
+        planner admits via ``allow_terminal_capacity_gap`` mirrors exactly
+        such a gap.  The mirror adopts what the owner reported; the call
+        sites validate with the flags they know apply.
+        """
+        self.host_pages_allocated = host_pages_allocated
+        self.host_owned_pages = host_owned_pages
+        self.host_token_capacity = host_token_capacity
 
     # ============ Dynamic Host KV Reservation Methods ============
 

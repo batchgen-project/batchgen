@@ -2637,10 +2637,9 @@ class BatchGenWorker:
 			for i, g in zip(fresh, placed):
 				groups[i] = g
 		for seq, g in zip(seqs, groups):
-			seq.decode_dp_group = g
 			# Grouped again: the eviction record has served its purpose, and
 			# a later eviction records the then-current group afresh.
-			seq.evicted_from_dp_group = None
+			seq.assign_decode_group(g)
 		if self.rank == 0:
 			# Rows per group after this stamp: the rows just placed and every
 			# grouped row still to decode. The fullest group sets the decode
@@ -4865,9 +4864,11 @@ class BatchGenWorker:
 						# This sequence belongs to another rank - update our local copy
 						seq = self.global_batch.get_sequence(uuid)
 						if seq is not None:
-							seq.decoded_length = state['decoded_length']
-							seq.current_context_length = state['current_context_length']
-							seq.gpu_pages_allocated = state['gpu_pages_allocated']
+							seq.mirror_decode_state(
+								state['decoded_length'],
+								state['current_context_length'],
+								state['gpu_pages_allocated'],
+							)
 							seq.eos_reached = state['eos_reached']
 							if state.get('rep_detected', False):
 								seq._rep_detected = True
@@ -4885,10 +4886,12 @@ class BatchGenWorker:
 								seq.original_max_decode_length = state['original_max_decode_length']
 							# Sync host KV fields for consistent migration planning
 							host_state = host_kv_reports[uuid]
-							seq.host_pages_allocated = host_state['host_pages_allocated']
-							seq.host_owned_pages = host_state['host_owned_pages']
+							seq.mirror_host_counters(
+								host_state['host_pages_allocated'],
+								host_state['host_owned_pages'],
+								host_state['host_token_capacity'],
+							)
 							seq.kda_record_pages = host_state['kda_record_pages']
-							seq.host_token_capacity = host_state['host_token_capacity']
 							# Eviction-related fields
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
@@ -4925,10 +4928,12 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or self._owns_host_kv(seq):
 				continue
-			seq.host_pages_allocated = host_state['host_pages_allocated']
-			seq.host_owned_pages = host_state['host_owned_pages']
+			seq.mirror_host_counters(
+				host_state['host_pages_allocated'],
+				host_state['host_owned_pages'],
+				host_state['host_token_capacity'],
+			)
 			seq.kda_record_pages = host_state['kda_record_pages']
-			seq.host_token_capacity = host_state['host_token_capacity']
 			seq.validate_metadata(
 				f"rank {self.rank} _sync_sequence_metadata/host_kv_owner"
 			)

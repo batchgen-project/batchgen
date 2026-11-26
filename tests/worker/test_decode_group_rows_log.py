@@ -35,7 +35,7 @@ from batchgen.decode_dp_group import (
     format_decode_groups_line,
     format_group_rows,
 )
-from batchgen.sequence import SequenceStatus
+from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.rank_sync_engine import RankSyncEngine
 from batchgen.worker.admission.context import DecodePhaseContext, RankFacts, SchedulingState
 
@@ -317,8 +317,12 @@ class _Batch:
 
 
 def _seq(uuid, length, *, status=SequenceStatus.QUEUEING, group=None):
-    return SimpleNamespace(uuid=uuid, prompt_length=length, status=status,
-                           decode_dp_group=group, evicted_from_dp_group=None)
+    seq = SimpleNamespace(uuid=uuid, prompt_length=length, status=status,
+                          decode_dp_group=group, evicted_from_dp_group=None)
+    # The group stamp is owned by SequenceEntry; bind the real method (never
+    # re-implemented here) so the planner under test can call it.
+    seq.assign_decode_group = MethodType(SequenceEntry.assign_decode_group, seq)
+    return seq
 
 
 def _plan_worker(seqs, *, packer_groups=None, rank=0, G=2, world_size=8):
