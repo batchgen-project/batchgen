@@ -9909,6 +9909,24 @@ class BatchGenWorker:
 			wave,
 		)
 
+	def _prefill_model_pass(
+		self, input_ids, tail_rows, *, lmhead_fp32, trace=None, layer_probe=None
+	):
+		# The engine receives this worker as its sole state collaborator.
+		engine = getattr(self, "_prefill_engine", None)
+		if engine is None:
+			from batchgen.worker.prefill_engine import PrefillEngine
+			engine = PrefillEngine()
+			self._prefill_engine = engine
+		return engine._prefill_model_pass(
+			self,
+			input_ids,
+			tail_rows,
+			lmhead_fp32=lmhead_fp32,
+			trace=trace,
+			layer_probe=layer_probe,
+		)
+
 	def _record_unsharded_epilogue_gather(self, tracer, selected, *, num_global_rows) -> None:
 		# The engine receives this worker as its sole state collaborator.
 		engine = getattr(self, "_prefill_engine", None)
