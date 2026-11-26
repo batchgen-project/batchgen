@@ -823,22 +823,6 @@ def _server_worker_main_impl(
 	# into the same slot; each entry restarts the budget for the step it names.
 	worker.set_startup_phase_reporter(phase_reporter)
 
-	# 2.5. Initialize watchdog for stuck process detection
-	watchdog_timeout = getattr(args, 'watchdog_timeout', None)
-	watchdog_test_stuck_time = getattr(args, 'watchdog_test_stuck_time', 0.0)
-	watchdog = Watchdog.create(
-		debug_name=f"worker-{args.global_rank}",
-		watchdog_timeout=watchdog_timeout,
-		soft=False,  # Hard mode: kill parent process on timeout
-		test_stuck_time=watchdog_test_stuck_time,
-		dump_info=recorder.watchdog_dump_info(f"worker-{args.global_rank}"),
-	)
-	if watchdog_timeout:
-		logging.info(f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s")
-
-	# Pass watchdog to worker for fine-grained feeding during inference
-	worker.set_watchdog(watchdog)
-
 	# Kimi-K3 finishes its workload-independent one-time work — model build,
 	# resident-EP decode shards, streamed-SP8 buffers and the H2D weight
 	# schedule — BEFORE the readiness signal below, so a server that reports
@@ -890,8 +874,37 @@ def _server_worker_main_impl(
 		global_rank=args.global_rank,
 	)
 
-	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
-	# not worker init, CUDA graph capture, or NCCL warmup.
+	# 2.6. Arm the watchdogs AT THE READINESS BOUNDARY — after the all-rank
+	# barrier and the ready signal above — never at worker spawn. Weight
+	# loading legitimately runs longer than watchdog_timeout with no
+	# heartbeats (a real 4-node start was killed mid-load by a watchdog armed
+	# at spawn), and startup has its own independent guards: the server-side
+	# startup-phase watchdog, the --startup-timeout whole-startup deadline,
+	# and the restart coordinator's peer heartbeats. The hang watchdog's job
+	# is the SERVING phase only. Every cohort respawn — initial start,
+	# /v1/workers/restart, debug-state rewarm — re-runs this function, so a
+	# restart window is a new startup window: not armed until the pool
+	# serves again.
+	watchdog_timeout = getattr(args, 'watchdog_timeout', None)
+	watchdog_test_stuck_time = getattr(args, 'watchdog_test_stuck_time', 0.0)
+	watchdog = Watchdog.create(
+		debug_name=f"worker-{args.global_rank}",
+		watchdog_timeout=watchdog_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+		test_stuck_time=watchdog_test_stuck_time,
+		dump_info=recorder.watchdog_dump_info(f"worker-{args.global_rank}"),
+	)
+	if watchdog_timeout:
+		logging.info(f"Rank {args.global_rank}: Watchdog armed at readiness with timeout={watchdog_timeout}s")
+	# Pass watchdog to worker for fine-grained feeding during inference.
+	# Until here worker._watchdog is None and every feed/disable path is
+	# None-safe, so the whole startup runs unwatched by design.
+	worker.set_watchdog(watchdog)
+
+	# The decode-step watchdog likewise only exists from readiness — and it
+	# additionally starts disabled (set_decode_watchdog): enabled only inside
+	# decode loops, so it never counts worker init, CUDA graph capture, or
+	# NCCL warmup.
 	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
 	decode_watchdog = Watchdog.create(
 		debug_name=f"decode-{args.global_rank}",
