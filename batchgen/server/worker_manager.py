@@ -278,6 +278,13 @@ class WorkerManager:
         self._fatal_ack_event = self._mp_ctx.Event()
         self.prefix_cache_runtime_config = None
         self.prefix_cache_coordinator = None
+        # Durable KDA record map region: an anonymous memfd THIS process
+        # owns, like the host-KV and prefix regions, so the per-sequence
+        # record store's sequence-id -> pages map survives every worker
+        # pool restart. Created lazily on the first spawn, size zero; the
+        # first cohort whose model keeps recurrent state sizes it, so a
+        # stateless model leaves it empty.
+        self._kda_record_map_memfd_fd = -1
         self._local_world_size: Optional[int] = None
         self._runtime_dir_created = False
         self._runtime_namespace_owned = False
@@ -1943,6 +1950,8 @@ class WorkerManager:
             input_ids_pool_size_gb=self.args.input_ids_pool_size_gb,
             prefix_memfd_pid=self._get_prefix_memfd_pid(),
             prefix_memfd_fd=self._get_prefix_memfd_fd(),
+            kda_record_map_memfd_pid=os.getpid(),
+            kda_record_map_memfd_fd=self._get_kda_record_map_memfd_fd(),
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
@@ -2006,6 +2015,18 @@ class WorkerManager:
             join=False,
             daemon=True,
         )
+
+    # The durable KDA record map region is an anonymous memfd owned by this
+    # process, published to the workers like the host-KV regions below. It is
+    # created empty on the first spawn and sized by the first cohort that
+    # builds the record store; the fd stays open here for the server's life,
+    # which is exactly what carries the map across pool restarts.
+    def _get_kda_record_map_memfd_fd(self) -> int:
+        if self._kda_record_map_memfd_fd < 0:
+            from batchgen.memfd import create_memfd
+
+            self._kda_record_map_memfd_fd = create_memfd("kda_record_map")
+        return self._kda_record_map_memfd_fd
 
     # The prefix-cache coordinator region is an anonymous memfd owned by this
     # process, published to the workers like the host-KV regions below.
