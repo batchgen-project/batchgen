@@ -345,40 +345,55 @@ def test_all_short_skips_every_scoring_stage():
     )
 
 
-def test_selected_fa3_call_shape_is_page_size_one_over_selected_token_ids():
+def test_selected_fa3_binds_the_selection_buffers_to_the_one_spelling():
+    # The FA3 call itself exists once (`glm5_decode_selector._run_selected_fa3`,
+    # kwargs pinned in test_glm5_eager_fa3_wiring.py); the segment helper only
+    # binds its static cache view and selection buffers to that function.
     helper = _method(_tree(_SEGMENTS_SRC), "Glm5FullDsaAttnSegment", "_run_selected_fa3")
-    kwargs = _call_kwargs(helper, "_fa3_with_kvcache")
-    assert kwargs["q"] == "buffers.q_rope_4d.squeeze(2).unsqueeze(1)"
-    assert kwargs["qv"] == "buffers.absorbed_q.unsqueeze(1)"
-    assert kwargs["page_table"] == "buffers.selected_token_ids"
-    assert kwargs["cache_seqlens"] == "buffers.selected_lengths"
+    assert "_fa3_with_kvcache" not in ast.unparse(helper)
+    (call,) = [
+        sub
+        for sub in ast.walk(helper)
+        if isinstance(sub, ast.Call)
+        and ast.unparse(sub.func) == "_run_selected_fa3"
+    ]
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "self.attn",
+        "buffers.q_rope_4d",
+        "buffers.absorbed_q",
+        "self.primary_blocked_k",
+        "buffers.selected_token_ids",
+        "buffers.selected_lengths",
+    ]
     # Selected token IDs are absolute: no slot indirection may be passed.
-    assert "cache_batch_idx" not in kwargs
-    assert kwargs["k_cache"] == "flat_kv[..., attn.kv_lora_rank:]"
-    assert kwargs["v_cache"] == "flat_kv[..., :attn.kv_lora_rank]"
-    assert kwargs["causal"] == "True"
-    # The sparse selected-token call pins the no-split policy constant; the
-    # dense all_short call below keeps auto-split ("0").
-    assert kwargs["num_splits"] == "GLM5_SPARSE_FA3_NUM_SPLITS"
-    assert kwargs["return_softmax_lse"] == "False"
-    assert kwargs["softmax_scale"] == "float(attn.softmax_scale)"
-    assert "self.primary_blocked_k.view(-1, 1, 1, self.primary_blocked_k.shape[-1])" in (
-        ast.unparse(helper)
-    )
+    assert not call.keywords
 
 
-def test_all_short_fa3_call_reads_the_resident_paged_cache():
+def test_all_short_fa3_binds_the_resident_cache_to_the_one_spelling():
+    # The dense all-short FA3 call exists once
+    # (`glm5_decode_selector._run_all_short_fa3`, kwargs pinned in
+    # test_glm5_eager_fa3_wiring.py); the segment helper binds the resident
+    # cache, its static page table and the slot indirection to that function.
     helper = _method(_tree(_SEGMENTS_SRC), "Glm5FullDsaAttnSegment", "_run_all_short_fa3")
-    kwargs = _call_kwargs(helper, "_fa3_with_kvcache")
-    assert kwargs["q"] == "buffers.q_rope_4d.squeeze(2).unsqueeze(1)"
-    assert kwargs["qv"] == "buffers.absorbed_q.unsqueeze(1)"
-    assert kwargs["page_table"] == "self.primary_page_table"
-    assert kwargs["cache_batch_idx"] == "buffers.safe_primary_slot_indices"
-    assert kwargs["cache_seqlens"] == "buffers.safe_cache_seqlens"
-    assert kwargs["k_cache"] == "self.primary_blocked_k[..., attn.kv_lora_rank:]"
-    assert kwargs["v_cache"] == "self.primary_blocked_k[..., :attn.kv_lora_rank]"
-    assert kwargs["causal"] == "True"
-    assert kwargs["num_splits"] == "0"
+    assert "_fa3_with_kvcache" not in ast.unparse(helper)
+    (call,) = [
+        sub
+        for sub in ast.walk(helper)
+        if isinstance(sub, ast.Call)
+        and ast.unparse(sub.func) == "_run_all_short_fa3"
+    ]
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "self.attn",
+        "buffers.q_rope_4d",
+        "buffers.absorbed_q",
+        "self.primary_blocked_k",
+    ]
+    kwargs = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+    assert kwargs == {
+        "page_table": "self.primary_page_table",
+        "cache_batch_idx": "buffers.safe_primary_slot_indices",
+        "cache_seqlens": "buffers.safe_cache_seqlens",
+    }
 
 
 @pytest.mark.parametrize(

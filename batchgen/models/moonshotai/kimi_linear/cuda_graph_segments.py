@@ -107,7 +107,6 @@ import time
 from typing import Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from batchgen.attention.mla.paged_decode import block_table_width
 from batchgen.cuda_graph.graph_manager import (
@@ -126,8 +125,8 @@ from .layer_body import (
     run_kimi_layer_body,
 )
 from .serving_modules import (
-    _reduce_mla_tp_output,
     kda_decode_serving,
+    mla_decode_nope_core,
     mla_decoding_nope_with_pagekv,
 )
 from .wrappers import KDALayerState, KimiLinearKDAWrapper
@@ -188,9 +187,11 @@ def _mla_decode_graph_safe(
     page_size_tokens,
     mla_schedule=None,
 ):
-    """Graph-safe inline of `serving_modules.mla_decoding_nope_with_pagekv`.
+    """The captured binding of `serving_modules.mla_decode_nope_core`.
 
-    Identical math; exactly three differences, all forced by capture:
+    The dense math exists ONCE, in the core; the eager step
+    (`serving_modules.mla_decoding_nope_with_pagekv`) runs the same function.
+    This binding injects exactly the three differences a capture forces:
       1. the new token is written with `run_paged_kv_token_update_fused` over
          the STATIC page table instead of
          `gpu_paged_kv_manager.update_layer_decode_new_token` (which re-reads
@@ -212,102 +213,45 @@ def _mla_decode_graph_safe(
         page_size_tokens: tokens per KV page.
         mla_schedule: the step's ``paged_decode.DecodeSchedule`` shared by
             every MLA layer (whole-model graph), or None for a standalone
-            per-layer capture, which then records its own.
+            per-layer capture, which then records its own inside the seam.
 
     Returns:
         (attn_output (bucket, 1, hidden), k_tensor (bucket, 1, 1, kv_dim)).
     """
     # The same pure-BF16 seam as the eager path; it never pulls in the legacy
     # FP8/FA3 backend and its DeepGEMM dependency.
-    from batchgen.attention.mla.paged_decode import mla_paged_decode
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
-    bsz = hidden_states.shape[0]
-    hidden_2d = hidden_states.squeeze(1)
+    def bind_kv_write(k_tensor):
+        # k_cache is the manager's per-layer view. Its address is fixed only
+        # for the life of ONE KV manager instance: the slice base is
+        # `data_ptr + layer * num_pages * page_stride`, so a re-init with a
+        # different num_pages moves it even when data_ptr is reused. That is
+        # why `_signature` must carry the cache shape/stride, not just the
+        # pointer. The graph brings its own static page table, so only the
+        # cache tensor is read here; an empty rank captures before it ever
+        # builds an active table.
+        blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
+            layer_idx
+        )
+        run_paged_kv_token_update_fused(
+            k_cache=blocked_k,
+            k_tokens=k_tensor.view(k_tensor.shape[0], -1),
+            page_table=page_table,
+            slot_indices=slot_indices,
+            token_indices=token_indices,
+            page_size_tokens=page_size_tokens,
+            num_valid_tokens=num_valid_tokens,
+        )
+        return blocked_k, page_table, k_tensor
 
-    if attn.q_lora_rank is not None:
-        q = F.linear(hidden_2d, attn.q_a_proj.weight)
-        q = attn.q_a_layernorm(q)
-        q = F.linear(q, attn.q_b_proj.weight)
-    else:
-        q = F.linear(hidden_2d, attn.q_proj.weight)
-    new_compressed_kv = F.linear(
-        hidden_2d, attn.kv_a_proj_with_mqa.weight
-    ).view(bsz, 1, -1)
-
-    q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(
-        q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
+    return mla_decode_nope_core(
+        attn,
+        hidden_states,
+        cache_seqlens=cache_seqlens,
+        bind_kv_write=bind_kv_write,
+        mla_schedule=mla_schedule,
     )
-
-    # NoPE: k_pe is carried unrotated.
-    kv, k_pe = torch.split(
-        new_compressed_kv, [attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1
-    )
-    normed_kv = attn.kv_a_layernorm(kv)
-    offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
-    k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
-
-    # k_cache is the manager's per-layer view. Its address is fixed only for
-    # the life of ONE KV manager instance: the slice base is
-    # `data_ptr + layer * num_pages * page_stride`, so a re-init with a
-    # different num_pages moves it even when data_ptr is reused. That is why
-    # `_signature` must carry the cache shape/stride, not just the pointer.
-    # The graph brings its own static page table, so only the cache tensor is
-    # read here; an empty rank captures before it ever builds an active table.
-    blocked_k, _ = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_cache(
-        layer_idx
-    )
-    run_paged_kv_token_update_fused(
-        k_cache=blocked_k,
-        k_tokens=k_tensor.view(bsz, -1),
-        page_table=page_table,
-        slot_indices=slot_indices,
-        token_indices=token_indices,
-        page_size_tokens=page_size_tokens,
-        num_valid_tokens=num_valid_tokens,
-    )
-
-    kv_b_proj = attn.kv_b_proj.weight.data.view(
-        attn.num_heads, -1, attn.kv_lora_rank
-    )
-    q_absorb = kv_b_proj[:, : attn.qk_nope_head_dim, :]
-    out_absorb = kv_b_proj[:, attn.qk_nope_head_dim :, :]
-
-    qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-    query_states = torch.empty(
-        bsz, attn.num_heads, 1, qk_head_dim,
-        dtype=blocked_k.dtype, device=hidden_states.device,
-    )
-    q_nope = q_nope.squeeze(2)
-    query_states[:, :, :, : attn.kv_lora_rank] = torch.einsum(
-        "bhd,hdc->bhc", q_nope, q_absorb
-    ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
-    query_states[:, :, :, attn.kv_lora_rank :] = q_pe
-    query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
-
-    # The standalone per-layer graph path has no enclosing model graph, so
-    # the seam records its schedule here (mla_schedule=None). The K3
-    # whole-model graph passes one schedule shared by all NoPE-MLA layers.
-    attn_out = mla_paged_decode(
-        query_states,
-        blocked_k,
-        page_table,
-        cache_seqlens,
-        attn.kv_lora_rank,
-        attn.scaling,
-        schedule=mla_schedule,
-    )
-
-    attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
-    if attn.use_output_gate:
-        gate = F.linear(hidden_2d, attn.g_proj.weight).sigmoid()
-        attn_output = attn_output * gate
-    attn_output = F.linear(attn_output, attn.o_proj.weight)
-    attn_output = _reduce_mla_tp_output(attn, attn_output)
-    return attn_output.view(bsz, 1, -1), k_tensor
 
 
 class _BucketStatics:

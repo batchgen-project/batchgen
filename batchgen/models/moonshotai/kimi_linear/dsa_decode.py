@@ -64,7 +64,12 @@ from .dsa_index_rotation import (
     decode_writer_rotation_args,
     index_q_rows,
 )
-from .serving_modules import _reduce_mla_tp_output, mla_decoding_nope_with_pagekv
+from .serving_modules import (
+    _absorb,
+    _finish,
+    _project,
+    mla_decoding_nope_with_pagekv,
+)
 
 # --------------------------------------------------------------------------- #
 #  Kernel seams                                                               #
@@ -405,50 +410,10 @@ def dsa_decode_forward(
 
 
 # --------------------------------------------------------------------------- #
-#  The dense path's own statements, shared by the eager and graph steps        #
+#  The dense path's own statements (``_project`` / ``_absorb`` / ``_finish``)  #
+#  live once in ``serving_modules`` and are shared by the eager and graph      #
+#  steps here and by the dense decode core.                                    #
 # --------------------------------------------------------------------------- #
-
-
-def _project(module, hidden_flat: torch.Tensor):
-    """``(q_a, q_nope [B, H, nope], q_pe [B, H, rope], offload_kv [B, 1, 576])``
-    — ``mla_decoding_nope_with_pagekv``'s projections, statement for statement
-    (NoPE: ``k_pe`` is carried unrotated)."""
-    bsz = hidden_flat.shape[0]
-    q_a = F.linear(hidden_flat, module.q_a_proj.weight)
-    q_a = module.q_a_layernorm(q_a)
-    q = F.linear(q_a, module.q_b_proj.weight)
-    new_compressed_kv = F.linear(
-        hidden_flat, module.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
-    q = q.view(bsz, 1, module.num_heads, module.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(
-        q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
-    kv, k_pe = torch.split(
-        new_compressed_kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
-    normed_kv = module.kv_a_layernorm(kv)
-    offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
-    return q_a, q_nope.squeeze(2), q_pe.squeeze(2), offload_kv
-
-
-def _absorb(module, q_nope: torch.Tensor):
-    """``(absorbed_q [B, H, kv_lora_rank], out_absorb [H, v, kv_lora_rank])``."""
-    kv_b_proj = module.kv_b_proj.weight.data.view(module.num_heads, -1, module.kv_lora_rank)
-    q_absorb = kv_b_proj[:, : module.qk_nope_head_dim, :]
-    out_absorb = kv_b_proj[:, module.qk_nope_head_dim:, :]
-    return torch.einsum("bhd,hdc->bhc", q_nope, q_absorb), out_absorb
-
-
-def _finish(module, attn_out: torch.Tensor, out_absorb: torch.Tensor,
-            hidden_flat: torch.Tensor) -> torch.Tensor:
-    """Out-absorb, sigmoid output gate, ``o_proj``, TP reduce: ``[B, hidden]``."""
-    bsz = hidden_flat.shape[0]
-    attn_output = torch.einsum("bqhc,hdc->bhqd", attn_out, out_absorb)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, module.num_heads * module.v_head_dim)
-    if module.use_output_gate:
-        gate = F.linear(hidden_flat, module.g_proj.weight).sigmoid()
-        attn_output = attn_output * gate
-    attn_output = F.linear(attn_output, module.o_proj.weight)
-    return _reduce_mla_tp_output(module, attn_output)
 
 
 # --------------------------------------------------------------------------- #

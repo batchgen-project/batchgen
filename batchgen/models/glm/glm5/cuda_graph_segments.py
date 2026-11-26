@@ -36,7 +36,6 @@ except ImportError:  # pragma: no cover - resolved by the node's FA3 install
     _fa3_with_kvcache = None
 
 from batchgen.attention.mla.fa3_backend import act_quant
-from batchgen.attention.dsa.fa3_split_policy import GLM5_SPARSE_FA3_NUM_SPLITS
 from batchgen.models.glm.glm5.qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -1439,22 +1438,23 @@ class Glm5FullDsaAttnSegment:
         Valid only for an ``all_short`` graph: every row attends to its whole
         context, so no selection is needed and the page table / slot indices
         of the real cache are used as-is (no copy, no top-k).
+
+        The FA3 call exists ONCE (``glm5_decode_selector._run_all_short_fa3``,
+        shared with the eager step); this binding passes the segment's static
+        tables and buffers.
         """
-        if _fa3_with_kvcache is None:
-            raise RuntimeError("FlashAttention-3 is unavailable")
-        attn = self.attn
-        return _fa3_with_kvcache(
-            q=buffers.q_rope_4d.squeeze(2).unsqueeze(1),
-            k_cache=self.primary_blocked_k[..., attn.kv_lora_rank :],
-            v_cache=self.primary_blocked_k[..., : attn.kv_lora_rank],
-            qv=buffers.absorbed_q.unsqueeze(1),
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            _run_all_short_fa3,
+        )
+
+        return _run_all_short_fa3(
+            self.attn,
+            buffers.q_rope_4d,
+            buffers.absorbed_q,
+            self.primary_blocked_k,
             page_table=self.primary_page_table,
             cache_batch_idx=buffers.safe_primary_slot_indices,
             cache_seqlens=buffers.safe_cache_seqlens,
-            softmax_scale=float(attn.softmax_scale),
-            causal=True,
-            num_splits=0,
-            return_softmax_lse=False,
         )
 
     def _run_selected_fa3(
@@ -1467,27 +1467,22 @@ class Glm5FullDsaAttnSegment:
         token IDs act directly as the FA3 page table: the selected KV is
         never materialized. ``cache_batch_idx`` is intentionally absent —
         the token IDs are already absolute, so there is no slot indirection.
+
+        The FA3 call exists ONCE (``glm5_decode_selector._run_selected_fa3``,
+        shared with the eager step); this binding passes the segment's static
+        cache view and selection buffers.
         """
-        if _fa3_with_kvcache is None:
-            raise RuntimeError("FlashAttention-3 is unavailable")
-        attn = self.attn
-        flat_kv = self.primary_blocked_k.view(
-            -1,
-            1,
-            1,
-            self.primary_blocked_k.shape[-1],
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            _run_selected_fa3,
         )
-        return _fa3_with_kvcache(
-            q=buffers.q_rope_4d.squeeze(2).unsqueeze(1),
-            k_cache=flat_kv[..., attn.kv_lora_rank :],
-            v_cache=flat_kv[..., : attn.kv_lora_rank],
-            qv=buffers.absorbed_q.unsqueeze(1),
-            page_table=buffers.selected_token_ids,
-            cache_seqlens=buffers.selected_lengths,
-            softmax_scale=float(attn.softmax_scale),
-            causal=True,
-            num_splits=GLM5_SPARSE_FA3_NUM_SPLITS,
-            return_softmax_lse=False,
+
+        return _run_selected_fa3(
+            self.attn,
+            buffers.q_rope_4d,
+            buffers.absorbed_q,
+            self.primary_blocked_k,
+            buffers.selected_token_ids,
+            buffers.selected_lengths,
         )
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
