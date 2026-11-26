@@ -8,6 +8,8 @@ import torch
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 
+from .layer_body import Glm5LayerBodyOps, run_glm5_layer_body
+
 
 def make_glm5_layer_graph_segment_name(layer_idx: int) -> str:
     return f"glm5_layer_{int(layer_idx)}_full_layer"
@@ -317,190 +319,85 @@ class Glm5DecoderLayerGraphSegment:
         residual: Optional[torch.Tensor] = None,
         defer_residual_add: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Run one decoder layer.
+        """Run one decoder layer by capturing the ONE shared layer body.
 
-        ``residual`` / ``defer_residual_add`` let a driver chain the layers in
-        the fused-add form. With ``defer_residual_add`` the layer does NOT
-        materialize ``residual + mlp_output``; it returns the two halves and the
-        NEXT layer's ``input_layernorm`` becomes the fused add+RMSNorm that was
-        going to run anyway, so the standalone add disappears from the graph.
-        ``residual`` is the previous layer's carried residual and is ``None``
-        only for the first layer, whose input comes straight from the
-        embedding. The driver owes the final add after the last layer.
-
-        Mixing the two conventions mid-chain would drop a residual, so
-        ``residual`` without ``defer_residual_add`` is a hard error rather than
-        a silent fallback.
+        The op sequence lives in ``run_glm5_layer_body`` (layer_body.py),
+        which the eager ``Glm5DecoderLayer.forward`` also runs; this segment
+        only binds the graph-safe operator set (the DSA and MoE segments'
+        statics and fusion decisions) and hands the body to capture. See the
+        body's docstring for the ``residual`` / ``defer_residual_add``
+        chaining contract; mixing the two conventions mid-chain is a hard
+        error there, not a silent fallback.
         """
-        from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        from batchgen_kernels.attention.add_rmsnorm_fp8_quant import (
-            cuda_add_rmsnorm_fp8_quant,
-        )
-
-        if residual is not None and not defer_residual_add:
-            raise ValueError(
-                "Glm5DecoderLayerGraphSegment.forward: residual was carried in "
-                "but defer_residual_add is False, which would materialize this "
-                "layer's add while the previous layer's add is still pending; "
-                "a driver must use one convention for the whole layer chain"
-            )
-
         batch_size = int(hidden_states.shape[0])
 
-        # Does the DSA segment below want its qkv_a activation emitted BY this
-        # input norm instead of quantized by its own launch? The segment owns
-        # that decision (it was fixed before capture); this layer only has to
-        # run the matching norm version. See norm_quant_fuse_policy.py.
-        fuse_attn_input = bool(self.dsa_segment.consumes_fused_hidden_fp8)
-        attn_input_fp8 = attn_input_scale = None
+        def attn(
+            *,
+            hidden_states: torch.Tensor,
+            hidden_fp8: Optional[torch.Tensor],
+            hidden_scale: Optional[torch.Tensor],
+        ) -> Dict[str, torch.Tensor]:
+            return self.dsa_segment.forward(
+                hidden_states=hidden_states,
+                hidden_fp8=hidden_fp8,
+                hidden_scale=hidden_scale,
+                position_ids=position_ids,
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+                row_validity_ready=row_validity_ready,
+                # Both say "the driver already recorded this step-level work":
+                # the shared paged-MQA preparation, and (for a layer that
+                # reuses another's top-k) the selected-page-table transform
+                # the first layer of this reuse run already ran.
+                paged_mqa_prep_ready=paged_mqa_prep_ready,
+                selected_positions_ready=selected_positions_ready,
+                # The body absorbs the segment's `attn_output` row mask into
+                # its post-attention add, so the segment must not spend a
+                # launch on it.
+                attn_output_mask_deferred=True,
+            )
 
-        if residual is None:
-            # First layer of the chain: its input IS the residual stream.
-            residual = hidden_states
-            attn_input = self.layer.input_layernorm(hidden_states)
-            if fuse_attn_input:
-                # There is no residual add in the chain's FIRST layer, so its
-                # input norm is the standalone `cuda_rmsnorm`
-                # (rmsnorm_bf16_6144_kernel), which has no fused FP8 version --
-                # fusing a kernel that is not the one the other 77 layers run
-                # would be a second variant for ONE launch per step. That one
-                # quantize stays standalone, which also keeps the DSA segment
-                # on a single contract: it always receives the FP8 pair.
-                from batchgen.attention.mla.fa3_backend import act_quant
-                attn_input_fp8, attn_input_scale = act_quant(
-                    attn_input.view(batch_size, self.hidden_size),
-                    num_valid_tokens=num_valid_tokens,
-                    scale_tma_aligned=num_valid_tokens is not None,
-                )
-        elif fuse_attn_input:
-            # The previous layer's deferred `residual + mlp_output`, the input
-            # norm, AND the qkv_a blocked-FP8 cast, in ONE launch: the FP8
-            # bytes come from the registers that held the normalized row, so
-            # the DSA segment's standalone quantize is not launched at all.
-            # `normed`/`residual` are bit-for-bit `cuda_add_rmsnorm`'s and the
-            # FP8 pair is bit-for-bit `act_quant`'s (byte-identity note in
-            # batchgen_kernels/src/attention/csrc/add_rmsnorm_fp8_quant.cu).
-            (
-                attn_input,
-                residual,
-                attn_input_fp8,
-                attn_input_scale,
-            ) = cuda_add_rmsnorm_fp8_quant(
-                residual,
-                hidden_states,
-                self.layer.input_layernorm.weight,
-                self.layer.input_layernorm.eps,
-                # The norm itself is NOT row-gated here, exactly as the
-                # unfused call below is not: every row is normalized, padding
-                # included. Only the FP8 half is gated, which is what the
-                # standalone `act_quant(..., num_valid_tokens=...)` did.
-                quant_num_valid_tokens=num_valid_tokens,
-                scale_tma_aligned=num_valid_tokens is not None,
-            )
-        else:
-            # The previous layer's deferred `residual + mlp_output` happens
-            # HERE, inside the input-norm launch. `hidden_states` is that
-            # layer's mlp_output.
-            attn_input, residual = cuda_add_rmsnorm(
-                residual,
-                hidden_states,
-                self.layer.input_layernorm.weight,
-                self.layer.input_layernorm.eps,
-            )
-        if self.criticality_probe is not None:
-            self.criticality_probe.mark("after_input_norm_quant", self.layer_idx)
-
-        dsa_out = self.dsa_segment.forward(
-            hidden_states=attn_input,
-            hidden_fp8=attn_input_fp8,
-            hidden_scale=attn_input_scale,
-            position_ids=position_ids,
-            cache_seqlens=cache_seqlens,
-            primary_slot_indices=primary_slot_indices,
-            aux_slot_indices=aux_slot_indices,
-            num_valid_tokens=num_valid_tokens,
-            row_validity_ready=row_validity_ready,
-            # Both say "the driver already recorded this step-level work":
-            # the shared paged-MQA preparation, and (for a layer that reuses
-            # another's top-k) the selected-page-table transform the first
-            # layer of this reuse run already ran.
-            paged_mqa_prep_ready=paged_mqa_prep_ready,
-            selected_positions_ready=selected_positions_ready,
-            # This layer absorbs the segment's `attn_output` row mask into the
-            # add below, so the segment must not spend a launch on it.
-            attn_output_mask_deferred=True,
-        )
-        if self.criticality_probe is not None:
-            self.criticality_probe.mark("after_attention", self.layer_idx)
-        # Same question for the MoE block's shared expert: does it want its x
-        # activation emitted BY this post-attention norm? A dense layer has no
-        # MoE segment and therefore no shared expert, so it never fuses.
-        fuse_moe_input = (
-            self.moe_segment is not None
-            and bool(self.moe_segment.consumes_fused_padded_fp8)
-        )
-        moe_input_fp8 = moe_input_scale = None
-        if fuse_moe_input:
-            # The residual add, the post-attention norm AND the shared
-            # expert's x blocked-FP8 cast in ONE launch. The shared expert's
-            # own quantize passed `scale_tma_aligned=True` and NO
-            # num_valid_tokens (it quantizes every row of the bucket), so this
-            # call gates neither half -- the padding rows carry exactly the
-            # values they carried before.
-            (
-                hidden_states,
-                residual,
-                moe_input_fp8,
-                moe_input_scale,
-            ) = cuda_add_rmsnorm_fp8_quant(
-                residual,
-                dsa_out["attn_output"],
-                self.layer.post_attention_layernorm.weight,
-                self.layer.post_attention_layernorm.eps,
-                row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
-                scale_tma_aligned=True,
-            )
-        else:
-            hidden_states, residual = cuda_add_rmsnorm(
-                residual,
-                dsa_out["attn_output"],
-                self.layer.post_attention_layernorm.weight,
-                self.layer.post_attention_layernorm.eps,
-                row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
-            )
-        if self.criticality_probe is not None:
-            self.criticality_probe.mark("after_post_attn_norm_quant", self.layer_idx)
-
-        if self.moe_segment is None:
-            mlp_output = self.layer.mlp(hidden_states)
-        else:
-            flat_hidden = hidden_states.view(batch_size, self.hidden_size)
+        def ffn(
+            hidden: torch.Tensor,
+            hidden_fp8: Optional[torch.Tensor],
+            hidden_scale: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            if self.moe_segment is None:
+                return self.layer.mlp(hidden)
+            flat_hidden = hidden.view(batch_size, self.hidden_size)
             moe_output = self.moe_segment.forward(
                 padded=flat_hidden,
                 rank_token_counts=rank_token_counts,
-                padded_fp8=moe_input_fp8,
-                padded_scale=moe_input_scale,
+                padded_fp8=hidden_fp8,
+                padded_scale=hidden_scale,
             )["moe_output"]
-            mlp_output = moe_output.view(batch_size, 1, self.hidden_size)
+            return moe_output.view(batch_size, 1, self.hidden_size)
 
-        if defer_residual_add:
-            # `mlp_output` may be the MoE pool's shared static buffer, which
-            # the NEXT layer's MoE block overwrites. That is safe only because
-            # the next layer's add+norm READS it to produce the input its own
-            # MoE block consumes, so the overwrite is downstream of the read by
-            # a true data dependency, not by launch-order luck.
-            out = {
-                "hidden_states": mlp_output,
-                "residual": residual,
-                "primary_k_tensor": dsa_out["primary_k_tensor"],
-            }
-        else:
-            out = {
-                "hidden_states": residual + mlp_output,
-                "primary_k_tensor": dsa_out["primary_k_tensor"],
-            }
-        if "indexer_k_tensor" in dsa_out:
-            out["indexer_k_tensor"] = dsa_out["indexer_k_tensor"]
-        if "indexer_k_scale" in dsa_out:
-            out["indexer_k_scale"] = dsa_out["indexer_k_scale"]
-        return out
+        ops = Glm5LayerBodyOps(
+            attn=attn,
+            ffn=ffn,
+            # The inner segments own the fusion decisions (fixed before
+            # capture); the body only runs the matching norm versions. A
+            # dense layer has no MoE segment and therefore no shared expert,
+            # so it never fuses its FFN input.
+            consumes_fused_hidden_fp8=bool(
+                self.dsa_segment.consumes_fused_hidden_fp8
+            ),
+            consumes_fused_padded_fp8=(
+                self.moe_segment is not None
+                and bool(self.moe_segment.consumes_fused_padded_fp8)
+            ),
+            attn_output_row_mask=self.dsa_segment.attn_output_row_mask,
+            criticality_probe=self.criticality_probe,
+        )
+        return run_glm5_layer_body(
+            layer=self.layer,
+            ops=ops,
+            hidden_states=hidden_states,
+            residual=residual,
+            defer_residual_add=defer_residual_add,
+            num_valid_tokens=num_valid_tokens,
+            layer_idx=self.layer_idx,
+        )
