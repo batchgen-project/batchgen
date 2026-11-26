@@ -117,9 +117,14 @@ from batchgen.cuda_graph.graph_manager import (
 )
 from batchgen.models.wrappers import AttnWrapperBase
 
-from .block_residual import apply_attn_res, num_block_residual_columns
+from .block_residual import num_block_residual_columns
 from .dsa_decode import dsa_decode_forward, dsa_decode_graph_safe
 from .dsa_index_rotation import KERNEL_INDEX_HEAD_DIM
+from .layer_body import (
+    KimiLayerBodyOps,
+    run_kimi_block_residual_layer_body,
+    run_kimi_layer_body,
+)
 from .serving_modules import (
     _reduce_mla_tp_output,
     kda_decode_serving,
@@ -501,6 +506,11 @@ class KimiLinearSpanSegment:
         mla_schedule=None,
         kda_cu_seqlens=None,
     ) -> Dict[str, torch.Tensor]:
+        """The captured span: the ONE shared layer body under the graph
+        operator set (graph-safe attention; ``layer.mlp`` on a fold-FFN span,
+        else the body returns the halves for the driver's MoE stitch;
+        out-of-place prefix merges; the boundary snapshot written in place
+        into the bucket-owned static buffer)."""
         attention = self._graph_attention
         if mla_schedule is not None or kda_cu_seqlens is not None:
 
@@ -509,25 +519,39 @@ class KimiLinearSpanSegment:
                     normed, mla_schedule, kda_cu_seqlens,
                 )
 
+        ffn = self.layer.mlp if self.fold_ffn else None
         if self.use_block_residual:
-            return self._forward_block_residual(
-                hidden_states,
-                attention,
-                self._buf.block_residual,
-                write_boundary=True,
-            )
+            buf = self._buf.block_residual
 
-        layer = self.layer
-        normed = layer.input_layernorm(hidden_states)
-        attn_out, kv_outputs = attention(normed)
-        residual = hidden_states + attn_out
-        normed_out = layer.post_attention_layernorm(residual)
-        if self.fold_ffn:
-            out = {"hidden": residual + layer.mlp(normed_out)}
-        else:
-            out = {"normed": normed_out, "residual": residual}
-        out.update(kv_outputs)
-        return out
+            def append_boundary(flat_prefix, active):
+                # The captured path writes the current layer's pre-mix prefix
+                # into its statically-known column of the bucket's shared
+                # buffer, then widens the active view. Compare mode binds a
+                # private torch.cat instead (``_eager_span``), so the eager
+                # reference cannot advance this state before the replay.
+                buf[:, self.num_blocks_before].copy_(flat_prefix)
+                return buf[:, : self.num_blocks_after]
+
+            out = run_kimi_block_residual_layer_body(
+                layer=self.layer,
+                ops=KimiLayerBodyOps(
+                    attn=attention,
+                    ffn=ffn,
+                    append_boundary=append_boundary,
+                ),
+                hidden_states=hidden_states,
+                block_residual=buf[:, : self.num_blocks_before],
+            )
+            # The residual bank is bucket-owned static state, not a segment
+            # output: the driver reads it through _block_residual_view.
+            out.pop("block_residual")
+            return out
+
+        return run_kimi_layer_body(
+            layer=self.layer,
+            ops=KimiLayerBodyOps(attn=attention, ffn=ffn),
+            hidden_states=hidden_states,
+        )
 
     def _graph_attention(
         self,
@@ -596,64 +620,6 @@ class KimiLinearSpanSegment:
                 mla_schedule=mla_schedule,
             )
         return attn_out, {"k_tensor": k_tensor}
-
-    def _forward_block_residual(
-        self,
-        hidden_states: torch.Tensor,
-        attention,
-        block_residual: torch.Tensor,
-        *,
-        write_boundary: bool,
-    ) -> Dict[str, torch.Tensor]:
-        """K3's exact per-layer transition with graph-stable residual state.
-
-        ``write_boundary=True`` is the captured path and writes the current
-        layer's pre-mix prefix into the bucket-owned static buffer. Compare mode
-        passes ``False`` and materializes the one new column privately, so the
-        eager reference cannot advance state before the graph replay.
-        """
-        layer = self.layer
-        hidden_size = self.hidden_size
-        flat_prefix = hidden_states.reshape(-1, hidden_size)
-        active = block_residual[:, : self.num_blocks_before]
-
-        attn_input = hidden_states
-        if self.num_blocks_before:
-            attn_input = apply_attn_res(
-                flat_prefix,
-                active,
-                layer.self_attention_res_proj,
-                layer.self_attention_res_norm,
-            ).view_as(hidden_states)
-
-        prefix_sum = hidden_states
-        if self.is_block_boundary:
-            if write_boundary:
-                block_residual[:, self.num_blocks_before].copy_(flat_prefix)
-                active = block_residual[:, : self.num_blocks_after]
-            else:
-                active = torch.cat(
-                    (active, flat_prefix.unsqueeze(1)), dim=1
-                )
-            prefix_sum = None
-
-        normed = layer.input_layernorm(attn_input)
-        attn_out, kv_outputs = attention(normed)
-        prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
-
-        ffn_input = apply_attn_res(
-            prefix_sum.reshape(-1, hidden_size),
-            active,
-            layer.mlp_res_proj,
-            layer.mlp_res_norm,
-        ).view_as(hidden_states)
-        normed_out = layer.post_attention_layernorm(ffn_input)
-        if self.fold_ffn:
-            out = {"hidden": prefix_sum + layer.mlp(normed_out)}
-        else:
-            out = {"normed": normed_out, "residual": prefix_sum}
-        out.update(kv_outputs)
-        return out
 
 
 class KimiLinearDecodeGraph:
@@ -2217,21 +2183,37 @@ class KimiLinearDecodeGraph:
             )
             return attn_out, {}
 
+        ffn = layer.mlp if segment.fold_ffn else None
         if segment.use_block_residual:
-            return segment._forward_block_residual(
-                hidden_states,
-                eager_attention,
-                segment._buf.block_residual[: self._bsz],
-                write_boundary=False,
-            )
 
-        normed = layer.input_layernorm(hidden_states)
-        attn_out, _ = eager_attention(normed)
-        residual = hidden_states + attn_out
-        normed_out = layer.post_attention_layernorm(residual)
-        if segment.fold_ffn:
-            return {"hidden": residual + layer.mlp(normed_out)}
-        return {"normed": normed_out, "residual": residual}
+            def append_boundary(flat_prefix, active):
+                # Compare mode materializes the one new column privately, so
+                # the eager reference cannot advance the bucket's static
+                # residual bank before the graph replay.
+                return torch.cat(
+                    (active, flat_prefix.unsqueeze(1)), dim=1
+                )
+
+            out = run_kimi_block_residual_layer_body(
+                layer=layer,
+                ops=KimiLayerBodyOps(
+                    attn=eager_attention,
+                    ffn=ffn,
+                    append_boundary=append_boundary,
+                ),
+                hidden_states=hidden_states,
+                block_residual=segment._buf.block_residual[
+                    : self._bsz, : segment.num_blocks_before
+                ],
+            )
+            out.pop("block_residual")
+            return out
+
+        return run_kimi_layer_body(
+            layer=layer,
+            ops=KimiLayerBodyOps(attn=eager_attention, ffn=ffn),
+            hidden_states=hidden_states,
+        )
 
     def _record_compare(self, segment, graph_out, eager_out) -> None:
         deltas = {}
