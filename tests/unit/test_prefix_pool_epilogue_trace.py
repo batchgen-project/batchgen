@@ -422,9 +422,17 @@ def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
     rule = helper.split("def tracer_from_debug")[1].split("\ndef ")[0]
     assert "parse_trace_flag(debug.get(DEBUG_FLAG))" in rule
     assert "parse_probe_token(debug.get(PROBE_FLAG))" in rule
-    # The logits handed over are the ones _select_tokens consumed, built from
-    # the vocab-parallel head when it is sharded.
-    block = source.split("logits = (\n" + " " * 24 + "self.model.lm_head.forward")[1]
+    # The logits handed over are the ones _select_tokens consumed, built by
+    # the one model pass (step 4) from the vocab-parallel head when it is
+    # sharded.
+    model_pass = source.split("    def _prefill_model_pass(")[1]
+    model_pass = model_pass.split("\n    def ")[0]
+    assert "logits = self.model.lm_head.forward(last_token_hidden).float()" in (
+        model_pass
+    )
+    pool = source.split("    def _prefill_prepacked_pool(")[1]
+    pool = pool.split("\n    def ")[0]
+    block = pool.split("logits = _engine._prefill_model_pass(")[1]
     assert block.index("self._select_tokens(") < block.index("logits=logits")
 
 
@@ -498,11 +506,15 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     assert select < emit
     assert "logits=logits," in body[emit:emit + 900]
     assert "tokens=[int(token) for token in batch_new_tokens]" in body[emit:emit + 900]
-    # The chunk is opened BEFORE the gather, so the gather-side record the
-    # gather itself writes is still the one this emit reports.
+    # The chunk is opened BEFORE the model pass (step 4: the gather lives
+    # inside the one pass), so the gather-side record the gather itself
+    # writes is still the one this emit reports.
     assert body.index("unpooled_trace.begin_chunk(batch_idx)") < body.index(
-        "last_token_hidden = gather_last_token_hidden("
+        "logits = _engine._prefill_model_pass("
     )
+    model_pass = source.split("    def _prefill_model_pass(")[1]
+    model_pass = model_pass.split("\n    def ")[0]
+    assert "last_token_hidden = gather_last_token_hidden(" in model_pass
 
 
 def test_the_pooled_helper_now_shares_the_arming_rule():

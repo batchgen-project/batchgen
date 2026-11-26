@@ -894,17 +894,21 @@ def test_streamed_sp8_gathers_only_sequence_final_rows(monkeypatch):
 
 
 def test_worker_uses_model_prefill_last_token_gather_seam():
-    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
-    source = ast.unparse(
-        _function(
-            ROOT / "batchgen" / "worker" / "prefill_engine.py",
-            "PrefillEngine",
-            "prefill_prepacked",
-        )
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine. Step 4:
+    # the gather epilogue lives in the ONE model pass both drivers call, so
+    # the seam is pinned there and the driver is pinned to drive the pass.
+    engine_path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
+    model_pass = ast.unparse(
+        _function(engine_path, "PrefillEngine", "_prefill_model_pass")
     )
+    assert "gather_prefill_last_token_hidden" in model_pass
+    assert "input_ids.numel()" in model_pass
 
-    assert "gather_prefill_last_token_hidden" in source
-    assert "batch_input_ids_flat.numel()" in source
+    driver = ast.unparse(
+        _function(engine_path, "PrefillEngine", "prefill_prepacked")
+    )
+    assert "self._prefill_model_pass(" in driver
+    assert "batch_input_ids_flat" in driver
 
 
 def _psm_layer(module, *, wrapped):
@@ -3645,7 +3649,10 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
 
 
 def test_prefill_sync_happens_before_decoder_layers():
-    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine. Step 4:
+    # the decoder-layer loop lives in the ONE model pass, so the invariant is
+    # now "the rank-count sync precedes the model-pass call in the driver" --
+    # the pass holds the layer loop and makes no collective of its own.
     engine_path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
     function = _function(engine_path, "PrefillEngine", "prefill_prepacked")
     sync_lines = [
@@ -3655,9 +3662,20 @@ def test_prefill_sync_happens_before_decoder_layers():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_sync_prefill_moe_rank_counts"
     ]
-    layer_loops = [
+    pass_lines = [
         node.lineno
         for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_prefill_model_pass"
+    ]
+    assert sync_lines and pass_lines
+    assert min(sync_lines) < min(pass_lines)
+
+    model_pass = _function(engine_path, "PrefillEngine", "_prefill_model_pass")
+    layer_loops = [
+        node.lineno
+        for node in ast.walk(model_pass)
         if isinstance(node, ast.For)
         and isinstance(node.target, ast.Tuple)
         and any(
@@ -3665,8 +3683,13 @@ def test_prefill_sync_happens_before_decoder_layers():
             for item in node.target.elts
         )
     ]
-    assert sync_lines and layer_loops
-    assert min(sync_lines) < min(layer_loops)
+    assert layer_loops
+    assert not [
+        node for node in ast.walk(model_pass)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_sync_prefill_moe_rank_counts"
+    ], "no collective may live in the shared model pass"
 
 
 def test_prefill_schedule_checks_microbatch_count_before_sync_loop():
