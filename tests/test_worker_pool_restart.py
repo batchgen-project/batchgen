@@ -26,6 +26,8 @@ from batchgen import eventlog
 from batchgen.eventlog import flight_recorder
 from batchgen.worker.code_identity import CodeIdentity
 from batchgen.worker.server_config import ServerConfig
+from tests.test_rank_sync_engine_source import engine_method, load_rank_sync
+
 from tests.worker_method_source import (
     RANK_SYNC_SOURCE,
     delegated_method_names,
@@ -2237,10 +2239,12 @@ def _load_worker_shutdown_seam():
     wanted = {
         "set_cohort_shutdown_probe",
         "_cohort_shutdown_requested",
+        "_cohort_shutdown_probe",
         "cohort_shutdown_observed",
     }
     members = [
-        _worker_method(node.name) for node in _worker_class().body
+        node if node.name == "_cohort_shutdown_probe" else _worker_method(node.name)
+        for node in _worker_class().body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     assert {node.name for node in members} == wanted, (
@@ -2258,7 +2262,7 @@ def _load_worker_shutdown_seam():
     module = ast.fix_missing_locations(
         ast.Module(body=[cls], type_ignores=[])
     )
-    namespace: Dict[str, Any] = {"property": property}
+    namespace: Dict[str, Any] = load_rank_sync({"property": property})
     exec(compile(module, str(BATCHGEN_WORKER_PATH), "exec"), namespace)
     seam = namespace["_Seam"]
 
@@ -2413,7 +2417,7 @@ def test_the_decode_exit_never_strands_in_flight_local_work():
             "pending_async_task"
         ]
 
-    helper = _worker_method("_quiesce_decode_for_cohort_shutdown")
+    helper = engine_method("_quiesce_decode_for_cohort_shutdown")
 
     # Local waits only.  No collective may appear here at all.
     assert not [
@@ -2426,7 +2430,7 @@ def test_the_decode_exit_never_strands_in_flight_local_work():
     drains = [
         node for node in ast.walk(helper)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "self._wait_pending_kv_append_tasks"
+        and ast.unparse(node.func) == "wait_pending_kv_append_tasks"
     ]
     assert len(drains) == 1
     assert [(kw.arg, ast.unparse(kw.value)) for kw in drains[0].keywords] == [
@@ -3050,6 +3054,7 @@ def test_the_self_exit_window_is_bounded_and_needs_no_env_var():
 # ==========================================================================
 
 _WORKER_DECODE_WAIT_MEMBERS = (
+    "_cohort_shutdown_probe",
     "set_cohort_shutdown_probe",
     "_cohort_shutdown_requested",
     "_wait_decode_tokens",
@@ -3132,7 +3137,8 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
         + _lift(ast.parse(RANK_SYNC_SOURCE.read_text()), _RANK_SYNC_DECODE_WAIT_CONSTANTS)
     )
     members = [
-        _worker_method(node.name) for node in _worker_class().body
+        node if node.name == "_cohort_shutdown_probe" else _worker_method(node.name)
+        for node in _worker_class().body
         if isinstance(node, ast.FunctionDef)
         and node.name in _WORKER_DECODE_WAIT_MEMBERS
     ]
@@ -3173,6 +3179,7 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
         "os": _GuardOs,
         "property": property,
     }
+    load_rank_sync(namespace)
     exec(compile(module, str(BATCHGEN_WORKER_PATH), "exec"), namespace)
     # After the exec, so an override of a module constant is not overwritten by
     # the real value the exec just assigned.
@@ -3186,6 +3193,7 @@ def _decode_wait_worker(namespace: Dict[str, Any], **attrs):
     worker._cohort_shutdown_observed = False
     worker._decode_watchdog = None
     worker._pending_kv_append_tasks = []
+    worker._wait_pending_kv_append_tasks = lambda **kwargs: None
     worker.rank = 3
     worker.torch_device = "cuda:3"
     for name, value in attrs.items():
@@ -3600,7 +3608,7 @@ def test_every_decode_teardown_exit_takes_the_same_ordered_route():
 # ---- W3: the quiesce is bounded, and a missed bound does not unwind ------
 
 _QUIESCE_BLOCKING_CALLS = (
-    "self._wait_pending_kv_append_tasks",
+    "wait_pending_kv_append_tasks",
     "pending_async_task.wait",
     "torch.cuda.synchronize",
 )
@@ -3631,13 +3639,13 @@ def test_the_quiesce_holds_no_thread_and_blocks_only_after_its_probes():
     # service thread does), so a module-wide import check says nothing about
     # this path.
     for name in _WORKER_QUIESCE_MEMBERS:
-        source = ast.unparse(_worker_method(name))
+        source = ast.unparse(engine_method(name))
         assert "threading" not in source, (
             f"{name}: the decode teardown path must need no thread at all"
         )
         assert "Thread" not in source, name
 
-    helper = _worker_method("_quiesce_decode_for_cohort_shutdown")
+    helper = engine_method("_quiesce_decode_for_cohort_shutdown")
     assert "torch.cuda.synchronize" not in ast.unparse(helper), (
         "the load drain's unbounded device sync is what the event probe "
         "replaces; it must not survive on this path"
@@ -3920,7 +3928,7 @@ def test_the_quiesce_deadline_marker_extends_the_supervisor_s_marker():
     loop_source = WORKER_LOOP_PATH.read_text()
     assert '"[shutdown] worker exit path=%s rank=%s pid=%s"' in loop_source
 
-    fn = _worker_method("_self_exit_on_quiesce_deadline")
+    fn = engine_method("_self_exit_on_quiesce_deadline")
     formats = [
         node.args[0].value for node in ast.walk(fn)
         if isinstance(node, ast.Call)
@@ -3940,7 +3948,7 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
     """No second exit status and no second path name: both come from the
     supervisor's module, so the manager's reaping argument (it branches on no
     exitcode value) and the marker vocabulary stay as grounded in attempt 3."""
-    fn = _worker_method("_self_exit_on_quiesce_deadline")
+    fn = engine_method("_self_exit_on_quiesce_deadline")
     imports = {
         node.module: {alias.name for alias in node.names}
         for node in ast.walk(fn) if isinstance(node, ast.ImportFrom)
@@ -3956,18 +3964,22 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
         },
     }
     (exit_call,) = [
-        node for node in ast.walk(fn)
+        node for node in ast.walk(_worker_method("_self_exit_on_quiesce_deadline"))
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "os._exit"
     ]
-    assert ast.unparse(exit_call.args[0]) == "WORKER_SELF_EXIT_CODE"
+    assert ast.unparse(exit_call.args[0]) == "outcome.exit_code"
+    assert ast.unparse(fn.body[-1]) == "return SelfExitOutcome(exit_code=WORKER_SELF_EXIT_CODE)"
     # Log, then flush, then exit -- os._exit runs no handler and no flush.
     order = [
         ast.unparse(node.value.func) for node in fn.body
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
     assert order == [
-        "logging.error", "flush_logs_before_exit", "record_exit", "os._exit",
+        "logging.error", "flush_logs_before_exit", "record_exit",
     ]
+    delegator = _worker_method("_self_exit_on_quiesce_deadline")
+    assert ast.unparse(delegator.body[0].value.func) == "self._rank_sync_engine._self_exit_on_quiesce_deadline"
+    assert ast.unparse(delegator.body[1].value.func) == "os._exit"
 
 
 def test_the_quiesce_probe_runner_cannot_raise_into_the_teardown():

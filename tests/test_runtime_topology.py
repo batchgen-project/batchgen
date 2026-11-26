@@ -481,21 +481,20 @@ def test_pynccl_search_never_leaves_assigned_range():
         calls.append((host, start_port, max_attempts))
         return start_port
 
-    worker_type = _worker_method(
-        "_find_available_pynccl_port",
-        {"_find_available_port": _find_available_port},
-    )
-    worker = worker_type()
-    worker.pynccl_port_base = 21000
-    worker.pynccl_port_span = 4
+    from tests.test_rank_sync_engine_source import load_rank_sync
 
-    assert worker._find_available_pynccl_port("127.0.0.1", 20900) == 21000
+    namespace = load_rank_sync({})
+    namespace["_find_available_port"] = _find_available_port
+    engine = namespace["RankSyncEngine"]()
+    context = namespace["PortRangeContext"](21000, 4)
+
+    assert engine._find_available_pynccl_port(context, host="127.0.0.1", start_port=20900) == 21000
     assert calls[-1] == ("127.0.0.1", 21000, 4)
-    assert worker._find_available_pynccl_port("127.0.0.1", 21003) == 21003
+    assert engine._find_available_pynccl_port(context, host="127.0.0.1", start_port=21003) == 21003
     assert calls[-1] == ("127.0.0.1", 21003, 1)
 
     with pytest.raises(RuntimeError, match="range exhausted"):
-        worker._find_available_pynccl_port("127.0.0.1", 21004)
+        engine._find_available_pynccl_port(context, host="127.0.0.1", start_port=21004)
 
 
 def test_worker_rank_math_uses_configured_local_world_size():

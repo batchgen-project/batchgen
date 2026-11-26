@@ -990,7 +990,7 @@ def test_pynccl_helper_keeps_the_collective_creation_contract():
     assert "PyNcclCommunicator(" in source
     # Single GPU and the all-to-all build both opt out, as before.
     assert "BATCHGEN_ENABLE_ALL_TO_ALL" in source
-    assert "self.world_size == 1" in source
+    assert "context.world_size == 1" in source
 
 
 def test_startup_uses_the_same_helper_as_generate():
