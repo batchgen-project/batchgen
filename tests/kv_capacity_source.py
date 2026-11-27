@@ -1,4 +1,4 @@
-"""Load the D6.1-D6.4 definitions without importing the native/CUDA graph."""
+"""Load the D6.1-D6.5 definitions without importing the native/CUDA graph."""
 
 import ast
 import copy
@@ -20,7 +20,15 @@ from batchgen.query_book import (
     refresh_query_book_entry,
     release_query_book_slot,
 )
+import batchgen.sequence as _sequence_module
 from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.worker.admission.plan import (
+    StatusEdge,
+    Transition,
+    TransitionPlan,
+    apply_or_raise,
+    update_batch_status,
+)
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.kv_manager import (
@@ -33,9 +41,17 @@ from batchgen.worker.kv_manager import (
     WatermarkTriggerRequest,
 )
 from batchgen.worker.kv_plan import (
+    NodeCapacityReport,
     credit_reclaimable_pages,
     host_capacity_due,
+    prefill_owner_demand_pages,
     provisional_pool_gb,
+    verdict_node_capacity,
+)
+from batchgen.worker.prefill import (
+    compute_prefill_host_reservation,
+    host_owned_pages_after_sharing,
+    prefill_host_reserve_page_deficit,
 )
 from batchgen.worker.rank_context import node_of_rank
 
@@ -52,6 +68,8 @@ CONTEXT_CLASSES = {
     # D6.4
     "DeferredKVFlushContext", "DeferredKVFlushOutcome",
     "AuxLayerSlotsContext", "AuxLayerSlotsOutcome",
+    # D6.5 (GPUKVDestroyContext loads through the GPUKV prefix rule below)
+    "NodeMemfdIdentityContext",
 }
 # D6.4: the deferred flush normalizes each queued aux entry through this
 # module-scope helper, so the loaded body gets the real one.
@@ -82,6 +100,11 @@ METHODS = {
     "_aux_layers_with_slots", "_append_decode_kv_to_host_aux_async",
     "_load_host_kv_to_gpu", "_integrate_pending_async_load",
     "_allocate_gpu_kv_two_page_buffer",
+    # D6.5: the last worker-shaped operations of this engine.
+    "_exchange_node_memfd_identity", "_collective_prefill_host_capacity_ok",
+    "_retry_prefill_host_capacity_after_reclaim",
+    "_destroy_gpu_paged_kv_cache", "_prefill_host_reservation_plan",
+    "_put_sequences_on_hold", "_try_load_new_sequences",
 }
 # The D6.3 names, so a test can assert the guard covers exactly this stage.
 D6_3_METHODS = {
@@ -101,6 +124,14 @@ D6_4_METHODS = {
     "_aux_layers_with_slots", "_append_decode_kv_to_host_aux_async",
     "_load_host_kv_to_gpu", "_integrate_pending_async_load",
     "_allocate_gpu_kv_two_page_buffer",
+}
+# The D6.5 names: the LAST worker-shaped operations of this engine, so after
+# this stage ``METHODS`` is every delegated operation the file defines.
+D6_5_METHODS = {
+    "_exchange_node_memfd_identity", "_collective_prefill_host_capacity_ok",
+    "_retry_prefill_host_capacity_after_reclaim",
+    "_destroy_gpu_paged_kv_cache", "_prefill_host_reservation_plan",
+    "_put_sequences_on_hold", "_try_load_new_sequences",
 }
 
 
@@ -158,6 +189,21 @@ def load_kv_capacity(namespace=None):
         BATCHGEN_ENABLE_CRITICAL_DIAGS=False,
         IndexManager=IndexManager,
         IndexLookupRequest=IndexLookupRequest,
+        # D6.5 module-scope collaborators of the identity exchange, the
+        # prefill-admission transaction, the pool destroy, the watermark hold
+        # and the legacy host-to-GPU load.
+        prefill_owner_demand_pages=prefill_owner_demand_pages,
+        verdict_node_capacity=verdict_node_capacity,
+        NodeCapacityReport=NodeCapacityReport,
+        prefill_host_reserve_page_deficit=prefill_host_reserve_page_deficit,
+        compute_prefill_host_reservation=compute_prefill_host_reservation,
+        host_owned_pages_after_sharing=host_owned_pages_after_sharing,
+        _sequence_module=_sequence_module,
+        apply_or_raise=apply_or_raise,
+        update_batch_status=update_batch_status,
+        TransitionPlan=TransitionPlan,
+        Transition=Transition,
+        StatusEdge=StatusEdge,
     ).items():
         namespace.setdefault(name, value)
     nodes = []

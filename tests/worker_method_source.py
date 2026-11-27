@@ -197,6 +197,13 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx._aux_layers_with_slots_cache": (
             "getattr(self, '_aux_layers_with_slots_cache', False)"
         ),
+        # D6.5 NodeMemfdIdentityContext and GPUKVDestroyContext: narrow value
+        # contexts whose fields are named after the worker attributes they
+        # snapshot (the pool handle shares its name with the D6.1 contexts'
+        # field, and resolves to the same worker attribute). The residency set
+        # already maps above, under the decode phase context's own field name.
+        "ctx.torch_device": "self.torch_device",
+        "ctx.gpu_paged_kv_cache_manager": "self.gpu_paged_kv_cache_manager",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -291,6 +298,15 @@ class _ContextToWorker(ast.NodeTransformer):
                 "_finalize_async_load_minimal": (
                     "self._finalize_async_load_minimal"
                 ),
+                # D6.5 keyword-only collaborators: each is the worker's own
+                # method of that name, which is what the pre-move body called.
+                "_prefill_pool_segment_host_pages": (
+                    "self._prefill_pool_segment_host_pages"
+                ),
+                "_owns_host_kv": "self._owns_host_kv",
+                "_assign_decode_dp_groups": "self._assign_decode_dp_groups",
+                "_prepare_decode_batch": "self._prepare_decode_batch",
+                "_update_batch_status": "self._update_batch_status",
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -369,16 +385,103 @@ class _ContextToWorker(ast.NodeTransformer):
             node.args.pop(0)
             # A sibling called with the same context is also handed the
             # collaborators it was given; the worker's same-name delegator
-            # resolves those itself, so they are not part of its call.
+            # resolves those itself, so they are not part of its call. The
+            # same holds for a VALUE the sibling's delegator resolves (D6.5:
+            # the capacity vote's per-sequence KDA record pages), which the
+            # pre-move body likewise never passed.
+            resolved = set(DELEGATOR_EXTRA_VALUE_ARGS.get(node.func.attr, ()))
             node.keywords = [
                 kw for kw in node.keywords
                 if not (
                     kw.arg
-                    and kw.arg.startswith("_")
-                    and ast.unparse(kw.value) == f"self.{kw.arg}"
+                    and (
+                        (
+                            kw.arg.startswith("_")
+                            and ast.unparse(kw.value) == f"self.{kw.arg}"
+                        )
+                        or kw.arg in resolved
+                    )
                 )
             ]
         return node
+
+
+# D6.5: an engine method may take a VALUE parameter its worker delegator
+# resolves and therefore does not declare. The pre-move body read that value
+# as a parameter of its own, so the worker-shaped view keeps the parameter
+# (with its default) after adopting the delegator's arguments, and a sibling
+# call that forwards it drops the keyword the delegator would have supplied.
+DELEGATOR_EXTRA_VALUE_ARGS = {
+    "_collective_prefill_host_capacity_ok": ("kda_record_pages_per_sequence",),
+}
+
+
+def _extra_value_args(args: ast.arguments, names) -> list:
+    """``(arg, default)`` for each named positional parameter of a signature.
+
+    Defaults bind to the LAST ``len(defaults)`` positional parameters, so the
+    pairing runs from the tail. A named parameter without a default would
+    change the worker-shaped signature's call contract, so it is refused.
+    """
+    wanted = set(names)
+    offset = len(args.args) - len(args.defaults)
+    paired = []
+    for index, arg in enumerate(args.args):
+        if arg.arg not in wanted:
+            continue
+        if index < offset:
+            raise AssertionError(
+                f"{arg.arg} is a delegator-resolved value without a default"
+            )
+        paired.append(
+            (copy.deepcopy(arg), copy.deepcopy(args.defaults[index - offset]))
+        )
+    return paired
+
+
+# D6.5: the last two converted bodies read a worker attribute through a
+# pre-move PRESENCE guard -- the hold's ``hasattr(...) and ...`` pool test and
+# the capacity vote's ``getattr(..., None)`` core-engine fallback. A frozen
+# context always carries the field, so the engine spells both as a plain read;
+# the worker-shaped view puts the original guard back. ``limit`` is how many
+# leading occurrences carried the guard: the hold's later
+# ``mgr = self.gpu_paged_kv_cache_manager`` read did not, so only the first
+# one is restored. ``None`` restores every occurrence.
+GUARDED_CONTEXT_READS = {
+    "_put_sequences_on_hold": (
+        (
+            "ctx.gpu_kv",
+            "hasattr(self, 'gpu_paged_kv_cache_manager') "
+            "and self.gpu_paged_kv_cache_manager",
+            1,
+        ),
+    ),
+    "_collective_prefill_host_capacity_ok": (
+        ("ctx.core_engine", "getattr(self, 'core_engine', None)", None),
+    ),
+}
+
+
+class _GuardedContextReadToWorker(ast.NodeTransformer):
+    """Restore the pre-move presence guard around a context read.
+
+    Runs BEFORE :class:`_ContextToWorker`, so the context path is still
+    spelled as the engine wrote it. Traversal is depth-first in field order,
+    which is source order, so a ``limit`` counts the leading occurrences.
+    """
+
+    def __init__(self, guards) -> None:
+        self._guards = {
+            path: [restored, limit] for path, restored, limit in guards
+        }
+
+    def visit_Attribute(self, node):
+        guard = self._guards.get(ast.unparse(node))
+        if guard is not None and (guard[1] is None or guard[1] > 0):
+            if guard[1] is not None:
+                guard[1] -= 1
+            return ast.parse(guard[0], mode="eval").body
+        return self.generic_visit(node)
 
 
 # D6.3: a converted method returns its worker writes in a frozen outcome the
@@ -830,6 +933,9 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         del args[1]
         if node.name == "_make_boundary_decision_request":
             del args[-1]
+        guards = GUARDED_CONTEXT_READS.get(node.name)
+        if guards is not None:
+            method = _GuardedContextReadToWorker(guards).visit(method)
         method.body = _ContextToWorker().visit(method).body
         outcome = OUTCOME_METHODS.get(node.name)
         if outcome is not None:
@@ -847,7 +953,16 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
             method = _restore_migration_receive_writes(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
         if worker_method is not None:
+            extras = _extra_value_args(
+                method.args, DELEGATOR_EXTRA_VALUE_ARGS.get(node.name, ())
+            )
             method.args = copy.deepcopy(worker_method.args)
+            # A value parameter the delegator resolves is not in its
+            # signature, but the pre-move body read it as its own parameter,
+            # so it goes back on the end with its default.
+            for arg, default in extras:
+                method.args.args.append(arg)
+                method.args.defaults.append(default)
             # The delegator is the signature of record, its return annotation
             # included: an engine method that hands its worker writes back in
             # an outcome is annotated with that outcome, which the worker

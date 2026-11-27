@@ -34,9 +34,21 @@ rank facts nor phase state and so declares its own value context; the worker's
 pending append-task and append-tensor lists arrive BY REFERENCE as explicit
 value arguments, the way they already reach ``_wait_pending_kv_append_tasks``,
 because the per-step drain waits on and clears the same objects the launch
-appended to. The
-remaining operations retain the older worker
-delegator shape until their own conversion slice. The worker keeps a same-name
+appended to.
+
+D6.5 converted the last seven operations, so NO operation in this file
+receives the worker any more. The prefill-admission transaction's three
+(the host-capacity vote, its reserve-time retry and the reservation plan)
+take the decode phase context their already-converted siblings take, which
+is what lets the retry call the reclaim helper and the vote directly instead
+of routing back through the worker; the vote's per-sequence KDA record pages
+stay the value parameter the delegator resolves. The node memfd identity
+exchange and the GPU pool destroy declare their own narrow value contexts:
+the first runs inside core initialization, before ``rank_ctx`` exists, and
+the second runs in the phase-transition lifecycle, where the live pool handle
+has to be read at the call rather than taken from a held phase snapshot. The
+watermark hold and the legacy host-to-GPU load take the decode phase context,
+like the decode operations around them. The worker keeps a same-name
 delegator for every moved method.
 """
 
@@ -433,6 +445,41 @@ class AuxLayerSlotsOutcome:
     # deliberately does NOT cache, because the layer map appears only once the
     # pool exists. Both leave the field at the sentinel.
     _aux_layers_with_slots_cache: object = GPU_KV_UNCHANGED
+
+
+# D6.5: two of the last operations cannot take the decode phase context, so
+# each declares the narrow value context its own body reads.
+@dataclass(frozen=True)
+class NodeMemfdIdentityContext:
+    """The identity exchange's four rank facts.
+
+    Deliberately NOT the decode phase context: this collective runs inside
+    core initialization, where ``rank_ctx`` and the scheduling state the phase
+    context carries do not exist yet. The node arithmetic therefore comes from
+    ``local_world_size`` here, exactly as the pre-move body computed it.
+    """
+
+    rank: int
+    world_size: int
+    local_world_size: int
+    torch_device: object
+
+
+@dataclass(frozen=True)
+class GPUKVDestroyContext:
+    """The pool destroy's reads, snapshotted at the call.
+
+    Deliberately NOT the decode phase context: the destroy runs in the
+    phase-transition lifecycle, around the pool bind that reassigns the
+    handle, so a held decode-phase snapshot could hand it the previous
+    phase's manager. ``pool`` is ``None`` when no batch has been built yet,
+    which is the pre-move read's own "nothing to reset" case.
+    """
+
+    rank: int
+    gpu_paged_kv_cache_manager: object
+    pool: object
+    gpu_resident: object
 
 
 class KVCapacityEngine:
@@ -1117,7 +1164,9 @@ class KVCapacityEngine:
 
     # ---- Node memfd identity -----------------------------------------------
 
-    def _exchange_node_memfd_identity(self, worker, pid: int, fd: int) -> Tuple[int, int]:
+    def _exchange_node_memfd_identity(
+        self, ctx: NodeMemfdIdentityContext, pid: int, fd: int
+    ) -> Tuple[int, int]:
         """Publish this rank's ``input_ids`` memfd identity, take its node's.
 
         COLLECTIVE, one per pool generation, issued identically by every rank on
@@ -1126,21 +1175,23 @@ class KVCapacityEngine:
         has entered, so the creator's memfd is guaranteed to exist — and to be
         sized — by the time an attacher reads its pid and fd. Non-creators
         contribute ``fd=-1``, which is never selected.
+
+        The all_gather did not move: it is the same single collective, in the
+        same statement position, inside the same ``inference_mode(False)``
+        block. Its four inputs arrive as a frozen value context because this
+        runs before the decode phase context's state exists at all.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         # Pool allocation can run inside InferenceMode (see the buffer creation
         # in allocate_node_shared_int64); the collective writes into `gathered`.
         with torch.inference_mode(False):
             identity = torch.tensor(
-                [pid, fd], dtype=torch.int64, device=self.torch_device
+                [pid, fd], dtype=torch.int64, device=ctx.torch_device
             )
-            gathered = [torch.zeros_like(identity) for _ in range(self.world_size)]
+            gathered = [torch.zeros_like(identity) for _ in range(ctx.world_size)]
             dist.all_gather(gathered, identity)
             # Pre-`rank_ctx`: this collective runs inside core initialization.
             creator_rank = (
-                node_of_rank(self.rank, self.local_world_size) * self.local_world_size
+                node_of_rank(ctx.rank, ctx.local_world_size) * ctx.local_world_size
             )
             creator = gathered[creator_rank]
             return int(creator[0].item()), int(creator[1].item())
@@ -1679,10 +1730,12 @@ class KVCapacityEngine:
         return bool(int(flag.item()))
 
     def _collective_prefill_host_capacity_ok(
-        self, worker,
+        self, ctx,
         owner_requests: List[Tuple[str, int]],
         local_error: bool = False,
         kda_record_pages_per_sequence: int = 0,
+        *,
+        _prefill_pool_segment_host_pages: Callable[[], int],
     ) -> Tuple[bool, Optional[Dict[int, Tuple[int, int]]]]:
         """Check a fresh per-node host-KV snapshot before any mutation.
 
@@ -1699,10 +1752,14 @@ class KVCapacityEngine:
         ranks of one node disagreed): a deficit derived from it would be
         meaningless, so the caller must not retry on it. Both verdicts are
         reduced, hence rank-uniform -- the retry branch is collective.
+
+        Every collective stayed where it was: the all_gather of the per-rank
+        reports and the MIN all_reduce of the decision sit in the same
+        statement positions, under the same branches, as before the move. The
+        pooled-segment page count arrives as an injected collaborator because
+        it is a PrefillEngine computation, not a state read, and the KDA
+        record pages stay the value parameter the delegator resolves.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10b); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         # Members' demands exclude their shared chains, but the pooled
         # segments themselves allocate one Host copy (mirrored per group, so
         # one count). Leaving them out over-admits the wave and the
@@ -1712,9 +1769,9 @@ class KVCapacityEngine:
         # would multiply the node demand by G and falsely reject the wave.
         local_need = prefill_owner_demand_pages(
             [int(tokens) for _, tokens in owner_requests],
-            page_size=self.PAGE_SIZE,
+            page_size=ctx.facts.page_size,
             pool_segment_pages=(
-                self._prefill_pool_segment_host_pages() if owner_requests else 0
+                _prefill_pool_segment_host_pages() if owner_requests else 0
             ),
             # 方案甲: each owned sequence also reserves its KDA record pages
             # in the same transaction, so the preflight must see them or the
@@ -1723,18 +1780,18 @@ class KVCapacityEngine:
             # no new worker state.
             kda_record_pages_per_sequence=kda_record_pages_per_sequence,
         )
-        node_id = self.rank_ctx.node_id
+        node_id = ctx.facts.rank_ctx.node_id
         local_free = -1
         local_total = -1
         snapshot_error = 1 if local_error else 0
-        host_view = getattr(self, "host_paged_kv_worker_view", None)
+        host_view = ctx.host_view
         if host_view is None:
             host_view = getattr(
-                getattr(self, "core_engine", None),
+                ctx.core_engine,
                 "host_paged_kv_worker_view",
                 None,
             )
-        if self.local_rank == 0:
+        if ctx.facts.local_rank == 0:
             try:
                 stats = host_view.get_stats()
                 local_free = int(stats.num_free_pages)
@@ -1742,15 +1799,15 @@ class KVCapacityEngine:
             except Exception:
                 snapshot_error = 1
                 logging.exception(
-                    "Rank %s: host-KV prefill capacity snapshot failed", self.rank
+                    "Rank %s: host-KV prefill capacity snapshot failed", ctx.facts.rank
                 )
 
         report = torch.tensor(
             [node_id, local_need, local_free, local_total, snapshot_error],
             dtype=torch.int64,
-            device=self.torch_device,
+            device=ctx.facts.device,
         )
-        if self.world_size == 1:
+        if ctx.facts.world_size == 1:
             if snapshot_error:
                 return False, None
             ok = 0 <= local_need <= local_free and local_need <= local_total
@@ -1759,7 +1816,7 @@ class KVCapacityEngine:
             raise RuntimeError(
                 "distributed process group is required for host-KV prefill admission"
             )
-        gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
+        gathered = [torch.zeros_like(report) for _ in range(ctx.facts.world_size)]
         dist.all_gather(gathered, report)
 
         verdict = verdict_node_capacity(
@@ -1778,7 +1835,7 @@ class KVCapacityEngine:
 
         decision = torch.tensor(
             [1 if verdict.ok else 0, 1 if verdict.rows_usable else 0],
-            dtype=torch.int32, device=self.torch_device,
+            dtype=torch.int32, device=ctx.facts.device,
         )
         dist.all_reduce(decision, op=dist.ReduceOp.MIN)
         if not int(decision[1].item()):
@@ -1899,9 +1956,12 @@ class KVCapacityEngine:
         return reclaimed_page_count
 
     def _retry_prefill_host_capacity_after_reclaim(
-        self, worker,
+        self, ctx,
         owner_requests: List[Tuple[str, int]],
         capacity_rows: Dict[int, Tuple[int, int]],
+        kda_record_pages_per_sequence: int = 0,
+        *,
+        _prefill_pool_segment_host_pages: Callable[[], int],
     ) -> bool:
         """Reclaim this node's host-page deficit once, then re-check capacity.
 
@@ -1919,16 +1979,25 @@ class KVCapacityEngine:
         Collective discipline is ``_reclaim_host_prefix_pages_collective``'s:
         every rank reaches every collective, and the deficit is computed on the
         leader inside its MAX-reduced failure flag.
+
+        Both halves are sibling engine operations now, called with THIS
+        context instead of through the worker, so the reclaim and the second
+        capacity collective run in the same two statement positions as before.
+        The two values the vote's own delegator used to resolve travel with
+        the call, so the re-check charges the same KDA record pages and the
+        same pooled-segment pages the first vote charged.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10b); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        node_id = node_of_rank(self.rank, self.local_world_size)
+        node_id = node_of_rank(ctx.facts.rank, ctx.facts.local_world_size)
         self._reclaim_host_prefix_pages_collective(
+            ctx,
             lambda: prefill_host_reserve_page_deficit(capacity_rows, node_id),
             reason="host_reserve",
         )
-        capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
+        capacity_ok, _ = self._collective_prefill_host_capacity_ok(
+            ctx, owner_requests,
+            kda_record_pages_per_sequence=kda_record_pages_per_sequence,
+            _prefill_pool_segment_host_pages=_prefill_pool_segment_host_pages,
+        )
         return capacity_ok
 
     def _reclaim_host_prefix_pages_for_growth(
@@ -3282,24 +3351,26 @@ class KVCapacityEngine:
     # ---- Repatriated S10a (capacity and layout, layer ruling 2026-11-14) ---
 
     def _destroy_gpu_paged_kv_cache(
-        self, worker, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
+        self, ctx: GPUKVDestroyContext, *,
+        empty_cuda_cache: bool = False, keep_buffers: bool = False,
     ) -> None:
         """Destroy the GPU paged KV cache manager if it is present.
 
         With ``keep_buffers`` the manager only drops every sequence; its KV
         pools and CUDA-graph page-table storage stay at their addresses.
+
+        No worker attribute is written here: the residency set and the
+        sequences are objects the worker owns and this body mutates in place,
+        exactly as before, so there is nothing for an outcome to carry.
         """
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if manager is None:
             return
 
         # DIAGNOSTIC: Log state before destruction for KV corruption investigation
-        if self.global_batch is not None:
+        if ctx.pool is not None:
             seqs_with_gpu_alloc = []
-            for seq in self.global_batch:
+            for seq in ctx.pool:
                 if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
                     seqs_with_gpu_alloc.append({
                         'uuid': seq.uuid[:8],
@@ -3312,7 +3383,7 @@ class KVCapacityEngine:
                     })
             if seqs_with_gpu_alloc and BATCHGEN_CB_DEBUG:
                 logging.debug(
-                    f"Rank {self.rank}: _destroy_gpu_paged_kv_cache called with "
+                    f"Rank {ctx.rank}: _destroy_gpu_paged_kv_cache called with "
                     f"{len(seqs_with_gpu_alloc)} sequences having GPU allocation state. "
                     f"First 5: {seqs_with_gpu_alloc[:5]}"
                 )
@@ -3321,21 +3392,21 @@ class KVCapacityEngine:
             manager.reset_allocations()
         else:
             manager.destroy(empty_cuda_cache=empty_cuda_cache)
-    
+
         # FIX Bug 2: Clear tracking set when GPU KV is destroyed
-        self._sequences_with_gpu_kv.drop_all()
-    
+        ctx.gpu_resident.drop_all()
+
         # CRITICAL FIX: Reset GPU allocation state for ALL non-completed sequences
         # Without this, sequences retain stale had_initial_gpu_reservation=True,
         # causing them to get insufficient GPU buffer on resume after prefill interruption
-        if self.global_batch is not None:
+        if ctx.pool is not None:
             reset_count = 0
-            for seq in self.global_batch:
+            for seq in ctx.pool:
                 if seq.status != SequenceStatus.COMPLETED:
                     if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
                         if BATCHGEN_CB_DEBUG:
                             logging.debug(
-                                f"Rank {self.rank}: Resetting GPU state for {seq.uuid[:8]} "
+                                f"Rank {ctx.rank}: Resetting GPU state for {seq.uuid[:8]} "
                                 f"(status={seq.status.name}, gpu_pages={seq.gpu_pages_allocated}, "
                                 f"had_initial={seq.had_initial_gpu_reservation})"
                             )
@@ -3343,7 +3414,7 @@ class KVCapacityEngine:
                         reset_count += 1
             if reset_count > 0:
                 logging.info(
-                    f"Rank {self.rank}: Reset GPU allocation state for {reset_count} sequences"
+                    f"Rank {ctx.rank}: Reset GPU allocation state for {reset_count} sequences"
                 )
 
     def _legacy_get_host_kv_utilization(self, ctx) -> Dict[str, int]:
@@ -3607,7 +3678,8 @@ class KVCapacityEngine:
         )
 
     def _prefill_host_reservation_plan(
-        self, worker, prefill_uuids: List[str]
+        self, ctx, prefill_uuids: List[str], *,
+        _owns_host_kv: Callable[[object], bool],
     ) -> Tuple[Dict[str, Tuple[int, int]], List[Tuple[str, int]]]:
         """Build the immutable host reservation plan for a prefill wave.
 
@@ -3615,18 +3687,19 @@ class KVCapacityEngine:
         owner list contains one entry per physical host-KV allocation: the host
         pool is node-shared, so TP replicas must not allocate the same sequence
         more than once.
+
+        The host-KV ownership predicate arrives as an injected collaborator:
+        it is the rank-context rule the worker publishes, and the same
+        predicate decides host ownership everywhere else in admission.
         """
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        chunk_size = self._get_effective_chunk_size()
+        chunk_size = self._get_effective_chunk_size(ctx)
         reservations: Dict[str, Tuple[int, int]] = {}
         owner_requests: List[Tuple[str, int]] = []
         for uuid in prefill_uuids:
-            seq = self.global_batch.get_sequence(uuid)
+            seq = ctx.sched.pool.get_sequence(uuid)
             if seq is None:
                 raise RuntimeError(
-                    f"Rank {self.rank}: prefill reservation references unknown {uuid}"
+                    f"Rank {ctx.facts.rank}: prefill reservation references unknown {uuid}"
                 )
             pages, tokens = compute_prefill_host_reservation(
                 prompt_length=seq.prompt_length,
@@ -3636,11 +3709,11 @@ class KVCapacityEngine:
                 initial_gpu_page_buffer=_sequence_module.INITIAL_GPU_PAGE_BUFFER,
             )
             reservations[uuid] = (pages, tokens)
-            if self._owns_host_kv(seq):
+            if _owns_host_kv(seq):
                 private_tokens = tokens
                 state = (
-                    self._prefix.prefix_sequence_states.get(seq.global_idx)
-                    if self.enable_prefix_cache
+                    ctx.sched.prefix.prefix_sequence_states.get(seq.global_idx)
+                    if ctx.facts.enable_prefix_cache
                     else None
                 )
                 if state is not None and state.attached_tokens:
@@ -4217,15 +4290,22 @@ class KVCapacityEngine:
 
     # ---- Repatriated S10c (load, eviction, async-load finalize) ------------
 
-    def _put_sequences_on_hold(self, worker, uuids: List[str]) -> None:
-        """Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _put_sequences_on_hold(
+        self, ctx, uuids: List[str], *,
+        _sync_sequence_metadata: Callable[[List[str]], None],
+    ) -> None:
+        """Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV.
+
+        The rank-aligned metadata sync and the closing barrier did not move:
+        the sync stays the first thing after the log line and the barrier
+        stays the last statement, so every rank still enters both exactly
+        once. The sync is an injected collaborator because it is the worker's
+        own cross-rank gather, not a state read.
+        """
         if not uuids:
             return
 
-        if self.rank == 0:
+        if ctx.facts.rank == 0:
             logging.info(
                 f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
             )
@@ -4233,44 +4313,44 @@ class KVCapacityEngine:
         # CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
         # This ensures all ranks have consistent current_context_length values
         # which is essential for correct KV migration validation later
-        self._sync_sequence_metadata(uuids)
+        _sync_sequence_metadata(uuids)
 
         # Free GPU pages for these sequences
         # CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
-        if hasattr(self, 'gpu_paged_kv_cache_manager') and self.gpu_paged_kv_cache_manager:
+        if ctx.gpu_kv:
             global_seq_ids = []
             for uuid in uuids:
-                seq = self.global_batch.get_sequence(uuid)
-                if uuid in self._uuid_to_local_map:
+                seq = ctx.sched.pool.get_sequence(uuid)
+                if uuid in ctx.sched.seq_table.uuid_to_local:
                     global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
             if global_seq_ids:
                 # Filter to only sequences the GPU manager actually tracks
-                mgr = self.gpu_paged_kv_cache_manager
+                mgr = ctx.gpu_kv
                 known_ids = [gid for gid in global_seq_ids if gid in mgr._sequences]
                 if known_ids:
                     mgr.free_pages_for_sequences(known_ids)
                 if len(known_ids) < len(global_seq_ids):
                     unknown = len(global_seq_ids) - len(known_ids)
                     logging.debug(
-                        f"Rank {self.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
+                        f"Rank {ctx.facts.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
                     )
                 # Also remove from tracking set
                 for uuid in uuids:
-                    if uuid in self._uuid_to_local_map:
-                        self._sequences_with_gpu_kv.drop(uuid)
+                    if uuid in ctx.sched.seq_table.uuid_to_local:
+                        ctx.gpu_resident.drop(uuid)
 
         # Update sequence status and reset GPU allocation
         # NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
         # ON_HOLD sequences are continuing decode when resumed, so they should
         # get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
         for uuid in uuids:
-            seq = self.global_batch.get_sequence(uuid)
+            seq = ctx.sched.pool.get_sequence(uuid)
             seq.release_gpu_pages()
-            seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=watermark")
+            seq.log_event(SeqEvent.ON_HOLD, ctx.facts.rank, "trigger=watermark")
         # None of the per-sequence steps above reads a status, so the
         # transitions apply together, in loop order, after them.
-        apply_or_raise(self.global_batch, TransitionPlan(
+        apply_or_raise(ctx.sched.pool, TransitionPlan(
             StatusEdge.CAPACITY_HOLD,
             tuple(Transition(uuid, SequenceStatus.ON_HOLD) for uuid in uuids),
         ))
@@ -4279,17 +4359,26 @@ class KVCapacityEngine:
         dist.barrier()
 
     def _try_load_new_sequences(
-        self, worker,
+        self, ctx,
         current_decode_uuids: List[str],
-        current_local_indices: List[int]
+        current_local_indices: List[int],
+        *,
+        _assign_decode_dp_groups: Callable[[List[object]], None],
+        _prepare_decode_batch: Callable[[], List[str]],
+        _update_batch_status: Callable[..., object],
     ) -> Tuple[List[str], List[int]]:
         """
         Load PREFILLED sequences from Host KV to GPU KV if space available.
         Maintains deterministic ordering across all ranks.
+
+        The collective allocation preflight did not move: it is the same
+        single call in the same statement position, still ahead of the status
+        transition, so every rank votes before any allocator mutation. The
+        three worker operations this body drives (the decode DP-group stamp,
+        the decode-entry selection and the status transition) arrive as
+        injected collaborators; the two index lookups resolve through
+        ``IndexManager`` from the context, as the sibling allocation does.
         """
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         # Legacy attention modes still run on a live worker, so route their
         # boundary admission through the same collective-capacity contract as
         # mode 3.  The old local-free/pages-required loop could desynchronize
@@ -4297,57 +4386,74 @@ class KVCapacityEngine:
         # DecodeScheduler needs a TP group on every candidate, so stamp all
         # PREFILLED/ON_HOLD candidates before taking its live capacity snapshot.
         admission_candidates = (
-            self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-            + self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+            ctx.sched.pool.get_sequences_by_status(SequenceStatus.PREFILLED)
+            + ctx.sched.pool.get_sequences_by_status(SequenceStatus.ON_HOLD)
         )
-        self._assign_decode_dp_groups(admission_candidates)
+        _assign_decode_dp_groups(admission_candidates)
         new_uuids = [
-            uuid for uuid in self._prepare_decode_batch()
+            uuid for uuid in _prepare_decode_batch()
             if uuid not in set(current_decode_uuids)
         ]
-    
+
         if not new_uuids:
             return current_decode_uuids, current_local_indices
 
         # Get local indices for sequences belonging to THIS rank
-        new_local_indices = self._get_local_indices_for_uuids(new_uuids)
-    
+        new_local_indices = IndexManager.get_local_indices_for_uuids(
+            IndexLookupRequest(
+                rank=ctx.facts.rank,
+                local_to_uuid=ctx.sched.seq_table.local_to_uuid,
+                uuid_to_local=ctx.sched.seq_table.uuid_to_local,
+                global_batch=ctx.sched.pool,
+            ),
+            new_uuids,
+        )
+
         # M2b: assign the decode DP-group before the transition (no-op for G==1).
-        self._assign_decode_dp_groups(new_uuids)
+        _assign_decode_dp_groups(new_uuids)
 
         # Every rank participates, including ranks with no local rows, before any
         # allocator mutation.  A failed preflight is global and leaves statuses
         # untouched, so the next caller can retry safely.
         alloc_ok = self._allocate_gpu_kv_two_page_buffer(
+            ctx,
             new_local_indices,
             load_from_host=True,
             collective_preflight=True,
         )
         if not alloc_ok:
             raise RuntimeError(
-                f"Rank {self.rank}: collective GPU KV load preflight failed for "
+                f"Rank {ctx.facts.rank}: collective GPU KV load preflight failed for "
                 f"{len(new_uuids)} legacy-mode sequences"
             )
 
         # Update status AFTER load completes
-        self._update_batch_status(
+        _update_batch_status(
             new_uuids, SequenceStatus.IN_DECODE, StatusEdge.DECODE_ENTRY
         )
-    
+
         # Build updated lists
         updated_uuids = current_decode_uuids + new_uuids
         updated_batch = current_local_indices + new_local_indices
-    
+
         # Final page table rebuild with ALL active sequences
-        if self.gpu_paged_kv_cache_manager is not None and updated_batch:
-            all_global_ids = self._local_indices_to_global_seq_ids(updated_batch)
-            self.gpu_paged_kv_cache_manager.rebuild_page_table(all_global_ids)
-    
+        if ctx.gpu_kv is not None and updated_batch:
+            all_global_ids = IndexManager.local_indices_to_global_seq_ids(
+                IndexLookupRequest(
+                    rank=ctx.facts.rank,
+                    local_to_uuid=ctx.sched.seq_table.local_to_uuid,
+                    uuid_to_local=ctx.sched.seq_table.uuid_to_local,
+                    global_batch=ctx.sched.pool,
+                ),
+                updated_batch,
+            )
+            ctx.gpu_kv.rebuild_page_table(all_global_ids)
+
         logging.info(
-            f"Rank {self.rank}: Loaded {len(new_uuids)} new sequences, "
+            f"Rank {ctx.facts.rank}: Loaded {len(new_uuids)} new sequences, "
             f"total decode batch now {len(updated_uuids)}"
         )
-    
+
         return updated_uuids, updated_batch
 
     def _finalize_async_load_minimal(
