@@ -2041,6 +2041,8 @@ def test_max_decode_rank_bsz_env_name_mismatch_raises(monkeypatch):
             )
         ),
         _decode_attn_tp_size=lambda: 1,
+        # D6.2: the delegator hands the engine both width collaborators.
+        _whole_model_decode_graphs_requested=lambda: False,
     )
     monkeypatch.setenv("BATCHGEN_MAX_DECODE_RANK_BSZ", "128")
     monkeypatch.setenv("BATCHGEN_MAX_RANK_BSZ", "160")

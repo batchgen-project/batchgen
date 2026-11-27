@@ -28,7 +28,6 @@ from batchgen.config.max_model_len import (
 from batchgen.worker import startup_transient
 from batchgen.worker.kv_manager import KVCacheManager
 from batchgen.worker.kv_plan import provisional_pool_gb
-from batchgen.worker.rank_context import node_of_rank
 from tests.test_kv_fixed_address_page_table import MANAGER
 from tests.test_prompt_rejection_fails_one_request import (
     _chat_line, _items, _scheduler,
@@ -240,37 +239,57 @@ def test_worker_collects_remote_host_regions_before_accepting_length(monkeypatch
             copies=2, available_pages=5,
         )]
 
-    method = load_worker_shaped_methods(["_verify_deployment_max_model_len"], {
-        "SequenceLengthCapacity": SequenceLengthCapacity,
-        "verify_max_model_len": verify_max_model_len,
+    ns = load_kv_capacity({
         "QueryBook": SimpleNamespace(TOKEN_BYTES=4),
         "dist": SimpleNamespace(all_gather_object=gather),
-        "node_of_rank": node_of_rank,
-    })["_verify_deployment_max_model_len"]
+    })
+    engine = ns["KVCapacityEngine"]()
+    # D6.2: the engine returns the three published effects instead of writing
+    # them; this fake applies them in the worker delegator's order (the
+    # delegator's own binding is pinned in tests/worker/test_kv_capacity_context.py).
     worker = SimpleNamespace(
-        huggingface_ckpt_name="test-model", rank=0, local_rank=0,
-        local_world_size=2, world_size=2, model_context_length=1024,
-        args=SimpleNamespace(max_model_len=-1 if auto_fit else 1024),
+        model_context_length=1024,
         engine_config=SimpleNamespace(Basic_Config=SimpleNamespace()),
-        _host_views_by_group=lambda: {
-            i: SimpleNamespace(get_stats=lambda: SimpleNamespace(num_total_pages=100))
-            for i in (0, 1)
-        },
-        _decode_attn_tp_size=lambda: 2,
-        _traj=SimpleNamespace(
-            trajectory_book=SimpleNamespace(page_tokens=64, page_count=100)
-        ),
+        _deployment_length_verified=False,
     )
+
+    def method(pool_gb):
+        ctx = ns["DeploymentVerifyContext"](
+            huggingface_ckpt_name="test-model", rank=0, local_rank=0,
+            local_world_size=2, world_size=2,
+            model_context_length=worker.model_context_length,
+            args=SimpleNamespace(max_model_len=-1 if auto_fit else 1024),
+            traj=SimpleNamespace(
+                trajectory_book=SimpleNamespace(page_tokens=64, page_count=100)
+            ),
+            _deployment_length_verified=worker._deployment_length_verified,
+        )
+        outcome = engine._verify_deployment_max_model_len(
+            ctx, pool_gb,
+            _decode_attn_tp_size=lambda: 2,
+            _host_views_by_group=lambda: {
+                i: SimpleNamespace(
+                    get_stats=lambda: SimpleNamespace(num_total_pages=100)
+                )
+                for i in (0, 1)
+            },
+        )
+        worker.model_context_length = outcome.model_context_length
+        worker.engine_config.Basic_Config.max_model_len = (
+            outcome.engine_config_max_model_len
+        )
+        worker._deployment_length_verified = outcome._deployment_length_verified
+
     if auto_fit:
-        method(worker, 100 * 2048 / (1024 ** 3))
+        method(100 * 2048 / (1024 ** 3))
         assert worker.model_context_length == 128
         assert worker.engine_config.Basic_Config.max_model_len == 128
         # Once published, even auto-fit cannot silently lower L again.
         with pytest.raises(MaxModelLenCapacityError):
-            method(worker, 2048 / (1024 ** 3))
+            method(2048 / (1024 ** 3))
     else:
         with pytest.raises(MaxModelLenCapacityError) as info:
-            method(worker, 100 * 2048 / (1024 ** 3))
+            method(100 * 2048 / (1024 ** 3))
         assert (info.value.node, info.value.region) == (1, "1")
     assert [(r.region, r.available_pages) for r in gathered_local[:4:2]] == [
         ("0", 100), ("1", 100)]
