@@ -31,7 +31,8 @@ from __future__ import annotations
 
 import ast
 import pathlib
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,7 @@ from batchgen.worker.admission.context import (
     SchedulingState,
 )
 from batchgen.worker.gpu_residency import GpuResidencySet
+from tests.kv_capacity_source import load_kv_capacity
 from tests.worker_method_source import WORKER_CLASS, WORKER_SOURCE, load_worker_methods
 
 _METHODS = load_worker_methods(
@@ -153,18 +155,29 @@ def test_a_nested_decode_phase_entry_fails_by_name():
         worker.enter()
 
 
-def test_the_gpu_kv_rebind_point_refuses_a_held_decode_context():
+def test_the_gpu_kv_rebind_point_refuses_a_held_decode_context(monkeypatch):
     """The one post-setup reassignment of a context field is pinned shut."""
     bind = load_worker_methods(["_bind_gpu_paged_kv_manager"], {})[
         "_bind_gpu_paged_kv_manager"
     ]
     bound = []
+    ns = load_kv_capacity()
+    module = ModuleType("batchgen.worker.kv_capacity_engine")
+    module.GPUKVBindContext = ns["GPUKVBindContext"]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    def bind_manager(ctx, manager):
+        assert isinstance(ctx, ns["GPUKVBindContext"])
+        bound.append(manager)
+        return ns["GPUKVBindOutcome"](manager, True)
+
     engine = SimpleNamespace(
-        _bind_gpu_paged_kv_manager=lambda worker, manager: bound.append(manager)
+        _bind_gpu_paged_kv_manager=bind_manager,
     )
     manager = object()
     worker = SimpleNamespace(
         rank=0,
+        core_engine=object(),
         _kv_capacity_engine=engine,
         _held_decode_phase_context=object(),
     )
@@ -175,6 +188,8 @@ def test_the_gpu_kv_rebind_point_refuses_a_held_decode_context():
     worker._held_decode_phase_context = None
     bind(worker, manager)
     assert bound == [manager]
+    assert worker.gpu_paged_kv_cache_manager is manager
+    assert worker._gpu_kv_pool_created is True
 
 
 _TREE = ast.parse(pathlib.Path(WORKER_SOURCE).read_text())

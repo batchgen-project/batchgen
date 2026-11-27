@@ -1625,37 +1625,57 @@ class BatchGenWorker:
 		)
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVMemoryContext
+		ctx = GPUKVMemoryContext(self.rank, self.local_rank, self.torch_device, self.gpu_memory_frac)
 		return engine._calculate_gpu_kv_cache_size(
-			self,
+			ctx,
 		)
 
 	def _kv_fixed_address_pool_available(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVDeviceContext
+		ctx = GPUKVDeviceContext(self.local_rank)
 		return engine._kv_fixed_address_pool_available(
-			self,
+			ctx,
 		)
 
-	def _initialize_gpu_kv_manager_fixed_size(self) -> GPUPagedKVCacheManager:
-		# The engine receives this worker as its sole state collaborator.
+	def _initialize_gpu_kv_manager_fixed_size(self, *, gpu_kv_cache_size_gb=None) -> GPUPagedKVCacheManager:
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._initialize_gpu_kv_manager_fixed_size(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPUKVFixedSizeContext, GPU_KV_UNCHANGED
+		ctx = GPUKVFixedSizeContext(
+			rank=self.rank, local_rank=self.local_rank,
+			huggingface_ckpt_name=self.huggingface_ckpt_name,
+			gpu_kv_cache_size_gb=(
+				self.gpu_kv_cache_size_gb
+				if gpu_kv_cache_size_gb is None else gpu_kv_cache_size_gb
+			),
 		)
+		manager, outcome = engine._initialize_gpu_kv_manager_fixed_size(
+			ctx,
+			_calculate_gpu_kv_cache_size=self._calculate_gpu_kv_cache_size,
+			_with_cuda_graph_page_table_capacity=self._with_cuda_graph_page_table_capacity,
+			_kv_fixed_address_pool_available=self._kv_fixed_address_pool_available,
+			_bind_gpu_paged_kv_manager=self._bind_gpu_paged_kv_manager,
+		)
+		if outcome.gpu_kv_cache_size_gb is not GPU_KV_UNCHANGED:
+			self.gpu_kv_cache_size_gb = outcome.gpu_kv_cache_size_gb
+		return manager
 		
 	def _debug_values(self) -> Optional[dict]:
 		"""The adopted server debug state as a dict (None when it is empty).
@@ -4304,26 +4324,32 @@ class BatchGenWorker:
 				"context is held; the pool is created before decode-phase "
 				"entry, never inside a decode phase"
 			)
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._bind_gpu_paged_kv_manager(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPUKVBindContext
+		ctx = GPUKVBindContext(self.core_engine)
+		outcome = engine._bind_gpu_paged_kv_manager(
+			ctx,
 			manager,
 		)
+		self.gpu_paged_kv_cache_manager = outcome.gpu_paged_kv_cache_manager
+		self._gpu_kv_pool_created = outcome._gpu_kv_pool_created
 
 	def _get_cuda_graph_gpu_manager(self):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVHandleContext
+		ctx = GPUKVHandleContext(self.gpu_paged_kv_cache_manager, self.core_engine)
 		return engine._get_cuda_graph_gpu_manager(
-			self,
+			ctx,
 		)
 
 	# Page-table capacity helpers — thin delegations to `KVCacheManager`.
@@ -4332,36 +4358,47 @@ class BatchGenWorker:
 	# `PageTableCapacityRequest` frozen snapshot.
 
 	def _deployment_context_bound_tokens(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import DeploymentContext
+		ctx = DeploymentContext(getattr(self, "model_context_length", 0))
 		return engine._deployment_context_bound_tokens(
-			self,
+			ctx,
 		)
 
 	def _make_page_table_capacity_request(self) -> PageTableCapacityRequest:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import PageTableContext
+		ctx = PageTableContext(
+			engine_config=getattr(self, "engine_config", None),
+			model_config=getattr(self, "model_config", None),
+			args=getattr(self, "args", None),
+		)
 		return engine._make_page_table_capacity_request(
-			self,
+			ctx,
+			_deployment_context_bound_tokens=self._deployment_context_bound_tokens,
+			_decode_graph_top_bucket=self._decode_graph_top_bucket,
 		)
 
 	def _with_cuda_graph_page_table_capacity(self, config):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		ctx = self._make_page_table_capacity_request()
 		return engine._with_cuda_graph_page_table_capacity(
-			self,
+			ctx,
 			config,
 		)
 
@@ -8154,14 +8191,21 @@ class BatchGenWorker:
 				self.core_engine.reset_decoding_buffer()
 
 	def _release_suspended_decode_kv_pool(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVPoolContext
+		ctx = GPUKVPoolContext(
+			rank=self.rank, gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+			gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+		)
 		return engine._release_suspended_decode_kv_pool(
-			self,
+			ctx,
+			_assert_kv_pool_addresses_are_fixed=self._assert_kv_pool_addresses_are_fixed,
+			_destroy_gpu_paged_kv_cache=self._destroy_gpu_paged_kv_cache,
 		)
 
 	def _transition_phase(
@@ -8447,49 +8491,68 @@ class BatchGenWorker:
 		)
 
 	def _remap_reused_kv_pool(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVPoolContext
+		ctx = GPUKVPoolContext(
+			rank=self.rank, gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+			_gpu_kv_pool_created=self._gpu_kv_pool_created,
+		)
 		return engine._remap_reused_kv_pool(
-			self,
+			ctx,
+			_assert_kv_pool_addresses_are_fixed=self._assert_kv_pool_addresses_are_fixed,
 		)
 
 	def _assert_kv_pool_addresses_are_fixed(self, context: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVPoolContext
+		ctx = GPUKVPoolContext(
+			rank=self.rank, gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+		)
 		return engine._assert_kv_pool_addresses_are_fixed(
-			self,
+			ctx,
 			context,
 		)
 
 	def _assert_kv_region_mapped(self, context: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVPoolContext
+		ctx = GPUKVPoolContext(
+			rank=self.rank, gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+			_gpu_kv_pool_created=self._gpu_kv_pool_created,
+		)
 		return engine._assert_kv_region_mapped(
-			self,
+			ctx,
 			context,
 		)
 
 	def _assert_kv_region_released(self, context: str) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import GPUKVPoolContext
+		ctx = GPUKVPoolContext(
+			rank=self.rank, gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+		)
 		return engine._assert_kv_region_released(
-			self,
+			ctx,
 			context,
 		)
 
@@ -8985,15 +9048,32 @@ class BatchGenWorker:
 		)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._init_gpu_kv_with_actual_size(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPUKVInitContext, GPU_KV_UNCHANGED
+		ctx = GPUKVInitContext(
+			rank=self.rank, local_rank=self.local_rank,
+			torch_device=self.torch_device, gpu_memory_frac=self.gpu_memory_frac,
+			gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+			_phase=getattr(self, "_phase", None),
+			_gpu_kv_cached_pool_gb=self._gpu_kv_cached_pool_gb,
 		)
+		outcome = engine._init_gpu_kv_with_actual_size(
+			ctx,
+			_remap_reused_kv_pool=self._remap_reused_kv_pool,
+			_initialize_gpu_kv_manager_fixed_size=self._initialize_gpu_kv_manager_fixed_size,
+			_verify_deployment_max_model_len=self._verify_deployment_max_model_len,
+		)
+		if outcome is not None:
+			self.gpu_kv_cache_size_gb = outcome.gpu_kv_cache_size_gb
+			if outcome._gpu_kv_sizing_provisional is not GPU_KV_UNCHANGED:
+				self._gpu_kv_sizing_provisional = outcome._gpu_kv_sizing_provisional
+			if outcome._gpu_kv_cached_pool_gb is not GPU_KV_UNCHANGED:
+				self._gpu_kv_cached_pool_gb = outcome._gpu_kv_cached_pool_gb
 
 	def _config_decoding_for_batch(
 		self,
@@ -12668,16 +12748,28 @@ class BatchGenWorker:
 		}
 
 	def _finalize_gpu_kv_pool_after_capture(self, gpu_manager) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._finalize_gpu_kv_pool_after_capture(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPUKVFinalizeContext
+		ctx = GPUKVFinalizeContext(
+			rank=self.rank, local_rank=self.local_rank,
+			torch_device=self.torch_device, gpu_memory_frac=self.gpu_memory_frac,
+			gpu_paged_kv_cache_manager=self.gpu_paged_kv_cache_manager,
+			gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+			_gpu_kv_sizing_provisional=self._gpu_kv_sizing_provisional,
+			whole_model_bucketing=self._graph.whole_model_bucketing,
+		)
+		outcome = engine._finalize_gpu_kv_pool_after_capture(
+			ctx,
 			gpu_manager,
 		)
+		if outcome is not None:
+			self._gpu_kv_sizing_provisional = outcome._gpu_kv_sizing_provisional
+			self._gpu_kv_cached_pool_gb = outcome._gpu_kv_cached_pool_gb
 
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture from values and live helpers, then bind the final outcome.

@@ -36,6 +36,7 @@ from batchgen.config.graph_span_policy import (
 )
 from batchgen.worker.kv_manager import KVCacheManager, PageTableCapacityRequest
 from tests.worker.worker_fakes import make_graph_state
+from tests.kv_capacity_source import load_kv_capacity
 from tests.worker_method_source import (
     STEP_OBSERVABILITY_SOURCE,
     delegated_method_names,
@@ -138,7 +139,8 @@ def _page_table(num_pages_per_sequence: int):
 
 @pytest.fixture
 def bound_fn():
-    return _compile("_deployment_context_bound_tokens")
+    ns = load_kv_capacity()
+    return ns["KVCapacityEngine"]()._deployment_context_bound_tokens
 
 
 @pytest.mark.parametrize(
@@ -154,8 +156,8 @@ def bound_fn():
 def test_deployment_bound_is_the_model_context_length(
     bound_fn, model_context_length, expected
 ):
-    worker = types.SimpleNamespace(model_context_length=model_context_length)
-    assert bound_fn(worker) == expected
+    ctx = load_kv_capacity()["DeploymentContext"](model_context_length)
+    assert bound_fn(ctx) == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -171,18 +173,16 @@ def _capacity_request(
     model_config=None,
     cuda_graph_max_bucket_size=128,
 ):
-    make = _compile("_make_page_table_capacity_request")
-    worker = types.SimpleNamespace(
-        max_input_length=max_input_length,
-        max_decoding_length=max_decoding_length,
-        engine_config=None,
-        model_config=model_config,
-        args=types.SimpleNamespace(
-            cuda_graph_max_bucket_size=cuda_graph_max_bucket_size
-        ),
-        _deployment_context_bound_tokens=lambda: int(model_context_length or 0),
+    ns = load_kv_capacity()
+    ctx = ns["PageTableContext"](
+        engine_config=None, model_config=model_config,
+        args=types.SimpleNamespace(cuda_graph_max_bucket_size=cuda_graph_max_bucket_size),
     )
-    return make(worker)
+    return ns["KVCapacityEngine"]()._make_page_table_capacity_request(
+        ctx,
+        _deployment_context_bound_tokens=lambda: int(model_context_length or 0),
+        _decode_graph_top_bucket=lambda: pytest.fail("unconfigured ladder read"),
+    )
 
 
 @pytest.mark.parametrize(

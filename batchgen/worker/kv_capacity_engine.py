@@ -20,7 +20,9 @@ straddlers ``_mirror_group_host_kv`` and ``_release_host_kv_pages_for_batch``
 stay on the worker.
 
 The engine is intentionally stateless. The AS3.1 operations receive a frozen
-decode phase context, while the remaining operations retain the older worker
+decode phase context. D6.1 pool operations take frozen value contexts and
+keyword-only collaborators; worker writes return as frozen outcomes. The
+remaining operations retain the older worker
 delegator shape until their own conversion slice. The worker keeps a same-name
 delegator for every moved method.
 """
@@ -172,12 +174,116 @@ class _DualKVLoadPointers:
     aux_page_counts: torch.Tensor
 
 
+# D6.1: values stay in frozen snapshots; collaborators are call arguments.
+# A skipped write is distinct from writing None (the pool size starts as None).
+GPU_KV_UNCHANGED = object()
+
+
+@dataclass(frozen=True)
+class GPUKVMemoryContext:
+    rank: int
+    local_rank: int
+    torch_device: object
+    gpu_memory_frac: float
+
+
+@dataclass(frozen=True)
+class GPUKVDeviceContext:
+    local_rank: object
+
+
+@dataclass(frozen=True)
+class GPUKVFixedSizeContext:
+    rank: int
+    local_rank: int
+    huggingface_ckpt_name: str
+    gpu_kv_cache_size_gb: Optional[float]
+
+
+@dataclass(frozen=True)
+class GPUKVBindContext:
+    core_engine: object
+
+
+@dataclass(frozen=True)
+class DeploymentContext:
+    model_context_length: Optional[int]
+
+
+@dataclass(frozen=True)
+class PageTableContext:
+    engine_config: object
+    model_config: object
+    args: object
+
+
+@dataclass(frozen=True)
+class GPUKVInitContext:
+    rank: int
+    local_rank: int
+    torch_device: object
+    gpu_memory_frac: float
+    gpu_paged_kv_cache_manager: object
+    _phase: Optional[str]
+    _gpu_kv_cached_pool_gb: Optional[float]
+
+
+@dataclass(frozen=True)
+class GPUKVFinalizeContext:
+    rank: int
+    local_rank: int
+    torch_device: object
+    gpu_memory_frac: float
+    gpu_paged_kv_cache_manager: object
+    gpu_kv_cache_size_gb: float
+    _gpu_kv_sizing_provisional: bool
+    whole_model_bucketing: object
+
+
+@dataclass(frozen=True)
+class GPUKVHandleContext:
+    gpu_paged_kv_cache_manager: object
+    core_engine: object
+
+
+@dataclass(frozen=True)
+class GPUKVPoolContext:
+    rank: int
+    gpu_paged_kv_cache_manager: object
+    _gpu_kv_pool_created: bool = False
+    gpu_kv_cache_size_gb: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class GPUKVSizeOutcome:
+    gpu_kv_cache_size_gb: object = GPU_KV_UNCHANGED
+
+
+@dataclass(frozen=True)
+class GPUKVBindOutcome:
+    gpu_paged_kv_cache_manager: object
+    _gpu_kv_pool_created: bool
+
+
+@dataclass(frozen=True)
+class GPUKVInitOutcome:
+    gpu_kv_cache_size_gb: float
+    _gpu_kv_sizing_provisional: object = GPU_KV_UNCHANGED
+    _gpu_kv_cached_pool_gb: object = GPU_KV_UNCHANGED
+
+
+@dataclass(frozen=True)
+class GPUKVFinalizeOutcome:
+    _gpu_kv_sizing_provisional: bool
+    _gpu_kv_cached_pool_gb: float
+
+
 class KVCapacityEngine:
     """Stateless KV capacity and layout operations; the worker owns all state."""
 
     # ---- GPU KV pool sizing ------------------------------------------------
 
-    def _calculate_gpu_kv_cache_size(self, worker) -> float:
+    def _calculate_gpu_kv_cache_size(self, ctx: GPUKVMemoryContext) -> float:
         """
         Calculate GPU KV cache size based on actual GPU memory usage.
 
@@ -192,13 +298,10 @@ class KVCapacityEngine:
 
         Rank 0 calculates and broadcasts to all ranks to ensure consistency.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         # Check for environment variable override first
         if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
             gpu_kv_cache_gb = float(_GPU_KV_CACHE_SIZE_OVERRIDE)
-            if self.rank == 0:
+            if ctx.rank == 0:
                 logging.info(
                     f"[GPU-KV] Size from env override: {gpu_kv_cache_gb:.2f} GB "
                     f"(BATCHGEN_GPU_KV_CACHE_SIZE_GB)"
@@ -206,9 +309,9 @@ class KVCapacityEngine:
             return gpu_kv_cache_gb
 
         # Rank 0 calculates, then broadcasts to all ranks
-        if self.rank == 0:
+        if ctx.rank == 0:
             # Get actual GPU memory usage (after model is loaded)
-            free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+            free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(ctx.local_rank)
             free_mem_gb = free_mem_bytes / (1024 ** 3)
             total_mem_gb = total_mem_bytes / (1024 ** 3)
             used_mem_gb = total_mem_gb - free_mem_gb
@@ -217,47 +320,49 @@ class KVCapacityEngine:
             # kv_plan.provisional_pool_gb).
             # This reserves (1-frac) of GPU memory for activations and overhead
             calculated_gb = provisional_pool_gb(
-                total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
+                total_mem_gb, ctx.gpu_memory_frac, used_mem_gb, floor_gb=None
             )
             # Ensure positive value: a non-positive remainder warns here and is
             # replaced by the 1 GB floor kv_plan substitutes.
             gpu_kv_cache_gb = provisional_pool_gb(
-                total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=1.0
+                total_mem_gb, ctx.gpu_memory_frac, used_mem_gb, floor_gb=1.0
             )
             if calculated_gb <= 0:
                 logging.warning(
                     f"[GPU-KV] Calculated size is non-positive ({calculated_gb:.2f} GB). "
-                    f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
+                    f"Total: {total_mem_gb:.2f} GB × frac: {ctx.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
                     f"Using minimum 1 GB."
                 )
 
             logging.info(
                 f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
-                f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+                f"(total: {total_mem_gb:.2f} GB × frac: {ctx.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
             )
         else:
             gpu_kv_cache_gb = 0.0
 
         # Broadcast from rank 0 to all ranks
-        size_tensor = torch.tensor([gpu_kv_cache_gb], dtype=torch.float32, device=self.torch_device)
+        size_tensor = torch.tensor([gpu_kv_cache_gb], dtype=torch.float32, device=ctx.torch_device)
         dist.broadcast(size_tensor, src=0)
         gpu_kv_cache_gb = float(size_tensor.item())
 
         return gpu_kv_cache_gb
 
-    def _kv_fixed_address_pool_available(self, worker) -> bool:
+    def _kv_fixed_address_pool_available(self, ctx: GPUKVDeviceContext) -> bool:
         """Whether the KV pools can be carved from a reserved virtual range.
 
         CUDA VMM is the only implementation, and it needs an indexed device.
         Every serving path has one; CPU-only unit tests that build a manager
         directly keep the allocator-backed default.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        return bool(torch.cuda.is_available() and isinstance(self.local_rank, int))
+        return bool(torch.cuda.is_available() and isinstance(ctx.local_rank, int))
 
-    def _initialize_gpu_kv_manager_fixed_size(self, worker) -> GPUPagedKVCacheManager:
+    def _initialize_gpu_kv_manager_fixed_size(self, ctx: GPUKVFixedSizeContext, *,
+        _calculate_gpu_kv_cache_size: Callable[[], float],
+        _with_cuda_graph_page_table_capacity: Callable,
+        _kv_fixed_address_pool_available: Callable[[], bool],
+        _bind_gpu_paged_kv_manager: Callable[[object], None],
+    ) -> Tuple[GPUPagedKVCacheManager, GPUKVSizeOutcome]:
         """
         Initialize GPU KV manager with pre-determined fixed size.
         Called once at the start of decoding.
@@ -273,9 +378,6 @@ class KVCapacityEngine:
         pointers, so releasing an allocator-backed pool under it would make the
         next replay read freed memory.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         from batchgen.kv_cache.host_kv_mananger_config import (
             build_gpu_kv_config_fixed_size,
             is_dsa_model,
@@ -284,23 +386,27 @@ class KVCapacityEngine:
         )
         from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 
-        # Calculate GPU KV cache size if not already done
-        if self.gpu_kv_cache_size_gb is None:
-            self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
+        gpu_kv_cache_size_gb = ctx.gpu_kv_cache_size_gb
+        size_outcome = GPUKVSizeOutcome()
 
-        if is_dsa_model(self.huggingface_ckpt_name):
+        # Calculate GPU KV cache size if not already done
+        if gpu_kv_cache_size_gb is None:
+            gpu_kv_cache_size_gb = _calculate_gpu_kv_cache_size()
+            size_outcome = GPUKVSizeOutcome(gpu_kv_cache_size_gb)
+
+        if is_dsa_model(ctx.huggingface_ckpt_name):
             # Split memory budget between primary MLA cache and auxiliary indexer cache.
             # Compute the ratio of bytes-per-page for primary vs auxiliary so both
             # get the same number of pages (they share the same page table).
             from batchgen.kv_cache.host_kv_mananger_config import _resolve_profile
-            primary_profile = _resolve_profile(self.huggingface_ckpt_name)
-            aux_profile = _resolve_indexer_profile(self.huggingface_ckpt_name)
+            primary_profile = _resolve_profile(ctx.huggingface_ckpt_name)
+            aux_profile = _resolve_indexer_profile(ctx.huggingface_ckpt_name)
 
             primary_bytes_per_page = primary_profile.bytes_per_page() * primary_profile.num_layers
             aux_bytes_per_page = aux_profile.bytes_per_page() * aux_profile.num_layers
             combined_bytes_per_page = primary_bytes_per_page + aux_bytes_per_page
 
-            total_bytes = int(self.gpu_kv_cache_size_gb * (1024 ** 3))
+            total_bytes = int(gpu_kv_cache_size_gb * (1024 ** 3))
             num_pages = total_bytes // combined_bytes_per_page
 
             primary_config = GPUPagedKVConfig(
@@ -326,7 +432,7 @@ class KVCapacityEngine:
                     else None
                 ),
             )
-            primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
+            primary_config = _with_cuda_graph_page_table_capacity(primary_config)
             aux_config = GPUPagedKVConfig(
                 num_layers=aux_profile.num_layers,
                 num_pages=num_pages,
@@ -342,25 +448,25 @@ class KVCapacityEngine:
                     else None
                 ),
             )
-            aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
+            aux_config = _with_cuda_graph_page_table_capacity(aux_config)
 
-            fixed_addresses = self._kv_fixed_address_pool_available()
+            fixed_addresses = _kv_fixed_address_pool_available()
             primary = GPUPagedKVCacheManager(
                 config=primary_config,
-                device=self.local_rank,
+                device=ctx.local_rank,
                 fixed_address_pool=fixed_addresses,
             )
             primary.initialize()
             auxiliary = GPUPagedKVCacheManager(
                 config=aux_config,
-                device=self.local_rank,
+                device=ctx.local_rank,
                 fixed_address_pool=fixed_addresses,
             )
             auxiliary.initialize()
             manager = DualKVCacheCoordinator(primary, auxiliary)
-            self._bind_gpu_paged_kv_manager(manager)
+            _bind_gpu_paged_kv_manager(manager)
 
-            if self.rank == 0:
+            if ctx.rank == 0:
                 primary_gb = (primary_bytes_per_page * num_pages) / (1024 ** 3)
                 aux_gb = (aux_bytes_per_page * num_pages) / (1024 ** 3)
                 logging.info(
@@ -368,51 +474,49 @@ class KVCapacityEngine:
                     f"{num_pages} pages, primary={primary_gb:.2f} GB (dim={primary_profile.k_head_dim}), "
                     f"auxiliary={aux_gb:.2f} GB (dim={aux_profile.k_head_dim})"
                 )
-            return manager
+            return manager, size_outcome
         else:
             config = build_gpu_kv_config_fixed_size(
-                model_name=self.huggingface_ckpt_name,
-                gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+                model_name=ctx.huggingface_ckpt_name,
+                gpu_kv_cache_size_gb=gpu_kv_cache_size_gb,
             )
-            config = self._with_cuda_graph_page_table_capacity(config)
+            config = _with_cuda_graph_page_table_capacity(config)
 
             manager = GPUPagedKVCacheManager(
                 config=config,
-                device=self.local_rank,
-                fixed_address_pool=self._kv_fixed_address_pool_available(),
+                device=ctx.local_rank,
+                fixed_address_pool=_kv_fixed_address_pool_available(),
             )
             manager.initialize()
-            self._bind_gpu_paged_kv_manager(manager)
+            _bind_gpu_paged_kv_manager(manager)
 
-            if self.rank == 0:
+            if ctx.rank == 0:
                 logging.info(
-                    f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
+                    f"[GPU-KV] Initialized: {gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
                 )
 
-            return manager
+            return manager, size_outcome
 
-    def _bind_gpu_paged_kv_manager(self, worker, manager) -> None:
+    def _bind_gpu_paged_kv_manager(self, ctx: GPUKVBindContext, manager) -> GPUKVBindOutcome:
         """Bind GPU KV manager to both worker and core_engine.
 
         If manager is a DualKVCacheCoordinator, the primary manager is bound
         to existing gpu_paged_kv_manager slots and the auxiliary (indexer) is
         bound to gpu_paged_kv_manager_aux slots.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        self.gpu_paged_kv_cache_manager = manager
-        self._gpu_kv_pool_created = True
+        gpu_paged_kv_cache_manager = manager
+        _gpu_kv_pool_created = True
         if isinstance(manager, DualKVCacheCoordinator):
-            if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-                self.core_engine.gpu_paged_kv_manager = manager.primary
-            if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
-                self.core_engine.gpu_paged_kv_manager_aux = manager.auxiliary
+            if hasattr(ctx.core_engine, "gpu_paged_kv_manager"):
+                ctx.core_engine.gpu_paged_kv_manager = manager.primary
+            if hasattr(ctx.core_engine, "gpu_paged_kv_manager_aux"):
+                ctx.core_engine.gpu_paged_kv_manager_aux = manager.auxiliary
         else:
-            if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-                self.core_engine.gpu_paged_kv_manager = manager
+            if hasattr(ctx.core_engine, "gpu_paged_kv_manager"):
+                ctx.core_engine.gpu_paged_kv_manager = manager
+        return GPUKVBindOutcome(gpu_paged_kv_cache_manager, _gpu_kv_pool_created)
 
-    def _deployment_context_bound_tokens(self, worker) -> int:
+    def _deployment_context_bound_tokens(self, ctx: DeploymentContext) -> int:
         """Longest context any sequence can reach for the life of this server.
 
         Admission clamps every sequence to `model_context_length`
@@ -428,16 +532,13 @@ class KVCapacityEngine:
         to the pool and capture paths. Returns 0 only before core init; the
         caller decides whether that is an error.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        return int(getattr(self, "model_context_length", 0) or 0)
+        return int(getattr(ctx, "model_context_length", 0) or 0)
 
-    def _make_page_table_capacity_request(self, worker) -> PageTableCapacityRequest:
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        engine_config = getattr(self, "engine_config", None)
+    def _make_page_table_capacity_request(self, ctx: PageTableContext, *,
+        _deployment_context_bound_tokens: Callable[[], int],
+        _decode_graph_top_bucket: Callable[[], Optional[int]],
+    ) -> PageTableCapacityRequest:
+        engine_config = getattr(ctx, "engine_config", None)
         engine_module_global_batch_size: Optional[int] = None
         engine_module_attn_decoding_micro_batch_size: Optional[int] = None
         engine_basic_num_queries: Optional[int] = None
@@ -453,7 +554,7 @@ class KVCapacityEngine:
             # KDA slot count, 160 > the 128 arg default) must fit.
             graph_buckets = getattr(basic, "decode_graph_buckets", None) or ()
             engine_basic_decode_graph_max_bucket = max(graph_buckets) if graph_buckets else None
-        model_config = getattr(self, "model_config", None)
+        model_config = getattr(ctx, "model_config", None)
         # Deployment bound first, model config second. `model_context_length`
         # is what admission clamps to, and it exists even when the config class
         # does not declare `max_position_embeddings` — a config that lacks the
@@ -461,15 +562,15 @@ class KVCapacityEngine:
         # the page table's token span at the first batch's
         # `max_input_length + max_decoding_length`. A graph captured against
         # that span then rejected every later, longer decode step.
-        model_max_position_embeddings = self._deployment_context_bound_tokens() or getattr(
+        model_max_position_embeddings = _deployment_context_bound_tokens() or getattr(
             model_config, "max_position_embeddings", None
         )
-        args = getattr(self, "args", None)
+        args = getattr(ctx, "args", None)
         args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
         # The derived ladder can top out above the flag (at the per-rank
         # decode width); the page table must address every row of that bucket.
         decode_graph_top_bucket = (
-            self._decode_graph_top_bucket() if engine_config is not None else None
+            _decode_graph_top_bucket() if engine_config is not None else None
         )
         return PageTableCapacityRequest(
             engine_module_global_batch_size=engine_module_global_batch_size,
@@ -481,15 +582,16 @@ class KVCapacityEngine:
             decode_graph_top_bucket=decode_graph_top_bucket,
         )
 
-    def _with_cuda_graph_page_table_capacity(self, worker, config):
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _with_cuda_graph_page_table_capacity(self, ctx: PageTableCapacityRequest, config):
         return KVCacheManager.apply_page_table_capacity(
-            self._make_page_table_capacity_request(), config
+            ctx, config
         )
 
-    def _init_gpu_kv_with_actual_size(self, worker) -> None:
+    def _init_gpu_kv_with_actual_size(self, ctx: GPUKVInitContext, *,
+        _remap_reused_kv_pool: Callable[[], None],
+        _initialize_gpu_kv_manager_fixed_size: Callable[..., GPUPagedKVCacheManager],
+        _verify_deployment_max_model_len: Callable[[float], None],
+    ) -> Optional[GPUKVInitOutcome]:
         """
         Calculate actual GPU KV size AFTER model loading and initialize the manager.
         This replaces the theoretical estimation - must be called after _load_decode_model().
@@ -497,11 +599,8 @@ class KVCapacityEngine:
         Only runs the full calculation and initialization on the first call;
         subsequent calls skip if the manager is already initialized.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         # Skip if GPU KV manager is already initialized (subsequent decode iterations)
-        if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
+        if ctx.gpu_paged_kv_cache_manager is not None and ctx.gpu_paged_kv_cache_manager.is_initialized:
             return
 
         # The pool is sized from what is free once the decode model is in
@@ -512,10 +611,10 @@ class KVCapacityEngine:
         # with roughly half the pages the per-batch path got. Sizing therefore
         # only happens from the decode phase, after the prefill ring and the
         # prefill model have been released.
-        if getattr(self, "_phase", None) != "decode":
+        if getattr(ctx, "_phase", None) != "decode":
             raise RuntimeError(
-                f"Rank {self.rank}: GPU KV pool sizing attempted in phase "
-                f"{self._phase!r}; it must run from the decode phase so the "
+                f"Rank {ctx.rank}: GPU KV pool sizing attempted in phase "
+                f"{ctx._phase!r}; it must run from the decode phase so the "
                 "measurement cannot charge prefill-only residency against the "
                 "pool it then keeps"
             )
@@ -527,82 +626,85 @@ class KVCapacityEngine:
         # already remapped inside its activation; this covers a rank that
         # rebuilds its decode instance, and keeps every rank's num_total_pages
         # identical, which the cross-rank capacity snapshot requires.
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if manager is not None and getattr(manager, "uses_fixed_address_pool", False):
-            self._remap_reused_kv_pool()
+            _remap_reused_kv_pool()
             return
 
         # Measure-once-cache: once startup decode residency has been
         # measured, every later pool (re)creation reuses the cached size —
         # never a fresh measurement (contract invariant 1: the pool is
         # identical across decode rounds of the same server).
-        if self._gpu_kv_cached_pool_gb is not None:
-            self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
+        if ctx._gpu_kv_cached_pool_gb is not None:
+            gpu_kv_cache_size_gb = ctx._gpu_kv_cached_pool_gb
             # The previous pool's segments already returned to CUDA at destroy
             # (dedicated MemPool, whole-segment free). This flushes the
             # GENERAL cache's all-free segments (prefill transients) too, so
             # the full-size cudaMalloc below sees the maximum free memory. The
             # collection first drops tensors still held only by cycles, so
             # empty_cache can return their segments.
-            torch.cuda.synchronize(self.torch_device)
+            torch.cuda.synchronize(ctx.torch_device)
             gc.collect()
             torch.cuda.empty_cache()
             # Later residency may consume the fraction's reserved slack, but
             # the verified pool itself must still fit. Name any shortfall
             # instead of silently shrinking the deployment's capacity.
-            free_mem_gb = torch.cuda.mem_get_info(self.local_rank)[0] / (1024 ** 3)
+            free_mem_gb = torch.cuda.mem_get_info(ctx.local_rank)[0] / (1024 ** 3)
             KVCacheManager.check_cached_pool_fits(
-                self.gpu_kv_cache_size_gb, free_mem_gb, rank=self.rank
+                gpu_kv_cache_size_gb, free_mem_gb, rank=ctx.rank
             )
-            if self.rank == 0:
+            if ctx.rank == 0:
                 logging.info(
-                    f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
+                    f"[GPU-KV] Cached pool size: {gpu_kv_cache_size_gb:.2f} GB "
                     f"(startup budget; {free_mem_gb:.2f} GB free)"
                 )
-            self._initialize_gpu_kv_manager_fixed_size()
-            if self.rank == 0:
-                stats = self.gpu_paged_kv_cache_manager.get_stats()
+            manager = _initialize_gpu_kv_manager_fixed_size(gpu_kv_cache_size_gb=gpu_kv_cache_size_gb)
+            if ctx.rank == 0:
+                stats = manager.get_stats()
                 logging.info(
-                    f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, "
+                    f"[GPU-KV] Initialized: {gpu_kv_cache_size_gb:.2f} GB, "
                     f"{stats.num_total_pages} pages"
                 )
-            return
+            return GPUKVInitOutcome(gpu_kv_cache_size_gb)
 
         # First startup decode entry: measure after weights are resident. The
         # remaining fraction is reserved for graph and eager allocations; it
         # is not counted as KV capacity. Every later entry uses the cache.
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(ctx.torch_device)
         torch.cuda.empty_cache()
 
-        free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+        free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(ctx.local_rank)
         free_mem_gb = free_mem_bytes / (1024 ** 3)
         total_mem_gb = total_mem_bytes / (1024 ** 3)
         used_mem_gb = total_mem_gb - free_mem_gb
 
         local_pool_gb = provisional_pool_gb(
-            total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None
+            total_mem_gb, ctx.gpu_memory_frac, used_mem_gb, floor_gb=None
         )
-        self._verify_deployment_max_model_len(local_pool_gb)
+        _verify_deployment_max_model_len(local_pool_gb)
         # Identical page counts are required by decode admission. The tightest
         # rank supplies the common pool, rather than rank zero's residency.
-        size_tensor = torch.tensor([local_pool_gb], dtype=torch.float64, device=self.torch_device)
+        size_tensor = torch.tensor([local_pool_gb], dtype=torch.float64, device=ctx.torch_device)
         dist.all_reduce(size_tensor, op=dist.ReduceOp.MIN)
-        self.gpu_kv_cache_size_gb = float(size_tensor.item())
+        gpu_kv_cache_size_gb = float(size_tensor.item())
         # Freeze the measured startup pool for every mode before capture. A
         # lazy capture must not change it after L has been published. The
         # fraction's slack covers graph/eager allocations until startup can
         # measure those allocations at the per-rank cap.
-        self._gpu_kv_sizing_provisional = False
+        _gpu_kv_sizing_provisional = False
 
         # Initialize GPU KV manager with actual size
-        self._initialize_gpu_kv_manager_fixed_size()
-        self._gpu_kv_cached_pool_gb = self.gpu_kv_cache_size_gb
+        manager = _initialize_gpu_kv_manager_fixed_size(gpu_kv_cache_size_gb=gpu_kv_cache_size_gb)
+        _gpu_kv_cached_pool_gb = gpu_kv_cache_size_gb
 
-        if self.rank == 0:
-            stats = self.gpu_paged_kv_cache_manager.get_stats()
-            logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
+        if ctx.rank == 0:
+            stats = manager.get_stats()
+            logging.info(f"[GPU-KV] Initialized: {gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
+        return GPUKVInitOutcome(
+            gpu_kv_cache_size_gb, _gpu_kv_sizing_provisional, _gpu_kv_cached_pool_gb
+        )
 
-    def _finalize_gpu_kv_pool_after_capture(self, worker, gpu_manager) -> None:
+    def _finalize_gpu_kv_pool_after_capture(self, ctx: GPUKVFinalizeContext, gpu_manager) -> Optional[GPUKVFinalizeOutcome]:
         """Measure-once-cache finalization (semantic contract, POIS 2026-10-05).
 
         Called once, right after the full graph warmup/capture, while the
@@ -634,19 +736,16 @@ class KVCapacityEngine:
         already exists), from which point the page count is identical for
         every round.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if not self._gpu_kv_sizing_provisional:
+        if not ctx._gpu_kv_sizing_provisional:
             return
-        self._gpu_kv_sizing_provisional = False
+        _gpu_kv_sizing_provisional = False
 
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(ctx.torch_device)
         torch.cuda.empty_cache()
-        free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+        free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(ctx.local_rank)
         total_mem_gb = total_mem_bytes / (1024 ** 3)
         used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
-        provisional_gb = self.gpu_kv_cache_size_gb
+        provisional_gb = ctx.gpu_kv_cache_size_gb
         steady_used_gb = used_mem_gb - provisional_gb
 
         final_gb = KVCacheManager.compute_final_pool_gb(
@@ -656,18 +755,18 @@ class KVCapacityEngine:
         )
 
         # Broadcast rank 0's decision so every rank resizes identically.
-        size_tensor = torch.tensor([final_gb], dtype=torch.float32, device=self.torch_device)
+        size_tensor = torch.tensor([final_gb], dtype=torch.float32, device=ctx.torch_device)
         dist.broadcast(size_tensor, src=0)
         final_gb = float(size_tensor.item())
 
         # Fail-loud floor (contract invariant 3).
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         stats = manager.get_stats()
         bytes_per_page = (
             provisional_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
         )
         final_pages = KVCacheManager.pool_pages_for_gb(final_gb, bytes_per_page)
-        bucket_sizes = list(getattr(self._graph.whole_model_bucketing, "bucket_sizes", []) or [1])
+        bucket_sizes = list(getattr(ctx.whole_model_bucketing, "bucket_sizes", []) or [1])
         floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
         if final_gb <= 0 or final_pages < floor_pages:
             raise RuntimeError(
@@ -682,8 +781,8 @@ class KVCapacityEngine:
         # Cache only: the live round keeps the provisional pool (its sequences
         # hold pages and the captured graphs bake its addresses); every later
         # pool creation uses the cached final size.
-        self._gpu_kv_cached_pool_gb = final_gb
-        if self.rank == 0:
+        _gpu_kv_cached_pool_gb = final_gb
+        if ctx.rank == 0:
             logging.info(
                 f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
                 f"(~{final_pages} pages; steady used {steady_used_gb:.2f} GB of "
@@ -697,27 +796,28 @@ class KVCapacityEngine:
                 "gpu_memory_frac=%.3f bounds only the pre-capture provisional "
                 "measurement (the frac-based final size would have been %.2f GB)",
                 GPU_KV_POOL_HEADROOM_GB,
-                self.gpu_memory_frac,
+                ctx.gpu_memory_frac,
                 provisional_pool_gb(
-                    total_mem_gb, self.gpu_memory_frac, steady_used_gb, floor_gb=None
+                    total_mem_gb, ctx.gpu_memory_frac, steady_used_gb, floor_gb=None
                 ),
             )
+        return GPUKVFinalizeOutcome(_gpu_kv_sizing_provisional, _gpu_kv_cached_pool_gb)
 
     # ---- GPU KV pool handle, remap and region asserts ----------------------
 
-    def _get_cuda_graph_gpu_manager(self, worker):
+    def _get_cuda_graph_gpu_manager(self, ctx: GPUKVHandleContext):
         """Return the GPU KV manager object to use for CUDA graph setup."""
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if isinstance(manager, DualKVCacheCoordinator):
             return manager
         if manager is not None:
             return manager
-        return getattr(self.core_engine, "gpu_paged_kv_manager", None)
+        return getattr(ctx.core_engine, "gpu_paged_kv_manager", None)
 
-    def _release_suspended_decode_kv_pool(self, worker) -> None:
+    def _release_suspended_decode_kv_pool(self, ctx: GPUKVPoolContext, *,
+        _assert_kv_pool_addresses_are_fixed: Callable[[str], None],
+        _destroy_gpu_paged_kv_cache: Callable[[], None],
+    ) -> None:
         """Return the suspended decode KV pool's physical pages, keep its addresses.
 
         The decode graphs baked the pool bases, page-pointer tables and
@@ -726,25 +826,24 @@ class KVCapacityEngine:
         driver for the prefill phase, and ``_remap_reused_kv_pool`` maps it
         again on resume.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        self._assert_kv_pool_addresses_are_fixed("decode->prefill")
-        manager = self.gpu_paged_kv_cache_manager
+        _assert_kv_pool_addresses_are_fixed("decode->prefill")
+        manager = ctx.gpu_paged_kv_cache_manager
         pages = manager.get_stats().num_total_pages if manager is not None else 0
         start = time.perf_counter()
-        self._destroy_gpu_paged_kv_cache()
+        _destroy_gpu_paged_kv_cache()
         if manager is not None:
             logging.info(
                 "[GPU-KV] rank=%d released the reserved KV pool's physical "
                 "pages in %.3fs (%d pages, %.2f GB)",
-                self.rank,
+                ctx.rank,
                 time.perf_counter() - start,
                 pages,
-                self.gpu_kv_cache_size_gb,
+                ctx.gpu_kv_cache_size_gb,
             )
 
-    def _remap_reused_kv_pool(self, worker) -> None:
+    def _remap_reused_kv_pool(self, ctx: GPUKVPoolContext, *,
+        _assert_kv_pool_addresses_are_fixed: Callable[[str], None],
+    ) -> None:
         """P->D on the default lifecycle: map the KV pool back where it was.
 
         ``initialize()`` on a reserved-range pool maps fresh physical memory
@@ -764,20 +863,17 @@ class KVCapacityEngine:
         the decode phase, sizes it. A pool that existed and is gone is a
         lifecycle bug and still fails here.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if manager is None:
-            if not self._gpu_kv_pool_created:
+            if not ctx._gpu_kv_pool_created:
                 return
             raise RuntimeError(
-                f"Rank {self.rank}: prefill->decode activated a reused decode "
+                f"Rank {ctx.rank}: prefill->decode activated a reused decode "
                 "instance with no GPU KV manager although this process already "
                 "created a GPU KV pool; the reserved pool must survive every "
                 "phase switch"
             )
-        self._assert_kv_pool_addresses_are_fixed("prefill->decode")
+        _assert_kv_pool_addresses_are_fixed("prefill->decode")
         if manager.pool_is_mapped:
             # decode -> decode returns before the activation, so this is only
             # reached if a future caller activates an already-active instance.
@@ -787,12 +883,12 @@ class KVCapacityEngine:
         stats = manager.get_stats()
         logging.info(
             "[GPU-KV] rank=%d remapped the reserved KV pool in %.3fs (%d pages)",
-            self.rank,
+            ctx.rank,
             time.perf_counter() - start,
             stats.num_total_pages,
         )
 
-    def _assert_kv_pool_addresses_are_fixed(self, worker, context: str) -> None:
+    def _assert_kv_pool_addresses_are_fixed(self, ctx: GPUKVPoolContext, context: str) -> None:
         """A reused decode instance requires an address-stable KV pool.
 
         Its captured graphs dereference the pool bases and page-pointer tables
@@ -801,21 +897,18 @@ class KVCapacityEngine:
         replay would read someone else's memory, so an unsupported pool fails
         the switch instead of silently taking the old destroy/recreate path.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if manager is None:
             return
         if not getattr(manager, "uses_fixed_address_pool", False):
             raise RuntimeError(
-                f"Rank {self.rank}: {context} switch would release a GPU KV "
+                f"Rank {ctx.rank}: {context} switch would release a GPU KV "
                 "pool that is not held at fixed addresses while the decode "
                 "instance is reused; its captured graphs bake the pool "
                 "pointers, so the pool must be a reserved-range pool"
             )
 
-    def _assert_kv_region_mapped(self, worker, context: str) -> None:
+    def _assert_kv_region_mapped(self, ctx: GPUKVPoolContext, context: str) -> None:
         """Before decode configure and replay the KV pool is mapped.
 
         Decode admission reads live all-rank capacity through it (#424) and the
@@ -827,27 +920,24 @@ class KVCapacityEngine:
         which ``_init_gpu_kv_with_actual_size()`` performs right after this
         check, before admission or capture can read it.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
-        if manager is None and not self._gpu_kv_pool_created:
+        manager = ctx.gpu_paged_kv_cache_manager
+        if manager is None and not ctx._gpu_kv_pool_created:
             return
         if manager is None or not manager.is_initialized:
             raise RuntimeError(
-                f"Rank {self.rank}: {context} switch left the GPU KV region "
+                f"Rank {ctx.rank}: {context} switch left the GPU KV region "
                 "unmapped while phase instances are reused; decode admission "
                 "reads live capacity through it and the decode graphs bake its "
                 "pointers"
             )
         if not manager.pool_is_mapped:
             raise RuntimeError(
-                f"Rank {self.rank}: {context} switch left the GPU KV pool's "
+                f"Rank {ctx.rank}: {context} switch left the GPU KV pool's "
                 "physical pages unmapped at their reserved addresses; a decode "
                 "replay or capacity read would touch unmapped device memory"
             )
 
-    def _assert_kv_region_released(self, worker, context: str) -> None:
+    def _assert_kv_region_released(self, ctx: GPUKVPoolContext, context: str) -> None:
         """After decode->prefill the KV pool's physical pages are back.
 
         The addresses stay reserved — that is what lets the activation map the
@@ -856,17 +946,14 @@ class KVCapacityEngine:
         exists to avoid: the prefill phase would run with the whole decode KV
         pool charged against it.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_paged_kv_cache_manager
         if manager is None:
             # Never created: a lifetime whose decode phase has not sized a pool
             # yet has nothing to release.
             return
         if manager.pool_is_mapped:
             raise RuntimeError(
-                f"Rank {self.rank}: {context} switch left the GPU KV pool "
+                f"Rank {ctx.rank}: {context} switch left the GPU KV pool "
                 "mapped; prefill needs its physical pages back, and the "
                 "reserved addresses are what make the remap free"
             )

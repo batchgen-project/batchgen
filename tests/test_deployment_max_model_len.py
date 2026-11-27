@@ -1,6 +1,9 @@
 """CPU checks of the deployment limit at the real worker and server seams."""
 
+from tests.kv_capacity_source import load_kv_capacity
+
 import ast
+from dataclasses import replace
 import asyncio
 import gc
 import json
@@ -177,43 +180,44 @@ def test_pool_is_verified_before_allocation_and_recreation_uses_cached_size():
         assert op == "MIN"
         tensor.fill_(6)  # a peer has less space than this rank's 7 GiB
 
-    # S10a: the actual-size init runs in KVCapacityEngine (shaped body).
-    init = load_worker_shaped_methods(["_init_gpu_kv_with_actual_size"], {
+    ns = load_kv_capacity({
         "torch": SimpleNamespace(cuda=cuda, tensor=torch.tensor, float64=torch.float64),
         "dist": SimpleNamespace(all_reduce=reduce_pool, ReduceOp=SimpleNamespace(MIN="MIN")),
         "KVCacheManager": KVCacheManager, "logging": logging, "gc": gc,
         "GPU_KV_POOL_HEADROOM_GB": 2, "provisional_pool_gb": provisional_pool_gb,
-    })["_init_gpu_kv_with_actual_size"]
-    worker = SimpleNamespace(
+    })
+    init = ns["KVCapacityEngine"]()._init_gpu_kv_with_actual_size
+    ctx = ns["GPUKVInitContext"](
         gpu_paged_kv_cache_manager=None, _phase="decode", rank=0, local_rank=0,
         torch_device="cpu", _gpu_kv_cached_pool_gb=None, gpu_memory_frac=0.75,
-        _verify_deployment_max_model_len=lambda size: calls.append(("verify", size)),
     )
 
-    def allocate():
-        calls.append(("allocate", worker.gpu_kv_cache_size_gb))
-        worker.gpu_paged_kv_cache_manager = SimpleNamespace(
+    def allocate(*, gpu_kv_cache_size_gb):
+        calls.append(("allocate", gpu_kv_cache_size_gb))
+        return SimpleNamespace(
             is_initialized=True, get_stats=lambda: SimpleNamespace(num_total_pages=100))
 
-    worker._initialize_gpu_kv_manager_fixed_size = allocate
-    init(worker)
+    helpers = dict(
+        _initialize_gpu_kv_manager_fixed_size=allocate,
+        _verify_deployment_max_model_len=lambda size: calls.append(("verify", size)),
+        _remap_reused_kv_pool=lambda: pytest.fail("unexpected remap"),
+    )
+    outcome = init(ctx, **helpers)
     assert calls == [("verify", 7), ("allocate", 6)]
-    worker._gpu_kv_cached_pool_gb = worker.gpu_kv_cache_size_gb
-    worker.gpu_paged_kv_cache_manager = None
-    init(worker)
+    ctx = replace(ctx, _gpu_kv_cached_pool_gb=outcome.gpu_kv_cache_size_gb)
+    init(ctx, **helpers)
     assert calls[-1] == ("allocate", 6)
     assert len(calls) == 3
 
     # A failed verification never allocates the undersized pool.
-    worker._gpu_kv_cached_pool_gb = None
-    worker.gpu_paged_kv_cache_manager = None
+    ctx = replace(ctx, _gpu_kv_cached_pool_gb=None)
 
     def refuse(size):
         raise MaxModelLenCapacityError(129, capacity(available_pages=1))
 
-    worker._verify_deployment_max_model_len = refuse
+    helpers["_verify_deployment_max_model_len"] = refuse
     with pytest.raises(MaxModelLenCapacityError):
-        init(worker)
+        init(ctx, **helpers)
     assert len(calls) == 3
 
 
