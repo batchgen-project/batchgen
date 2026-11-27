@@ -15,6 +15,7 @@ import copy
 import hashlib
 import logging
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -43,6 +44,12 @@ CONTEXT_CLASSES = {
     "MaterializedSegmentStagingContext",
     "MaterializedIndexKeyLayersContext",
     "MaterializedSegmentLoadContext",
+    # D7.4: wave planning and instrumentation. Three new contexts; the three
+    # probe recorders reuse D7.1's `PoolProbeContext` above.
+    "PrefillMicroBatchPlanContext",
+    "PrefillPoolWavePlanContext",
+    "UnshardedEpilogueGatherContext",
+    "PrefillPoolWaveFinishContext",
 }
 # The frozen outcomes this engine declares: a converted body hands its worker
 # writes back in one of these for the delegator to apply.
@@ -51,6 +58,7 @@ OUTCOME_CLASSES = {
     "PrefillPrefixKVBudgetOutcome",
     "PrefillPoolBaseOutcome",
     "PrefillPoolLayoutOutcome",
+    "PrefillPoolWaveFinishOutcome",
 }
 # Module-scope values the loaded definitions close over, compiled from the
 # real source so a test can compare against the engine's own object identity.
@@ -98,6 +106,17 @@ D7_3_METHODS = {
     "_materialized_pool_index_key_layers",
     "_load_materialized_segments",
 }
+# The D7.4 names: wave planning and the pooled instrumentation. Every one of
+# the seven reads worker state, so none of them is stateless.
+D7_4_METHODS = {
+    "_plan_prefill_micro_batches",
+    "_plan_prefill_pool_wave",
+    "_finish_prefill_pool_wave",
+    "_new_pool_epilogue_tracer",
+    "_record_unsharded_epilogue_gather",
+    "_new_pool_kernel_dump_recorder",
+    "_new_pool_offload_check_recorder",
+}
 STATELESS_METHODS = {
     "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
     "_unmaterializable_frontier", "_prefix_pool_index_key_carrier",
@@ -108,16 +127,23 @@ OUTCOME_METHODS = {
     "_measure_prefill_prefix_kv_budget",
     "_construct_prefill_pool",
     "_prefill_pool_layout",
+    "_finish_prefill_pool_wave",
 }
-# The two bodies that issue a process-group collective, and the collective each
-# one issues. Pinned here so the position tests and the stage scan read one
-# declaration: a rank that issued these in a different order would deadlock the
-# serve group.
+# The three bodies that issue a process-group collective, and the collective
+# each one issues. Pinned here so the position tests and the stage scan read
+# one declaration: a rank that issued these in a different order would
+# deadlock the serve group. D7.4's wave planner issues the FIRST of the two a
+# pooled wave makes -- its budget reduction -- and then calls the plan-digest
+# comparison, so the pair's order is planner-reduce then identity-gather.
 COLLECTIVE_METHODS = {
     "_construct_prefill_pool": "all_reduce",
     "_check_pool_plan_identical": "all_gather",
+    "_plan_prefill_pool_wave": "all_reduce",
 }
-METHODS = set(D7_1_METHODS) | set(D7_2_METHODS) | set(D7_3_METHODS)
+METHODS = (
+    set(D7_1_METHODS) | set(D7_2_METHODS) | set(D7_3_METHODS)
+    | set(D7_4_METHODS)
+)
 
 
 def engine_class_node():
@@ -173,6 +199,8 @@ def load_prefill(namespace=None):
         # compares the engine's own digest rather than a restated one.
         # ``dist`` stays caller-supplied: a collective has to be observed.
         hashlib=hashlib,
+        # D7.4: the micro-batch planner reads the real L2-balance switch.
+        os=os,
     ).items():
         namespace.setdefault(name, value)
     tree = ast.parse(SOURCE.read_text())

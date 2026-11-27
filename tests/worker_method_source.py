@@ -407,6 +407,37 @@ class _ContextToWorker(ast.NodeTransformer):
                 "_materialized_pool_index_key_layers": (
                     "self._materialized_pool_index_key_layers"
                 ),
+                # D7.4 keyword-only collaborators and the second value a
+                # prefill delegator resolves. Each collaborator is the
+                # worker's own method of that name -- what the pre-move body
+                # called. `_trajectory_tokens`, `_prefill_pool_group`,
+                # `_prefill_pool_layout`, `_prefill_pool_psm_layout`,
+                # `_owns_host_kv`, `_host_views_by_group` and
+                # `_debug_flag_enabled` already map above.
+                "_prefix_materialization_kv_config": (
+                    "self._prefix_materialization_kv_config"
+                ),
+                "_prefill_pool_free_state_slots": (
+                    "self._prefill_pool_free_state_slots"
+                ),
+                "_materialized_prefix_hits": "self._materialized_prefix_hits",
+                "_check_pool_plan_identical": (
+                    "self._check_pool_plan_identical"
+                ),
+                "_replace_prefix_lookup_hits": (
+                    "self._replace_prefix_lookup_hits"
+                ),
+                "_settle_trajectory_restore_plan": (
+                    "self._settle_trajectory_restore_plan"
+                ),
+                # The server mode's ONE prefill cap, which all four prefill
+                # delegators that hand it over resolve the same way. Safe in
+                # this global map, like `attn_group_size` above: no converted
+                # body uses the name as a local, and no worker delegator of a
+                # converted method declares a parameter of this name --
+                # `prefill_prepacked` and `_config_prefill_for_batch` (D7.6,
+                # D7.7) resolve it in their delegators too.
+                "token_cap": "self._server_prefill_token_cap()",
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -605,6 +636,9 @@ OUTCOME_WRITE_FIELDS = {
     ),
     "PrefillPoolBaseOutcome": ("_prefill_pool_base",),
     "PrefillPoolLayoutOutcome": ("_prefill_pool_layout_cache",),
+    # D7.4: the wave epilogue CLEARS the planned wave, twice, and both
+    # statements assign the same value, so a plain-value field expresses them.
+    "PrefillPoolWaveFinishOutcome": ("_prefill_pool_wave",),
 }
 OUTCOME_METHODS = {
     "_check_host_kv_watermark_trigger": "WatermarkTriggerOutcome",
@@ -614,6 +648,7 @@ OUTCOME_METHODS = {
     "_measure_prefill_prefix_kv_budget": "PrefillPrefixKVBudgetOutcome",
     "_construct_prefill_pool": "PrefillPoolBaseOutcome",
     "_prefill_pool_layout": "PrefillPoolLayoutOutcome",
+    "_finish_prefill_pool_wave": "PrefillPoolWaveFinishOutcome",
 }
 # The "this path wrote nothing" sentinel each engine declares. The lift-back
 # drops a seed assignment of its outcome's own sentinel; naming it per outcome
@@ -626,6 +661,7 @@ OUTCOME_SENTINEL = {
     "PrefillPrefixKVBudgetOutcome": "PREFILL_UNCHANGED",
     "PrefillPoolBaseOutcome": "PREFILL_UNCHANGED",
     "PrefillPoolLayoutOutcome": "PREFILL_UNCHANGED",
+    "PrefillPoolWaveFinishOutcome": "PREFILL_UNCHANGED",
 }
 # Methods whose pre-move body ended WITHOUT a return statement: the outcome
 # return added at the tail is seam plumbing, so the worker-shaped view drops
@@ -635,6 +671,8 @@ OUTCOME_IMPLICIT_TAIL_RETURN = {
     "_flush_deferred_kv_to_host",
     "_measure_prefill_prefix_kv_budget",
     "_construct_prefill_pool",
+    # The wave epilogue's pre-move body ended with its ``try``/``finally``.
+    "_finish_prefill_pool_wave",
 }
 
 
@@ -984,12 +1022,12 @@ def load_worker_functions(
 # Still-worker-shaped engine methods whose delegator hands them the prefill
 # phase's attention group width. D7.1 converted two that take it
 # (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`), D7.2 a third
-# (`_cached_prefix_rank_cost_profile`) and D7.3 a fourth
-# (`_check_pool_plan_identical`); those are lifted to the worker's shape
+# (`_cached_prefix_rank_cost_profile`), D7.3 a fourth
+# (`_check_pool_plan_identical`) and D7.4 a fifth
+# (`_plan_prefill_micro_batches`); those are lifted to the worker's shape
 # instead, which inlines the same resolution, so adapting their call no longer
-# applies to them.
+# applies to them. `_config_prefill_for_batch` is D7.7's.
 PREFILL_ATTENTION_WIDTH_METHODS = (
-    "_plan_prefill_micro_batches",
     "_config_prefill_for_batch",
 )
 

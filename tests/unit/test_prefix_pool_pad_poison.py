@@ -204,10 +204,13 @@ def test_the_worker_reads_the_flag_through_the_batch_debug_seam():
     ).read_text()
 
     # D7.1: the predicate takes the probe context and the flag reader, not the
-    # worker. Its CALL SITE is still inside a worker-shaped forward, so that
-    # one keeps its spelling.
+    # worker. D7.3 then converted its caller, `_construct_prefill_pool`, so the
+    # call site reaches the predicate as a keyword-only collaborator callable
+    # and no longer carries `self.` -- which is why this pin was red at that
+    # stage and is repaired here, in the stage that converted the three sibling
+    # probe recorders.
     assert "def _pool_pad_poison_enabled(\n        self, ctx: PoolProbeContext, wave, *,\n" in source
-    assert "pad_poison=self._pool_pad_poison_enabled(wave)," in source
+    assert "pad_poison=_pool_pad_poison_enabled(wave)," in source
     # Same seam the offload check uses: the wave's own sequences.
     seam = source.split("    def _pool_pad_poison_enabled")[1].split("\n    def ")[0]
     # One cached read per wave, shared with the other pooled probes, and the
