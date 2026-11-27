@@ -38,6 +38,18 @@ def _worker(monkeypatch, *, probe_requested=True, failure=None, prior_probe=None
         fake.__dict__.update(values)
         monkeypatch.setitem(sys.modules, name, fake)
 
+    # The worker's `_deployment_context_bound_tokens` delegator (loaded from
+    # source below) lazily imports `batchgen.worker.kv_capacity_engine`, whose
+    # module chain imports `batchgen.native_loader` and refuses to run without
+    # the AOT `core_engine` extension. The capacity arithmetic itself needs no
+    # native symbol here, so on an extension-less environment the loader is
+    # stubbed (the established pattern of tests/test_glm52_host_kv_profile.py);
+    # where the extension exists the real module is untouched.
+    try:
+        from batchgen.native_loader import core_engine as _real_core_engine  # noqa: F401
+    except Exception:
+        module("batchgen.native_loader", core_engine=SimpleNamespace())
+
     class Segment:
         def __init__(self, *args, **kwargs):
             self.__dict__.update(kwargs)
