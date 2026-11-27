@@ -384,17 +384,15 @@ def _layout_worker(*, dual, engine_layers, indexer_layers, indexer_dim,
     )
     if cached is not None:
         worker._prefill_pool_layout_cache = cached
+    # ``_worker_method_node`` returns every one of these in the WORKER's own
+    # shape -- a delegated engine body is lifted by
+    # ``worker_shaped_method_node``, the rest come off the worker class -- so
+    # each binds directly, exactly as the predicate below does. The engine
+    # shim this used to wrap them in (``_fn(None, self, ...)``) stopped being
+    # right once these two took a frozen context, which is what made these ten
+    # tests fail with "takes 2 positional arguments but 3 were given".
     for name in names:
-        engine_method = namespace[name]
-        setattr(
-            worker,
-            name,
-            types.MethodType(
-                lambda self, *args, _fn=engine_method, **kwargs:
-                _fn(None, self, *args, **kwargs),
-                worker,
-            ),
-        )
+        setattr(worker, name, types.MethodType(namespace[name], worker))
     worker._prefill_host_view_is_dual = types.MethodType(
         namespace["_prefill_host_view_is_dual"], worker
     )

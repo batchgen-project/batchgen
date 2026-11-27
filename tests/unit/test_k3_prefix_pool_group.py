@@ -119,6 +119,12 @@ _CONTEXT_MOVED = {
     "_cached_prefix_rank_cost_profile", "_materialized_prefix_hits",
     "_unmaterializable_frontier", "_replace_prefix_lookup_hits",
     "_settle_trajectory_restore_plan",
+    # D7.3: pool construction and layout.
+    "_measure_prefill_prefix_kv_budget", "_construct_prefill_pool",
+    "_check_pool_plan_identical", "_prefill_pool_layout",
+    "_allocate_prefill_pool_host_pages", "_materialized_segment_loader",
+    "_prefix_pool_index_key_carrier", "_materialized_pool_index_key_layers",
+    "_load_materialized_segments",
 }
 
 
@@ -1338,7 +1344,9 @@ def test_pool_collectives_are_not_rank_conditional():
             node = parents[node]
             if isinstance(node, ast.If):
                 test = ast.unparse(node.test)
-                for rank_dependent in ("self.rank", "_owns_host_kv", "local_rank"):
+                for rank_dependent in (
+                    "self.rank", "ctx.rank", "_owns_host_kv", "local_rank",
+                ):
                     assert rank_dependent not in test, (
                         f"{name}: {collective} sits under {test!r}"
                     )

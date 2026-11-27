@@ -30,6 +30,22 @@ local copy and returns the single entry it added in
 original create-then-populate order.  The frontier predicate reads no worker
 state at all and therefore takes no context, like D7.1's two launch-value
 predicates.
+
+D7.3 converted pool construction and layout.  This is the stage with
+collectives in it, and they do not move: the budget reduction
+(``dist.all_reduce`` in ``_construct_prefill_pool``) and the plan-digest
+comparison (``dist.all_gather`` in ``_check_pool_plan_identical``) keep their
+positions and their one pre-existing condition each, the group handle, so
+every rank of a serve group still issues the same collectives in the same
+order.  The device synchronize that makes the free-memory read true keeps its
+place in the budget measurement, and the slab generators of
+``_load_materialized_segments`` are still created in group order and consumed
+in lockstep, which is what drives the loader's own H2D waits.  Nothing here
+shares a context: no two of the nine read sets are equal, and the index-key
+carrier reads no worker state at all.  Three of them write one or two plain
+worker values and hand them back in frozen outcomes
+(:class:`PrefillPrefixKVBudgetOutcome`, :class:`PrefillPoolBaseOutcome`,
+:class:`PrefillPoolLayoutOutcome`).
 """
 
 from __future__ import annotations
@@ -308,6 +324,168 @@ class TrajectoryRestoreSettleContext:
     rank: int
     traj: object
     prefix: object
+
+
+# D7.3: the pool construction and layout contexts. No two of these nine read
+# sets are equal, so nothing is shared in this stage; the index-key carrier
+# reads no worker state at all and therefore takes no context, like D7.1's two
+# launch-value predicates and D7.2's frontier predicate. Three of the nine
+# write a worker attribute and declare an outcome for it, seeded with
+# ``PREFILL_UNCHANGED`` above wherever a path writes nothing.
+
+
+@dataclass(frozen=True)
+class PrefillPrefixKVBudgetContext:
+    """What measuring the prefill-phase prefix KV budget reads.
+
+    Both budgets appear by value because the measurement compares each new
+    number against the one it replaces before it logs; the writes themselves
+    travel back in :class:`PrefillPrefixKVBudgetOutcome`. The worker binds
+    both in ``__init__`` (to ``None``), so neither is a presence-guarded read,
+    and ``None`` is the live "no budget yet" value rather than an absence.
+    """
+
+    rank: int
+    local_rank: int
+    torch_device: object
+    engine_config: object
+    _prefill_prefix_kv_budget_bytes: object
+    _prefill_pool_page_budget: object
+
+
+@dataclass(frozen=True)
+class PrefillPrefixKVBudgetOutcome:
+    """The two budgets the measurement rebinds.
+
+    Plain values, not containers, so each field carries the new number
+    directly. The page budget is rebound only past the pool gate, so its field
+    stays at the sentinel on the early exit a model without a pool workspace
+    takes -- ``None`` could not stand for that, because ``None`` is the value
+    the KV budget itself takes when no workspace is set.
+    """
+
+    _prefill_prefix_kv_budget_bytes: object = PREFILL_UNCHANGED
+    _prefill_pool_page_budget: object = PREFILL_UNCHANGED
+
+
+@dataclass(frozen=True)
+class PrefillPoolConstructionContext:
+    """What building the planned wave's pool and executor reads.
+
+    Its own context, not the budget context above: the construction resolves
+    the pool geometry from the checkpoint name and never reads the batching
+    config, and the measurement reads the config and never the checkpoint
+    name. The page budget is read ONCE at the top, before the group reduction,
+    exactly where the pre-move body read it.
+    """
+
+    rank: int
+    local_rank: int
+    torch_device: object
+    huggingface_ckpt_name: str
+    _prefill_pool_page_budget: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolBaseOutcome:
+    """The device-memory baseline the construction stamps for the wave.
+
+    One plain tuple, written on the single path that returns; every earlier
+    exit of that body raises.
+    """
+
+    _prefill_pool_base: object = PREFILL_UNCHANGED
+
+
+@dataclass(frozen=True)
+class PoolPlanIdentityContext:
+    """The rank identity the plan-digest comparison is made on.
+
+    Exactly two fields: the digest tensor is built on this rank's device and a
+    divergence is named with this rank's id. The process group and the group
+    width arrive as arguments, as they did before.
+    """
+
+    rank: int
+    torch_device: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolLayoutContext:
+    """What resolving this model's prefill pool row layout reads.
+
+    ``_prefill_pool_layout_cache`` is why this context is NOT shared with the
+    index-key layer walk below, whose read set is the model alone: the
+    pre-move body read the cache with a ``getattr`` default (the attribute
+    does not exist until a prefill measured the layout), so the delegator
+    keeps that default and a worker that never measured still reaches the
+    "requested before the first prefill" refusal instead of an
+    ``AttributeError``.
+    """
+
+    model: object
+    # ``None`` is the pre-move ``getattr`` default: no prefill has measured
+    # this model's pool layout yet.
+    _prefill_pool_layout_cache: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolLayoutOutcome:
+    """The layout the DSA walk caches for the decode-phase planner.
+
+    The two early exits write nothing and leave the field at the sentinel;
+    ``None`` could not stand for that either, because ``None`` is exactly the
+    "nothing cached yet" value the context carries in.
+    """
+
+    _prefill_pool_layout_cache: object = PREFILL_UNCHANGED
+
+
+@dataclass(frozen=True)
+class PrefillPoolHostPageContext:
+    """What allocating the wave's segment Host pages reads.
+
+    The planned wave and the prefix-reuse owner, which this body reaches only
+    through the owner's own methods (``install_state``,
+    ``add_pool_member_refs``). Deliberately NOT
+    :class:`PrefillPoolWaveContext`: that one's read set is the wave alone,
+    and widening it would make the segment-page count's delegator resolve the
+    prefix owner, which that reader never touches.
+    """
+
+    _prefill_pool_wave: object
+    prefix: object
+
+
+@dataclass(frozen=True)
+class MaterializedSegmentStagingContext:
+    """What building this wave's load staging reads.
+
+    The checkpoint name both geometries resolve from, the device the staging
+    buffers are allocated on, and the rank the staging line names.
+    """
+
+    rank: int
+    torch_device: object
+    huggingface_ckpt_name: str
+
+
+@dataclass(frozen=True)
+class MaterializedIndexKeyLayersContext:
+    """The model whose layer stack the index-key walk orders.
+
+    The model alone, read plainly: this walk runs inside a chunk load, where
+    the model is resident by construction.
+    """
+
+    model: object
+
+
+@dataclass(frozen=True)
+class MaterializedSegmentLoadContext:
+    """The rank id every refusal of the chunk load names."""
+
+    rank: int
 
 
 class PrefillModelStateBinder(Protocol):
@@ -1176,7 +1354,11 @@ class PrefillEngine:
             + len(indexer_layers) * page_tokens * indexer_dim
         ) * element
 
-    def _measure_prefill_prefix_kv_budget(self, worker) -> None:
+    def _measure_prefill_prefix_kv_budget(
+        self, ctx: PrefillPrefixKVBudgetContext, *,
+        _prefill_prefix_pool_enabled: Callable[[], bool],
+        _prefill_pool_page_bytes: Callable[[], int],
+    ) -> PrefillPrefixKVBudgetOutcome:
         """Measure the prefill-phase prefix KV budget. Runs after every
         configure_prefill while prefix caching is on; the device layout at
         that point is a deployment constant, so the measurement is stable.
@@ -1185,55 +1367,95 @@ class PrefillEngine:
         workspace of one prefill micro-batch; the free memory beside it is the
         prefix KV a prefill forward may hold, either the in-wave pool's pages
         or the temporary full-length KV of a cross-wave prefix hit. A model
-        whose planner sets no workspace has no such budget (None)."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
+        whose planner sets no workspace has no such budget (None).
+
+        The device synchronize stays exactly where it was, between the pool
+        predicate and the cache release: the free-memory read that follows is
+        only true once every queued kernel has retired, and nothing may be
+        inserted on either side of it.
+
+        Both budgets are worker attributes, so they travel back in
+        :class:`PrefillPrefixKVBudgetOutcome` for the delegator to apply in
+        the pre-move order. The two collaborators have their own read sets and
+        arrive as the worker delegators the pre-move body called; the
+        page-byte one must stay a delegator, because it is what applies the
+        layout cache the DSA layout walk fills in.
+        """
         from batchgen.prefix_reuse.pool import pool_pages_from_budget
 
-        pool_enabled = self._prefill_prefix_pool_enabled()
-        torch.cuda.synchronize(self.torch_device)
+        # Rebound only past the pool gate below, so this field stays at the
+        # sentinel on the early exit; ``None`` could not stand for that,
+        # because it is the KV budget's own "no workspace" value.
+        _prefill_pool_page_budget = PREFILL_UNCHANGED
+        pool_enabled = _prefill_prefix_pool_enabled()
+        torch.cuda.synchronize(ctx.torch_device)
         torch.cuda.empty_cache()
-        free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
-        batching = self.engine_config.Module_Batching_Config
+        free_bytes, _ = torch.cuda.mem_get_info(ctx.local_rank)
+        batching = ctx.engine_config.Module_Batching_Config
         workspace = int(batching.prefill_prefix_pool_workspace_bytes)
         kv_budget = max(0, free_bytes - workspace) if workspace > 0 else None
-        if kv_budget != self._prefill_prefix_kv_budget_bytes:
+        if kv_budget != ctx._prefill_prefix_kv_budget_bytes:
             logging.info(
                 "[PREFIX_KV] Rank %s prefill-phase prefix KV budget: %s B "
                 "(%d B free, %d B workspace, was %s)",
-                self.rank, kv_budget, free_bytes, workspace,
-                self._prefill_prefix_kv_budget_bytes,
+                ctx.rank, kv_budget, free_bytes, workspace,
+                ctx._prefill_prefix_kv_budget_bytes,
             )
-        self._prefill_prefix_kv_budget_bytes = kv_budget
+        _prefill_prefix_kv_budget_bytes = kv_budget
         if not pool_enabled:
-            return
+            return PrefillPrefixKVBudgetOutcome(
+                _prefill_prefix_kv_budget_bytes, _prefill_pool_page_budget,
+            )
         budget = pool_pages_from_budget(
-            free_bytes, workspace, self._prefill_pool_page_bytes(),
+            free_bytes, workspace, _prefill_pool_page_bytes(),
         )
-        previous = self._prefill_pool_page_budget
-        self._prefill_pool_page_budget = budget
+        previous = ctx._prefill_pool_page_budget
+        _prefill_pool_page_budget = budget
         if previous is None or previous != budget:
             logging.info(
                 "[PREFIX_POOL] Rank %s prefill-phase pool budget: %d pages "
                 "(%d B free, %d B workspace, was %s)",
-                self.rank, budget, free_bytes,
+                ctx.rank, budget, free_bytes,
                 int(batching.prefill_prefix_pool_workspace_bytes), previous,
             )
+        return PrefillPrefixKVBudgetOutcome(
+            _prefill_prefix_kv_budget_bytes, _prefill_pool_page_budget,
+        )
 
-    def _construct_prefill_pool(self, worker, wave) -> None:
-        """Build the planned wave's GPU pool and executor in the prefill phase."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
+    def _construct_prefill_pool(
+        self, ctx: PrefillPoolConstructionContext, wave, *,
+        _prefill_pool_group: Callable,
+        _prefill_pool_page_bytes: Callable[[], int],
+        _prefill_pool_layout: Callable,
+        _prefill_pool_page_dims: Callable,
+        _new_pool_kernel_dump_recorder: Callable,
+        _pool_pad_poison_enabled: Callable,
+    ) -> PrefillPoolBaseOutcome:
+        """Build the planned wave's GPU pool and executor in the prefill phase.
+
+        The budget reduction is a group collective and it does not move:
+        ``dist.all_reduce`` sits under the one condition the pre-move body
+        gave it (``group is not None``, i.e. G>1), between the tensor that
+        carries this rank's budget and the first read of the reduced value.
+        The group handle is the only thing it is conditional on, so every rank
+        of a serve group issues it, in this position, exactly once.
+
+        The wave's own fields (``pool``, ``executor``) and the pool's dump
+        recorder are set on objects the caller owns, in place. The one worker
+        attribute, the device-memory baseline, travels back in
+        :class:`PrefillPoolBaseOutcome`. All six collaborators are the worker
+        delegators the pre-move body called, and not one of them shares this
+        read set: the page dims and the pool group take the PSM context, the
+        row layout its own model-and-cache context, the page bytes the
+        deployment pair, the pad-poison predicate the probe context, and the
+        kernel-dump recorder is still worker-shaped until D7.4.
+        """
         from batchgen.prefix_reuse.executor import PoolChunkExecutor
         from batchgen.prefix_reuse.pool import PrefillPrefixPool
 
         num_pages = wave.total_pages
-        budget = self._prefill_pool_page_budget
-        group = self._prefill_pool_group()
+        budget = ctx._prefill_pool_page_budget
+        group = _prefill_pool_group()
         if group is not None:
             # One pool size per serve group: a rank-local jitter shrink (or a
             # rank-local failure) would leave the group's ranks in different
@@ -1241,7 +1463,7 @@ class PrefillEngine:
             reduced = torch.tensor(
                 [-1 if budget is None else int(budget)],
                 dtype=torch.int64,
-                device=self.torch_device,
+                device=ctx.torch_device,
             )
             dist.all_reduce(reduced, op=dist.ReduceOp.MIN, group=group)
             budget = None if int(reduced.item()) < 0 else int(reduced.item())
@@ -1253,23 +1475,23 @@ class PrefillEngine:
             required = wave.plan.peak_pool_pages + wave.scratch_pages
             if budget < required:
                 raise RuntimeError(
-                    f"Rank {self.rank}: prefill pool budget shrank to {budget} "
+                    f"Rank {ctx.rank}: prefill pool budget shrank to {budget} "
                     f"pages below the required {required} (peak "
                     f"{wave.plan.peak_pool_pages} + scratch {wave.scratch_pages})"
                 )
             logging.info(
                 "[PREFIX_POOL] Rank %s pool shrinks to the fresh budget: "
                 "%d pages (planned %d, required %d)",
-                self.rank, budget, num_pages, required,
+                ctx.rank, budget, num_pages, required,
             )
             num_pages = budget
         from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
-        geometry_page_bytes = self._prefill_pool_page_bytes()
-        geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
-        with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
+        geometry_page_bytes = _prefill_pool_page_bytes()
+        geometry = build_gpu_kv_config(ctx.huggingface_ckpt_name, [wave.page_tokens])
+        with_v, indexer_layers, indexer_dim = _prefill_pool_layout(geometry)
         pool_layers, pool_heads, k_head_dim, v_head_dim = (
-            self._prefill_pool_page_dims(geometry)
+            _prefill_pool_page_dims(geometry)
         )
         pool = PrefillPrefixPool(
             num_layers=pool_layers,
@@ -1278,7 +1500,7 @@ class PrefillEngine:
             num_kv_heads=pool_heads,
             head_dim=k_head_dim,
             dtype=geometry.kv_dtype,
-            device=self.torch_device,
+            device=ctx.torch_device,
             with_v=with_v,
             v_head_dim=v_head_dim,
             indexer_layers=indexer_layers,
@@ -1290,25 +1512,29 @@ class PrefillEngine:
                 f"{geometry_page_bytes} B"
             )
         wave.pool = pool
-        pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
+        pool.kernel_dump = _new_pool_kernel_dump_recorder(wave)
         wave.executor = PoolChunkExecutor(
             wave.plan, wave.prompts, pool,
-            pad_poison=self._pool_pad_poison_enabled(wave),
+            pad_poison=_pool_pad_poison_enabled(wave),
         )
-        free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
-        reserved = torch.cuda.memory_reserved(self.local_rank)
-        self._prefill_pool_base = (
-            torch.cuda.memory_allocated(self.local_rank),
+        free_after, device_total = torch.cuda.mem_get_info(ctx.local_rank)
+        reserved = torch.cuda.memory_reserved(ctx.local_rank)
+        _prefill_pool_base = (
+            torch.cuda.memory_allocated(ctx.local_rank),
             reserved,
             device_total - free_after - reserved,
         )
-        torch.cuda.reset_peak_memory_stats(self.local_rank)
+        torch.cuda.reset_peak_memory_stats(ctx.local_rank)
         logging.info(
             "[PREFIX_POOL] Rank %s pool up: %d pages (%d B each, %d segments)",
-            self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
+            ctx.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
         )
+        return PrefillPoolBaseOutcome(_prefill_pool_base)
 
-    def _check_pool_plan_identical(self, worker, plan, group, *, attn_group_size: int) -> None:
+    def _check_pool_plan_identical(
+        self, ctx: PoolPlanIdentityContext, plan, group, *,
+        attn_group_size: int,
+    ) -> None:
         """Raise unless every rank of the serve group planned the same wave.
 
         Deterministic planning over replicated prompts and a group-MIN budget
@@ -1316,11 +1542,12 @@ class PrefillEngine:
         different chunks of the per-layer collectives that pair them up, so it
         is named here instead of deadlocking or corrupting a row later. No-op at
         G==1, where the rank's plan is its own.
+
+        The ``dist.all_gather`` does not move: it stays under the one exit the
+        pre-move body had above it (``group is None``, i.e. G==1), after the
+        whole digest has been hashed and before the digests are compared.
+        Nothing is written here, so this operation declares no outcome.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if group is None:
             return
         hasher = hashlib.blake2b(digest_size=7)
@@ -1334,7 +1561,7 @@ class PrefillEngine:
         digest = torch.tensor(
             [int.from_bytes(hasher.digest(), "little")],
             dtype=torch.int64,
-            device=self.torch_device,
+            device=ctx.torch_device,
         )
         gathered = [
             torch.zeros_like(digest) for _ in range(attn_group_size)
@@ -1342,12 +1569,16 @@ class PrefillEngine:
         dist.all_gather(gathered, digest, group=group)
         if len({int(item.item()) for item in gathered}) != 1:
             raise RuntimeError(
-                f"Rank {self.rank}: the prefill prefix pool plan diverged inside "
+                f"Rank {ctx.rank}: the prefill prefix pool plan diverged inside "
                 f"the serve group ({len(plan.chunks)} chunks, "
                 f"{len(plan.segments)} segments, digest {int(digest.item())})"
             )
 
-    def _prefill_pool_layout(self, worker, geometry) -> tuple:
+    def _prefill_pool_layout(
+        self, ctx: PrefillPoolLayoutContext, geometry, *,
+        _prefill_host_view_is_dual: Callable[[], bool],
+        _prefill_pool_psm_layout: Callable,
+    ) -> Tuple[tuple, PrefillPoolLayoutOutcome]:
         """(with_v, indexer_layers, indexer_dim) of this model's prefill pool.
 
         A DSA model (dual Host KV) pools the indexer keys of its full (top-k
@@ -1364,31 +1595,39 @@ class PrefillEngine:
         ``_prefill_pool_page_dims`` kept declaring ``v_head_dim``, and the
         two would disagree silently -- ``PrefillPrefixPool`` simply leaves
         ``self.v`` as None.
+
+        The cache is the one worker attribute here and it travels back in
+        :class:`PrefillPoolLayoutOutcome`: the two early exits write nothing
+        and leave the field at the sentinel, and the DSA walk's single write
+        is the statement before its return, so the delegator applies it in the
+        pre-move order with nothing in between. The dual-host predicate and
+        the PSM override are collaborators rather than siblings taking this
+        context: the first is the worker's isinstance carve-out and the second
+        reads the PSM handle, which this context does not carry.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        if not self._prefill_host_view_is_dual():
-            return True, (), 0
-        psm_layout = self._prefill_pool_psm_layout()
+        _prefill_pool_layout_cache = PREFILL_UNCHANGED
+        if not _prefill_host_view_is_dual():
+            return (True, (), 0), PrefillPoolLayoutOutcome(
+                _prefill_pool_layout_cache
+            )
+        psm_layout = _prefill_pool_psm_layout()
         with_v = bool(psm_layout and int(psm_layout["v_head_dim"]) > 0)
-        if self.model is None:
+        if ctx.model is None:
             # Wave planning runs at reservation time (decode phase), where the
             # model object is not resident. The layout is a model constant and
             # the budget gate guarantees a prefill measured it before any wave
             # plans, so the cached copy is always available here.
-            cached = getattr(self, "_prefill_pool_layout_cache", None)
+            cached = ctx._prefill_pool_layout_cache
             if cached is None:
                 raise RuntimeError(
                     "DSA prefill pool: layout requested before the first "
                     "prefill measured it"
                 )
-            return cached
+            return cached, PrefillPoolLayoutOutcome(_prefill_pool_layout_cache)
         # The layers' own indexers decide what prefill scores and offloads: a
         # shared layer has none and reuses the previous full layer's top-k.
         indexers = {}
-        for layer_idx, layer in enumerate(self.model.model.layers):
+        for layer_idx, layer in enumerate(ctx.model.model.layers):
             attn = getattr(layer.self_attn, "module", layer.self_attn)
             if getattr(attn, "indexer", None) is not None:
                 indexers[layer_idx] = attn.indexer
@@ -1401,18 +1640,18 @@ class PrefillEngine:
         # declares -- a table lookup, not a per-model branch.
         logical_map = getattr(geometry, "logical_to_physical_layer", None)
         kv_depth = len(logical_map) if logical_map else geometry.num_layers
-        if not indexers or len(self.model.model.layers) != kv_depth:
+        if not indexers or len(ctx.model.model.layers) != kv_depth:
             raise RuntimeError(
                 "DSA prefill pool: indexer layers do not match the KV geometry "
-                f"({len(indexers)} indexer layers, {len(self.model.model.layers)} "
+                f"({len(indexers)} indexer layers, {len(ctx.model.model.layers)} "
                 f"engine layers, KV logical depth {kv_depth})"
             )
         dims = {int(indexer.index_head_dim) for indexer in indexers.values()}
         if len(dims) != 1:
             raise RuntimeError(f"DSA prefill pool: mixed indexer head dims {sorted(dims)}")
         layout = (with_v, tuple(indexers), dims.pop())
-        self._prefill_pool_layout_cache = layout
-        return layout
+        _prefill_pool_layout_cache = layout
+        return layout, PrefillPoolLayoutOutcome(_prefill_pool_layout_cache)
 
     def _replace_prefix_lookup_hits(
         self, ctx: PrefixLookupReplacementContext, seqs, prefix_states,
@@ -1539,22 +1778,31 @@ class PrefillEngine:
             seg.tokens for seg in wave.computed_segments()
         ) // wave.page_tokens
 
-    def _allocate_prefill_pool_host_pages(self, worker, host_views, prefix_states) -> None:
-        """One Host copy per pooled segment; members attach their chain of them."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
+    def _allocate_prefill_pool_host_pages(
+        self, ctx: PrefillPoolHostPageContext, host_views, prefix_states, *,
+        _next_pool_segment_sid: Callable[[], int],
+        _prefill_pool_segment_host_pages: Callable[[], int],
+    ) -> None:
+        """One Host copy per pooled segment; members attach their chain of them.
+
+        No worker attribute is written, so this operation declares no
+        outcome: the prefix-reuse owner installs the replaced state and
+        records the member references through its own methods, reached through
+        the context, and the caller's ``prefix_states`` map is its own object,
+        mutated in place exactly as before. The segment-id allocator is handed
+        on as a CALLABLE, which is what the pre-move body handed on -- the
+        allocation helper calls it once per segment.
+        """
         from batchgen.prefix_reuse.wave_runtime import allocate_segment_host_pages
 
-        wave = self._prefill_pool_wave
+        wave = ctx._prefill_pool_wave
         allocated = allocate_segment_host_pages(
-            wave, host_views, self._next_pool_segment_sid
+            wave, host_views, _next_pool_segment_sid
         )
-        if allocated != self._prefill_pool_segment_host_pages():
+        if allocated != _prefill_pool_segment_host_pages():
             raise RuntimeError(
                 f"pool segments got {allocated} Host pages, planned "
-                f"{self._prefill_pool_segment_host_pages()}"
+                f"{_prefill_pool_segment_host_pages()}"
             )
         for index, global_id in enumerate(wave.global_ids):
             if not wave.chains[index]:
@@ -1571,7 +1819,7 @@ class PrefillEngine:
             # replace-setter: the call site needs the replaced state anyway
             # for its wave-local ``prefix_states`` map, so the owner would
             # otherwise duplicate the ``replace`` the caller already did.
-            self._prefix.install_state(global_id, state)
+            ctx.prefix.install_state(global_id, state)
             # A segment's Host pages live until its last member releases. A
             # materialized segment has no pseudo sequence to refcount: its
             # pages are the prefix cache's, kept by this sequence's own
@@ -1581,9 +1829,12 @@ class PrefillEngine:
                 for seg in wave.chains[index]
                 if seg not in wave.materialized
             )
-            self._prefix.add_pool_member_refs(global_id, sids)
+            ctx.prefix.add_pool_member_refs(global_id, sids)
 
-    def _materialized_segment_loader(self, worker, wave):
+    def _materialized_segment_loader(
+        self, ctx: MaterializedSegmentStagingContext, wave, *,
+        _host_views_by_group: Callable,
+    ):
         """Staging for this wave's loads, or None when it materializes none.
 
         One loader per prefix-cache KV group, keyed by group id. Group 0 is the
@@ -1592,11 +1843,13 @@ class PrefillEngine:
         ARE the index keys, so they are read back and dequantized rather than
         reconstructed, and they are cut at the same page boundaries as the
         latent so the two slab streams pair up one for one.
+
+        The index-key carrier is a sibling that reads NO worker state, so it is
+        called on the engine directly: a worker delegator would add nothing to
+        it, the same reason D7.1's page dims call the PSM layout with their own
+        context. The Host views arrive as the worker delegator the pre-move
+        body called.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         from batchgen.kv_cache.host_kv_mananger_config import (
             build_gpu_kv_config,
             build_gpu_kv_config_aux,
@@ -1609,7 +1862,7 @@ class PrefillEngine:
 
         if not wave.materialized:
             return None
-        views = self._host_views_by_group()
+        views = _host_views_by_group()
         if sorted(views) not in ([0], [0, 1]):
             raise RuntimeError(
                 "materializing a prefix needs the primary Host KV region "
@@ -1617,7 +1870,7 @@ class PrefillEngine:
                 f"this model has groups {sorted(views)}"
             )
         geometry = build_gpu_kv_config(
-            self.huggingface_ckpt_name, [int(wave.page_tokens)]
+            ctx.huggingface_ckpt_name, [int(wave.page_tokens)]
         )
         primary = MaterializedSegmentLoader(
             worker_view=views[0],
@@ -1625,13 +1878,13 @@ class PrefillEngine:
             page_tokens=int(wave.page_tokens),
             latent_dim=int(geometry.num_k_heads) * int(geometry.k_head_dim),
             dtype=geometry.kv_dtype,
-            device=self.torch_device,
+            device=ctx.torch_device,
             max_slab_bytes=DEFAULT_SLAB_BYTES,
         )
         loaders = {0: primary}
         if 1 in views:
             aux_geometry = build_gpu_kv_config_aux(
-                self.huggingface_ckpt_name, [int(wave.page_tokens)]
+                ctx.huggingface_ckpt_name, [int(wave.page_tokens)]
             )
             if aux_geometry is None:
                 raise RuntimeError(
@@ -1653,18 +1906,18 @@ class PrefillEngine:
                 carrier_bytes=self._prefix_pool_index_key_carrier(aux_geometry),
                 slab_pages=primary.slab_pages,
                 dtype=geometry.kv_dtype,
-                device=self.torch_device,
+                device=ctx.torch_device,
             )
         logging.info(
             "[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
             "%d B of device staging (%d Host page(s) per slab, groups %s)",
-            self.rank, len(wave.materialized),
+            ctx.rank, len(wave.materialized),
             sum(loader.staging_bytes for loader in loaders.values()),
             primary.slab_pages, sorted(loaders),
         )
         return loaders
 
-    def _prefix_pool_index_key_carrier(self, worker, aux_geometry) -> int:
+    def _prefix_pool_index_key_carrier(self, aux_geometry) -> int:
         """Bytes per token in the auxiliary region, scale bytes included.
 
         A page-split FP8 region declares ``k_head_dim`` in BYTES per token (the
@@ -1672,11 +1925,11 @@ class PrefillEngine:
         key width through the layout's own statement. An AoS indexer region
         declares ELEMENTS and carries no scale, so reading it as page-split
         bytes would silently reinterpret every key: refused here.
+
+        It takes NO context: both values it reads come off the geometry it is
+        given, so there is no worker state to snapshot and an empty context
+        would claim otherwise. Its delegator resolves nothing for it either.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if aux_geometry.kv_dtype is not torch.float8_e4m3fn:
             raise RuntimeError(
                 "loading a cached prefix's index keys needs the page-split "
@@ -1684,7 +1937,9 @@ class PrefillEngine:
             )
         return int(aux_geometry.k_head_dim)
 
-    def _materialized_pool_index_key_layers(self, worker, pool):
+    def _materialized_pool_index_key_layers(
+        self, ctx: MaterializedIndexKeyLayersContext, pool,
+    ):
         """The attention layers that materialize INDEX KEYS, in pool-row order.
 
         The same assertion the latent walk makes, against the pool's indexer
@@ -1693,18 +1948,19 @@ class PrefillEngine:
         engine order and the load addresses it by that one index. A model whose
         two orders disagree would load every layer's prefix keys into the wrong
         row and the suffix would select plausible keys from the wrong depth.
+
+        Its own context rather than the pool layout's: that one also carries
+        the layout cache, which the pre-move body read with a ``getattr``
+        default, and sharing it would make this walk's delegator resolve an
+        attribute a worker need not have. Nothing is written here.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         rows = getattr(pool, "indexer_row", None) if pool is not None else None
         if not rows:
             raise RuntimeError(
                 "a materialized DSA prefix needs the pool's indexer rows"
             )
         layers = []
-        for engine_layer, decoder_layer in enumerate(self.model.model.layers):
+        for engine_layer, decoder_layer in enumerate(ctx.model.model.layers):
             attn = decoder_layer.self_attn
             if not hasattr(attn, "materialize_pool_segment_index_keys"):
                 continue
@@ -1728,7 +1984,11 @@ class PrefillEngine:
             )
         return layers
 
-    def _load_materialized_segments(self, worker, wave, rows, loaders) -> int:
+    def _load_materialized_segments(
+        self, ctx: MaterializedSegmentLoadContext, wave, rows, loaders, *,
+        _materialized_pool_layers: Callable,
+        _materialized_pool_index_key_layers: Callable,
+    ) -> int:
         """Fill this chunk's loaded segments BEFORE its forward reads them.
 
         Per slab: one H2D per KV group of the committed prefix across every
@@ -1740,22 +2000,29 @@ class PrefillEngine:
         regions carry the SAME segment pages in the same order, so the slabs
         pair up and one window of pool slots receives both. Returns the number
         of tokens loaded, for the wave's metrics.
+
+        Nothing on the load path moves. The H2D and the wait that makes its
+        bytes visible are the loader's own, inside ``slabs``: this body
+        creates one slab generator per KV group, in group order, and consumes
+        them in lockstep through ``zip``, which is what drives those waits. So
+        the generator creation, the ``zip`` and every write inside it stay in
+        their pre-move order and count, and the body writes no worker
+        attribute, so it declares no outcome. The index-key walk arrives as
+        the worker delegator the pre-move body called (its read set is the
+        model, which this context does not carry) and the latent walk as the
+        worker's own model-state seam method of that name.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if not rows.materialized:
             return 0
         if not loaders:
             raise RuntimeError(
-                f"Rank {self.rank}: this chunk loads "
+                f"Rank {ctx.rank}: this chunk loads "
                 f"{len(rows.materialized)} materialized segment(s) with no "
                 "staging; the wave was built without a loader"
             )
-        layers = self._materialized_pool_layers()
+        layers = _materialized_pool_layers()
         key_layers = (
-            self._materialized_pool_index_key_layers(wave.pool)
+            _materialized_pool_index_key_layers(wave.pool)
             if 1 in loaders else ()
         )
         loaded = 0
@@ -1763,12 +2030,12 @@ class PrefillEngine:
             pages_by_group = wave.segment_host_pages.get(stage.segment_id)
             if not pages_by_group:
                 raise RuntimeError(
-                    f"Rank {self.rank}: materialized segment "
+                    f"Rank {ctx.rank}: materialized segment "
                     f"{stage.segment_id} names no Host page to load from"
                 )
             if sorted(pages_by_group) != sorted(loaders):
                 raise RuntimeError(
-                    f"Rank {self.rank}: materialized segment "
+                    f"Rank {ctx.rank}: materialized segment "
                     f"{stage.segment_id} names Host pages in groups "
                     f"{sorted(pages_by_group)}, this model loads groups "
                     f"{sorted(loaders)}"
@@ -1797,7 +2064,7 @@ class PrefillEngine:
                         or key_slab.tokens != latent_slab.tokens
                     ):
                         raise RuntimeError(
-                            f"Rank {self.rank}: materialized segment "
+                            f"Rank {ctx.rank}: materialized segment "
                             f"{stage.segment_id} loaded index keys for "
                             f"[{key_slab.token_start}, {key_slab.tokens}) "
                             f"against a latent slab of "
@@ -1813,7 +2080,7 @@ class PrefillEngine:
                 "[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
                 "token(s) over %d Host page(s) per region into %d pool "
                 "page(s), groups %s",
-                self.rank, stage.segment_id, int(stage.tokens), len(pages),
+                ctx.rank, stage.segment_id, int(stage.tokens), len(pages),
                 len(stage.pages), sorted(loaders),
             )
         return loaded

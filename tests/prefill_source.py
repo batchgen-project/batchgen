@@ -12,6 +12,7 @@ the real body changes, and re-implements nothing.
 
 import ast
 import copy
+import hashlib
 import logging
 import math
 from pathlib import Path
@@ -33,10 +34,24 @@ CONTEXT_CLASSES = {
     "MaterializedPrefixHitsContext",
     "PrefixLookupReplacementContext",
     "TrajectoryRestoreSettleContext",
+    # D7.3: the pool construction and layout contexts.
+    "PrefillPrefixKVBudgetContext",
+    "PrefillPoolConstructionContext",
+    "PoolPlanIdentityContext",
+    "PrefillPoolLayoutContext",
+    "PrefillPoolHostPageContext",
+    "MaterializedSegmentStagingContext",
+    "MaterializedIndexKeyLayersContext",
+    "MaterializedSegmentLoadContext",
 }
 # The frozen outcomes this engine declares: a converted body hands its worker
 # writes back in one of these for the delegator to apply.
-OUTCOME_CLASSES = {"PrefixRankCostProfileCacheOutcome"}
+OUTCOME_CLASSES = {
+    "PrefixRankCostProfileCacheOutcome",
+    "PrefillPrefixKVBudgetOutcome",
+    "PrefillPoolBaseOutcome",
+    "PrefillPoolLayoutOutcome",
+}
 # Module-scope values the loaded definitions close over, compiled from the
 # real source so a test can compare against the engine's own object identity.
 MODULE_SENTINELS = {"PREFILL_UNCHANGED"}
@@ -69,13 +84,40 @@ D7_2_METHODS = {
     "_replace_prefix_lookup_hits",
     "_settle_trajectory_restore_plan",
 }
+# The D7.3 names: pool construction and layout. `_prefix_pool_index_key_carrier`
+# reads no worker state at all, so like the three predicates above it takes no
+# context either.
+D7_3_METHODS = {
+    "_measure_prefill_prefix_kv_budget",
+    "_construct_prefill_pool",
+    "_check_pool_plan_identical",
+    "_prefill_pool_layout",
+    "_allocate_prefill_pool_host_pages",
+    "_materialized_segment_loader",
+    "_prefix_pool_index_key_carrier",
+    "_materialized_pool_index_key_layers",
+    "_load_materialized_segments",
+}
 STATELESS_METHODS = {
     "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
-    "_unmaterializable_frontier",
+    "_unmaterializable_frontier", "_prefix_pool_index_key_carrier",
 }
-# The one converted operation that hands a worker write back in an outcome.
-OUTCOME_METHODS = {"_cached_prefix_rank_cost_profile"}
-METHODS = set(D7_1_METHODS) | set(D7_2_METHODS)
+# Every converted operation that hands a worker write back in an outcome.
+OUTCOME_METHODS = {
+    "_cached_prefix_rank_cost_profile",
+    "_measure_prefill_prefix_kv_budget",
+    "_construct_prefill_pool",
+    "_prefill_pool_layout",
+}
+# The two bodies that issue a process-group collective, and the collective each
+# one issues. Pinned here so the position tests and the stage scan read one
+# declaration: a rank that issued these in a different order would deadlock the
+# serve group.
+COLLECTIVE_METHODS = {
+    "_construct_prefill_pool": "all_reduce",
+    "_check_pool_plan_identical": "all_gather",
+}
+METHODS = set(D7_1_METHODS) | set(D7_2_METHODS) | set(D7_3_METHODS)
 
 
 def engine_class_node():
@@ -127,6 +169,10 @@ def load_prefill(namespace=None):
     namespace = dict(namespace or {})
     for name, value in dict(
         __name__=__name__, logging=logging, math=math, torch=torch,
+        # D7.3: the plan digest is hashed with the real blake2b, so a test
+        # compares the engine's own digest rather than a restated one.
+        # ``dist`` stays caller-supplied: a collective has to be observed.
+        hashlib=hashlib,
     ).items():
         namespace.setdefault(name, value)
     tree = ast.parse(SOURCE.read_text())
