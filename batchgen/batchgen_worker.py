@@ -3843,14 +3843,14 @@ class BatchGenWorker:
 		load_from_host: bool = True,
 		collective_preflight: bool = False,
 	) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._allocate_gpu_kv_two_page_buffer(
-			self,
+			self._decode_phase_context(),
 			local_sequence_ids,
 			load_from_host,
 			collective_preflight,
@@ -3868,44 +3868,110 @@ class BatchGenWorker:
 			uuids,
 		)
 
+	def _deferred_kv_flush_context(self):
+		"""The decode forward's deferred-append channel, frozen per flush."""
+		from batchgen.worker.kv_capacity_engine import DeferredKVFlushContext
+		return DeferredKVFlushContext(
+			deferred_entries=getattr(self, '_deferred_kv_entries', []),
+			deferred_entries_aux=getattr(self, '_deferred_kv_entries_aux', []),
+			deferred_worker_view=getattr(self, '_deferred_kv_worker_view', None),
+			deferred_batch=getattr(self, '_deferred_kv_batch', None),
+			deferred_worker_view_aux=getattr(
+				self, '_deferred_kv_worker_view_aux', None
+			),
+		)
+
+	def _pending_kv_append_tensor_list(self) -> list:
+		"""The append-tensor list, created here so both halves share ONE.
+
+		The pre-move bodies created this list on first use INSIDE the launch
+		and found it with hasattr on every later append, so it has to exist
+		before the engine runs: a copy would strand the tensors the in-flight
+		D2H copies read from, and the per-step drain clears the SAME object.
+		An empty list reads exactly as that hasattr miss did, because the
+		drain's only use of it is ``clear()``.
+		"""
+		if not hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors = []
+		return self._pending_kv_append_tensors
+
 	def _flush_deferred_kv_to_host(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._flush_deferred_kv_to_host(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPU_KV_UNCHANGED
+		outcome = engine._flush_deferred_kv_to_host(
+			self._deferred_kv_flush_context(),
+			# A worker-owned container passed explicitly, exactly as the
+			# pending KV-append channel reaches _wait_pending_kv_append_tasks.
+			getattr(self, "_pending_kv_append_tasks", None),
+			self._pending_kv_append_tensor_list(),
+			_ensure_host_kv_append_capacity=self._ensure_host_kv_append_capacity,
 		)
+		# The channel reset, in the order the pre-move tail wrote it. The early
+		# exit resets the two entry lists only, so the other three stay as the
+		# forward left them.
+		if outcome._deferred_kv_entries is not GPU_KV_UNCHANGED:
+			self._deferred_kv_entries = outcome._deferred_kv_entries
+		if outcome._deferred_kv_entries_aux is not GPU_KV_UNCHANGED:
+			self._deferred_kv_entries_aux = outcome._deferred_kv_entries_aux
+		if outcome._deferred_kv_batch is not GPU_KV_UNCHANGED:
+			self._deferred_kv_batch = outcome._deferred_kv_batch
+		if outcome._deferred_kv_worker_view is not GPU_KV_UNCHANGED:
+			self._deferred_kv_worker_view = outcome._deferred_kv_worker_view
+		if outcome._deferred_kv_worker_view_aux is not GPU_KV_UNCHANGED:
+			self._deferred_kv_worker_view_aux = (
+				outcome._deferred_kv_worker_view_aux
+			)
 
 	def _ensure_host_kv_append_capacity(
 		self,
 		sequence_ids: List[int],
 		sequence_lengths: List[int],
 	) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._ensure_host_kv_append_capacity(
-			self,
+			self._decode_phase_context(),
 			sequence_ids,
 			sequence_lengths,
 		)
 
 	def _aux_layers_with_slots(self):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._aux_layers_with_slots(
-			self,
+		from batchgen.worker.kv_capacity_engine import (
+			GPU_KV_UNCHANGED,
+			AuxLayerSlotsContext,
 		)
+		result, outcome = engine._aux_layers_with_slots(
+			AuxLayerSlotsContext(
+				aux_coordinator=getattr(
+					self, "gpu_paged_kv_cache_manager", None
+				),
+				_aux_layers_with_slots_cache=getattr(
+					self, "_aux_layers_with_slots_cache", False
+				),
+			),
+		)
+		# Only the resolving call caches; a hit and an uninitialized aux pool
+		# both leave the memo exactly as it was (for the pool, still absent).
+		if outcome._aux_layers_with_slots_cache is not GPU_KV_UNCHANGED:
+			self._aux_layers_with_slots_cache = (
+				outcome._aux_layers_with_slots_cache
+			)
+		return result
 
 	def _append_decode_kv_to_host_aux_async(
 		self,
@@ -3915,19 +3981,25 @@ class BatchGenWorker:
 		v_tensor: torch.Tensor = None,
 		scale_tensor: torch.Tensor = None,
 	) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._append_decode_kv_to_host_aux_async(
-			self,
+			self._decode_phase_context(),
+			# The same two worker-owned containers as the deferred flush; this
+			# body drains them itself at its cap, so they come in by reference.
+			getattr(self, "_pending_kv_append_tasks", None),
+			self._pending_kv_append_tensor_list(),
 			layer_idx,
 			batch,
 			k_tensor,
 			v_tensor,
 			scale_tensor,
+			_aux_layers_with_slots=self._aux_layers_with_slots,
+			_wait_pending_kv_append_tasks=self._wait_pending_kv_append_tasks,
 		)
 
 	def _initialize_core_components(self, num_queries: int) -> None:
@@ -4438,14 +4510,14 @@ class BatchGenWorker:
 		manager: GPUPagedKVCacheManager,
 		global_sequence_ids: List[int],
 	) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._load_host_kv_to_gpu(
-			self,
+			self._decode_phase_context(),
 			manager,
 			global_sequence_ids,
 		)
@@ -11993,14 +12065,14 @@ class BatchGenWorker:
 		batch: List[int],
 		gpu_manager,
 	) -> Tuple[List[str], List[int]]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._integrate_pending_async_load(
-			self,
+			self._decode_phase_context(),
 			pending_async_task,
 			pending_load_uuids,
 			pending_load_local_indices,
@@ -12008,6 +12080,7 @@ class BatchGenWorker:
 			decode_uuids,
 			batch,
 			gpu_manager,
+			_finalize_async_load_minimal=self._finalize_async_load_minimal,
 		)
 
 	def _ensure_decode_metadata_capacity(self, batch_size: int) -> None:

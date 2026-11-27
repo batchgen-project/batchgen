@@ -27,7 +27,14 @@ take the same decode phase context the free-page reads take. D6.3's watermark
 pair declares its own value context; its host-capacity due checks and its
 migration operations take the decode phase context their already-converted
 siblings take, with the one launch flag or latch each still needs arriving as
-an explicit value argument beside it. The
+an explicit value argument beside it. D6.4's decode append-to-host and
+host-to-GPU load operations take the decode phase context, except the deferred
+flush, whose five-attribute handoff channel from the decode forward is neither
+rank facts nor phase state and so declares its own value context; the worker's
+pending append-task and append-tensor lists arrive BY REFERENCE as explicit
+value arguments, the way they already reach ``_wait_pending_kv_append_tasks``,
+because the per-step drain waits on and clears the same objects the launch
+appended to. The
 remaining operations retain the older worker
 delegator shape until their own conversion slice. The worker keeps a same-name
 delegator for every moved method.
@@ -371,6 +378,61 @@ class KVMigrationReceiveOutcome:
     # the original create-then-add statements in their order.
     _migrated_sequences: object
     _pending_migrated_query_book: object
+
+
+# D6.4: the deferred flush reads the decode forward's handoff channel, which is
+# neither a rank fact nor decode phase state, so it declares its own value
+# context. The flush is the channel's only consumer: it reads the queued
+# entries once and resets all five attributes, so the reads come in by value
+# and the resets go back in the outcome.
+@dataclass(frozen=True)
+class DeferredKVFlushContext:
+    # ``[]`` / ``None`` are the pre-move ``getattr`` defaults: a worker whose
+    # forward queued nothing carries none of these attributes at all.
+    deferred_entries: object
+    deferred_entries_aux: object
+    deferred_worker_view: object
+    deferred_batch: object
+    deferred_worker_view_aux: object
+
+
+@dataclass(frozen=True)
+class DeferredKVFlushOutcome:
+    # The channel reset. The early exit that drops an unusable batch wrote the
+    # two entry lists only; the tail wrote all five. A branch that reset
+    # nothing leaves its field at the sentinel, which is distinct from writing
+    # ``None`` -- the tail writes exactly that into the last three.
+    _deferred_kv_entries: object = GPU_KV_UNCHANGED
+    _deferred_kv_entries_aux: object = GPU_KV_UNCHANGED
+    _deferred_kv_batch: object = GPU_KV_UNCHANGED
+    _deferred_kv_worker_view: object = GPU_KV_UNCHANGED
+    _deferred_kv_worker_view_aux: object = GPU_KV_UNCHANGED
+
+
+@dataclass(frozen=True)
+class AuxLayerSlotsContext:
+    """The aux-slot resolution's two reads, with the pre-move defaults.
+
+    Deliberately NOT the decode phase context: this pair of reads is all the
+    body touches, and the aux layer map is resolved during startup as well as
+    during decode, before a phase context exists.
+    """
+
+    # ``None`` is the pre-move ``getattr`` default: no GPU KV coordinator is
+    # bound yet, so there is no auxiliary pool to read a layer map from.
+    aux_coordinator: object
+    # ``False`` is the pre-move ``getattr`` default, standing for "not
+    # resolved yet", which ``None`` (resolved to "no layer mapping") does not.
+    _aux_layers_with_slots_cache: object
+
+
+@dataclass(frozen=True)
+class AuxLayerSlotsOutcome:
+    # The memo behind the aux-slot map. Only the tail writes it: a cache hit
+    # returns the memo untouched, and an aux pool that is not initialized yet
+    # deliberately does NOT cache, because the layer map appears only once the
+    # pool exists. Both leave the field at the sentinel.
+    _aux_layers_with_slots_cache: object = GPU_KV_UNCHANGED
 
 
 class KVCapacityEngine:
@@ -2019,48 +2081,53 @@ class KVCapacityEngine:
         return bool(int(can_allocate.item()))
 
     def _allocate_gpu_kv_two_page_buffer(
-        self, worker, 
+        self, ctx,
         local_sequence_ids: List[int],
         load_from_host: bool = True,
         collective_preflight: bool = False,
     ) -> bool:
         """
         Allocate GPU KV pages using two-page buffer strategy.
-    
+
         Returns:
             True if allocation succeeded, False otherwise.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        manager = self.gpu_paged_kv_cache_manager
+        manager = ctx.gpu_kv
         if manager is None:
             if collective_preflight:
-                return self._collective_gpu_kv_allocation_preflight(0, 0)
+                return self._collective_gpu_kv_allocation_preflight(ctx, 0, 0)
             return False
         if not manager.is_initialized:
             if collective_preflight:
-                return self._collective_gpu_kv_allocation_preflight(0, 0)
+                return self._collective_gpu_kv_allocation_preflight(ctx, 0, 0)
             return False
         if not local_sequence_ids:
             if collective_preflight:
                 return self._collective_gpu_kv_allocation_preflight(
-                    0, manager.get_stats().num_free_pages
+                    ctx, 0, manager.get_stats().num_free_pages
                 )
             return True
-    
-        global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-    
+
+        global_ids = IndexManager.local_indices_to_global_seq_ids(
+            IndexLookupRequest(
+                rank=ctx.facts.rank,
+                local_to_uuid=ctx.sched.seq_table.local_to_uuid,
+                uuid_to_local=ctx.sched.seq_table.uuid_to_local,
+                global_batch=ctx.sched.pool,
+            ),
+            local_sequence_ids,
+        )
+
         pages_per_seq = []
         total_pages = 0
     
         # DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
         alloc_details = []
         for local_idx in local_sequence_ids:
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
+            seq = ctx.sched.pool.get_sequence(uuid)
             pages = seq.get_gpu_pages_for_two_page_buffer()
-            pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
+            pages_per_seq.append(pages * ctx.facts.page_size)  # tokens for API
             total_pages += pages
         
             # Track details for resuming sequences (decoded_length > 0)
@@ -2076,7 +2143,7 @@ class KVCapacityEngine:
     
         if alloc_details and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
             logging.debug(
-                f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
+                f"Rank {ctx.facts.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
             )
 
         free_pages = manager.get_stats().num_free_pages
@@ -2086,7 +2153,7 @@ class KVCapacityEngine:
         # a demand it accepts cannot fail validation at allocation time.
         try:
             page_keys = self._host_identity_page_keys(
-                manager, global_ids, pages_per_seq
+                ctx, manager, global_ids, pages_per_seq
             )
             demand_pages = (
                 total_pages
@@ -2099,21 +2166,21 @@ class KVCapacityEngine:
             if collective_preflight:
                 # The failed rank still joins the collective so peers cannot
                 # advance into allocation while this rank raises.
-                self._collective_gpu_kv_allocation_preflight(1, 0)
+                self._collective_gpu_kv_allocation_preflight(ctx, 1, 0)
             raise
         if collective_preflight:
             if not self._collective_gpu_kv_allocation_preflight(
-                demand_pages, free_pages
+                ctx, demand_pages, free_pages
             ):
                 logging.warning(
-                    f"Rank {self.rank}: collective GPU KV allocation preflight failed "
+                    f"Rank {ctx.facts.rank}: collective GPU KV allocation preflight failed "
                     f"(need {demand_pages} of {total_pages} logical, "
                     f"local free {free_pages})"
                 )
                 return False
         elif demand_pages > free_pages:
             logging.error(
-                f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
+                f"Rank {ctx.facts.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
                 f"only {free_pages} free"
             )
             # Don't set gpu_pages_allocated since we're failing
@@ -2121,22 +2188,22 @@ class KVCapacityEngine:
     
         try:
             self._allocate_gpu_pages_with_host_identity(
-                manager, global_ids, pages_per_seq
+                ctx, manager, global_ids, pages_per_seq
             )
         except RuntimeError as exc:
             if "Insufficient free pages" not in str(exc):
                 raise
             logging.error(
                 "Rank %s cannot allocate shared GPU KV pages: %s",
-                self.rank,
+                ctx.facts.rank,
                 exc,
             )
             return False
 
         # Now safe to update tracking.
         for local_idx in local_sequence_ids:
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
+            seq = ctx.sched.pool.get_sequence(uuid)
             seq.grant_gpu_pages(
                 seq.get_gpu_pages_for_two_page_buffer(), initial=True
             )
@@ -2144,18 +2211,18 @@ class KVCapacityEngine:
         manager.rebuild_page_table(global_ids)
 
         if load_from_host:
-            self._load_host_kv_to_gpu(manager, global_ids)
+            self._load_host_kv_to_gpu(ctx, manager, global_ids)
     
         # Track in set
         for local_idx in local_sequence_ids:
-            uuid = self._local_to_uuid_map[local_idx]
-            self._sequences_with_gpu_kv.mark_resident(uuid)
+            uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
+            ctx.gpu_resident.mark_resident(uuid)
     
         # Rebuild page table with ALL active sequences
         all_active_global_ids = []
-        for uuid in self._sequences_with_gpu_kv:
-            if uuid in self._uuid_to_local_map:
-                seq = self.global_batch.get_sequence(uuid)
+        for uuid in ctx.gpu_resident:
+            if uuid in ctx.sched.seq_table.uuid_to_local:
+                seq = ctx.sched.pool.get_sequence(uuid)
                 all_active_global_ids.append(seq.global_idx)
         all_active_global_ids.sort()
     
@@ -2166,14 +2233,14 @@ class KVCapacityEngine:
         if manager and manager._gpu_page_table_manager and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
             final_slot_order = list(manager._gpu_page_table_manager.slot_to_seq_id) if manager._gpu_page_table_manager.slot_to_seq_id else []
             logging.debug(
-                f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer finished. "
+                f"Rank {ctx.facts.rank}: _allocate_gpu_kv_two_page_buffer finished. "
                 f"input_global_ids={global_ids[:5]}{'...' if len(global_ids) > 5 else ''} (len={len(global_ids)}), "
                 f"all_active_sorted={all_active_global_ids[:5]}{'...' if len(all_active_global_ids) > 5 else ''} (len={len(all_active_global_ids)}), "
                 f"final_slot_to_seq_id={final_slot_order[:5]}{'...' if len(final_slot_order) > 5 else ''} (len={len(final_slot_order)})"
             )
 
         logging.debug(
-            f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
+            f"Rank {ctx.facts.rank}: Allocated GPU KV for {len(global_ids)} sequences"
         )
         return True
 
@@ -2505,37 +2572,61 @@ class KVCapacityEngine:
 
     # ---- Decode KV append to host ------------------------------------------
 
-    def _flush_deferred_kv_to_host(self, worker) -> None:
+    def _flush_deferred_kv_to_host(
+        self, ctx: DeferredKVFlushContext,
+        pending_tasks,
+        pending_tensors,
+        *,
+        _ensure_host_kv_append_capacity: Callable[[List[int], List[int]], None],
+    ) -> DeferredKVFlushOutcome:
         """Flush all deferred KV host offload entries accumulated during forward.
 
         Batch-launch D2H copies for all layers (primary MLA KV + the DSA
         auxiliary indexer KV if present). The C++ async append APIs order their
         dedicated D2H stream after the producer stream with a CUDA event, so this
         function must not synchronize the CPU with the producer stream first.
-        """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        entries = getattr(self, '_deferred_kv_entries', [])
-        entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
-        if not entries and not entries_aux:
-            return
 
-        worker_view = getattr(self, '_deferred_kv_worker_view', None)
-        batch_info = getattr(self, '_deferred_kv_batch', None)
-        aux_view = getattr(self, '_deferred_kv_worker_view_aux', None)
+        ``pending_tasks`` and ``pending_tensors`` are the worker's own append
+        channel, handed over BY REFERENCE exactly as they already reach
+        ``_wait_pending_kv_append_tasks``: the per-step drain waits on and
+        clears the very objects this launch appends to, so an outcome carrying
+        copies would strand the tensors the in-flight D2H copies read from.
+        """
+        # The channel reset comes back in the outcome; a branch that resets
+        # nothing leaves its field at the sentinel.
+        _deferred_kv_entries = GPU_KV_UNCHANGED
+        _deferred_kv_entries_aux = GPU_KV_UNCHANGED
+        _deferred_kv_batch = GPU_KV_UNCHANGED
+        _deferred_kv_worker_view = GPU_KV_UNCHANGED
+        _deferred_kv_worker_view_aux = GPU_KV_UNCHANGED
+        entries = ctx.deferred_entries
+        entries_aux = ctx.deferred_entries_aux
+        if not entries and not entries_aux:
+            return DeferredKVFlushOutcome(
+                _deferred_kv_entries, _deferred_kv_entries_aux,
+                _deferred_kv_batch, _deferred_kv_worker_view,
+                _deferred_kv_worker_view_aux,
+            )
+
+        worker_view = ctx.deferred_worker_view
+        batch_info = ctx.deferred_batch
+        aux_view = ctx.deferred_worker_view_aux
         if entries_aux and aux_view is None:
             raise RuntimeError(
                 "DSA auxiliary host KV worker view is required for deferred aux KV offload"
             )
         if (worker_view is None or batch_info is None) and not aux_view:
-            self._deferred_kv_entries = []
-            self._deferred_kv_entries_aux = []
-            return
+            _deferred_kv_entries = []
+            _deferred_kv_entries_aux = []
+            return DeferredKVFlushOutcome(
+                _deferred_kv_entries, _deferred_kv_entries_aux,
+                _deferred_kv_batch, _deferred_kv_worker_view,
+                _deferred_kv_worker_view_aux,
+            )
 
         sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
         if sequence_ids is not None and sequence_lengths is not None:
-            self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
+            _ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 
         def _assert_deferred_kv_rows(cache_name: str, layer_idx: int, tensor: torch.Tensor) -> None:
             if sequence_ids is None:
@@ -2549,8 +2640,7 @@ class KVCapacityEngine:
                 )
 
         # Fire all D2H copies
-        if not hasattr(self, '_pending_kv_append_tensors'):
-            self._pending_kv_append_tensors = []
+        _pending_kv_append_tensors = pending_tensors
 
         _use_uva_kernel = os.environ.get(
             "BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1") == "1"
@@ -2567,16 +2657,16 @@ class KVCapacityEngine:
                     if v_tensor is not None:
                         _assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
                     _prepared_entries.append((layer_idx, k_tensor, v_tensor))
-                    self._pending_kv_append_tensors.append(k_tensor)
+                    _pending_kv_append_tensors.append(k_tensor)
                     if v_tensor is not None:
-                        self._pending_kv_append_tensors.append(v_tensor)
+                        _pending_kv_append_tensors.append(v_tensor)
                 task = worker_view.async_append_decode_kv_to_host_batched_kernel(
                     entries=_prepared_entries,
                     sequence_ids=sequence_ids,
                     sequence_lengths=sequence_lengths,
                 )
                 if task is not None:
-                    self._pending_kv_append_tasks.append(task)
+                    pending_tasks.append(task)
 
             if entries_aux and aux_view is not None and sequence_ids is not None:
                 _prepared_aux = []
@@ -2587,16 +2677,16 @@ class KVCapacityEngine:
                         k_tensor = k_tensor.unsqueeze(2)
                     _assert_deferred_kv_rows("aux", layer_idx, k_tensor)
                     _prepared_aux.append((layer_idx, k_tensor, None, scale_tensor))
-                    self._pending_kv_append_tensors.append(k_tensor)
+                    _pending_kv_append_tensors.append(k_tensor)
                     if scale_tensor is not None:
-                        self._pending_kv_append_tensors.append(scale_tensor)
+                        _pending_kv_append_tensors.append(scale_tensor)
                 task = aux_view.async_append_decode_kv_to_host_batched_kernel(
                     entries=_prepared_aux,
                     sequence_ids=sequence_ids,
                     sequence_lengths=sequence_lengths,
                 )
                 if task is not None:
-                    self._pending_kv_append_tasks.append(task)
+                    pending_tasks.append(task)
         else:
             if entries and worker_view is not None and sequence_ids is not None:
                 for layer_idx, k_tensor, v_tensor in entries:
@@ -2616,11 +2706,11 @@ class KVCapacityEngine:
                         sequence_lengths=sequence_lengths,
                     )
 
-                    self._pending_kv_append_tensors.append(k_tensor)
+                    _pending_kv_append_tensors.append(k_tensor)
                     if v_tensor is not None:
-                        self._pending_kv_append_tensors.append(v_tensor)
+                        _pending_kv_append_tensors.append(v_tensor)
                     if task is not None:
-                        self._pending_kv_append_tasks.append(task)
+                        pending_tasks.append(task)
 
             if entries_aux and aux_view is not None and sequence_ids is not None:
                 for layer_idx, k_tensor, v_tensor, scale_tensor in (
@@ -2639,42 +2729,44 @@ class KVCapacityEngine:
                         scale_tensor=scale_tensor,
                     )
 
-                    self._pending_kv_append_tensors.append(k_tensor)
+                    _pending_kv_append_tensors.append(k_tensor)
                     if scale_tensor is not None:
-                        self._pending_kv_append_tensors.append(scale_tensor)
+                        _pending_kv_append_tensors.append(scale_tensor)
                     if task is not None:
-                        self._pending_kv_append_tasks.append(task)
+                        pending_tasks.append(task)
 
         # This function only LAUNCHES the D2H append tasks. The decode loop
         # drains them every step right after the sampled-token readback, in
         # a step-split slot of its own; see [KV_APPEND_DRAIN] in
         # ``decoding_continuous`` for why that drain must stay per step.
-        self._deferred_kv_entries = []
-        self._deferred_kv_entries_aux = []
-        self._deferred_kv_batch = None
-        self._deferred_kv_worker_view = None
-        self._deferred_kv_worker_view_aux = None
+        _deferred_kv_entries = []
+        _deferred_kv_entries_aux = []
+        _deferred_kv_batch = None
+        _deferred_kv_worker_view = None
+        _deferred_kv_worker_view_aux = None
+        return DeferredKVFlushOutcome(
+            _deferred_kv_entries, _deferred_kv_entries_aux,
+            _deferred_kv_batch, _deferred_kv_worker_view,
+            _deferred_kv_worker_view_aux,
+        )
 
     def _ensure_host_kv_append_capacity(
-        self, worker,
+        self, ctx,
         sequence_ids: List[int],
         sequence_lengths: List[int],
     ) -> None:
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if len(sequence_ids) != len(sequence_lengths):
             raise RuntimeError(
                 f"host KV append metadata mismatch: ids={len(sequence_ids)} lengths={len(sequence_lengths)}"
             )
-        if self.global_batch is None:
+        if ctx.sched.pool is None:
             return
         # Resolve through SequenceBatch's maintained gid index. This runs on
         # every decode step, so rebuilding a gid -> entry dict here cost one
         # dict comprehension over the whole batch per step.
         grow_requests = []
         for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
-            seq = self.global_batch.get_sequence_by_global_idx(int(global_idx))
+            seq = ctx.sched.pool.get_sequence_by_global_idx(int(global_idx))
             if seq is None:
                 raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
             if int(write_pos) < 0:
@@ -2718,7 +2810,9 @@ class KVCapacityEngine:
             "planner before issuing the forward"
         )
 
-    def _aux_layers_with_slots(self, worker):
+    def _aux_layers_with_slots(
+        self, ctx: AuxLayerSlotsContext,
+    ) -> Tuple[object, AuxLayerSlotsOutcome]:
         """Logical layer ids that have a slot in the aux (indexer) KV pools.
 
         None = no layer mapping (every engine layer has an aux slot). GLM-5.2
@@ -2726,32 +2820,38 @@ class KVCapacityEngine:
         so decode appends for them are dropped at the queueing choke points —
         the mapped host view hard-fails on unmapped layers by design.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        cached = getattr(self, "_aux_layers_with_slots_cache", False)
+        # Only the tail caches; the outcome field stays at the sentinel on the
+        # two exits that deliberately do not.
+        _aux_layers_with_slots_cache = GPU_KV_UNCHANGED
+        cached = ctx._aux_layers_with_slots_cache
         if cached is not False:
-            return cached
-        coord = getattr(self, "gpu_paged_kv_cache_manager", None)
+            return cached, AuxLayerSlotsOutcome(_aux_layers_with_slots_cache)
+        coord = ctx.aux_coordinator
         aux_mgr = getattr(coord, "auxiliary", None)
         if aux_mgr is None:
-            return None  # aux not initialized yet; do not cache
+            # aux not initialized yet; do not cache
+            return None, AuxLayerSlotsOutcome(_aux_layers_with_slots_cache)
         aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
         result = None
         if aux_map is not None:
             result = frozenset(
                 l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
             )
-        self._aux_layers_with_slots_cache = result
-        return result
+        _aux_layers_with_slots_cache = result
+        return result, AuxLayerSlotsOutcome(_aux_layers_with_slots_cache)
 
     def _append_decode_kv_to_host_aux_async(
-        self, worker,
+        self, ctx,
+        pending_tasks,
+        pending_tensors,
         layer_idx: int,
         batch: List[int],
         k_tensor: torch.Tensor,
         v_tensor: torch.Tensor = None,
         scale_tensor: torch.Tensor = None,
+        *,
+        _aux_layers_with_slots: Callable[[], object],
+        _wait_pending_kv_append_tasks: Callable[..., int],
     ) -> None:
         """Fire-and-forget auxiliary (indexer) KV append to host.
 
@@ -2763,22 +2863,24 @@ class KVCapacityEngine:
         rejects it. The host view validates the pairing, so a producer that
         forgets the scales fails loud instead of leaving a page's scale region
         at its previous contents.
+
+        ``pending_tasks`` and ``pending_tensors`` are the worker's own append
+        channel by reference, as in the deferred flush: this body drains the
+        channel itself once it is full, and the drain clears the lists these
+        appends went into, so the appends have to land in those same objects.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+        aux_view = ctx.host_view_aux
         if aux_view is None or not batch:
             return
-        valid_layers = self._aux_layers_with_slots()
+        valid_layers = _aux_layers_with_slots()
         if valid_layers is not None and layer_idx not in valid_layers:
             return
 
         sequence_ids = []
         sequence_lengths = []
         for local_idx in batch:
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.sched.seq_table.local_to_uuid[local_idx]
+            seq = ctx.sched.pool.get_sequence(uuid)
             sequence_ids.append(seq.global_idx)
             write_pos = seq.current_context_length - 1
             sequence_lengths.append(write_pos)
@@ -2796,18 +2898,17 @@ class KVCapacityEngine:
             scale_tensor=scale_tensor,
         )
 
-        if not hasattr(self, '_pending_kv_append_tensors'):
-            self._pending_kv_append_tensors = []
-        self._pending_kv_append_tensors.append(k_tensor)
+        _pending_kv_append_tensors = pending_tensors
+        _pending_kv_append_tensors.append(k_tensor)
         if scale_tensor is not None:
-            self._pending_kv_append_tensors.append(scale_tensor)
+            _pending_kv_append_tensors.append(scale_tensor)
 
         if task is not None:
-            self._pending_kv_append_tasks.append(task)
+            pending_tasks.append(task)
 
         MAX_PENDING_KV_TASKS = 256
-        if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-            self._wait_pending_kv_append_tasks()
+        if len(pending_tasks) >= MAX_PENDING_KV_TASKS:
+            _wait_pending_kv_append_tasks()
 
     def _wait_pending_kv_append_tasks(
         self, ctx,
@@ -2974,27 +3075,24 @@ class KVCapacityEngine:
         )
 
     def _load_host_kv_to_gpu(
-        self, worker,
+        self, ctx,
         manager: GPUPagedKVCacheManager,
         global_sequence_ids: List[int],
     ) -> None:
         """Copy prefetched host KV pages into the GPU cache."""
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if not global_sequence_ids:
             return
         copy_start = time.perf_counter()
-        worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+        worker_view = getattr(ctx.core_engine, "host_paged_kv_worker_view", None)
         if worker_view is None:
             raise RuntimeError("Host paged KV worker view is not bound to the core engine")
-    
+
         # DIAGNOSTIC: Check if these are resuming sequences (have decoded tokens)
         resuming_seq_info = []
         for global_idx in global_sequence_ids:
             # Find the sequence by global_idx
-            for uuid, local_idx in self._uuid_to_local_map.items():
-                seq = self.global_batch.get_sequence(uuid)
+            for uuid, local_idx in ctx.sched.seq_table.uuid_to_local.items():
+                seq = ctx.sched.pool.get_sequence(uuid)
                 if seq and seq.global_idx == global_idx and seq.decoded_length > 0:
                     resuming_seq_info.append({
                         'global_idx': global_idx,
@@ -3005,17 +3103,17 @@ class KVCapacityEngine:
     
         if resuming_seq_info and BATCHGEN_CB_DEBUG:
             logging.debug(
-                f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
+                f"Rank {ctx.facts.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
             )
-    
+
         logging.debug(
-            f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
+            f"Rank {ctx.facts.rank}: _load_host_kv_to_gpu launching async load for "
             f"{len(global_sequence_ids)} sequences..."
         )
 
         if isinstance(manager, DualKVCacheCoordinator):
-            pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)
-            load_task = self._launch_dual_host_kv_load(pointers)
+            pointers = self._prepare_dual_kv_load_pointers(ctx, manager, global_sequence_ids)
+            load_task = self._launch_dual_host_kv_load(ctx, pointers)
         else:
             sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
             k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
@@ -3030,12 +3128,12 @@ class KVCapacityEngine:
         # Wait for load to complete (this is synchronous load path used during prefill)
         load_task.wait()
         # CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
-        torch.cuda.synchronize(self.torch_device)
+        torch.cuda.synchronize(ctx.facts.device)
 
         load_duration = time.perf_counter() - copy_start
         logging.debug(
             "Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
-            self.rank, len(global_sequence_ids), load_duration,
+            ctx.facts.rank, len(global_sequence_ids), load_duration,
         )
 
     # ---- Decode capacity snapshot ------------------------------------------
@@ -3133,7 +3231,7 @@ class KVCapacityEngine:
         )
 
     def _integrate_pending_async_load(
-        self, worker,
+        self, ctx,
         pending_async_task: Optional[object],
         pending_load_uuids: List[str],
         pending_load_local_indices: List[int],
@@ -3141,6 +3239,10 @@ class KVCapacityEngine:
         decode_uuids: List[str],
         batch: List[int],
         gpu_manager,
+        *,
+        _finalize_async_load_minimal: Callable[
+            ..., Tuple[List[str], List[int]]
+        ],
     ) -> Tuple[List[str], List[int]]:
         """Complete an in-flight boundary GPU-KV load and fold its rows in.
 
@@ -3157,15 +3259,17 @@ class KVCapacityEngine:
         All ranks hold identical ``pending_load_uuids`` and reach this from
         broadcast boundary decisions, so the wait/barrier/finalize protocol
         stays rank-aligned.
+
+        The finalize arrives as an injected collaborator rather than a sibling
+        call: its worker delegator carries the load-tensor holder across the
+        call and stamps the decode row epoch afterwards, so an engine-to-engine
+        call would silently drop both.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10c); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         if pending_async_task is not None:
             pending_async_task.wait()
-            torch.cuda.synchronize(self.torch_device)
+            torch.cuda.synchronize(ctx.facts.device)
         dist.barrier()
-        return self._finalize_async_load_minimal(
+        return _finalize_async_load_minimal(
             pending_async_task,
             pending_load_uuids,
             pending_load_local_indices,

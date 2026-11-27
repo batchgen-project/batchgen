@@ -24,6 +24,7 @@ from batchgen.worker.kv_manager import (
 from batchgen.worker.kv_migration_types import MigrationOp
 from tests.kv_capacity_source import (
     D6_3_METHODS,
+    D6_4_METHODS,
     METHODS,
     engine_method_names,
     load_kv_capacity,
@@ -103,16 +104,22 @@ def test_converted_methods_have_no_worker_or_rebinding(name):
     # lazy generator across the boundary. A generator expression consumed on
     # the spot by a reduction builtin is arithmetic the verbatim move carried
     # with it (`sum(m.pages for m in migrations)`), not seam plumbing, so it
-    # is allowed exactly there and nowhere else.
+    # is allowed exactly there and nowhere else. A generator exhausted by the
+    # `for` statement that owns it (`for a, b in (f(e) for e in entries)`) is
+    # the same case: it is created, consumed and dropped inside one statement
+    # of this body and is never a value the boundary passes.
     assert not any(isinstance(n, (ast.Yield, ast.YieldFrom))
                    for n in ast.walk(node))
     reduced = {
         id(arg) for call in ast.walk(node)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
-        and call.func.id in {"sum", "any", "all", "min", "max",
-                             "sorted", "tuple", "list", "set", "dict"}
+        and call.func.id in {"sum", "any", "all", "min", "max", "sorted",
+                             "tuple", "list", "set", "dict", "frozenset"}
         for arg in call.args
+    } | {
+        id(loop.iter) for loop in ast.walk(node)
+        if isinstance(loop, (ast.For, ast.AsyncFor))
     }
     assert not [ast.unparse(n) for n in ast.walk(node)
                 if isinstance(n, ast.GeneratorExp) and id(n) not in reduced]
@@ -121,9 +128,16 @@ def test_converted_methods_have_no_worker_or_rebinding(name):
 
 
 def test_the_guard_covers_every_method_this_stage_converted():
-    """D6.3's names are in the guarded set, and still define this engine."""
+    """D6.3's and D6.4's names are in the guarded set, and still define this engine."""
     assert D6_3_METHODS <= METHODS
     assert D6_3_METHODS <= engine_method_names()
+    assert D6_4_METHODS <= METHODS
+    assert D6_4_METHODS <= engine_method_names()
+    # The pending-append wait shares this file section but arrived
+    # context-shaped before Phase D, so D6.4 left it alone: it is out of the
+    # guarded set, and a later stage claiming it must add it deliberately.
+    assert "_wait_pending_kv_append_tasks" not in METHODS
+    assert "_wait_pending_kv_append_tasks" in engine_method_names()
 
 
 def test_frozen_contexts_and_exact_outcome_fields():
@@ -146,6 +160,19 @@ def test_frozen_contexts_and_exact_outcome_fields():
         "KVMigrationReceiveOutcome": {
             "_migrated_sequences", "_pending_migrated_query_book",
         },
+        "DeferredKVFlushContext": {
+            "deferred_entries", "deferred_entries_aux", "deferred_worker_view",
+            "deferred_batch", "deferred_worker_view_aux",
+        },
+        "DeferredKVFlushOutcome": {
+            "_deferred_kv_entries", "_deferred_kv_entries_aux",
+            "_deferred_kv_batch", "_deferred_kv_worker_view",
+            "_deferred_kv_worker_view_aux",
+        },
+        "AuxLayerSlotsContext": {
+            "aux_coordinator", "_aux_layers_with_slots_cache",
+        },
+        "AuxLayerSlotsOutcome": {"_aux_layers_with_slots_cache"},
     }
     for name, cls in ns.items():
         if not inspect.isclass(cls) or not hasattr(cls, "__dataclass_fields__"):
@@ -1941,3 +1968,1064 @@ def test_due_check_delegators_pass_the_completion_predicate(monkeypatch):
         assert ctx is worker._held_decode_phase_context
         assert helpers == {"_is_sequence_completed": worker._is_sequence_completed}
     assert [row[2] for row in seen] == [[1, 2], [3]]
+
+
+# ---- D6.4: the decode KV append to host and the host-to-GPU KV load ---------
+
+
+def d64(events=None, **extra):
+    """The engine with the collaborators the D6.4 bodies name at module scope.
+
+    ``torch.cuda`` refuses every attribute unless a test opts in: the launch
+    paths must not reach the CPU-side synchronizer, and the two loads that do
+    sync have to be seen doing it in the recorded order. A caller that already
+    owns an event log passes it, so the collective and the sync land in the
+    SAME ordered record as the launches.
+    """
+    events = [] if events is None else events
+
+    class _ForbiddenCuda:
+        def __getattr__(self, name):
+            raise AssertionError(f"the engine touched torch.cuda.{name}")
+
+    namespace = {
+        "logging": SimpleNamespace(
+            info=lambda *a: events.append(("info", a)),
+            debug=lambda *a: events.append(("debug", a)),
+            warning=lambda *a: events.append(("warning", a)),
+            error=lambda *a: events.append(("error", a)),
+        ),
+        "torch": SimpleNamespace(
+            cuda=_ForbiddenCuda(), Tensor=object, tensor=torch.tensor,
+            int64=torch.int64,
+        ),
+        "time": SimpleNamespace(perf_counter=lambda: len(events) * 0.5),
+        "dist": SimpleNamespace(
+            barrier=lambda: events.append("barrier"),
+        ),
+        "DualKVCacheCoordinator": type("NoDual", (), {}),
+        "DualHostKVCoordinator": type("NoDualHost", (), {}),
+    }
+    namespace.update(extra)
+    ns = load_kv_capacity(namespace)
+    return ns, ns["KVCapacityEngine"](), events
+
+
+class _FakeTensor:
+    """A tensor stand-in whose rows and rank the flush actually inspects."""
+
+    def __init__(self, rows=2, dims=3, name="k"):
+        self.shape = (rows,) + (1,) * (dims - 1)
+        self._dims = dims
+        self.name = name
+        self.unsqueezed = 0
+
+    def dim(self):
+        return self._dims
+
+    def unsqueeze(self, dim):
+        assert dim == 2
+        self.unsqueezed += 1
+        self._dims += 1
+        return self
+
+    def __repr__(self):
+        return f"<{self.name}>"
+
+
+def flush_channel(events, *, batched=True):
+    """A host view that records every launch into the shared event log."""
+
+    def launch_batched(entries, sequence_ids, sequence_lengths):
+        events.append(("launch_batched", tuple(e[0] for e in entries),
+                       tuple(sequence_ids), tuple(sequence_lengths)))
+        return f"task:{tuple(e[0] for e in entries)}"
+
+    def launch_one(layer_idx, sequence_ids, k_tensor, v_tensor,
+                   sequence_lengths, scale_tensor=None):
+        events.append(("launch_one", layer_idx, k_tensor.name,
+                       None if v_tensor is None else v_tensor.name))
+        return f"task:{layer_idx}"
+
+    view = SimpleNamespace(async_append_decode_kv_to_host=launch_one)
+    if batched:
+        view.async_append_decode_kv_to_host_batched_kernel = launch_batched
+    return view
+
+
+def flush_context(ns, **changes):
+    values = dict(
+        deferred_entries=[], deferred_entries_aux=[],
+        deferred_worker_view=None, deferred_batch=None,
+        deferred_worker_view_aux=None,
+    )
+    return ns["DeferredKVFlushContext"](**(values | changes))
+
+
+class _RecordingChannel:
+    """The worker's append channel, recording the order of every mutation."""
+
+    def __init__(self, events):
+        self.events = events
+        self.tasks = _RecordingList(events, "task")
+        self.tensors = _RecordingList(events, "retain")
+
+
+class _RecordingList(list):
+    def __init__(self, events, label):
+        super().__init__()
+        self._events = events
+        self._label = label
+
+    def append(self, item):
+        self._events.append((self._label, getattr(item, "name", item)))
+        super().append(item)
+
+    def clear(self):
+        self._events.append((self._label, "cleared"))
+        super().clear()
+
+
+def test_deferred_flush_with_an_empty_channel_resets_nothing():
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    outcome = engine._flush_deferred_kv_to_host(
+        flush_context(ns), channel.tasks, channel.tensors,
+        _ensure_host_kv_append_capacity=lambda ids, lengths: events.append("cap"),
+    )
+    unchanged = ns["GPU_KV_UNCHANGED"]
+    assert all(getattr(outcome, field.name) is unchanged
+               for field in fields(outcome))
+    assert events == []
+
+
+def test_deferred_flush_refuses_aux_entries_without_the_aux_view():
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    ctx = flush_context(ns, deferred_entries_aux=[(3, _FakeTensor(), None)])
+    with pytest.raises(RuntimeError, match="auxiliary host KV worker view"):
+        engine._flush_deferred_kv_to_host(
+            ctx, channel.tasks, channel.tensors,
+            _ensure_host_kv_append_capacity=lambda ids, lengths: None,
+        )
+    # The refusal precedes every channel mutation and every launch.
+    assert events == []
+
+
+def test_deferred_flush_without_a_usable_batch_resets_only_the_entry_lists():
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    # Primary entries queued but no batch metadata and no aux view: the
+    # pre-move body dropped the entries and left the three view/batch fields
+    # exactly as the forward had set them.
+    ctx = flush_context(
+        ns, deferred_entries=[(0, _FakeTensor(), None)],
+        deferred_worker_view=flush_channel(events), deferred_batch=None,
+    )
+    outcome = engine._flush_deferred_kv_to_host(
+        ctx, channel.tasks, channel.tensors,
+        _ensure_host_kv_append_capacity=lambda ids, lengths: None,
+    )
+    unchanged = ns["GPU_KV_UNCHANGED"]
+    assert outcome._deferred_kv_entries == []
+    assert outcome._deferred_kv_entries_aux == []
+    assert outcome._deferred_kv_batch is unchanged
+    assert outcome._deferred_kv_worker_view is unchanged
+    assert outcome._deferred_kv_worker_view_aux is unchanged
+    assert events == []
+
+
+def test_deferred_flush_checks_capacity_before_any_launch_and_retains_in_order(
+    monkeypatch,
+):
+    """The batched-kernel path: capacity, then retain, then launch, then task.
+
+    This is the stream-order contract. The C++ append orders its own D2H
+    stream behind the producer stream with an event, so the body must not
+    sync; the tensors have to be retained in the SAME list the later drain
+    clears, before the task that reads from them is handed over.
+    """
+    monkeypatch.setenv("BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1")
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    k_primary, v_primary = _FakeTensor(name="kp"), _FakeTensor(name="vp")
+    k_aux, scale_aux = _FakeTensor(name="ka"), _FakeTensor(name="sa")
+    view, aux_view = flush_channel(events), flush_channel(events)
+    ctx = flush_context(
+        ns,
+        deferred_entries=[(1, k_primary, v_primary)],
+        deferred_entries_aux=[(2, k_aux, None, scale_aux)],
+        deferred_worker_view=view, deferred_worker_view_aux=aux_view,
+        deferred_batch=([11, 12], [63, 64]),
+    )
+    outcome = engine._flush_deferred_kv_to_host(
+        ctx, channel.tasks, channel.tensors,
+        _ensure_host_kv_append_capacity=(
+            lambda ids, lengths: events.append(("capacity", tuple(ids), tuple(lengths)))
+        ),
+    )
+    assert events == [
+        ("capacity", (11, 12), (63, 64)),
+        ("retain", "kp"), ("retain", "vp"),
+        ("launch_batched", (1,), (11, 12), (63, 64)),
+        ("task", "task:(1,)"),
+        ("retain", "ka"), ("retain", "sa"),
+        ("launch_batched", (2,), (11, 12), (63, 64)),
+        ("task", "task:(2,)"),
+    ]
+    # Every append landed in the objects the worker still owns.
+    assert channel.tensors == [k_primary, v_primary, k_aux, scale_aux]
+    assert channel.tasks == ["task:(1,)", "task:(2,)"]
+    # The whole channel is reset on the full path.
+    assert outcome._deferred_kv_entries == []
+    assert outcome._deferred_kv_entries_aux == []
+    assert outcome._deferred_kv_batch is None
+    assert outcome._deferred_kv_worker_view is None
+    assert outcome._deferred_kv_worker_view_aux is None
+
+
+def test_deferred_flush_per_layer_path_launches_before_it_retains(monkeypatch):
+    """The non-kernel path launches each layer FIRST, then retains its rows.
+
+    The two paths differ in exactly this order and the move kept both: the
+    per-layer API takes the tensors itself, so the retention follows its
+    return, while the batched kernel is handed a prepared list.
+    """
+    monkeypatch.setenv("BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "0")
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    k0, v0 = _FakeTensor(name="k0"), _FakeTensor(name="v0")
+    k1 = _FakeTensor(name="k1")
+    ctx = flush_context(
+        ns, deferred_entries=[(0, k0, v0), (1, k1, None)],
+        deferred_worker_view=flush_channel(events, batched=False),
+        deferred_batch=([5, 6], [7, 8]),
+    )
+    engine._flush_deferred_kv_to_host(
+        ctx, channel.tasks, channel.tensors,
+        _ensure_host_kv_append_capacity=lambda ids, lengths: events.append("capacity"),
+    )
+    assert events == [
+        "capacity",
+        ("launch_one", 0, "k0", "v0"), ("retain", "k0"), ("retain", "v0"),
+        ("task", "task:0"),
+        ("launch_one", 1, "k1", None), ("retain", "k1"), ("task", "task:1"),
+    ]
+
+
+def test_deferred_flush_refuses_a_row_mismatch_before_handing_over_the_task(
+    monkeypatch,
+):
+    monkeypatch.setenv("BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1")
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    ctx = flush_context(
+        ns, deferred_entries=[(4, _FakeTensor(rows=3, name="kp"), None)],
+        deferred_worker_view=flush_channel(events),
+        deferred_batch=([1, 2], [9, 9]),
+    )
+    with pytest.raises(RuntimeError, match="primary deferred KV row mismatch at layer 4"):
+        engine._flush_deferred_kv_to_host(
+            ctx, channel.tasks, channel.tensors,
+            _ensure_host_kv_append_capacity=lambda ids, lengths: None,
+        )
+    assert channel.tasks == []
+
+
+def test_deferred_flush_skips_the_capacity_check_without_batch_metadata(
+    monkeypatch,
+):
+    """Aux-only entries with no batch tuple still launch, with ids ``None``."""
+    monkeypatch.setenv("BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1")
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    aux_view = flush_channel(events)
+    ctx = flush_context(
+        ns, deferred_entries_aux=[(2, _FakeTensor(name="ka"), None, None)],
+        deferred_worker_view_aux=aux_view, deferred_batch=None,
+    )
+    engine._flush_deferred_kv_to_host(
+        ctx, channel.tasks, channel.tensors,
+        _ensure_host_kv_append_capacity=lambda ids, lengths: events.append("capacity"),
+    )
+    # No batch metadata, so no capacity call and no launch (the aux branch
+    # needs sequence ids); the channel reset still runs.
+    assert events == []
+
+
+def append_capacity_context(sequences, *, pool=True):
+    rows = {int(gid): seq for gid, seq in sequences.items()}
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=64, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(
+                get_sequence_by_global_idx=rows.get,
+            ) if pool else None,
+            seq_table=None, trajectories=None,
+        ),
+        gpu_kv=None, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+    )
+
+
+def append_row(*, capacity=128, budget=4096, context=64, decoded=0, growth=2):
+    return SimpleNamespace(
+        host_token_capacity=capacity, kv_token_budget=budget,
+        current_context_length=context, decoded_length=decoded,
+        status=SimpleNamespace(name="DECODING"),
+        get_host_growth_pages=lambda tokens: growth,
+    )
+
+
+def test_append_capacity_passes_a_row_inside_its_reservation():
+    _, engine, _ = d64()
+    ctx = append_capacity_context({7: append_row(capacity=128)})
+    assert engine._ensure_host_kv_append_capacity(ctx, [7], [63]) is None
+
+
+def test_append_capacity_without_a_pool_returns_before_reading_rows():
+    _, engine, _ = d64()
+    ctx = append_capacity_context({}, pool=False)
+    assert engine._ensure_host_kv_append_capacity(ctx, [7], [63]) is None
+
+
+@pytest.mark.parametrize("ids,lengths,rows,message", [
+    ([7], [1, 2], {}, "host KV append metadata mismatch"),
+    ([7], [1], {}, "host KV append for unknown global_idx=7"),
+    ([7], [-1], {7: append_row()}, "negative write position"),
+    ([7], [3], {7: append_row(capacity=0)}, "unallocated gid=7"),
+    ([7], [9], {7: append_row(budget=4)}, "exceed token budget"),
+    ([7], [200], {7: append_row(capacity=128, budget=4096)},
+     "reached without a boundary reservation"),
+])
+def test_append_capacity_refuses_every_broken_row(ids, lengths, rows, message):
+    _, engine, _ = d64()
+    ctx = append_capacity_context(rows)
+    with pytest.raises(RuntimeError, match=message):
+        engine._ensure_host_kv_append_capacity(ctx, ids, lengths)
+
+
+def aux_slots_context(ns, *, layer_map=(), aux_pool=True, coordinator=True,
+                      cache=False):
+    """``coordinator=False`` = no GPU KV manager; ``aux_pool=False`` = no aux."""
+    coord = None
+    if coordinator:
+        aux = SimpleNamespace(
+            config=SimpleNamespace(logical_to_physical_layer=layer_map)
+        ) if aux_pool else None
+        coord = SimpleNamespace(auxiliary=aux)
+    return ns["AuxLayerSlotsContext"](
+        aux_coordinator=coord, _aux_layers_with_slots_cache=cache,
+    )
+
+
+def test_aux_slot_map_resolves_the_mapped_layers_and_caches_them():
+    ns, engine, _ = d64()
+    ctx = aux_slots_context(ns, layer_map=[0, None, 2, -1, 4])
+    result, outcome = engine._aux_layers_with_slots(ctx)
+    assert result == frozenset({0, 2, 4})
+    assert outcome._aux_layers_with_slots_cache == frozenset({0, 2, 4})
+
+
+def test_aux_slot_map_without_a_layer_mapping_caches_none():
+    ns, engine, _ = d64()
+    result, outcome = engine._aux_layers_with_slots(
+        aux_slots_context(ns, layer_map=None)
+    )
+    # ``logical_to_physical_layer=None`` means every layer has a slot; that
+    # IS a resolved answer, so it is cached as None.
+    assert result is None
+    assert outcome._aux_layers_with_slots_cache is None
+
+
+@pytest.mark.parametrize("coordinator,aux_pool", [
+    (False, True),   # no GPU KV coordinator bound yet
+    (True, False),   # coordinator bound, auxiliary pool not created
+])
+def test_aux_slot_map_without_an_aux_pool_returns_none_and_does_not_cache(
+    coordinator, aux_pool,
+):
+    ns, engine, _ = d64()
+    ctx = aux_slots_context(ns, coordinator=coordinator, aux_pool=aux_pool)
+    result, outcome = engine._aux_layers_with_slots(ctx)
+    assert result is None
+    assert outcome._aux_layers_with_slots_cache is ns["GPU_KV_UNCHANGED"]
+
+
+@pytest.mark.parametrize("cache", [None, frozenset({3})])
+def test_aux_slot_map_cache_hit_returns_the_memo_and_rewrites_nothing(cache):
+    ns, engine, _ = d64()
+    # A hit must not even look at the coordinator: ``False`` is the only
+    # "unresolved" value, so a cached ``None`` short-circuits too.
+    ctx = ns["AuxLayerSlotsContext"](
+        aux_coordinator=None, _aux_layers_with_slots_cache=cache,
+    )
+    result, outcome = engine._aux_layers_with_slots(ctx)
+    assert result is cache
+    assert outcome._aux_layers_with_slots_cache is ns["GPU_KV_UNCHANGED"]
+
+
+def aux_append_context(rows, sequences, *, aux_view):
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=64, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(get_sequence=sequences.get),
+            seq_table=SimpleNamespace(local_to_uuid=rows),
+            trajectories=None,
+        ),
+        gpu_kv=None, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+        host_view_aux=aux_view,
+    )
+
+
+@pytest.mark.parametrize("aux_view,batch", [(None, [0]), ("view", [])])
+def test_aux_append_without_a_view_or_a_batch_never_touches_the_channel(
+    aux_view, batch,
+):
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    ctx = aux_append_context({}, {}, aux_view=aux_view)
+    engine._append_decode_kv_to_host_aux_async(
+        ctx, channel.tasks, channel.tensors, 0, batch, _FakeTensor(),
+        _aux_layers_with_slots=lambda: events.append("slots"),
+        _wait_pending_kv_append_tasks=lambda: events.append("drain"),
+    )
+    assert events == []
+
+
+def test_aux_append_drops_an_unmapped_layer_before_resolving_any_row():
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    ctx = aux_append_context(
+        {0: "u0"}, {}, aux_view=flush_channel(events, batched=False),
+    )
+    engine._append_decode_kv_to_host_aux_async(
+        ctx, channel.tasks, channel.tensors, 7, [0], _FakeTensor(),
+        _aux_layers_with_slots=lambda: frozenset({1, 2}),
+        _wait_pending_kv_append_tasks=lambda: events.append("drain"),
+    )
+    # The gate returns before the row lookup, the launch and the channel.
+    assert events == []
+    assert channel.tasks == [] and channel.tensors == []
+
+
+def test_aux_append_launches_then_retains_then_queues_the_task():
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    k, scale = _FakeTensor(name="ka"), _FakeTensor(name="sa")
+    ctx = aux_append_context(
+        {0: "u0", 1: "u1"},
+        {"u0": SimpleNamespace(global_idx=10, current_context_length=5),
+         "u1": SimpleNamespace(global_idx=11, current_context_length=9)},
+        aux_view=flush_channel(events, batched=False),
+    )
+    engine._append_decode_kv_to_host_aux_async(
+        ctx, channel.tasks, channel.tensors, 3, [0, 1], k, None, scale,
+        _aux_layers_with_slots=lambda: None,
+        _wait_pending_kv_append_tasks=lambda: events.append("drain"),
+    )
+    assert events == [
+        ("launch_one", 3, "ka", None),
+        ("retain", "ka"), ("retain", "sa"), ("task", "task:3"),
+    ]
+    # The write position is the row's context length minus one, per row.
+    assert k.unsqueezed == 1
+
+
+def test_aux_append_drains_only_after_the_appends_and_only_at_the_cap():
+    """The 256-task cap drains the channel AFTER this round went into it.
+
+    The drain clears both lists, so an append that landed anywhere but in
+    those objects would be lost by it -- and an append made after the drain
+    would survive a wait that never covered its copy.
+    """
+    ns, engine, events = d64()
+    channel = _RecordingChannel(events)
+    channel.tasks.extend(f"old:{i}" for i in range(255))
+    ctx = aux_append_context(
+        {0: "u0"}, {"u0": SimpleNamespace(global_idx=10, current_context_length=5)},
+        aux_view=flush_channel(events, batched=False),
+    )
+
+    def drain():
+        events.append(("drain", len(channel.tasks)))
+        channel.tasks.clear()
+        channel.tensors.clear()
+
+    engine._append_decode_kv_to_host_aux_async(
+        ctx, channel.tasks, channel.tensors, 3, [0], _FakeTensor(name="ka"),
+        _aux_layers_with_slots=lambda: None,
+        _wait_pending_kv_append_tasks=drain,
+    )
+    assert events == [
+        ("launch_one", 3, "ka", None), ("retain", "ka"), ("task", "task:3"),
+        ("drain", 256), ("task", "cleared"), ("retain", "cleared"),
+    ]
+    assert channel.tasks == [] and channel.tensors == []
+    # One task short of the cap, the body queues and returns without draining.
+    events.clear()
+    channel.tasks.extend(f"old:{i}" for i in range(254))
+    engine._append_decode_kv_to_host_aux_async(
+        ctx, channel.tasks, channel.tensors, 3, [0], _FakeTensor(name="kb"),
+        _aux_layers_with_slots=lambda: None,
+        _wait_pending_kv_append_tasks=drain,
+    )
+    assert [e for e in events if e[0] == "drain"] == []
+    assert len(channel.tasks) == 255
+
+
+def load_context(ns, *, sequences=None, core_engine=..., worker_view=None,
+                 synchronize=None):
+    if core_engine is ...:
+        core_engine = SimpleNamespace(host_paged_kv_worker_view=worker_view)
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1,
+            device="cuda:0", page_size=64, decision_interval=1,
+            enable_prefix_cache=False, enable_host_kv_eviction=False,
+            host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(get_sequence=(sequences or {}).get),
+            seq_table=SimpleNamespace(
+                uuid_to_local={uuid: i for i, uuid in enumerate(sequences or {})},
+            ),
+            trajectories=None,
+        ),
+        gpu_kv=None, host_view=None, core_engine=core_engine,
+        gpu_resident=None, prefix_coordinator=None, prefix_runtime=None,
+        chunk_sizer=None,
+    )
+
+
+def ordered(events):
+    """The recorded sequence without the diagnostic log lines.
+
+    The log calls share the event list so a test CAN pin a message, but the
+    order these tests assert is the stream/collective order, which the
+    debug-only lines must not be able to shift.
+    """
+    return [e for e in events
+            if not (isinstance(e, tuple) and e[0] in {"debug", "info"})]
+
+
+def syncing_runtime(events, **extra):
+    """``d64`` with the device sync allowed, so its position is observable."""
+    return d64(
+        events,
+        torch=SimpleNamespace(
+            cuda=SimpleNamespace(
+                synchronize=lambda device: events.append(("sync", device)),
+            ),
+            Tensor=object, tensor=torch.tensor, int64=torch.int64,
+        ),
+        **extra,
+    )
+
+
+def test_host_to_gpu_load_without_ids_returns_before_reading_the_view():
+    _, engine, events = d64()
+    ctx = load_context(None, core_engine=None)
+    assert engine._load_host_kv_to_gpu(ctx, object(), []) is None
+    assert events == []
+
+
+def test_host_to_gpu_load_refuses_without_a_bound_worker_view():
+    _, engine, _ = d64()
+    ctx = load_context(None, worker_view=None)
+    with pytest.raises(RuntimeError, match="not bound to the core engine"):
+        engine._load_host_kv_to_gpu(ctx, object(), [10])
+
+
+def test_host_to_gpu_load_waits_then_syncs_on_the_declared_device():
+    """The primary path: launch, wait, then ONE device sync on ctx's device.
+
+    The sync has to follow the wait -- the task's own completion event covers
+    only its copy stream, and the caller is about to hand the pages to the
+    model.
+    """
+    events = []
+    ns, engine, _ = syncing_runtime(events)
+
+    def launch(sequence_ids, active_page_counts, k_device_ptrs, v_device_ptrs):
+        events.append(("launch", tuple(sequence_ids.tolist()), active_page_counts))
+        return SimpleNamespace(wait=lambda: events.append("wait"))
+
+    view = SimpleNamespace(async_load_layer_paged_kv_to_device=launch)
+    manager = SimpleNamespace(
+        get_padded_3d_page_pointers=lambda: ("k", "v"),
+        export_active_sequence_page_counts=lambda: "counts",
+    )
+    ctx = load_context(ns, worker_view=view)
+    assert engine._load_host_kv_to_gpu(ctx, manager, [10, 11]) is None
+    assert ordered(events) == [
+        ("launch", (10, 11), "counts"), "wait", ("sync", "cuda:0"),
+    ]
+
+
+def test_host_to_gpu_load_dual_path_prepares_launches_waits_then_syncs():
+    events = []
+    dual = type("Dual", (), {})
+    ns, engine, _ = syncing_runtime(events, DualKVCacheCoordinator=dual)
+    engine._prepare_dual_kv_load_pointers = (
+        lambda ctx, mgr, ids: events.append(("prepare", tuple(ids))) or "ptrs"
+    )
+    engine._launch_dual_host_kv_load = (
+        lambda ctx, ptrs: events.append(("launch", ptrs))
+        or SimpleNamespace(wait=lambda: events.append("wait"))
+    )
+    ctx = load_context(ns, worker_view=object())
+    assert engine._load_host_kv_to_gpu(ctx, dual(), [10]) is None
+    assert ordered(events) == [
+        ("prepare", (10,)), ("launch", "ptrs"), "wait", ("sync", "cuda:0"),
+    ]
+
+
+def test_integrate_waits_syncs_barriers_then_finalizes():
+    """The exit protocol's four steps, in the one order every rank runs.
+
+    All ranks reach this from a broadcast decision, so the barrier has to sit
+    between the local wait and the finalize: a rank that finalized before the
+    barrier would free pages a peer is still copying into.
+    """
+    events = []
+    ns, engine, _ = syncing_runtime(events)
+    task = SimpleNamespace(wait=lambda: events.append("wait"))
+    ctx = load_context(ns)
+    result = engine._integrate_pending_async_load(
+        ctx, task, ["u0"], [0], [10], ["u1"], [1], "mgr",
+        _finalize_async_load_minimal=(
+            lambda *args: events.append(("finalize", args)) or (["u1", "u0"], [1, 0])
+        ),
+    )
+    assert result == (["u1", "u0"], [1, 0])
+    assert ordered(events) == [
+        "wait", ("sync", "cuda:0"), "barrier",
+        ("finalize", (task, ["u0"], [0], [10], ["u1"], [1], "mgr")),
+    ]
+
+
+def test_integrate_without_a_task_still_barriers_before_finalizing():
+    events = []
+    ns, engine, _ = syncing_runtime(events)
+    engine._integrate_pending_async_load(
+        load_context(ns), None, [], [], [], ["u1"], [1], "mgr",
+        _finalize_async_load_minimal=lambda *args: events.append("finalize") or ([], []),
+    )
+    # No in-flight task means no wait and no sync, but the collective stays.
+    assert ordered(events) == ["barrier", "finalize"]
+
+
+def allocate_context(ns, *, manager, rows=None, sequences=None, resident=None):
+    rows = rows if rows is not None else {}
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=64, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(get_sequence=(sequences or {}).get),
+            seq_table=SimpleNamespace(
+                local_to_uuid=rows,
+                uuid_to_local={uuid: idx for idx, uuid in rows.items()},
+            ),
+            trajectories=None,
+        ),
+        gpu_kv=manager, host_view=None, core_engine=None,
+        gpu_resident=resident, prefix_coordinator=None, prefix_runtime=None,
+        chunk_sizer=None,
+    )
+
+
+def alloc_row(global_idx, *, pages=2, decoded=0):
+    granted = []
+    return SimpleNamespace(
+        global_idx=global_idx, decoded_length=decoded,
+        current_context_length=64, had_initial_gpu_reservation=False,
+        granted=granted,
+        get_gpu_pages_for_two_page_buffer=lambda: pages,
+        grant_gpu_pages=(
+            lambda count, initial: granted.append((count, initial))
+        ),
+    )
+
+
+class _ResidentSet(set):
+    def mark_resident(self, uuid):
+        self.add(uuid)
+
+
+@pytest.mark.parametrize("manager,rows,expected", [
+    (None, [1], False),                       # no pool bound
+    ("uninitialized", [1], False),            # pool bound but not initialized
+    ("ready", [], True),                      # nothing to allocate
+])
+def test_two_page_allocation_early_exits_without_the_collective(
+    manager, rows, expected,
+):
+    ns, engine, events = d64()
+    pool = {
+        None: None,
+        "uninitialized": SimpleNamespace(is_initialized=False),
+        "ready": SimpleNamespace(
+            is_initialized=True,
+            get_stats=lambda: SimpleNamespace(num_free_pages=9),
+        ),
+    }[manager]
+    ctx = allocate_context(ns, manager=pool)
+    engine._collective_gpu_kv_allocation_preflight = (
+        lambda c, required, free: events.append(("preflight", required, free))
+    )
+    assert engine._allocate_gpu_kv_two_page_buffer(ctx, rows) is expected
+    # Without the preflight flag no rank joins a collective on these exits.
+    assert events == []
+
+
+@pytest.mark.parametrize("manager,required,free", [
+    (None, 0, 0), ("uninitialized", 0, 0), ("ready", 0, 9),
+])
+def test_two_page_allocation_early_exits_still_join_the_collective(
+    manager, required, free,
+):
+    """A rank that cannot allocate still votes, so peers cannot run ahead."""
+    ns, engine, events = d64()
+    pool = {
+        None: None,
+        "uninitialized": SimpleNamespace(is_initialized=False),
+        "ready": SimpleNamespace(
+            is_initialized=True,
+            get_stats=lambda: SimpleNamespace(num_free_pages=9),
+        ),
+    }[manager]
+    ctx = allocate_context(ns, manager=pool)
+    engine._collective_gpu_kv_allocation_preflight = (
+        lambda c, req, fr: events.append(("preflight", req, fr)) or "voted"
+    )
+    rows = [] if manager == "ready" else [1]
+    result = engine._allocate_gpu_kv_two_page_buffer(
+        ctx, rows, collective_preflight=True,
+    )
+    assert result == "voted"
+    assert events == [("preflight", required, free)]
+
+
+def ready_pool(events, *, free=10):
+    return SimpleNamespace(
+        is_initialized=True,
+        get_stats=lambda: SimpleNamespace(num_free_pages=free),
+        count_new_shared_pages=(
+            lambda ids, tokens, keys: events.append(("count", tuple(ids))) or 3
+        ),
+        rebuild_page_table=lambda ids: events.append(("rebuild", tuple(ids))),
+        _gpu_page_table_manager=None,
+    )
+
+
+def test_two_page_allocation_runs_keys_allocate_rebuild_load_mark_rebuild():
+    """The allocation order the KV identity guard depends on.
+
+    The host-identity keys are previewed BEFORE the allocation, the rows are
+    granted only after it succeeds, the host load runs against the page table
+    this batch just rebuilt, and the final rebuild covers every resident row.
+    """
+    ns, engine, events = d64()
+    manager = ready_pool(events)
+    # ``u9`` is already resident AND bound in the local table, so the final
+    # rebuild covers it as well as this batch's two rows.
+    rows = {1: "u1", 2: "u2", 9: "u9"}
+    sequences = {"u1": alloc_row(10), "u2": alloc_row(11), "u9": alloc_row(9)}
+    resident = _ResidentSet({"u9"})
+    ctx = allocate_context(
+        ns, manager=manager, rows=rows, sequences=sequences, resident=resident,
+    )
+    engine._host_identity_page_keys = (
+        lambda c, mgr, ids, tokens: events.append(("keys", tuple(ids), tuple(tokens))) or "K"
+    )
+    engine._allocate_gpu_pages_with_host_identity = (
+        lambda c, mgr, ids, tokens: events.append(("allocate", tuple(ids)))
+    )
+    engine._load_host_kv_to_gpu = (
+        lambda c, mgr, ids: events.append(("load", tuple(ids)))
+    )
+    assert engine._allocate_gpu_kv_two_page_buffer(ctx, [1, 2]) is True
+    assert ordered(events) == [
+        ("keys", (10, 11), (128, 128)),
+        ("count", (10, 11)),
+        ("allocate", (10, 11)),
+        ("rebuild", (10, 11)),
+        ("load", (10, 11)),
+        ("rebuild", (9, 10, 11)),
+    ]
+    assert sequences["u1"].granted == [(2, True)]
+    assert resident == {"u1", "u2", "u9"}
+
+
+def test_two_page_allocation_votes_before_it_reraises_a_key_failure():
+    ns, engine, events = d64()
+    manager = ready_pool(events)
+    ctx = allocate_context(
+        ns, manager=manager, rows={1: "u1"}, sequences={"u1": alloc_row(10)},
+    )
+    engine._host_identity_page_keys = (
+        lambda *a: events.append("keys") or (_ for _ in ()).throw(ValueError("boom"))
+    )
+    engine._collective_gpu_kv_allocation_preflight = (
+        lambda c, req, fr: events.append(("preflight", req, fr))
+    )
+    with pytest.raises(ValueError, match="boom"):
+        engine._allocate_gpu_kv_two_page_buffer(
+            ctx, [1], collective_preflight=True,
+        )
+    # The failed rank joined the collective as the losing vote, then raised.
+    assert events == ["keys", ("preflight", 1, 0)]
+
+
+def test_two_page_allocation_refuses_a_demand_over_the_free_pages():
+    ns, engine, events = d64()
+    manager = ready_pool(events, free=1)
+    ctx = allocate_context(
+        ns, manager=manager, rows={1: "u1"}, sequences={"u1": alloc_row(10)},
+    )
+    engine._host_identity_page_keys = lambda *a: "K"
+    engine._allocate_gpu_pages_with_host_identity = (
+        lambda *a: events.append("allocate")
+    )
+    assert engine._allocate_gpu_kv_two_page_buffer(ctx, [1]) is False
+    assert "allocate" not in events
+
+
+def test_two_page_allocation_reports_an_insufficient_page_runtime_error():
+    ns, engine, events = d64()
+    manager = ready_pool(events)
+    ctx = allocate_context(
+        ns, manager=manager, rows={1: "u1"}, sequences={"u1": alloc_row(10)},
+    )
+    engine._host_identity_page_keys = lambda *a: None
+    engine._allocate_gpu_pages_with_host_identity = (
+        lambda *a: (_ for _ in ()).throw(RuntimeError("Insufficient free pages"))
+    )
+    assert engine._allocate_gpu_kv_two_page_buffer(ctx, [1]) is False
+    # Any OTHER allocation error is a defect and propagates.
+    engine._allocate_gpu_pages_with_host_identity = (
+        lambda *a: (_ for _ in ()).throw(RuntimeError("page table corrupt"))
+    )
+    with pytest.raises(RuntimeError, match="page table corrupt"):
+        engine._allocate_gpu_kv_two_page_buffer(ctx, [1])
+
+
+# ---- D6.4 delegators -------------------------------------------------------
+
+
+D64_HELPERS = (
+    "_decode_phase_context", "_deferred_kv_flush_context",
+    "_pending_kv_append_tensor_list",
+)
+
+
+def test_flush_delegator_shares_the_channel_and_resets_in_the_old_order(
+    monkeypatch,
+):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._deferred_kv_entries = [("entry",)]
+    worker._deferred_kv_batch = ([1], [2])
+    worker._deferred_kv_worker_view = "view"
+    worker._pending_kv_append_tasks = []
+    seen = []
+
+    def flush(ctx, tasks, tensors, **helpers):
+        seen.append((ctx, tasks, tensors, sorted(helpers)))
+        # The list the engine appends into is the worker's own, created by the
+        # delegator so the later drain clears the very same object.
+        tensors.append("retained")
+        assert tensors is worker._pending_kv_append_tensors
+        return ns["DeferredKVFlushOutcome"](
+            _deferred_kv_entries=[], _deferred_kv_entries_aux=[],
+            _deferred_kv_batch=None, _deferred_kv_worker_view=None,
+            _deferred_kv_worker_view_aux=None,
+        )
+
+    engine._flush_deferred_kv_to_host = flush
+    assert worker._flush_deferred_kv_to_host() is None
+    ctx, tasks, tensors, helpers = seen[0]
+    assert helpers == ["_ensure_host_kv_append_capacity"]
+    assert tasks is worker._pending_kv_append_tasks
+    assert worker._pending_kv_append_tensors == ["retained"]
+    # The context carries the forward's channel with the pre-move defaults.
+    assert ctx.deferred_entries == [("entry",)]
+    assert ctx.deferred_batch == ([1], [2])
+    assert ctx.deferred_worker_view == "view"
+    assert ctx.deferred_entries_aux == []
+    assert ctx.deferred_worker_view_aux is None
+    # All five resets applied.
+    assert worker._deferred_kv_entries == []
+    assert worker._deferred_kv_batch is None
+    assert worker._deferred_kv_worker_view is None
+    assert worker._deferred_kv_worker_view_aux is None
+    # A second flush reuses the SAME tensor list, never a fresh one.
+    held = worker._pending_kv_append_tensors
+    worker._flush_deferred_kv_to_host()
+    assert seen[-1][2] is held
+
+
+def test_flush_delegator_leaves_the_untouched_fields_alone(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._deferred_kv_batch = ([3], [4])
+    worker._deferred_kv_worker_view = "view"
+    worker._pending_kv_append_tasks = []
+    engine._flush_deferred_kv_to_host = lambda *a, **kw: (
+        ns["DeferredKVFlushOutcome"](
+            _deferred_kv_entries=[], _deferred_kv_entries_aux=[],
+        )
+    )
+    worker._flush_deferred_kv_to_host()
+    assert worker._deferred_kv_entries == []
+    # The three sentinel fields are not bound, so the forward's handoff stands.
+    assert worker._deferred_kv_batch == ([3], [4])
+    assert worker._deferred_kv_worker_view == "view"
+    assert not hasattr(worker, "_deferred_kv_worker_view_aux")
+
+
+def test_aux_slot_delegator_caches_only_what_the_outcome_carries(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker.gpu_paged_kv_cache_manager = "coord"
+    seen = []
+
+    def resolve(ctx):
+        seen.append(ctx)
+        return frozenset({2}), ns["AuxLayerSlotsOutcome"](
+            _aux_layers_with_slots_cache=frozenset({2}),
+        )
+
+    engine._aux_layers_with_slots = resolve
+    assert worker._aux_layers_with_slots() == frozenset({2})
+    # The context is the narrow pair, with the pre-move getattr defaults.
+    assert seen[0].aux_coordinator == "coord"
+    assert seen[0]._aux_layers_with_slots_cache is False
+    assert worker._aux_layers_with_slots_cache == frozenset({2})
+    # The non-caching exits leave the memo exactly as it was.
+    engine._aux_layers_with_slots = lambda ctx: (
+        seen.append(ctx) or (None, ns["AuxLayerSlotsOutcome"]())
+    )
+    assert worker._aux_layers_with_slots() is None
+    assert worker._aux_layers_with_slots_cache == frozenset({2})
+    assert seen[-1]._aux_layers_with_slots_cache == frozenset({2})
+
+
+def test_aux_slot_delegator_works_without_a_coordinator_attribute(monkeypatch):
+    """The pre-move body tolerated a worker with no GPU KV manager bound.
+
+    The narrow context keeps that: resolving the full decode phase context
+    here would raise on a startup-time caller instead of reporting "no aux".
+    """
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    seen = []
+    engine._aux_layers_with_slots = lambda ctx: (
+        seen.append(ctx) or (None, ns["AuxLayerSlotsOutcome"]())
+    )
+    assert worker._aux_layers_with_slots() is None
+    assert seen[0].aux_coordinator is None
+
+
+def test_aux_append_delegator_hands_over_the_channel_and_collaborators(
+    monkeypatch,
+):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._pending_kv_append_tasks = ["t"]
+    # The drain is a worker method of its own, outside this stage's set.
+    worker._wait_pending_kv_append_tasks = lambda **kwargs: 0
+    seen = []
+    engine._append_decode_kv_to_host_aux_async = (
+        lambda ctx, tasks, tensors, *args, **helpers:
+        seen.append((ctx, tasks, tensors, args, sorted(helpers)))
+    )
+    worker._append_decode_kv_to_host_aux_async(5, [0], "k", "v", "s")
+    ctx, tasks, tensors, args, helpers = seen[0]
+    assert ctx is worker._held_decode_phase_context
+    assert tasks is worker._pending_kv_append_tasks
+    assert tensors is worker._pending_kv_append_tensors
+    assert args == (5, [0], "k", "v", "s")
+    assert helpers == [
+        "_aux_layers_with_slots", "_wait_pending_kv_append_tasks",
+    ]
+
+
+def test_capacity_load_and_allocate_delegators_pass_the_phase_context(
+    monkeypatch,
+):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    seen = []
+    engine._ensure_host_kv_append_capacity = (
+        lambda ctx, ids, lengths: seen.append(("capacity", ctx, ids, lengths))
+    )
+    engine._load_host_kv_to_gpu = (
+        lambda ctx, mgr, ids: seen.append(("load", ctx, mgr, ids))
+    )
+    engine._allocate_gpu_kv_two_page_buffer = (
+        lambda ctx, rows, load, preflight:
+        seen.append(("allocate", ctx, rows, load, preflight))
+    )
+    worker._ensure_host_kv_append_capacity([1], [2])
+    worker._load_host_kv_to_gpu("mgr", [10])
+    worker._allocate_gpu_kv_two_page_buffer([3], False, True)
+    assert [row[0] for row in seen] == ["capacity", "load", "allocate"]
+    for row in seen:
+        assert row[1] is worker._held_decode_phase_context
+    assert seen[0][2:] == ([1], [2])
+    assert seen[1][2:] == ("mgr", [10])
+    assert seen[2][2:] == ([3], False, True)
+
+
+def test_integrate_delegator_injects_the_finalize_collaborator(monkeypatch):
+    """The finalize arrives as the WORKER's method, not the engine sibling.
+
+    Its delegator carries the load-tensor holder across the call and stamps
+    the decode row epoch afterwards, so the engine must reach it through the
+    worker or both effects are silently dropped.
+    """
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D64_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._finalize_async_load_minimal = lambda *args: (["u"], [0])
+    seen = []
+    engine._integrate_pending_async_load = (
+        lambda ctx, *args, **helpers:
+        seen.append((ctx, args, helpers)) or (["u"], [0])
+    )
+    assert worker._integrate_pending_async_load(
+        "task", ["u0"], [0], [10], ["u1"], [1], "mgr",
+    ) == (["u"], [0])
+    ctx, args, helpers = seen[0]
+    assert ctx is worker._held_decode_phase_context
+    assert args == ("task", ["u0"], [0], [10], ["u1"], [1], "mgr")
+    assert helpers == {
+        "_finalize_async_load_minimal": worker._finalize_async_load_minimal,
+    }
