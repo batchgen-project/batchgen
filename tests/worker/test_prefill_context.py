@@ -1,10 +1,17 @@
-"""The prefill engine's readers and predicates run from frozen values.
+"""The prefill engine's converted operations run from frozen values.
 
 D7.1, the first stage of this engine's conversion: fourteen small operations
 stop receiving the worker. Each takes a frozen plain-value context (or, where
 it reads no worker state at all, only the launch value its delegator resolves)
 plus explicit keyword-only collaborator callables. Nothing here builds a
 stand-in worker: every body is driven by the context it declares.
+
+D7.2, the second stage: the five prefix-planning operations. Four of them read
+the two owned stores (prefix reuse, trajectories) through their context and
+change nothing in them but the one state installation the owner's own method
+performs; the fifth, the cost-profile lookup, is this engine's first worker
+WRITE handed back in an outcome, and the tests below pin its cache as
+create-then-populate, on the delegator, with the second call hitting it.
 
 The bodies are compiled out of the engine's own AST
 (``tests/prefill_source.py``), because importing the engine pulls in the
@@ -22,7 +29,10 @@ import pytest
 import torch
 
 from tests.prefill_source import (
+    D7_1_METHODS,
+    D7_2_METHODS,
     METHODS,
+    OUTCOME_METHODS,
     STATELESS_METHODS,
     engine_class_node,
     engine_method_names,
@@ -41,10 +51,24 @@ PSM_READERS = (
 )
 PROBE_READERS = ("_pool_probe_debug", "_pool_pad_poison_enabled")
 
-# Every worker delegator this stage converted, plus the two context builders
+# Every worker delegator these stages converted, plus the two context builders
 # they share.
 DELEGATORS = tuple(sorted(METHODS))
 DELEGATOR_HELPERS = ("_prefill_pool_parallel_context", "_pool_probe_context")
+
+
+def worker_method_names():
+    """Every method name defined on ``BatchGenWorker``.
+
+    A collaborator callable is the worker's own method of that name, so the
+    allowed set of underscore-prefixed keyword-only parameters is "a real
+    worker or engine method" rather than a hand-maintained exception list.
+    """
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    return {node.name for node in cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
 def runtime(**namespace):
@@ -148,7 +172,7 @@ def test_every_collaborator_is_keyword_only(name):
     silently slide a context into it.
     """
     node = method_node(name)
-    worker_shaped = engine_method_names() | {"_debug_flag_enabled"}
+    worker_shaped = engine_method_names() | worker_method_names()
     for arg in node.args.args:
         assert arg.arg not in worker_shaped, arg.arg
     for arg in node.args.kwonlyargs:
@@ -164,7 +188,7 @@ def test_no_context_field_holds_a_collaborator():
     annotation would be the same thing under another name.
     """
     ns, _ = runtime()
-    engine_methods = engine_method_names() | {"_debug_flag_enabled"}
+    engine_methods = engine_method_names() | worker_method_names()
     for name, value in sorted(ns.items()):
         if not (isinstance(value, type) and name.endswith("Context")):
             continue
@@ -179,11 +203,76 @@ def test_every_context_is_frozen():
         value for name, value in sorted(ns.items())
         if isinstance(value, type) and name.endswith("Context")
     ]
-    assert len(contexts) == 8
+    # Eight from D7.1, four from D7.2.
+    assert len(contexts) == 12
     for context in contexts:
         instance = context(**{field.name: None for field in fields(context)})
         with pytest.raises(FrozenInstanceError):
             setattr(instance, fields(context)[0].name, object())
+
+
+def test_every_outcome_is_frozen_and_declares_no_container():
+    """An outcome carries what a write ADDED, never the worker's container."""
+    ns, _ = runtime()
+    outcomes = [
+        value for name, value in sorted(ns.items())
+        if isinstance(value, type) and name.endswith("Outcome")
+    ]
+    assert len(outcomes) == 1
+    for outcome in outcomes:
+        instance = outcome()
+        with pytest.raises(FrozenInstanceError):
+            setattr(instance, fields(outcome)[0].name, object())
+        # The default IS the engine's own sentinel, so "added nothing" can
+        # never be confused with adding ``None`` (a valid cost profile).
+        for field in fields(outcome):
+            assert getattr(instance, field.name) is ns["PREFILL_UNCHANGED"]
+
+
+def test_only_the_declared_operation_returns_an_outcome():
+    """Every other converted body writes no worker attribute at all.
+
+    The no-worker guard above already proves none of them STORES through the
+    seam; this pins the other half, that none of them smuggles a write out in
+    an outcome either.
+    """
+    ns, _ = runtime()
+    outcomes = {name for name in ns if name.endswith("Outcome")}
+    for name in sorted(METHODS):
+        node = method_node(name)
+        built = {
+            n.func.id for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        } & outcomes
+        assert bool(built) == (name in OUTCOME_METHODS), (name, built)
+
+
+def test_no_context_carries_a_field_its_operations_do_not_read():
+    """Narrowness, measured against the bodies instead of asserted by name.
+
+    A context's declared fields must be exactly what the operations annotated
+    with it read through ``ctx`` -- the UNION over those operations, because a
+    shared context is shared precisely where the read sets coincide. A field
+    nobody reads would make a delegator resolve a worker attribute its
+    operation never needed, which is how a narrow read turns into an
+    AttributeError.
+    """
+    reads = {}
+    for name in sorted(METHODS):
+        if name in STATELESS_METHODS:
+            continue
+        node = method_node(name)
+        annotation = ast.unparse(node.args.args[1].annotation)
+        reads.setdefault(annotation, set()).update(
+            n.attr for n in ast.walk(node)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.value, ast.Name) and n.value.id == "ctx"
+        )
+    ns, _ = runtime()
+    assert len(reads) == 12
+    for context_name, read in sorted(reads.items()):
+        declared = {field.name for field in fields(ns[context_name])}
+        assert declared == read, (context_name, declared ^ read)
 
 
 def test_the_psm_readers_share_one_context_because_they_read_one_object():
@@ -209,7 +298,7 @@ def test_the_probe_pair_shares_one_context_because_their_reads_coincide():
 
 
 def test_the_stage_converted_exactly_its_own_methods():
-    """The file still holds worker-shaped operations: this is stage one.
+    """The file still holds worker-shaped operations: this is stage two of seven.
 
     The later stages of this engine convert the rest, so the guard that the
     whole FILE names no worker belongs to the last one, not here.
@@ -225,7 +314,13 @@ def test_the_stage_converted_exactly_its_own_methods():
             converted.add(node.name)
     assert converted == METHODS
     assert not worker_shaped & METHODS
-    assert worker_shaped, "nothing left to convert, but D7.1 is not the last stage"
+    assert worker_shaped, "nothing left to convert, but D7.2 is not the last stage"
+    # The two stages are disjoint, and what is left is what D7.3-D7.7 take:
+    # fourteen converted here, five there, twenty-three still worker-shaped.
+    assert D7_1_METHODS.isdisjoint(D7_2_METHODS)
+    assert (len(D7_1_METHODS), len(D7_2_METHODS), len(worker_shaped)) == (
+        14, 5, 23,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -815,11 +910,16 @@ def load_delegators(monkeypatch, ns, extra=DELEGATOR_HELPERS):
     return worker
 
 
-def recording(engine, name, capture):
-    """Replace one engine operation with a recorder of its arguments."""
+def recording(engine, name, capture, result="recorded"):
+    """Replace one engine operation with a recorder of its arguments.
+
+    ``result`` is what the recorder hands back, because a delegator that
+    applies an outcome unpacks the engine's return value: the cost-profile
+    delegator needs a ``(profile, outcome)`` pair, not a marker string.
+    """
     def record(*args, **kwargs):
         capture.append((args, kwargs))
-        return "recorded"
+        return result
     setattr(engine, name, record)
 
 
@@ -1038,3 +1138,855 @@ def test_the_delegators_create_the_engine_once(monkeypatch):
     assert isinstance(engine, ns["PrefillEngine"])
     assert worker._next_pool_segment_sid() == -1
     assert worker._prefill_engine is engine
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: the cost-profile cache
+# --------------------------------------------------------------------------- #
+MEM_141G = 141 * 1024 ** 3
+
+
+@pytest.fixture
+def cost_lookup(monkeypatch):
+    """The real import seam, with the device and the table recorded.
+
+    The body imports the lookup inside the miss branch and reads device 0, so
+    an arm that resolves nothing must leave both of these untouched.
+    """
+    import batchgen.prefix_reuse.executor_cost as executor_cost
+
+    calls, devices = [], []
+    profile = SimpleNamespace(model="kimi", machine="h200", group_size=8)
+
+    def lookup(*args):
+        calls.append(args)
+        return profile
+
+    def device_properties(index):
+        devices.append(index)
+        return SimpleNamespace(major=9, minor=0, total_memory=MEM_141G)
+
+    monkeypatch.setattr(executor_cost, "find_executor_cost_profile", lookup)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties,
+                        raising=False)
+    return SimpleNamespace(calls=calls, devices=devices, profile=profile)
+
+
+def cost_context(ns, *, cache=None, model="org/Kimi-K3", world=16, rank=3):
+    return ns["PrefixRankCostProfileContext"](
+        rank=rank,
+        world_size=world,
+        model_name=model,
+        _prefix_rank_cost_profiles=cache,
+    )
+
+
+def test_an_absent_cache_resolves_the_profile_and_reports_the_entry(cost_lookup):
+    ns, engine = runtime()
+    profile, outcome = engine._cached_prefix_rank_cost_profile(
+        # ``None`` is the delegator's pre-move ``hasattr`` miss.
+        cost_context(ns), attn_group_size=8,
+    )
+    assert profile is cost_lookup.profile
+    assert outcome.cache_entry == (False, cost_lookup.profile)
+    # The group size scores one serve group, and device 0 stands for the node.
+    assert cost_lookup.calls == [
+        ("org/Kimi-K3", (9, 0), MEM_141G, 16, 8),
+    ]
+    assert cost_lookup.devices == [0]
+
+
+def test_a_pure_dp_rank_resolves_a_group_of_one(cost_lookup):
+    ns, engine = runtime()
+    engine._cached_prefix_rank_cost_profile(cost_context(ns), attn_group_size=1)
+    assert cost_lookup.calls[0][-1] == 1
+
+
+def test_the_off_arm_reports_a_none_entry_without_a_lookup(cost_lookup):
+    ns, engine = runtime()
+    profile, outcome = engine._cached_prefix_rank_cost_profile(
+        cost_context(ns), True, attn_group_size=8,
+    )
+    assert profile is None
+    # ``None`` IS the entry: the token-balance arm caches that answer, which
+    # is why the sentinel and not ``None`` means "added nothing".
+    assert outcome.cache_entry == (True, None)
+    assert outcome.cache_entry[1] is not ns["PREFILL_UNCHANGED"]
+    assert cost_lookup.calls == [] and cost_lookup.devices == []
+
+
+def test_a_cache_hit_adds_nothing_and_looks_nothing_up(cost_lookup):
+    ns, engine = runtime()
+    cached = object()
+    profile, outcome = engine._cached_prefix_rank_cost_profile(
+        cost_context(ns, cache={False: cached}), attn_group_size=8,
+    )
+    assert profile is cached
+    assert outcome.cache_entry is ns["PREFILL_UNCHANGED"]
+    assert cost_lookup.calls == []
+
+
+def test_the_other_arms_entry_is_not_this_arms_answer(cost_lookup):
+    """The cache is keyed: one process serves both arms."""
+    ns, engine = runtime()
+    profile, outcome = engine._cached_prefix_rank_cost_profile(
+        cost_context(ns, cache={True: None}), attn_group_size=8,
+    )
+    assert profile is cost_lookup.profile
+    assert outcome.cache_entry == (False, cost_lookup.profile)
+
+
+def test_the_engine_never_writes_the_cache_it_was_handed(cost_lookup):
+    """The one worker container this stage writes is written by the delegator.
+
+    The context carries the cache by value for the key test and the tail
+    lookup; the add goes back in the outcome, so the object the delegator
+    passed in comes back untouched.
+    """
+    ns, engine = runtime()
+    live = {True: None}
+    profile, outcome = engine._cached_prefix_rank_cost_profile(
+        cost_context(ns, cache=live), attn_group_size=8,
+    )
+    assert live == {True: None}
+    assert outcome.cache_entry == (False, profile)
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: the wave's trajectory re-entries
+# --------------------------------------------------------------------------- #
+def frontier_record(pages=((0, (71, 72)),)):
+    return SimpleNamespace(page_ids_by_group=dict(pages))
+
+
+def attachment(*, boundary=8, group_id=0, pages=((0, (71, 72)),)):
+    return SimpleNamespace(
+        boundary_tokens=boundary, owning_group_id=group_id,
+        record=frontier_record(pages),
+    )
+
+
+def seq(global_idx=100, *, prompt_length=32, group=0):
+    return SimpleNamespace(
+        global_idx=global_idx, prompt_length=prompt_length,
+        decode_dp_group=group,
+    )
+
+
+def session_index(entry, *, calls=None):
+    """The mirrored session index: replicated, read-only, resolve-by-prompt."""
+    def resolve(*, namespace_digest, prompt_token_ids):
+        if calls is not None:
+            calls.append((namespace_digest, prompt_token_ids))
+        return entry
+    return SimpleNamespace(resolve=resolve)
+
+
+def hits_context(
+    ns, *, attachments=None, index=None, states=None, digest=(1, 2), rank=4,
+):
+    return ns["MaterializedPrefixHitsContext"](
+        rank=rank,
+        prefix_runtime=SimpleNamespace(namespace_digest=digest),
+        traj=SimpleNamespace(
+            trajectory_attachments=dict(attachments or {}),
+            trajectory_session_groups=index,
+        ),
+        prefix=SimpleNamespace(prefix_sequence_states=dict(states or {})),
+    )
+
+
+def derive(
+    engine, context, seqs, *, page_tokens=4, group=None, requested=True,
+    tokens=(1, 2, 3), reason=None, owns=False, asked=None,
+):
+    """Drive the derivation with its four collaborator callables."""
+    def frontier(sequence, **kwargs):
+        if asked is not None:
+            asked.append((sequence.global_idx, kwargs))
+        return reason
+
+    return engine._materialized_prefix_hits(
+        context, seqs, page_tokens=page_tokens, group=group,
+        _trajectory_commit_requested=lambda _seqs: requested,
+        _trajectory_tokens=lambda sequence, length: SimpleNamespace(
+            tolist=lambda: list(tokens),
+        ),
+        _unmaterializable_frontier=frontier,
+        _owns_host_kv=lambda sequence: owns,
+    )
+
+
+def test_a_flag_off_wave_derives_nothing_and_reads_no_state():
+    ns, engine = runtime()
+    context = ns["MaterializedPrefixHitsContext"](
+        rank=7,
+        prefix_runtime=Explode("prefix_runtime"),
+        traj=Explode("traj"),
+        prefix=Explode("prefix"),
+    )
+    assert derive(engine, context, [seq()], requested=False) == (
+        [], True, {}, {},
+    )
+
+
+def test_its_own_group_reads_its_live_attachment(caplog):
+    ns, engine = runtime()
+    context = hits_context(
+        ns, attachments={100: attachment()},
+        states={100: SimpleNamespace(attached_tokens=8)},
+    )
+    with caplog.at_level("WARNING"):
+        hits, confirmed, pages, drops = derive(engine, context, [seq()])
+    assert [(hit.index, hit.tokens) for hit in hits] == [(0, 8)]
+    assert confirmed is True and drops == {}
+    assert pages == {0: {0: [71, 72]}}
+    assert caplog.text == ""
+
+
+def test_a_turn_one_prompt_continues_nothing_and_is_counted_once(caplog):
+    ns, engine = runtime()
+    with caplog.at_level("INFO"):
+        hits, confirmed, pages, drops = derive(
+            engine, hits_context(ns), [seq(), seq(101)],
+        )
+    assert (hits, confirmed, pages, drops) == ([], True, {}, {})
+    # One aggregate line, naming where the rank looked.
+    assert caplog.text.count("[PREFIX_POOL]") == 1
+    assert "2 of 2 flag-on sequence(s)" in caplog.text
+    assert "this rank's live attachments" in caplog.text
+
+
+def test_a_grouped_wave_reads_the_mirrored_index_not_the_registry():
+    ns, engine = runtime()
+    asked = []
+    index = session_index(
+        SimpleNamespace(boundary_tokens=8, owning_group_id=0), calls=asked,
+    )
+    # The live attachment exists and agrees, but the BOUNDARY came from the
+    # index: every rank of the group derives the same hit.
+    context = hits_context(
+        ns, attachments={100: attachment()}, index=index, digest=(9, 9),
+        states={100: SimpleNamespace(attached_tokens=8)},
+    )
+    hits, confirmed, pages, drops = derive(
+        engine, context, [seq()], group="pg", tokens=(5, 6),
+    )
+    assert [(hit.index, hit.tokens) for hit in hits] == [(0, 8)]
+    assert (confirmed, drops) == (True, {})
+    assert asked == [((9, 9), [5, 6])]
+
+
+def test_a_grouped_wave_without_an_index_drops_every_row(caplog):
+    ns, engine = runtime()
+    with caplog.at_level("INFO"):
+        hits, confirmed, pages, drops = derive(
+            engine, hits_context(ns, index=None), [seq()], group="pg",
+        )
+    assert (hits, confirmed, pages) == ([], True, {})
+    assert drops == {0: "the mirrored session index does not place this session"}
+    assert "the mirrored session index" in caplog.text
+
+
+def test_a_row_the_index_does_not_place_is_dropped_by_name():
+    ns, engine = runtime()
+    context = hits_context(ns, index=session_index(None))
+    hits, confirmed, pages, drops = derive(
+        engine, context, [seq()], group="pg",
+    )
+    assert (hits, confirmed, pages) == ([], True, {})
+    assert drops == {0: "the mirrored session index does not place this session"}
+
+
+def test_an_unmaterializable_frontier_is_dropped_by_its_reason(caplog):
+    ns, engine = runtime()
+    asked = []
+    context = hits_context(ns, attachments={100: attachment(boundary=12)})
+    with caplog.at_level("INFO"):
+        hits, confirmed, pages, drops = derive(
+            engine, context, [seq()], page_tokens=4,
+            reason="no_private_token_left", asked=asked,
+        )
+    assert (hits, confirmed, pages) == ([], True, {})
+    assert drops == {
+        0: "the pool cannot materialize it (no_private_token_left)",
+    }
+    # The predicate is asked with the boundary and group the row resolved.
+    assert asked == [
+        (100, {"boundary": 12, "owning_group_id": 0, "page_tokens": 4}),
+    ]
+    assert "the pool cannot materialize" in caplog.text
+
+
+def test_a_leader_without_a_live_record_takes_the_group_back(caplog):
+    """The mirror is stale: this rank holds the registry and has no record."""
+    ns, engine = runtime()
+    context = hits_context(
+        ns, index=session_index(
+            SimpleNamespace(boundary_tokens=8, owning_group_id=0),
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        hits, confirmed, pages, drops = derive(
+            engine, context, [seq()], group="pg", owns=True,
+        )
+    assert [hit.index for hit in hits] == [0]
+    assert confirmed is False and pages == {} and drops == {}
+    assert "holds no live frontier" in caplog.text
+
+
+def test_a_follower_without_a_record_has_no_opinion(caplog):
+    ns, engine = runtime()
+    context = hits_context(
+        ns, index=session_index(
+            SimpleNamespace(boundary_tokens=8, owning_group_id=0),
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        _, confirmed, pages, drops = derive(
+            engine, context, [seq()], group="pg", owns=False,
+        )
+    assert confirmed is True and pages == {} and drops == {}
+    assert caplog.text == ""
+
+
+def test_a_boundary_the_index_disagrees_with_is_dropped_and_vetoed(caplog):
+    ns, engine = runtime()
+    context = hits_context(
+        ns, attachments={100: attachment(boundary=4)},
+        index=session_index(
+            SimpleNamespace(boundary_tokens=8, owning_group_id=0),
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        hits, confirmed, pages, drops = derive(
+            engine, context, [seq()], group="pg",
+        )
+    assert [hit.index for hit in hits] == [0]
+    assert confirmed is False and pages == {}
+    assert drops == {
+        0: "the live frontier is at boundary 4 but the mirrored index says 8",
+    }
+    assert "the group recomputes this wave" in caplog.text
+
+
+def test_an_attachment_short_of_the_frontier_is_dropped_and_vetoed(caplog):
+    """The resident pages the load reads are kept by this row's attachment."""
+    ns, engine = runtime()
+    context = hits_context(
+        ns, attachments={100: attachment()},
+        states={100: SimpleNamespace(attached_tokens=4)},
+    )
+    with caplog.at_level("WARNING"):
+        hits, confirmed, pages, drops = derive(engine, context, [seq()])
+    assert [hit.index for hit in hits] == [0]
+    assert confirmed is False and pages == {}
+    assert drops == {
+        0: ("its prefix-cache attachment covers 4 token(s), short of the "
+            "8-token frontier it must keep resident"),
+    }
+    assert "fewer than the" in caplog.text
+
+
+def test_a_row_with_no_installed_state_counts_as_zero_attached():
+    ns, engine = runtime()
+    context = hits_context(ns, attachments={100: attachment()}, states={})
+    _, confirmed, pages, drops = derive(engine, context, [seq()])
+    assert confirmed is False and pages == {}
+    assert "covers 0 token(s)" in drops[0]
+
+
+def test_a_record_naming_no_resident_page_is_dropped_and_vetoed(caplog):
+    ns, engine = runtime()
+    context = hits_context(
+        ns, attachments={100: attachment(pages=())},
+        states={100: SimpleNamespace(attached_tokens=8)},
+    )
+    with caplog.at_level("WARNING"):
+        hits, confirmed, pages, drops = derive(engine, context, [seq()])
+    assert [hit.index for hit in hits] == [0]
+    assert confirmed is False and pages == {}
+    assert drops == {0: "its frontier record names no resident Host page"}
+    assert "names no resident Host page" in caplog.text
+
+
+def test_the_wave_index_is_the_position_and_a_hole_is_skipped():
+    """``None`` in the wave is a hole: every map is keyed by POSITION."""
+    ns, engine = runtime()
+    context = hits_context(
+        ns,
+        attachments={
+            100: attachment(),
+            102: attachment(boundary=8, pages=((0, (81,)),)),
+        },
+        states={
+            100: SimpleNamespace(attached_tokens=8),
+            102: SimpleNamespace(attached_tokens=8),
+        },
+    )
+    hits, confirmed, pages, drops = derive(
+        engine, context, [seq(100), None, seq(102)],
+    )
+    assert [hit.index for hit in hits] == [0, 2]
+    assert sorted(pages) == [0, 2]
+    assert (confirmed, drops) == (True, {})
+
+
+def test_the_owned_stores_are_only_read():
+    """Prefix-reuse and trajectory state have one owner each: this reads."""
+    ns, engine = runtime()
+    context = hits_context(
+        ns, attachments={100: attachment()},
+        states={100: SimpleNamespace(attached_tokens=8)},
+    )
+    before_attachments = dict(context.traj.trajectory_attachments)
+    before_states = dict(context.prefix.prefix_sequence_states)
+    derive(engine, context, [seq()])
+    assert context.traj.trajectory_attachments == before_attachments
+    assert context.prefix.prefix_sequence_states == before_states
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: why a frontier cannot become a pool segment
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("boundary", [0, -4, 3, 5])
+def test_a_boundary_off_the_page_grid_is_refused(boundary):
+    _, engine = runtime()
+    assert engine._unmaterializable_frontier(
+        seq(prompt_length=64), boundary=boundary, owning_group_id=0,
+        page_tokens=4,
+    ) == "boundary_off_the_page_grid"
+
+
+def test_the_last_prompt_token_must_stay_private():
+    """It produces the logit, so the frontier cannot cover the whole prompt."""
+    _, engine = runtime()
+    assert engine._unmaterializable_frontier(
+        seq(prompt_length=8), boundary=8, owning_group_id=0, page_tokens=4,
+    ) == "no_private_token_left"
+    assert engine._unmaterializable_frontier(
+        seq(prompt_length=9), boundary=8, owning_group_id=0, page_tokens=4,
+    ) is None
+
+
+def test_a_sequence_serving_outside_the_owning_group_is_refused():
+    _, engine = runtime()
+    assert engine._unmaterializable_frontier(
+        seq(prompt_length=64, group=1), boundary=8, owning_group_id=0,
+        page_tokens=4,
+    ) == "serving_group_is_not_the_owning_group"
+
+
+def test_an_unplaced_sequence_counts_as_group_zero():
+    _, engine = runtime()
+    assert engine._unmaterializable_frontier(
+        seq(prompt_length=64, group=None), boundary=8, owning_group_id=0,
+        page_tokens=4,
+    ) is None
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: releasing the cross-wave lookup hits
+# --------------------------------------------------------------------------- #
+def owner_state():
+    """A REAL prefix-reuse owner that records the installs it was asked for."""
+    from batchgen.worker.prefix_reuse_state import PrefixReuseState
+
+    class Recording(PrefixReuseState):
+        def __init__(self):
+            super().__init__(rank=0, world_size=1)
+            self.installed = []
+
+        def install_state(self, global_id, state):
+            self.installed.append((global_id, state))
+            super().install_state(global_id, state)
+
+    return Recording()
+
+
+def replacement_context(ns, *, released=None, prefix=None, rank=2):
+    return ns["PrefixLookupReplacementContext"](
+        rank=rank,
+        prefix_coordinator=SimpleNamespace(
+            release_attachment=(released if released is not None else []).append,
+        ),
+        prefix=prefix if prefix is not None else owner_state(),
+    )
+
+
+def test_a_lookup_hit_is_released_and_the_prompt_starts_at_its_chain_end():
+    ns, engine = runtime()
+    released, owner = [], owner_state()
+    context = replacement_context(ns, released=released, prefix=owner)
+    states = {3: SimpleNamespace(attachment_handle=7)}
+    engine._replace_prefix_lookup_hits(
+        context, [seq(3)], states, [64],
+    )
+    assert released == [7]
+    installed = states[3]
+    assert (installed.attached_tokens, installed.compute_cached_tokens) == (64, 64)
+    assert installed.lookup_result is None
+    assert installed.commit_attachment_handles == ()
+    # Installed through the OWNER's method, which is the only write path.
+    assert owner.installed == [(3, installed)]
+    assert owner.prefix_sequence_states == {3: installed}
+
+
+def test_a_retained_hit_keeps_its_attachment_as_a_commit_handle():
+    ns, engine = runtime()
+    released, owner = [], owner_state()
+    engine._replace_prefix_lookup_hits(
+        replacement_context(ns, released=released, prefix=owner),
+        [seq(3)], {3: SimpleNamespace(attachment_handle=7)}, [64],
+        retain={0},
+    )
+    assert released == []
+    assert owner.prefix_sequence_states[3].commit_attachment_handles == (7,)
+
+
+def test_a_follower_without_a_lookup_releases_nothing():
+    ns, engine = runtime()
+    released, owner = [], owner_state()
+    states = {}
+    engine._replace_prefix_lookup_hits(
+        replacement_context(ns, released=released, prefix=owner),
+        [seq(3)], states, [0],
+    )
+    assert released == []
+    assert states[3].commit_attachment_handles == ()
+
+
+def test_the_restore_boundary_is_carried_on_the_row_it_was_planned_for():
+    ns, engine = runtime()
+    owner = owner_state()
+    states = {}
+    engine._replace_prefix_lookup_hits(
+        replacement_context(ns, prefix=owner),
+        [seq(3), seq(5)], states, [64, 0], restore_boundaries={0: 64},
+    )
+    assert states[3].trajectory_restore_boundary == 64
+    assert states[5].trajectory_restore_boundary == 0
+
+
+def test_a_restore_that_does_not_meet_its_compute_start_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="Rank 2: sequence 3 is planned"):
+        engine._replace_prefix_lookup_hits(
+            replacement_context(ns), [seq(3)], {}, [32],
+            restore_boundaries={0: 64},
+        )
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: the plan-time restore settlement
+# --------------------------------------------------------------------------- #
+class Restorer:
+    def __init__(self):
+        self.declined = []
+
+    def decline(self, attached, *, reason, detail):
+        self.declined.append((attached, reason, detail))
+
+
+def settle_context(
+    ns, *, attachments=None, restorer=None, states=None, rank=6, prefix=None,
+):
+    return ns["TrajectoryRestoreSettleContext"](
+        rank=rank,
+        traj=SimpleNamespace(
+            trajectory_attachments=dict(attachments or {}),
+            trajectory_restorer=restorer,
+        ),
+        prefix=prefix if prefix is not None else SimpleNamespace(
+            prefix_sequence_states=dict(states or {}),
+        ),
+    )
+
+
+def test_a_follower_with_no_attachment_settles_nothing():
+    ns, engine = runtime()
+    context = settle_context(ns, prefix=Explode("prefix"))
+    assert engine._settle_trajectory_restore_plan(
+        context, [seq()], {}, "unused",
+    ) is None
+
+
+def test_a_planned_row_keeps_its_attachment():
+    ns, engine = runtime()
+    restorer = Restorer()
+    held = attachment()
+    context = settle_context(
+        ns, attachments={100: held}, restorer=restorer,
+        states={100: SimpleNamespace(trajectory_restore_boundary=8)},
+    )
+    engine._settle_trajectory_restore_plan(context, [seq()], {}, "unused")
+    assert context.traj.trajectory_attachments == {100: held}
+    assert restorer.declined == []
+
+
+def test_a_plan_that_disagrees_with_the_live_frontier_is_refused():
+    ns, engine = runtime()
+    context = settle_context(
+        ns, attachments={100: attachment(boundary=8)}, restorer=Restorer(),
+        states={100: SimpleNamespace(trajectory_restore_boundary=4)},
+    )
+    with pytest.raises(RuntimeError, match="Rank 6: sequence 100 is planned"):
+        engine._settle_trajectory_restore_plan(context, [seq()], {}, "unused")
+
+
+def test_an_unplanned_attachment_is_consumed_here_with_the_plans_reason():
+    ns, engine = runtime()
+    restorer = Restorer()
+    held = attachment()
+    context = settle_context(
+        ns, attachments={100: held}, restorer=restorer,
+        states={100: SimpleNamespace(trajectory_restore_boundary=0)},
+    )
+    engine._settle_trajectory_restore_plan(
+        context, [seq()], {0: "the group could not confirm it"}, "not planned",
+    )
+    # Removed from the store's own map, so it never reaches the restore seam.
+    assert context.traj.trajectory_attachments == {}
+    (declined, reason, detail), = restorer.declined
+    assert declined is held
+    assert detail == "at plan time: the group could not confirm it"
+    from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
+    assert reason == DECLINE_NOT_PLANNED
+
+
+def test_a_row_the_plan_dropped_without_a_reason_takes_the_default():
+    ns, engine = runtime()
+    restorer = Restorer()
+    context = settle_context(
+        ns, attachments={100: attachment()}, restorer=restorer, states={},
+    )
+    engine._settle_trajectory_restore_plan(context, [seq()], {}, "no budget")
+    assert restorer.declined[0][2] == "at plan time: no budget"
+
+
+def test_an_unplanned_attachment_without_a_restorer_is_refused():
+    ns, engine = runtime()
+    context = settle_context(ns, attachments={100: attachment()}, restorer=None)
+    with pytest.raises(RuntimeError, match="has no restorer"):
+        engine._settle_trajectory_restore_plan(context, [seq()], {}, "unused")
+
+
+def test_the_settlement_runs_in_wave_order_and_skips_holes():
+    ns, engine = runtime()
+    restorer = Restorer()
+    context = settle_context(
+        ns,
+        attachments={100: attachment(), 102: attachment()},
+        restorer=restorer,
+        states={},
+    )
+    engine._settle_trajectory_restore_plan(
+        context, [seq(100), None, seq(102)], {0: "first", 2: "third"}, "unused",
+    )
+    assert [detail for _, _, detail in restorer.declined] == [
+        "at plan time: first", "at plan time: third",
+    ]
+    assert context.traj.trajectory_attachments == {}
+
+
+def test_the_settlement_only_reads_the_prefix_states():
+    ns, engine = runtime()
+    states = {100: SimpleNamespace(trajectory_restore_boundary=0)}
+    context = settle_context(
+        ns, attachments={100: attachment()}, restorer=Restorer(),
+        states=states,
+    )
+    engine._settle_trajectory_restore_plan(context, [seq()], {}, "unused")
+    assert context.prefix.prefix_sequence_states == states
+
+
+# --------------------------------------------------------------------------- #
+#  D7.2: the worker delegators
+# --------------------------------------------------------------------------- #
+def cost_profile_worker(monkeypatch, ns, engine, *, group=8):
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 3
+    worker.world_size = 16
+    worker.model_name = "org/Kimi-K3"
+    worker._prefill_attn_tp_size = lambda: group
+    return worker
+
+
+def test_the_cost_profile_delegator_creates_the_cache_then_populates_it(
+    monkeypatch, cost_lookup,
+):
+    """The pre-move order, on the worker: create when absent, then add.
+
+    The engine hands the entry back; the delegator is what writes. A second
+    call must find the entry and resolve nothing, which is the whole point of
+    a cache keyed by the arm.
+    """
+    ns, engine = runtime()
+    worker = cost_profile_worker(monkeypatch, ns, engine)
+    assert not hasattr(worker, "_prefix_rank_cost_profiles")
+    assert worker._cached_prefix_rank_cost_profile() is cost_lookup.profile
+    assert worker._prefix_rank_cost_profiles == {False: cost_lookup.profile}
+    # Second call: the cache answers and the lookup is not repeated.
+    assert worker._cached_prefix_rank_cost_profile() is cost_lookup.profile
+    assert len(cost_lookup.calls) == 1
+    assert worker._prefix_rank_cost_profiles == {False: cost_lookup.profile}
+
+
+def test_the_cost_profile_delegator_keeps_both_arms(monkeypatch, cost_lookup):
+    """An outcome carrying the container would drop the other arm's entry."""
+    ns, engine = runtime()
+    worker = cost_profile_worker(monkeypatch, ns, engine)
+    seen = [worker._cached_prefix_rank_cost_profile(disabled)
+            for disabled in (False, True, False, True)]
+    assert [item is None for item in seen] == [False, True, False, True]
+    assert worker._prefix_rank_cost_profiles == {
+        False: cost_lookup.profile, True: None,
+    }
+    assert len(cost_lookup.calls) == 1
+
+
+def test_the_cost_profile_delegator_writes_nothing_on_a_hit(
+    monkeypatch, cost_lookup,
+):
+    ns, engine = runtime()
+    worker = cost_profile_worker(monkeypatch, ns, engine)
+
+    class Watching(dict):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.writes = []
+
+        def __setitem__(self, key, value):
+            self.writes.append(key)
+            super().__setitem__(key, value)
+
+    worker._prefix_rank_cost_profiles = Watching({False: cost_lookup.profile})
+    assert worker._cached_prefix_rank_cost_profile() is cost_lookup.profile
+    assert worker._prefix_rank_cost_profiles.writes == []
+    assert cost_lookup.calls == []
+
+
+def test_the_cost_profile_delegator_builds_its_context(monkeypatch):
+    ns, engine = runtime()
+    worker = cost_profile_worker(monkeypatch, ns, engine, group=4)
+    worker._prefix_rank_cost_profiles = {True: None}
+    seen = []
+    recording(engine, "_cached_prefix_rank_cost_profile", seen,
+              result=("profile", ns["PrefixRankCostProfileCacheOutcome"]()))
+    assert worker._cached_prefix_rank_cost_profile(True) == "profile"
+    (context, disabled), kwargs = seen[0]
+    assert isinstance(context, ns["PrefixRankCostProfileContext"])
+    assert (context.rank, context.world_size, context.model_name) == (
+        3, 16, "org/Kimi-K3",
+    )
+    # The cache travels by value, and the live one at that.
+    assert context._prefix_rank_cost_profiles == {True: None}
+    assert disabled is True
+    assert kwargs == {"attn_group_size": 4}
+
+
+def test_the_cost_profile_delegator_passes_the_hasattr_miss_as_none(monkeypatch):
+    ns, engine = runtime()
+    worker = cost_profile_worker(monkeypatch, ns, engine)
+    assert not hasattr(worker, "_prefix_rank_cost_profiles")
+    seen = []
+    recording(engine, "_cached_prefix_rank_cost_profile", seen,
+              result=(None, ns["PrefixRankCostProfileCacheOutcome"]()))
+    worker._cached_prefix_rank_cost_profile()
+    assert seen[0][0][0]._prefix_rank_cost_profiles is None
+    # The delegator still creates the container, exactly as the pre-move body
+    # did before it read the key.
+    assert worker._prefix_rank_cost_profiles == {}
+
+
+def test_the_hits_delegator_builds_its_context_and_its_collaborators(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 4
+    worker.prefix_cache_runtime_config = "runtime"
+    worker._traj = "trajectories"
+    worker._prefix = "prefix state"
+    worker._trajectory_commit_requested = lambda seqs: True
+    worker._trajectory_tokens = lambda seq, length: seq
+    worker._owns_host_kv = lambda seq: False
+    seen = []
+    recording(engine, "_materialized_prefix_hits", seen)
+    assert worker._materialized_prefix_hits(
+        ["seq"], page_tokens=64, group="pg",
+    ) == "recorded"
+    (context, seqs), kwargs = seen[0]
+    assert isinstance(context, ns["MaterializedPrefixHitsContext"])
+    assert (context.rank, context.prefix_runtime, context.traj,
+            context.prefix) == (4, "runtime", "trajectories", "prefix state")
+    assert seqs == ["seq"]
+    assert kwargs == {
+        "page_tokens": 64,
+        "group": "pg",
+        "_trajectory_commit_requested": worker._trajectory_commit_requested,
+        "_trajectory_tokens": worker._trajectory_tokens,
+        "_unmaterializable_frontier": worker._unmaterializable_frontier,
+        "_owns_host_kv": worker._owns_host_kv,
+    }
+
+
+def test_the_frontier_predicate_delegator_passes_no_context(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    seen = []
+    recording(engine, "_unmaterializable_frontier", seen)
+    assert worker._unmaterializable_frontier(
+        "seq", boundary=8, owning_group_id=0, page_tokens=4,
+    ) == "recorded"
+    assert seen[0] == (
+        ("seq",), {"boundary": 8, "owning_group_id": 0, "page_tokens": 4},
+    )
+
+
+def test_the_lookup_replacement_delegator_builds_its_context(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 2
+    worker.prefix_cache_coordinator = "coordinator"
+    worker._prefix = "prefix state"
+    seen = []
+    recording(engine, "_replace_prefix_lookup_hits", seen)
+    worker._replace_prefix_lookup_hits(
+        ["seq"], {"states": 1}, [64], {0}, {0: 64},
+    )
+    (context, seqs, states, chain, retain, restores), kwargs = seen[0]
+    assert isinstance(context, ns["PrefixLookupReplacementContext"])
+    assert (context.rank, context.prefix_coordinator, context.prefix) == (
+        2, "coordinator", "prefix state",
+    )
+    # Every argument of the pre-move call stays positional, in its order.
+    assert (seqs, states, chain, retain, restores) == (
+        ["seq"], {"states": 1}, [64], {0}, {0: 64},
+    )
+    assert kwargs == {}
+
+
+def test_the_settle_delegator_reads_the_live_stores_each_call(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 6
+    worker._traj = "first"
+    worker._prefix = "prefix state"
+    seen = []
+    recording(engine, "_settle_trajectory_restore_plan", seen)
+    worker._settle_trajectory_restore_plan(["seq"], {0: "why"}, "default")
+    worker._traj = "second"
+    worker._settle_trajectory_restore_plan(["seq"], {}, "default")
+    contexts = [args[0] for args, _ in seen]
+    assert all(isinstance(c, ns["TrajectoryRestoreSettleContext"])
+               for c in contexts)
+    assert [c.traj for c in contexts] == ["first", "second"]
+    assert [c.rank for c in contexts] == [6, 6]
+    assert seen[0][0][1:] == (["seq"], {0: "why"}, "default")
+    assert seen[0][1] == {}

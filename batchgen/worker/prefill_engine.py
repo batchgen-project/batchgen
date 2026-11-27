@@ -17,6 +17,19 @@ placement and geometry readers touch, and :class:`PoolProbeContext` carries the
 rank and the adopted debug state the pooled probes read.  No converted
 operation writes a worker attribute, so this stage declares no outcome; the
 probe read's two writes land on the wave object its caller passed, in place.
+
+D7.2 converted the prefix-planning operations.  Prefix-reuse and trajectory
+state each have ONE owner (``PrefixReuseState``, ``TrajectoryStore``), which
+these bodies reach through their context: reads go to the owner's own
+attributes and the one state installation goes through
+``PrefixReuseState.install_state``, exactly as the pre-move bodies did.  One of
+them, the cost-profile cache, is the first worker WRITE this engine hands back:
+the cache is created on first use and then added to, so the engine works on a
+local copy and returns the single entry it added in
+:class:`PrefixRankCostProfileCacheOutcome` for the delegator to apply in the
+original create-then-populate order.  The frontier predicate reads no worker
+state at all and therefore takes no context, like D7.1's two launch-value
+predicates.
 """
 
 from __future__ import annotations
@@ -206,6 +219,95 @@ class PoolProbeContext:
 
     rank: int
     _phase_prefill_debug: object
+
+
+# D7.2: the prefix-planning contexts. Each is narrow, one per read set: the
+# three bodies that read owned state read overlapping but DIFFERENT sets, and a
+# shared wider context would make the delegator resolve an attribute its
+# operation never reads. A skipped write is distinct from writing ``None``,
+# which is a legal cost profile, so the cache outcome needs its own sentinel.
+PREFILL_UNCHANGED = object()
+
+
+@dataclass(frozen=True)
+class PrefixRankCostProfileContext:
+    """The deployment identity the packer's cost-profile lookup resolves from.
+
+    ``_prefix_rank_cost_profiles`` is the cache itself, by value: ``None`` is
+    the pre-move ``hasattr`` miss, i.e. this process has resolved neither arm
+    yet. The engine does NOT write it -- see
+    :class:`PrefixRankCostProfileCacheOutcome`.
+    """
+
+    rank: int
+    world_size: int
+    model_name: object
+    _prefix_rank_cost_profiles: object
+
+
+@dataclass(frozen=True)
+class PrefixRankCostProfileCacheOutcome:
+    """The ONE entry the cost-profile lookup adds to its cache.
+
+    The pre-move body CREATED the cache on first use and then ADDED one entry
+    to it, keyed by the A/B arm, so an outcome carrying the container would
+    drop whatever the other arm resolved earlier in the same process -- and
+    passing the container in to be mutated is not available either, because
+    this body neither drains nor clears it. The field therefore carries the
+    ``(key, profile)`` pair the write added, and the delegator keeps the
+    original create-then-populate statements in their order. A cache hit adds
+    nothing and leaves the field at the sentinel, which ``None`` could not
+    stand for: ``None`` is a valid profile (the token-balance arm).
+    """
+
+    cache_entry: object = PREFILL_UNCHANGED
+
+
+@dataclass(frozen=True)
+class MaterializedPrefixHitsContext:
+    """What deriving this wave's trajectory re-entries reads.
+
+    Both owned stores appear, and both are read-only here: the mirrored
+    session index and the live attachments belong to ``TrajectoryStore``, the
+    per-sequence prefix states to ``PrefixReuseState``. Deliberately narrower
+    than a prefill phase context, and not shared with the settle operation
+    below, which reads neither the namespace digest nor the runtime config.
+    """
+
+    rank: int
+    prefix_runtime: object
+    traj: object
+    prefix: object
+
+
+@dataclass(frozen=True)
+class PrefixLookupReplacementContext:
+    """What releasing this wave's cross-wave lookup hits reads.
+
+    Its own context: the coordinator is the only holder of a lookup
+    attachment, and no other converted body in this stage touches it. The new
+    state goes in through ``PrefixReuseState.install_state``, the owner's own
+    method, which is what the pre-move body called.
+    """
+
+    rank: int
+    prefix_coordinator: object
+    prefix: object
+
+
+@dataclass(frozen=True)
+class TrajectoryRestoreSettleContext:
+    """What declining the plan's unrestored attachments reads.
+
+    Its own context rather than the hits context above: this body reads the
+    two owned stores and the rank, and a context that also carried the prefix
+    runtime config would make the delegator resolve an attribute this
+    operation never reads.
+    """
+
+    rank: int
+    traj: object
+    prefix: object
 
 
 class PrefillModelStateBinder(Protocol):
@@ -486,7 +588,10 @@ class PrefillEngine:
             )
         return value == "off"
 
-    def _cached_prefix_rank_cost_profile(self, worker, disabled: bool = False, *, attn_group_size: int):
+    def _cached_prefix_rank_cost_profile(
+        self, ctx: PrefixRankCostProfileContext, disabled: bool = False, *,
+        attn_group_size: int,
+    ) -> Tuple[object, PrefixRankCostProfileCacheOutcome]:
         """This deployment's prefill executor cost profile, looked up once.
 
         Model, device properties and parallel layout are deployment constants,
@@ -505,15 +610,19 @@ class PrefillEngine:
         cached under whichever arm arrived first would pin every later batch to
         it. ``disabled`` resolves to ``None`` — the same value as "no profile
         matches", which is exactly the fallback arm the packer already has.
+
+        The cache is the one worker container this stage writes, and the engine
+        does not write it: the pre-move pair "create it when absent, then read
+        it" resolves here as a LOCAL copy seeded from the context (``None`` is
+        that ``hasattr`` miss), so the key test and the tail lookup below are
+        the pre-move ones, and the single entry a miss adds travels back in
+        :class:`PrefixRankCostProfileCacheOutcome`. The delegator performs the
+        create and the add, in that original order.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        if not hasattr(self, "_prefix_rank_cost_profiles"):
-            self._prefix_rank_cost_profiles = {}
+        _prefix_rank_cost_profiles = dict(ctx._prefix_rank_cost_profiles or {})
+        cache_entry = PREFILL_UNCHANGED
         key = bool(disabled)
-        if key not in self._prefix_rank_cost_profiles:
+        if key not in _prefix_rank_cost_profiles:
             from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 
             G = attn_group_size
@@ -523,26 +632,37 @@ class PrefillEngine:
             else:
                 props = torch.cuda.get_device_properties(0)
                 profile = find_executor_cost_profile(
-                    self.model_name or "",
+                    ctx.model_name or "",
                     (props.major, props.minor),
                     props.total_memory,
-                    self.world_size,
+                    ctx.world_size,
                     group_size,
                 )
-            self._prefix_rank_cost_profiles[key] = profile
+            _prefix_rank_cost_profiles[key] = profile
+            cache_entry = (key, profile)
             logging.info(
                 "[PREFIX_PACK] rank %d executor cost profile: model=%s "
                 "group_size=%d disabled=%d -> %s",
-                self.rank,
-                (self.model_name or "").lower().rsplit("/", 1)[-1],
+                ctx.rank,
+                (ctx.model_name or "").lower().rsplit("/", 1)[-1],
                 group_size,
                 int(key),
                 "none" if profile is None
                 else f"{profile.model}/{profile.machine}/g{profile.group_size}",
             )
-        return self._prefix_rank_cost_profiles[key]
+        return (
+            _prefix_rank_cost_profiles[key],
+            PrefixRankCostProfileCacheOutcome(cache_entry),
+        )
 
-    def _materialized_prefix_hits(self, worker, seqs, *, page_tokens: int, group):
+    def _materialized_prefix_hits(
+        self, ctx: MaterializedPrefixHitsContext, seqs, *, page_tokens: int,
+        group,
+        _trajectory_commit_requested: Callable,
+        _trajectory_tokens: Callable,
+        _unmaterializable_frontier: Callable,
+        _owns_host_kv: Callable,
+    ):
         """``(hits, confirmed, pages, drops)`` for this wave's trajectory re-entries.
 
         M3 Slice 3, the plan input. EVERY rank of a serve group must derive
@@ -575,17 +695,21 @@ class PrefillEngine:
         pages ``[0, boundary)`` the load reads are kept resident by the row's
         own prefix-cache attachment alone (an eviction under a referenced
         record releases the pages first and only then refuses the record).
+
+        Both owned stores are READ-ONLY here, through the context: the session
+        index and the live attachments are the trajectory store's, the prefix
+        states are the prefix-reuse owner's, and this body changes neither.
+        The four collaborators arrive as keyword-only callables -- the worker's
+        own methods of those names, which is what the pre-move body called;
+        each has a different read set from this one, the frontier predicate
+        included (it reads no worker state at all).
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
 
-        if not self._trajectory_commit_requested(seqs):
+        if not _trajectory_commit_requested(seqs):
             return [], True, {}, {}
-        digest = self.prefix_cache_runtime_config.namespace_digest
-        index = self._traj.trajectory_session_groups
+        digest = ctx.prefix_runtime.namespace_digest
+        index = ctx.traj.trajectory_session_groups
         hits: List[MaterializedPrefix] = []
         pages: Dict[int, Dict[int, List[int]]] = {}
         drops: Dict[int, str] = {}
@@ -594,7 +718,7 @@ class PrefillEngine:
         for position, seq in enumerate(seqs):
             if seq is None:
                 continue
-            attachment = self._traj.trajectory_attachments.get(int(seq.global_idx))
+            attachment = ctx.traj.trajectory_attachments.get(int(seq.global_idx))
             if group is None:
                 # Own group: no peer to agree with, so the live record is the
                 # only truth there is.
@@ -606,7 +730,7 @@ class PrefillEngine:
             else:
                 entry = None if index is None else index.resolve(
                     namespace_digest=digest,
-                    prompt_token_ids=self._trajectory_tokens(
+                    prompt_token_ids=_trajectory_tokens(
                         seq, length=seq.prompt_length
                     ).tolist(),
                 )
@@ -618,7 +742,7 @@ class PrefillEngine:
                     continue
                 boundary = int(entry.boundary_tokens)
                 entry_group = int(entry.owning_group_id)
-            reason = self._unmaterializable_frontier(
+            reason = _unmaterializable_frontier(
                 seq, boundary=boundary, owning_group_id=entry_group,
                 page_tokens=page_tokens,
             )
@@ -627,20 +751,20 @@ class PrefillEngine:
                     "[PREFIX_POOL] Rank %s sequence %s continues a frontier at "
                     "%s token(s) the pool cannot materialize (%s); it is "
                     "prefilled in full",
-                    self.rank, int(seq.global_idx), boundary, reason,
+                    ctx.rank, int(seq.global_idx), boundary, reason,
                 )
                 drops[position] = f"the pool cannot materialize it ({reason})"
                 continue
             hits.append(MaterializedPrefix(index=position, tokens=boundary))
             if attachment is None:
-                if self._owns_host_kv(seq):
+                if _owns_host_kv(seq):
                     # This rank holds the registry the index came from and has
                     # no live record for it: the mirror is stale.
                     logging.warning(
                         "[PREFIX_POOL] Rank %s holds no live frontier for "
                         "sequence %s, which the mirrored session index places "
                         "at boundary %s; the group recomputes this wave",
-                        self.rank, int(seq.global_idx), boundary,
+                        ctx.rank, int(seq.global_idx), boundary,
                     )
                     confirmed = False
                 continue
@@ -649,7 +773,7 @@ class PrefillEngine:
                     "[PREFIX_POOL] Rank %s holds sequence %s's frontier at "
                     "boundary %s but the mirrored index says %s; the group "
                     "recomputes this wave",
-                    self.rank, int(seq.global_idx),
+                    ctx.rank, int(seq.global_idx),
                     int(attachment.boundary_tokens), boundary,
                 )
                 drops[position] = (
@@ -659,7 +783,7 @@ class PrefillEngine:
                 )
                 confirmed = False
                 continue
-            state = self._prefix.prefix_sequence_states.get(int(seq.global_idx))
+            state = ctx.prefix.prefix_sequence_states.get(int(seq.global_idx))
             attached = 0 if state is None else int(state.attached_tokens)
             if attached < boundary:
                 # The resident pages the load reads are kept resident by this
@@ -671,7 +795,7 @@ class PrefillEngine:
                     "[PREFIX_POOL] Rank %s: sequence %s holds %s attached "
                     "prefix token(s), fewer than the %s-token frontier the "
                     "index advertised; the group recomputes",
-                    self.rank, int(seq.global_idx), attached, boundary,
+                    ctx.rank, int(seq.global_idx), attached, boundary,
                 )
                 drops[position] = (
                     f"its prefix-cache attachment covers {attached} token(s), "
@@ -689,7 +813,7 @@ class PrefillEngine:
                 logging.warning(
                     "[PREFIX_POOL] Rank %s: sequence %s's frontier record "
                     "names no resident Host page; the group recomputes",
-                    self.rank, int(seq.global_idx),
+                    ctx.rank, int(seq.global_idx),
                 )
                 drops[position] = "its frontier record names no resident Host page"
                 confirmed = False
@@ -704,24 +828,24 @@ class PrefillEngine:
             logging.info(
                 "[PREFIX_POOL] Rank %s: %s of %s flag-on sequence(s) continue "
                 "no session known to %s; they are prefilled in full",
-                self.rank, unknown, len(seqs),
+                ctx.rank, unknown, len(seqs),
                 "this rank's live attachments" if group is None
                 else "the mirrored session index",
             )
         return hits, confirmed, pages, drops
 
     def _unmaterializable_frontier(
-        self, worker, seq, *, boundary: int, owning_group_id: int, page_tokens: int
+        self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
     ) -> Optional[str]:
         """Why this frontier cannot become a pool segment, or None.
 
         Each reason is a property of the wave, identical on every rank that
         derived the same hit, so skipping on it keeps the plans identical.
+
+        It takes NO context: every reason is read off the sequence and the
+        wave's own numbers, so there is no worker state to snapshot and an
+        empty context would claim otherwise.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
 
         if boundary <= 0 or boundary % int(page_tokens):
             return "boundary_off_the_page_grid"
@@ -1291,8 +1415,8 @@ class PrefillEngine:
         return layout
 
     def _replace_prefix_lookup_hits(
-        self, worker, seqs, prefix_states, chain_tokens, retain=frozenset(),
-        restore_boundaries=None,
+        self, ctx: PrefixLookupReplacementContext, seqs, prefix_states,
+        chain_tokens, retain=frozenset(), restore_boundaries=None,
     ) -> None:
         """Release each cross-wave lookup hit; a prompt starts at its chain end.
 
@@ -1313,11 +1437,13 @@ class PrefillEngine:
         the plan materialized to that boundary: the row's restore decision,
         carried on its state as ``trajectory_restore_boundary``. Every other
         row gets 0, i.e. no restore.
+
+        The per-sequence prefix state has ONE owner: the new state goes in
+        through ``PrefixReuseState.install_state``, the owner's own method and
+        the one the pre-move body called, reached through the context. The
+        caller's ``prefix_states`` map is its own object, mutated in place
+        exactly as before.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
         restores = restore_boundaries or {}
@@ -1325,12 +1451,12 @@ class PrefillEngine:
             old = prefix_states.get(seq.global_idx)
             handle = 0 if old is None else int(old.attachment_handle)
             if handle and index not in retain:
-                self.prefix_cache_coordinator.release_attachment(handle)
+                ctx.prefix_coordinator.release_attachment(handle)
                 handle = 0
             restore = int(restores.get(index, 0))
             if restore and restore != int(end):
                 raise RuntimeError(
-                    f"Rank {self.rank}: sequence {int(seq.global_idx)} is "
+                    f"Rank {ctx.rank}: sequence {int(seq.global_idx)} is "
                     f"planned to restore at token {restore} but its compute "
                     f"starts at {int(end)}"
                 )
@@ -1342,9 +1468,11 @@ class PrefillEngine:
                 trajectory_restore_boundary=restore,
             )
             prefix_states[seq.global_idx] = state
-            self._prefix.install_state(seq.global_idx, state)
+            ctx.prefix.install_state(seq.global_idx, state)
 
-    def _settle_trajectory_restore_plan(self, worker, seqs, drops, default_reason) -> None:
+    def _settle_trajectory_restore_plan(
+        self, ctx: TrajectoryRestoreSettleContext, seqs, drops, default_reason,
+    ) -> None:
         """Decline, at plan time, every live attachment the plan does not restore.
 
         Runs once at the end of every wave plan, on every return path, over
@@ -1355,39 +1483,41 @@ class PrefillEngine:
         otherwise), so it never reaches the restore seam and its reference is
         released exactly once. Only the rank holding attachments (the
         host-KV leader) has anything to do; a follower's map is empty.
+
+        The live attachment map belongs to the trajectory store and the prefix
+        states to the prefix-reuse owner; both are reached through the context.
+        The consumed attachment is removed from the store's own map exactly as
+        the pre-move body removed it -- no worker attribute is written here, so
+        this operation declares no outcome.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        if not self._traj.trajectory_attachments:
+        if not ctx.traj.trajectory_attachments:
             return
         from batchgen.prefix_reuse.trajectory_restore import DECLINE_NOT_PLANNED
 
-        restorer = self._traj.trajectory_restorer
+        restorer = ctx.traj.trajectory_restorer
         for index, seq in enumerate(seqs):
             if seq is None:
                 continue
             global_id = int(seq.global_idx)
-            attachment = self._traj.trajectory_attachments.get(global_id)
+            attachment = ctx.traj.trajectory_attachments.get(global_id)
             if attachment is None:
                 continue
-            state = self._prefix.prefix_sequence_states.get(global_id)
+            state = ctx.prefix.prefix_sequence_states.get(global_id)
             planned = 0 if state is None else int(state.trajectory_restore_boundary)
             if planned:
                 if planned != int(attachment.boundary_tokens):
                     raise RuntimeError(
-                        f"Rank {self.rank}: sequence {global_id} is planned to "
+                        f"Rank {ctx.rank}: sequence {global_id} is planned to "
                         f"restore at token {planned} but its live frontier is "
                         f"at {int(attachment.boundary_tokens)}"
                     )
                 continue
             if restorer is None:
                 raise RuntimeError(
-                    f"Rank {self.rank}: sequence {global_id} holds a live "
+                    f"Rank {ctx.rank}: sequence {global_id} holds a live "
                     "trajectory attachment but this rank has no restorer"
                 )
-            del self._traj.trajectory_attachments[global_id]
+            del ctx.traj.trajectory_attachments[global_id]
             restorer.decline(
                 attachment,
                 reason=DECLINE_NOT_PLANNED,

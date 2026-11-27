@@ -1,12 +1,13 @@
-"""Load the D7.1 definitions without importing the native/CUDA graph.
+"""Load the converted prefill definitions without the native/CUDA graph.
 
 ``batchgen.worker.prefill_engine`` imports ``batchgen.native_loader``, which
 refuses to load without the compiled core engine and UCX, so this module
 compiles the pieces under test straight out of the engine's AST: the frozen
-context classes, the module-scope probe-key literals (their only reader is
-this engine, which is why they live there) and the converted methods. The
-sibling of ``tests/kv_capacity_source.py``, and the same contract: the test
-fails when the real body changes, and re-implements nothing.
+context and outcome classes, the module-scope probe-key literals (their only
+reader is this engine, which is why they live there), the module-scope
+outcome sentinel and the converted methods. The sibling of
+``tests/kv_capacity_source.py``, and the same contract: the test fails when
+the real body changes, and re-implements nothing.
 """
 
 import ast
@@ -27,7 +28,18 @@ CONTEXT_CLASSES = {
     "PrefillPoolWaveContext",
     "PrefillModelPassCountContext",
     "PoolProbeContext",
+    # D7.2: the prefix-planning contexts.
+    "PrefixRankCostProfileContext",
+    "MaterializedPrefixHitsContext",
+    "PrefixLookupReplacementContext",
+    "TrajectoryRestoreSettleContext",
 }
+# The frozen outcomes this engine declares: a converted body hands its worker
+# writes back in one of these for the delegator to apply.
+OUTCOME_CLASSES = {"PrefixRankCostProfileCacheOutcome"}
+# Module-scope values the loaded definitions close over, compiled from the
+# real source so a test can compare against the engine's own object identity.
+MODULE_SENTINELS = {"PREFILL_UNCHANGED"}
 # The D7.1 names: the small pure readers and predicates of the prefill engine.
 # Two of them (`_prefix_rank_packing_mode`, `_prefix_rank_cost_profile_disabled`)
 # read no worker state at all, so they take no context either.
@@ -47,10 +59,23 @@ D7_1_METHODS = {
     "_pool_probe_debug",
     "_pool_pad_poison_enabled",
 }
+# The D7.2 names: the prefix-planning operations of the prefill engine.
+# `_unmaterializable_frontier` reads no worker state at all, so like the two
+# launch-value predicates above it takes no context either.
+D7_2_METHODS = {
+    "_cached_prefix_rank_cost_profile",
+    "_materialized_prefix_hits",
+    "_unmaterializable_frontier",
+    "_replace_prefix_lookup_hits",
+    "_settle_trajectory_restore_plan",
+}
 STATELESS_METHODS = {
     "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
+    "_unmaterializable_frontier",
 }
-METHODS = set(D7_1_METHODS)
+# The one converted operation that hands a worker write back in an outcome.
+OUTCOME_METHODS = {"_cached_prefix_rank_cost_profile"}
+METHODS = set(D7_1_METHODS) | set(D7_2_METHODS)
 
 
 def engine_class_node():
@@ -77,10 +102,12 @@ def method_node(name):
 
 
 def _probe_key_assigns(tree):
-    """The module-scope probe-key literals and the tuple that collects them.
+    """The module-scope probe keys, their tuple, and the outcome sentinel.
 
     Compiled from the real source rather than restated here, so the loaded
-    ``_pool_probe_debug`` scans exactly the keys production scans.
+    ``_pool_probe_debug`` scans exactly the keys production scans and the
+    loaded cost-profile lookup returns the engine's own "nothing added"
+    sentinel object.
     """
     out = []
     for node in tree.body:
@@ -91,7 +118,7 @@ def _probe_key_assigns(tree):
             continue
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             out.append(node)
-        elif target.id == "_POOL_PROBE_DEBUG_KEYS":
+        elif target.id == "_POOL_PROBE_DEBUG_KEYS" or target.id in MODULE_SENTINELS:
             out.append(node)
     return out
 
@@ -116,7 +143,7 @@ def load_prefill(namespace=None):
                              if isinstance(member, ast.FunctionDef)
                              and member.name in METHODS]
                 nodes.append(node)
-            elif node.name in CONTEXT_CLASSES:
+            elif node.name in CONTEXT_CLASSES | OUTCOME_CLASSES:
                 nodes.append(node)
     nodes = nodes[:1] + _probe_key_assigns(tree) + nodes[1:]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
