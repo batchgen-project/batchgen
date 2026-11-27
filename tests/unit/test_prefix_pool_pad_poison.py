@@ -203,13 +203,17 @@ def test_the_worker_reads_the_flag_through_the_batch_debug_seam():
         "batchgen", "worker", "prefill_engine.py"
     ).read_text()
 
-    assert "def _pool_pad_poison_enabled(self, worker, wave) -> bool:" in source
+    # D7.1: the predicate takes the probe context and the flag reader, not the
+    # worker. Its CALL SITE is still inside a worker-shaped forward, so that
+    # one keeps its spelling.
+    assert "def _pool_pad_poison_enabled(\n        self, ctx: PoolProbeContext, wave, *,\n" in source
     assert "pad_poison=self._pool_pad_poison_enabled(wave)," in source
     # Same seam the offload check uses: the wave's own sequences.
     seam = source.split("    def _pool_pad_poison_enabled")[1].split("\n    def ")[0]
     # One cached read per wave, shared with the other pooled probes, and the
-    # flag decision precedes the import so the off path imports nothing.
-    assert "self._pool_probe_debug(wave)" in seam
+    # flag decision precedes the import so the off path imports nothing. The
+    # read is now the engine sibling, reached with the SAME context.
+    assert "self._pool_probe_debug(ctx, wave)" in seam
     assert seam.index("if debug is None:") < seam.index(
         "from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG"
     )

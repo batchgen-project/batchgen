@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-import copy
 import logging
 from dataclasses import fields
 from pathlib import Path
@@ -46,6 +45,7 @@ import torch
 
 from batchgen.prefix_reuse import epilogue_trace as _TRACE
 from batchgen.prefix_reuse.wave_runtime import PoolWave
+from tests.worker_method_source import worker_shaped_method_node
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 TREE = ast.parse(WORKER.read_text())
@@ -117,18 +117,16 @@ _NAMESPACE = {
     "logging": logging,
     "_POOL_PROBE_DEBUG_KEYS": _PROBE_KEYS,
 }
+# Each seam method is compiled in the WORKER's own shape, so it binds onto the
+# fake below as an ordinary method. D7.1 converted two of them
+# (``_pool_probe_debug``, ``_pool_pad_poison_enabled``) to a frozen context and
+# explicit collaborators; the lift puts their delegator's resolutions back
+# inline, which is the body that actually runs. The other three still take the
+# worker, and the lift only drops their ``self = worker`` rebinding.
 exec(compile(ast.fix_missing_locations(ast.Module(
-    body=[copy.deepcopy(_method(name)) for name in _SEAM],
+    body=[worker_shaped_method_node(name) for name in _SEAM],
     type_ignores=[],
 )), "<worker-probe-seam>", "exec"), _NAMESPACE)
-
-for _name in _ENGINE_METHODS:
-    _engine_method = _NAMESPACE[_name]
-
-    def _worker_method(worker, *args, _engine_method=_engine_method, **kwargs):
-        return _engine_method(None, worker, *args, **kwargs)
-
-    _NAMESPACE[_name] = _worker_method
 
 
 # --------------------------------------------------------------------------- #
