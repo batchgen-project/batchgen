@@ -111,10 +111,12 @@ def test_synchronous_host_to_gpu_load_uses_dual_dsa_path():
     body = delegated_method_source("_load_host_kv_to_gpu")
 
     dual_branch = body.index("if isinstance(manager, DualKVCacheCoordinator):")
+    # D6.4: the load takes the decode phase context and hands the SAME context
+    # to the two siblings that were already context-shaped.
     dual_prepare = body.index(
-        "pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)"
+        "pointers = self._prepare_dual_kv_load_pointers(ctx, manager, global_sequence_ids)"
     )
-    dual_launch = body.index("load_task = self._launch_dual_host_kv_load(pointers)")
+    dual_launch = body.index("load_task = self._launch_dual_host_kv_load(ctx, pointers)")
     primary_only_call = body.index("k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()")
 
     assert dual_branch < dual_prepare < dual_launch < primary_only_call

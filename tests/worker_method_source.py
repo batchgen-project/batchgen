@@ -176,6 +176,27 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx._watermark_check_counter": (
             "getattr(self, '_watermark_check_counter', None)"
         ),
+        # D6.4 DeferredKVFlushContext: the decode forward's handoff channel,
+        # which the pre-move flush read with the same getattr defaults.
+        "ctx.deferred_entries": "getattr(self, '_deferred_kv_entries', [])",
+        "ctx.deferred_entries_aux": (
+            "getattr(self, '_deferred_kv_entries_aux', [])"
+        ),
+        "ctx.deferred_worker_view": (
+            "getattr(self, '_deferred_kv_worker_view', None)"
+        ),
+        "ctx.deferred_batch": "getattr(self, '_deferred_kv_batch', None)",
+        "ctx.deferred_worker_view_aux": (
+            "getattr(self, '_deferred_kv_worker_view_aux', None)"
+        ),
+        # D6.4 AuxLayerSlotsContext: the aux-slot resolution's two reads, both
+        # of which the pre-move body took with a getattr default.
+        "ctx.aux_coordinator": (
+            "getattr(self, 'gpu_paged_kv_cache_manager', None)"
+        ),
+        "ctx._aux_layers_with_slots_cache": (
+            "getattr(self, '_aux_layers_with_slots_cache', False)"
+        ),
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -256,6 +277,19 @@ class _ContextToWorker(ast.NodeTransformer):
                 ),
                 "logged_migration_skip_tp": (
                     "getattr(self, '_logged_migration_skip_tp', False)"
+                ),
+                # D6.4 keyword-only collaborators and value parameters. The
+                # append channel's task list is handed over by reference, and
+                # the pre-move bodies named it without a hasattr guard.
+                "_ensure_host_kv_append_capacity": (
+                    "self._ensure_host_kv_append_capacity"
+                ),
+                "_aux_layers_with_slots": "self._aux_layers_with_slots",
+                "_wait_pending_kv_append_tasks": (
+                    "self._wait_pending_kv_append_tasks"
+                ),
+                "_finalize_async_load_minimal": (
+                    "self._finalize_async_load_minimal"
                 ),
             }
             replacement = replacements.get(node.id)
@@ -356,11 +390,60 @@ OUTCOME_WRITE_FIELDS = {
         "_host_kv_page_stats", "_watermark_check_counter",
     ),
     "MigrationPlanOutcome": ("_logged_migration_skip_tp",),
+    "DeferredKVFlushOutcome": (
+        "_deferred_kv_entries", "_deferred_kv_entries_aux",
+        "_deferred_kv_batch", "_deferred_kv_worker_view",
+        "_deferred_kv_worker_view_aux",
+    ),
+    "AuxLayerSlotsOutcome": ("_aux_layers_with_slots_cache",),
 }
 OUTCOME_METHODS = {
     "_check_host_kv_watermark_trigger": "WatermarkTriggerOutcome",
     "_plan_kv_migration": "MigrationPlanOutcome",
+    "_flush_deferred_kv_to_host": "DeferredKVFlushOutcome",
+    "_aux_layers_with_slots": "AuxLayerSlotsOutcome",
 }
+# Methods whose pre-move body ended WITHOUT a return statement: the outcome
+# return added at the tail is seam plumbing, so the worker-shaped view drops
+# it rather than keeping a bare ``return`` the original never had. An outcome
+# return anywhere else is a real early exit and stays as ``return``.
+OUTCOME_IMPLICIT_TAIL_RETURN = {"_flush_deferred_kv_to_host"}
+
+
+# D6.4: the pending append-tensor list is CREATED on first use inside the
+# launch and appended to afterwards, so the converted bodies take it by
+# reference under a local alias named after the attribute, bound once where the
+# pre-move body created it. Its worker spelling is that original create block,
+# which no field-by-field outcome rule can express -- the same reason the
+# migration receive needs its own restore.
+_PENDING_TENSORS_ALIAS = "_pending_kv_append_tensors"
+_PENDING_TENSORS_CREATE = """
+if not hasattr(self, '_pending_kv_append_tensors'):
+    self._pending_kv_append_tensors = []
+"""
+
+
+class _PendingTensorAliasToWorker(ast.NodeTransformer):
+    """Restore the append-tensor alias to the worker's create-then-append."""
+
+    def visit_Assign(self, node):
+        target = node.targets[0]
+        if (
+            len(node.targets) == 1
+            and isinstance(target, ast.Name)
+            and target.id == _PENDING_TENSORS_ALIAS
+        ):
+            return ast.parse(_PENDING_TENSORS_CREATE).body
+        return self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if node.id == _PENDING_TENSORS_ALIAS and isinstance(node.ctx, ast.Load):
+            return ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=_PENDING_TENSORS_ALIAS,
+                ctx=ast.Load(),
+            )
+        return node
 
 
 def _is_outcome_call(node: ast.AST, outcome: str) -> bool:
@@ -751,11 +834,25 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         outcome = OUTCOME_METHODS.get(node.name)
         if outcome is not None:
             method = _OutcomeToWorkerWrites(outcome).visit(method)
+        if node.name in OUTCOME_IMPLICIT_TAIL_RETURN:
+            tail = method.body[-1]
+            if isinstance(tail, ast.Return) and tail.value is None:
+                del method.body[-1]
+        if any(
+            isinstance(n, ast.Name) and n.id == _PENDING_TENSORS_ALIAS
+            for n in ast.walk(method)
+        ):
+            method = _PendingTensorAliasToWorker().visit(method)
         if node.name == "_execute_single_kv_migration":
             method = _restore_migration_receive_writes(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
         if worker_method is not None:
             method.args = copy.deepcopy(worker_method.args)
+            # The delegator is the signature of record, its return annotation
+            # included: an engine method that hands its worker writes back in
+            # an outcome is annotated with that outcome, which the worker
+            # method never returned and a test namespace cannot resolve.
+            method.returns = copy.deepcopy(worker_method.returns)
         ast.fix_missing_locations(method)
         return method
     del args[1]

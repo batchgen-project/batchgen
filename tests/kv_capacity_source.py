@@ -1,4 +1,4 @@
-"""Load the D6.1/D6.2/D6.3 definitions without importing the native/CUDA graph."""
+"""Load the D6.1-D6.4 definitions without importing the native/CUDA graph."""
 
 import ast
 import copy
@@ -22,6 +22,7 @@ from batchgen.query_book import (
 )
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.host_rebalancer import HostKVRebalancer
+from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.kv_manager import (
     GPU_KV_POOL_HEADROOM_GB,
     KVCacheManager,
@@ -48,7 +49,13 @@ CONTEXT_CLASSES = {
     # D6.3
     "HostKVWatermarkContext", "WatermarkTriggerOutcome",
     "MigrationPlanOutcome", "KVMigrationReceiveOutcome",
+    # D6.4
+    "DeferredKVFlushContext", "DeferredKVFlushOutcome",
+    "AuxLayerSlotsContext", "AuxLayerSlotsOutcome",
 }
+# D6.4: the deferred flush normalizes each queued aux entry through this
+# module-scope helper, so the loaded body gets the real one.
+MODULE_FUNCTIONS = {"_normalize_aux_kv_entry"}
 METHODS = {
     "_calculate_gpu_kv_cache_size", "_kv_fixed_address_pool_available",
     "_initialize_gpu_kv_manager_fixed_size", "_bind_gpu_paged_kv_manager",
@@ -70,6 +77,11 @@ METHODS = {
     "_plan_kv_migration", "_execute_kv_migrations_parallel",
     "_group_migrations_for_parallel_execution",
     "_execute_single_kv_migration", "_rebalance_host_kv",
+    # D6.4: the decode KV append to host and the host-to-GPU KV load.
+    "_flush_deferred_kv_to_host", "_ensure_host_kv_append_capacity",
+    "_aux_layers_with_slots", "_append_decode_kv_to_host_aux_async",
+    "_load_host_kv_to_gpu", "_integrate_pending_async_load",
+    "_allocate_gpu_kv_two_page_buffer",
 }
 # The D6.3 names, so a test can assert the guard covers exactly this stage.
 D6_3_METHODS = {
@@ -79,6 +91,16 @@ D6_3_METHODS = {
     "_plan_kv_migration", "_execute_kv_migrations_parallel",
     "_group_migrations_for_parallel_execution",
     "_execute_single_kv_migration", "_rebalance_host_kv",
+}
+# The D6.4 names, so a test can assert the guard covers exactly this stage.
+# ``_wait_pending_kv_append_tasks`` sits in the same file section but is NOT
+# here: it arrived context-shaped before Phase D and this stage left it byte
+# for byte alone, which is why it is also absent from METHODS.
+D6_4_METHODS = {
+    "_flush_deferred_kv_to_host", "_ensure_host_kv_append_capacity",
+    "_aux_layers_with_slots", "_append_decode_kv_to_host_aux_async",
+    "_load_host_kv_to_gpu", "_integrate_pending_async_load",
+    "_allocate_gpu_kv_two_page_buffer",
 }
 
 
@@ -131,6 +153,11 @@ def load_kv_capacity(namespace=None):
         release_query_book_slot=release_query_book_slot,
         refresh_query_book_entry=refresh_query_book_entry,
         BATCHGEN_CB_DEBUG=False,
+        # D6.4 module-scope collaborators of the deferred flush, the aux
+        # append and the two-page allocation.
+        BATCHGEN_ENABLE_CRITICAL_DIAGS=False,
+        IndexManager=IndexManager,
+        IndexLookupRequest=IndexLookupRequest,
     ).items():
         namespace.setdefault(name, value)
     nodes = []
@@ -141,6 +168,13 @@ def load_kv_capacity(namespace=None):
             isinstance(target, ast.Name) and target.id == "GPU_KV_UNCHANGED"
             for target in node.targets
         ):
+            nodes.append(node)
+        elif (
+            isinstance(node, ast.FunctionDef)
+            and node.name in MODULE_FUNCTIONS
+        ):
+            # A module-scope helper a converted body calls on the spot; it is
+            # compiled from the real source, not re-implemented here.
             nodes.append(node)
         elif isinstance(node, ast.ClassDef):
             if node.name == "KVCapacityEngine":
