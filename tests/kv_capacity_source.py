@@ -1,4 +1,4 @@
-"""Load the D6.1/D6.2 definitions without importing the native/CUDA module graph."""
+"""Load the D6.1/D6.2/D6.3 definitions without importing the native/CUDA graph."""
 
 import ast
 import copy
@@ -13,15 +13,29 @@ from batchgen.config.max_model_len import (
     SequenceLengthCapacity,
     verify_max_model_len,
 )
-from batchgen.query_book import QueryBook
-from batchgen.sequence import SequenceStatus
+from batchgen.lifespan import SeqEvent
+from batchgen.query_book import (
+    QueryBook,
+    QueryBookPoolCapacityError,
+    refresh_query_book_entry,
+    release_query_book_slot,
+)
+from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.kv_manager import (
     GPU_KV_POOL_HEADROOM_GB,
     KVCacheManager,
     KVUtilizationRequest,
+    MigrationCandidate,
+    MigrationPlanRequest,
     PageTableCapacityRequest,
+    WatermarkTriggerRequest,
 )
-from batchgen.worker.kv_plan import provisional_pool_gb
+from batchgen.worker.kv_plan import (
+    credit_reclaimable_pages,
+    host_capacity_due,
+    provisional_pool_gb,
+)
 from batchgen.worker.rank_context import node_of_rank
 
 
@@ -31,6 +45,9 @@ CONTEXT_CLASSES = {
     # D6.2
     "HostKVStatsContext", "HostKVHealthContext", "DecodeRankBszContext",
     "DeploymentVerifyContext", "DeploymentVerifyOutcome",
+    # D6.3
+    "HostKVWatermarkContext", "WatermarkTriggerOutcome",
+    "MigrationPlanOutcome", "KVMigrationReceiveOutcome",
 }
 METHODS = {
     "_calculate_gpu_kv_cache_size", "_kv_fixed_address_pool_available",
@@ -45,6 +62,23 @@ METHODS = {
     "_make_kv_utilization_request", "_get_host_kv_utilization",
     "_get_host_kv_total_pages", "_log_host_kv_health", "_max_decode_rank_bsz",
     "_legacy_get_host_kv_utilization", "_verify_deployment_max_model_len",
+    # D6.3: the host-KV watermark, the host-capacity due checks and the KV
+    # migration plan / execution / rebalance.
+    "_make_watermark_trigger_request", "_credit_reclaimable_prefix_pages",
+    "_host_capacity_due_local", "_host_capacity_due_all_ranks",
+    "_check_host_kv_watermark_trigger", "_make_migration_plan_request",
+    "_plan_kv_migration", "_execute_kv_migrations_parallel",
+    "_group_migrations_for_parallel_execution",
+    "_execute_single_kv_migration", "_rebalance_host_kv",
+}
+# The D6.3 names, so a test can assert the guard covers exactly this stage.
+D6_3_METHODS = {
+    "_make_watermark_trigger_request", "_credit_reclaimable_prefix_pages",
+    "_host_capacity_due_local", "_host_capacity_due_all_ranks",
+    "_check_host_kv_watermark_trigger", "_make_migration_plan_request",
+    "_plan_kv_migration", "_execute_kv_migrations_parallel",
+    "_group_migrations_for_parallel_execution",
+    "_execute_single_kv_migration", "_rebalance_host_kv",
 }
 
 
@@ -84,6 +118,19 @@ def load_kv_capacity(namespace=None):
         SequenceStatus=SequenceStatus, node_of_rank=node_of_rank, QueryBook=QueryBook,
         SequenceLengthCapacity=SequenceLengthCapacity,
         verify_max_model_len=verify_max_model_len,
+        # D6.3 module-scope collaborators of the watermark, host-capacity and
+        # migration bodies.
+        WatermarkTriggerRequest=WatermarkTriggerRequest,
+        MigrationPlanRequest=MigrationPlanRequest,
+        MigrationCandidate=MigrationCandidate,
+        HostKVRebalancer=HostKVRebalancer,
+        credit_reclaimable_pages=credit_reclaimable_pages,
+        host_capacity_due=host_capacity_due,
+        SequenceEntry=SequenceEntry, SeqEvent=SeqEvent,
+        QueryBookPoolCapacityError=QueryBookPoolCapacityError,
+        release_query_book_slot=release_query_book_slot,
+        refresh_query_book_entry=refresh_query_book_entry,
+        BATCHGEN_CB_DEBUG=False,
     ).items():
         namespace.setdefault(name, value)
     nodes = []
