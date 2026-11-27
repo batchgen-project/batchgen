@@ -13,6 +13,14 @@ performs; the fifth, the cost-profile lookup, is this engine's first worker
 WRITE handed back in an outcome, and the tests below pin its cache as
 create-then-populate, on the delegator, with the second call hitting it.
 
+D7.3, the third stage: pool construction and layout, and the stage with the
+COLLECTIVES in it. Nothing is shared here -- no two of the nine read sets are
+equal -- and three of the nine hand plain worker values back in outcomes. The
+collective pins are the point of this stage's tests: one records the ordered
+sequence of ``dist`` calls a run issues and asserts the exact expected order,
+another asserts from the AST that each collective stands under the one
+condition it already had (the process-group handle) and under nothing else.
+
 The bodies are compiled out of the engine's own AST
 (``tests/prefill_source.py``), because importing the engine pulls in the
 compiled core engine and UCX; the delegators are compiled out of the real
@@ -20,7 +28,7 @@ worker class the same way the KV capacity tests do it.
 """
 
 import ast
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import dataclass, FrozenInstanceError, fields
 import math
 import sys
 from types import ModuleType, SimpleNamespace
@@ -29,8 +37,10 @@ import pytest
 import torch
 
 from tests.prefill_source import (
+    COLLECTIVE_METHODS,
     D7_1_METHODS,
     D7_2_METHODS,
+    D7_3_METHODS,
     METHODS,
     OUTCOME_METHODS,
     STATELESS_METHODS,
@@ -203,8 +213,8 @@ def test_every_context_is_frozen():
         value for name, value in sorted(ns.items())
         if isinstance(value, type) and name.endswith("Context")
     ]
-    # Eight from D7.1, four from D7.2.
-    assert len(contexts) == 12
+    # Eight from D7.1, four from D7.2, eight from D7.3.
+    assert len(contexts) == 20
     for context in contexts:
         instance = context(**{field.name: None for field in fields(context)})
         with pytest.raises(FrozenInstanceError):
@@ -218,7 +228,8 @@ def test_every_outcome_is_frozen_and_declares_no_container():
         value for name, value in sorted(ns.items())
         if isinstance(value, type) and name.endswith("Outcome")
     ]
-    assert len(outcomes) == 1
+    # One from D7.2, three from D7.3.
+    assert len(outcomes) == 4
     for outcome in outcomes:
         instance = outcome()
         with pytest.raises(FrozenInstanceError):
@@ -269,7 +280,7 @@ def test_no_context_carries_a_field_its_operations_do_not_read():
             and isinstance(n.value, ast.Name) and n.value.id == "ctx"
         )
     ns, _ = runtime()
-    assert len(reads) == 12
+    assert len(reads) == 20
     for context_name, read in sorted(reads.items()):
         declared = {field.name for field in fields(ns[context_name])}
         assert declared == read, (context_name, declared ^ read)
@@ -314,13 +325,16 @@ def test_the_stage_converted_exactly_its_own_methods():
             converted.add(node.name)
     assert converted == METHODS
     assert not worker_shaped & METHODS
-    assert worker_shaped, "nothing left to convert, but D7.2 is not the last stage"
-    # The two stages are disjoint, and what is left is what D7.3-D7.7 take:
-    # fourteen converted here, five there, twenty-three still worker-shaped.
+    assert worker_shaped, "nothing left to convert, but D7.3 is not the last stage"
+    # The three stages are disjoint, and what is left is what D7.4-D7.7 take:
+    # fourteen converted in D7.1, five in D7.2, nine here, fourteen still
+    # worker-shaped.
     assert D7_1_METHODS.isdisjoint(D7_2_METHODS)
-    assert (len(D7_1_METHODS), len(D7_2_METHODS), len(worker_shaped)) == (
-        14, 5, 23,
-    )
+    assert D7_3_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS)
+    assert (
+        len(D7_1_METHODS), len(D7_2_METHODS), len(D7_3_METHODS),
+        len(worker_shaped),
+    ) == (14, 5, 9, 14)
 
 
 # --------------------------------------------------------------------------- #
@@ -1990,3 +2004,1550 @@ def test_the_settle_delegator_reads_the_live_stores_each_call(monkeypatch):
     assert [c.rank for c in contexts] == [6, 6]
     assert seen[0][0][1:] == (["seq"], {0: "why"}, "default")
     assert seen[0][1] == {}
+
+
+# --------------------------------------------------------------------------- #
+#  D7.3: the stage's own seam shape
+# --------------------------------------------------------------------------- #
+D7_3_CONTEXTS = {
+    "_measure_prefill_prefix_kv_budget": "PrefillPrefixKVBudgetContext",
+    "_construct_prefill_pool": "PrefillPoolConstructionContext",
+    "_check_pool_plan_identical": "PoolPlanIdentityContext",
+    "_prefill_pool_layout": "PrefillPoolLayoutContext",
+    "_allocate_prefill_pool_host_pages": "PrefillPoolHostPageContext",
+    "_materialized_segment_loader": "MaterializedSegmentStagingContext",
+    "_materialized_pool_index_key_layers": "MaterializedIndexKeyLayersContext",
+    "_load_materialized_segments": "MaterializedSegmentLoadContext",
+}
+
+
+@pytest.mark.parametrize("name", sorted(D7_3_CONTEXTS))
+def test_each_construction_operation_declares_its_own_context(name):
+    """No sharing in this stage, asserted per operation.
+
+    Eight contexts for eight operations, because no two of their read sets are
+    equal; the ninth reads no worker state and takes none. The narrowness
+    itself is proved by ``test_no_context_carries_a_field_its_operations_do
+    _not_read`` above, which derives each context's fields from the bodies.
+    """
+    node = method_node(name)
+    assert ast.unparse(node.args.args[1].annotation) == D7_3_CONTEXTS[name]
+
+
+def test_no_earlier_stages_context_was_widened_for_this_stage():
+    """The D7.1/D7.2 contexts keep exactly the fields they were declared with.
+
+    The tempting share was the wave context: the host-page allocation reads
+    the planned wave, which is that context's whole read set, but it also
+    reads the prefix-reuse owner. Widening the wave context would make the
+    segment-page reader's delegator resolve an owner it never touches, so the
+    allocation got its own.
+    """
+    ns, _ = runtime()
+    assert [f.name for f in fields(ns["PrefillPoolWaveContext"])] == [
+        "_prefill_pool_wave",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolHostPageContext"])] == [
+        "_prefill_pool_wave", "prefix",
+    ]
+    assert {f.name for f in fields(ns["PrefillPoolParallelContext"])} == {
+        "parallel_manager",
+    }
+    for name, context in sorted(D7_3_CONTEXTS.items()):
+        del name
+        assert context not in {
+            ast.unparse(method_node(other).args.args[1].annotation)
+            for other in sorted((D7_1_METHODS | D7_2_METHODS)
+                                - STATELESS_METHODS)
+        }
+
+
+def test_the_stage_declares_exactly_three_outcomes():
+    ns, _ = runtime()
+    assert OUTCOME_METHODS & D7_3_METHODS == {
+        "_measure_prefill_prefix_kv_budget", "_construct_prefill_pool",
+        "_prefill_pool_layout",
+    }
+    for outcome, declared in (
+        ("PrefillPrefixKVBudgetOutcome",
+         ["_prefill_prefix_kv_budget_bytes", "_prefill_pool_page_budget"]),
+        ("PrefillPoolBaseOutcome", ["_prefill_pool_base"]),
+        ("PrefillPoolLayoutOutcome", ["_prefill_pool_layout_cache"]),
+    ):
+        assert [f.name for f in fields(ns[outcome])] == declared
+
+
+# --------------------------------------------------------------------------- #
+#  D7.3: the collectives keep their position and their one condition
+# --------------------------------------------------------------------------- #
+def _parents(node):
+    parents = {}
+    for parent in ast.walk(node):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+def _collective_calls(node, attr):
+    return [n for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == attr
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "dist"]
+
+
+@pytest.mark.parametrize("name", sorted(COLLECTIVE_METHODS))
+def test_the_collective_stands_under_its_group_handle_and_nothing_else(name):
+    """Every rank of a serve group must issue this, here, exactly once.
+
+    The pre-move condition is the process-group handle alone: the reduction
+    runs under ``group is not None`` and the gather past an early
+    ``group is None`` return. A condition that named the rank, the host-KV
+    leadership or the local rank would make one rank of a group skip a
+    collective its peers issue, which deadlocks the group.
+    """
+    node = method_node(name)
+    calls = _collective_calls(node, COLLECTIVE_METHODS[name])
+    assert len(calls) == 1, name
+    parents, current, tests = _parents(node), calls[0], []
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.If, ast.IfExp)):
+            tests.append(ast.unparse(current.test))
+    for condition in tests:
+        for rank_dependent in (
+            "ctx.rank", "self.rank", "ctx.local_rank", "local_rank",
+            "_owns_host_kv", "ctx._prefill_pool_page_budget",
+        ):
+            assert rank_dependent not in condition, (name, condition)
+        assert "group" in condition, (name, condition)
+
+
+def test_the_reduction_sits_between_the_tensor_and_the_reduced_read():
+    """Statement order around the collective, not just its presence."""
+    node = method_node("_construct_prefill_pool")
+    branch = next(n for n in ast.walk(node)
+                  if isinstance(n, ast.If) and _collective_calls(n, "all_reduce"))
+    assert [ast.unparse(stmt).split("=")[0].strip() for stmt in branch.body
+            if isinstance(stmt, ast.Assign)] == ["reduced", "budget"]
+    assert ast.unparse(branch.body[1]).startswith(
+        "dist.all_reduce(reduced, op=dist.ReduceOp.MIN, group=group)"
+    )
+    assert "reduced.item()" in ast.unparse(branch.body[2])
+
+
+def test_the_gather_sits_between_the_digest_and_the_comparison():
+    node = method_node("_check_pool_plan_identical")
+    body = [stmt for stmt in node.body if not isinstance(stmt, ast.Expr)]
+    gather = next(i for i, stmt in enumerate(node.body)
+                  if _collective_calls(stmt, "all_gather"))
+    del body
+    assert ast.unparse(node.body[gather - 2]).startswith("digest = torch.tensor")
+    assert ast.unparse(node.body[gather - 1]).startswith("gathered = [")
+    assert isinstance(node.body[gather + 1], ast.If)
+    assert "gathered" in ast.unparse(node.body[gather + 1].test)
+
+
+# --------------------------------------------------------------------------- #
+#  D7.3: fakes for the construction and layout bodies
+# --------------------------------------------------------------------------- #
+class RecordingDist:
+    """``torch.distributed``, recording the ordered sequence of collectives.
+
+    ``reduce_to`` is what a peer group agrees on, so a MIN below this rank's
+    own budget is observable; ``gather_to`` is what the peers' digests are.
+    """
+
+    class ReduceOp:
+        MIN = "MIN"
+
+    def __init__(self, *, log, reduce_to=None, gather_to=None):
+        self.log = log
+        self._reduce_to = reduce_to
+        self._gather_to = gather_to
+
+    def all_reduce(self, tensor, *, op, group):
+        self.log.append(("all_reduce", op, group, tensor.value))
+        if self._reduce_to is not None:
+            tensor.value = self._reduce_to
+
+    def all_gather(self, out, tensor, *, group):
+        self.log.append(("all_gather", group, tensor.value, len(out)))
+        peers = self._gather_to
+        if peers is None:
+            peers = [tensor.value] * len(out)
+        for slot, value in zip(out, peers):
+            slot.value = value
+
+
+class FakeTensor:
+    def __init__(self, value):
+        self.value = value
+
+    def item(self):
+        return self.value
+
+
+class FakeCuda:
+    """The memory accounting the budget and the construction read, recorded."""
+
+    def __init__(self, *, log, free=100, total=400, reserved=7, allocated=3):
+        self.log = log
+        self.free, self.total = free, total
+        self.reserved, self.allocated = reserved, allocated
+
+    def synchronize(self, device):
+        self.log.append(("synchronize", device))
+
+    def empty_cache(self):
+        self.log.append(("empty_cache",))
+
+    def mem_get_info(self, index):
+        self.log.append(("mem_get_info", index))
+        return self.free, self.total
+
+    def memory_reserved(self, index):
+        self.log.append(("memory_reserved", index))
+        return self.reserved
+
+    def memory_allocated(self, index):
+        self.log.append(("memory_allocated", index))
+        return self.allocated
+
+    def reset_peak_memory_stats(self, index):
+        self.log.append(("reset_peak", index))
+
+
+class FakeTorch:
+    """Only what these nine bodies touch of the torch module."""
+
+    int64 = "int64"
+    float8_e4m3fn = "float8_e4m3fn"
+
+    def __init__(self, cuda):
+        self.cuda = cuda
+
+    @staticmethod
+    def tensor(values, *, dtype, device):
+        return FakeTensor(values[0])
+
+    @staticmethod
+    def zeros_like(tensor):
+        return FakeTensor(0)
+
+
+def construction_runtime(log, **extra):
+    cuda = FakeCuda(log=log, **{k: v for k, v in extra.items()
+                                if k in {"free", "total", "reserved",
+                                         "allocated"}})
+    dist = RecordingDist(
+        log=log,
+        reduce_to=extra.get("reduce_to"),
+        gather_to=extra.get("gather_to"),
+    )
+    return runtime(torch=FakeTorch(cuda), dist=dist)
+
+
+def stub_module(monkeypatch, name, **members):
+    module = ModuleType(name)
+    module.__dict__.update(members)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def pool_wave(*, total_pages=20, peak=8, scratch=2, page_tokens=4,
+              segments=(1,), prompts=("p",)):
+    return SimpleNamespace(
+        total_pages=total_pages,
+        page_tokens=page_tokens,
+        scratch_pages=scratch,
+        prompts=list(prompts),
+        plan=SimpleNamespace(peak_pool_pages=peak, segments=tuple(segments)),
+        pool=None,
+        executor=None,
+    )
+
+
+class FakePool:
+    """``PrefillPrefixPool`` as the construction builds it, by keyword.
+
+    Every argument is kept in ``kwargs`` -- the pool's page count is the one
+    the budget reduction settled on, which is what the tests read back.
+    """
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.page_bytes = kwargs.pop("page_bytes", 64)
+        self.num_pages = kwargs.get("num_pages")
+        self.kernel_dump = None
+
+
+# --------------------------------------------------------------------------- #
+#  The prefill-phase prefix KV budget
+# --------------------------------------------------------------------------- #
+def budget_context(ns, *, workspace, kv_budget=None, page_budget=None,
+                   rank=3, local_rank=1):
+    return ns["PrefillPrefixKVBudgetContext"](
+        rank=rank,
+        local_rank=local_rank,
+        torch_device="cuda:1",
+        engine_config=SimpleNamespace(
+            Module_Batching_Config=SimpleNamespace(
+                prefill_prefix_pool_workspace_bytes=workspace,
+            )
+        ),
+        _prefill_prefix_kv_budget_bytes=kv_budget,
+        _prefill_pool_page_budget=page_budget,
+    )
+
+
+def measure(ns, engine, ctx, *, pool_enabled, page_bytes=1):
+    return engine._measure_prefill_prefix_kv_budget(
+        ctx,
+        _prefill_prefix_pool_enabled=lambda: pool_enabled,
+        _prefill_pool_page_bytes=lambda: page_bytes,
+    )
+
+
+@pytest.fixture
+def pool_budget_module(monkeypatch):
+    """The real import seam of the page-budget arithmetic, recorded."""
+    calls = []
+
+    def pool_pages_from_budget(free_bytes, workspace, page_bytes):
+        calls.append((free_bytes, workspace, page_bytes))
+        return max(0, free_bytes - workspace) // page_bytes
+
+    stub_module(monkeypatch, "batchgen.prefix_reuse.pool",
+                pool_pages_from_budget=pool_pages_from_budget)
+    return calls
+
+
+def test_the_kv_budget_is_free_memory_beside_the_workspace(pool_budget_module):
+    log = []
+    ns, engine = construction_runtime(log, free=100, total=400)
+    outcome = measure(
+        ns, engine, budget_context(ns, workspace=16), pool_enabled=False,
+    )
+    assert outcome._prefill_prefix_kv_budget_bytes == 84
+    # The early exit writes no page budget at all, which is NOT the same as
+    # writing None: None is what the KV budget takes without a workspace.
+    assert outcome._prefill_pool_page_budget is ns["PREFILL_UNCHANGED"]
+    assert not pool_budget_module
+
+
+def test_a_model_without_a_workspace_has_no_kv_budget(pool_budget_module):
+    log = []
+    ns, engine = construction_runtime(log, free=100)
+    outcome = measure(
+        ns, engine, budget_context(ns, workspace=0), pool_enabled=False,
+    )
+    assert outcome._prefill_prefix_kv_budget_bytes is None
+    assert outcome._prefill_pool_page_budget is ns["PREFILL_UNCHANGED"]
+    assert not pool_budget_module
+
+
+def test_the_measurement_synchronizes_before_it_reads_free_memory(
+    pool_budget_module,
+):
+    """The ordered sequence of device operations, the synchronize included.
+
+    The free-memory read is only true once every queued kernel has retired, so
+    the synchronize and the cache release stay immediately ahead of it, in
+    this order, on the device the context names.
+    """
+    log = []
+    ns, engine = construction_runtime(log, free=100)
+    measure(ns, engine, budget_context(ns, workspace=16), pool_enabled=False)
+    assert log == [
+        ("synchronize", "cuda:1"), ("empty_cache",), ("mem_get_info", 1),
+    ]
+
+
+def test_an_enabled_pool_also_measures_its_page_budget(pool_budget_module):
+    log = []
+    ns, engine = construction_runtime(log, free=100)
+    outcome = measure(
+        ns, engine, budget_context(ns, workspace=16), pool_enabled=True,
+        page_bytes=4,
+    )
+    assert outcome._prefill_prefix_kv_budget_bytes == 84
+    assert outcome._prefill_pool_page_budget == 21
+    # The arithmetic is the pool module's own, over the measured free bytes,
+    # the planner's workspace and the engine's page size.
+    assert pool_budget_module == [(100, 16, 4)]
+
+
+def test_the_pool_predicate_is_asked_before_the_device_is_touched(
+    pool_budget_module,
+):
+    """Short-circuit order: a predicate that raises leaves the device alone."""
+    log = []
+    ns, engine = construction_runtime(log)
+
+    def refuse():
+        raise RuntimeError("the pool is not available")
+
+    with pytest.raises(RuntimeError, match="not available"):
+        engine._measure_prefill_prefix_kv_budget(
+            budget_context(ns, workspace=16),
+            _prefill_prefix_pool_enabled=refuse,
+            _prefill_pool_page_bytes=lambda: 1,
+        )
+    assert log == []
+
+
+def test_an_unchanged_budget_is_not_logged_again(pool_budget_module, caplog):
+    log = []
+    ns, engine = construction_runtime(log, free=100)
+    with caplog.at_level("INFO"):
+        measure(
+            ns, engine,
+            budget_context(ns, workspace=16, kv_budget=84, page_budget=21),
+            pool_enabled=True, page_bytes=4,
+        )
+    assert "[PREFIX_KV]" not in caplog.text
+    assert "[PREFIX_POOL]" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+#  Building the planned wave's pool
+# --------------------------------------------------------------------------- #
+def construction_context(ns, *, page_budget, rank=2, local_rank=1):
+    return ns["PrefillPoolConstructionContext"](
+        rank=rank,
+        local_rank=local_rank,
+        torch_device="cuda:1",
+        huggingface_ckpt_name="org/model",
+        _prefill_pool_page_budget=page_budget,
+    )
+
+
+@pytest.fixture
+def construction_modules(monkeypatch):
+    """The three real import seams the construction reaches, recorded."""
+    built = {}
+
+    class Executor:
+        def __init__(self, plan, prompts, pool, *, pad_poison):
+            self.plan, self.prompts, self.pool = plan, prompts, pool
+            self.pad_poison = pad_poison
+            built["executor"] = self
+
+    def pool_class(**kwargs):
+        pool = FakePool(**kwargs)
+        built["pool"] = pool
+        return pool
+
+    def build_gpu_kv_config(ckpt, page_tokens):
+        built.setdefault("geometry_calls", []).append((ckpt, page_tokens))
+        return SimpleNamespace(kv_dtype="bf16", num_layers=4)
+
+    stub_module(monkeypatch, "batchgen.prefix_reuse.executor",
+                PoolChunkExecutor=Executor)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.pool",
+                PrefillPrefixPool=pool_class,
+                pool_pages_from_budget=lambda *a: 0)
+    stub_module(monkeypatch, "batchgen.kv_cache.host_kv_mananger_config",
+                build_gpu_kv_config=build_gpu_kv_config)
+    return built
+
+
+def construct(ns, engine, ctx, wave, *, group=None, page_bytes=64,
+              layout=(True, (), 0), dims=(4, 2, 8, 8), dump="dump",
+              poison=False, seen=None):
+    def record(name, result):
+        def call(*args, **kwargs):
+            if seen is not None:
+                seen.append((name, args, kwargs))
+            return result
+        return call
+
+    return engine._construct_prefill_pool(
+        ctx, wave,
+        _prefill_pool_group=record("group", group),
+        _prefill_pool_page_bytes=record("page_bytes", page_bytes),
+        _prefill_pool_layout=record("layout", layout),
+        _prefill_pool_page_dims=record("dims", dims),
+        _new_pool_kernel_dump_recorder=record("dump", dump),
+        _pool_pad_poison_enabled=record("poison", poison),
+    )
+
+
+def test_one_rank_per_group_builds_the_pool_with_no_collective(
+    construction_modules,
+):
+    log = []
+    ns, engine = construction_runtime(log)
+    wave = pool_wave()
+    outcome = construct(ns, engine, construction_context(ns, page_budget=20),
+                        wave, group=None)
+    assert [entry[0] for entry in log if entry[0] in
+            {"all_reduce", "all_gather"}] == []
+    assert wave.pool is construction_modules["pool"]
+    assert wave.executor is construction_modules["executor"]
+    assert construction_modules["pool"].kwargs["num_pages"] == 20
+    assert outcome._prefill_pool_base == (3, 7, 400 - 100 - 7)
+
+
+def test_a_serve_group_reduces_its_budget_to_the_tightest_rank(
+    construction_modules,
+):
+    """The group MIN, and the only condition the collective has."""
+    log = []
+    ns, engine = construction_runtime(log, reduce_to=12)
+    wave = pool_wave(total_pages=20, peak=8, scratch=2)
+    construct(ns, engine, construction_context(ns, page_budget=20), wave,
+              group="serve-group")
+    assert [entry for entry in log if entry[0] == "all_reduce"] == [
+        ("all_reduce", "MIN", "serve-group", 20),
+    ]
+    # The reduced budget is below the plan, and above peak+scratch, so the
+    # pool shrinks to it rather than refusing.
+    assert construction_modules["pool"].kwargs["num_pages"] == 12
+
+
+def test_a_rank_with_no_budget_reduces_as_minus_one(construction_modules):
+    """``None`` has to survive the integer reduction, as -1."""
+    log = []
+    ns, engine = construction_runtime(log, reduce_to=-1)
+    wave = pool_wave(total_pages=20)
+    construct(ns, engine, construction_context(ns, page_budget=None), wave,
+              group="serve-group")
+    assert log[0] == ("all_reduce", "MIN", "serve-group", -1)
+    # A group whose tightest rank has no budget plans the wave's own pages.
+    assert construction_modules["pool"].kwargs["num_pages"] == 20
+
+
+def test_a_budget_below_the_required_peak_is_refused(construction_modules):
+    log = []
+    ns, engine = construction_runtime(log, reduce_to=5)
+    wave = pool_wave(total_pages=20, peak=8, scratch=2)
+    with pytest.raises(RuntimeError, match="Rank 2: prefill pool budget shrank"):
+        construct(ns, engine, construction_context(ns, page_budget=20), wave,
+                  group="serve-group")
+    assert "pool" not in construction_modules
+
+
+def test_a_pool_page_that_disagrees_with_the_budget_is_refused(
+    construction_modules,
+):
+    log = []
+    ns, engine = construction_runtime(log)
+    with pytest.raises(RuntimeError, match="prefix pool page is 64 B"):
+        construct(ns, engine, construction_context(ns, page_budget=20),
+                  pool_wave(), page_bytes=99)
+
+
+def test_the_construction_asks_every_collaborator_in_its_pre_move_order(
+    construction_modules,
+):
+    log, seen = [], []
+    ns, engine = construction_runtime(log)
+    wave = pool_wave()
+    construct(ns, engine, construction_context(ns, page_budget=20), wave,
+              poison=True, seen=seen)
+    assert [name for name, _, _ in seen] == [
+        "group", "page_bytes", "layout", "dims", "dump", "poison",
+    ]
+    # The geometry both readers are asked about is the one built from the
+    # checkpoint the context names and this wave's page size.
+    assert construction_modules["geometry_calls"] == [("org/model", [4])]
+    assert construction_modules["pool"].kernel_dump == "dump"
+    assert construction_modules["executor"].pad_poison is True
+
+
+def test_the_memory_baseline_is_read_after_the_pool_exists(
+    construction_modules,
+):
+    """Device-memory order: the pool is allocated, then the baseline taken."""
+    log = []
+    ns, engine = construction_runtime(log)
+    construct(ns, engine, construction_context(ns, page_budget=20),
+              pool_wave())
+    assert log == [
+        ("mem_get_info", 1), ("memory_reserved", 1), ("memory_allocated", 1),
+        ("reset_peak", 1),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+#  The plan-digest comparison
+# --------------------------------------------------------------------------- #
+def plan(*chunks):
+    return SimpleNamespace(
+        chunks=[
+            SimpleNamespace(
+                release_after=release,
+                items=[SimpleNamespace(kind=k, ref=r, token_start=s,
+                                       token_end=e, prefix_segments=p)
+                       for k, r, s, e, p in items],
+            )
+            for release, items in chunks
+        ],
+        segments=(1,),
+    )
+
+
+ONE_CHUNK = ((3, [("segment", 7, 0, 64, (1,))]),)
+
+
+def identity_context(ns, rank=4):
+    return ns["PoolPlanIdentityContext"](rank=rank, torch_device="cuda:1")
+
+
+def test_one_rank_per_group_compares_nothing(monkeypatch):
+    log = []
+    ns, engine = construction_runtime(log)
+    assert engine._check_pool_plan_identical(
+        identity_context(ns), plan(*ONE_CHUNK), None, attn_group_size=1,
+    ) is None
+    assert log == []
+
+
+def test_a_group_that_agrees_passes_and_gathers_once():
+    log = []
+    ns, engine = construction_runtime(log)
+    engine._check_pool_plan_identical(
+        identity_context(ns), plan(*ONE_CHUNK), "serve-group",
+        attn_group_size=4,
+    )
+    assert [entry[0] for entry in log] == ["all_gather"]
+    # One slot per rank of the serve group, over this rank's own digest.
+    assert log[0][1] == "serve-group"
+    assert log[0][3] == 4
+
+
+def test_a_group_whose_plans_diverge_is_refused():
+    log = []
+    ns, engine = construction_runtime(log, gather_to=[11, 22])
+    with pytest.raises(RuntimeError, match="Rank 4: the prefill prefix pool "
+                                           "plan diverged"):
+        engine._check_pool_plan_identical(
+            identity_context(ns), plan(*ONE_CHUNK), "serve-group",
+            attn_group_size=2,
+        )
+
+
+def test_the_digest_is_the_real_hash_over_the_chunk_items():
+    """The digest is computed, not restated: two different plans differ."""
+    log = []
+    ns, engine = construction_runtime(log)
+    for plan_chunks in (
+        ONE_CHUNK,
+        ((3, [("segment", 7, 0, 65, (1,))]),),
+        ((4, [("segment", 7, 0, 64, (1,))]),),
+    ):
+        engine._check_pool_plan_identical(
+            identity_context(ns), plan(*plan_chunks), "g", attn_group_size=1,
+        )
+    digests = [entry[2] for entry in log]
+    assert len(set(digests)) == 3, digests
+
+
+# --------------------------------------------------------------------------- #
+#  The pool row layout
+# --------------------------------------------------------------------------- #
+def layout_context(ns, *, model=None, cached=None):
+    return ns["PrefillPoolLayoutContext"](
+        model=model, _prefill_pool_layout_cache=cached,
+    )
+
+
+def resolve_layout(engine, ctx, *, dual=True, psm=None):
+    return engine._prefill_pool_layout(
+        ctx, SimpleNamespace(num_layers=2, logical_to_physical_layer=None),
+        _prefill_host_view_is_dual=lambda: dual,
+        _prefill_pool_psm_layout=lambda: psm,
+    )
+
+
+def dsa_model(*, indexer_dims):
+    layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(module=SimpleNamespace(
+            indexer=None if dim is None
+            else SimpleNamespace(index_head_dim=dim))))
+        for dim in indexer_dims
+    ]
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def test_a_non_dsa_model_pools_kv_and_caches_nothing():
+    ns, engine = runtime()
+    layout, outcome = resolve_layout(
+        engine, layout_context(ns, model=Explode("model")), dual=False,
+    )
+    assert layout == (True, (), 0)
+    assert outcome._prefill_pool_layout_cache is ns["PREFILL_UNCHANGED"]
+
+
+def test_a_deep_freed_model_answers_from_the_cache_and_rewrites_nothing():
+    ns, engine = runtime()
+    layout, outcome = resolve_layout(
+        engine, layout_context(ns, model=None, cached=(True, (0, 1), 64)),
+        psm={"v_head_dim": 128},
+    )
+    assert layout == (True, (0, 1), 64)
+    assert outcome._prefill_pool_layout_cache is ns["PREFILL_UNCHANGED"]
+
+
+def test_a_deep_freed_model_with_no_cache_is_refused():
+    """The pre-move read took the cache with a default, so absent is False,
+    not an AttributeError: the refusal below is what must be reached."""
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="requested before the first"):
+        resolve_layout(
+            engine, layout_context(ns, model=None, cached=None),
+            psm={"v_head_dim": 128},
+        )
+
+
+def test_the_dsa_walk_reports_its_layout_in_the_outcome():
+    ns, engine = runtime()
+    layout, outcome = resolve_layout(
+        engine,
+        layout_context(ns, model=dsa_model(indexer_dims=[64, None])),
+        psm={"v_head_dim": 128},
+    )
+    assert layout == (True, (0,), 64)
+    assert outcome._prefill_pool_layout_cache == layout
+
+
+def test_the_pool_carries_v_only_where_the_psm_declares_it():
+    ns, engine = runtime()
+    layout, _ = resolve_layout(
+        engine,
+        layout_context(ns, model=dsa_model(indexer_dims=[64, None])),
+        psm={"v_head_dim": 0},
+    )
+    assert layout[0] is False
+
+
+def test_mixed_indexer_head_dims_are_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="mixed indexer head dims"):
+        resolve_layout(
+            engine,
+            layout_context(ns, model=dsa_model(indexer_dims=[64, 32])),
+            psm={"v_head_dim": 128},
+        )
+
+
+def test_a_dsa_model_whose_depth_disagrees_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="do not match the KV geometry"):
+        resolve_layout(
+            engine,
+            layout_context(ns, model=dsa_model(indexer_dims=[64, 64, 64])),
+            psm={"v_head_dim": 128},
+        )
+
+
+# --------------------------------------------------------------------------- #
+#  The wave's segment Host pages
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class FakePrefixState:
+    planned_shared_page_ids: tuple = ()
+
+
+class RecordingPrefix:
+    """``PrefixReuseState``: the owner whose own methods take every write."""
+
+    def __init__(self):
+        self.installed = []
+        self.refs = []
+
+    def install_state(self, global_id, state):
+        self.installed.append((global_id, state))
+
+    def add_pool_member_refs(self, global_id, sids):
+        self.refs.append((global_id, sids))
+
+
+def host_page_wave(*, chains, materialized=(), segment_sids=None):
+    return SimpleNamespace(
+        global_ids=[100 + index for index in range(len(chains))],
+        chains=list(chains),
+        materialized=set(materialized),
+        segment_sids=segment_sids or {},
+        chain_host_pages=lambda index: {0: (71, 72)},
+    )
+
+
+@pytest.fixture
+def allocation_module(monkeypatch):
+    calls = []
+
+    def allocate_segment_host_pages(wave, host_views, next_sid):
+        calls.append((wave, host_views, next_sid))
+        return 2
+
+    stub_module(monkeypatch, "batchgen.prefix_reuse.wave_runtime",
+                allocate_segment_host_pages=allocate_segment_host_pages)
+    return calls
+
+
+def allocate(ns, engine, wave, prefix, states, *, allocator, planned=2):
+    return engine._allocate_prefill_pool_host_pages(
+        ns["PrefillPoolHostPageContext"](
+            _prefill_pool_wave=wave, prefix=prefix,
+        ),
+        {"views": 1},
+        states,
+        _next_pool_segment_sid=allocator,
+        _prefill_pool_segment_host_pages=lambda: planned,
+    )
+
+
+def test_the_segment_id_allocator_is_handed_on_as_a_callable(
+    allocation_module,
+):
+    """The helper calls it once per segment, so the body passes it, uncalled."""
+    ns, engine = runtime()
+    prefix, sentinel = RecordingPrefix(), object()
+    allocate(ns, engine, host_page_wave(chains=[()]), prefix,
+             {100: FakePrefixState()}, allocator=sentinel)
+    (wave, views, handed), = allocation_module
+    assert handed is sentinel
+    assert views == {"views": 1}
+
+
+def test_an_allocation_that_disagrees_with_the_plan_is_refused(
+    allocation_module,
+):
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="got 2 Host pages, planned 5"):
+        allocate(ns, engine, host_page_wave(chains=[()]), RecordingPrefix(),
+                 {}, allocator=object(), planned=5)
+
+
+def test_each_member_installs_its_chain_through_the_owner(allocation_module):
+    ns, engine = runtime()
+    prefix = RecordingPrefix()
+    states = {100: FakePrefixState(), 101: FakePrefixState()}
+    wave = host_page_wave(chains=[(7, 8), ()], segment_sids={7: -3, 8: -5})
+    allocate(ns, engine, wave, prefix, states, allocator=object())
+    # Only the member with a chain is touched, and its new state is both in
+    # the caller's map and installed through the owner.
+    assert [global_id for global_id, _ in prefix.installed] == [100]
+    assert states[100].planned_shared_page_ids == {0: (71, 72)}
+    assert prefix.installed[0][1] is states[100]
+    assert prefix.refs == [(100, (-3, -5))]
+
+
+def test_a_materialized_segment_holds_no_pseudo_sequence_reference(
+    allocation_module,
+):
+    """Its pages are the prefix cache's, kept by the member's own attachment."""
+    ns, engine = runtime()
+    prefix = RecordingPrefix()
+    wave = host_page_wave(chains=[(7, 8)], materialized={8},
+                          segment_sids={7: -3, 8: -5})
+    allocate(ns, engine, wave, prefix, {100: FakePrefixState()},
+             allocator=object())
+    assert prefix.refs == [(100, (-3,))]
+
+
+# --------------------------------------------------------------------------- #
+#  The load staging
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def staging_modules(monkeypatch):
+    built = {}
+
+    class Loader:
+        staging_bytes = 128
+        slab_pages = 2
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            built.setdefault("primary", []).append(self)
+
+    class KeyLoader:
+        staging_bytes = 64
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            built.setdefault("aux", []).append(self)
+
+    def build_gpu_kv_config(ckpt, page_tokens):
+        built.setdefault("primary_geometry", []).append((ckpt, page_tokens))
+        return SimpleNamespace(num_layers=4, num_k_heads=2, k_head_dim=8,
+                               kv_dtype="bf16")
+
+    def build_gpu_kv_config_aux(ckpt, page_tokens):
+        built.setdefault("aux_geometry", []).append((ckpt, page_tokens))
+        return built.get("aux_profile", SimpleNamespace(
+            num_layers=4, k_head_dim=72, kv_dtype="float8_e4m3fn"))
+
+    stub_module(monkeypatch, "batchgen.kv_cache.host_kv_mananger_config",
+                build_gpu_kv_config=build_gpu_kv_config,
+                build_gpu_kv_config_aux=build_gpu_kv_config_aux)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.pool_materialize",
+                DEFAULT_SLAB_BYTES=4096, MaterializedSegmentLoader=Loader,
+                PageSplitIndexKeyLoader=KeyLoader)
+    return built
+
+
+def staging_context(ns, rank=5):
+    return ns["MaterializedSegmentStagingContext"](
+        rank=rank, torch_device="cuda:1", huggingface_ckpt_name="org/model",
+    )
+
+
+def stage(ns, engine, *, views, materialized=(3,)):
+    log = []
+    return engine._materialized_segment_loader(
+        staging_context(ns),
+        SimpleNamespace(materialized=set(materialized), page_tokens=4),
+        _host_views_by_group=lambda: views,
+    ), log
+
+
+def test_a_wave_that_materializes_nothing_stages_nothing(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    loaders, _ = stage(ns, engine, views={0: "primary"}, materialized=())
+    assert loaders is None
+    # Nothing is imported or built when there is nothing to load.
+    assert staging_modules == {}
+
+
+def test_a_single_region_model_stages_the_primary_latent(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    loaders, _ = stage(ns, engine, views={0: "primary"})
+    assert sorted(loaders) == [0]
+    assert staging_modules["primary_geometry"] == [("org/model", [4])]
+    assert loaders[0].kwargs == {
+        "worker_view": "primary", "num_layers": 4, "page_tokens": 4,
+        "latent_dim": 16, "dtype": "bf16", "device": "cuda:1",
+        "max_slab_bytes": 4096,
+    }
+    assert "aux" not in staging_modules
+
+
+def test_a_model_with_an_unexpected_region_set_is_refused(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    with pytest.raises(RuntimeError, match=r"this model has groups \[0, 1, 2\]"):
+        stage(ns, engine, views={0: "a", 1: "b", 2: "c"})
+
+
+def test_a_dsa_model_adds_the_page_split_index_key_loader(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    loaders, _ = stage(ns, engine, views={0: "primary", 1: "aux"})
+    assert sorted(loaders) == [0, 1]
+    # The carrier width comes from the engine's own stateless sibling, which
+    # reads it off the auxiliary profile.
+    assert loaders[1].kwargs["carrier_bytes"] == 72
+    assert loaders[1].kwargs["slab_pages"] == 2
+    assert staging_modules["aux_geometry"] == [("org/model", [4])]
+
+
+def test_a_dsa_model_with_no_indexer_profile_is_refused(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    staging_modules["aux_profile"] = None
+    with pytest.raises(RuntimeError, match="no DSA indexer profile"):
+        stage(ns, engine, views={0: "primary", 1: "aux"})
+
+
+def test_an_indexer_region_of_another_depth_is_refused(staging_modules):
+    log = []
+    ns, engine = construction_runtime(log)
+    staging_modules["aux_profile"] = SimpleNamespace(
+        num_layers=3, k_head_dim=72, kv_dtype="float8_e4m3fn")
+    with pytest.raises(RuntimeError, match="keeps 3 row"):
+        stage(ns, engine, views={0: "primary", 1: "aux"})
+
+
+# --------------------------------------------------------------------------- #
+#  The index-key carrier (no context at all)
+# --------------------------------------------------------------------------- #
+def test_the_carrier_is_the_page_split_byte_width():
+    ns, engine = runtime()
+    assert engine._prefix_pool_index_key_carrier(
+        SimpleNamespace(kv_dtype=torch.float8_e4m3fn, k_head_dim=72)
+    ) == 72
+
+
+def test_an_aos_indexer_region_is_refused():
+    """It declares ELEMENTS and carries no scale: reading it as page-split
+    bytes would reinterpret every key."""
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="needs the page-split"):
+        engine._prefix_pool_index_key_carrier(
+            SimpleNamespace(kv_dtype=torch.bfloat16, k_head_dim=64)
+        )
+
+
+def test_the_carrier_takes_no_seam_parameter_at_all():
+    node = method_node("_prefix_pool_index_key_carrier")
+    assert [arg.arg for arg in node.args.args] == ["self", "aux_geometry"]
+    assert not node.args.kwonlyargs
+
+
+# --------------------------------------------------------------------------- #
+#  The index-key layer walk
+# --------------------------------------------------------------------------- #
+class FakeIndexKeyLayer:
+    def __init__(self):
+        self.calls = []
+
+    def materialize_pool_segment_index_keys(self, *, index_keys, slots):
+        self.calls.append((index_keys, slots))
+
+
+class FakeLatentLayer:
+    def __init__(self):
+        self.calls = []
+
+    def materialize_pool_segment(self, *, latent, slots):
+        self.calls.append((latent, slots))
+
+
+def key_layer_model(flags):
+    """One decoder layer per flag; True = this layer materializes keys."""
+    return SimpleNamespace(model=SimpleNamespace(layers=[
+        SimpleNamespace(self_attn=FakeIndexKeyLayer() if flag
+                        else FakeLatentLayer())
+        for flag in flags
+    ]))
+
+
+def index_key_layers(ns, engine, model, pool):
+    return engine._materialized_pool_index_key_layers(
+        ns["MaterializedIndexKeyLayersContext"](model=model), pool,
+    )
+
+
+def test_a_pool_without_indexer_rows_cannot_take_index_keys():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="needs the pool's indexer rows"):
+        index_key_layers(ns, engine, Explode("model"),
+                         SimpleNamespace(indexer_row={}))
+    with pytest.raises(RuntimeError, match="needs the pool's indexer rows"):
+        index_key_layers(ns, engine, Explode("model"), None)
+
+
+def test_the_walk_returns_the_key_layers_in_pool_row_order():
+    ns, engine = runtime()
+    model = key_layer_model([True, False, True])
+    layers = index_key_layers(
+        ns, engine, model, SimpleNamespace(indexer_row={0: 0, 2: 1}),
+    )
+    assert layers == [model.model.layers[0].self_attn,
+                      model.model.layers[2].self_attn]
+
+
+def test_a_key_layer_with_no_pool_row_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="no prefix-pool indexer row"):
+        index_key_layers(ns, engine, key_layer_model([True, True]),
+                         SimpleNamespace(indexer_row={0: 0}))
+
+
+def test_a_pool_row_out_of_engine_order_is_refused():
+    """The n-th key-materializing layer MUST be indexer row n."""
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="is pool indexer row 1 but the 0th"):
+        index_key_layers(ns, engine, key_layer_model([True, True]),
+                         SimpleNamespace(indexer_row={0: 1, 1: 0}))
+
+
+def test_more_pool_rows_than_key_layers_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match=r"1 layer\(s\) materialize index "
+                                          r"keys against 2 pool"):
+        index_key_layers(ns, engine, key_layer_model([True, False]),
+                         SimpleNamespace(indexer_row={0: 0, 1: 1}))
+
+
+# --------------------------------------------------------------------------- #
+#  Filling a chunk's loaded segments
+# --------------------------------------------------------------------------- #
+class Slab:
+    def __init__(self, token_start, tokens, *, rows):
+        self.token_start, self.tokens = token_start, tokens
+        self.latent = rows
+        self.keys = rows
+
+
+class SlabLoader:
+    """A loader whose ``slabs`` is a generator, like the real one.
+
+    The real generator issues the H2D and WAITS on it before it yields, so the
+    order these are created in and the lockstep in which they are drained is
+    what the test records.
+    """
+
+    def __init__(self, name, log, slabs):
+        self.name, self.log, self._slabs = name, log, slabs
+
+    def slabs(self, *, host_page_ids, tokens):
+        self.log.append(("create", self.name, tuple(host_page_ids), tokens))
+
+        def stream():
+            for slab in self._slabs:
+                self.log.append(("wait", self.name, slab.token_start))
+                yield slab
+        return stream()
+
+
+def load_rows(*, materialized):
+    return SimpleNamespace(materialized=list(materialized))
+
+
+def segment(segment_id=3, *, tokens=8, slots=None, pages=(71, 72)):
+    return SimpleNamespace(segment_id=segment_id, tokens=tokens,
+                           slots=list(slots if slots is not None
+                                      else range(tokens)),
+                           pages=list(pages))
+
+
+def load(ns, engine, *, rows, loaders, host_pages, layers=(), key_layers=(),
+         pool="pool"):
+    return engine._load_materialized_segments(
+        ns["MaterializedSegmentLoadContext"](rank=5),
+        SimpleNamespace(segment_host_pages=host_pages, pool=pool),
+        rows, loaders,
+        _materialized_pool_layers=lambda: list(layers),
+        _materialized_pool_index_key_layers=lambda p: list(key_layers),
+    )
+
+
+def test_a_chunk_with_no_loaded_segment_loads_nothing():
+    ns, engine = runtime()
+    assert load(ns, engine, rows=load_rows(materialized=()), loaders=None,
+                host_pages=Explode("host pages")) == 0
+
+
+def test_a_chunk_that_loads_without_staging_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="Rank 5: this chunk loads 1 "):
+        load(ns, engine, rows=load_rows(materialized=[segment()]),
+             loaders=None, host_pages={})
+
+
+def test_a_segment_with_no_host_page_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match="names no Host page to load from"):
+        load(ns, engine, rows=load_rows(materialized=[segment()]),
+             loaders={0: "primary"}, host_pages={})
+
+
+def test_a_segment_whose_regions_do_not_match_the_loaders_is_refused():
+    ns, engine = runtime()
+    with pytest.raises(RuntimeError, match=r"names Host pages in groups \[0\], "
+                                          r"this model loads groups \[0, 1\]"):
+        load(ns, engine, rows=load_rows(materialized=[segment()]),
+             loaders={0: "a", 1: "b"}, host_pages={3: {0: (71, 72)}})
+
+
+def test_one_region_loads_each_slab_into_the_window_its_tokens_name():
+    log = []
+    ns, engine = runtime()
+    latent = [FakeLatentLayer(), FakeLatentLayer()]
+    loader = SlabLoader("primary", log, [
+        Slab(0, 4, rows=["row0-a", "row1-a"]),
+        Slab(4, 4, rows=["row0-b", "row1-b"]),
+    ])
+    loaded = load(
+        ns, engine, rows=load_rows(materialized=[segment(tokens=8)]),
+        loaders={0: loader}, host_pages={3: {0: (71, 72)}}, layers=latent,
+    )
+    assert loaded == 8
+    assert [slots for _, slots in latent[0].calls] == [[0, 1, 2, 3],
+                                                       [4, 5, 6, 7]]
+    assert [keys for keys, _ in latent[1].calls] == ["row1-a", "row1-b"]
+    assert log == [
+        ("create", "primary", (71, 72), 8),
+        ("wait", "primary", 0), ("wait", "primary", 4),
+    ]
+
+
+def test_both_regions_are_created_in_group_order_and_drained_in_lockstep():
+    """The ordering invariant of the load: one zip over both slab streams.
+
+    Each stream's own H2D-and-wait happens inside ``slabs``, so the order the
+    streams are created in and the lockstep they are consumed in is what pairs
+    a latent slab with its index keys.
+    """
+    log = []
+    ns, engine = runtime()
+    latent, keys = [FakeLatentLayer()], [FakeIndexKeyLayer()]
+    loaders = {
+        0: SlabLoader("primary", log, [Slab(0, 4, rows=["L0"]),
+                                       Slab(4, 4, rows=["L1"])]),
+        1: SlabLoader("aux", log, [Slab(0, 4, rows=["K0"]),
+                                   Slab(4, 4, rows=["K1"])]),
+    }
+    loaded = load(
+        ns, engine, rows=load_rows(materialized=[segment(tokens=8)]),
+        loaders=loaders, host_pages={3: {0: (71, 72), 1: (71, 72)}},
+        layers=latent, key_layers=keys,
+    )
+    assert loaded == 8
+    assert log == [
+        ("create", "primary", (71, 72), 8),
+        ("create", "aux", (71, 72), 8),
+        ("wait", "primary", 0), ("wait", "aux", 0),
+        ("wait", "primary", 4), ("wait", "aux", 4),
+    ]
+    # Both regions wrote the SAME window, in the same iteration.
+    assert [slots for _, slots in latent[0].calls] == [
+        [0, 1, 2, 3], [4, 5, 6, 7],
+    ]
+    assert [slots for _, slots in keys[0].calls] == [
+        [0, 1, 2, 3], [4, 5, 6, 7],
+    ]
+
+
+def test_an_index_key_slab_that_does_not_pair_with_its_latent_is_refused():
+    log = []
+    ns, engine = runtime()
+    loaders = {
+        0: SlabLoader("primary", log, [Slab(0, 4, rows=["L0"])]),
+        1: SlabLoader("aux", log, [Slab(0, 2, rows=["K0"])]),
+    }
+    with pytest.raises(RuntimeError, match="loaded index keys for"):
+        load(ns, engine, rows=load_rows(materialized=[segment(tokens=4)]),
+             loaders=loaders, host_pages={3: {0: (71,), 1: (71,)}},
+             layers=[FakeLatentLayer()], key_layers=[FakeIndexKeyLayer()])
+
+
+def test_a_single_region_load_never_asks_for_the_index_key_layers():
+    """The walk is consulted only when the auxiliary region is loaded."""
+    log = []
+    ns, engine = runtime()
+
+    def refuse(pool):
+        raise AssertionError("the index-key walk ran on a single-region load")
+
+    assert engine._load_materialized_segments(
+        ns["MaterializedSegmentLoadContext"](rank=5),
+        SimpleNamespace(segment_host_pages={3: {0: (71,)}}, pool="pool"),
+        load_rows(materialized=[segment(tokens=4)]),
+        {0: SlabLoader("primary", log, [Slab(0, 4, rows=[])])},
+        _materialized_pool_layers=lambda: [],
+        _materialized_pool_index_key_layers=refuse,
+    ) == 4
+
+
+# --------------------------------------------------------------------------- #
+#  D7.3: the nine worker delegators
+# --------------------------------------------------------------------------- #
+def test_the_budget_delegator_applies_both_writes_in_the_pre_move_order(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank, worker.local_rank = 3, 1
+    worker.torch_device = "cuda:1"
+    worker.engine_config = "config"
+    worker._prefill_prefix_kv_budget_bytes = None
+    worker._prefill_pool_page_budget = None
+    seen = []
+    recording(engine, "_measure_prefill_prefix_kv_budget", seen,
+              result=ns["PrefillPrefixKVBudgetOutcome"](84, 21))
+    worker._measure_prefill_prefix_kv_budget()
+    (context,), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPrefixKVBudgetContext"])
+    assert (context.rank, context.local_rank, context.torch_device,
+            context.engine_config,
+            context._prefill_prefix_kv_budget_bytes,
+            context._prefill_pool_page_budget) == (
+        3, 1, "cuda:1", "config", None, None,
+    )
+    assert kwargs == {
+        "_prefill_prefix_pool_enabled": worker._prefill_prefix_pool_enabled,
+        "_prefill_pool_page_bytes": worker._prefill_pool_page_bytes,
+    }
+    assert worker._prefill_prefix_kv_budget_bytes == 84
+    assert worker._prefill_pool_page_budget == 21
+
+
+def test_the_budget_delegator_leaves_the_page_budget_on_the_early_exit(
+    monkeypatch,
+):
+    """The sentinel means "this path wrote nothing", not "wrote None"."""
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank, worker.local_rank = 0, 0
+    worker.torch_device = "cuda:0"
+    worker.engine_config = "config"
+    worker._prefill_prefix_kv_budget_bytes = 1
+    worker._prefill_pool_page_budget = 17
+    recording(engine, "_measure_prefill_prefix_kv_budget", [],
+              result=ns["PrefillPrefixKVBudgetOutcome"](None))
+    worker._measure_prefill_prefix_kv_budget()
+    assert worker._prefill_prefix_kv_budget_bytes is None
+    assert worker._prefill_pool_page_budget == 17
+
+
+def test_the_budget_delegator_reads_both_budgets_live_each_call(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank, worker.local_rank = 0, 0
+    worker.torch_device = "cuda:0"
+    worker.engine_config = "config"
+    worker._prefill_prefix_kv_budget_bytes = None
+    worker._prefill_pool_page_budget = None
+    seen = []
+    recording(engine, "_measure_prefill_prefix_kv_budget", seen,
+              result=ns["PrefillPrefixKVBudgetOutcome"](84, 21))
+    worker._measure_prefill_prefix_kv_budget()
+    worker._measure_prefill_prefix_kv_budget()
+    assert [args[0]._prefill_prefix_kv_budget_bytes for args, _ in seen] == [
+        None, 84,
+    ]
+    assert [args[0]._prefill_pool_page_budget for args, _ in seen] == [
+        None, 21,
+    ]
+
+
+def test_the_construction_delegator_passes_six_collaborators(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank, worker.local_rank = 2, 1
+    worker.torch_device = "cuda:1"
+    worker.huggingface_ckpt_name = "org/model"
+    worker._prefill_pool_page_budget = 20
+    worker._prefill_pool_base = (0, 0, 0)
+    worker._new_pool_kernel_dump_recorder = lambda wave: None
+    seen = []
+    recording(engine, "_construct_prefill_pool", seen,
+              result=ns["PrefillPoolBaseOutcome"]((1, 2, 3)))
+    worker._construct_prefill_pool("wave")
+    (context, wave), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolConstructionContext"])
+    assert (context.rank, context.local_rank, context.torch_device,
+            context.huggingface_ckpt_name,
+            context._prefill_pool_page_budget) == (
+        2, 1, "cuda:1", "org/model", 20,
+    )
+    assert wave == "wave"
+    assert kwargs == {
+        "_prefill_pool_group": worker._prefill_pool_group,
+        "_prefill_pool_page_bytes": worker._prefill_pool_page_bytes,
+        "_prefill_pool_layout": worker._prefill_pool_layout,
+        "_prefill_pool_page_dims": worker._prefill_pool_page_dims,
+        "_new_pool_kernel_dump_recorder": worker._new_pool_kernel_dump_recorder,
+        "_pool_pad_poison_enabled": worker._pool_pad_poison_enabled,
+    }
+    assert worker._prefill_pool_base == (1, 2, 3)
+
+
+def test_the_construction_delegator_leaves_the_baseline_on_the_sentinel(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank, worker.local_rank = 0, 0
+    worker.torch_device = "cuda:0"
+    worker.huggingface_ckpt_name = "org/model"
+    worker._prefill_pool_page_budget = None
+    worker._prefill_pool_base = (9, 9, 9)
+    worker._new_pool_kernel_dump_recorder = lambda wave: None
+    recording(engine, "_construct_prefill_pool", [],
+              result=ns["PrefillPoolBaseOutcome"]())
+    worker._construct_prefill_pool("wave")
+    assert worker._prefill_pool_base == (9, 9, 9)
+
+
+def test_the_plan_identity_delegator_builds_its_narrow_context(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 4
+    worker.torch_device = "cuda:1"
+    worker._prefill_attn_tp_size = lambda: 8
+    seen = []
+    recording(engine, "_check_pool_plan_identical", seen)
+    worker._check_pool_plan_identical("plan", "group")
+    (context, plan_arg, group), kwargs = seen[0]
+    assert isinstance(context, ns["PoolPlanIdentityContext"])
+    assert (context.rank, context.torch_device) == (4, "cuda:1")
+    assert (plan_arg, group) == ("plan", "group")
+    # The group WIDTH travels as a value beside the context, as it did.
+    assert kwargs == {"attn_group_size": 8}
+
+
+def test_the_layout_delegator_keeps_the_cache_default_and_applies_the_write(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.model = "model"
+    worker._prefill_host_view_is_dual = lambda: True
+    assert not hasattr(worker, "_prefill_pool_layout_cache")
+    seen = []
+    recording(engine, "_prefill_pool_layout", seen,
+              result=((True, (0,), 64),
+                      ns["PrefillPoolLayoutOutcome"]((True, (0,), 64))))
+    assert worker._prefill_pool_layout("geometry") == (True, (0,), 64)
+    (context, geometry), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolLayoutContext"])
+    # Absent stays absent: the pre-move read took it with this default.
+    assert (context.model, context._prefill_pool_layout_cache) == (
+        "model", None,
+    )
+    assert geometry == "geometry"
+    assert kwargs == {
+        "_prefill_host_view_is_dual": worker._prefill_host_view_is_dual,
+        "_prefill_pool_psm_layout": worker._prefill_pool_psm_layout,
+    }
+    assert worker._prefill_pool_layout_cache == (True, (0,), 64)
+
+
+def test_the_layout_delegator_creates_no_cache_on_the_early_exits(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.model = None
+    worker._prefill_host_view_is_dual = lambda: False
+    recording(engine, "_prefill_pool_layout", [],
+              result=((True, (), 0), ns["PrefillPoolLayoutOutcome"]()))
+    assert worker._prefill_pool_layout("geometry") == (True, (), 0)
+    assert not hasattr(worker, "_prefill_pool_layout_cache")
+
+
+def test_the_host_page_delegator_passes_the_allocator_uncalled(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker._prefill_pool_wave = "wave"
+    worker._prefix = "prefix state"
+    seen = []
+    recording(engine, "_allocate_prefill_pool_host_pages", seen)
+    worker._allocate_prefill_pool_host_pages({"views": 1}, {"states": 2})
+    (context, views, states), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolHostPageContext"])
+    assert (context._prefill_pool_wave, context.prefix) == (
+        "wave", "prefix state",
+    )
+    assert (views, states) == ({"views": 1}, {"states": 2})
+    assert kwargs == {
+        "_next_pool_segment_sid": worker._next_pool_segment_sid,
+        "_prefill_pool_segment_host_pages":
+            worker._prefill_pool_segment_host_pages,
+    }
+
+
+def test_the_host_page_delegator_reads_the_live_wave_each_call(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker._prefix = "prefix state"
+    seen = []
+    recording(engine, "_allocate_prefill_pool_host_pages", seen)
+    worker._prefill_pool_wave = "first"
+    worker._allocate_prefill_pool_host_pages({}, {})
+    worker._prefill_pool_wave = "second"
+    worker._allocate_prefill_pool_host_pages({}, {})
+    assert [args[0]._prefill_pool_wave for args, _ in seen] == [
+        "first", "second",
+    ]
+
+
+def test_the_staging_delegator_passes_the_host_view_delegator(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 5
+    worker.torch_device = "cuda:1"
+    worker.huggingface_ckpt_name = "org/model"
+    worker._host_views_by_group = lambda: {0: "primary"}
+    seen = []
+    recording(engine, "_materialized_segment_loader", seen)
+    assert worker._materialized_segment_loader("wave") == "recorded"
+    (context, wave), kwargs = seen[0]
+    assert isinstance(context, ns["MaterializedSegmentStagingContext"])
+    assert (context.rank, context.torch_device,
+            context.huggingface_ckpt_name) == (5, "cuda:1", "org/model")
+    assert wave == "wave"
+    assert kwargs == {"_host_views_by_group": worker._host_views_by_group}
+
+
+def test_the_carrier_delegator_passes_no_context_at_all(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    seen = []
+    recording(engine, "_prefix_pool_index_key_carrier", seen)
+    assert worker._prefix_pool_index_key_carrier("aux") == "recorded"
+    assert seen[0] == (("aux",), {})
+
+
+def test_the_index_key_layer_delegator_reads_the_live_model(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    seen = []
+    recording(engine, "_materialized_pool_index_key_layers", seen)
+    worker.model = "first"
+    worker._materialized_pool_index_key_layers("pool")
+    worker.model = "second"
+    worker._materialized_pool_index_key_layers("pool")
+    contexts = [args[0] for args, _ in seen]
+    assert all(isinstance(c, ns["MaterializedIndexKeyLayersContext"])
+               for c in contexts)
+    assert [c.model for c in contexts] == ["first", "second"]
+    assert [args[1] for args, _ in seen] == ["pool", "pool"]
+    assert seen[0][1] == {}
+
+
+def test_the_chunk_load_delegator_passes_both_layer_walks(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 5
+    worker._materialized_pool_layers = lambda: []
+    seen = []
+    recording(engine, "_load_materialized_segments", seen)
+    assert worker._load_materialized_segments("wave", "rows", "loaders") == (
+        "recorded"
+    )
+    (context, wave, rows, loaders), kwargs = seen[0]
+    assert isinstance(context, ns["MaterializedSegmentLoadContext"])
+    assert context.rank == 5
+    assert (wave, rows, loaders) == ("wave", "rows", "loaders")
+    assert kwargs == {
+        "_materialized_pool_layers": worker._materialized_pool_layers,
+        "_materialized_pool_index_key_layers":
+            worker._materialized_pool_index_key_layers,
+    }
+
+
+def test_every_d7_3_delegator_names_no_worker_in_its_engine_call(monkeypatch):
+    """The delegator hands over VALUES and CALLABLES, never itself.
+
+    One assertion over the whole stage: no engine call in any of the nine
+    delegators passes a bare ``self``, which is the shape this phase removes.
+    """
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    for node in cls.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in D7_3_METHODS:
+            continue
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "engine"):
+                continue
+            assert not any(isinstance(arg, ast.Name) and arg.id == "self"
+                           for arg in call.args), node.name
+            assert not any(isinstance(kw.value, ast.Name)
+                           and kw.value.id == "self"
+                           for kw in call.keywords), node.name

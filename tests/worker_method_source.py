@@ -119,9 +119,12 @@ STATELESS_DELEGATED_VALUES = {
 # Every converted operation that takes NO seam parameter. D7.2 adds one whose
 # delegator resolves nothing for it either -- the frontier predicate reads its
 # whole input off its own arguments -- so it has no entry above and its
-# worker-shaped view is the body itself under the delegator's signature.
+# worker-shaped view is the body itself under the delegator's signature. D7.3
+# adds the index-key carrier, which reads both of its values off the geometry
+# it is handed.
 STATELESS_CONVERTED = frozenset(STATELESS_DELEGATED_VALUES) | {
     "_unmaterializable_frontier",
+    "_prefix_pool_index_key_carrier",
 }
 
 
@@ -243,6 +246,20 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         # `prefix`, `prefix_runtime` and `prefix_coordinator` already map
         # above, onto the same worker attributes these contexts snapshot.
         "ctx.model_name": "self.model_name",
+        # D7.3 pool construction and layout contexts. `rank`, `local_rank`,
+        # `torch_device`, `engine_config`, `huggingface_ckpt_name`, `prefix`
+        # and `_prefill_pool_wave` already map above, onto the same worker
+        # attributes these contexts snapshot.
+        "ctx.model": "self.model",
+        "ctx._prefill_prefix_kv_budget_bytes": (
+            "self._prefill_prefix_kv_budget_bytes"
+        ),
+        "ctx._prefill_pool_page_budget": "self._prefill_pool_page_budget",
+        # The pre-move layout walk read its cache with a getattr default: the
+        # attribute does not exist until a prefill measured the layout.
+        "ctx._prefill_pool_layout_cache": (
+            "getattr(self, '_prefill_pool_layout_cache', None)"
+        ),
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -365,6 +382,30 @@ class _ContextToWorker(ast.NodeTransformer):
                 ),
                 "_unmaterializable_frontier": (
                     "self._unmaterializable_frontier"
+                ),
+                # D7.3 keyword-only collaborators, each the worker's own
+                # method of that name -- what the pre-move body called. The
+                # names the outcomes carry back are NOT here: those are write
+                # locals, restored by the outcome rule instead.
+                "_prefill_prefix_pool_enabled": (
+                    "self._prefill_prefix_pool_enabled"
+                ),
+                "_prefill_pool_page_bytes": "self._prefill_pool_page_bytes",
+                "_prefill_pool_group": "self._prefill_pool_group",
+                "_new_pool_kernel_dump_recorder": (
+                    "self._new_pool_kernel_dump_recorder"
+                ),
+                "_pool_pad_poison_enabled": "self._pool_pad_poison_enabled",
+                "_prefill_host_view_is_dual": (
+                    "self._prefill_host_view_is_dual"
+                ),
+                "_prefill_pool_psm_layout": "self._prefill_pool_psm_layout",
+                "_next_pool_segment_sid": "self._next_pool_segment_sid",
+                # `_host_views_by_group` and `_prefill_pool_segment_host_pages`
+                # already map above, under D6.2 and D6.5.
+                "_materialized_pool_layers": "self._materialized_pool_layers",
+                "_materialized_pool_index_key_layers": (
+                    "self._materialized_pool_index_key_layers"
                 ),
             }
             replacement = replacements.get(node.id)
@@ -558,18 +599,43 @@ OUTCOME_WRITE_FIELDS = {
         "_deferred_kv_worker_view_aux",
     ),
     "AuxLayerSlotsOutcome": ("_aux_layers_with_slots_cache",),
+    # D7.3: the prefill engine's three plain-value outcomes.
+    "PrefillPrefixKVBudgetOutcome": (
+        "_prefill_prefix_kv_budget_bytes", "_prefill_pool_page_budget",
+    ),
+    "PrefillPoolBaseOutcome": ("_prefill_pool_base",),
+    "PrefillPoolLayoutOutcome": ("_prefill_pool_layout_cache",),
 }
 OUTCOME_METHODS = {
     "_check_host_kv_watermark_trigger": "WatermarkTriggerOutcome",
     "_plan_kv_migration": "MigrationPlanOutcome",
     "_flush_deferred_kv_to_host": "DeferredKVFlushOutcome",
     "_aux_layers_with_slots": "AuxLayerSlotsOutcome",
+    "_measure_prefill_prefix_kv_budget": "PrefillPrefixKVBudgetOutcome",
+    "_construct_prefill_pool": "PrefillPoolBaseOutcome",
+    "_prefill_pool_layout": "PrefillPoolLayoutOutcome",
+}
+# The "this path wrote nothing" sentinel each engine declares. The lift-back
+# drops a seed assignment of its outcome's own sentinel; naming it per outcome
+# keeps one engine's sentinel from standing for another's.
+OUTCOME_SENTINEL = {
+    "WatermarkTriggerOutcome": "GPU_KV_UNCHANGED",
+    "MigrationPlanOutcome": "GPU_KV_UNCHANGED",
+    "DeferredKVFlushOutcome": "GPU_KV_UNCHANGED",
+    "AuxLayerSlotsOutcome": "GPU_KV_UNCHANGED",
+    "PrefillPrefixKVBudgetOutcome": "PREFILL_UNCHANGED",
+    "PrefillPoolBaseOutcome": "PREFILL_UNCHANGED",
+    "PrefillPoolLayoutOutcome": "PREFILL_UNCHANGED",
 }
 # Methods whose pre-move body ended WITHOUT a return statement: the outcome
 # return added at the tail is seam plumbing, so the worker-shaped view drops
 # it rather than keeping a bare ``return`` the original never had. An outcome
 # return anywhere else is a real early exit and stays as ``return``.
-OUTCOME_IMPLICIT_TAIL_RETURN = {"_flush_deferred_kv_to_host"}
+OUTCOME_IMPLICIT_TAIL_RETURN = {
+    "_flush_deferred_kv_to_host",
+    "_measure_prefill_prefix_kv_budget",
+    "_construct_prefill_pool",
+}
 
 
 # D6.4: the pending append-tensor list is CREATED on first use inside the
@@ -629,6 +695,7 @@ class _OutcomeToWorkerWrites(ast.NodeTransformer):
     def __init__(self, outcome: str):
         self.outcome = outcome
         self.fields = set(OUTCOME_WRITE_FIELDS[outcome])
+        self.sentinel = OUTCOME_SENTINEL[outcome]
 
     def _bound(self, name: str, ctx) -> ast.Attribute:
         return ast.Attribute(
@@ -641,7 +708,7 @@ class _OutcomeToWorkerWrites(ast.NodeTransformer):
         if isinstance(target, ast.Name) and target.id in self.fields:
             if (
                 isinstance(node.value, ast.Name)
-                and node.value.id == "GPU_KV_UNCHANGED"
+                and node.value.id == self.sentinel
             ):
                 return None
             node.targets = [self._bound(target.id, ast.Store())]
@@ -916,13 +983,13 @@ def load_worker_functions(
 # worker's args. A fake sets ``worker.args`` the way a server's launch does.
 # Still-worker-shaped engine methods whose delegator hands them the prefill
 # phase's attention group width. D7.1 converted two that take it
-# (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`) and D7.2 a third
-# (`_cached_prefix_rank_cost_profile`); those are lifted to the worker's shape
+# (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`), D7.2 a third
+# (`_cached_prefix_rank_cost_profile`) and D7.3 a fourth
+# (`_check_pool_plan_identical`); those are lifted to the worker's shape
 # instead, which inlines the same resolution, so adapting their call no longer
 # applies to them.
 PREFILL_ATTENTION_WIDTH_METHODS = (
     "_plan_prefill_micro_batches",
-    "_check_pool_plan_identical",
     "_config_prefill_for_batch",
 )
 

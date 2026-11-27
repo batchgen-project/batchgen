@@ -10021,53 +10021,135 @@ class BatchGenWorker:
 		)
 
 	def _measure_prefill_prefix_kv_budget(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._measure_prefill_prefix_kv_budget(
-			self,
+		from batchgen.worker.prefill_engine import (
+			PREFILL_UNCHANGED,
+			PrefillPrefixKVBudgetContext,
 		)
+		# Read HERE, not from a held snapshot: this runs after every
+		# configure_prefill, and both budgets are what the previous run of it
+		# left behind.
+		outcome = engine._measure_prefill_prefix_kv_budget(
+			PrefillPrefixKVBudgetContext(
+				rank=self.rank,
+				local_rank=self.local_rank,
+				torch_device=self.torch_device,
+				engine_config=self.engine_config,
+				_prefill_prefix_kv_budget_bytes=self._prefill_prefix_kv_budget_bytes,
+				_prefill_pool_page_budget=self._prefill_pool_page_budget,
+			),
+			# Both collaborators have their own read sets, so they arrive as
+			# the worker delegators the pre-move body called.
+			_prefill_prefix_pool_enabled=self._prefill_prefix_pool_enabled,
+			_prefill_pool_page_bytes=self._prefill_pool_page_bytes,
+		)
+		# The KV budget is rebound on every path that returns; the pool budget
+		# only past the pool gate, so its field stays at the sentinel on the
+		# early exit -- which ``None`` could not stand for, because that is the
+		# KV budget's own "no workspace" value.
+		if outcome._prefill_prefix_kv_budget_bytes is not PREFILL_UNCHANGED:
+			self._prefill_prefix_kv_budget_bytes = (
+				outcome._prefill_prefix_kv_budget_bytes
+			)
+		if outcome._prefill_pool_page_budget is not PREFILL_UNCHANGED:
+			self._prefill_pool_page_budget = outcome._prefill_pool_page_budget
 
 	def _construct_prefill_pool(self, wave) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._construct_prefill_pool(
-			self,
-			wave,
+		from batchgen.worker.prefill_engine import (
+			PREFILL_UNCHANGED,
+			PrefillPoolConstructionContext,
 		)
+		# Read HERE, not from a held snapshot: the page budget is re-measured
+		# after every configure_prefill, and the construction must see the one
+		# the current prefill phase measured.
+		outcome = engine._construct_prefill_pool(
+			PrefillPoolConstructionContext(
+				rank=self.rank,
+				local_rank=self.local_rank,
+				torch_device=self.torch_device,
+				huggingface_ckpt_name=self.huggingface_ckpt_name,
+				_prefill_pool_page_budget=self._prefill_pool_page_budget,
+			),
+			wave,
+			# Each collaborator is the worker's own method of that name, which
+			# is what the pre-move body called.
+			_prefill_pool_group=self._prefill_pool_group,
+			_prefill_pool_page_bytes=self._prefill_pool_page_bytes,
+			_prefill_pool_layout=self._prefill_pool_layout,
+			_prefill_pool_page_dims=self._prefill_pool_page_dims,
+			_new_pool_kernel_dump_recorder=self._new_pool_kernel_dump_recorder,
+			_pool_pad_poison_enabled=self._pool_pad_poison_enabled,
+		)
+		# The baseline is stamped on the one path that returns; every earlier
+		# exit of that body raises, so the sentinel guard is what says so.
+		if outcome._prefill_pool_base is not PREFILL_UNCHANGED:
+			self._prefill_pool_base = outcome._prefill_pool_base
 
 	def _check_pool_plan_identical(self, plan, group) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PoolPlanIdentityContext
 		return engine._check_pool_plan_identical(
-			self,
+			PoolPlanIdentityContext(
+				rank=self.rank,
+				torch_device=self.torch_device,
+			),
 			plan,
 			group,
 			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_layout(self, geometry) -> tuple:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._prefill_pool_layout(
-			self,
-			geometry,
+		from batchgen.worker.prefill_engine import (
+			PREFILL_UNCHANGED,
+			PrefillPoolLayoutContext,
 		)
+		layout, outcome = engine._prefill_pool_layout(
+			PrefillPoolLayoutContext(
+				model=self.model,
+				# The pre-move body read the cache with this default: the
+				# attribute does not exist until a prefill measured the
+				# layout, and the refusal below is what "absent" must reach.
+				_prefill_pool_layout_cache=getattr(
+					self, "_prefill_pool_layout_cache", None
+				),
+			),
+			geometry,
+			# The dual-host predicate is the worker's isinstance carve-out and
+			# the PSM override reads the PSM handle; neither shares this read
+			# set, so both arrive as the delegators the pre-move body called.
+			_prefill_host_view_is_dual=self._prefill_host_view_is_dual,
+			_prefill_pool_psm_layout=self._prefill_pool_psm_layout,
+		)
+		# Only the DSA walk caches; the two early exits leave the field at the
+		# sentinel, which ``None`` could not stand for -- ``None`` is the
+		# "nothing measured yet" value the context carries in.
+		if outcome._prefill_pool_layout_cache is not PREFILL_UNCHANGED:
+			self._prefill_pool_layout_cache = (
+				outcome._prefill_pool_layout_cache
+			)
+		return layout
 
 	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens, retain=frozenset(), restore_boundaries=None) -> None:
 		# Resolve values and live collaborators at the worker boundary.
@@ -10135,16 +10217,28 @@ class BatchGenWorker:
 		)
 
 	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolHostPageContext
+		# Read HERE, not from a held snapshot: the wave is planned, replaced
+		# and dropped inside one prefill, and this allocation runs once per
+		# wave against the one in flight.
 		return engine._allocate_prefill_pool_host_pages(
-			self,
+			PrefillPoolHostPageContext(
+				_prefill_pool_wave=self._prefill_pool_wave,
+				prefix=self._prefix,
+			),
 			host_views,
 			prefix_states,
+			# The allocator is handed on as a CALLABLE, which is what the
+			# pre-move body handed on; the page count is a sibling reader with
+			# its own context.
+			_next_pool_segment_sid=self._next_pool_segment_sid,
+			_prefill_pool_segment_host_pages=self._prefill_pool_segment_host_pages,
 		)
 
 	def _materialized_pool_layers(self):
@@ -10182,53 +10276,75 @@ class BatchGenWorker:
 		return layers
 
 	def _materialized_segment_loader(self, wave):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import (
+			MaterializedSegmentStagingContext,
+		)
 		return engine._materialized_segment_loader(
-			self,
+			MaterializedSegmentStagingContext(
+				rank=self.rank,
+				torch_device=self.torch_device,
+				huggingface_ckpt_name=self.huggingface_ckpt_name,
+			),
 			wave,
+			# The Host views are rebound per phase, so the engine asks for
+			# them through this delegator, which is what the pre-move body
+			# called.
+			_host_views_by_group=self._host_views_by_group,
 		)
 
 	def _prefix_pool_index_key_carrier(self, aux_geometry) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		# No context: the carrier reads no worker state at all.
 		return engine._prefix_pool_index_key_carrier(
-			self,
 			aux_geometry,
 		)
 
 	def _materialized_pool_index_key_layers(self, pool):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import (
+			MaterializedIndexKeyLayersContext,
+		)
+		# Read HERE, not from a held snapshot: the model is bound and dropped
+		# with the phase, and this walk runs inside a chunk load.
 		return engine._materialized_pool_index_key_layers(
-			self,
+			MaterializedIndexKeyLayersContext(model=self.model),
 			pool,
 		)
 
 	def _load_materialized_segments(self, wave, rows, loaders) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import MaterializedSegmentLoadContext
 		return engine._load_materialized_segments(
-			self,
+			MaterializedSegmentLoadContext(rank=self.rank),
 			wave,
 			rows,
 			loaders,
+			# The latent walk is the worker's own model-state seam method and
+			# the index-key walk a sibling with its own read set; both are the
+			# delegators the pre-move body called.
+			_materialized_pool_layers=self._materialized_pool_layers,
+			_materialized_pool_index_key_layers=self._materialized_pool_index_key_layers,
 		)
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
