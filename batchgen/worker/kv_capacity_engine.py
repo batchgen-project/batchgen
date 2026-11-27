@@ -20,8 +20,10 @@ straddlers ``_mirror_group_host_kv`` and ``_release_host_kv_pages_for_batch``
 stay on the worker.
 
 The engine is intentionally stateless. The AS3.1 operations receive a frozen
-decode phase context. D6.1 pool operations take frozen value contexts and
-keyword-only collaborators; worker writes return as frozen outcomes. The
+decode phase context. D6.1 pool operations and D6.2's host-view, decode-cap
+and deployment-length operations take frozen value contexts and keyword-only
+collaborators; worker writes return as frozen outcomes. D6.2's KV stats reads
+take the same decode phase context the free-page reads take. The
 remaining operations retain the older worker
 delegator shape until their own conversion slice. The worker keeps a same-name
 delegator for every moved method.
@@ -276,6 +278,50 @@ class GPUKVInitOutcome:
 class GPUKVFinalizeOutcome:
     _gpu_kv_sizing_provisional: bool
     _gpu_kv_cached_pool_gb: float
+
+
+# D6.2: the KV stats reads take the decode phase context the free-page reads
+# already take; the host-view, decode-cap and deployment-length operations
+# declare their own value contexts.
+@dataclass(frozen=True)
+class HostKVStatsContext:
+    host_view: object
+
+
+@dataclass(frozen=True)
+class HostKVHealthContext:
+    host_view: object
+    node_id: object
+
+
+@dataclass(frozen=True)
+class DecodeRankBszContext:
+    engine_config: object
+    args: object
+
+
+@dataclass(frozen=True)
+class DeploymentVerifyContext:
+    rank: int
+    local_rank: int
+    world_size: int
+    local_world_size: int
+    huggingface_ckpt_name: str
+    model_context_length: Optional[int]
+    args: object
+    traj: object
+    _deployment_length_verified: bool
+
+
+@dataclass(frozen=True)
+class DeploymentVerifyOutcome:
+    # The three effects of the old tail, in its order: the worker's published
+    # length, the same length inside the launch config (an object the worker
+    # owns, so the engine returns the value instead of writing through the
+    # context), and the publish latch.
+    model_context_length: int
+    engine_config_max_model_len: int
+    _deployment_length_verified: bool
 
 
 class KVCapacityEngine:
@@ -1005,16 +1051,14 @@ class KVCapacityEngine:
             backend=_TorchKVStatsBackend(ctx.host_view, ctx.gpu_kv)
         )
 
-    def _make_kv_utilization_request(self, worker) -> KVUtilizationRequest:
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
+    def _make_kv_utilization_request(self, ctx) -> KVUtilizationRequest:
+        """Snapshot the utilization request from the decode phase context."""
         return KVUtilizationRequest(
-            rank=self.rank,
-            world_size=self.world_size,
-            local_rank=self.local_rank,
-            num_gpus_per_node=self.local_world_size,
-            global_batch=self.global_batch,
+            rank=ctx.facts.rank,
+            world_size=ctx.facts.world_size,
+            local_rank=ctx.facts.local_rank,
+            num_gpus_per_node=ctx.facts.local_world_size,
+            global_batch=ctx.sched.pool,
         )
 
     def _get_host_kv_free_pages(self, ctx) -> int:
@@ -1032,20 +1076,17 @@ class KVCapacityEngine:
         stats = ctx.host_view.get_stats()
         return stats.num_free_pages
 
-    def _get_host_kv_utilization(self, worker) -> Dict[str, int]:
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        if self._kv_stats_compare:
-            legacy = self._legacy_get_host_kv_utilization()
-            native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
+    def _get_host_kv_utilization(self, ctx) -> Dict[str, int]:
+        if ctx.facts.kv_stats_compare:
+            legacy = self._legacy_get_host_kv_utilization(ctx)
+            native_obj = self._make_kv_cache_manager(ctx).get_host_utilization(self._make_kv_utilization_request(ctx))
             native = _dataclasses.asdict(native_obj)
             assert legacy == native, f"kv_stats compare mismatch: get_host_kv_utilization legacy={legacy} native={native}"
-            return native if self._kv_stats_native else legacy
-        if self._kv_stats_native:
-            native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
+            return native if ctx.facts.kv_stats_native else legacy
+        if ctx.facts.kv_stats_native:
+            native_obj = self._make_kv_cache_manager(ctx).get_host_utilization(self._make_kv_utilization_request(ctx))
             return _dataclasses.asdict(native_obj)
-        return self._legacy_get_host_kv_utilization()
+        return self._legacy_get_host_kv_utilization(ctx)
 
     def _gather_host_kv_stats_by_node(self, ctx, worker_view: Optional[object]) -> List[Dict[str, int]]:
         """Gather one host-KV pool stat record per node.
@@ -1122,14 +1163,11 @@ class KVCapacityEngine:
 
         return per_node_stats
 
-    def _get_host_kv_total_pages(self, worker) -> int:
+    def _get_host_kv_total_pages(self, ctx: HostKVStatsContext) -> int:
         """This node's shared Host-KV pool size in pages."""
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        return int(self.host_paged_kv_worker_view.get_stats().num_total_pages)
+        return int(ctx.host_view.get_stats().num_total_pages)
 
-    def _log_host_kv_health(self, worker) -> None:
+    def _log_host_kv_health(self, ctx: HostKVHealthContext) -> None:
         """Log the audited health of this node's host-KV region(s).
 
         One line per region: the used-page identity, the sequence-table
@@ -1138,10 +1176,7 @@ class KVCapacityEngine:
         O(table + pages) under both region locks; call this only from the
         periodic heartbeat.
         """
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        view = getattr(self, "host_paged_kv_worker_view", None)
+        view = ctx.host_view
         if view is None:
             return
         if isinstance(view, DualHostKVCoordinator):
@@ -1151,7 +1186,7 @@ class KVCapacityEngine:
             )
         else:
             regions = (("host", view),)
-        node_id = self.rank_ctx.node_id
+        node_id = ctx.node_id
         for name, region_view in regions:
             logging.info(
                 f"[HOST_KV] node={node_id} "
@@ -1160,7 +1195,10 @@ class KVCapacityEngine:
 
     # ---- Decode cap and host views -----------------------------------------
 
-    def _max_decode_rank_bsz(self, worker) -> int:
+    def _max_decode_rank_bsz(self, ctx: DecodeRankBszContext, *,
+        _decode_attn_tp_size: Callable[[], int],
+        _whole_model_decode_graphs_requested: Callable[[], bool],
+    ) -> int:
         """Per-rank in-decode cap: the generic guard, lifted to the planner's
         per-node cap when a TP-group model (every rank holds the same rows)
         plans more slots than the guard — e.g. K3 H200 with sharded latent
@@ -1169,9 +1207,6 @@ class KVCapacityEngine:
         The legacy BATCHGEN_MAX_RANK_BSZ env name sizes the deepseek PSM
         padding separately; silently diverging values corrupt the padded
         buffer contract, so both names must agree when both are set."""
-        # Moved VERBATIM from batchgen_worker.py (S10a); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         explicit = os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ")
         legacy = os.environ.get("BATCHGEN_MAX_RANK_BSZ")
         if explicit is not None and legacy is not None and explicit != legacy:
@@ -1180,9 +1215,9 @@ class KVCapacityEngine:
                 "must match when both are set"
             )
         planned = int(getattr(
-            self.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
+            ctx.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
         ) or 0)
-        if self._decode_attn_tp_size() > 1 and planned > _MAX_DECODE_RANK_BSZ:
+        if _decode_attn_tp_size() > 1 and planned > _MAX_DECODE_RANK_BSZ:
             return planned
         if explicit is None and legacy is None:
             # On a whole-model-graph deployment the bucket flag is the width
@@ -1191,11 +1226,11 @@ class KVCapacityEngine:
             # set and this width share one source). An explicit env cap or a
             # TP-planner value still wins above.
             flag_bucket = int(getattr(
-                getattr(self, "args", None), "cuda_graph_max_bucket_size", 0,
+                ctx.args, "cuda_graph_max_bucket_size", 0,
             ) or 0)
             if (
                 flag_bucket > _MAX_DECODE_RANK_BSZ
-                and self._whole_model_decode_graphs_requested()
+                and _whole_model_decode_graphs_requested()
             ):
                 return flag_bucket
         return _MAX_DECODE_RANK_BSZ
@@ -3160,7 +3195,7 @@ class KVCapacityEngine:
                     f"Rank {self.rank}: Reset GPU allocation state for {reset_count} sequences"
                 )
 
-    def _legacy_get_host_kv_utilization(self, worker) -> Dict[str, int]:
+    def _legacy_get_host_kv_utilization(self, ctx) -> Dict[str, int]:
         """Get host KV stats counting sequences with KV in host memory.
 
         Valid sequences = PREFILLED, ON_HOLD, and IN_DECODE (all have KV in host).
@@ -3176,16 +3211,13 @@ class KVCapacityEngine:
         Returns:
             Dict with: rank, node_id, num_free_pages, num_total_pages, num_used_pages, free_percent
         """
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
-        stats = self.host_paged_kv_worker_view.get_stats()
+        stats = ctx.host_view.get_stats()
 
         # Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
         # Host KV is shared across all GPUs on a node
-        node_id = self.rank_ctx.node_id
-        node_rank_start = node_id * self.local_world_size
-        node_rank_end = min(node_rank_start + self.local_world_size, self.world_size)
+        node_id = ctx.facts.rank_ctx.node_id
+        node_rank_start = node_id * ctx.facts.local_world_size
+        node_rank_end = min(node_rank_start + ctx.facts.local_world_size, ctx.facts.world_size)
 
         # CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
         valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
@@ -3194,7 +3226,7 @@ class KVCapacityEngine:
         status_counts = {status: [] for status in valid_statuses}
         for rank_on_node in range(node_rank_start, node_rank_end):
             for status in valid_statuses:
-                seqs = self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
+                seqs = ctx.sched.pool.get_sequences_for_rank_with_status(rank_on_node, status)
                 status_counts[status].extend(seqs)
 
         valid_sequences = []
@@ -3208,15 +3240,15 @@ class KVCapacityEngine:
         free_pages = stats.num_free_pages
         free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
 
-        if self.local_rank == 0:
+        if ctx.facts.local_rank == 0:
             logging.debug(
                 f"[HOST_KV_UTIL] C++ stats: used={used_pages}, free={free_pages}, "
                 f"total={stats.num_total_pages}, {len(valid_sequences)} valid seqs"
             )
 
         return {
-            'rank': self.rank,
-            'node_id': self.rank_ctx.node_id,
+            'rank': ctx.facts.rank,
+            'node_id': ctx.facts.rank_ctx.node_id,
             'num_free_pages': free_pages,
             'num_total_pages': stats.num_total_pages,
             'num_used_pages': used_pages,
@@ -3228,56 +3260,59 @@ class KVCapacityEngine:
             'num_valid_sequences': len(valid_sequences),
         }
 
-    def _verify_deployment_max_model_len(self, worker, pool_gb: float) -> None:
+    def _verify_deployment_max_model_len(
+        self, ctx: DeploymentVerifyContext, pool_gb: float, *,
+        _decode_attn_tp_size: Callable[[], int],
+        _host_views_by_group: Callable[[], dict],
+    ) -> DeploymentVerifyOutcome:
         """Collect every region before allocating GPU pages or publishing L."""
-        # Moved VERBATIM from batchgen_worker.py (repatriation); rebinding self to the
-        # worker keeps every original self. spelling. The engine is stateless.
-        self = worker
         from batchgen.kv_cache.host_kv_mananger_config import (
             _resolve_profile, _resolve_indexer_profile, is_dsa_model,
         )
 
-        profiles = [_resolve_profile(self.huggingface_ckpt_name)]
-        if is_dsa_model(self.huggingface_ckpt_name):
-            profiles.append(_resolve_indexer_profile(self.huggingface_ckpt_name))
+        profiles = [_resolve_profile(ctx.huggingface_ckpt_name)]
+        if is_dsa_model(ctx.huggingface_ckpt_name):
+            profiles.append(_resolve_indexer_profile(ctx.huggingface_ckpt_name))
         page_bytes = [p.bytes_per_page() * p.num_layers for p in profiles]
         # This is the same split used by _initialize_gpu_kv_manager_fixed_size:
         # all regions have equal page counts, each page spans its physical layers.
         gpu_pages = max(0, int(pool_gb * (1024 ** 3))) // sum(page_bytes)
-        node = node_of_rank(self.rank, self.local_world_size)
+        node = node_of_rank(ctx.rank, ctx.local_world_size)
         capacities = []
-        host_views = self._host_views_by_group()
+        host_views = _host_views_by_group()
         for region, (profile, size) in enumerate(zip(profiles, page_bytes)):
             capacities.append(SequenceLengthCapacity(
-                "GPU KV", str(region), node, self.rank,
+                "GPU KV", str(region), node, ctx.rank,
                 profile.page_size, size, gpu_pages,
             ))
-            if self.local_rank == 0:
+            if ctx.local_rank == 0:
                 capacities.append(SequenceLengthCapacity(
-                    "host KV", str(region), node, self.rank,
+                    "host KV", str(region), node, ctx.rank,
                     profile.page_size, size,
                     int(host_views[region].get_stats().num_total_pages),
-                    copies=self._decode_attn_tp_size(),
+                    copies=_decode_attn_tp_size(),
                 ))
-        if self.local_rank == 0:
-            book = self._traj.trajectory_book
+        if ctx.local_rank == 0:
+            book = ctx.traj.trajectory_book
             capacities.append(SequenceLengthCapacity(
-                "input IDs", "trajectory", node, self.rank,
+                "input IDs", "trajectory", node, ctx.rank,
                 book.page_tokens, book.page_tokens * QueryBook.TOKEN_BYTES, book.page_count,
             ))
-        all_capacities = [None] * self.world_size
+        all_capacities = [None] * ctx.world_size
         dist.all_gather_object(all_capacities, capacities)
         length = verify_max_model_len(
-            self.model_context_length,
+            ctx.model_context_length,
             [capacity for rank_capacities in all_capacities for capacity in rank_capacities],
             auto_fit=(
-                getattr(self.args, "max_model_len", None) == -1
-                and not getattr(self, "_deployment_length_verified", False)
+                getattr(ctx.args, "max_model_len", None) == -1
+                and not ctx._deployment_length_verified
             ),
         )
-        self.model_context_length = length
-        self.engine_config.Basic_Config.max_model_len = length
-        self._deployment_length_verified = True
+        return DeploymentVerifyOutcome(
+            model_context_length=length,
+            engine_config_max_model_len=length,
+            _deployment_length_verified=True,
+        )
 
     # ---- Repatriated S10b (watermark, host capacity and KV migration) ------
 

@@ -4526,14 +4526,14 @@ class BatchGenWorker:
 		)
 
 	def _make_kv_utilization_request(self) -> KVUtilizationRequest:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._make_kv_utilization_request(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _get_host_kv_free_pages(self) -> int:
@@ -4564,36 +4564,41 @@ class BatchGenWorker:
 		)
 
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._get_host_kv_utilization(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _legacy_get_host_kv_utilization(self) -> Dict[str, int]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._legacy_get_host_kv_utilization(
-			self,
+			self._decode_phase_context(),
 		)
 
 	def _log_host_kv_health(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import HostKVHealthContext
+		ctx = HostKVHealthContext(
+			host_view=getattr(self, "host_paged_kv_worker_view", None),
+			node_id=self.rank_ctx.node_id,
+		)
 		return engine._log_host_kv_health(
-			self,
+			ctx,
 		)
 
 	def _gather_host_kv_stats_by_node(self, worker_view: Optional[object]) -> List[Dict[str, int]]:
@@ -5518,14 +5523,16 @@ class BatchGenWorker:
 		return describe_prefill_blockers(selection, total_pages_by_node=totals)
 
 	def _get_host_kv_total_pages(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import HostKVStatsContext
+		ctx = HostKVStatsContext(host_view=self.host_paged_kv_worker_view)
 		return engine._get_host_kv_total_pages(
-			self,
+			ctx,
 		)
 
 	def _prefill_candidate_digest(self, candidate_uuids: List[str]) -> int:
@@ -6334,16 +6341,32 @@ class BatchGenWorker:
 		)
 
 	def _verify_deployment_max_model_len(self, pool_gb: float) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._verify_deployment_max_model_len(
-			self,
-			pool_gb,
+		from batchgen.worker.kv_capacity_engine import DeploymentVerifyContext
+		ctx = DeploymentVerifyContext(
+			rank=self.rank, local_rank=self.local_rank,
+			world_size=self.world_size, local_world_size=self.local_world_size,
+			huggingface_ckpt_name=self.huggingface_ckpt_name,
+			model_context_length=self.model_context_length,
+			args=self.args, traj=self._traj,
+			_deployment_length_verified=getattr(
+				self, "_deployment_length_verified", False
+			),
 		)
+		outcome = engine._verify_deployment_max_model_len(
+			ctx,
+			pool_gb,
+			_decode_attn_tp_size=self._decode_attn_tp_size,
+			_host_views_by_group=self._host_views_by_group,
+		)
+		self.model_context_length = outcome.model_context_length
+		self.engine_config.Basic_Config.max_model_len = outcome.engine_config_max_model_len
+		self._deployment_length_verified = outcome._deployment_length_verified
 
 	def _snapshot_server_config(self) -> None:
 		"""Snapshot the [SERVER_CONFIG] values while their owners are live.
@@ -8373,14 +8396,21 @@ class BatchGenWorker:
 			self.core_engine.start_h2d_worker()
 
 	def _max_decode_rank_bsz(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		from batchgen.worker.kv_capacity_engine import DecodeRankBszContext
+		ctx = DecodeRankBszContext(
+			engine_config=self.engine_config,
+			args=getattr(self, "args", None),
+		)
 		return engine._max_decode_rank_bsz(
-			self,
+			ctx,
+			_decode_attn_tp_size=self._decode_attn_tp_size,
+			_whole_model_decode_graphs_requested=self._whole_model_decode_graphs_requested,
 		)
 
 	def _manager_decode_graphs_persist(self) -> bool:

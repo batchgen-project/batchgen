@@ -151,6 +151,22 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.parallel_manager": "self.parallel_manager",
         # PrefillPhaseContext (admission.prefill_selection)
         "ctx.prefix": "self._prefix",
+        # D6.1/D6.2 KV capacity value contexts: rank identity and the launch
+        # objects each context carries by reference.
+        "ctx.rank": "self.rank",
+        "ctx.local_rank": "self.local_rank",
+        "ctx.world_size": "self.world_size",
+        "ctx.local_world_size": "self.local_world_size",
+        "ctx.engine_config": "self.engine_config",
+        "ctx.args": "getattr(self, 'args', None)",
+        "ctx.huggingface_ckpt_name": "self.huggingface_ckpt_name",
+        "ctx.model_context_length": "self.model_context_length",
+        "ctx.traj": "self._traj",
+        "ctx._deployment_length_verified": (
+            "getattr(self, '_deployment_length_verified', False)"
+        ),
+        # HostKVHealthContext: the health line needs this node's id only.
+        "ctx.node_id": "self.rank_ctx.node_id",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -193,6 +209,13 @@ class _ContextToWorker(ast.NodeTransformer):
                     "self._debug_flag_enabled((self._debug_values() or {})"
                     ".get('glm5_prefill_nsys_profile'))"
                 ),
+                # D6.2 keyword-only collaborators: the worker spelling of a
+                # collaborator callable is the worker's own method of that name.
+                "_decode_attn_tp_size": "self._decode_attn_tp_size",
+                "_whole_model_decode_graphs_requested": (
+                    "self._whole_model_decode_graphs_requested"
+                ),
+                "_host_views_by_group": "self._host_views_by_group",
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
