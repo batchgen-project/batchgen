@@ -116,13 +116,20 @@ STATELESS_DELEGATED_VALUES = {
         "value": "self.args.prefix_rank_cost_profile",
     },
 }
+# Every converted operation that takes NO seam parameter. D7.2 adds one whose
+# delegator resolves nothing for it either -- the frontier predicate reads its
+# whole input off its own arguments -- so it has no entry above and its
+# worker-shaped view is the body itself under the delegator's signature.
+STATELESS_CONVERTED = frozenset(STATELESS_DELEGATED_VALUES) | {
+    "_unmaterializable_frontier",
+}
 
 
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
     args = node.args.args
     if node.name == "_setup_cuda_graphs" and [a.arg for a in args] == ["ctx", "gpu_manager"]:
         return True
-    if node.name in STATELESS_DELEGATED_VALUES:
+    if node.name in STATELESS_CONVERTED:
         return True
     return (
         len(args) >= 2
@@ -232,6 +239,10 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         # The pre-move body read this diagnostic latch with a getattr default,
         # at both of its occurrences.
         "ctx._prefix_integrity": "getattr(self, '_prefix_integrity', False)",
+        # D7.2 prefix-planning contexts. `rank`, `world_size`, `traj`,
+        # `prefix`, `prefix_runtime` and `prefix_coordinator` already map
+        # above, onto the same worker attributes these contexts snapshot.
+        "ctx.model_name": "self.model_name",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -347,6 +358,14 @@ class _ContextToWorker(ast.NodeTransformer):
                 "_prefill_pool_page_dims": "self._prefill_pool_page_dims",
                 "_debug_flag_enabled": "self._debug_flag_enabled",
                 "attn_group_size": "self._prefill_attn_tp_size()",
+                # D7.2 keyword-only collaborators, each the worker's own
+                # method of that name -- what the pre-move body called.
+                "_trajectory_commit_requested": (
+                    "self._trajectory_commit_requested"
+                ),
+                "_unmaterializable_frontier": (
+                    "self._unmaterializable_frontier"
+                ),
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -708,6 +727,66 @@ def _restore_migration_receive_writes(method: ast.FunctionDef) -> ast.FunctionDe
     return _Restore().visit(method)
 
 
+# D7.2: the cost-profile cache is CREATED on first use and then ADDED to, so
+# its outcome carries the one entry the write added rather than the container
+# (the same reason the migration receive needs its own restore). The engine
+# body works on a local dict named after the attribute, seeded from the
+# context; its worker spelling is the original create guard, with every use of
+# the local back on the worker and the bookkeeping local that carries the
+# entry dropped.
+_COST_PROFILE_CACHE = "_prefix_rank_cost_profiles"
+_COST_PROFILE_ENTRY = "cache_entry"
+_COST_PROFILE_CREATE = """
+if not hasattr(self, '_prefix_rank_cost_profiles'):
+    self._prefix_rank_cost_profiles = {}
+"""
+
+
+def _restore_cost_profile_cache_writes(
+    method: ast.FunctionDef,
+) -> ast.FunctionDef:
+    """Put ``_cached_prefix_rank_cost_profile``'s cache writes back."""
+
+    class _Restore(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            # The target is inspected BEFORE the children are visited: the
+            # rewrite below turns the local's name into an attribute, which
+            # would hide a bare-assignment target from this test.
+            target = node.targets[0]
+            if len(node.targets) == 1 and isinstance(target, ast.Name):
+                if target.id == _COST_PROFILE_CACHE:
+                    # The seeded local IS the pre-move create guard.
+                    return ast.parse(_COST_PROFILE_CREATE).body
+                if target.id == _COST_PROFILE_ENTRY:
+                    # Seam bookkeeping: the worker wrote the cache directly.
+                    return None
+            return self.generic_visit(node)
+
+        def visit_Name(self, node):
+            if node.id == _COST_PROFILE_CACHE:
+                return ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=_COST_PROFILE_CACHE,
+                    ctx=node.ctx,
+                )
+            return node
+
+        def visit_Return(self, node):
+            node = self.generic_visit(node)
+            value = node.value
+            if (
+                isinstance(value, ast.Tuple)
+                and len(value.elts) == 2
+                and _is_outcome_call(
+                    value.elts[1], "PrefixRankCostProfileCacheOutcome"
+                )
+            ):
+                return ast.Return(value=value.elts[0])
+            return node
+
+    return _Restore().visit(method)
+
+
 class _StatelessValueToWorker(ast.NodeTransformer):
     """Resolve a stateless operation's value parameters to worker spelling.
 
@@ -836,13 +915,13 @@ def load_worker_functions(
 # launch parameters, which the engine takes as values instead of reading the
 # worker's args. A fake sets ``worker.args`` the way a server's launch does.
 # Still-worker-shaped engine methods whose delegator hands them the prefill
-# phase's attention group width. D7.1 converted two more that take it
-# (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`); those are lifted to
-# the worker's shape instead, which inlines the same resolution, so adapting
-# their call no longer applies to them.
+# phase's attention group width. D7.1 converted two that take it
+# (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`) and D7.2 a third
+# (`_cached_prefix_rank_cost_profile`); those are lifted to the worker's shape
+# instead, which inlines the same resolution, so adapting their call no longer
+# applies to them.
 PREFILL_ATTENTION_WIDTH_METHODS = (
     "_plan_prefill_micro_batches",
-    "_cached_prefix_rank_cost_profile",
     "_check_pool_plan_identical",
     "_config_prefill_for_batch",
 )
@@ -896,7 +975,7 @@ def load_prefill_engine_methods(
             continue
         if node.name not in wanted:
             continue
-        converted = node.name in STATELESS_DELEGATED_VALUES or (
+        converted = node.name in STATELESS_CONVERTED or (
             len(node.args.args) >= 2 and node.args.args[1].arg == "ctx"
         )
         lifted = engine_method_as_worker_method(node) if converted else node
@@ -993,11 +1072,11 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
     """
     method = copy.deepcopy(node)
     args = method.args.args
-    stateless = STATELESS_DELEGATED_VALUES.get(node.name)
-    if stateless is not None:
+    if node.name in STATELESS_CONVERTED:
         # No seam parameter at all: the body reads no worker state, so only
-        # its delegator-resolved values map back and the signature of record
-        # is the delegator's.
+        # its delegator-resolved values map back (there may be none at all)
+        # and the signature of record is the delegator's.
+        stateless = STATELESS_DELEGATED_VALUES.get(node.name, {})
         method = _StatelessValueToWorker(stateless).visit(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS)[node.name]
         method.args = copy.deepcopy(worker_method.args)
@@ -1035,6 +1114,8 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
             method = _PendingTensorAliasToWorker().visit(method)
         if node.name == "_execute_single_kv_migration":
             method = _restore_migration_receive_writes(method)
+        if node.name == "_cached_prefix_rank_cost_profile":
+            method = _restore_cost_profile_cache_writes(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
         if worker_method is not None:
             extras = _extra_value_args(

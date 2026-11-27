@@ -9664,17 +9664,39 @@ class BatchGenWorker:
 		)
 
 	def _cached_prefix_rank_cost_profile(self, disabled: bool=False):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._cached_prefix_rank_cost_profile(
-			self,
+		from batchgen.worker.prefill_engine import (
+			PREFILL_UNCHANGED,
+			PrefixRankCostProfileContext,
+		)
+		profile, outcome = engine._cached_prefix_rank_cost_profile(
+			PrefixRankCostProfileContext(
+				rank=self.rank,
+				world_size=self.world_size,
+				model_name=self.model_name,
+				# ``None`` is the pre-move ``hasattr`` miss: this process has
+				# resolved neither arm yet.
+				_prefix_rank_cost_profiles=getattr(
+					self, "_prefix_rank_cost_profiles", None
+				),
+			),
 			disabled,
 			attn_group_size=self._prefill_attn_tp_size(),
 		)
+		# The cache is CREATED on first use and then ADDED to, in that order;
+		# an outcome carrying the container would drop whatever the other A/B
+		# arm resolved earlier in this process. A cache hit adds nothing.
+		if not hasattr(self, '_prefix_rank_cost_profiles'):
+			self._prefix_rank_cost_profiles = {}
+		if outcome.cache_entry is not PREFILL_UNCHANGED:
+			cache_key, cached_profile = outcome.cache_entry
+			self._prefix_rank_cost_profiles[cache_key] = cached_profile
+		return profile
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a pool-served admission by prompt prefix, not by arrival.
@@ -9897,28 +9919,43 @@ class BatchGenWorker:
 				)
 
 	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import MaterializedPrefixHitsContext
+		# Read HERE, not from a held snapshot: the session index is folded and
+		# the attachments are taken and consumed within one prefill, and this
+		# derivation runs once per wave plan.
 		return engine._materialized_prefix_hits(
-			self,
+			MaterializedPrefixHitsContext(
+				rank=self.rank,
+				prefix_runtime=self.prefix_cache_runtime_config,
+				traj=self._traj,
+				prefix=self._prefix,
+			),
 			seqs,
 			page_tokens=page_tokens,
 			group=group,
+			# Each collaborator is the worker's own method of that name, which
+			# is what the pre-move body called.
+			_trajectory_commit_requested=self._trajectory_commit_requested,
+			_trajectory_tokens=self._trajectory_tokens,
+			_unmaterializable_frontier=self._unmaterializable_frontier,
+			_owns_host_kv=self._owns_host_kv,
 		)
 
 	def _unmaterializable_frontier(self, seq, *, boundary: int, owning_group_id: int, page_tokens: int) -> Optional[str]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		# No context: the predicate reads no worker state at all.
 		return engine._unmaterializable_frontier(
-			self,
 			seq,
 			boundary=boundary,
 			owning_group_id=owning_group_id,
@@ -10033,14 +10070,19 @@ class BatchGenWorker:
 		)
 
 	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens, retain=frozenset(), restore_boundaries=None) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefixLookupReplacementContext
 		return engine._replace_prefix_lookup_hits(
-			self,
+			PrefixLookupReplacementContext(
+				rank=self.rank,
+				prefix_coordinator=self.prefix_cache_coordinator,
+				prefix=self._prefix,
+			),
 			seqs,
 			prefix_states,
 			chain_tokens,
@@ -10049,14 +10091,21 @@ class BatchGenWorker:
 		)
 
 	def _settle_trajectory_restore_plan(self, seqs, drops, default_reason) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import TrajectoryRestoreSettleContext
+		# Read HERE, not from a held snapshot: this runs on every return path
+		# of a wave plan, and the stores it reads are rebound per phase.
 		return engine._settle_trajectory_restore_plan(
-			self,
+			TrajectoryRestoreSettleContext(
+				rank=self.rank,
+				traj=self._traj,
+				prefix=self._prefix,
+			),
 			seqs,
 			drops,
 			default_reason,

@@ -101,11 +101,12 @@ _MOVED = {
     "_finish_prefill_pool_wave",
 }
 
-# Bodies that take a frozen context instead of the worker: they compile from
-# their engine in the WORKER's shape, which is the body that actually runs with
-# its delegator's resolutions inlined. ``_release_pool_segment_refs`` lives in
-# another engine and takes the decode context; the rest are this engine's
-# readers and predicates, converted in D7.1.
+# Bodies that take a frozen context instead of the worker (or, where they read
+# no worker state, no seam parameter at all): they compile from their engine in
+# the WORKER's shape, which is the body that actually runs with its delegator's
+# resolutions inlined. ``_release_pool_segment_refs`` lives in another engine
+# and takes the decode context; the rest are this engine's readers and
+# predicates, converted in D7.1, and its prefix planning, converted in D7.2.
 _CONTEXT_MOVED = {
     "_release_pool_segment_refs",
     "_prefill_model_pass_count", "_prefill_prefix_pool_enabled",
@@ -115,6 +116,9 @@ _CONTEXT_MOVED = {
     "_prefill_pool_psm_layout", "_prefill_pool_page_dims",
     "_prefill_pool_page_bytes", "_prefill_pool_segment_host_pages",
     "_pool_probe_debug", "_pool_pad_poison_enabled",
+    "_cached_prefix_rank_cost_profile", "_materialized_prefix_hits",
+    "_unmaterializable_frontier", "_replace_prefix_lookup_hits",
+    "_settle_trajectory_restore_plan",
 }
 
 

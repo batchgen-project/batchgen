@@ -24,6 +24,7 @@ from batchgen.prefix_reuse.executor_cost import (
     PROFILES,
     find_executor_cost_profile,
 )
+from tests.prefill_source import load_prefill
 
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
@@ -58,26 +59,87 @@ def _engine_method_ast(name):
 
 @functools.lru_cache(maxsize=4)
 def _methods(names):
-    module = ast.fix_missing_locations(
-        ast.Module(body=[_engine_method_ast(name) for name in names], type_ignores=[])
-    )
-    scope = {"List": List, "Optional": Optional, "torch": torch,
-             "logging": SimpleNamespace(info=lambda *a, **k: None)}
-    exec(compile(module, str(ENGINE), "exec"), scope)
-    return {name: _adapt(name, scope[name]) for name in names}
+    """The engine bodies under test, compiled from the engine's own AST.
+
+    ``tests.prefill_source`` is this engine's loader and already knows how to
+    compile its converted definitions -- the frozen contexts and the outcome
+    sentinel included, which the cost-profile lookup now needs -- so the
+    namespace comes from there instead of a second hand-rolled compile.
+    """
+    namespace = load_prefill({
+        "List": List, "Optional": Optional, "torch": torch,
+        "logging": SimpleNamespace(info=lambda *a, **k: None),
+    })
+    engine = namespace["PrefillEngine"]
+    return {name: _adapt(name, getattr(engine, name), namespace)
+            for name in names}
 
 
-def _adapt(name, function):
+def _adapt(name, function, namespace):
     """Call the engine method the way its worker delegator does.
 
     ``None`` always stands for the stateless engine's own ``self``. A method
     that still takes the worker gets the fake as its seam argument; the
     converted cost-profile predicate reads no worker state at all, so it gets
-    only the launch value its delegator resolves (the caller passes it).
+    only the launch value its delegator resolves (the caller passes it); and
+    the converted lookup takes a frozen context and hands its cache write
+    back in an outcome, so it gets the delegator's full treatment.
     """
-    if function.__code__.co_varnames[1] == "worker":
-        return lambda worker, *args, **kwargs: function(None, worker, *args, **kwargs)
-    return lambda worker, *args, **kwargs: function(None, *args, **kwargs)
+    seam = function.__code__.co_varnames[1]
+    if seam == "worker":
+        return _worker_seam_call(function)
+    if seam == "ctx":
+        return _cost_profile_delegator(name, function, namespace)
+    return _value_seam_call(function)
+
+
+def _worker_seam_call(function):
+    def call(worker, *args, **kwargs):
+        return function(None, worker, *args, **kwargs)
+    return call
+
+
+def _value_seam_call(function):
+    def call(worker, *args, **kwargs):
+        return function(None, *args, **kwargs)
+    return call
+
+
+def _cost_profile_delegator(name, function, namespace):
+    """Mirror ``BatchGenWorker._cached_prefix_rank_cost_profile`` exactly.
+
+    The context is resolved per call (``None`` is the pre-move ``hasattr``
+    miss) and the outcome is applied in the pre-move order: create the cache
+    when it is absent, then add the one entry the lookup resolved. The cache
+    the assertions below read is therefore the one the real delegator builds
+    on the worker.
+    """
+    assert name == "_cached_prefix_rank_cost_profile", name
+    context = namespace["PrefixRankCostProfileContext"]
+    unchanged = namespace["PREFILL_UNCHANGED"]
+
+    def call(worker, *args, **kwargs):
+        profile, outcome = function(
+            None,
+            context(
+                rank=worker.rank,
+                world_size=worker.world_size,
+                model_name=worker.model_name,
+                _prefix_rank_cost_profiles=getattr(
+                    worker, "_prefix_rank_cost_profiles", None
+                ),
+            ),
+            *args,
+            **kwargs,
+        )
+        if not hasattr(worker, "_prefix_rank_cost_profiles"):
+            worker._prefix_rank_cost_profiles = {}
+        if outcome.cache_entry is not unchanged:
+            key, cached = outcome.cache_entry
+            worker._prefix_rank_cost_profiles[key] = cached
+        return profile
+
+    return call
 
 
 class _Props:
