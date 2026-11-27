@@ -105,6 +105,8 @@ DELEGATED_CONTEXT_MODULES = (DECODE_ENTRY_SOURCE, PREFILL_SELECTION_SOURCE)
 
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
     args = node.args.args
+    if node.name == "_setup_cuda_graphs" and [a.arg for a in args] == ["ctx", "gpu_manager"]:
+        return True
     return (
         len(args) >= 2
         and args[0].arg == "self"
@@ -426,6 +428,61 @@ def load_prefill_engine_methods(
     return loaded
 
 
+class _GraphSetupToWorker(ast.NodeTransformer):
+    """Restore only the explicit graph setup seam for source-pinned tests.
+
+    Runtime tests exercise the actual delegator separately. These source
+    assertions restore explicit helper calls and local outcome assignments
+    to their historic spelling; they do not model binding time.
+    """
+
+    def visit_Attribute(self, node):
+        if (
+            isinstance(node.value, ast.Name) and node.value.id == "ctx"
+            and node.attr == "disable_decode_host_kv_staging"
+        ):
+            node.attr = "glm5_disable_decode_host_kv_staging"
+        return self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id.startswith("setup_"):
+            if isinstance(node.value, ast.Name) and node.value.id == "GRAPH_SETUP_UNCHANGED":
+                return None
+            node.targets = [ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=target.id.removeprefix("setup"), ctx=ast.Store(),
+            )]
+        return self.generic_visit(node)
+
+    def __init__(self, callable_names):
+        self.callable_names = set(callable_names)
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self.callable_names:
+                node.func = ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=node.func.id, ctx=ast.Load(),
+                )
+        return node
+
+    def visit_Return(self, node):
+        assert isinstance(node.value, ast.Call)
+        assert node.value.func.id == "GraphSetupOutcome"
+        assert not node.value.args
+        assert {kw.arg for kw in node.value.keywords} == {
+            "_decode_graph_ladder_logged", "_criticality_probe", "_criticality_probe_recapture",
+        }
+        return ast.Return(value=None)
+
+    def visit_Name(self, node):
+        if node.id == "ctx":
+            return ast.Name(id="self", ctx=node.ctx)
+        return node
+
+
 def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
     """Convert an engine method ``(self, worker/ctx, ...)`` to worker shape.
 
@@ -435,6 +492,13 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
     """
     method = copy.deepcopy(node)
     args = method.args.args
+    if node.name == "_setup_cuda_graphs" and [a.arg for a in args] == ["ctx", "gpu_manager"]:
+        method = _GraphSetupToWorker(a.arg for a in node.args.kwonlyargs).visit(method)
+        method.args = copy.deepcopy(_class_methods(WORKER_SOURCE, WORKER_CLASS)[node.name].args)
+        method.decorator_list = []
+        method.returns = None
+        ast.fix_missing_locations(method)
+        return method
     if len(args) < 2 or args[0].arg != "self" or args[1].arg not in {"worker", "ctx"}:
         raise AssertionError(f"{node.name} is not an engine method (self, worker/ctx, ...)")
     if args[1].arg == "ctx":
