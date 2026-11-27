@@ -157,6 +157,9 @@ def _worker(monkeypatch, *, probe_requested=True, failure=None, prior_probe=None
         _max_decode_rank_bsz=lambda: 4,
         _glm5_whole_model_graph_requested_for_current_batch=lambda: True,
         _assert_decode_graph_capture_allowed=lambda: events.append("allowed"),
+        # The D2-shape span-warn delegator resolves the frozen decode context
+        # beside the graph state; the engine reads only ctx.facts.rank.
+        _decode_phase_context=lambda: SimpleNamespace(facts=SimpleNamespace(rank=0)),
         model_context_length=256, global_batch=None, _debug_state_values=None,
         _bind_graph_capture_kv_managers=lambda *args: events.append("bind_kv"),
         _bind_graph_capture_kv_manager=lambda *args: events.append("bind_kv"),
