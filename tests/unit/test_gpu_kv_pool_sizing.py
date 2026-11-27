@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import functools
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +33,10 @@ import pytest
 
 from batchgen.worker.kv_manager import GPU_KV_POOL_HEADROOM_GB, KVCacheManager
 from batchgen.worker.kv_plan import provisional_pool_gb
-from tests.worker.worker_fakes import make_graph_state
+from tests.kv_capacity_source import load_kv_capacity, method_node
 from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+
+_KV = load_kv_capacity()
 
 GIB = 1024 ** 3
 
@@ -222,10 +225,7 @@ def _fake_torch(free_gb: float, total_gb: float):
 
 
 def _callable(name, free_gb, total_gb):
-    """Compile one worker method against fakes; returns (function, recorder)."""
-    module = ast.fix_missing_locations(
-        ast.Module(body=[_method(name)], type_ignores=[])
-    )
+    """Load the engine against device fakes; returns (method, recorder)."""
     recorder = _Recorder()
     collections = []
     namespace = {
@@ -237,8 +237,8 @@ def _callable(name, free_gb, total_gb):
         "GPU_KV_POOL_HEADROOM_GB": GPU_KV_POOL_HEADROOM_GB,
         "provisional_pool_gb": provisional_pool_gb,
     }
-    exec(compile(module, str(WORKER), "exec"), namespace)
-    return namespace[name], recorder
+    ns = load_kv_capacity(namespace)
+    return getattr(ns["KVCapacityEngine"](), name), recorder
 
 
 def _manager(num_total_pages: int):
@@ -249,25 +249,13 @@ def _manager(num_total_pages: int):
     )
 
 
-def _finalize_worker(provisional_gb=PROVISIONAL_GB, max_bucket=128):
+def _finalize_context(provisional_gb=PROVISIONAL_GB, max_bucket=128):
     pages = int(provisional_gb * GIB / BYTES_PER_PAGE)
-    return SimpleNamespace(
-        rank=0,
-        local_rank=0,
-        torch_device="cuda:0",
-        gpu_memory_frac=0.93,
-        gpu_kv_cache_size_gb=provisional_gb,
-        _gpu_kv_sizing_provisional=True,
-        _gpu_kv_cached_pool_gb=None,
+    return _KV["GPUKVFinalizeContext"](
+        rank=0, local_rank=0, torch_device="cuda:0", gpu_memory_frac=0.93,
+        gpu_kv_cache_size_gb=provisional_gb, _gpu_kv_sizing_provisional=True,
         gpu_paged_kv_cache_manager=_manager(pages),
-        # S2: the capture-time bucketing moved onto the worker's GraphRuntime.
-        # Same value, read through `self._graph` -- the floor still comes from
-        # max(bucket_sizes).
-        _graph=make_graph_state(
-            whole_model_bucketing=SimpleNamespace(
-                bucket_sizes=[1, 16, 64, max_bucket]
-            ),
-        ),
+        whole_model_bucketing=SimpleNamespace(bucket_sizes=[1, 16, 64, max_bucket]),
     )
 
 
@@ -276,14 +264,14 @@ def test_finalize_caches_the_measured_size_and_reports_the_headroom():
     finalize, recorder = _callable(
         "_finalize_gpu_kv_pool_after_capture", TOTAL_GB - used, TOTAL_GB
     )
-    worker = _finalize_worker()
-    finalize(worker, worker.gpu_paged_kv_cache_manager)
+    ctx = _finalize_context()
+    outcome = finalize(ctx, ctx.gpu_paged_kv_cache_manager)
 
-    assert abs(worker._gpu_kv_cached_pool_gb - 18.23) < 0.01
+    assert abs(outcome._gpu_kv_cached_pool_gb - 18.23) < 0.01
     # The live round keeps its provisional pool (captured graphs bake its
     # addresses and this codebase refuses to recapture).
-    assert worker.gpu_kv_cache_size_gb == PROVISIONAL_GB
-    assert worker._gpu_kv_sizing_provisional is False
+    assert ctx.gpu_kv_cache_size_gb == PROVISIONAL_GB
+    assert outcome._gpu_kv_sizing_provisional is False
 
     log = "\n".join(recorder.lines)
     assert "Finalized pool size: 18.23 GB" in log
@@ -291,7 +279,7 @@ def test_finalize_caches_the_measured_size_and_reports_the_headroom():
     # count divided into its size), not a re-derived profile constant.
     provisional_pages = int(PROVISIONAL_GB * GIB / BYTES_PER_PAGE)
     bytes_per_page = PROVISIONAL_GB * GIB / provisional_pages
-    expected_pages = int(worker._gpu_kv_cached_pool_gb * GIB / bytes_per_page)
+    expected_pages = int(outcome._gpu_kv_cached_pool_gb * GIB / bytes_per_page)
     assert expected_pages == 3300
     assert f"~{expected_pages} pages" in log
     assert expected_pages > provisional_pages  # round 1 was the smaller pool
@@ -307,13 +295,14 @@ def test_finalize_is_idempotent_so_a_later_capture_cannot_resize_the_pool():
         TOTAL_GB - (STEADY_GB + PROVISIONAL_GB),
         TOTAL_GB,
     )
-    worker = _finalize_worker()
-    finalize(worker, worker.gpu_paged_kv_cache_manager)
-    cached = worker._gpu_kv_cached_pool_gb
+    ctx = _finalize_context()
+    outcome = finalize(ctx, ctx.gpu_paged_kv_cache_manager)
+    cached = outcome._gpu_kv_cached_pool_gb
     # Second call (e.g. a later warmup entry): the measure-once flag is down.
-    worker.gpu_kv_cache_size_gb = 1.0
-    finalize(worker, worker.gpu_paged_kv_cache_manager)
-    assert worker._gpu_kv_cached_pool_gb == cached
+    ctx = replace(ctx, gpu_kv_cache_size_gb=1.0,
+                  _gpu_kv_sizing_provisional=outcome._gpu_kv_sizing_provisional)
+    assert finalize(ctx, ctx.gpu_paged_kv_cache_manager) is None
+    assert outcome._gpu_kv_cached_pool_gb == cached
 
 
 def test_finalize_fails_loud_when_the_steady_state_leaves_no_usable_pool():
@@ -325,14 +314,14 @@ def test_finalize_fails_loud_when_the_steady_state_leaves_no_usable_pool():
     )
     # Provisional pool of 1 GB inside that residency: the 1.1 GB remainder is
     # ~199 pages, below the 512 the largest bucket needs.
-    worker = _finalize_worker(provisional_gb=1.0)
+    ctx = _finalize_context(provisional_gb=1.0)
     with pytest.raises(RuntimeError) as excinfo:
-        finalize(worker, worker.gpu_paged_kv_cache_manager)
+        finalize(ctx, ctx.gpu_paged_kv_cache_manager)
     message = str(excinfo.value)
     assert "below floor" in message
     assert "512 pages" in message  # bucket 128 * 4 pages
     assert "2.00 GB pool headroom" in message
-    assert worker._gpu_kv_cached_pool_gb is None
+    assert ctx._gpu_kv_sizing_provisional is True
 
 
 def test_finalize_does_not_pass_the_memory_fraction_to_the_sizing_helper():
@@ -340,7 +329,7 @@ def test_finalize_does_not_pass_the_memory_fraction_to_the_sizing_helper():
     # headroom constant replaced.
     call = next(
         node
-        for node in ast.walk(_method("_finalize_gpu_kv_pool_after_capture"))
+        for node in ast.walk(method_node("_finalize_gpu_kv_pool_after_capture"))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "compute_final_pool_gb"
@@ -355,36 +344,32 @@ def test_the_provisional_measurement_still_bounds_itself_with_the_fraction():
     # The formula ``total * frac - used`` has one definition,
     # kv_plan.provisional_pool_gb; this site must still feed it the fraction
     # and keep its fail-loud policy (no floor).
-    body = ast.unparse(_method("_init_gpu_kv_with_actual_size"))
+    body = ast.unparse(method_node("_init_gpu_kv_with_actual_size"))
     assert (
-        "provisional_pool_gb(total_mem_gb, self.gpu_memory_frac, used_mem_gb, floor_gb=None)"
+        "provisional_pool_gb(total_mem_gb, ctx.gpu_memory_frac, used_mem_gb, floor_gb=None)"
         in body
     )
     assert "KVCacheManager.provisional_pool_gb" not in body
 
 
-def _cached_path_worker(cached_gb):
+def _cached_path_context(cached_gb):
     created = []
-
-    worker = SimpleNamespace(
-        rank=0,
-        local_rank=0,
-        torch_device="cuda:0",
-        _phase="decode",
-        gpu_memory_frac=0.93,
-        gpu_kv_cache_size_gb=None,
-        _gpu_kv_cached_pool_gb=cached_gb,
-        _gpu_kv_sizing_provisional=False,
+    ctx = _KV["GPUKVInitContext"](
+        rank=0, local_rank=0, torch_device="cuda:0", _phase="decode",
+        gpu_memory_frac=0.93, _gpu_kv_cached_pool_gb=cached_gb,
         gpu_paged_kv_cache_manager=None,
     )
 
-    def _init_fixed_size():
-        created.append(worker.gpu_kv_cache_size_gb)
-        pages = int(worker.gpu_kv_cache_size_gb * GIB / BYTES_PER_PAGE)
-        worker.gpu_paged_kv_cache_manager = _manager(pages)
+    def initialize(*, gpu_kv_cache_size_gb):
+        created.append(gpu_kv_cache_size_gb)
+        return _manager(int(gpu_kv_cache_size_gb * GIB / BYTES_PER_PAGE))
 
-    worker._initialize_gpu_kv_manager_fixed_size = _init_fixed_size
-    return worker, created
+    helpers = dict(
+        _initialize_gpu_kv_manager_fixed_size=initialize,
+        _verify_deployment_max_model_len=lambda size: pytest.fail("cached pool reverified"),
+        _remap_reused_kv_pool=lambda: pytest.fail("allocator pool remapped"),
+    )
+    return ctx, helpers, created
 
 
 def test_every_later_round_creates_the_pool_at_the_one_cached_size():
@@ -398,8 +383,8 @@ def test_every_later_round_creates_the_pool_at_the_one_cached_size():
         init, recorder = _callable(
             "_init_gpu_kv_with_actual_size", free_gb, TOTAL_GB
         )
-        worker, created = _cached_path_worker(cached)
-        init(worker)
+        ctx, helpers, created = _cached_path_context(cached)
+        init(ctx, **helpers)
         sizes.append(created)
         assert "Cached pool size" in "\n".join(recorder.lines)
     assert sizes == [[cached], [cached]]
@@ -413,8 +398,8 @@ def test_a_cached_pool_that_no_longer_fits_fails_loud_instead_of_shrinking():
     init, _ = _callable(
         "_init_gpu_kv_with_actual_size", cached - 1.0, TOTAL_GB
     )
-    worker, created = _cached_path_worker(cached)
+    ctx, helpers, created = _cached_path_context(cached)
     with pytest.raises(RuntimeError) as excinfo:
-        init(worker)
+        init(ctx, **helpers)
     assert "no longer fits" in str(excinfo.value)
     assert created == []  # no pool was created at a silently smaller size
