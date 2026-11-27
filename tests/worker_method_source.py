@@ -104,9 +104,25 @@ PREFILL_SELECTION_SOURCE = (
 DELEGATED_CONTEXT_MODULES = (DECODE_ENTRY_SOURCE, PREFILL_SELECTION_SOURCE)
 
 
+# D7.1: launch values a prefill delegator resolves for an operation that reads
+# NO worker state at all, so it takes no context either -- the value IS its
+# whole input. Named per method, because the parameter names (`mode`, `value`)
+# are ordinary locals in other bodies and must not be rewritten there.
+STATELESS_DELEGATED_VALUES = {
+    "_prefix_rank_packing_mode": {
+        "mode": "self.args.prefix_rank_assignment_mode",
+    },
+    "_prefix_rank_cost_profile_disabled": {
+        "value": "self.args.prefix_rank_cost_profile",
+    },
+}
+
+
 def _is_delegator_shape(node: ast.FunctionDef) -> bool:
     args = node.args.args
     if node.name == "_setup_cuda_graphs" and [a.arg for a in args] == ["ctx", "gpu_manager"]:
+        return True
+    if node.name in STATELESS_DELEGATED_VALUES:
         return True
     return (
         len(args) >= 2
@@ -204,6 +220,18 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         # already maps above, under the decode phase context's own field name.
         "ctx.torch_device": "self.torch_device",
         "ctx.gpu_paged_kv_cache_manager": "self.gpu_paged_kv_cache_manager",
+        # D7.1 prefill value contexts. `parallel_manager`, `engine_config`,
+        # `prefix_runtime`, `pool`, `prefix`, `traj`, `rank` and
+        # `huggingface_ckpt_name` already map above, onto the same worker
+        # attributes these contexts snapshot.
+        "ctx.enable_prefix_cache": "self.enable_prefix_cache",
+        "ctx.enable_prepack": "self.enable_prepack",
+        "ctx.local_to_uuid": "self._local_to_uuid_map",
+        "ctx._prefill_pool_wave": "self._prefill_pool_wave",
+        "ctx._phase_prefill_debug": "self._phase_prefill_debug",
+        # The pre-move body read this diagnostic latch with a getattr default,
+        # at both of its occurrences.
+        "ctx._prefix_integrity": "getattr(self, '_prefix_integrity', False)",
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -307,6 +335,18 @@ class _ContextToWorker(ast.NodeTransformer):
                 "_assign_decode_dp_groups": "self._assign_decode_dp_groups",
                 "_prepare_decode_batch": "self._prepare_decode_batch",
                 "_update_batch_status": "self._update_batch_status",
+                # D7.1 keyword-only collaborators and the one value a prefill
+                # delegator resolves for every converted reader that takes it.
+                # Each collaborator is the worker's own method of that name,
+                # which is what the pre-move body called.
+                "_plan_prefill_micro_batches": (
+                    "self._plan_prefill_micro_batches"
+                ),
+                "_pool_prefill_group_safe": "self._pool_prefill_group_safe",
+                "_prefill_pool_layout": "self._prefill_pool_layout",
+                "_prefill_pool_page_dims": "self._prefill_pool_page_dims",
+                "_debug_flag_enabled": "self._debug_flag_enabled",
+                "attn_group_size": "self._prefill_attn_tp_size()",
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -668,6 +708,27 @@ def _restore_migration_receive_writes(method: ast.FunctionDef) -> ast.FunctionDe
     return _Restore().visit(method)
 
 
+class _StatelessValueToWorker(ast.NodeTransformer):
+    """Resolve a stateless operation's value parameters to worker spelling.
+
+    D7.1: two converted predicates read no worker state, so they take no
+    context -- only the launch value their delegator resolves. The
+    worker-shaped view of such a body is the delegator's resolution inlined at
+    every use, which is exactly the expression the pre-move body evaluated.
+    """
+
+    def __init__(self, values) -> None:
+        self._values = dict(values)
+
+    def visit_Name(self, node):
+        replacement = (
+            self._values.get(node.id) if isinstance(node.ctx, ast.Load) else None
+        )
+        if replacement is None:
+            return node
+        return ast.parse(replacement, mode="eval").body
+
+
 class _FillMigrationReceive(ast.NodeTransformer):
     """Put the outcome's two values back into the original write statements.
 
@@ -774,28 +835,24 @@ def load_worker_functions(
 # What the worker's delegators pass to the engine besides their own arguments:
 # launch parameters, which the engine takes as values instead of reading the
 # worker's args. A fake sets ``worker.args`` the way a server's launch does.
-# Engine methods whose worker delegator hands them the prefill phase's
-# attention group width.
+# Still-worker-shaped engine methods whose delegator hands them the prefill
+# phase's attention group width. D7.1 converted two more that take it
+# (`_prefill_prefix_pool_enabled`, `_prefill_pool_group`); those are lifted to
+# the worker's shape instead, which inlines the same resolution, so adapting
+# their call no longer applies to them.
 PREFILL_ATTENTION_WIDTH_METHODS = (
     "_plan_prefill_micro_batches",
-    "_prefill_prefix_pool_enabled",
-    "_prefill_pool_group",
     "_cached_prefix_rank_cost_profile",
     "_check_pool_plan_identical",
     "_config_prefill_for_batch",
 )
 
+# D7.1 left this map to the worker-shaped methods only: the two launch-value
+# predicates it used to adapt are converted, and their value now travels
+# through STATELESS_DELEGATED_VALUES in the lift.
 PREFILL_ENGINE_DELEGATOR_KWARGS = {
-    "_prefix_rank_packing_mode": lambda worker: {
-        "mode": worker.args.prefix_rank_assignment_mode
-    },
-    "_prefix_rank_cost_profile_disabled": lambda worker: {
-        "value": worker.args.prefix_rank_cost_profile
-    },
-    **{
-        name: (lambda worker: {"attn_group_size": worker._prefill_attn_tp_size()})
-        for name in PREFILL_ATTENTION_WIDTH_METHODS
-    },
+    name: (lambda worker: {"attn_group_size": worker._prefill_attn_tp_size()})
+    for name in PREFILL_ATTENTION_WIDTH_METHODS
 }
 
 
@@ -805,10 +862,18 @@ def load_prefill_engine_methods(
 ) -> Dict[str, Any]:
     """Compile S5a ``PrefillEngine`` methods from their real source.
 
-    The engine methods have the explicit S4b-style seam ``(self, worker, ...)``.
-    This helper adapts them back to the worker-shaped call used by CPU fakes:
-    the engine instance is stateless, so ``None`` is sufficient for its
-    pre-rebinding ``self`` and the fake is passed as ``worker``.
+    An unconverted engine method has the explicit S4b-style seam
+    ``(self, worker, ...)``. This helper adapts it back to the worker-shaped
+    call used by CPU fakes: the engine instance is stateless, so ``None`` is
+    sufficient for its pre-rebinding ``self`` and the fake is passed as
+    ``worker``.
+
+    A method converted by Phase D takes a frozen context (or, where it reads
+    no worker state, no seam parameter at all), so there is nothing to pass a
+    fake as. It is lifted to the worker's own shape by
+    :func:`engine_method_as_worker_method` instead, which is the body that
+    actually runs with the delegator's resolutions inlined; the caller's fake
+    and namespace reach it exactly as before.
     """
     wanted = set(names)
     tree = ast.parse(
@@ -831,11 +896,19 @@ def load_prefill_engine_methods(
             continue
         if node.name not in wanted:
             continue
-        module = ast.Module(body=[node], type_ignores=[])
+        converted = node.name in STATELESS_DELEGATED_VALUES or (
+            len(node.args.args) >= 2 and node.args.args[1].arg == "ctx"
+        )
+        lifted = engine_method_as_worker_method(node) if converted else node
+        module = ast.Module(body=[lifted], type_ignores=[])
         ast.fix_missing_locations(module)
         scope: Dict[str, Any] = dict(namespace)
         exec(compile(module, str(PREFILL_ENGINE_SOURCE), "exec"), scope)  # noqa: S102
         engine_method = scope[node.name]
+        if converted:
+            # Already the worker's own shape: its first parameter is the fake.
+            loaded[node.name] = engine_method
+            continue
 
         def worker_method(
             worker, *args, _engine_method=engine_method, _name=node.name, **kwargs
@@ -920,6 +993,17 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
     """
     method = copy.deepcopy(node)
     args = method.args.args
+    stateless = STATELESS_DELEGATED_VALUES.get(node.name)
+    if stateless is not None:
+        # No seam parameter at all: the body reads no worker state, so only
+        # its delegator-resolved values map back and the signature of record
+        # is the delegator's.
+        method = _StatelessValueToWorker(stateless).visit(method)
+        worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS)[node.name]
+        method.args = copy.deepcopy(worker_method.args)
+        method.returns = copy.deepcopy(worker_method.returns)
+        ast.fix_missing_locations(method)
+        return method
     if node.name == "_setup_cuda_graphs" and [a.arg for a in args] == ["ctx", "gpu_manager"]:
         method = _GraphSetupToWorker(a.arg for a in node.args.kwonlyargs).visit(method)
         method.args = copy.deepcopy(_class_methods(WORKER_SOURCE, WORKER_CLASS)[node.name].args)

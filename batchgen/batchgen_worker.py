@@ -5879,15 +5879,26 @@ class BatchGenWorker:
 		)
 
 	def _prefill_model_pass_count(self, batch: List[int]) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillModelPassCountContext
 		return engine._prefill_model_pass_count(
-			self,
+			PrefillModelPassCountContext(
+				_prefill_pool_wave=self._prefill_pool_wave,
+				enable_prepack=self.enable_prepack,
+				engine_config=self.engine_config,
+				pool=self.global_batch,
+				local_to_uuid=self._local_to_uuid_map,
+				prefix=self._prefix,
+			),
 			batch,
+			# The micro-batch planner's own delegator, which resolves the
+			# server mode's prefill cap and the phase's group width.
+			_plan_prefill_micro_batches=self._plan_prefill_micro_batches,
 		)
 
 	def _streamed_sp8_prefill_pass_alignment(
@@ -9549,85 +9560,105 @@ class BatchGenWorker:
 
 	# ============ IN-WAVE PREFIX POOL (batchgen/prefix_reuse) ============
 
+	def _prefill_pool_parallel_context(self):
+		"""The ONE PSM handle the pool's placement and geometry readers take.
+
+		Resolved per call, never held: the phase lifecycle rebinds the manager,
+		and the four readers that share this context are each asked again on
+		every wave.
+		"""
+		from batchgen.worker.prefill_engine import PrefillPoolParallelContext
+		return PrefillPoolParallelContext(parallel_manager=self.parallel_manager)
+
 	def _prefill_prefix_pool_enabled(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPrefixPoolEnabledContext
 		return engine._prefill_prefix_pool_enabled(
-			self,
+			PrefillPrefixPoolEnabledContext(
+				parallel_manager=self.parallel_manager,
+				engine_config=self.engine_config,
+				enable_prefix_cache=self.enable_prefix_cache,
+				prefix_runtime=self.prefix_cache_runtime_config,
+				# The pre-move body read this diagnostic latch with the same
+				# default, twice: a launch that never armed it answers False.
+				_prefix_integrity=getattr(self, "_prefix_integrity", False),
+			),
 			attn_group_size=self._prefill_attn_tp_size(),
+			_pool_prefill_group_safe=self._pool_prefill_group_safe,
 		)
 
 	def _pool_prefill_group_safe(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._pool_prefill_group_safe(
-			self,
+			self._prefill_pool_parallel_context(),
 		)
 
 	def _prefill_pool_group(self):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._prefill_pool_group(
-			self,
+			self._prefill_pool_parallel_context(),
 			attn_group_size=self._prefill_attn_tp_size(),
 		)
 
 	def _prefill_pool_free_state_slots(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolStateSlotsContext
 		return engine._prefill_pool_free_state_slots(
-			self,
+			PrefillPoolStateSlotsContext(traj=self._traj),
 		)
 
 	def _next_pool_segment_sid(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PoolSegmentSidContext
 		return engine._next_pool_segment_sid(
-			self,
+			PoolSegmentSidContext(prefix=self._prefix),
 		)
 
 	def _prefix_rank_packing_mode(self, seqs) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._prefix_rank_packing_mode(
-			self,
 			seqs,
 			mode=self.args.prefix_rank_assignment_mode,
 		)
 
 	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._prefix_rank_cost_profile_disabled(
-			self,
 			seqs,
 			value=self.args.prefix_rank_cost_profile,
 		)
@@ -9911,37 +9942,45 @@ class BatchGenWorker:
 		)
 
 	def _prefill_pool_psm_layout(self):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._prefill_pool_psm_layout(
-			self,
+			self._prefill_pool_parallel_context(),
 		)
 
 	def _prefill_pool_page_dims(self, geometry) -> tuple:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._prefill_pool_page_dims(
-			self,
+			self._prefill_pool_parallel_context(),
 			geometry,
 		)
 
 	def _prefill_pool_page_bytes(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolPageBytesContext
 		return engine._prefill_pool_page_bytes(
-			self,
+			PrefillPoolPageBytesContext(
+				prefix_runtime=self.prefix_cache_runtime_config,
+				huggingface_ckpt_name=self.huggingface_ckpt_name,
+			),
+			# Both siblings have their own read sets, so they arrive as the
+			# worker delegators the pre-move body called.
+			_prefill_pool_layout=self._prefill_pool_layout,
+			_prefill_pool_page_dims=self._prefill_pool_page_dims,
 		)
 
 	def _measure_prefill_prefix_kv_budget(self) -> None:
@@ -10032,14 +10071,18 @@ class BatchGenWorker:
 		return isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator)
 
 	def _prefill_pool_segment_host_pages(self) -> int:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolWaveContext
+		# Read HERE, not from a held snapshot: the wave is planned, replaced
+		# and dropped inside one prefill, and this count is asked for both
+		# before and after those transitions.
 		return engine._prefill_pool_segment_host_pages(
-			self,
+			PrefillPoolWaveContext(_prefill_pool_wave=self._prefill_pool_wave),
 		)
 
 	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
@@ -10151,15 +10194,28 @@ class BatchGenWorker:
 			batch,
 		)
 
+	def _pool_probe_context(self):
+		"""The rank and the debug state this wave adopted, per call.
+
+		``_phase_prefill_debug`` is read plainly, exactly as the pre-move
+		bodies read it: it is bound when the wave begins, so every pooled probe
+		runs after it exists.
+		"""
+		from batchgen.worker.prefill_engine import PoolProbeContext
+		return PoolProbeContext(
+			rank=self.rank,
+			_phase_prefill_debug=self._phase_prefill_debug,
+		)
+
 	def _pool_probe_debug(self, wave):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._pool_probe_debug(
-			self,
+			self._pool_probe_context(),
 			wave,
 		)
 
@@ -10220,15 +10276,16 @@ class BatchGenWorker:
 		)
 
 	def _pool_pad_poison_enabled(self, wave) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._pool_pad_poison_enabled(
-			self,
+			self._pool_probe_context(),
 			wave,
+			_debug_flag_enabled=self._debug_flag_enabled,
 		)
 
 	def _new_pool_offload_check_recorder(self, wave):

@@ -4251,12 +4251,22 @@ def test_worker_counts_the_same_prefill_plan_that_execution_uses():
     execute = _function(path, "PrefillEngine", "prefill_prepacked")
 
     def calls_plan(function):
+        """Calls to the micro-batch planner, however the body reaches it.
+
+        D7.1 converted the counter: it takes the planner as an explicit
+        collaborator callable, so its call is a bare name. Execution still
+        reaches the same planner through the rebound ``self``.
+        """
         return sum(
             1
             for node in ast.walk(function)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_plan_prefill_micro_batches"
+            and (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_plan_prefill_micro_batches"
+                or isinstance(node.func, ast.Name)
+                and node.func.id == "_plan_prefill_micro_batches"
+            )
         )
 
     assert calls_plan(count) == 1

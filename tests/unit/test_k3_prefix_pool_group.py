@@ -101,9 +101,21 @@ _MOVED = {
     "_finish_prefill_pool_wave",
 }
 
-# Bodies that live in another engine and take the decode context: they compile
-# from that engine in the worker's shape.
-_CONTEXT_MOVED = {"_release_pool_segment_refs"}
+# Bodies that take a frozen context instead of the worker: they compile from
+# their engine in the WORKER's shape, which is the body that actually runs with
+# its delegator's resolutions inlined. ``_release_pool_segment_refs`` lives in
+# another engine and takes the decode context; the rest are this engine's
+# readers and predicates, converted in D7.1.
+_CONTEXT_MOVED = {
+    "_release_pool_segment_refs",
+    "_prefill_model_pass_count", "_prefill_prefix_pool_enabled",
+    "_pool_prefill_group_safe", "_prefill_pool_group",
+    "_prefill_pool_free_state_slots", "_next_pool_segment_sid",
+    "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
+    "_prefill_pool_psm_layout", "_prefill_pool_page_dims",
+    "_prefill_pool_page_bytes", "_prefill_pool_segment_host_pages",
+    "_pool_probe_debug", "_pool_pad_poison_enabled",
+}
 
 
 def _worker_class():
@@ -155,7 +167,7 @@ def _worker_methods(names, globals_=None):
                 )
                 return _function(None, worker, *args, **kwargs)
             function = worker_method
-        elif name in _MOVED:
+        elif name in _MOVED and name not in _CONTEXT_MOVED:
             def worker_method(
                 worker, *args, _function=function, _name=name, **kwargs
             ):

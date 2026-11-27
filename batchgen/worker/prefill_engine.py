@@ -1,8 +1,22 @@
 """Prefill wave planning and lifecycle behind a worker seam.
 
-The engine is intentionally stateless.  Each operation receives the live worker
-as its collaborator, then rebinds ``self`` to that worker so the moved statements
-keep their original state access and call spellings.
+The engine is intentionally stateless.  An operation that has not been
+converted yet receives the live worker as its collaborator, then rebinds
+``self`` to that worker so the moved statements keep their original state
+access and call spellings.
+
+D7.1 converted the small pure readers and predicates: each takes a frozen
+plain-value context and explicit keyword-only collaborator callables, and none
+of them rebinds ``self``.  Their contexts are deliberately narrow, one per read
+set, because several of these reads were ``getattr`` defaults on the worker and
+a wider context would turn "absent" into an ``AttributeError`` at the
+delegator.  Where two readers' read sets genuinely coincide they share one
+context and the caller reaches its sibling with it directly:
+:class:`PrefillPoolParallelContext` carries the one PSM handle the pool's
+placement and geometry readers touch, and :class:`PoolProbeContext` carries the
+rank and the adopted debug state the pooled probes read.  No converted
+operation writes a worker attribute, so this stage declares no outcome; the
+probe read's two writes land on the wave object its caller passed, in place.
 """
 
 from __future__ import annotations
@@ -13,8 +27,8 @@ import logging
 import math
 import os
 import time
-from dataclasses import replace
-from typing import Dict, List, Optional, Protocol, Tuple
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 import torch
 import torch.distributed as dist
@@ -87,6 +101,111 @@ _POOL_PROBE_DEBUG_KEYS = (
     _POOL_KERNEL_DUMP_DIR_FLAG,
     _POOL_PAD_POISON_DEBUG_FLAG,
 )
+
+
+# D7.1: the frozen value contexts of this engine's pure readers and predicates.
+# One context per read set, named after the worker attributes it snapshots, and
+# collaborators are never fields -- they arrive as keyword-only callables.
+
+
+@dataclass(frozen=True)
+class PrefillPoolParallelContext:
+    """The ONE PSM handle the pool's placement and geometry readers touch.
+
+    Shared by four readers because their read set is exactly this object: the
+    group-safety declaration, the pool's process group, the PSM's pool layout
+    override and the page dims that resolve through that override. The page
+    dims therefore call the layout reader with THIS context instead of going
+    back out through a worker delegator that would add nothing.
+    """
+
+    parallel_manager: object
+
+
+@dataclass(frozen=True)
+class PrefillPrefixPoolEnabledContext:
+    """What deciding "is the in-wave prefix pool on" reads.
+
+    Deliberately narrower than a prefill phase context: ``_prefix_integrity``
+    is a diagnostic latch the pre-move body read with a ``getattr`` default, so
+    the delegator keeps that default and a worker that never set it still
+    answers False instead of raising.
+    """
+
+    parallel_manager: object
+    engine_config: object
+    enable_prefix_cache: bool
+    prefix_runtime: object
+    # ``False`` is the pre-move ``getattr`` default: the integrity check is off
+    # unless a launch armed it.
+    _prefix_integrity: bool
+
+
+@dataclass(frozen=True)
+class PrefillPoolPageBytesContext:
+    """The page-byte arithmetic's two deployment reads.
+
+    The layout and the page dims it also needs are sibling operations with
+    their own contexts, so they arrive as collaborator callables -- the same
+    worker delegators the pre-move body called.
+    """
+
+    prefix_runtime: object
+    huggingface_ckpt_name: str
+
+
+@dataclass(frozen=True)
+class PrefillPoolStateSlotsContext:
+    """The trajectory store the free recurrent-state slot count reads."""
+
+    traj: object
+
+
+@dataclass(frozen=True)
+class PoolSegmentSidContext:
+    """The prefix-reuse state that owns the pooled-segment sequence ids."""
+
+    prefix: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolWaveContext:
+    """The planned wave, or ``None`` when no wave is in flight.
+
+    ``None`` is the pre-move read's own "nothing planned" case, which the
+    segment host-page count answers with zero.
+    """
+
+    _prefill_pool_wave: object
+
+
+@dataclass(frozen=True)
+class PrefillModelPassCountContext:
+    """What counting this prefill's model forwards reads.
+
+    The micro-batch planner is a sibling with a different read set (and its own
+    delegator-resolved cap), so it arrives as a collaborator callable.
+    """
+
+    _prefill_pool_wave: object
+    enable_prepack: bool
+    engine_config: object
+    pool: object
+    local_to_uuid: object
+    prefix: object
+
+
+@dataclass(frozen=True)
+class PoolProbeContext:
+    """The rank and the debug state the pooled probes were armed through.
+
+    Shared by the probe read and the pad-poison predicate, whose read sets
+    coincide on exactly these two, so the predicate calls the read with THIS
+    context. The three probe recorders read the same two.
+    """
+
+    rank: int
+    _phase_prefill_debug: object
 
 
 class PrefillModelStateBinder(Protocol):
@@ -206,23 +325,22 @@ class PrefillEngine:
         )
         return micro_batches, l2_cap, single_sequence_only
 
-    def _prefill_model_pass_count(self, worker, batch: List[int]) -> int:
+    def _prefill_model_pass_count(
+        self, ctx: PrefillModelPassCountContext, batch: List[int], *,
+        _plan_prefill_micro_batches: Callable,
+    ) -> int:
         """Return the number of complete model forwards local prefill will run."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if not batch:
             return 0
-        if self._prefill_pool_wave is not None:
+        if ctx._prefill_pool_wave is not None:
             # A pool wave runs one forward per planned chunk, not one per
             # micro-batch of whole prompts: a chunk packs pooled segments and
             # tails. The plan is identical on every rank of the serve group, so
             # the pass counts the transport padding aligns against agree.
-            return len(self._prefill_pool_wave.plan.chunks)
-        if not self.enable_prepack:
+            return len(ctx._prefill_pool_wave.plan.chunks)
+        if not ctx.enable_prepack:
             micro_batch_size = (
-                self.engine_config.Module_Batching_Config
+                ctx.engine_config.Module_Batching_Config
                 .MoE_prefill_micro_batch_size
             )
             return math.ceil(len(batch) / micro_batch_size)
@@ -232,15 +350,15 @@ class PrefillEngine:
         full_seq_lengths = []
         compute_cached_tokens = []
         for local_idx in batch:
-            seq = self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-            prefix_state = self._prefix.prefix_sequence_states.get(seq.global_idx)
+            seq = ctx.pool.get_sequence(ctx.local_to_uuid[local_idx])
+            prefix_state = ctx.prefix.prefix_sequence_states.get(seq.global_idx)
             full_seq_lengths.append(seq.prompt_length)
             compute_cached_tokens.append(
                 prefix_state.compute_cached_tokens
                 if prefix_state is not None
                 else 0
             )
-        micro_batches, _, _ = self._plan_prefill_micro_batches(
+        micro_batches, _, _ = _plan_prefill_micro_batches(
             [
                 full - cached
                 for full, cached in zip(full_seq_lengths, compute_cached_tokens)
@@ -250,34 +368,33 @@ class PrefillEngine:
         )
         return len(micro_batches)
 
-    def _prefill_prefix_pool_enabled(self, worker, *, attn_group_size: int) -> bool:
+    def _prefill_prefix_pool_enabled(
+        self, ctx: PrefillPrefixPoolEnabledContext, *, attn_group_size: int,
+        _pool_prefill_group_safe: Callable[[], bool],
+    ) -> bool:
         """In-wave prefix pool: prefix caching on, planner workspace set, pure DP prefill."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        workspace = self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
-        if not self.enable_prefix_cache:
+        workspace = ctx.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+        if not ctx.enable_prefix_cache:
             return False
         from batchgen.prefix_reuse.config import PrefixKVGroupSemantic
         if any(
             spec.semantic is not PrefixKVGroupSemantic.FULL_KV
-            for spec in self.prefix_cache_runtime_config.group_specs
-        ) and (workspace <= 0 or getattr(self, "_prefix_integrity", False)):
+            for spec in ctx.prefix_runtime.group_specs
+        ) and (workspace <= 0 or ctx._prefix_integrity):
             # Only the pool path serves MLA-latent prefix reuse (GLM DSA, Kimi-K3);
             # the cross-wave materialization path handles one full-K/V group.
             raise RuntimeError(
                 "MLA-latent prefix reuse needs the prefill prefix pool, but this "
                 "model's planner sets no pool workspace or the integrity check is on"
             )
-        if workspace <= 0 or getattr(self, "_prefix_integrity", False):
+        if workspace <= 0 or ctx._prefix_integrity:
             return False
         if (
-            hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-            and self.parallel_manager.prefill_uses_resident_ep()
+            hasattr(ctx.parallel_manager, "prefill_uses_resident_ep")
+            and ctx.parallel_manager.prefill_uses_resident_ep()
         ) or (
             attn_group_size != 1
-            and not self._pool_prefill_group_safe()
+            and not _pool_prefill_group_safe()
         ):
             raise RuntimeError(
                 "the prefill prefix pool runs per DP rank; this model's prefill "
@@ -285,7 +402,7 @@ class PrefillEngine:
             )
         return True
 
-    def _pool_prefill_group_safe(self, worker) -> bool:
+    def _pool_prefill_group_safe(self, ctx: PrefillPoolParallelContext) -> bool:
         """Whether the PSM plans ONE identical pool wave per serve group (G>1).
 
         At G>1 a sequence is replicated onto all G ranks of its serve group and
@@ -294,24 +411,18 @@ class PrefillEngine:
         then still pair up. The PSM declares that; the resident-EP refusal above
         stands either way, since those passes join EP-world collectives.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         declares = getattr(
-            self.parallel_manager, "supports_group_pool_prefill", None
+            ctx.parallel_manager, "supports_group_pool_prefill", None
         )
         return declares is not None and bool(declares())
 
-    def _prefill_pool_group(self, worker, *, attn_group_size: int):
+    def _prefill_pool_group(
+        self, ctx: PrefillPoolParallelContext, *, attn_group_size: int,
+    ):
         """The process group a pool wave must be identical over; None at G==1."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         if attn_group_size <= 1:
             return None
-        group = getattr(self.parallel_manager, "attn_tp_group", None)
+        group = getattr(ctx.parallel_manager, "attn_tp_group", None)
         if group is None:
             raise RuntimeError(
                 "the prefill prefix pool at attn_tp_size>1 needs the attention "
@@ -319,30 +430,24 @@ class PrefillEngine:
             )
         return group
 
-    def _prefill_pool_free_state_slots(self, worker) -> int:
+    def _prefill_pool_free_state_slots(
+        self, ctx: PrefillPoolStateSlotsContext,
+    ) -> int:
         """Free recurrent-state slots, or -1 when the model keeps no such state.
 
         A pooled segment runs as a row of its own under a pseudo sequence id, so
         it holds one slot for the whole wave on top of the wave's sequences.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        manager = self._traj.kda_state_manager()
+        manager = ctx.traj.kda_state_manager()
         if manager is None:
             return -1
         return int(manager.get_stats().num_free_state_items)
 
-    def _next_pool_segment_sid(self, worker) -> int:
+    def _next_pool_segment_sid(self, ctx: PoolSegmentSidContext) -> int:
         """Negative Host sequence ids, rank-strided so no two ranks collide."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        return self._prefix.next_pool_segment_sid()
+        return ctx.prefix.next_pool_segment_sid()
 
-    def _prefix_rank_packing_mode(self, worker, seqs, *, mode: str) -> bool:
+    def _prefix_rank_packing_mode(self, seqs, *, mode: str) -> bool:
         """True when this batch runs the predicted-time wave packer.
 
         The packer is the default assignment for a pool-served wave: it is the
@@ -352,6 +457,10 @@ class PrefillEngine:
         A server asks for the arrival-order assignment back with the launch
         parameter ``--prefix-rank-assignment-mode global_idx``, which is what
         the A/B arms use; it holds for every wave of the server.
+
+        It takes NO context: the launch value its delegator resolves is all it
+        reads, so there is no worker state to snapshot and an empty context
+        would claim otherwise.
         """
         if mode not in ("packing_v2", "global_idx"):
             raise ValueError(
@@ -360,13 +469,16 @@ class PrefillEngine:
             )
         return mode == "packing_v2"
 
-    def _prefix_rank_cost_profile_disabled(self, worker, seqs, *, value: str) -> bool:
+    def _prefix_rank_cost_profile_disabled(self, seqs, *, value: str) -> bool:
         """The launch parameter ``--prefix-rank-cost-profile off``.
 
         Scoring the packer's targets by predicted seconds and balancing their
         computed tokens are the two arms of the packing comparison. The arm is
         a property of the server: every rank of every group reads the same
         launch value, so the packing stays replicated.
+
+        It takes NO context, for the same reason as the packing-mode predicate
+        above: the delegator's launch value is the whole of its input.
         """
         if value not in ("on", "off"):
             raise ValueError(
@@ -887,7 +999,7 @@ class PrefillEngine:
         )
         return wave
 
-    def _prefill_pool_psm_layout(self, worker):
+    def _prefill_pool_psm_layout(self, ctx: PrefillPoolParallelContext):
         """The PSM's pool-geometry override, or None to use the Host geometry.
 
         A model whose pool holds the EXPANDED heads (K3: 192-wide K and
@@ -895,20 +1007,19 @@ class PrefillEngine:
         geometry from the PSM; the Host geometry is the pool's only while
         prefill attention reads exactly what the Host stores.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
+        layout = getattr(ctx.parallel_manager, "prefill_pool_layout", None)
         return layout() if layout is not None else None
 
-    def _prefill_pool_page_dims(self, worker, geometry) -> tuple:
-        """(layers, heads, k_head_dim, v_head_dim) of one pool page row."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        layout = self._prefill_pool_psm_layout()
+    def _prefill_pool_page_dims(
+        self, ctx: PrefillPoolParallelContext, geometry,
+    ) -> tuple:
+        """(layers, heads, k_head_dim, v_head_dim) of one pool page row.
+
+        The PSM override is a sibling with the SAME context, so it is called
+        with this one rather than through the worker delegator, which added
+        nothing but the engine lookup.
+        """
+        layout = self._prefill_pool_psm_layout(ctx)
         if layout:
             return (
                 int(layout["num_layers"]),
@@ -923,18 +1034,18 @@ class PrefillEngine:
             geometry.k_head_dim,
         )
 
-    def _prefill_pool_page_bytes(self, worker) -> int:
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
+    def _prefill_pool_page_bytes(
+        self, ctx: PrefillPoolPageBytesContext, *,
+        _prefill_pool_layout: Callable,
+        _prefill_pool_page_dims: Callable,
+    ) -> int:
         from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
-        page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-        geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+        page_tokens = int(ctx.prefix_runtime.group_specs[0].raw_page_tokens)
+        geometry = build_gpu_kv_config(ctx.huggingface_ckpt_name, [page_tokens])
         element = torch.empty((), dtype=geometry.kv_dtype).element_size()
-        with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
-        layers, heads, k_head_dim, v_head_dim = self._prefill_pool_page_dims(geometry)
+        with_v, indexer_layers, indexer_dim = _prefill_pool_layout(geometry)
+        layers, heads, k_head_dim, v_head_dim = _prefill_pool_page_dims(geometry)
         return (
             layers * page_tokens * heads
             * (k_head_dim + (v_head_dim if with_v else 0))
@@ -1283,17 +1394,15 @@ class PrefillEngine:
                 detail=f"at plan time: {drops.get(index, default_reason)}",
             )
 
-    def _prefill_pool_segment_host_pages(self, worker) -> int:
+    def _prefill_pool_segment_host_pages(
+        self, ctx: PrefillPoolWaveContext,
+    ) -> int:
         """Host pages this wave allocates for its segments.
 
         A materialized segment is excluded: its pages are the frontier's,
         already allocated and retained by the wave that computed it.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        wave = self._prefill_pool_wave
+        wave = ctx._prefill_pool_wave
         if wave is None:
             return 0
         return sum(
@@ -1579,7 +1688,7 @@ class PrefillEngine:
             )
         return loaded
 
-    def _pool_probe_debug(self, worker, wave):
+    def _pool_probe_debug(self, ctx: PoolProbeContext, wave):
         """The probe keys this wave armed, or None. Read ONCE per wave.
 
         The four pooled probes (epilogue trace, offload byte check, kernel dump,
@@ -1592,16 +1701,16 @@ class PrefillEngine:
         the wave, and the result dict is not created until a probe key is
         actually found. Each probe's own setup then imports its module only
         after this returned non-None.
+
+        The two cached answers are written onto the WAVE the caller passed, in
+        place: they are the wave's own fields, not worker attributes, so this
+        stage needs no outcome for them.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
 
         if wave.probe_debug_read:
             return wave.probe_debug
         armed = None
-        server_debug = self._phase_prefill_debug
+        server_debug = ctx._phase_prefill_debug
         if server_debug:
             for key in _POOL_PROBE_DEBUG_KEYS:
                 value = server_debug.get(key)
@@ -1758,7 +1867,10 @@ class PrefillEngine:
             rank=self.rank,
         )
 
-    def _pool_pad_poison_enabled(self, worker, wave) -> bool:
+    def _pool_pad_poison_enabled(
+        self, ctx: PoolProbeContext, wave, *,
+        _debug_flag_enabled: Callable[[object], bool],
+    ) -> bool:
         """Server-level ``debug_state.prefix_pool_pad_poison``.
 
         Read through the same seam as ``prefix_pool_offload_check``: the key
@@ -1768,22 +1880,21 @@ class PrefillEngine:
 
         The flag check comes BEFORE the import: on a production wave
         ``_pool_probe_debug`` has already answered None.
+
+        The probe read is a sibling with the SAME context, so it is called
+        with this one instead of through the worker delegator.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        debug = self._pool_probe_debug(wave)
+        debug = self._pool_probe_debug(ctx, wave)
         if debug is None:
             return False
         from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
 
-        if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
+        if not _debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
             return False
         logging.info(
             "[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
             "with its own last page: members=%s segments=%s",
-            self.rank,
+            ctx.rank,
             len(wave.uuids),
             len(wave.plan.segments),
         )

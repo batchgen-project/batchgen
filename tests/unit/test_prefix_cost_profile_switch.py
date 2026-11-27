@@ -64,11 +64,20 @@ def _methods(names):
     scope = {"List": List, "Optional": Optional, "torch": torch,
              "logging": SimpleNamespace(info=lambda *a, **k: None)}
     exec(compile(module, str(ENGINE), "exec"), scope)
-    return {
-        name: (lambda worker, *args, _fn=scope[name], **kwargs:
-               _fn(None, worker, *args, **kwargs))
-        for name in names
-    }
+    return {name: _adapt(name, scope[name]) for name in names}
+
+
+def _adapt(name, function):
+    """Call the engine method the way its worker delegator does.
+
+    ``None`` always stands for the stateless engine's own ``self``. A method
+    that still takes the worker gets the fake as its seam argument; the
+    converted cost-profile predicate reads no worker state at all, so it gets
+    only the launch value its delegator resolves (the caller passes it).
+    """
+    if function.__code__.co_varnames[1] == "worker":
+        return lambda worker, *args, **kwargs: function(None, worker, *args, **kwargs)
+    return lambda worker, *args, **kwargs: function(None, *args, **kwargs)
 
 
 class _Props:
