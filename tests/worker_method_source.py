@@ -167,6 +167,15 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         ),
         # HostKVHealthContext: the health line needs this node's id only.
         "ctx.node_id": "self.rank_ctx.node_id",
+        # D6.3 HostKVWatermarkContext: the watermark pair's launch flags and
+        # the per-rank log counter, which the pre-move code read with hasattr.
+        "ctx.enable_decode_preemption": "self.enable_decode_preemption",
+        "ctx.enable_host_kv_eviction": "self.enable_host_kv_eviction",
+        "ctx.host_kv_watermark": "self.host_kv_watermark",
+        "ctx.pool": "self.global_batch",
+        "ctx._watermark_check_counter": (
+            "getattr(self, '_watermark_check_counter', None)"
+        ),
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -216,6 +225,38 @@ class _ContextToWorker(ast.NodeTransformer):
                     "self._whole_model_decode_graphs_requested"
                 ),
                 "_host_views_by_group": "self._host_views_by_group",
+                # D6.3 keyword-only collaborators and value parameters: the
+                # worker spelling of a collaborator callable is the worker's
+                # own method of that name, and of a value parameter the
+                # resolution its delegator performs.
+                "_is_sequence_completed": "self._is_sequence_completed",
+                "_get_host_kv_utilization": "self._get_host_kv_utilization",
+                "_credit_reclaimable_prefix_pages": (
+                    "self._credit_reclaimable_prefix_pages"
+                ),
+                "_get_or_create_gloo_group": "self._get_or_create_gloo_group",
+                "_execute_single_kv_migration": (
+                    "self._execute_single_kv_migration"
+                ),
+                "_execute_kv_migrations_parallel": (
+                    "self._execute_kv_migrations_parallel"
+                ),
+                "_plan_kv_migration": "self._plan_kv_migration",
+                "_sync_sequence_metadata": "self._sync_sequence_metadata",
+                "_bump_decode_row_epoch": "self._bump_decode_row_epoch",
+                "_trajectory_tokens": "self._trajectory_tokens",
+                "_trajectory_slot": "self._trajectory_slot",
+                "enable_decode_preemption": "self.enable_decode_preemption",
+                # The rebalance delegator creates the staging map before the
+                # engine runs; the worker-shaped view keeps the hasattr-safe
+                # read, which is what the pre-move statement did and what a
+                # shell that never received anything still needs.
+                "pending_migrated_query_book": (
+                    "getattr(self, '_pending_migrated_query_book', None)"
+                ),
+                "logged_migration_skip_tp": (
+                    "getattr(self, '_logged_migration_skip_tp', False)"
+                ),
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -292,7 +333,160 @@ class _ContextToWorker(ast.NodeTransformer):
             and node.args[0].id == "ctx"
         ):
             node.args.pop(0)
+            # A sibling called with the same context is also handed the
+            # collaborators it was given; the worker's same-name delegator
+            # resolves those itself, so they are not part of its call.
+            node.keywords = [
+                kw for kw in node.keywords
+                if not (
+                    kw.arg
+                    and kw.arg.startswith("_")
+                    and ast.unparse(kw.value) == f"self.{kw.arg}"
+                )
+            ]
         return node
+
+
+# D6.3: a converted method returns its worker writes in a frozen outcome the
+# delegator applies. For the worker-shaped view the write has to be back where
+# the pre-move statement stood, so each outcome names the attributes it binds
+# and the lift-back puts the locals and the return back into worker spelling.
+OUTCOME_WRITE_FIELDS = {
+    "WatermarkTriggerOutcome": (
+        "_host_kv_page_stats", "_watermark_check_counter",
+    ),
+    "MigrationPlanOutcome": ("_logged_migration_skip_tp",),
+}
+OUTCOME_METHODS = {
+    "_check_host_kv_watermark_trigger": "WatermarkTriggerOutcome",
+    "_plan_kv_migration": "MigrationPlanOutcome",
+}
+
+
+def _is_outcome_call(node: ast.AST, outcome: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == outcome
+    )
+
+
+class _OutcomeToWorkerWrites(ast.NodeTransformer):
+    """Restore an outcome's locals and return to the worker's own writes.
+
+    An engine body carries each write as a local named after the worker
+    attribute, seeded with the sentinel where a branch does not write, and
+    hands them back in the outcome. The worker spelling is the attribute
+    assignment at that same statement, with the sentinel seed dropped (the
+    worker simply does not write) and the outcome stripped from the return.
+    """
+
+    def __init__(self, outcome: str):
+        self.outcome = outcome
+        self.fields = set(OUTCOME_WRITE_FIELDS[outcome])
+
+    def _bound(self, name: str, ctx) -> ast.Attribute:
+        return ast.Attribute(
+            value=ast.Name(id="self", ctx=ast.Load()), attr=name, ctx=ctx,
+        )
+
+    def visit_Assign(self, node):
+        node = self.generic_visit(node)
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id in self.fields:
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "GPU_KV_UNCHANGED"
+            ):
+                return None
+            node.targets = [self._bound(target.id, ast.Store())]
+        return node
+
+    def visit_AugAssign(self, node):
+        node = self.generic_visit(node)
+        if isinstance(node.target, ast.Name) and node.target.id in self.fields:
+            node.target = self._bound(node.target.id, ast.Store())
+        return node
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.fields:
+            return self._bound(node.id, ast.Load())
+        return node
+
+    def visit_Return(self, node):
+        node = self.generic_visit(node)
+        value = node.value
+        if (
+            isinstance(value, ast.Tuple)
+            and len(value.elts) == 2
+            and _is_outcome_call(value.elts[1], self.outcome)
+        ):
+            return ast.Return(value=value.elts[0])
+        if _is_outcome_call(value, self.outcome):
+            return ast.Return(value=None)
+        return node
+
+
+# The migration receive's two writes ADD to containers the pre-move code
+# created on first use, so the outcome carries the uuid and the record rather
+# than the containers. Its worker spelling is therefore the original
+# create-then-add block, which no field-by-field rule can express.
+_MIGRATION_RECEIVE_WRITES = """
+if not hasattr(self, '_pending_migrated_query_book'):
+    self._pending_migrated_query_book = {}
+if not hasattr(self, '_migrated_sequences'):
+    self._migrated_sequences = set()
+self._migrated_sequences.add(MIGRATED_UUID)
+self._pending_migrated_query_book[MIGRATED_UUID] = PENDING_RECORD
+"""
+
+
+def _restore_migration_receive_writes(method: ast.FunctionDef) -> ast.FunctionDef:
+    """Put ``_execute_single_kv_migration``'s staging writes back on the worker."""
+
+    class _Restore(ast.NodeTransformer):
+        def visit_Return(self, node):
+            if _is_outcome_call(node.value, "KVMigrationReceiveOutcome"):
+                return None
+            return node
+
+        def generic_visit(self, node):
+            node = super().generic_visit(node)
+            for field in ("body", "orelse", "finalbody"):
+                body = getattr(node, field, None)
+                if not isinstance(body, list):
+                    continue
+                for index, stmt in enumerate(body):
+                    if not (
+                        isinstance(stmt, ast.Assign)
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id == "_migrated_sequences"
+                        and index + 1 < len(body)
+                        and isinstance(body[index + 1], ast.Assign)
+                        and isinstance(body[index + 1].targets[0], ast.Name)
+                        and body[index + 1].targets[0].id
+                        == "_pending_migrated_query_book"
+                    ):
+                        continue
+                    uuid_value = stmt.value
+                    record_value = body[index + 1].value
+                    restored = ast.parse(_MIGRATION_RECEIVE_WRITES).body
+
+                    class _Fill(ast.NodeTransformer):
+                        def visit_Name(self, name):
+                            if name.id == "MIGRATED_UUID":
+                                return uuid_value
+                            if name.id == "PENDING_RECORD":
+                                return record_value
+                            return name
+
+                    body[index:index + 2] = [
+                        _Fill().visit(stmt) for stmt in restored
+                    ]
+                    break
+            return node
+
+    return _Restore().visit(method)
 
 
 def load_worker_methods(
@@ -541,9 +735,15 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
         if node.name == "_make_boundary_decision_request":
             del args[-1]
         method.body = _ContextToWorker().visit(method).body
+        outcome = OUTCOME_METHODS.get(node.name)
+        if outcome is not None:
+            method = _OutcomeToWorkerWrites(outcome).visit(method)
+        if node.name == "_execute_single_kv_migration":
+            method = _restore_migration_receive_writes(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
         if worker_method is not None:
             method.args = copy.deepcopy(worker_method.args)
+        ast.fix_missing_locations(method)
         return method
     del args[1]
     rebinds = [

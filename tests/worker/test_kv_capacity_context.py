@@ -21,7 +21,9 @@ from batchgen.worker.kv_manager import (
     KVStats,
     PageTableCapacityRequest,
 )
+from batchgen.worker.kv_migration_types import MigrationOp
 from tests.kv_capacity_source import (
+    D6_3_METHODS,
     METHODS,
     engine_method_names,
     load_kv_capacity,
@@ -97,10 +99,31 @@ def test_converted_methods_have_no_worker_or_rebinding(name):
             if isinstance(n, ast.Name) and n.id == "self":
                 assert isinstance(n.ctx, ast.Load), ast.unparse(stmt)
                 assert id(n) in engine_calls, ast.unparse(stmt)
-    assert not any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.GeneratorExp))
+    # The seam is a plain function: it never yields, and it never hands a
+    # lazy generator across the boundary. A generator expression consumed on
+    # the spot by a reduction builtin is arithmetic the verbatim move carried
+    # with it (`sum(m.pages for m in migrations)`), not seam plumbing, so it
+    # is allowed exactly there and nowhere else.
+    assert not any(isinstance(n, (ast.Yield, ast.YieldFrom))
                    for n in ast.walk(node))
+    reduced = {
+        id(arg) for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id in {"sum", "any", "all", "min", "max",
+                             "sorted", "tuple", "list", "set", "dict"}
+        for arg in call.args
+    }
+    assert not [ast.unparse(n) for n in ast.walk(node)
+                if isinstance(n, ast.GeneratorExp) and id(n) not in reduced]
     for arg in node.args.kwonlyargs:
         assert "Callable" in ast.unparse(arg.annotation)
+
+
+def test_the_guard_covers_every_method_this_stage_converted():
+    """D6.3's names are in the guarded set, and still define this engine."""
+    assert D6_3_METHODS <= METHODS
+    assert D6_3_METHODS <= engine_method_names()
 
 
 def test_frozen_contexts_and_exact_outcome_fields():
@@ -115,6 +138,13 @@ def test_frozen_contexts_and_exact_outcome_fields():
         "DeploymentVerifyOutcome": {
             "model_context_length", "engine_config_max_model_len",
             "_deployment_length_verified",
+        },
+        "WatermarkTriggerOutcome": {
+            "_host_kv_page_stats", "_watermark_check_counter",
+        },
+        "MigrationPlanOutcome": {"_logged_migration_skip_tp"},
+        "KVMigrationReceiveOutcome": {
+            "_migrated_sequences", "_pending_migrated_query_book",
         },
     }
     for name, cls in ns.items():
@@ -410,16 +440,21 @@ def test_region_assertions(name, state, error):
         assert getattr(engine, name)(ctx, "phase") is None
 
 
-def load_delegators(monkeypatch, ns):
-    """Compile the actual worker class with only the delegators under test."""
+def load_delegators(monkeypatch, ns, extra=()):
+    """Compile the actual worker class with only the delegators under test.
+
+    ``extra`` names worker-owned helpers a delegator calls (its context
+    builders); they are the worker's own methods, not delegated bodies.
+    """
     module = ModuleType("batchgen.worker.kv_capacity_engine")
     module.__dict__.update(ns)
     monkeypatch.setitem(sys.modules, "batchgen.worker.kv_capacity_engine", module)
     tree = ast.parse(WORKER_SOURCE.read_text())
     cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    wanted = METHODS | set(extra)
     cls.body = [node for node in cls.body
-                if isinstance(node, ast.FunctionDef) and node.name in METHODS]
+                if isinstance(node, ast.FunctionDef) and node.name in wanted]
     cls.bases, cls.decorator_list = [], []
     code = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls], type_ignores=[])
     namespace = {}
@@ -922,3 +957,987 @@ def test_delegator_publishes_the_deployment_length_in_the_old_order(monkeypatch)
     assert worker.model_context_length == 128
     assert worker.engine_config.Basic_Config.max_model_len == 128
     assert worker._deployment_length_verified is True
+
+
+# ---- D6.3: the host-KV watermark, host capacity and KV migration -----------
+
+
+def d63(**extra):
+    """The engine with the collaborators the D6.3 bodies name at module scope."""
+    events = []
+    namespace = {
+        "logging": SimpleNamespace(
+            info=lambda line: events.append(("info", line)),
+            debug=lambda line: events.append(("debug", line)),
+            error=lambda line: events.append(("error", line)),
+        ),
+        # The migration transfer tests run the single-region branch; the dual
+        # coordinator's own split is covered by the D6.2 health-line tests.
+        "DualHostKVCoordinator": type("NoDual", (), {}),
+    }
+    namespace.update(extra)
+    ns = load_kv_capacity(namespace)
+    return ns, ns["KVCapacityEngine"](), events
+
+
+def recording_pool(*, queued=False, evicted=False, by_status=()):
+    """A sequence pool that records which question it was asked."""
+    asked = []
+    return SimpleNamespace(
+        asked=asked,
+        has_queueing=lambda: asked.append("queueing") or queued,
+        has_evicted=lambda: asked.append("evicted") or evicted,
+        get_sequences_by_status=(
+            lambda status: asked.append(("status", status)) or list(by_status)
+        ),
+    )
+
+
+def watermark_context(ns, **changes):
+    values = dict(
+        rank=0, local_rank=0, world_size=1, enable_decode_preemption=True,
+        enable_host_kv_eviction=False, host_kv_watermark=70,
+        pool=recording_pool(), _watermark_check_counter=None,
+    )
+    return ns["HostKVWatermarkContext"](**(values | changes))
+
+
+def test_watermark_request_is_the_declared_snapshot_and_stays_lazy():
+    ns, engine, _ = d63()
+    pool = recording_pool(queued=True, evicted=True)
+    ctx = watermark_context(ns, pool=pool, host_kv_watermark=65)
+    request = engine._make_watermark_trigger_request(ctx, [{"node_id": 0}])
+    assert request.node_stats == ({"node_id": 0},)
+    assert request.host_kv_watermark == 65
+    assert request.has_queued is True
+    # The launch flag is the left operand, so a deployment without eviction
+    # never asks the pool whether anything was evicted.
+    assert request.has_evicted is False
+    assert pool.asked == ["queueing"]
+    enabled = watermark_context(
+        ns, pool=recording_pool(queued=True, evicted=True),
+        enable_host_kv_eviction=True,
+    )
+    assert engine._make_watermark_trigger_request(enabled, []).has_evicted is True
+
+
+def credit_context(*, prefix=True, coordinator=None, queued=False,
+                   evicted=False, eviction=False):
+    pool = recording_pool(queued=queued, evicted=evicted)
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=64, decision_interval=1, enable_prefix_cache=prefix,
+            enable_host_kv_eviction=eviction, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(pool=pool, seq_table=None, trajectories=None),
+        gpu_kv=None, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=coordinator, prefix_runtime=None, chunk_sizer=None,
+    ), pool
+
+
+def coordinator_with(pages):
+    asked = []
+    return SimpleNamespace(
+        asked=asked,
+        count_releasable_pages=lambda group: asked.append(group) or pages,
+    )
+
+
+RAW_STATS = {
+    "num_total_pages": 10, "num_used_pages": 8, "num_free_pages": 2,
+    "free_percent": 20,
+}
+
+
+@pytest.mark.parametrize("prefix,pages,queued,eviction,evicted,credited", [
+    (False, 4, True, False, False, False),    # prefix cache off
+    (True, None, True, False, False, False),  # no coordinator on this rank
+    (True, 4, False, False, False, False),    # nothing waiting
+    (True, 4, True, False, False, True),      # queued work waiting
+    (True, 4, False, True, True, True),       # evicted work waiting
+])
+def test_reclaimable_credit_only_when_work_is_waiting(
+    prefix, pages, queued, eviction, evicted, credited,
+):
+    _, engine, _ = d63()
+    coordinator = None if pages is None else coordinator_with(pages)
+    ctx, pool = credit_context(
+        prefix=prefix, coordinator=coordinator, queued=queued,
+        eviction=eviction, evicted=evicted,
+    )
+    result = engine._credit_reclaimable_prefix_pages(ctx, RAW_STATS)
+    if not credited:
+        assert result is RAW_STATS
+        assert coordinator is None or coordinator.asked == []
+    else:
+        assert result["num_free_pages"] == 6
+        assert result["num_used_pages"] == 4
+        assert result["num_reclaimable_prefix_pages"] == 4
+        assert result["free_percent"] == 60
+        assert coordinator.asked == [0]
+    # The eviction flag is the right operand of the waiting test, so the pool
+    # is asked about eviction only on a deployment that evicts.
+    if prefix and coordinator is not None:
+        assert ("evicted" in pool.asked) is eviction
+
+
+def due_context(rows, sequences, *, world_size=1):
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=world_size, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=64, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(get_sequence=sequences.get),
+            seq_table=SimpleNamespace(local_to_uuid=rows),
+            trajectories=None,
+        ),
+        gpu_kv=None, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+    )
+
+
+def row(*, capacity, context):
+    return SimpleNamespace(
+        host_token_capacity=capacity, current_context_length=context,
+    )
+
+
+def test_host_capacity_due_local_reads_the_rows_of_the_declared_table():
+    _, engine, _ = d63()
+    seen = []
+    sequences = {"a": row(capacity=128, context=64), "b": row(capacity=64, context=64)}
+    ctx = due_context({0: "a", 2: "b"}, sequences)
+    completed = lambda seq: seen.append(seq) or False
+    # Row 1 is unbound and row 3 names a sequence the pool dropped: neither
+    # reaches the completion predicate or the capacity test.
+    assert engine._host_capacity_due_local(
+        ctx, [1, 0], _is_sequence_completed=completed,
+    ) is False
+    assert seen == [sequences["a"]]
+    assert engine._host_capacity_due_local(
+        ctx, [0, 2], _is_sequence_completed=completed,
+    ) is True
+    assert engine._host_capacity_due_local(
+        ctx, [2], _is_sequence_completed=lambda seq: True,
+    ) is False
+
+
+def test_host_capacity_due_all_ranks_reduces_the_local_verdict_with_max():
+    collectives = []
+    ns, engine, _ = d63(dist=SimpleNamespace(
+        all_reduce=lambda tensor, op: collectives.append(
+            ("all_reduce", op, int(tensor[0].item()))
+        ) or tensor.fill_(1),
+        ReduceOp=SimpleNamespace(MAX="MAX"),
+    ), torch=torch)
+    sequences = {"a": row(capacity=128, context=64)}
+    single = due_context({0: "a"}, sequences, world_size=1)
+    assert engine._host_capacity_due_all_ranks(
+        single, [0], _is_sequence_completed=lambda seq: False,
+    ) is False
+    # A single-rank deployment answers locally: no collective at all.
+    assert collectives == []
+    many = due_context({0: "a"}, sequences, world_size=4)
+    assert engine._host_capacity_due_all_ranks(
+        many, [0], _is_sequence_completed=lambda seq: False,
+    ) is True
+    assert collectives == [("all_reduce", "MAX", 0)]
+
+
+def gathering_dist(payloads):
+    """``all_gather_object`` that fills the out list with ``payloads``."""
+    calls = []
+
+    def all_gather_object(out, local, group=None):
+        calls.append(local)
+        for index, value in enumerate(payloads):
+            out[index] = value
+
+    return SimpleNamespace(all_gather_object=all_gather_object), calls
+
+
+NODE_STATS = {
+    "node_id": 0, "free_percent": 90, "num_used_pages": 1,
+    "num_total_pages": 10, "num_free_pages": 9,
+}
+
+
+def test_watermark_trigger_without_preemption_reaches_no_collective():
+    ns, engine, events = d63(dist=SimpleNamespace(
+        all_gather_object=lambda out, local: pytest.fail("unexpected gather"),
+    ))
+    ctx = watermark_context(ns, enable_decode_preemption=False)
+    assert engine._check_host_kv_watermark_trigger(
+        ctx,
+        _get_host_kv_utilization=lambda: pytest.fail("unexpected stats read"),
+        _credit_reclaimable_prefix_pages=lambda stats: stats,
+    ) == (False, ns["WatermarkTriggerOutcome"]())
+    assert events == []
+
+
+def test_watermark_trigger_on_rank_zero_returns_only_the_page_stats():
+    distributed, gathered = gathering_dist([NODE_STATS])
+    ns, engine, events = d63(dist=distributed)
+    pool = recording_pool(queued=True, by_status=("q1", "q2"))
+    ctx = watermark_context(ns, pool=pool)
+    order = []
+    should_trigger, outcome = engine._check_host_kv_watermark_trigger(
+        ctx,
+        _get_host_kv_utilization=lambda: order.append("stats") or dict(NODE_STATS),
+        _credit_reclaimable_prefix_pages=(
+            lambda stats: order.append("credit") or stats
+        ),
+    )
+    # The node leader reads its stats and credits them BEFORE the gather.
+    assert order == ["stats", "credit"]
+    assert gathered == [NODE_STATS]
+    assert should_trigger is True
+    assert outcome._host_kv_page_stats == {
+        'used': 1, 'total': 10, 'free_percent': 90, 'num_nodes': 1,
+    }
+    # Rank 0 never touches the follower counter.
+    assert outcome._watermark_check_counter is ns["GPU_KV_UNCHANGED"]
+    assert [kind for kind, _ in events] == ["info", "info"]
+    assert ("status", SequenceStatus.QUEUEING) in pool.asked
+
+
+def test_watermark_trigger_on_a_follower_only_advances_its_counter():
+    distributed, _ = gathering_dist([NODE_STATS])
+    ns, engine, events = d63(dist=distributed)
+    ctx = watermark_context(ns, rank=1, local_rank=1, pool=recording_pool(queued=True))
+    _, outcome = engine._check_host_kv_watermark_trigger(
+        ctx,
+        _get_host_kv_utilization=lambda: pytest.fail("a follower reports nothing"),
+        _credit_reclaimable_prefix_pages=lambda stats: stats,
+    )
+    # An absent counter starts at one, exactly as the pre-move hasattr did.
+    assert outcome._watermark_check_counter == 1
+    assert outcome._host_kv_page_stats is ns["GPU_KV_UNCHANGED"]
+    assert events == []
+    ninth = replace(ctx, _watermark_check_counter=9)
+    _, outcome = engine._check_host_kv_watermark_trigger(
+        ninth,
+        _get_host_kv_utilization=lambda: pytest.fail("a follower reports nothing"),
+        _credit_reclaimable_prefix_pages=lambda stats: stats,
+    )
+    assert outcome._watermark_check_counter == 10
+    assert [kind for kind, _ in events] == ["debug"]
+
+
+def test_watermark_trigger_with_no_node_reporting_writes_nothing():
+    distributed, _ = gathering_dist([None])
+    ns, engine, _ = d63(dist=distributed)
+    ctx = watermark_context(ns, local_rank=1)
+    assert engine._check_host_kv_watermark_trigger(
+        ctx,
+        _get_host_kv_utilization=lambda: pytest.fail("a follower reports nothing"),
+        _credit_reclaimable_prefix_pages=lambda stats: stats,
+    ) == (False, ns["WatermarkTriggerOutcome"]())
+
+
+def migration_context(*, rank=0, local_rank=0, world_size=4,
+                      local_world_size=2, sequences=None, by_status=None,
+                      seq_table=None, trajectories=None, gpu_resident=None,
+                      host_view=None, host_view_aux=None, core_engine=None):
+    sequences = sequences or {}
+    by_status = by_status or {}
+    pool = SimpleNamespace(
+        get_sequence=sequences.get,
+        get_sequences_for_rank_with_status=(
+            lambda rank, status: list(by_status.get((rank, status), ()))
+        ),
+        assign_rank=lambda uuid, new_rank: sequences[uuid].__setattr__(
+            "assigned_rank", new_rank
+        ),
+    )
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=rank, world_size=world_size, local_rank=local_rank,
+            local_world_size=local_world_size,
+            rank_ctx=SimpleNamespace(node_id=rank // max(1, local_world_size)),
+            attn_tp_size=1, device="cpu", page_size=64, decision_interval=1,
+            enable_prefix_cache=False, enable_host_kv_eviction=False,
+            host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=pool, seq_table=seq_table, trajectories=trajectories,
+        ),
+        gpu_kv=None, host_view=host_view, host_view_aux=host_view_aux,
+        core_engine=core_engine, gpu_resident=gpu_resident,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+    )
+
+
+def candidate(uuid, *, rank, idx, budget=512, pages=4):
+    return SimpleNamespace(
+        uuid=uuid, assigned_rank=rank, global_idx=idx, kv_token_budget=budget,
+        host_pages_allocated=pages, prompt_length=2, decoded_length=1,
+    )
+
+
+def test_migration_plan_request_enumerates_both_statuses_of_every_rank():
+    _, engine, _ = d63()
+    sequences = {
+        "a": candidate("a", rank=0, idx=0), "b": candidate("b", rank=1, idx=1),
+        "gone": candidate("gone", rank=1, idx=9),
+    }
+    del sequences["gone"]
+    ctx = migration_context(
+        world_size=2, local_world_size=2, sequences=sequences,
+        by_status={
+            (0, SequenceStatus.PREFILLED): ["a"],
+            (1, SequenceStatus.ON_HOLD): ["b", "gone"],
+        },
+    )
+    request = engine._make_migration_plan_request(ctx, {0: NODE_STATS})
+    assert request.node_stats == {0: NODE_STATS}
+    assert [c.uuid for c in request.candidates] == ["a", "b"]
+    assert (request.world_size, request.num_gpus_per_node) == (2, 2)
+
+
+def test_plan_kv_migration_skips_a_tp_group_and_latches_the_log_once():
+    ns, engine, events = d63(dist=SimpleNamespace(
+        all_gather_object=lambda out, local: pytest.fail("unexpected gather"),
+    ))
+    ctx = migration_context()
+    helpers = dict(
+        _decode_attn_tp_size=lambda: 8,
+        _get_host_kv_utilization=lambda: pytest.fail("unexpected stats read"),
+    )
+    migrations, outcome = engine._plan_kv_migration(ctx, False, **helpers)
+    assert migrations == []
+    assert outcome._logged_migration_skip_tp is True
+    assert [kind for kind, _ in events] == ["info"]
+    assert "attn_tp_size=8" in events[0][1]
+    # Already latched, or not rank zero: the same safe plan, no second line.
+    for latched, rank in ((True, 0), (False, 1)):
+        again = migration_context(rank=rank)
+        migrations, outcome = engine._plan_kv_migration(again, latched, **helpers)
+        assert migrations == []
+        assert outcome._logged_migration_skip_tp is ns["GPU_KV_UNCHANGED"]
+    assert len(events) == 1
+
+
+def test_plan_kv_migration_on_one_node_plans_nothing_and_latches_nothing():
+    distributed, gathered = gathering_dist([dict(NODE_STATS), None])
+    ns, engine, events = d63(dist=distributed)
+    ctx = migration_context(world_size=2)
+    migrations, outcome = engine._plan_kv_migration(
+        ctx, False,
+        _decode_attn_tp_size=lambda: 1,
+        _get_host_kv_utilization=lambda: dict(NODE_STATS),
+    )
+    assert migrations == []
+    assert outcome._logged_migration_skip_tp is ns["GPU_KV_UNCHANGED"]
+    assert gathered == [NODE_STATS]
+    assert events == [("info", "MIGRATION: Single node detected, skipping rebalancing")]
+
+
+def test_plan_kv_migration_returns_the_planner_decision_verbatim():
+    second = {**NODE_STATS, "node_id": 1}
+    distributed, gathered = gathering_dist([dict(NODE_STATS), second])
+    planned = [MigrationOp("a" * 12, from_rank=0, to_rank=2, pages=3, host_pages=3)]
+    seen = []
+    ns, engine, events = d63(
+        dist=distributed,
+        KVCacheManager=SimpleNamespace(
+            plan_kv_migration=lambda req: seen.append(req) or planned,
+        ),
+    )
+    ctx = migration_context(world_size=2, local_world_size=1)
+    migrations, outcome = engine._plan_kv_migration(
+        ctx, False,
+        _decode_attn_tp_size=lambda: 1,
+        _get_host_kv_utilization=lambda: dict(NODE_STATS),
+    )
+    assert migrations is planned
+    assert outcome._logged_migration_skip_tp is ns["GPU_KV_UNCHANGED"]
+    # The request is built from the SAME context the delegator passed in.
+    assert seen[0].node_stats == {0: NODE_STATS, 1: second}
+    assert gathered == [NODE_STATS]
+    assert [line for kind, line in events if "Planned" in line]
+
+
+def recording_dist(**extra):
+    """A distributed stub that records barriers in call order."""
+    order = []
+    stub = SimpleNamespace(barrier=lambda *a, **k: order.append("barrier"))
+    for name, value in extra.items():
+        setattr(stub, name, value)
+    return stub, order
+
+
+def test_execute_migrations_keeps_the_group_barrier_round_order():
+    distributed, order = recording_dist()
+    ns, engine, _ = d63(dist=distributed)
+    first = MigrationOp("aaaaaaaaaaaa", from_rank=0, to_rank=1, pages=1, host_pages=1)
+    second = MigrationOp("bbbbbbbbbbbb", from_rank=0, to_rank=2, pages=1, host_pages=1)
+    sequences = {
+        "aaaaaaaaaaaa": candidate("aaaaaaaaaaaa", rank=0, idx=0),
+        "bbbbbbbbbbbb": candidate("bbbbbbbbbbbb", rank=0, idx=1),
+    }
+    for seq in sequences.values():
+        seq.status = "PREFILLED"
+    ctx = migration_context(sequences=sequences)
+    helpers = dict(
+        _get_or_create_gloo_group=lambda: order.append("group"),
+        _execute_single_kv_migration=(
+            lambda *, uuid, from_rank, to_rank: order.append(("migrate", uuid[:4]))
+        ),
+    )
+    # An empty plan is not a collective: no group, no barrier.
+    assert engine._execute_kv_migrations_parallel(ctx, [], **helpers) is None
+    assert order == []
+    assert engine._execute_kv_migrations_parallel(
+        ctx, [first, second], **helpers,
+    ) is None
+    # The group comes first, then one barrier, then one barrier per round, and
+    # rank 0 shares a rank with both migrations so the rounds are serial.
+    assert order == [
+        "group", "barrier",
+        ("migrate", "aaaa"), "barrier",
+        ("migrate", "bbbb"), "barrier",
+    ]
+
+
+def test_execute_migrations_still_barriers_when_the_sequence_is_gone():
+    distributed, order = recording_dist()
+    ns, engine, events = d63(dist=distributed)
+    op = MigrationOp("cccccccccccc", from_rank=0, to_rank=1, pages=1, host_pages=1)
+    ctx = migration_context(sequences={})
+    assert engine._execute_kv_migrations_parallel(
+        ctx, [op],
+        _get_or_create_gloo_group=lambda: order.append("group"),
+        _execute_single_kv_migration=lambda **kw: pytest.fail("no sequence"),
+    ) is None
+    assert order == ["group", "barrier", "barrier"]
+    assert [kind for kind, _ in events if kind == "error"] == ["error"]
+
+
+def test_a_rank_outside_the_round_reaches_the_same_barriers():
+    distributed, order = recording_dist()
+    _, engine, _ = d63(dist=distributed)
+    op = MigrationOp("dddddddddddd", from_rank=1, to_rank=2, pages=1, host_pages=1)
+    ctx = migration_context(rank=3, local_rank=1, sequences={})
+    assert engine._execute_kv_migrations_parallel(
+        ctx, [op],
+        _get_or_create_gloo_group=lambda: order.append("group"),
+        _execute_single_kv_migration=lambda **kw: pytest.fail("not this rank"),
+    ) is None
+    assert order == ["group", "barrier", "barrier"]
+
+
+def test_grouping_uses_the_declared_node_width():
+    _, engine, _ = d63()
+    ops = [
+        MigrationOp("a", from_rank=0, to_rank=2, pages=1, host_pages=1),
+        MigrationOp("b", from_rank=1, to_rank=3, pages=1, host_pages=1),
+        MigrationOp("c", from_rank=0, to_rank=3, pages=1, host_pages=1),
+    ]
+    # The declared node width decides which sources share a staging buffer:
+    # at two GPUs per node ranks 0 and 1 are one source node and serialize,
+    # at one GPU per node they are two and go in the same round.
+    assert [[op.uuid for op in group] for group in
+            engine._group_migrations_for_parallel_execution(
+                migration_context(local_world_size=2), ops)] == [["a"], ["b"], ["c"]]
+    rounds = engine._group_migrations_for_parallel_execution(
+        migration_context(local_world_size=1), ops,
+    )
+    assert [[op.uuid for op in group] for group in rounds] == [["a", "b"], ["c"]]
+    assert sum(len(group) for group in rounds) == len(ops)
+
+
+def migration_views(*, pages=1, tokens=4):
+    """One host-KV region holding a page of placeholder KV."""
+    written = []
+    released = []
+    registered = []
+    return SimpleNamespace(
+        written=written, released=released, registered=registered,
+        read_sequence_kv_to_cpu=lambda idx: (
+            torch.zeros((pages, tokens), dtype=torch.float32), torch.empty(0)
+        ),
+        write_sequence_kv_from_cpu=(
+            lambda idx, k, v: written.append((idx, tuple(k.shape), v))
+        ),
+        register_sequences=registered.append,
+        allocate_pages_for_sequences=registered.append,
+        release_sequence_pages=released.append,
+    )
+
+
+def migration_book(uuid, *, slot=0, present=True):
+    restored = []
+    return SimpleNamespace(
+        restored=restored,
+        has_sequence=lambda name: present and name == uuid,
+        slot_for=lambda name: slot,
+        turns_payload=lambda s: torch.zeros((0, 6), dtype=torch.int64),
+        restore=lambda s, tokens, **kw: restored.append((s, tokens.tolist(), kw)),
+    )
+
+
+def test_single_migration_on_the_source_sends_then_releases_and_writes_nothing():
+    order = []
+    distributed = SimpleNamespace(
+        send=lambda tensor, dst, group=None: order.append(("send", dst, tensor.numel())),
+        recv=lambda tensor, src, group=None: pytest.fail("the source never receives"),
+    )
+    ns, engine, _ = d63(dist=distributed, torch=torch)
+    uuid = "eeeeeeeeeeee"
+    seq = candidate(uuid, rank=0, idx=5, pages=1)
+    view = migration_views()
+    book = migration_book(uuid)
+    ctx = migration_context(
+        sequences={uuid: seq}, host_view=view,
+        trajectories=SimpleNamespace(trajectory_book=book),
+    )
+    engine._release_prefix_cache_attachments = (
+        lambda context, ids: order.append(("detach", list(ids)))
+    )
+    assert engine._execute_single_kv_migration(
+        ctx, uuid, 0, 1,
+        _trajectory_tokens=lambda sequence, dtype: torch.zeros(3, dtype=dtype),
+        _trajectory_slot=lambda sequence: 0,
+        _get_or_create_gloo_group=lambda: order.append("group") or "gloo",
+    ) is None
+    # KV first, then the header, the trajectory and the turns; the pages are
+    # released only after the whole payload left, and the attachments after.
+    assert order == [
+        "group", ("send", 1, 4), ("send", 1, 5), ("send", 1, 3), ("send", 1, 0),
+        ("detach", [5]),
+    ]
+    assert view.released == [[5]]
+
+
+def test_single_migration_on_the_destination_returns_both_staging_writes():
+    order = []
+    header = [1, 3, 2, 1, 0]
+
+    def recv(tensor, src, group=None):
+        order.append(("recv", src, tuple(tensor.shape)))
+        if tensor.dtype == torch.int64 and tensor.numel() == 5:
+            tensor.copy_(torch.tensor(header, dtype=torch.int64))
+        elif tensor.dtype == torch.int32:
+            tensor.copy_(torch.tensor([7, 8, 9], dtype=torch.int32))
+
+    ns, engine, _ = d63(
+        dist=SimpleNamespace(
+            send=lambda tensor, dst, group=None: pytest.fail("the dest never sends"),
+            recv=recv,
+        ),
+        torch=torch,
+    )
+    uuid = "ffffffffffff"
+    seq = candidate(uuid, rank=0, idx=6, pages=1)
+    seq._buffer_slot = -1
+    view = migration_views()
+    book = migration_book(uuid, slot=4)
+    ctx = migration_context(
+        rank=1, sequences={uuid: seq}, host_view=view,
+        trajectories=SimpleNamespace(trajectory_book=book),
+    )
+    outcome = engine._execute_single_kv_migration(
+        ctx, uuid, 0, 1,
+        _trajectory_tokens=lambda sequence, dtype: pytest.fail("dest reads nothing"),
+        _trajectory_slot=lambda sequence: pytest.fail("dest reads nothing"),
+        _get_or_create_gloo_group=lambda: order.append("group") or "gloo",
+    )
+    assert view.registered == [[6], [(6, 64)]]
+    assert book.restored == [(4, [7, 8, 9], {
+        "prompt_length": 2, "decoded_length": 1, "turns": [],
+    })]
+    assert seq._buffer_slot == 4
+    # The outcome carries exactly what each write added, nothing more.
+    assert outcome._migrated_sequences == uuid
+    assert outcome._pending_migrated_query_book["slot"] == 4
+    assert outcome._pending_migrated_query_book["restored"] is True
+    assert outcome._pending_migrated_query_book["prompt_length"] == 2
+    assert outcome._pending_migrated_query_book["trajectory"].tolist() == [7, 8, 9]
+
+
+def test_single_migration_refuses_a_destination_without_a_reservation():
+    def recv(tensor, src, group=None):
+        if tensor.dtype == torch.int64 and tensor.numel() == 5:
+            tensor.copy_(torch.tensor([1, 0, 0, 0, 0], dtype=torch.int64))
+
+    ns, engine, _ = d63(
+        dist=SimpleNamespace(send=lambda **kw: None, recv=recv), torch=torch,
+    )
+    uuid = "gggggggggggg"
+    seq = candidate(uuid, rank=0, idx=7, pages=1)
+    ctx = migration_context(
+        rank=1, sequences={uuid: seq}, host_view=migration_views(),
+        trajectories=SimpleNamespace(
+            trajectory_book=migration_book(uuid, present=False),
+        ),
+    )
+    with pytest.raises(Exception, match="no admission reservation"):
+        engine._execute_single_kv_migration(
+            ctx, uuid, 0, 1,
+            _trajectory_tokens=lambda sequence, dtype: None,
+            _trajectory_slot=lambda sequence: 0,
+            _get_or_create_gloo_group=lambda: "gloo",
+        )
+
+
+@pytest.mark.parametrize("pages,message", [
+    (0, "no host pages allocated"),
+])
+def test_single_migration_refuses_an_unallocated_sequence(pages, message):
+    ns, engine, events = d63()
+    uuid = "hhhhhhhhhhhh"
+    ctx = migration_context(sequences={uuid: candidate(uuid, rank=0, idx=8, pages=pages)})
+    assert engine._execute_single_kv_migration(
+        ctx, uuid, 0, 1,
+        _trajectory_tokens=lambda sequence, dtype: pytest.fail("no transfer"),
+        _trajectory_slot=lambda sequence: pytest.fail("no transfer"),
+        _get_or_create_gloo_group=lambda: pytest.fail("no group"),
+    ) is None
+    assert [line for kind, line in events if message in line]
+    missing = migration_context(sequences={})
+    assert engine._execute_single_kv_migration(
+        missing, uuid, 0, 1,
+        _trajectory_tokens=lambda sequence, dtype: pytest.fail("no transfer"),
+        _trajectory_slot=lambda sequence: pytest.fail("no transfer"),
+        _get_or_create_gloo_group=lambda: pytest.fail("no group"),
+    ) is None
+    assert [line for kind, line in events if "sequence not found" in line]
+
+
+def rebalance_sequence(uuid, *, rank):
+    commits = []
+    return SimpleNamespace(
+        uuid=uuid, assigned_rank=rank, global_idx=0, kv_token_budget=512,
+        host_pages_allocated=1, commits=commits, prompt_length=1,
+        input_ids=None, decoded_tokens=None,
+        log_event=lambda *args, **kwargs: None,
+        commit_host_reservation=(
+            lambda pages, tokens, owned: commits.append((pages, tokens, owned))
+        ),
+        rebase_decoded_length=lambda value: None,
+    )
+
+
+def test_rebalance_without_preemption_plans_nothing():
+    ns, engine, events = d63()
+    assert engine._rebalance_host_kv(
+        migration_context(), False, {}, None,
+        _plan_kv_migration=lambda: pytest.fail("no plan without preemption"),
+        _execute_kv_migrations_parallel=lambda ops: pytest.fail("no transfer"),
+        _sync_sequence_metadata=lambda uuids: pytest.fail("no sync"),
+        _bump_decode_row_epoch=lambda: pytest.fail("no epoch bump"),
+        _get_host_kv_utilization=lambda: pytest.fail("no stats read"),
+    ) is None
+    assert events == []
+
+
+def test_rebalance_with_an_empty_plan_reaches_no_barrier():
+    distributed, order = recording_dist()
+    ns, engine, _ = d63(dist=distributed)
+    assert engine._rebalance_host_kv(
+        migration_context(), True, {}, None,
+        _plan_kv_migration=lambda: order.append("plan") or [],
+        _execute_kv_migrations_parallel=lambda ops: pytest.fail("no transfer"),
+        _sync_sequence_metadata=lambda uuids: pytest.fail("no sync"),
+        _bump_decode_row_epoch=lambda: pytest.fail("no epoch bump"),
+        _get_host_kv_utilization=lambda: pytest.fail("no stats read"),
+    ) is None
+    assert order == ["plan"]
+
+
+def test_rebalance_keeps_the_plan_execute_sync_barrier_order_on_the_source():
+    distributed, order = recording_dist()
+    ns, engine, _ = d63(dist=distributed)
+    uuid = "iiiiiiiiiiii"
+    seq = rebalance_sequence(uuid, rank=0)
+    op = MigrationOp(uuid, from_rank=0, to_rank=1, pages=2, host_pages=2)
+    table = SimpleNamespace(
+        unbind=lambda name: order.append(("unbind", name)) or 5,
+        local_of=lambda name: 5,
+        bind=lambda name: pytest.fail("the source never binds"),
+    )
+    resident = SimpleNamespace(drop=lambda name: order.append(("drop", name)))
+    book = {5: "entry"}
+    ctx = migration_context(
+        rank=0, sequences={uuid: seq}, seq_table=table, gpu_resident=resident,
+        trajectories=SimpleNamespace(trajectory_book=None),
+    )
+    assert engine._rebalance_host_kv(
+        ctx, True, book, None,
+        _plan_kv_migration=lambda: order.append("plan") or [op],
+        _execute_kv_migrations_parallel=lambda ops: order.append(("execute", len(ops))),
+        _sync_sequence_metadata=lambda uuids: order.append(("sync", list(uuids))),
+        _bump_decode_row_epoch=lambda: order.append("epoch"),
+        _get_host_kv_utilization=lambda: order.append("stats") or dict(NODE_STATS),
+    ) is None
+    assert order == [
+        "plan", ("execute", 1),
+        "barrier", ("sync", [uuid]), "barrier",
+        ("unbind", uuid), "epoch", ("drop", uuid),
+        "barrier", "stats",
+    ]
+    # Ownership and the host reservation are committed before the barriers.
+    assert seq.assigned_rank == 1
+    assert seq.commits == [(2, 2 * 64, 2)]
+    assert book == {}
+
+
+def test_rebalance_on_the_destination_consumes_the_staging_entry():
+    distributed, order = recording_dist()
+    ns, engine, events = d63(dist=distributed)
+    uuid = "jjjjjjjjjjjj"
+    seq = rebalance_sequence(uuid, rank=0)
+    op = MigrationOp(uuid, from_rank=0, to_rank=1, pages=1, host_pages=1)
+    table = SimpleNamespace(
+        unbind=lambda name: pytest.fail("the destination never unbinds"),
+        local_of=lambda name: 3,
+        bind=lambda name: order.append(("bind", name)) or 3,
+    )
+    book = {}
+    pending = {uuid: {
+        'trajectory': torch.tensor([1, 2, 3], dtype=torch.int32),
+        'prompt_length': 2, 'decoded_length': 1, 'turns': (),
+        'restored': True, 'slot': 3, 'kv_token_budget': 512,
+    }}
+    trajectory_book = migration_book(uuid, slot=3)
+    ctx = migration_context(
+        rank=1, sequences={uuid: seq}, seq_table=table,
+        gpu_resident=SimpleNamespace(drop=lambda name: pytest.fail("no drop")),
+        trajectories=SimpleNamespace(trajectory_book=trajectory_book),
+    )
+    assert engine._rebalance_host_kv(
+        ctx, True, book, pending,
+        _plan_kv_migration=lambda: [op],
+        _execute_kv_migrations_parallel=lambda ops: order.append("execute"),
+        _sync_sequence_metadata=lambda uuids: order.append("sync"),
+        _bump_decode_row_epoch=lambda: order.append("epoch"),
+        _get_host_kv_utilization=lambda: pytest.fail("a follower logs nothing"),
+    ) is None
+    assert order == [
+        "execute", "barrier", "sync", "barrier",
+        ("bind", uuid), "epoch", "barrier",
+    ]
+    # The staged record is consumed exactly once, and an already-restored
+    # payload is not restored a second time.
+    assert pending == {}
+    assert trajectory_book.restored == []
+    assert book[3]
+    missing = [line for kind, line in events if "No pending query_book" in line]
+    assert missing == []
+
+
+def test_rebalance_without_a_staging_map_logs_the_missing_payload():
+    distributed, _ = recording_dist()
+    ns, engine, events = d63(dist=distributed)
+    uuid = "kkkkkkkkkkkk"
+    seq = rebalance_sequence(uuid, rank=0)
+    op = MigrationOp(uuid, from_rank=0, to_rank=1, pages=1, host_pages=1)
+    ctx = migration_context(
+        rank=1, sequences={uuid: seq},
+        seq_table=SimpleNamespace(bind=lambda name: 3, local_of=lambda name: 3),
+        trajectories=SimpleNamespace(trajectory_book=None),
+    )
+    assert engine._rebalance_host_kv(
+        ctx, True, {}, None,
+        _plan_kv_migration=lambda: [op],
+        _execute_kv_migrations_parallel=lambda ops: None,
+        _sync_sequence_metadata=lambda uuids: None,
+        _bump_decode_row_epoch=lambda: None,
+        _get_host_kv_utilization=lambda: pytest.fail("a follower logs nothing"),
+    ) is None
+    assert [line for kind, line in events if "No pending query_book" in line]
+
+
+# ---- D6.3 delegators -------------------------------------------------------
+
+
+WATERMARK_HELPERS = ("_host_kv_watermark_context", "_decode_phase_context")
+
+
+def test_delegator_applies_the_watermark_writes_in_the_old_order(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, WATERMARK_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker.rank = worker.local_rank = 0
+    worker.world_size = 1
+    worker.enable_decode_preemption = True
+    worker.enable_host_kv_eviction = False
+    worker.host_kv_watermark = 70
+    worker.global_batch = recording_pool()
+    worker._get_host_kv_utilization = lambda: dict(NODE_STATS)
+    worker._credit_reclaimable_prefix_pages = lambda stats: stats
+    seen = []
+
+    def check(ctx, **helpers):
+        seen.append((ctx, sorted(helpers)))
+        assert not hasattr(worker, "_host_kv_page_stats")
+        return True, ns["WatermarkTriggerOutcome"](
+            _host_kv_page_stats={"used": 1},
+        )
+
+    engine._check_host_kv_watermark_trigger = check
+    assert worker._check_host_kv_watermark_trigger() is True
+    ctx, helpers = seen[0]
+    assert helpers == [
+        "_credit_reclaimable_prefix_pages", "_get_host_kv_utilization",
+    ]
+    # The context carries the launch flags as values and the counter as the
+    # hasattr miss the pre-move code saw.
+    assert ctx.host_kv_watermark == 70
+    assert ctx._watermark_check_counter is None
+    assert ctx.pool is worker.global_batch
+    assert worker._host_kv_page_stats == {"used": 1}
+    # An unchanged field is not bound, so the counter stays absent.
+    assert not hasattr(worker, "_watermark_check_counter")
+    engine._check_host_kv_watermark_trigger = lambda ctx, **kw: (
+        False, ns["WatermarkTriggerOutcome"](_watermark_check_counter=4)
+    )
+    assert worker._check_host_kv_watermark_trigger() is False
+    assert worker._watermark_check_counter == 4
+    assert worker._host_kv_page_stats == {"used": 1}
+
+
+def test_delegator_latches_the_migration_skip_log(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, WATERMARK_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._decode_attn_tp_size = lambda: 8
+    worker._get_host_kv_utilization = lambda: dict(NODE_STATS)
+    planned = [MigrationOp("a", from_rank=0, to_rank=1, pages=1, host_pages=1)]
+    seen = []
+
+    def plan(ctx, latched, **helpers):
+        seen.append((ctx, latched, sorted(helpers)))
+        return planned, ns["MigrationPlanOutcome"](_logged_migration_skip_tp=True)
+
+    engine._plan_kv_migration = plan
+    assert worker._plan_kv_migration() is planned
+    ctx, latched, helpers = seen[0]
+    assert ctx is worker._held_decode_phase_context
+    assert latched is False
+    assert helpers == ["_decode_attn_tp_size", "_get_host_kv_utilization"]
+    assert worker._logged_migration_skip_tp is True
+    # The latch the delegator now reports is the one it bound.
+    engine._plan_kv_migration = lambda ctx, latched, **kw: (
+        [], ns["MigrationPlanOutcome"]()
+    )
+    assert worker._plan_kv_migration() == []
+    assert worker._logged_migration_skip_tp is True
+    engine._plan_kv_migration = plan
+    worker._plan_kv_migration()
+    assert seen[-1][1] is True
+
+
+def test_delegator_adds_the_received_payload_without_replacing_the_stores(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, WATERMARK_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._trajectory_tokens = lambda seq, dtype: None
+    worker._trajectory_slot = lambda seq: 0
+    worker._get_or_create_gloo_group = lambda: "gloo"
+    seen = []
+
+    def execute(ctx, uuid, from_rank, to_rank, **helpers):
+        seen.append((ctx, uuid, from_rank, to_rank, sorted(helpers)))
+        assert not hasattr(worker, "_migrated_sequences")
+        return ns["KVMigrationReceiveOutcome"](uuid, {"slot": 1})
+
+    engine._execute_single_kv_migration = execute
+    assert worker._execute_single_kv_migration("one", 0, 1) is None
+    ctx, uuid, from_rank, to_rank, helpers = seen[0]
+    assert (ctx, uuid, from_rank, to_rank) == (
+        worker._held_decode_phase_context, "one", 0, 1,
+    )
+    assert helpers == [
+        "_get_or_create_gloo_group", "_trajectory_slot", "_trajectory_tokens",
+    ]
+    assert worker._migrated_sequences == {"one"}
+    assert worker._pending_migrated_query_book == {"one": {"slot": 1}}
+    # A second receive ADDS to both stores instead of replacing them.
+    engine._execute_single_kv_migration = lambda *a, **kw: (
+        ns["KVMigrationReceiveOutcome"]("two", {"slot": 2})
+    )
+    assert worker._execute_single_kv_migration("two", 0, 1) is None
+    assert worker._migrated_sequences == {"one", "two"}
+    assert worker._pending_migrated_query_book == {
+        "one": {"slot": 1}, "two": {"slot": 2},
+    }
+    # The source branch writes nothing at all.
+    engine._execute_single_kv_migration = lambda *a, **kw: None
+    assert worker._execute_single_kv_migration("three", 0, 1) is None
+    assert worker._migrated_sequences == {"one", "two"}
+
+
+def test_rebalance_delegator_hands_over_the_worker_owned_containers(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, WATERMARK_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker.enable_decode_preemption = True
+    worker.query_book = {7: "entry"}
+    worker._sync_sequence_metadata = lambda uuids: None
+    worker._bump_decode_row_epoch = lambda: 1
+    worker._get_host_kv_utilization = lambda: dict(NODE_STATS)
+    worker._decode_attn_tp_size = lambda: 1
+    worker._trajectory_tokens = lambda seq, dtype: None
+    worker._trajectory_slot = lambda seq: 0
+    worker._get_or_create_gloo_group = lambda: "gloo"
+    seen = []
+
+    def rebalance(ctx, preemption, book, pending, **helpers):
+        seen.append((ctx, preemption, book, pending, sorted(helpers)))
+        # The receive stages its payload DURING the rebalance, so the map the
+        # engine was handed has to be the live one the receive adds into --
+        # resolving it before the transfers would hand over a map that is
+        # already stale (and, on a worker's first rebalance, absent).
+        engine._execute_single_kv_migration = lambda *a, **kw: (
+            ns["KVMigrationReceiveOutcome"]("one", {"slot": 1})
+        )
+        worker._execute_single_kv_migration("one", 0, 1)
+        assert pending == {"one": {"slot": 1}}
+        assert pending is worker._pending_migrated_query_book
+
+    engine._rebalance_host_kv = rebalance
+    assert worker._rebalance_host_kv() is None
+    ctx, preemption, book, pending, helpers = seen[0]
+    assert ctx is worker._held_decode_phase_context
+    assert preemption is True
+    assert book is worker.query_book
+    assert helpers == [
+        "_bump_decode_row_epoch", "_execute_kv_migrations_parallel",
+        "_get_host_kv_utilization", "_plan_kv_migration",
+        "_sync_sequence_metadata",
+    ]
+    # A later rebalance reuses the same container, never a fresh one.
+    worker._rebalance_host_kv()
+    assert seen[-1][3] is worker._pending_migrated_query_book
+
+
+def test_due_check_delegators_pass_the_completion_predicate(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, WATERMARK_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._is_sequence_completed = lambda seq: False
+    seen = []
+    engine._host_capacity_due_local = (
+        lambda ctx, batch, **helpers: seen.append(("local", ctx, batch, helpers))
+    )
+    engine._host_capacity_due_all_ranks = (
+        lambda ctx, batch, **helpers: seen.append(("all", ctx, batch, helpers))
+    )
+    worker._host_capacity_due_local([1, 2])
+    worker._host_capacity_due_all_ranks([3])
+    assert [row[0] for row in seen] == ["local", "all"]
+    for _, ctx, batch, helpers in seen:
+        assert ctx is worker._held_decode_phase_context
+        assert helpers == {"_is_sequence_completed": worker._is_sequence_completed}
+    assert [row[2] for row in seen] == [[1, 2], [3]]

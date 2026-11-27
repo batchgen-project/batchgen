@@ -4613,116 +4613,183 @@ class BatchGenWorker:
 			worker_view,
 		)
 
+	def _host_kv_watermark_context(self):
+		"""The watermark pair's frozen values; its launch flags are not facts."""
+		from batchgen.worker.kv_capacity_engine import HostKVWatermarkContext
+		return HostKVWatermarkContext(
+			rank=self.rank,
+			local_rank=self.local_rank,
+			world_size=self.world_size,
+			enable_decode_preemption=self.enable_decode_preemption,
+			enable_host_kv_eviction=self.enable_host_kv_eviction,
+			host_kv_watermark=self.host_kv_watermark,
+			pool=self.global_batch,
+			_watermark_check_counter=getattr(
+				self, "_watermark_check_counter", None
+			),
+		)
+
 	def _make_watermark_trigger_request(
 		self, node_stats: List[dict]
 	) -> WatermarkTriggerRequest:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._make_watermark_trigger_request(
-			self,
+			self._host_kv_watermark_context(),
 			node_stats,
 		)
 
 	def _credit_reclaimable_prefix_pages(
 		self, stats: Dict[str, int]
 	) -> Dict[str, int]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._credit_reclaimable_prefix_pages(
-			self,
+			self._decode_phase_context(),
 			stats,
 		)
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._check_host_kv_watermark_trigger(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPU_KV_UNCHANGED
+		should_trigger, outcome = engine._check_host_kv_watermark_trigger(
+			self._host_kv_watermark_context(),
+			_get_host_kv_utilization=self._get_host_kv_utilization,
+			_credit_reclaimable_prefix_pages=self._credit_reclaimable_prefix_pages,
 		)
+		# Each branch of the check writes one of these; the other stays as it
+		# was, which for the counter is "still absent".
+		if outcome._host_kv_page_stats is not GPU_KV_UNCHANGED:
+			self._host_kv_page_stats = outcome._host_kv_page_stats
+		if outcome._watermark_check_counter is not GPU_KV_UNCHANGED:
+			self._watermark_check_counter = outcome._watermark_check_counter
+		return should_trigger
 
 	def _make_migration_plan_request(self, node_stats: dict) -> MigrationPlanRequest:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._make_migration_plan_request(
-			self,
+			self._decode_phase_context(),
 			node_stats,
 		)
 
 	def _plan_kv_migration(self) -> List[MigrationOp]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._plan_kv_migration(
-			self,
+		from batchgen.worker.kv_capacity_engine import GPU_KV_UNCHANGED
+		migrations, outcome = engine._plan_kv_migration(
+			self._decode_phase_context(),
+			getattr(self, '_logged_migration_skip_tp', False),
+			_decode_attn_tp_size=self._decode_attn_tp_size,
+			_get_host_kv_utilization=self._get_host_kv_utilization,
 		)
+		if outcome._logged_migration_skip_tp is not GPU_KV_UNCHANGED:
+			self._logged_migration_skip_tp = outcome._logged_migration_skip_tp
+		return migrations
 
 	def _execute_kv_migrations_parallel(self, migrations: List[MigrationOp]) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._execute_kv_migrations_parallel(
-			self,
+			self._decode_phase_context(),
 			migrations,
+			_get_or_create_gloo_group=self._get_or_create_gloo_group,
+			_execute_single_kv_migration=self._execute_single_kv_migration,
 		)
 
 	def _group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._group_migrations_for_parallel_execution(
-			self,
+			self._decode_phase_context(),
 			migrations,
 		)
 
 	def _execute_single_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
-		return engine._execute_single_kv_migration(
-			self,
+		outcome = engine._execute_single_kv_migration(
+			self._decode_phase_context(),
 			uuid,
 			from_rank,
 			to_rank,
+			_trajectory_tokens=self._trajectory_tokens,
+			_trajectory_slot=self._trajectory_slot,
+			_get_or_create_gloo_group=self._get_or_create_gloo_group,
 		)
+		# Only the destination rank stages a received trajectory; both stores
+		# are created on first use and ADDED to, so the round's entry goes in
+		# without replacing what an earlier round of the same wave left.
+		if outcome is not None:
+			if not hasattr(self, '_pending_migrated_query_book'):
+				self._pending_migrated_query_book = {}
+			if not hasattr(self, '_migrated_sequences'):
+				self._migrated_sequences = set()
+			self._migrated_sequences.add(outcome._migrated_sequences)
+			self._pending_migrated_query_book[outcome._migrated_sequences] = (
+				outcome._pending_migrated_query_book
+			)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
 	def _rebalance_host_kv(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
+		# The migration receive stages its payload into this map DURING the
+		# rebalance, so the container has to exist before the engine runs: the
+		# pre-move code created it on first use inside the receive and found it
+		# with hasattr afterwards. Creating it here gives both halves ONE live
+		# object, and an empty map reads exactly as that hasattr miss did.
+		if not hasattr(self, '_pending_migrated_query_book'):
+			self._pending_migrated_query_book = {}
 		return engine._rebalance_host_kv(
-			self,
+			self._decode_phase_context(),
+			self.enable_decode_preemption,
+			self.query_book,
+			# A worker-owned container passed explicitly, exactly as the
+			# pending KV-append channel reaches _wait_pending_kv_append_tasks.
+			self._pending_migrated_query_book,
+			_plan_kv_migration=self._plan_kv_migration,
+			_execute_kv_migrations_parallel=self._execute_kv_migrations_parallel,
+			_sync_sequence_metadata=self._sync_sequence_metadata,
+			_bump_decode_row_epoch=self._bump_decode_row_epoch,
+			_get_host_kv_utilization=self._get_host_kv_utilization,
 		)
 
 	# ============ UUID/Index Conversion Helpers ============
@@ -5021,27 +5088,29 @@ class BatchGenWorker:
 		)
 
 	def _host_capacity_due_local(self, batch: List[int]) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._host_capacity_due_local(
-			self,
+			self._decode_phase_context(),
 			batch,
+			_is_sequence_completed=self._is_sequence_completed,
 		)
 
 	def _host_capacity_due_all_ranks(self, batch: List[int]) -> bool:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_kv_capacity_engine", None)
 		if engine is None:
 			from batchgen.worker.kv_capacity_engine import KVCapacityEngine
 			engine = KVCapacityEngine()
 			self._kv_capacity_engine = engine
 		return engine._host_capacity_due_all_ranks(
-			self,
+			self._decode_phase_context(),
 			batch,
+			_is_sequence_completed=self._is_sequence_completed,
 		)
 
 	def _prefill_host_reservation_plan(
