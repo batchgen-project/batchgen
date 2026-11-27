@@ -21,11 +21,15 @@ from batchgen.worker.kv_manager import (
     KVStats,
     PageTableCapacityRequest,
 )
+from batchgen.worker.admission.plan import StatusEdge
 from batchgen.worker.kv_migration_types import MigrationOp
+import tests.kv_capacity_source as _kv_capacity_source
 from tests.kv_capacity_source import (
     D6_3_METHODS,
     D6_4_METHODS,
+    D6_5_METHODS,
     METHODS,
+    engine_class_node,
     engine_method_names,
     load_kv_capacity,
     method_node,
@@ -34,6 +38,9 @@ from tests.worker_method_source import WORKER_SOURCE
 
 
 GIB = 1024 ** 3
+# ``load_kv_capacity`` compiles the engine's own classes into this module's
+# namespace, so a dataclass from any other module is one it injected.
+KV_CAPACITY_SOURCE_MODULE = _kv_capacity_source.__name__
 
 
 def runtime(*, free=12, total=20, override=None, reduced=None):
@@ -123,8 +130,16 @@ def test_converted_methods_have_no_worker_or_rebinding(name):
     }
     assert not [ast.unparse(n) for n in ast.walk(node)
                 if isinstance(n, ast.GeneratorExp) and id(n) not in reduced]
+    # Collaborators are keyword-only and named after the worker method they
+    # are: every one of those is a declared ``Callable``. A keyword-only
+    # parameter under any other name is a plain VALUE the pre-move signature
+    # already declared keyword-only (the pool destroy's two flags), and it
+    # must not be a callable -- that is how a collaborator would hide.
     for arg in node.args.kwonlyargs:
-        assert "Callable" in ast.unparse(arg.annotation)
+        annotation = ast.unparse(arg.annotation)
+        assert ("Callable" in annotation) is arg.arg.startswith("_"), (
+            name, arg.arg, annotation,
+        )
 
 
 def test_the_guard_covers_every_method_this_stage_converted():
@@ -177,7 +192,11 @@ def test_frozen_contexts_and_exact_outcome_fields():
     for name, cls in ns.items():
         if not inspect.isclass(cls) or not hasattr(cls, "__dataclass_fields__"):
             continue
-        if name == "PageTableCapacityRequest":
+        if cls.__module__ != KV_CAPACITY_SOURCE_MODULE:
+            # A dataclass the loader INJECTS rather than compiles from the
+            # engine source (the KV manager's request records, the admission
+            # transition plan): not one of this engine's seam shapes, and not
+            # constructible from all-None fields.
             continue
         members = fields(cls)
         value = cls(**{field.name: None for field in members})
@@ -3028,4 +3047,918 @@ def test_integrate_delegator_injects_the_finalize_collaborator(monkeypatch):
     assert args == ("task", ["u0"], [0], [10], ["u1"], [1], "mgr")
     assert helpers == {
         "_finalize_async_load_minimal": worker._finalize_async_load_minimal,
+    }
+
+
+# ---- D6.5: the last worker-shaped operations ------------------------------
+
+
+def d65(**extra):
+    """The engine with the collaborators the D6.5 bodies name at module scope.
+
+    Real ``torch`` throughout: the identity exchange and the capacity vote
+    build and read real tensors, and a stub would hide a dtype or a device
+    the collective actually needs.
+    """
+    events = []
+    namespace = {
+        "logging": SimpleNamespace(
+            info=lambda *a: events.append(("info", a)),
+            debug=lambda *a: events.append(("debug", a)),
+            error=lambda *a: events.append(("error", a)),
+            exception=lambda *a: events.append(("exception", a)),
+        ),
+        "torch": torch,
+        "DualKVCacheCoordinator": type("NoDual", (), {}),
+        "DualHostKVCoordinator": type("NoDualHost", (), {}),
+    }
+    namespace.update(extra)
+    ns = load_kv_capacity(namespace)
+    return ns, ns["KVCapacityEngine"](), events
+
+
+# --------------------------------------------------------------------------- #
+#  D6.5 permanence: the engine FILE never names the worker again
+# --------------------------------------------------------------------------- #
+
+
+ENGINE_SOURCE_PATH = (
+    WORKER_SOURCE.parent / "worker" / "kv_capacity_engine.py"
+)
+
+
+def test_engine_file_never_names_self_or_worker():
+    """D6.5 permanence: no ``worker`` parameter and no ``self = worker``.
+
+    The sibling of the D1 and D2 guards (replica transport,
+    step observability). The boundary checker's census counts a worker
+    attribute only under the rebinding convention, so the moment either
+    spelling comes back the census rises repo-wide; this local guard fails the
+    suite in the same commit. ``self`` itself stays legal -- it is the
+    stateless engine, and the companion guard above confines what a converted
+    method may reach through it.
+    """
+    tree = ast.parse(ENGINE_SOURCE_PATH.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            assert node.arg != "worker", ast.dump(node)
+        if isinstance(node, ast.Name):
+            assert node.id != "worker", node.lineno
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                assert not (
+                    isinstance(target, ast.Name) and target.id == "self"
+                ), f"self rebinding at line {node.lineno}"
+
+
+def test_every_delegated_operation_of_this_engine_takes_a_context():
+    """D6.5 closes the file: NO delegated operation is worker-shaped.
+
+    A method of this engine is a delegated operation exactly when its second
+    parameter is the seam one. Before this stage seven still named that
+    parameter ``worker``; after it, every single one names it ``ctx``. The
+    methods converted in D6.1-D6.5 are all inside the guarded set, and the
+    remainder arrived context-shaped before Phase D.
+    """
+    assert D6_5_METHODS <= METHODS
+    assert D6_5_METHODS <= engine_method_names()
+    seam_shaped = {}
+    for node in engine_class_node().body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        args = node.args.args
+        if len(args) >= 2 and args[0].arg == "self":
+            if args[1].arg in {"ctx", "worker"}:
+                seam_shaped[node.name] = args[1].arg
+    assert set(seam_shaped.values()) == {"ctx"}, sorted(
+        name for name, seam in seam_shaped.items() if seam == "worker"
+    )
+    assert not METHODS - set(seam_shaped)
+
+
+# --------------------------------------------------------------------------- #
+#  The node memfd identity exchange
+# --------------------------------------------------------------------------- #
+
+
+def memfd_context(ns, *, rank=0, world_size=4, local_world_size=2):
+    return ns["NodeMemfdIdentityContext"](
+        rank=rank, world_size=world_size,
+        local_world_size=local_world_size, torch_device="cpu",
+    )
+
+
+def gathering_identity_dist(identities):
+    """``all_gather`` that publishes one (pid, fd) pair per rank."""
+    calls = []
+
+    def all_gather(out, local):
+        calls.append(tuple(int(v) for v in local.tolist()))
+        for index, pair in enumerate(identities):
+            out[index].copy_(torch.tensor(pair, dtype=local.dtype))
+
+    return SimpleNamespace(all_gather=all_gather), calls
+
+
+@pytest.mark.parametrize("rank,creator", [(0, 0), (1, 0), (2, 2), (3, 2)])
+def test_identity_exchange_takes_this_rank_node_leader_pair(rank, creator):
+    identities = [(100, -1), (101, -1), (102, 7), (103, -1)]
+    identities[creator] = (200 + creator, 9)
+    dist, calls = gathering_identity_dist(identities)
+    ns, engine, _ = d65(dist=dist)
+    assert engine._exchange_node_memfd_identity(
+        memfd_context(ns, rank=rank), 55, -1
+    ) == (200 + creator, 9)
+    # ONE collective, and it published THIS rank's own pair.
+    assert calls == [(55, -1)]
+
+
+def test_identity_exchange_declares_exactly_the_four_facts_it_reads():
+    ns, _, _ = d65(dist=gathering_identity_dist([(1, 1)])[0])
+    context_type = ns["NodeMemfdIdentityContext"]
+    assert {f.name for f in fields(context_type)} == {
+        "rank", "world_size", "local_world_size", "torch_device",
+    }
+    ctx = memfd_context(ns)
+    with pytest.raises(FrozenInstanceError):
+        ctx.rank = 3
+
+
+# --------------------------------------------------------------------------- #
+#  The prefill host-capacity vote
+# --------------------------------------------------------------------------- #
+
+
+PAGE = 64
+
+
+def vote_context(
+    *, rank=0, world_size=1, local_rank=0, node_id=0,
+    host_view=None, core_engine=None,
+):
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=rank, world_size=world_size, local_rank=local_rank,
+            local_world_size=2, rank_ctx=SimpleNamespace(node_id=node_id),
+            attn_tp_size=1, device="cpu", page_size=PAGE,
+            decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(pool=None, seq_table=None, trajectories=None),
+        gpu_kv=None, host_view=host_view, core_engine=core_engine,
+        gpu_resident=None, prefix_coordinator=None, prefix_runtime=None,
+        chunk_sizer=None,
+    )
+
+
+def stats_view(free, total, *, fail=False):
+    def get_stats():
+        if fail:
+            raise RuntimeError("stats down")
+        return SimpleNamespace(num_free_pages=free, num_total_pages=total)
+
+    return SimpleNamespace(get_stats=get_stats)
+
+
+def voting_dist(peer_rows, *, floor=(1, 1)):
+    """``all_gather`` of the per-rank reports, then the MIN of the decision."""
+    events = []
+
+    def all_gather(out, local):
+        events.append(("all_gather", tuple(int(v) for v in local.tolist())))
+        out[0].copy_(local)
+        for index, row in enumerate(peer_rows, start=1):
+            out[index].copy_(torch.tensor(row, dtype=local.dtype))
+
+    def all_reduce(tensor, op):
+        events.append(("all_reduce", op, tuple(int(v) for v in tensor.tolist())))
+        tensor.copy_(torch.minimum(
+            tensor, torch.tensor(floor, dtype=tensor.dtype)
+        ))
+
+    return SimpleNamespace(
+        all_gather=all_gather, all_reduce=all_reduce,
+        is_initialized=lambda: True,
+        ReduceOp=SimpleNamespace(MIN="MIN"),
+    ), events
+
+
+def test_vote_on_one_rank_fits_and_reports_its_own_row():
+    _, engine, _ = d65()
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=stats_view(10, 20)),
+        [("a", 2 * PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (True, {0: (2, 10)})
+
+
+def test_vote_on_one_rank_with_a_broken_snapshot_refuses_the_rows():
+    _, engine, events = d65()
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=stats_view(10, 20, fail=True)),
+        [("a", PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (False, None)
+    assert [kind for kind, _ in events] == ["exception"]
+
+
+def test_vote_charges_the_segment_pages_only_with_owner_demand():
+    """The collaborator is the right operand of the owner-demand test."""
+    _, engine, _ = d65()
+    asked = []
+    segments = lambda: asked.append("asked") or 3
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=stats_view(10, 20)), [],
+        _prefill_pool_segment_host_pages=segments,
+    ) == (True, {0: (0, 10)})
+    assert asked == []
+    # 2 KV pages + 3 segment pages + 1 KDA record page for the one sequence.
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=stats_view(10, 20)), [("a", 2 * PAGE)],
+        kda_record_pages_per_sequence=1,
+        _prefill_pool_segment_host_pages=segments,
+    ) == (True, {0: (6, 10)})
+    assert asked == ["asked"]
+
+
+def test_vote_falls_back_to_the_core_engine_host_view():
+    """``ctx.host_view`` first, the native engine's view second, as before."""
+    _, engine, _ = d65()
+    core = SimpleNamespace(host_paged_kv_worker_view=stats_view(8, 16))
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=None, core_engine=core), [("a", PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (True, {0: (1, 8)})
+    # No view anywhere is the broken-snapshot path, not a crash.
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(host_view=None, core_engine=None), [("a", PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (False, None)
+
+
+def test_vote_gathers_the_reports_then_reduces_the_decision():
+    # A peer of the same node with 3 pages of demand and no capacity report.
+    dist, events = voting_dist([[0, 3, -1, -1, 0]])
+    _, engine, _ = d65(dist=dist)
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(world_size=2, host_view=stats_view(10, 20)),
+        [("a", 2 * PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (True, {0: (5, 10)})
+    assert [row[0] for row in events] == ["all_gather", "all_reduce"]
+    assert events[0][1] == (0, 2, 10, 20, 0)
+    assert events[1][1:] == ("MIN", (1, 1))
+
+
+def test_vote_drops_the_rows_when_a_peer_reduced_them_away():
+    """A peer whose rows were unusable makes every rank return None rows."""
+    dist, events = voting_dist([[0, 1, -1, -1, 0]], floor=(1, 0))
+    _, engine, _ = d65(dist=dist)
+    assert engine._collective_prefill_host_capacity_ok(
+        vote_context(world_size=2, host_view=stats_view(10, 20)),
+        [("a", PAGE)],
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) == (True, None)
+    assert [row[0] for row in events] == ["all_gather", "all_reduce"]
+
+
+def test_vote_refuses_a_multi_rank_deployment_without_a_process_group():
+    dist, _ = voting_dist([])
+    dist.is_initialized = lambda: False
+    _, engine, _ = d65(dist=dist)
+    with pytest.raises(RuntimeError, match="distributed process group"):
+        engine._collective_prefill_host_capacity_ok(
+            vote_context(world_size=2, host_view=stats_view(10, 20)),
+            [("a", PAGE)],
+            _prefill_pool_segment_host_pages=lambda: 0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+#  The reserve-time retry
+# --------------------------------------------------------------------------- #
+
+
+def test_retry_reclaims_this_node_deficit_then_rechecks_once():
+    ns, engine, _ = d65()
+    seen = []
+    engine._reclaim_host_prefix_pages_collective = (
+        lambda ctx, page_target, *, reason:
+        seen.append(("reclaim", ctx, int(page_target()), reason)) or 0
+    )
+    engine._collective_prefill_host_capacity_ok = (
+        lambda ctx, requests, *args, **kwargs:
+        seen.append(("recheck", ctx, requests, kwargs)) or (True, None)
+    )
+    ctx = vote_context(rank=2, world_size=4)
+    segments = lambda: 0
+    assert engine._retry_prefill_host_capacity_after_reclaim(
+        ctx, [("a", PAGE)], {1: (9, 4)},
+        kda_record_pages_per_sequence=5,
+        _prefill_pool_segment_host_pages=segments,
+    ) is True
+    # Exactly one reclaim, then exactly one re-check, in that order, both on
+    # THIS context -- rank 2 of local_world_size 2 is node 1.
+    assert [row[0] for row in seen] == ["reclaim", "recheck"]
+    assert seen[0][1] is ctx and seen[1][1] is ctx
+    assert seen[0][2] == 5  # need 9 - free 4
+    assert seen[0][3] == "host_reserve"
+    # Both values the vote's own delegator resolves travel with the re-check.
+    assert seen[1][3] == {
+        "kda_record_pages_per_sequence": 5,
+        "_prefill_pool_segment_host_pages": segments,
+    }
+
+
+def test_retry_returns_the_second_verdict_unchanged():
+    _, engine, _ = d65()
+    engine._reclaim_host_prefix_pages_collective = (
+        lambda ctx, page_target, *, reason: 0
+    )
+    engine._collective_prefill_host_capacity_ok = (
+        lambda ctx, requests, **kwargs: (False, {0: (9, 1)})
+    )
+    assert engine._retry_prefill_host_capacity_after_reclaim(
+        vote_context(), [("a", PAGE)], {0: (9, 1)},
+        _prefill_pool_segment_host_pages=lambda: 0,
+    ) is False
+
+
+# --------------------------------------------------------------------------- #
+#  The GPU KV pool destroy
+# --------------------------------------------------------------------------- #
+
+
+def destroy_context(ns, *, manager, pool=None, resident=None):
+    return ns["GPUKVDestroyContext"](
+        rank=0, gpu_paged_kv_cache_manager=manager, pool=pool,
+        gpu_resident=resident,
+    )
+
+
+def destroy_manager(events):
+    return SimpleNamespace(
+        reset_allocations=lambda: events.append("reset_allocations"),
+        destroy=lambda empty_cuda_cache: events.append(
+            ("destroy", empty_cuda_cache)
+        ),
+    )
+
+
+class _Residency:
+    def __init__(self, events):
+        self._events = events
+
+    def drop_all(self):
+        self._events.append("drop_all")
+
+
+def destroy_seq(*, status, pages=2, initial=True):
+    seq = SimpleNamespace(
+        uuid="abcdefgh0", global_idx=3, status=status,
+        gpu_pages_allocated=pages, had_initial_gpu_reservation=initial,
+        current_context_length=10, decoded_length=1,
+    )
+    seq.reset_gpu_allocation = lambda: setattr(seq, "reset", True)
+    return seq
+
+
+def test_destroy_without_a_pool_returns_before_touching_anything():
+    ns, engine, events = d65()
+    resident = _Residency(events)
+    assert engine._destroy_gpu_paged_kv_cache(
+        destroy_context(ns, manager=None, resident=resident)
+    ) is None
+    assert events == []
+
+
+@pytest.mark.parametrize("keep_buffers,expected", [
+    (False, [("destroy", True), "drop_all"]),
+    (True, ["reset_allocations", "drop_all"]),
+])
+def test_destroy_keeps_or_drops_the_buffers_then_clears_residency(
+    keep_buffers, expected,
+):
+    ns, engine, events = d65()
+    engine._destroy_gpu_paged_kv_cache(
+        destroy_context(
+            ns, manager=destroy_manager(events), resident=_Residency(events),
+        ),
+        empty_cuda_cache=True, keep_buffers=keep_buffers,
+    )
+    assert events == expected
+
+
+def test_destroy_resets_only_the_sequences_that_are_not_completed():
+    ns, engine, events = d65()
+    live = destroy_seq(status=SequenceStatus.IN_DECODE)
+    done = destroy_seq(status=SequenceStatus.COMPLETED)
+    idle = destroy_seq(status=SequenceStatus.PREFILLED, pages=0, initial=False)
+    engine._destroy_gpu_paged_kv_cache(
+        destroy_context(
+            ns, manager=destroy_manager(events),
+            pool=[live, done, idle], resident=_Residency(events),
+        ),
+    )
+    assert getattr(live, "reset", False) is True
+    assert getattr(done, "reset", False) is False
+    assert getattr(idle, "reset", False) is False
+    # The reset count is logged once, after the residency set is cleared.
+    assert events[:2] == [("destroy", False), "drop_all"]
+    assert [kind for kind, _ in events[2:]] == ["info"]
+
+
+def test_destroy_declares_the_four_reads_and_tolerates_no_batch():
+    ns, engine, events = d65()
+    assert {f.name for f in fields(ns["GPUKVDestroyContext"])} == {
+        "rank", "gpu_paged_kv_cache_manager", "pool", "gpu_resident",
+    }
+    ctx = destroy_context(
+        ns, manager=destroy_manager(events), pool=None,
+        resident=_Residency(events),
+    )
+    with pytest.raises(FrozenInstanceError):
+        ctx.rank = 1
+    engine._destroy_gpu_paged_kv_cache(ctx)
+    assert events == [("destroy", False), "drop_all"]
+
+
+# --------------------------------------------------------------------------- #
+#  The prefill host reservation plan
+# --------------------------------------------------------------------------- #
+
+
+def plan_context(sequences, *, prefix_states=None, prefix_cache=False):
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=PAGE, decision_interval=1,
+            enable_prefix_cache=prefix_cache,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(get_sequence=sequences.get),
+            seq_table=None, trajectories=None,
+            prefix=SimpleNamespace(
+                prefix_sequence_states=prefix_states or {}
+            ),
+        ),
+        gpu_kv=None, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+    )
+
+
+def plan_seq(uuid, *, global_idx=0, prompt=128, budget=256):
+    return SimpleNamespace(
+        uuid=uuid, global_idx=global_idx, prompt_length=prompt,
+        kv_token_budget=budget, PAGE_SIZE=PAGE,
+    )
+
+
+def test_plan_refuses_a_uuid_the_pool_does_not_hold():
+    _, engine, _ = d65()
+    engine._get_effective_chunk_size = lambda ctx: 4 * PAGE
+    with pytest.raises(RuntimeError, match="references unknown q9"):
+        engine._prefill_host_reservation_plan(
+            plan_context({}), ["q9"], _owns_host_kv=lambda seq: True,
+        )
+
+
+def test_plan_takes_the_chunk_size_from_its_sibling_once():
+    _, engine, _ = d65()
+    asked = []
+    engine._get_effective_chunk_size = (
+        lambda ctx: asked.append(ctx) or 4 * PAGE
+    )
+    ctx = plan_context({"q0": plan_seq("q0")})
+    engine._prefill_host_reservation_plan(
+        ctx, ["q0"], _owns_host_kv=lambda seq: True,
+    )
+    # ONE resolution for the whole wave, on THIS context.
+    assert asked == [ctx]
+
+
+def test_plan_lists_an_owner_request_only_for_an_owned_sequence():
+    _, engine, _ = d65()
+    engine._get_effective_chunk_size = lambda ctx: 4 * PAGE
+    sequences = {"q0": plan_seq("q0", global_idx=0),
+                 "q1": plan_seq("q1", global_idx=1)}
+    owners = []
+    reservations, owner_requests = engine._prefill_host_reservation_plan(
+        plan_context(sequences), ["q0", "q1"],
+        _owns_host_kv=lambda seq: owners.append(seq) or seq.uuid == "q0",
+    )
+    # Every candidate is reserved; only the owner allocates.
+    assert set(reservations) == {"q0", "q1"}
+    assert [uuid for uuid, _ in owner_requests] == ["q0"]
+    assert owner_requests[0][1] == reservations["q0"][1]
+    assert [seq.uuid for seq in owners] == ["q0", "q1"]
+
+
+def test_plan_charges_the_owner_only_the_private_remainder_of_a_hit():
+    _, engine, _ = d65()
+    engine._get_effective_chunk_size = lambda ctx: 4 * PAGE
+    seq = plan_seq("q0", global_idx=5)
+    ctx = plan_context(
+        {"q0": seq},
+        prefix_states={5: SimpleNamespace(attached_tokens=2 * PAGE)},
+        prefix_cache=True,
+    )
+    reservations, owner_requests = engine._prefill_host_reservation_plan(
+        ctx, ["q0"], _owns_host_kv=lambda s: True,
+    )
+    chain_pages, chain_tokens = reservations["q0"]
+    # Metadata still commits the TOTAL capacity; the owner allocates the rest.
+    assert owner_requests == [("q0", (chain_pages - 2) * PAGE)]
+    assert chain_tokens == chain_pages * PAGE
+    # With the prefix cache off the state is never consulted at all.
+    off = plan_context(
+        {"q0": seq},
+        prefix_states={5: SimpleNamespace(attached_tokens=2 * PAGE)},
+        prefix_cache=False,
+    )
+    assert engine._prefill_host_reservation_plan(
+        off, ["q0"], _owns_host_kv=lambda s: True,
+    )[1] == [("q0", chain_tokens)]
+
+
+# --------------------------------------------------------------------------- #
+#  The watermark hold
+# --------------------------------------------------------------------------- #
+
+
+def hold_context(sequences, rows, *, manager=None, resident=None, rank=0):
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=rank, world_size=2, local_rank=0, local_world_size=2,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=PAGE, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(
+                get_sequence=sequences.get,
+                # ``apply_or_raise`` reads the rejected transitions it returns.
+                apply=lambda plan: (),
+            ),
+            seq_table=SimpleNamespace(uuid_to_local=rows),
+            trajectories=None,
+        ),
+        gpu_kv=manager, host_view=None, core_engine=None,
+        gpu_resident=resident, prefix_coordinator=None, prefix_runtime=None,
+        chunk_sizer=None,
+    )
+
+
+def hold_seq(events, uuid, global_idx):
+    seq = SimpleNamespace(uuid=uuid, global_idx=global_idx)
+    seq.release_gpu_pages = lambda: events.append(("release", uuid))
+    seq.log_event = lambda event, rank, note: events.append(("log", uuid, note))
+    return seq
+
+
+def hold_manager(events, tracked):
+    return SimpleNamespace(
+        _sequences=tracked,
+        free_pages_for_sequences=lambda ids: events.append(("free", list(ids))),
+    )
+
+
+class _HoldResidency:
+    def __init__(self, events):
+        self._events = events
+
+    def drop(self, uuid):
+        self._events.append(("drop", uuid))
+
+
+def test_hold_of_nothing_never_syncs_and_never_barriers():
+    _, engine, events = d65(dist=SimpleNamespace(
+        barrier=lambda: events.append("barrier")
+    ))
+    assert engine._put_sequences_on_hold(
+        hold_context({}, {}), [],
+        _sync_sequence_metadata=lambda uuids: events.append("sync"),
+    ) is None
+    assert events == []
+
+
+def test_hold_syncs_then_frees_then_transitions_then_barriers():
+    events = []
+    ns, engine, events = d65(dist=SimpleNamespace(
+        barrier=lambda: events.append("barrier")
+    ))
+    sequences = {
+        "u0": hold_seq(events, "u0", 17),
+        "u1": hold_seq(events, "u1", 18),
+    }
+    ctx = hold_context(
+        sequences, {"u0": 3, "u1": 4},
+        manager=hold_manager(events, {17: object()}),
+        resident=_HoldResidency(events),
+    )
+    plans = []
+    ctx.sched.pool.apply = lambda plan: plans.append(plan) or ()
+    engine._put_sequences_on_hold(
+        ctx, ["u0", "u1"],
+        _sync_sequence_metadata=lambda uuids: events.append(("sync", list(uuids))),
+    )
+    assert events[0] == ("info", ("[WATERMARK] Putting 2 sequences ON_HOLD",))
+    assert events[1] == ("sync", ["u0", "u1"])
+    # Only the row the GPU manager actually tracks is freed; the skip is
+    # logged, and both rows leave the residency set.
+    assert events[2] == ("free", [17])
+    assert events[3][0] == "debug"
+    assert events[4:6] == [("drop", "u0"), ("drop", "u1")]
+    # Per-sequence release and event, then ONE transition plan, then the
+    # barrier LAST.
+    assert events[6:10] == [
+        ("release", "u0"), ("log", "u0", "trigger=watermark"),
+        ("release", "u1"), ("log", "u1", "trigger=watermark"),
+    ]
+    assert events[10] == "barrier"
+    assert len(plans) == 1
+    assert plans[0].edge is ns["StatusEdge"].CAPACITY_HOLD
+    assert [(t.uuid, t.to) for t in plans[0].transitions] == [
+        ("u0", SequenceStatus.ON_HOLD), ("u1", SequenceStatus.ON_HOLD),
+    ]
+
+
+def test_hold_without_a_gpu_pool_still_transitions_and_barriers():
+    ns, engine, events = d65(dist=SimpleNamespace(
+        barrier=lambda: events.append("barrier")
+    ))
+    sequences = {"u0": hold_seq(events, "u0", 17)}
+    ctx = hold_context(sequences, {"u0": 3}, manager=None)
+    engine._put_sequences_on_hold(
+        ctx, ["u0"], _sync_sequence_metadata=lambda uuids: events.append("sync"),
+    )
+    assert [event for event in events if event in ("sync", "barrier")] == [
+        "sync", "barrier",
+    ]
+    assert not [event for event in events if event[0] == "free"]
+
+
+def test_hold_skips_the_residency_drop_for_a_row_outside_the_local_table():
+    ns, engine, events = d65(dist=SimpleNamespace(
+        barrier=lambda: events.append("barrier")
+    ))
+    sequences = {"u0": hold_seq(events, "u0", 17)}
+    ctx = hold_context(
+        sequences, {}, manager=hold_manager(events, {17: object()}),
+        resident=_HoldResidency(events),
+    )
+    engine._put_sequences_on_hold(
+        ctx, ["u0"], _sync_sequence_metadata=lambda uuids: None,
+    )
+    # No local row means no global id, so no free call and no drop.
+    assert not [event for event in events if event[0] in ("free", "drop")]
+    assert "barrier" in events
+
+
+# --------------------------------------------------------------------------- #
+#  The legacy host-to-GPU load
+# --------------------------------------------------------------------------- #
+
+
+def load_new_context(sequences, rows, *, by_status=(), manager=None):
+    uuid_to_local = dict(rows)
+    return DecodePhaseContext(
+        facts=RankFacts(
+            rank=0, world_size=1, local_rank=0, local_world_size=1,
+            rank_ctx=SimpleNamespace(node_id=0), attn_tp_size=1, device="cpu",
+            page_size=PAGE, decision_interval=1, enable_prefix_cache=False,
+            enable_host_kv_eviction=False, host_kv_chunk_size=1,
+        ),
+        sched=SchedulingState(
+            pool=SimpleNamespace(
+                get_sequence=sequences.get,
+                get_sequences_by_status=lambda status: list(
+                    dict(by_status).get(status, [])
+                ),
+            ),
+            seq_table=SimpleNamespace(
+                uuid_to_local=uuid_to_local,
+                local_to_uuid={v: k for k, v in uuid_to_local.items()},
+            ),
+            trajectories=None,
+        ),
+        gpu_kv=manager, host_view=None, core_engine=None, gpu_resident=None,
+        prefix_coordinator=None, prefix_runtime=None, chunk_sizer=None,
+    )
+
+
+def test_load_new_without_a_new_uuid_returns_the_batch_untouched():
+    _, engine, events = d65()
+    stamped = []
+    engine._allocate_gpu_kv_two_page_buffer = lambda *a, **k: (
+        events.append("allocate") or True
+    )
+    ctx = load_new_context({}, {"u0": 1}, by_status=(
+        (SequenceStatus.PREFILLED, ["candidate"]),
+    ))
+    assert engine._try_load_new_sequences(
+        ctx, ["u0"], [1],
+        _assign_decode_dp_groups=lambda rows: stamped.append(list(rows)),
+        _prepare_decode_batch=lambda: ["u0"],
+        _update_batch_status=lambda *a: events.append("status"),
+    ) == (["u0"], [1])
+    # The candidate stamp happened, nothing else did.
+    assert stamped == [["candidate"]]
+    assert events == []
+
+
+def test_load_new_stamps_selects_votes_transitions_then_rebuilds():
+    _, engine, events = d65()
+    rebuilt = []
+    manager = SimpleNamespace(
+        rebuild_page_table=lambda ids: rebuilt.append(list(ids))
+    )
+    sequences = {
+        "u0": SimpleNamespace(uuid="u0", global_idx=10),
+        "u1": SimpleNamespace(uuid="u1", global_idx=11),
+    }
+    ctx = load_new_context(
+        sequences, {"u0": 1, "u1": 2},
+        by_status=((SequenceStatus.ON_HOLD, ["cand"]),), manager=manager,
+    )
+    engine._allocate_gpu_kv_two_page_buffer = (
+        lambda c, rows, load_from_host, collective_preflight: events.append(
+            ("allocate", c is ctx, list(rows), load_from_host,
+             collective_preflight)
+        ) or True
+    )
+    assert engine._try_load_new_sequences(
+        ctx, ["u0"], [1],
+        _assign_decode_dp_groups=lambda rows: events.append(
+            ("stamp", list(rows))
+        ),
+        _prepare_decode_batch=lambda: ["u0", "u1"],
+        _update_batch_status=lambda uuids, status, edge: events.append(
+            ("status", list(uuids), status, edge)
+        ),
+    ) == (["u0", "u1"], [1, 2])
+    assert [row[0] for row in events[:4]] == [
+        "stamp", "stamp", "allocate", "status",
+    ]
+    # The collective preflight votes on THIS context, before the transition.
+    assert events[2] == ("allocate", True, [2], True, True)
+    assert events[3][1:] == (["u1"], SequenceStatus.IN_DECODE,
+                             StatusEdge.DECODE_ENTRY)
+    # The final rebuild covers the WHOLE decode batch, not just the new rows.
+    assert rebuilt == [[10, 11]]
+
+
+def test_load_new_raises_when_the_collective_preflight_refuses():
+    _, engine, events = d65()
+    sequences = {"u1": SimpleNamespace(uuid="u1", global_idx=11)}
+    ctx = load_new_context(sequences, {"u1": 2})
+    engine._allocate_gpu_kv_two_page_buffer = lambda *a, **k: False
+    with pytest.raises(RuntimeError, match="collective GPU KV load preflight"):
+        engine._try_load_new_sequences(
+            ctx, [], [],
+            _assign_decode_dp_groups=lambda rows: None,
+            _prepare_decode_batch=lambda: ["u1"],
+            _update_batch_status=lambda *a: events.append("status"),
+        )
+    # The status transition is downstream of the vote, so it never ran.
+    assert events == []
+
+
+# ---- D6.5 delegators -------------------------------------------------------
+
+
+D65_HELPERS = ("_decode_phase_context",)
+
+
+def test_identity_and_destroy_delegators_build_their_narrow_contexts(
+    monkeypatch,
+):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D65_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker.rank = 2
+    worker.world_size = 4
+    worker.local_rank = 0
+    worker.local_world_size = 2
+    worker.torch_device = "cpu"
+    worker.gpu_paged_kv_cache_manager = "pool"
+    worker.global_batch = "batch"
+    worker._sequences_with_gpu_kv = "resident"
+    seen = []
+    engine._exchange_node_memfd_identity = (
+        lambda ctx, pid, fd: seen.append(("identity", ctx, pid, fd)) or (1, 2)
+    )
+    engine._destroy_gpu_paged_kv_cache = (
+        lambda ctx, **flags: seen.append(("destroy", ctx, flags))
+    )
+    assert worker._exchange_node_memfd_identity(7, 8) == (1, 2)
+    worker._destroy_gpu_paged_kv_cache(keep_buffers=True)
+    identity = seen[0][1]
+    # The narrow context, not the decode phase one: no phase state is read.
+    assert isinstance(identity, ns["NodeMemfdIdentityContext"])
+    assert (identity.rank, identity.world_size, identity.local_world_size,
+            identity.torch_device) == (2, 4, 2, "cpu")
+    assert seen[0][2:] == (7, 8)
+    destroy = seen[1][1]
+    assert isinstance(destroy, ns["GPUKVDestroyContext"])
+    assert (destroy.rank, destroy.gpu_paged_kv_cache_manager, destroy.pool,
+            destroy.gpu_resident) == (2, "pool", "batch", "resident")
+    assert seen[1][2] == {"empty_cuda_cache": False, "keep_buffers": True}
+
+
+def test_destroy_delegator_reads_the_live_pool_handle_each_call(monkeypatch):
+    """The handle is read HERE, so a rebind between calls is seen."""
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D65_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker.rank = 0
+    worker._sequences_with_gpu_kv = "resident"
+    worker.gpu_paged_kv_cache_manager = "first"
+    seen = []
+    engine._destroy_gpu_paged_kv_cache = (
+        lambda ctx, **flags: seen.append(ctx.gpu_paged_kv_cache_manager)
+    )
+    worker._destroy_gpu_paged_kv_cache()
+    worker.gpu_paged_kv_cache_manager = "second"
+    worker._destroy_gpu_paged_kv_cache()
+    assert seen == ["first", "second"]
+    # A lifetime that has not built a batch yet is the pre-move read's own
+    # "nothing to reset" case, not an attribute error.
+    assert not hasattr(worker, "global_batch")
+    engine._destroy_gpu_paged_kv_cache = lambda ctx, **flags: seen.append(ctx.pool)
+    worker._destroy_gpu_paged_kv_cache()
+    assert seen[-1] is None
+
+
+def test_prefill_transaction_delegators_pass_the_phase_context(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D65_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._owns_host_kv = lambda seq: True
+    worker._prefill_pool_segment_host_pages = lambda: 4
+    worker._kda_record_pages_per_sequence = lambda: 3
+    seen = []
+    engine._prefill_host_reservation_plan = (
+        lambda ctx, uuids, **helpers:
+        seen.append(("plan", ctx, uuids, helpers)) or ({}, [])
+    )
+    engine._collective_prefill_host_capacity_ok = (
+        lambda ctx, requests, local_error, **extra:
+        seen.append(("vote", ctx, requests, local_error, extra)) or (True, None)
+    )
+    engine._retry_prefill_host_capacity_after_reclaim = (
+        lambda ctx, requests, rows, **extra:
+        seen.append(("retry", ctx, requests, rows, extra)) or True
+    )
+    worker._prefill_host_reservation_plan(["q0"])
+    worker._collective_prefill_host_capacity_ok([("q0", 64)], local_error=True)
+    worker._retry_prefill_host_capacity_after_reclaim([("q0", 64)], {0: (1, 1)})
+    assert [row[0] for row in seen] == ["plan", "vote", "retry"]
+    for row in seen:
+        assert row[1] is worker._held_decode_phase_context
+    assert seen[0][3] == {"_owns_host_kv": worker._owns_host_kv}
+    # The vote and its retry resolve the SAME two values, so the re-check
+    # charges exactly what the first vote charged.
+    assert seen[1][3] is True
+    assert seen[1][4] == {
+        "kda_record_pages_per_sequence": 3,
+        "_prefill_pool_segment_host_pages": (
+            worker._prefill_pool_segment_host_pages
+        ),
+    }
+    assert seen[2][4] == seen[1][4]
+
+
+def test_hold_and_load_delegators_inject_their_collaborators(monkeypatch):
+    ns, engine, _ = runtime()
+    worker = load_delegators(monkeypatch, ns, D65_HELPERS)
+    worker._kv_capacity_engine = engine
+    worker._held_decode_phase_context = object()
+    worker._sync_sequence_metadata = lambda uuids: None
+    worker._assign_decode_dp_groups = lambda rows: None
+    worker._prepare_decode_batch = lambda: []
+    worker._update_batch_status = lambda *a: None
+    seen = []
+    engine._put_sequences_on_hold = (
+        lambda ctx, uuids, **helpers: seen.append(("hold", ctx, uuids, helpers))
+    )
+    engine._try_load_new_sequences = (
+        lambda ctx, uuids, rows, **helpers:
+        seen.append(("load", ctx, uuids, rows, helpers)) or (uuids, rows)
+    )
+    worker._put_sequences_on_hold(["u0"])
+    assert worker._try_load_new_sequences(["u0"], [1]) == (["u0"], [1])
+    assert [row[0] for row in seen] == ["hold", "load"]
+    for row in seen:
+        assert row[1] is worker._held_decode_phase_context
+    assert seen[0][3] == {
+        "_sync_sequence_metadata": worker._sync_sequence_metadata,
+    }
+    assert seen[1][4] == {
+        "_assign_decode_dp_groups": worker._assign_decode_dp_groups,
+        "_prepare_decode_batch": worker._prepare_decode_batch,
+        "_update_batch_status": worker._update_batch_status,
     }
