@@ -319,6 +319,9 @@ def test_prefill_nsys_profile_is_inert_under_an_empty_debug_state():
     worker = SimpleNamespace(
         _debug_flag_enabled=lambda value: False,
         _debug_values=lambda: None,
+        # D2: the delegator freezes the context before the engine's gate; an
+        # inert window must not touch the device either way.
+        _decode_phase_context=lambda: None,
     )
 
     active = begin(worker, local_bsz=42, global_bsz=336)
@@ -329,25 +332,31 @@ def test_prefill_nsys_profile_is_inert_under_an_empty_debug_state():
 
 def test_prefill_nsys_profile_reads_the_server_debug_state():
     # The capture window opens from the server's debug state as the worker
-    # adopted it, the same for a pool-served wave and any other.
+    # adopted it, the same for a pool-served wave and any other. D2: the
+    # delegator resolves the flag and passes the frozen context — the engine
+    # never receives the worker.
     begin = _isolated_worker_method("_nsys_prefill_profile_begin")
     seen = {}
 
     class _Engine:
-        def _nsys_prefill_profile_begin(self, worker, **kwargs):
+        def _nsys_prefill_profile_begin(self, ctx, **kwargs):
+            seen["ctx"] = ctx
             seen.update(kwargs)
             return True
 
     worker = SimpleNamespace(
         _step_observability_engine=_Engine(),
         _debug_values=lambda: {"glm5_prefill_nsys_profile": True},
+        _debug_flag_enabled=lambda value: bool(value),
+        _decode_phase_context=lambda: "frozen-ctx",
     )
 
     assert begin(worker, local_bsz=3, global_bsz=24) is True
     assert seen == {
+        "ctx": "frozen-ctx",
         "local_bsz": 3,
         "global_bsz": 24,
-        "debug": {"glm5_prefill_nsys_profile": True},
+        "profile_enabled": True,
     }
 
 
