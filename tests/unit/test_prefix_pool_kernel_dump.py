@@ -502,12 +502,21 @@ def test_the_worker_reads_both_flags_through_the_batch_debug_seam():
         "batchgen", "worker", "prefill_engine.py"
     ).read_text()
 
-    assert "def _new_pool_kernel_dump_recorder(self, worker, wave):" in source
-    assert "pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)" in source
+    # D7.4 converted the recorder: it takes the probe context its three
+    # siblings share. D7.3 had already made the construction reach it as a
+    # keyword-only collaborator callable, so the install line lost its
+    # ``self.`` -- which is why this pin was red at that stage and is repaired
+    # here, in the stage that owns the recorder.
+    assert (
+        "def _new_pool_kernel_dump_recorder(self, ctx: PoolProbeContext, wave):"
+        in source
+    )
+    assert "pool.kernel_dump = _new_pool_kernel_dump_recorder(wave)" in source
     seam = source.split("    def _new_pool_kernel_dump_recorder")[1].split("\n    def ")[0]
     # One cached read per wave, shared with the other pooled probes, and the
-    # flag decision precedes the import so the off path imports nothing.
-    assert "self._pool_probe_debug(wave)" in seam
+    # flag decision precedes the import so the off path imports nothing. The
+    # probe read is a sibling taking the SAME context, so it is called with it.
+    assert "self._pool_probe_debug(ctx, wave)" in seam
     assert seam.index("if debug is None:") < seam.index(
         "from batchgen.prefix_reuse.kernel_dump import"
     )

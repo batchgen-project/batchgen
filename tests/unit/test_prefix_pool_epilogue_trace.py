@@ -416,7 +416,9 @@ def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
     emit = source.split("epilogue_trace.emit(")[1].split("\n" + " " * 24 + ")")[0]
     assert "logits=logits" in emit
     # Both keys are parsed by the shared helper the two paths arm through.
-    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in engine_source
+    # D7.4 converted the pooled arming site, so its rank is the probe
+    # context's field now; the helper call is otherwise unchanged.
+    assert 'tracer_from_debug(debug, rank=ctx.rank, path="pool")' in engine_source
     helper = _ROOT.joinpath("batchgen", "prefix_reuse",
                             "epilogue_trace.py").read_text()
     rule = helper.split("def tracer_from_debug")[1].split("\ndef ")[0]
@@ -521,10 +523,13 @@ def test_the_pooled_helper_now_shares_the_arming_rule():
     source = _ROOT.joinpath("batchgen", "worker", "prefill_engine.py").read_text()
     seam = source.split("    def _new_pool_epilogue_tracer")[1].split("\n    def ")[0]
 
-    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in seam
+    # D7.4 converted the tracer setup: the rank comes from the probe context
+    # its three siblings share, and the probe read is called with that same
+    # context instead of through the worker delegator.
+    assert 'tracer_from_debug(debug, rank=ctx.rank, path="pool")' in seam
     # One cached read per wave, shared with the other three pooled probes,
     # and the flag decision precedes the import.
-    assert "self._pool_probe_debug(wave)" in seam
+    assert "self._pool_probe_debug(ctx, wave)" in seam
     assert seam.index("if debug is None:") < seam.index(
         "from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug"
     )
@@ -539,12 +544,17 @@ def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
         "batchgen", "worker", "prefill_engine.py"
     ).read_text()
 
-    assert "def _new_pool_epilogue_tracer(self, worker, wave):" in engine_source
+    assert (
+        "def _new_pool_epilogue_tracer(self, ctx: PoolProbeContext, wave):"
+        in engine_source
+    )
     # S5b: the pooled forward (arming and pairing sites) moved to PrefillEngine.
     source = engine_source
+    # The pooled forward is still worker-shaped (D7.5), so it reaches the
+    # tracer through the worker delegator of that name, as it did.
     assert "epilogue_trace = self._new_pool_epilogue_tracer(wave)" in source
     seam = engine_source.split("    def _new_pool_epilogue_tracer")[1].split("\n    def ")[0]
-    assert "self._pool_probe_debug(wave)" in seam
+    assert "self._pool_probe_debug(ctx, wave)" in seam
     assert "tracer_from_debug" in seam
     assert "return None" in seam
     # The pairing side is emitted beside the token selection.

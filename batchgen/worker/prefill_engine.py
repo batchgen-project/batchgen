@@ -46,6 +46,23 @@ carrier reads no worker state at all.  Three of them write one or two plain
 worker values and hand them back in frozen outcomes
 (:class:`PrefillPrefixKVBudgetOutcome`, :class:`PrefillPoolBaseOutcome`,
 :class:`PrefillPoolLayoutOutcome`).
+
+D7.4 converted wave planning and the pooled instrumentation.  It carries ONE
+collective, the wave planner's budget reduction (``dist.all_reduce`` in
+``_plan_prefill_pool_wave``), and it does not move: it keeps its single
+enclosing condition, the group handle, it still sits between the tensor that
+carries this rank's three budgets and the first read of the reduced ones, and
+it still precedes the plan-digest gather one level down in
+``_check_pool_plan_identical``, which now arrives as a collaborator callable.
+The wave is formed against the planner's compute-token budget (design clause
+C7) and that arithmetic is untouched: the chunk cap is still
+``max(0, (total_pages - len(prompts)) // 2) * page_tokens``, the pool still
+gets ``total_pages - scratch``, and both refusals keep their comparison
+operand order.  Three of the four probe instruments SHARE
+:class:`PoolProbeContext` with D7.1's pair, because their read set is exactly
+its two fields; the fourth reads the parallel manager instead and takes its
+own.  The one worker write of the stage is the wave epilogue clearing the
+planned wave, handed back in :class:`PrefillPoolWaveFinishOutcome`.
 """
 
 from __future__ import annotations
@@ -488,6 +505,105 @@ class MaterializedSegmentLoadContext:
     rank: int
 
 
+# D7.4: the wave planning and instrumentation contexts. Three new narrow ones
+# and ONE reuse: the three probe recorders read exactly the rank plus the
+# adopted probe state, which is :class:`PoolProbeContext`'s declared set, so
+# they take it and reach the probe read with it directly -- the coincidence
+# D7.1 already named when it wrote that class. The fourth instrument, the
+# hand-written gather record, does NOT share it: it reads the rank and the
+# parallel manager and never the probe state, so sharing would make three
+# recorder delegators resolve a manager they never touch. The stage declares
+# ONE outcome, for the single worker attribute the wave epilogue rebinds.
+
+
+@dataclass(frozen=True)
+class PrefillMicroBatchPlanContext:
+    """What planning this rank's prepacked forwards reads.
+
+    The PSM, whose streamed-SP8 declaration decides the single-sequence arm,
+    and the prefill-phase prefix KV budget that bounds the transient
+    full-length KV of a prefix-hit micro-batch. Deliberately NOT
+    :class:`PrefillPoolParallelContext`, whose read set is the PSM alone:
+    widening that one would make the four pool-geometry readers' delegators
+    resolve a budget none of them reads. The worker binds the budget in
+    ``__init__`` (to ``None``), so this is a plain read and ``None`` is the
+    live "no budget measured yet" value, which the body refuses by name.
+    """
+
+    parallel_manager: object
+    _prefill_prefix_kv_budget_bytes: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolWavePlanContext:
+    """What planning this rank's in-wave prefix sharing reads.
+
+    Its own context: the budget it reads is the pool PAGE budget (the
+    construction context's field of the same name, resolved from the same
+    worker attribute), while the geometry it builds comes from the checkpoint
+    name and the page tokens of the prefix runtime config -- no other
+    converted read set in this engine is this union. The planned wave is NOT
+    a field: this body is what PRODUCES it, and the worker's caller binds the
+    attribute from the return value.
+    """
+
+    rank: int
+    torch_device: object
+    parallel_manager: object
+    huggingface_ckpt_name: str
+    pool: object
+    prefix_runtime: object
+    _prefill_pool_page_budget: object
+
+
+@dataclass(frozen=True)
+class UnshardedEpilogueGatherContext:
+    """What the hand-written "no sharded gather" record is checked against.
+
+    The manager, because ``record_unsharded_gather`` asserts the branch's
+    premise against it rather than taking the branch's word, and the rank the
+    probe guard names. Not :class:`PoolProbeContext`: this operation never
+    reads the probe state -- its caller already holds the tracer.
+    """
+
+    rank: int
+    parallel_manager: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolWaveFinishContext:
+    """What publishing the finished wave's segments reads.
+
+    The wave to publish, the sequence pool its members are looked up in, and
+    the three owners the publication goes through: the prefix-cache
+    coordinator, the prefix-reuse state that records the commit handles and
+    the runtime config the publication is parameterized by. Not
+    :class:`PrefillPoolHostPageContext` (wave + prefix owner): this body also
+    reads the pool, the coordinator and the runtime config.
+    """
+
+    _prefill_pool_wave: object
+    pool: object
+    prefix_runtime: object
+    prefix_coordinator: object
+    prefix: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolWaveFinishOutcome:
+    """The wave handle the epilogue clears.
+
+    One plain value, never a container. The pre-move body cleared it twice --
+    once before the publication and once in the ``finally`` that covers it --
+    and both statements set the same value, so the outcome carries that value
+    and the delegator applies it after the engine returns. The sentinel is
+    what the "no wave in flight" early exit leaves behind, and ``None`` could
+    not stand for that: ``None`` is exactly what the two writes assign.
+    """
+
+    _prefill_pool_wave: object = PREFILL_UNCHANGED
+
+
 class PrefillModelStateBinder(Protocol):
     """Model-state seam the prefill forwards drive (S5b; the worker implements it).
 
@@ -537,13 +653,14 @@ class PrefillEngine:
     """
 
     def _plan_prefill_micro_batches(
-        self, worker,
+        self, ctx: PrefillMicroBatchPlanContext,
         seq_lengths: List[int],
         full_seq_lengths: List[int],
         compute_cached_tokens: List[int],
         *,
         token_cap: int,
         attn_group_size: int,
+        _prefix_materialization_kv_config: Callable,
     ) -> Tuple[List[Tuple[int, int]], int, bool]:
         """Build the one authoritative prepacked-forward plan for local rows.
 
@@ -553,19 +670,20 @@ class PrefillEngine:
         length, so its pages are capped by the prefill-phase prefix KV budget
         (``_measure_prefill_prefix_kv_budget``) and the micro-batch splits
         until the transient fits.
+
+        Nothing is written here, so this operation declares no outcome, and
+        the temporary-KV config builder is the worker's own method of that
+        name -- it resolves the Host geometry from the checkpoint, a read this
+        context does not carry -- so it arrives as a collaborator callable.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         # token_cap: the server mode's one prefill cap, resolved by the
         # worker's delegator and handed over explicitly.
         use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
         single_sequence_only = (
             token_cap > 0
             and max(seq_lengths) > token_cap
-            and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
-            and self.parallel_manager.prefill_uses_streamed_sp8()
+            and hasattr(ctx.parallel_manager, "prefill_uses_streamed_sp8")
+            and ctx.parallel_manager.prefill_uses_streamed_sp8()
         )
         prefix_hits = [int(tokens) > 0 for tokens in compute_cached_tokens]
         kv_pages = [0] * len(prefix_hits)
@@ -576,7 +694,7 @@ class PrefillEngine:
                 temporary_kv_pages,
             )
 
-            budget = self._prefill_prefix_kv_budget_bytes
+            budget = ctx._prefill_prefix_kv_budget_bytes
             if budget is None:
                 raise RuntimeError(
                     "prefix-hit prefill has no prefill-phase prefix KV budget: "
@@ -588,7 +706,7 @@ class PrefillEngine:
                     "prefix-hit prefill splits micro-batches by a rank-local "
                     "budget, which a serve group of attn_tp_size>1 cannot share"
                 )
-            page_config = self._prefix_materialization_kv_config([1])
+            page_config = _prefix_materialization_kv_config([1])
             kv_pages = [
                 temporary_kv_pages(length, page_config.page_size_tokens)
                 for length in full_seq_lengths
@@ -1036,7 +1154,19 @@ class PrefillEngine:
             return "serving_group_is_not_the_owning_group"
         return None
 
-    def _plan_prefill_pool_wave(self, worker, uuids, prefix_states, *, token_cap):
+    def _plan_prefill_pool_wave(
+        self, ctx: PrefillPoolWavePlanContext, uuids, prefix_states, *,
+        token_cap,
+        _trajectory_tokens: Callable,
+        _prefill_pool_group: Callable,
+        _prefill_pool_layout: Callable,
+        _prefill_pool_free_state_slots: Callable[[], int],
+        _prefill_pool_psm_layout: Callable,
+        _materialized_prefix_hits: Callable,
+        _check_pool_plan_identical: Callable,
+        _replace_prefix_lookup_hits: Callable,
+        _settle_trajectory_restore_plan: Callable,
+    ):
         """Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
         the prefill phase (`_construct_prefill_pool`), after configure_prefill
         settles the device layout.
@@ -1061,11 +1191,35 @@ class PrefillEngine:
         compute exactly there; every other live trajectory attachment of the
         wave is declined here, at plan time, with the reason it was dropped
         (``_settle_trajectory_restore_plan``) -- on every return path.
+
+        The group reduction is this stage's ONE collective and it does not
+        move: ``dist.all_reduce`` keeps its single enclosing condition
+        (``group is not None``, i.e. G>1), it stays between the tensor that
+        carries this rank's three budgets and the first read of the reduced
+        ones, and it still runs BEFORE the plan-digest ``dist.all_gather``
+        that ``_check_pool_plan_identical`` issues one level down, so every
+        rank of a serve group issues the same two collectives in the same
+        order.
+
+        The budget arithmetic is design clause C7 and is untouched: the pool
+        chunk cap is still ``max(0, (total_pages - len(prompts)) // 2) *
+        page_tokens``, the planner still gets ``pool_pages=total_pages -
+        scratch``, the segment allowance is still ``max(0, state_slots -
+        len(prompts))``, and both refusals keep their comparison operand order
+        (``total_pages <= scratch``, ``0 <= state_slots <
+        state_slots_needed``). Not one computed quantity became a passed-in
+        one.
+
+        Nothing is written through the seam: the planned wave is this body's
+        RETURN value and the worker's caller binds the attribute from it, so
+        this operation declares no outcome. Each of the nine collaborators has
+        its own read set -- the pool group and the PSM layout read the PSM
+        handle, the row layout its model-and-cache pair, the free slots the
+        trajectory store, the hits and the two settlements the owned stores,
+        the plan identity the rank and the device, the prompt reader the
+        trajectory book -- so each arrives as the worker delegator the
+        pre-move body called.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
         from batchgen.prefix_reuse.levels import order_chunk_items_by_level
         from batchgen.prefix_reuse.pool import scratch_pages_bound
@@ -1075,8 +1229,8 @@ class PrefillEngine:
         )
         from batchgen.prefix_reuse.wave_runtime import PoolWave
 
-        seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
-        total_pages = self._prefill_pool_page_budget
+        seqs = [ctx.pool.get_sequence(uuid) for uuid in uuids]
+        total_pages = ctx._prefill_pool_page_budget
         if total_pages is None:
             # Budget seeding is part of configure_prefill, which every rank of
             # a wave runs in the same step, so an unmeasured budget is
@@ -1086,30 +1240,30 @@ class PrefillEngine:
             logging.info(
                 "[PREFIX_POOL] Rank %s first wave keeps the existing path: "
                 "prefill-phase pool budget not yet measured",
-                self.rank,
+                ctx.rank,
             )
-            self._settle_trajectory_restore_plan(
+            _settle_trajectory_restore_plan(
                 seqs, {}, "the prefill-phase pool budget is not yet measured"
             )
             return None
-        group = self._prefill_pool_group()
+        group = _prefill_pool_group()
         prompts = [
-            self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+            _trajectory_tokens(seq, length=seq.prompt_length).tolist()
             for seq in seqs
         ]
-        page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-        geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
-        with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
+        page_tokens = int(ctx.prefix_runtime.group_specs[0].raw_page_tokens)
+        geometry = build_gpu_kv_config(ctx.huggingface_ckpt_name, [page_tokens])
+        with_v, indexer_layers, indexer_dim = _prefill_pool_layout(geometry)
         # Planned before this wave's phase transition (the live phase may still
         # be decode) and on this group's subset of the wave: the cap is the
         # server's, the one every wave and every group runs under, resolved by
         # the worker's delegator and handed over explicitly.
         chunk_tokens = token_cap
-        state_slots = self._prefill_pool_free_state_slots()
+        state_slots = _prefill_pool_free_state_slots()
         # M3 Slice 3: the wave's trajectory re-entry hits, derived from
         # replicated data so every rank of the group has the same set, plus
         # this rank's vote on whether that set is still live.
-        hits, hits_confirmed, hit_pages, drops = self._materialized_prefix_hits(
+        hits, hits_confirmed, hit_pages, drops = _materialized_prefix_hits(
             seqs, page_tokens=page_tokens, group=group
         )
         if group is not None:
@@ -1122,7 +1276,7 @@ class PrefillEngine:
             budget = torch.tensor(
                 [total_pages, state_slots, 1 if hits_confirmed else 0],
                 dtype=torch.int64,
-                device=self.torch_device,
+                device=ctx.torch_device,
             )
             dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)
             total_pages = int(budget[0].item())
@@ -1133,7 +1287,7 @@ class PrefillEngine:
                 "[PREFIX_POOL] Rank %s drops %d materialized prefix(es): the "
                 "serve group could not confirm the mirrored frontier set; the "
                 "wave recomputes them",
-                self.rank, len(hits),
+                ctx.rank, len(hits),
             )
             for hit in hits:
                 drops.setdefault(
@@ -1141,7 +1295,7 @@ class PrefillEngine:
                     "the serve group could not confirm the mirrored frontier set",
                 )
             hits = []
-        if self._prefill_pool_psm_layout() is not None:
+        if _prefill_pool_psm_layout() is not None:
             # The pool holds EVERY token of a chunk, tails as well as segments,
             # so a chunk wider than the pool can never be planned; leave half the
             # pages for the pooled segments those tails read.
@@ -1152,7 +1306,7 @@ class PrefillEngine:
                 logging.info(
                     "[PREFIX_POOL] Rank %s caps the pool chunk at %d tokens "
                     "(cap %d): %d pool pages hold every chunk token",
-                    self.rank, pool_chunk_tokens, chunk_tokens, total_pages,
+                    ctx.rank, pool_chunk_tokens, chunk_tokens, total_pages,
                 )
                 chunk_tokens = pool_chunk_tokens
         scratch = scratch_pages_bound(
@@ -1161,9 +1315,9 @@ class PrefillEngine:
         if total_pages <= scratch:
             logging.info(
                 "[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
-                self.rank, total_pages, scratch,
+                ctx.rank, total_pages, scratch,
             )
-            self._settle_trajectory_restore_plan(
+            _settle_trajectory_restore_plan(
                 seqs, drops,
                 f"the wave is not pooled: pool {total_pages} pages <= scratch "
                 f"{scratch}",
@@ -1173,7 +1327,7 @@ class PrefillEngine:
         # before attending over it AND runs its recurrent layers level by level,
         # so a whole prefix tree finishes in one forward. Read from the PSM like
         # the pool layout above; GPT-OSS and GLM declare neither.
-        declares = getattr(self.parallel_manager, "supports_group_pool_prefill", None)
+        declares = getattr(ctx.parallel_manager, "supports_group_pool_prefill", None)
         level_wise = declares is not None and bool(declares())
         plan_kwargs = dict(
             block_tokens=page_tokens,
@@ -1194,7 +1348,7 @@ class PrefillEngine:
                 "[PREFIX_POOL] Rank %s drops %d materialized prefix(es): this "
                 "model's pool does not read a segment resident in its own "
                 "chunk",
-                self.rank, len(hits),
+                ctx.rank, len(hits),
             )
             for hit in hits:
                 drops.setdefault(
@@ -1219,7 +1373,7 @@ class PrefillEngine:
             logging.warning(
                 "[PREFIX_POOL] Rank %s plans %d of %d materialized prefix(es); "
                 "declined by the planner: %s",
-                self.rank, len(hits) - len(plan.declined_materialized),
+                ctx.rank, len(hits) - len(plan.declined_materialized),
                 len(hits),
                 ", ".join(
                     f"sequence {int(seqs[index].global_idx)} ({reason})"
@@ -1233,7 +1387,7 @@ class PrefillEngine:
             # per level, each after the level that left its parents' state.
             plan = order_chunk_items_by_level(plan)
         validate_wave_prefix_plan(plan, prompts)
-        self._check_pool_plan_identical(plan, group)
+        _check_pool_plan_identical(plan, group)
         # Nothing shared, or no room for the state: a pooled segment is a prefill
         # row of its own, so on a model with per-sequence recurrent state it
         # holds a slot of its own until the wave ends. The slot budget is the
@@ -1247,9 +1401,9 @@ class PrefillEngine:
             logging.info(
                 "[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
                 "shared, %d state slots needed, %d free",
-                self.rank, len(plan.segments), state_slots_needed, state_slots,
+                ctx.rank, len(plan.segments), state_slots_needed, state_slots,
             )
-            self._settle_trajectory_restore_plan(
+            _settle_trajectory_restore_plan(
                 seqs, drops,
                 f"the wave is not pooled: {len(plan.segments)} segment(s), "
                 f"{state_slots_needed} state slot(s) needed, {state_slots} free",
@@ -1282,20 +1436,20 @@ class PrefillEngine:
             for segment_id in wave.materialized
             for index in plan.segments[segment_id].members
         }
-        self._replace_prefix_lookup_hits(
+        _replace_prefix_lookup_hits(
             seqs, prefix_states,
             [wave.chain_tokens(index) for index in range(len(seqs))],
             retain=frozenset(restore_boundaries),
             restore_boundaries=restore_boundaries,
         )
-        self._settle_trajectory_restore_plan(
+        _settle_trajectory_restore_plan(
             seqs, drops, "the wave plan does not materialize its frontier"
         )
         logging.info(
             "[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
             "threshold %s, compute %d of %d prompt tokens, %d pool pages "
             "(%d for segments, %d scratch)",
-            self.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
+            ctx.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
             plan.computed_tokens, plan.prompt_tokens, total_pages,
             total_pages - scratch, scratch,
         )
@@ -2119,7 +2273,7 @@ class PrefillEngine:
         wave.probe_debug_read = True
         return armed
 
-    def _new_pool_epilogue_tracer(self, worker, wave):
+    def _new_pool_epilogue_tracer(self, ctx: PoolProbeContext, wave):
         """Server-level ``debug_state.prefix_pool_epilogue_trace``.
 
         Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
@@ -2133,12 +2287,14 @@ class PrefillEngine:
         ``_pool_probe_debug`` has already answered None and this method touches
         nothing else. A malformed flag value is a diagnostics failure, not a
         serving failure, so it leaves a ``probe_error`` line and no tracer.
+
+        The probe read is a sibling with the SAME context, so it is called
+        with this one instead of through the worker delegator. The setup
+        closure captures only ``debug`` (the dict the wave cached) and this
+        frozen context, never the worker, and what it returns is the tracer
+        ``tracer_from_debug`` built, which holds neither.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        debug = self._pool_probe_debug(wave)
+        debug = self._pool_probe_debug(ctx, wave)
         if debug is None:
             return None
         from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
@@ -2146,15 +2302,15 @@ class PrefillEngine:
 
         tracer = run_probe(
             "epilogue_trace.setup",
-            lambda: tracer_from_debug(debug, rank=self.rank, path="pool"),
-            rank=self.rank,
+            lambda: tracer_from_debug(debug, rank=ctx.rank, path="pool"),
+            rank=ctx.rank,
         )
         if tracer is None:
             return None
         logging.info(
             "[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
             "chunks=%s probe_token=%s",
-            self.rank,
+            ctx.rank,
             len(wave.uuids),
             len(wave.plan.segments),
             len(wave.plan.chunks),
@@ -2163,7 +2319,8 @@ class PrefillEngine:
         return tracer
 
     def _record_unsharded_epilogue_gather(
-        self, worker, tracer, selected, *, num_global_rows
+        self, ctx: UnshardedEpilogueGatherContext, tracer, selected, *,
+        num_global_rows,
     ) -> None:
         """Hand-write the gather record for a path with NO sharded gather.
 
@@ -2178,11 +2335,15 @@ class PrefillEngine:
 
         Where a gather DOES exist the tracer goes into it (``trace=``) and the
         record is written from inside, with the real shard and owned mask.
+
+        Its OWN context, not the probe one the three recorders share: this
+        operation never reads the probe state (its caller already holds the
+        tracer) and it does read the parallel manager, which the probe context
+        does not carry. Nothing is written through the seam -- the record goes
+        onto the caller's tracer -- so this declares no outcome, and the
+        closure captures the caller's tracer, the caller's rows and this
+        frozen context.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
 
         from batchgen.prefix_reuse.epilogue_trace import record_unsharded_gather
         from batchgen.prefix_reuse.probe_guard import run_probe
@@ -2193,12 +2354,12 @@ class PrefillEngine:
                 tracer,
                 selected,
                 num_global_rows=num_global_rows,
-                manager=self.parallel_manager,
+                manager=ctx.parallel_manager,
             ),
-            rank=self.rank,
+            rank=ctx.rank,
         )
 
-    def _new_pool_kernel_dump_recorder(self, worker, wave):
+    def _new_pool_kernel_dump_recorder(self, ctx: PoolProbeContext, wave):
         """Server-level ``debug_state.prefix_pool_dump_kernel_args``.
 
         Same seam as ``prefix_pool_offload_check``: the key is read from the
@@ -2211,12 +2372,15 @@ class PrefillEngine:
         The flag check comes BEFORE the import, and the whole setup - mode
         parse, directory resolution, the recorder's own ``makedirs`` - is
         guarded: an undumpable directory must cost the dump, not the wave.
+
+        The probe read is a sibling with the SAME context, so it is called
+        with this one. None of the three setup closures captures the worker:
+        they hold ``debug``, the two parsed locals, the caller's wave and this
+        frozen context, and the recorder that comes back carries only the
+        rank, the mode, the directory, the page tokens and a copy of the
+        wave's global ids.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        debug = self._pool_probe_debug(wave)
+        debug = self._pool_probe_debug(ctx, wave)
         if debug is None:
             return None
         from batchgen.prefix_reuse.kernel_dump import (
@@ -2231,21 +2395,21 @@ class PrefillEngine:
         mode = run_probe(
             "kernel_dump.setup",
             lambda: parse_dump_mode(debug.get(_POOL_DUMP_FLAG)),
-            rank=self.rank,
+            rank=ctx.rank,
         )
         if mode is None:
             return None
         directory = run_probe(
             "kernel_dump.setup",
-            lambda: dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank),
-            rank=self.rank,
+            lambda: dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), ctx.rank),
+            rank=ctx.rank,
         )
         if directory is None:
             return None
         logging.info(
             "[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
             "segments=%s page_tokens=%s",
-            self.rank,
+            ctx.rank,
             mode,
             directory,
             len(wave.uuids),
@@ -2255,13 +2419,13 @@ class PrefillEngine:
         return run_probe(
             "kernel_dump.setup",
             lambda: PoolKernelDumpRecorder(
-                rank=self.rank,
+                rank=ctx.rank,
                 mode=mode,
                 directory=directory,
                 page_tokens=wave.page_tokens,
                 global_ids=list(wave.global_ids),
             ),
-            rank=self.rank,
+            rank=ctx.rank,
         )
 
     def _pool_pad_poison_enabled(
@@ -2297,7 +2461,10 @@ class PrefillEngine:
         )
         return True
 
-    def _new_pool_offload_check_recorder(self, worker, wave):
+    def _new_pool_offload_check_recorder(
+        self, ctx: PoolProbeContext, wave, *,
+        _debug_flag_enabled: Callable[[object], bool],
+    ):
         """Server-level ``debug_state.prefix_pool_offload_check``.
 
         The key is part of the debug state the wave adopted, so an operator
@@ -2307,12 +2474,15 @@ class PrefillEngine:
 
         The flag check comes BEFORE the import: on a production wave
         ``_pool_probe_debug`` has already answered None.
+
+        The probe read is a sibling with the SAME context, so it is called
+        with this one; the flag reader is the worker's own method of that
+        name, which is what the pre-move body called and what the pad-poison
+        predicate already takes. The setup closure captures the caller's wave
+        and this frozen context, and the recorder it returns carries the rank
+        and the page tokens only.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        debug = self._pool_probe_debug(wave)
+        debug = self._pool_probe_debug(ctx, wave)
         if debug is None:
             return None
         from batchgen.prefix_reuse.offload_check import (
@@ -2320,12 +2490,12 @@ class PrefillEngine:
             PoolOffloadCheckRecorder,
         )
 
-        if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
+        if not _debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
             return None
         logging.info(
             "[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
             "members=%s segments=%s page_tokens=%s",
-            self.rank,
+            ctx.rank,
             len(wave.uuids),
             len(wave.plan.segments),
             wave.page_tokens,
@@ -2335,12 +2505,16 @@ class PrefillEngine:
         return run_probe(
             "offload_check.setup",
             lambda: PoolOffloadCheckRecorder(
-                rank=self.rank, page_tokens=wave.page_tokens
+                rank=ctx.rank, page_tokens=wave.page_tokens
             ),
-            rank=self.rank,
+            rank=ctx.rank,
         )
 
-    def _finish_prefill_pool_wave(self, worker) -> None:
+    def _finish_prefill_pool_wave(
+        self, ctx: PrefillPoolWaveFinishContext, *,
+        _owns_host_kv: Callable[[object], bool],
+        _host_views_by_group: Callable[[], dict],
+    ) -> PrefillPoolWaveFinishOutcome:
         """After every D2H retired: publish the segments, pin members to them.
 
         The Host pages and the prefix-cache nodes are the serve group's leader's,
@@ -2348,33 +2522,48 @@ class PrefillEngine:
         the leader's pages and has nothing to publish: it drops the page-table
         record it mirrored for the pseudo sequences and keeps the mirrored prefix
         state. The leader's member refcount is what keeps those pages alive.
+
+        The one worker attribute this body touches is the planned wave, and it
+        CLEARS it: the pre-move statements assigned ``None`` twice, once
+        before the publication and once in the ``finally`` that covers it, and
+        both travel back in :class:`PrefillPoolWaveFinishOutcome` as a local
+        of the attribute's own name. The "no wave in flight" exit leaves the
+        field at the sentinel, which is why ``None`` could not be the
+        sentinel. On a publication that RAISES, the clear is lost: the
+        exception leaves this frame before the delegator can apply it. Every
+        call site has no ``except`` handler above it (``generate`` ->
+        ``generate_persistent``, which the worker main loop catches only to
+        classify the process teardown), and every reader of the attribute is
+        on the prefill path that same exception ends, so no caller observes
+        the stale handle.
+
+        Neither collaborator shares this read set -- the host-KV ownership
+        predicate is the worker's leadership test and the view map is rebuilt
+        per phase -- so both arrive as the worker delegators the pre-move body
+        called, and the view map is asked twice exactly as it was.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
-        wave = self._prefill_pool_wave
+        wave = ctx._prefill_pool_wave
         if wave is None:
-            return
-        self._prefill_pool_wave = None
+            return PrefillPoolWaveFinishOutcome()
+        _prefill_pool_wave = None
         if not all(
-            self._owns_host_kv(self.global_batch.get_sequence(uuid))
+            _owns_host_kv(ctx.pool.get_sequence(uuid))
             for uuid in wave.uuids
         ):
-            for view in self._host_views_by_group().values():
+            for view in _host_views_by_group().values():
                 view.unregister_sequences(list(wave.segment_sids.values()))
-            return
+            return PrefillPoolWaveFinishOutcome(_prefill_pool_wave)
         from batchgen.prefix_reuse.wave_runtime import (
             attach_pool_members,
             commit_pool_segments,
         )
 
-        runtime = self.prefix_cache_runtime_config
+        runtime = ctx.prefix_runtime
         try:
             segment_handles = commit_pool_segments(
                 wave,
-                coordinator=self.prefix_cache_coordinator,
-                worker_views_by_group=self._host_views_by_group(),
+                coordinator=ctx.prefix_coordinator,
+                worker_views_by_group=_host_views_by_group(),
                 namespace_digest=runtime.namespace_digest,
                 publish_boundary_tokens=runtime.publish_boundary_tokens,
                 max_scan_nodes=runtime.max_nodes,
@@ -2382,21 +2571,22 @@ class PrefillEngine:
             try:
                 member_handles = attach_pool_members(
                     wave,
-                    coordinator=self.prefix_cache_coordinator,
+                    coordinator=ctx.prefix_coordinator,
                     namespace_digest=runtime.namespace_digest,
                 )
             finally:
                 for handle in segment_handles:
-                    self.prefix_cache_coordinator.release_attachment(handle)
+                    ctx.prefix_coordinator.release_attachment(handle)
             for index, handle in member_handles.items():
                 global_id = wave.global_ids[index]
-                self._prefix.append_commit_handle(global_id, handle)
+                ctx.prefix.append_commit_handle(global_id, handle)
         finally:
             # Success or failure, the wave object is done. Segment Host pages
             # stay tracked in _pool_sid_members/_pool_member_sids, so after a
             # failed commit/attach the per-member release lane still frees and
             # unregisters every pseudo-sid.
-            self._prefill_pool_wave = None
+            _prefill_pool_wave = None
+        return PrefillPoolWaveFinishOutcome(_prefill_pool_wave)
 
 
     def prefill(self, worker, batch: list[int]):

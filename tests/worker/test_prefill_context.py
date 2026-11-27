@@ -21,6 +21,18 @@ sequence of ``dist`` calls a run issues and asserts the exact expected order,
 another asserts from the AST that each collective stands under the one
 condition it already had (the process-group handle) and under nothing else.
 
+D7.4, the fourth stage: wave planning and the pooled instrumentation. It
+carries ONE collective, the wave planner's budget reduction, and the pins
+below hold it in place three ways -- its enclosing condition, its statement
+position, and the ordered sequence a real run issues, which also proves it
+still precedes the plan-digest gather one level down. The planner is where
+design clause C7 lives, so the budget arithmetic is pinned both as source
+identities and by running the body: a wave is bounded by the compute-token
+budget, never by how many sequences it holds. Three of the four probe
+instruments SHARE D7.1's `PoolProbeContext`, because their read set is
+exactly its two fields; the fourth reads the parallel manager instead. The
+wave epilogue is the stage's one worker write and it CLEARS the planned wave.
+
 The bodies are compiled out of the engine's own AST
 (``tests/prefill_source.py``), because importing the engine pulls in the
 compiled core engine and UCX; the delegators are compiled out of the real
@@ -41,6 +53,7 @@ from tests.prefill_source import (
     D7_1_METHODS,
     D7_2_METHODS,
     D7_3_METHODS,
+    D7_4_METHODS,
     METHODS,
     OUTCOME_METHODS,
     STATELESS_METHODS,
@@ -123,7 +136,17 @@ def wave(*, uuids=("a", "b"), segments=(), page_tokens=4, chunks=()):
 _CONSUMING_CALLS = {
     "sum", "any", "all", "min", "max", "len", "tuple", "list", "set", "dict",
     "sorted", "zip",
+    # D7.4: the wave planner picks the first matching hit page with
+    # ``next(genexp, None)``, which consumes the generator on the spot just as
+    # the reductions above do.
+    "next",
 }
+# A METHOD that likewise consumes its generator argument on the spot. D7.4's
+# planner formats its decline list with ``", ".join(genexp)``; recognising the
+# consumer by name keeps the invariant ("no generator crosses the seam")
+# exactly as strict as a bare-builtin allowlist did, rather than accepting any
+# call that happens to take a generator.
+_CONSUMING_METHODS = {"join"}
 
 
 @pytest.mark.parametrize("name", sorted(METHODS))
@@ -164,8 +187,13 @@ def test_converted_methods_have_no_worker_or_rebinding(name):
                    for n in ast.walk(node))
     consumed = {
         id(arg) for call in ast.walk(node)
-        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-        and call.func.id in _CONSUMING_CALLS
+        if isinstance(call, ast.Call)
+        and (
+            (isinstance(call.func, ast.Name)
+             and call.func.id in _CONSUMING_CALLS)
+            or (isinstance(call.func, ast.Attribute)
+                and call.func.attr in _CONSUMING_METHODS)
+        )
         for arg in call.args
     }
     for n in ast.walk(node):
@@ -213,8 +241,9 @@ def test_every_context_is_frozen():
         value for name, value in sorted(ns.items())
         if isinstance(value, type) and name.endswith("Context")
     ]
-    # Eight from D7.1, four from D7.2, eight from D7.3.
-    assert len(contexts) == 20
+    # Eight from D7.1, four from D7.2, eight from D7.3, four from D7.4 (whose
+    # three probe recorders reuse D7.1's probe context instead of declaring).
+    assert len(contexts) == 24
     for context in contexts:
         instance = context(**{field.name: None for field in fields(context)})
         with pytest.raises(FrozenInstanceError):
@@ -228,8 +257,8 @@ def test_every_outcome_is_frozen_and_declares_no_container():
         value for name, value in sorted(ns.items())
         if isinstance(value, type) and name.endswith("Outcome")
     ]
-    # One from D7.2, three from D7.3.
-    assert len(outcomes) == 4
+    # One from D7.2, three from D7.3, one from D7.4.
+    assert len(outcomes) == 5
     for outcome in outcomes:
         instance = outcome()
         with pytest.raises(FrozenInstanceError):
@@ -280,7 +309,10 @@ def test_no_context_carries_a_field_its_operations_do_not_read():
             and isinstance(n.value, ast.Name) and n.value.id == "ctx"
         )
     ns, _ = runtime()
-    assert len(reads) == 20
+    # One entry per DISTINCT annotation: 24 contexts, and the probe context is
+    # annotated five times (D7.1's pair plus D7.4's three recorders), so the
+    # union it is measured against spans all five bodies.
+    assert len(reads) == 24
     for context_name, read in sorted(reads.items()):
         declared = {field.name for field in fields(ns[context_name])}
         assert declared == read, (context_name, declared ^ read)
@@ -309,7 +341,7 @@ def test_the_probe_pair_shares_one_context_because_their_reads_coincide():
 
 
 def test_the_stage_converted_exactly_its_own_methods():
-    """The file still holds worker-shaped operations: this is stage two of seven.
+    """The file still holds worker-shaped operations: this is stage four of seven.
 
     The later stages of this engine convert the rest, so the guard that the
     whole FILE names no worker belongs to the last one, not here.
@@ -325,16 +357,17 @@ def test_the_stage_converted_exactly_its_own_methods():
             converted.add(node.name)
     assert converted == METHODS
     assert not worker_shaped & METHODS
-    assert worker_shaped, "nothing left to convert, but D7.3 is not the last stage"
-    # The three stages are disjoint, and what is left is what D7.4-D7.7 take:
-    # fourteen converted in D7.1, five in D7.2, nine here, fourteen still
-    # worker-shaped.
+    assert worker_shaped, "nothing left to convert, but D7.4 is not the last stage"
+    # The four stages are disjoint, and what is left is what D7.5-D7.7 take:
+    # fourteen converted in D7.1, five in D7.2, nine in D7.3, seven here, and
+    # the seven execution/preparation bodies still worker-shaped.
     assert D7_1_METHODS.isdisjoint(D7_2_METHODS)
     assert D7_3_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS)
+    assert D7_4_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS | D7_3_METHODS)
     assert (
         len(D7_1_METHODS), len(D7_2_METHODS), len(D7_3_METHODS),
-        len(worker_shaped),
-    ) == (14, 5, 9, 14)
+        len(D7_4_METHODS), len(worker_shaped),
+    ) == (14, 5, 9, 7, 7)
 
 
 # --------------------------------------------------------------------------- #
@@ -3551,3 +3584,1629 @@ def test_every_d7_3_delegator_names_no_worker_in_its_engine_call(monkeypatch):
             assert not any(isinstance(kw.value, ast.Name)
                            and kw.value.id == "self"
                            for kw in call.keywords), node.name
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the stage's own seam shape
+# --------------------------------------------------------------------------- #
+D7_4_CONTEXTS = {
+    "_plan_prefill_micro_batches": "PrefillMicroBatchPlanContext",
+    "_plan_prefill_pool_wave": "PrefillPoolWavePlanContext",
+    "_finish_prefill_pool_wave": "PrefillPoolWaveFinishContext",
+    "_record_unsharded_epilogue_gather": "UnshardedEpilogueGatherContext",
+    # The three probe recorders SHARE D7.1's probe context.
+    "_new_pool_epilogue_tracer": "PoolProbeContext",
+    "_new_pool_kernel_dump_recorder": "PoolProbeContext",
+    "_new_pool_offload_check_recorder": "PoolProbeContext",
+}
+# The four pooled instruments. The three recorders coincide on the probe
+# context; the gather record does not.
+PROBE_RECORDERS = (
+    "_new_pool_epilogue_tracer",
+    "_new_pool_kernel_dump_recorder",
+    "_new_pool_offload_check_recorder",
+)
+
+
+@pytest.mark.parametrize("name", sorted(D7_4_CONTEXTS))
+def test_each_wave_operation_declares_the_context_it_reads(name):
+    node = method_node(name)
+    assert ast.unparse(node.args.args[1].annotation) == D7_4_CONTEXTS[name]
+
+
+def test_the_three_probe_recorders_share_the_probe_context_d71_declared():
+    """Reuse because the read sets coincide, not because the family does.
+
+    D7.1 wrote ``PoolProbeContext`` for the probe read and the pad-poison
+    predicate and said the recorders read the same two fields. They do: each
+    reads ``ctx.rank`` and reaches the probe state only by handing this same
+    context to the probe read, so the union over all five bodies is still
+    exactly the two declared fields -- which
+    ``test_no_context_carries_a_field_its_operations_do_not_read`` checks
+    mechanically.
+    """
+    ns, _ = runtime()
+    assert {field.name for field in fields(ns["PoolProbeContext"])} == {
+        "rank", "_phase_prefill_debug",
+    }
+    for name in PROBE_RECORDERS:
+        node = method_node(name)
+        assert ast.unparse(node.args.args[1].annotation) == "PoolProbeContext"
+        # It reaches the probe state ONLY through the sibling read, with this
+        # same context -- it never names the field itself.
+        reads = {
+            n.attr for n in ast.walk(node)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.value, ast.Name) and n.value.id == "ctx"
+        }
+        assert reads == {"rank"}, (name, reads)
+        sibling = [
+            call for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_pool_probe_debug"
+        ]
+        assert len(sibling) == 1, name
+        assert [ast.unparse(arg) for arg in sibling[0].args] == ["ctx", "wave"]
+
+
+def test_the_unsharded_gather_record_does_not_share_the_probe_context():
+    """The fourth instrument reads the manager and never the probe state."""
+    ns, _ = runtime()
+    node = method_node("_record_unsharded_epilogue_gather")
+    assert ast.unparse(node.args.args[1].annotation) == (
+        "UnshardedEpilogueGatherContext"
+    )
+    assert {f.name for f in fields(ns["UnshardedEpilogueGatherContext"])} == {
+        "rank", "parallel_manager",
+    }
+    assert not any(
+        isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+        and n.value.id == "ctx" and n.attr == "_phase_prefill_debug"
+        for n in ast.walk(node)
+    )
+    # And it never consults the shared probe read either.
+    assert not any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "_pool_probe_debug"
+        for call in ast.walk(node)
+    )
+
+
+def test_no_earlier_stages_context_was_widened_for_the_wave_stage():
+    """D7.1-D7.3's contexts keep exactly the fields they were declared with.
+
+    The one reuse of this stage adds no field, and the three tempting shares
+    were all rejected: the micro-batch planner reads the PSM handle, which is
+    ``PrefillPoolParallelContext``'s whole read set, but it also reads the
+    prefix KV budget; the wave planner reads the pool page budget, which the
+    construction context carries, but nothing else of it; the wave epilogue
+    reads the planned wave and the prefix owner, which is
+    ``PrefillPoolHostPageContext``, but also the pool, the coordinator and
+    the runtime config.
+    """
+    ns, _ = runtime()
+    assert {f.name for f in fields(ns["PrefillPoolParallelContext"])} == {
+        "parallel_manager",
+    }
+    assert [f.name for f in fields(ns["PrefillPoolWaveContext"])] == [
+        "_prefill_pool_wave",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolHostPageContext"])] == [
+        "_prefill_pool_wave", "prefix",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolConstructionContext"])] == [
+        "rank", "local_rank", "torch_device", "huggingface_ckpt_name",
+        "_prefill_pool_page_budget",
+    ]
+    # The three contexts this stage declares are annotated nowhere earlier.
+    earlier = {
+        ast.unparse(method_node(other).args.args[1].annotation)
+        for other in sorted(
+            (D7_1_METHODS | D7_2_METHODS | D7_3_METHODS) - STATELESS_METHODS
+        )
+    }
+    for name in (
+        "PrefillMicroBatchPlanContext", "PrefillPoolWavePlanContext",
+        "PrefillPoolWaveFinishContext", "UnshardedEpilogueGatherContext",
+    ):
+        assert name not in earlier, name
+
+
+def test_the_wave_stage_declares_exactly_one_outcome():
+    ns, _ = runtime()
+    assert OUTCOME_METHODS & D7_4_METHODS == {"_finish_prefill_pool_wave"}
+    assert [f.name for f in fields(ns["PrefillPoolWaveFinishOutcome"])] == [
+        "_prefill_pool_wave",
+    ]
+
+
+def test_the_wave_planner_writes_nothing_and_returns_the_wave():
+    """The planned wave is the planner's RETURN, not a worker write.
+
+    The no-worker guard already proves the body stores through no seam; this
+    pins the positive half, that the object the caller binds comes back as the
+    return value of the one pooled path.
+    """
+    node = method_node("_plan_prefill_pool_wave")
+    returns = [
+        stmt for stmt in ast.walk(node) if isinstance(stmt, ast.Return)
+    ]
+    returns.sort(key=lambda stmt: stmt.lineno)
+    assert [ast.unparse(stmt.value) for stmt in returns] == [
+        "None", "None", "None", "wave",
+    ]
+    assert not any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id.endswith("Outcome")
+        for n in ast.walk(node)
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the ONE collective keeps its position and its one condition
+# --------------------------------------------------------------------------- #
+def test_the_wave_stage_carries_exactly_one_collective():
+    """Six of the seven bodies issue none, and the seventh issues one.
+
+    Scanned over every ``dist.*`` call, not just the reductions, and over
+    every stream/event/synchronize/wait the engine could name, because a
+    stage that silently acquired one of those would be as bad as a moved
+    collective.
+    """
+    found = {}
+    for name in sorted(D7_4_METHODS):
+        node = method_node(name)
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            text = ast.unparse(call.func)
+            if text.startswith("dist.") or any(
+                part in text for part in (
+                    "all_reduce", "all_gather", "broadcast", "barrier",
+                    "synchronize", "Stream", "Event", "wait_stream",
+                    "wait_event", "record_event", "current_stream",
+                )
+            ):
+                found.setdefault(name, []).append(text)
+    assert found == {"_plan_prefill_pool_wave": ["dist.all_reduce"]}
+    assert COLLECTIVE_METHODS["_plan_prefill_pool_wave"] == "all_reduce"
+
+
+def test_the_wave_reduction_sits_between_its_tensor_and_the_reduced_reads():
+    """Statement order around the collective, not just its presence."""
+    node = method_node("_plan_prefill_pool_wave")
+    branch = next(n for n in ast.walk(node)
+                  if isinstance(n, ast.If) and _collective_calls(n, "all_reduce"))
+    assert ast.unparse(branch.test) == "group is not None"
+    assert [ast.unparse(stmt).split("=")[0].strip() for stmt in branch.body
+            if isinstance(stmt, ast.Assign)] == [
+        "budget", "total_pages", "state_slots", "hits_confirmed",
+    ]
+    assert ast.unparse(branch.body[1]) == (
+        "dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)"
+    )
+    # The three reduced values are read immediately after it, in order, and
+    # nothing stands between the reduce and the first of them.
+    assert [ast.unparse(stmt) for stmt in branch.body[2:5]] == [
+        "total_pages = int(budget[0].item())",
+        "state_slots = int(budget[1].item())",
+        "hits_confirmed = bool(int(budget[2].item()))",
+    ]
+    assert len(branch.body) == 5
+
+
+def test_the_reduction_precedes_the_plan_identity_call_in_the_source():
+    """The pair's ORDER: reduce first, then the digest gather one level down.
+
+    ``_check_pool_plan_identical`` is where the ``all_gather`` lives (D7.3);
+    the planner now reaches it as a collaborator callable, and that call must
+    stay after the reduction or two ranks of a serve group would pair a
+    reduce with a gather.
+    """
+    node = method_node("_plan_prefill_pool_wave")
+    reduce_line = _collective_calls(node, "all_reduce")[0].lineno
+    identity = [
+        call for call in ast.walk(node)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        and call.func.id == "_check_pool_plan_identical"
+    ]
+    assert len(identity) == 1
+    assert reduce_line < identity[0].lineno
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: fakes for the wave planner and its epilogue
+# --------------------------------------------------------------------------- #
+class WaveTensor:
+    """The int64 vector the budget reduction carries.
+
+    Indexable like the real tensor (``budget[0].item()``) and usable as the
+    one-element digest tensor of the plan-identity check, so one fake serves
+    both collectives of a pooled wave.
+    """
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __getitem__(self, index):
+        return WaveTensor([self.values[index]])
+
+    def item(self):
+        (value,) = self.values
+        return value
+
+
+class WavePlanDist:
+    """``torch.distributed`` for the planner, recording its ordered calls.
+
+    ``peers`` is what the rest of the serve group contributes to the MIN, so a
+    tighter peer is observable; ``peer_digest`` is what the peers' plan
+    digests are, so a divergence is too.
+    """
+
+    class ReduceOp:
+        MIN = "MIN"
+
+    def __init__(self, *, log, peers=None, peer_digest=None):
+        self.log = log
+        self._peers = peers
+        self._peer_digest = peer_digest
+
+    def all_reduce(self, tensor, *, op, group):
+        self.log.append(("all_reduce", op, group, list(tensor.values)))
+        if self._peers is not None:
+            tensor.values = [
+                min(mine, peer) for mine, peer in zip(tensor.values, self._peers)
+            ]
+
+    def all_gather(self, out, tensor, *, group):
+        self.log.append(("all_gather", group, tensor.item(), len(out)))
+        for slot in out:
+            slot.values = [
+                tensor.item() if self._peer_digest is None else self._peer_digest
+            ]
+
+
+class WaveTorch:
+    """Only what the planner and the plan-identity check touch of torch."""
+
+    int64 = "int64"
+
+    @staticmethod
+    def tensor(values, *, dtype, device):
+        return WaveTensor(values)
+
+    @staticmethod
+    def zeros_like(tensor):
+        return WaveTensor([0])
+
+
+def wave_runtime(log, **extra):
+    return runtime(torch=WaveTorch(), dist=WavePlanDist(log=log, **extra))
+
+
+def plan_segments(*ids, members=None):
+    """``plan.segments``: a mapping, read both by id and by length."""
+    return {
+        segment_id: SimpleNamespace(
+            members=(members or {}).get(segment_id, (index,))
+        )
+        for index, segment_id in enumerate(ids)
+    }
+
+
+def wave_plan(*, segments=(1,), chunks=(), materialized_segments=(),
+              declined=(), members=None):
+    return SimpleNamespace(
+        segments=plan_segments(*segments, members=members),
+        chunks=tuple(chunks),
+        materialized_segments=tuple(materialized_segments),
+        declined_materialized=tuple(declined),
+        threshold=2,
+        computed_tokens=7,
+        prompt_tokens=11,
+        same_chunk_ancestors=True,
+    )
+
+
+class PlannedWave:
+    """``PoolWave`` as the planner builds it, by keyword."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.plan = kwargs["plan"]
+        self.prompts = kwargs["prompts"]
+        self.uuids = kwargs["uuids"]
+        self.global_ids = kwargs["global_ids"]
+        self.page_tokens = kwargs["page_tokens"]
+        self.total_pages = kwargs["total_pages"]
+        self.scratch_pages = kwargs["scratch_pages"]
+        self.materialized = tuple(self.plan.materialized_segments)
+        self.bound = []
+
+    def bind_materialized_host_pages(self, segment_id, source):
+        self.bound.append((segment_id, source))
+
+    def chain_tokens(self, index):
+        return 10 * (index + 1)
+
+
+def wave_plan_context(ns, *, page_budget, prompts, page_tokens=4, rank=0,
+                      psm=None, ckpt="org/model"):
+    sequences = {
+        f"u{index}": SimpleNamespace(
+            global_idx=100 + index, prompt_length=len(prompt),
+        )
+        for index, prompt in enumerate(prompts)
+    }
+    return ns["PrefillPoolWavePlanContext"](
+        rank=rank,
+        torch_device="cuda:0",
+        parallel_manager=psm if psm is not None else SimpleNamespace(),
+        huggingface_ckpt_name=ckpt,
+        pool=SimpleNamespace(get_sequence=sequences.__getitem__),
+        prefix_runtime=SimpleNamespace(
+            group_specs=[SimpleNamespace(raw_page_tokens=page_tokens)]
+        ),
+        _prefill_pool_page_budget=page_budget,
+    )
+
+
+def planner_modules(monkeypatch, *, scratch=2, plan=None, calls=None):
+    """Stub every module the planner imports, recording the plan's kwargs."""
+    calls = calls if calls is not None else {}
+    built = plan if plan is not None else wave_plan()
+
+    def plan_wave_prefix_sharing(prompts, *, materialized=(), **kwargs):
+        calls["plan"] = (list(prompts), tuple(materialized), dict(kwargs))
+        return built
+
+    def scratch_pages_bound(chunk_tokens, longest, count, page_tokens):
+        calls["scratch"] = (chunk_tokens, longest, count, page_tokens)
+        return scratch
+
+    def build_gpu_kv_config(ckpt, page_tokens):
+        calls["geometry"] = (ckpt, list(page_tokens))
+        return SimpleNamespace(name="geometry")
+
+    def order_chunk_items_by_level(value):
+        calls["level_wise"] = True
+        return value
+
+    def validate_wave_prefix_plan(value, prompts):
+        calls["validated"] = (value, list(prompts))
+
+    stub_module(monkeypatch, "batchgen.kv_cache.host_kv_mananger_config",
+                build_gpu_kv_config=build_gpu_kv_config)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.levels",
+                order_chunk_items_by_level=order_chunk_items_by_level)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.pool",
+                scratch_pages_bound=scratch_pages_bound)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.wave_plan",
+                plan_wave_prefix_sharing=plan_wave_prefix_sharing,
+                validate_wave_prefix_plan=validate_wave_prefix_plan)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.wave_runtime",
+                PoolWave=PlannedWave)
+    return calls
+
+
+def tokens_of(seq, length=None, **_):
+    return SimpleNamespace(tolist=lambda: list(range(length or 0)))
+
+
+def run_plan(ns, engine, ctx, *, uuids, token_cap=64, group=None,
+             state_slots=32, psm_layout=None, layout=(True, (), 0),
+             hits=(), hits_confirmed=True, hit_pages=None, drops=None,
+             identity=None, settled=None, replaced=None):
+    """Drive the planner from its context, with every collaborator recorded."""
+    settled = settled if settled is not None else []
+    replaced = replaced if replaced is not None else []
+    return engine._plan_prefill_pool_wave(
+        ctx,
+        list(uuids),
+        {},
+        token_cap=token_cap,
+        _trajectory_tokens=tokens_of,
+        _prefill_pool_group=lambda: group,
+        _prefill_pool_layout=lambda geometry: layout,
+        _prefill_pool_free_state_slots=lambda: state_slots,
+        _prefill_pool_psm_layout=lambda: psm_layout,
+        _materialized_prefix_hits=lambda seqs, *, page_tokens, group: (
+            list(hits), hits_confirmed, dict(hit_pages or {}),
+            dict(drops or {}),
+        ),
+        _check_pool_plan_identical=(
+            identity if identity is not None else lambda plan, group: None
+        ),
+        _replace_prefix_lookup_hits=lambda *a, **k: replaced.append((a, k)),
+        _settle_trajectory_restore_plan=lambda *a: settled.append(a),
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the one collective, observed in order at runtime
+# --------------------------------------------------------------------------- #
+def test_one_rank_per_group_plans_without_issuing_any_collective(monkeypatch):
+    log = []
+    ns, engine = wave_runtime(log)
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+
+    wave = run_plan(ns, engine, ctx, uuids=("u0", "u1"), group=None)
+
+    assert isinstance(wave, PlannedWave)
+    assert log == []
+    assert calls["plan"][2]["pool_pages"] == 18
+
+
+def test_a_serve_group_issues_the_reduce_then_the_digest_gather(monkeypatch):
+    """The ordered sequence of collectives a pooled wave really issues.
+
+    The plan-identity collaborator is the engine's OWN
+    ``_check_pool_plan_identical``, driven with its own context, so the
+    ``all_gather`` it issues lands in the same recorder. Reduce first, gather
+    second: every rank of a serve group issues exactly this pair, in this
+    order.
+    """
+    log = []
+    ns, engine = wave_runtime(log, peers=[16, 8, 1])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"], rank=3)
+    identity_ctx = ns["PoolPlanIdentityContext"](rank=3, torch_device="cuda:0")
+
+    wave = run_plan(
+        ns, engine, ctx, uuids=("u0", "u1"), group="pg", state_slots=32,
+        identity=lambda plan, group: engine._check_pool_plan_identical(
+            identity_ctx, plan, group, attn_group_size=2,
+        ),
+    )
+
+    assert [entry[0] for entry in log] == ["all_reduce", "all_gather"]
+    # This rank contributed its own three budgets; the group's MIN won.
+    assert log[0] == ("all_reduce", "MIN", "pg", [20, 32, 1])
+    assert log[1][1] == "pg" and log[1][3] == 2
+    assert wave.total_pages == 16
+    assert calls["plan"][2]["pool_pages"] == 14
+
+
+def test_a_wave_the_budget_declines_issues_the_reduce_and_nothing_else(
+    monkeypatch,
+):
+    """The reduce is NOT conditional on the wave being pooled.
+
+    Every rank of the group reaches it, and the decline that follows is taken
+    on the reduced values, so it is group-uniform. Only the gather is skipped,
+    because the body returns before the plan exists.
+    """
+    log = []
+    ns, engine = wave_runtime(log, peers=[3, 32, 1])
+    planner_modules(monkeypatch, scratch=4)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+    settled = []
+
+    assert run_plan(
+        ns, engine, ctx, uuids=("u0", "u1"), group="pg", settled=settled,
+    ) is None
+    assert [entry[0] for entry in log] == ["all_reduce"]
+    # The decline still settles the wave's restore plan, with its reason.
+    assert "pool 3 pages <= scratch 4" in settled[0][2]
+
+
+def test_an_unmeasured_budget_declines_before_the_group_is_consulted(
+    monkeypatch,
+):
+    """The first wave after startup issues no collective at all."""
+    log = []
+    ns, engine = wave_runtime(log)
+    planner_modules(monkeypatch)
+    ctx = wave_plan_context(
+        ns, page_budget=None, prompts=["ab"], psm=Explode("parallel_manager"),
+    )
+    settled = []
+
+    assert run_plan(
+        ns, engine, ctx, uuids=("u0",), group="pg", settled=settled,
+        identity=lambda plan, group: pytest.fail("compared"),
+    ) is None
+    assert log == []
+    assert settled[0][2] == "the prefill-phase pool budget is not yet measured"
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: design clause C7 -- the wave is bounded by the token budget
+# --------------------------------------------------------------------------- #
+def test_the_chunk_bound_is_the_token_cap_however_many_sequences_there_are(
+    monkeypatch,
+):
+    """C7, run: a sequence COUNT must not be what bounds the wave.
+
+    Two sequences and then six, at a page budget wide enough that the pool
+    cap is above the server cap: the planner is handed the token cap both
+    times, unchanged, and the only thing the count moves is the segment
+    allowance and the scratch bound.
+    """
+    ns, engine = wave_runtime([])
+    for count in (2, 6):
+        calls = planner_modules(monkeypatch)
+        prompts = ["ab"] * count
+        ctx = wave_plan_context(ns, page_budget=4096, prompts=prompts)
+        run_plan(
+            ns, engine, ctx, uuids=tuple(f"u{i}" for i in range(count)),
+            token_cap=64, psm_layout={"num_layers": 2}, state_slots=32,
+        )
+        assert calls["plan"][2]["chunk_tokens"] == 64, count
+        assert calls["scratch"][0] == 64, count
+
+
+def test_the_chunk_bound_falls_to_the_page_identity_when_that_is_tighter(
+    monkeypatch,
+):
+    """The exact identity, not an approximation of it.
+
+    ``max(0, (total_pages - len(prompts)) // 2) * page_tokens``: 16 pages, two
+    prompts, 4 tokens a page -> (16 - 2) // 2 * 4 = 28, below the 64-token
+    server cap, so 28 is what the planner gets. The integer division
+    truncates: 17 pages gives (17 - 2) // 2 = 7, the same 28.
+    """
+    ns, engine = wave_runtime([])
+    for pages, expected in ((16, 28), (17, 28), (18, 32)):
+        calls = planner_modules(monkeypatch)
+        ctx = wave_plan_context(ns, page_budget=pages, prompts=["ab", "cd"])
+        run_plan(
+            ns, engine, ctx, uuids=("u0", "u1"), token_cap=64,
+            psm_layout={"num_layers": 2},
+        )
+        assert calls["plan"][2]["chunk_tokens"] == expected, pages
+        assert calls["scratch"][0] == expected, pages
+
+
+def test_a_model_without_a_psm_layout_keeps_the_whole_token_cap(monkeypatch):
+    """No pool-page cap at all: the wave is the server cap's, as it was."""
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=16, prompts=["ab", "cd"])
+
+    run_plan(ns, engine, ctx, uuids=("u0", "u1"), token_cap=64,
+             psm_layout=None)
+
+    assert calls["plan"][2]["chunk_tokens"] == 64
+
+
+def test_the_pool_pages_are_the_budget_minus_the_scratch_bound(monkeypatch):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch, scratch=5)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"])
+
+    run_plan(ns, engine, ctx, uuids=("u0",))
+
+    assert calls["plan"][2]["pool_pages"] == 15
+
+
+def test_the_segment_allowance_is_the_spare_slots_and_never_negative(
+    monkeypatch,
+):
+    """``max(0, state_slots - len(prompts))``, and absent at "no such state"."""
+    ns, engine = wave_runtime([])
+    for slots, expected in ((5, 3), (2, 0), (0, 0)):
+        calls = planner_modules(monkeypatch, plan=wave_plan(segments=()))
+        ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+        run_plan(ns, engine, ctx, uuids=("u0", "u1"), state_slots=slots)
+        assert calls["plan"][2]["max_computed_segments"] == expected, slots
+    calls = planner_modules(monkeypatch, plan=wave_plan(segments=()))
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+    run_plan(ns, engine, ctx, uuids=("u0", "u1"), state_slots=-1)
+    assert "max_computed_segments" not in calls["plan"][2]
+
+
+def test_the_two_refusals_keep_their_comparison_operand_order():
+    """C7/K3 as source identities: the arithmetic is an exact expression.
+
+    Pinned textually because a re-association, a flipped operand or a changed
+    rounding direction would each change which waves are admitted while every
+    behavioural test above still passed on its own numbers.
+    """
+    node = method_node("_plan_prefill_pool_wave")
+    body = ast.unparse(node)
+    assert "pool_chunk_tokens = max(0, (total_pages - len(prompts)) // 2) * page_tokens" in body
+    assert "if pool_chunk_tokens < chunk_tokens:" in body
+    assert "pool_pages=total_pages - scratch" in body
+    assert "if total_pages <= scratch:" in body
+    assert "plan_kwargs['max_computed_segments'] = max(0, state_slots - len(prompts))" in body
+    assert "state_slots_needed = len(plan.segments) - len(plan.materialized_segments) + len(prompts)" in body
+    assert "if not plan.segments or 0 <= state_slots < state_slots_needed:" in body
+    # The cap itself is the delegator's value, never recomputed here.
+    assert "chunk_tokens = token_cap" in body
+    assert "_server_prefill_token_cap" not in body
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the rest of the wave planner's behaviour, from its context
+# --------------------------------------------------------------------------- #
+def test_the_geometry_is_built_from_the_contexts_checkpoint_and_page_tokens(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(
+        ns, page_budget=20, prompts=["ab"], page_tokens=64, ckpt="org/k3",
+    )
+
+    run_plan(ns, engine, ctx, uuids=("u0",))
+
+    assert calls["geometry"] == ("org/k3", [64])
+    assert calls["plan"][2]["block_tokens"] == 64
+
+
+def test_the_prompts_come_from_the_trajectory_reader_at_each_prompt_length():
+    ns, engine = wave_runtime([])
+    seen = []
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["abc", "de"])
+
+    def reader(seq, length=None, **_):
+        seen.append((seq.global_idx, length))
+        return SimpleNamespace(tolist=lambda: list(range(length)))
+
+    with pytest.MonkeyPatch.context() as patch:
+        calls = planner_modules(patch)
+        engine._plan_prefill_pool_wave(
+            ctx, ["u0", "u1"], {}, token_cap=64,
+            _trajectory_tokens=reader,
+            _prefill_pool_group=lambda: None,
+            _prefill_pool_layout=lambda geometry: (True, (), 0),
+            _prefill_pool_free_state_slots=lambda: 32,
+            _prefill_pool_psm_layout=lambda: None,
+            _materialized_prefix_hits=lambda seqs, *, page_tokens, group: (
+                [], True, {}, {},
+            ),
+            _check_pool_plan_identical=lambda plan, group: None,
+            _replace_prefix_lookup_hits=lambda *a, **k: None,
+            _settle_trajectory_restore_plan=lambda *a: None,
+        )
+    assert seen == [(100, 3), (101, 2)]
+    assert calls["plan"][0] == [[0, 1, 2], [0, 1]]
+
+
+def test_a_level_wise_model_reorders_its_plan_and_shares_its_chunk(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(
+        ns, page_budget=20, prompts=["ab"],
+        psm=psm(supports_group_pool_prefill=lambda: True),
+    )
+
+    run_plan(ns, engine, ctx, uuids=("u0",), layout=(True, (), 0))
+
+    assert calls["plan"][2]["same_chunk_ancestors"] is True
+    assert calls.get("level_wise") is True
+
+
+def test_a_psm_that_declares_nothing_leaves_the_plan_in_planner_order(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"])
+
+    run_plan(ns, engine, ctx, uuids=("u0",), layout=(True, (), 0))
+
+    assert "level_wise" not in calls
+    # with_v is True, so a non-level-wise model does not share its chunk and
+    # the DSA index-key reservation stays off.
+    assert calls["plan"][2]["same_chunk_ancestors"] is False
+    assert calls["plan"][2]["chunk_keys"] is None
+
+
+def test_a_dsa_model_reserves_its_index_key_window(monkeypatch):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"])
+
+    run_plan(ns, engine, ctx, uuids=("u0",), layout=(False, (0,), 64))
+
+    assert calls["plan"][2]["same_chunk_ancestors"] is True
+    assert calls["plan"][2]["chunk_keys"] == 8 * 1024 * 1024
+
+
+def test_a_wave_with_no_segment_declines_and_settles_its_restore_plan(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    planner_modules(monkeypatch, plan=wave_plan(segments=()))
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"])
+    settled, replaced = [], []
+
+    assert run_plan(
+        ns, engine, ctx, uuids=("u0",), settled=settled, replaced=replaced,
+    ) is None
+    # A decline keeps its lookup hits: only the pooled return releases them.
+    assert replaced == []
+    assert "0 segment(s)" in settled[0][2]
+
+
+def test_the_pooled_return_releases_the_hits_at_their_chain_ends(monkeypatch):
+    ns, engine = wave_runtime([])
+    planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+    settled, replaced = [], []
+
+    wave = run_plan(
+        ns, engine, ctx, uuids=("u0", "u1"), settled=settled,
+        replaced=replaced,
+    )
+
+    assert isinstance(wave, PlannedWave)
+    (seqs, states, chains), kwargs = replaced[0]
+    assert chains == [10, 20]
+    assert kwargs == {"retain": frozenset(), "restore_boundaries": {}}
+    assert settled[0][2] == "the wave plan does not materialize its frontier"
+
+
+def test_a_materialized_segment_binds_the_host_pages_its_leader_recorded(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    planner_modules(
+        monkeypatch,
+        plan=wave_plan(segments=(7,), materialized_segments=(7,),
+                       members={7: (0,)}),
+    )
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+    replaced = []
+
+    wave = run_plan(
+        ns, engine, ctx, uuids=("u0", "u1"), hits=(), hit_pages={0: [71, 72]},
+        replaced=replaced,
+    )
+
+    assert wave.bound == [(7, [71, 72])]
+    # The materialized row, and only it, restores at its chain end.
+    (_, _, _), kwargs = replaced[0]
+    assert kwargs["restore_boundaries"] == {0: 10}
+    assert kwargs["retain"] == frozenset({0})
+
+
+def test_a_follower_without_a_record_binds_nothing_and_still_plans(
+    monkeypatch,
+):
+    ns, engine = wave_runtime([])
+    planner_modules(
+        monkeypatch,
+        plan=wave_plan(segments=(7,), materialized_segments=(7,),
+                       members={7: (0,)}),
+    )
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab", "cd"])
+
+    wave = run_plan(ns, engine, ctx, uuids=("u0", "u1"), hit_pages={})
+
+    assert wave.bound == []
+
+
+def test_an_unconfirmed_hit_set_is_dropped_by_name_before_the_plan(
+    monkeypatch, caplog,
+):
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"], rank=4)
+    hit = SimpleNamespace(index=0)
+
+    with caplog.at_level("WARNING"):
+        run_plan(
+            ns, engine, ctx, uuids=("u0",), hits=(hit,),
+            hits_confirmed=False,
+        )
+
+    assert calls["plan"][1] == ()
+    assert "could not confirm the mirrored frontier set" in caplog.text
+
+
+def test_a_model_whose_pool_cannot_read_its_own_chunk_drops_its_hits(
+    monkeypatch, caplog,
+):
+    """with_v and no level-wise declaration: same_chunk_ancestors is False."""
+    ns, engine = wave_runtime([])
+    calls = planner_modules(monkeypatch)
+    ctx = wave_plan_context(ns, page_budget=20, prompts=["ab"])
+    hit = SimpleNamespace(index=0)
+
+    with caplog.at_level("INFO"):
+        run_plan(ns, engine, ctx, uuids=("u0",), hits=(hit,),
+                 layout=(True, (), 0))
+
+    assert calls["plan"][1] == ()
+    assert "does not read a segment resident in its own chunk" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the micro-batch planner
+# --------------------------------------------------------------------------- #
+def micro_batch_context(ns, *, budget=None, psm_declares=None):
+    return ns["PrefillMicroBatchPlanContext"](
+        parallel_manager=(
+            SimpleNamespace() if psm_declares is None
+            else psm(prefill_uses_streamed_sp8=lambda: psm_declares)
+        ),
+        _prefill_prefix_kv_budget_bytes=budget,
+    )
+
+
+def micro_runtime():
+    """The planner's bodies with the real packer replaced by a recorder."""
+    log = []
+
+    def build(seq_lengths, token_cap, *, l2_balance, single_sequence_only,
+              prefix_hits, kv_pages, kv_page_cap):
+        log.append({
+            "seq_lengths": list(seq_lengths), "token_cap": token_cap,
+            "l2_balance": l2_balance,
+            "single_sequence_only": single_sequence_only,
+            "prefix_hits": list(prefix_hits), "kv_pages": list(kv_pages),
+            "kv_page_cap": kv_page_cap,
+        })
+        return [(0, len(seq_lengths))], 99
+
+    ns, engine = runtime(build_prefill_micro_batches=build)
+    return ns, engine, log
+
+
+def plan_micro(engine, ctx, *, token_cap=64, attn_group_size=1,
+               seq_lengths=(8,), full=(8,), cached=(0,), kv_config=None):
+    return engine._plan_prefill_micro_batches(
+        ctx, list(seq_lengths), list(full), list(cached),
+        token_cap=token_cap,
+        attn_group_size=attn_group_size,
+        _prefix_materialization_kv_config=(
+            kv_config if kv_config is not None
+            else lambda lengths: pytest.fail("resolved the KV config")
+        ),
+    )
+
+
+def test_a_wave_with_no_prefix_hit_reads_neither_budget_nor_geometry():
+    ns, engine, log = micro_runtime()
+    ctx = micro_batch_context(ns, budget=Explode("budget"))
+
+    micro_batches, cap, single = plan_micro(
+        engine, ctx, seq_lengths=(8, 8), full=(8, 8), cached=(0, 0),
+    )
+
+    assert (micro_batches, cap, single) == ([(0, 2)], 99, False)
+    assert log[0]["prefix_hits"] == [False, False]
+    assert log[0]["kv_pages"] == [0, 0] and log[0]["kv_page_cap"] == 0
+    assert log[0]["token_cap"] == 64
+
+
+def test_a_prefix_hit_without_a_measured_budget_is_refused_by_name():
+    ns, engine, _ = micro_runtime()
+    ctx = micro_batch_context(ns, budget=None)
+
+    with pytest.raises(RuntimeError, match="no prefill-phase prefix KV budget"):
+        plan_micro(engine, ctx, seq_lengths=(8,), full=(1280,), cached=(1272,))
+
+
+def test_a_prefix_hit_inside_a_serve_group_is_refused_by_name():
+    ns, engine, _ = micro_runtime()
+    ctx = micro_batch_context(ns, budget=10 ** 9)
+
+    with pytest.raises(RuntimeError, match="rank-local"):
+        plan_micro(
+            engine, ctx, attn_group_size=4,
+            seq_lengths=(8,), full=(1280,), cached=(1272,),
+        )
+
+
+def test_the_page_cap_is_the_budget_over_the_page_bytes(monkeypatch):
+    ns, engine, log = micro_runtime()
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.materialization",
+        gpu_kv_page_bytes=lambda config: 100,
+        temporary_kv_pages=lambda length, page_tokens: length // page_tokens,
+    )
+    ctx = micro_batch_context(ns, budget=1050)
+    seen = []
+
+    plan_micro(
+        engine, ctx, seq_lengths=(8, 8), full=(256, 512), cached=(248, 504),
+        kv_config=lambda lengths: (
+            seen.append(list(lengths)),
+            SimpleNamespace(page_size_tokens=128),
+        )[1],
+    )
+
+    # The config is resolved for ONE sequence, as the pre-move body did.
+    assert seen == [[1]]
+    assert log[0]["kv_pages"] == [2, 4]
+    # Integer division, truncating: 1050 // 100 == 10.
+    assert log[0]["kv_page_cap"] == 10
+    assert log[0]["prefix_hits"] == [True, True]
+
+
+@pytest.mark.parametrize("declares,expected", [(True, True), (False, False)])
+def test_the_single_sequence_arm_is_what_the_psm_declares(declares, expected):
+    ns, engine, log = micro_runtime()
+    ctx = micro_batch_context(ns, psm_declares=declares)
+
+    _, _, single = plan_micro(engine, ctx, seq_lengths=(128,), full=(128,),
+                              token_cap=64)
+
+    assert single is expected
+    assert log[0]["single_sequence_only"] is expected
+
+
+def test_a_psm_that_declares_nothing_never_runs_single_sequence():
+    ns, engine, _ = micro_runtime()
+    ctx = micro_batch_context(ns)
+
+    _, _, single = plan_micro(engine, ctx, seq_lengths=(128,), full=(128,),
+                              token_cap=64)
+
+    assert single is False
+
+
+def test_a_cap_no_sequence_exceeds_leaves_the_declaration_unread():
+    """Short-circuit order: the length test precedes the PSM question."""
+    ns, engine, _ = micro_runtime()
+    ctx = ns["PrefillMicroBatchPlanContext"](
+        parallel_manager=Explode("parallel_manager"),
+        _prefill_prefix_kv_budget_bytes=None,
+    )
+
+    _, _, single = plan_micro(engine, ctx, seq_lengths=(8,), full=(8,),
+                              token_cap=64)
+
+    assert single is False
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the four pooled instruments
+# --------------------------------------------------------------------------- #
+def probe_wave(*, uuids=("a", "b"), segments=(), page_tokens=64,
+               global_ids=(64, 65), debug=None):
+    return SimpleNamespace(
+        uuids=list(uuids),
+        global_ids=list(global_ids),
+        page_tokens=page_tokens,
+        plan=SimpleNamespace(segments=tuple(segments), chunks=()),
+        probe_debug=debug,
+        probe_debug_read=debug is not None,
+    )
+
+
+def test_an_unarmed_wave_arms_no_instrument_and_imports_nothing():
+    ns, engine = runtime()
+    ctx = probe_context(ns, {})
+    wave = probe_wave()
+
+    assert engine._new_pool_epilogue_tracer(ctx, wave) is None
+    assert engine._new_pool_kernel_dump_recorder(ctx, wave) is None
+    assert engine._new_pool_offload_check_recorder(
+        ctx, wave, _debug_flag_enabled=lambda value: pytest.fail("read"),
+    ) is None
+
+
+def test_the_epilogue_tracer_is_what_the_helper_built_for_this_rank(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    seen = []
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.epilogue_trace",
+        tracer_from_debug=lambda debug, *, rank, path: (
+            seen.append((dict(debug), rank, path)),
+            SimpleNamespace(probe_token="tok"),
+        )[1],
+    )
+    stub_module(monkeypatch, "batchgen.prefix_reuse.probe_guard",
+                run_probe=lambda name, call, *, rank: call())
+    ctx = probe_context(ns, {"prefix_pool_epilogue_trace": "on"}, rank=7)
+
+    tracer = engine._new_pool_epilogue_tracer(ctx, probe_wave())
+
+    assert seen == [({"prefix_pool_epilogue_trace": "on"}, 7, "pool")]
+    assert tracer.probe_token == "tok"
+
+
+def test_a_tracer_the_guard_refuses_leaves_no_tracer(monkeypatch):
+    ns, engine = runtime()
+    stub_module(monkeypatch, "batchgen.prefix_reuse.epilogue_trace",
+                tracer_from_debug=lambda *a, **k: None)
+    stub_module(monkeypatch, "batchgen.prefix_reuse.probe_guard",
+                run_probe=lambda name, call, *, rank: None)
+    ctx = probe_context(ns, {"prefix_pool_epilogue_trace": "on"})
+
+    assert engine._new_pool_epilogue_tracer(ctx, probe_wave()) is None
+
+
+def test_the_kernel_dump_recorder_carries_the_rank_mode_dir_and_wave_ids(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.kernel_dump",
+        DEBUG_FLAG="prefix_pool_dump_kernel_args",
+        DUMP_DIR_FLAG="prefix_pool_dump_dir",
+        PoolKernelDumpRecorder=lambda **kwargs: SimpleNamespace(**kwargs),
+        dump_directory=lambda value, rank: f"{value}/r{rank}",
+        parse_dump_mode=lambda value: value,
+    )
+    probes = []
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.probe_guard",
+        run_probe=lambda name, call, *, rank: (
+            probes.append((name, rank)), call(),
+        )[1],
+    )
+    ctx = probe_context(
+        ns,
+        {"prefix_pool_dump_kernel_args": "sync", "prefix_pool_dump_dir": "/d"},
+        rank=5,
+    )
+
+    recorder = engine._new_pool_kernel_dump_recorder(
+        ctx, probe_wave(global_ids=(9, 10)),
+    )
+
+    assert probes == [("kernel_dump.setup", 5)] * 3
+    assert (recorder.rank, recorder.mode, recorder.directory) == (
+        5, "sync", "/d/r5",
+    )
+    assert recorder.page_tokens == 64 and recorder.global_ids == [9, 10]
+
+
+def test_a_dump_mode_the_guard_refuses_stops_before_the_directory(monkeypatch):
+    ns, engine = runtime()
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.kernel_dump",
+        DEBUG_FLAG="prefix_pool_dump_kernel_args",
+        DUMP_DIR_FLAG="prefix_pool_dump_dir",
+        PoolKernelDumpRecorder=lambda **kwargs: pytest.fail("built"),
+        dump_directory=lambda value, rank: pytest.fail("resolved"),
+        parse_dump_mode=lambda value: None,
+    )
+    stub_module(monkeypatch, "batchgen.prefix_reuse.probe_guard",
+                run_probe=lambda name, call, *, rank: call())
+    ctx = probe_context(ns, {"prefix_pool_dump_kernel_args": "nonsense"})
+
+    assert engine._new_pool_kernel_dump_recorder(ctx, probe_wave()) is None
+
+
+def test_the_offload_recorder_follows_the_flag_reader_it_is_handed(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.offload_check",
+        DEBUG_FLAG="prefix_pool_offload_check",
+        PoolOffloadCheckRecorder=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    stub_module(monkeypatch, "batchgen.prefix_reuse.probe_guard",
+                run_probe=lambda name, call, *, rank: call())
+    ctx = probe_context(ns, {"prefix_pool_offload_check": "YES"}, rank=2)
+    read = []
+
+    recorder = engine._new_pool_offload_check_recorder(
+        ctx, probe_wave(),
+        _debug_flag_enabled=lambda value: (read.append(value), True)[1],
+    )
+
+    assert read == ["YES"]
+    assert (recorder.rank, recorder.page_tokens) == (2, 64)
+
+
+def test_an_offload_flag_the_reader_rejects_arms_no_recorder(monkeypatch):
+    ns, engine = runtime()
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.offload_check",
+        DEBUG_FLAG="prefix_pool_offload_check",
+        PoolOffloadCheckRecorder=lambda **kwargs: pytest.fail("armed"),
+    )
+    ctx = probe_context(ns, {"prefix_pool_offload_check": "off"})
+
+    assert engine._new_pool_offload_check_recorder(
+        ctx, probe_wave(), _debug_flag_enabled=lambda value: False,
+    ) is None
+
+
+def test_the_unsharded_record_asserts_its_premise_against_the_manager(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    seen = []
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.epilogue_trace",
+        record_unsharded_gather=lambda tracer, selected, *, num_global_rows,
+        manager: seen.append((tracer, selected, num_global_rows, manager)),
+    )
+    probes = []
+    stub_module(
+        monkeypatch, "batchgen.prefix_reuse.probe_guard",
+        run_probe=lambda name, call, *, rank: (
+            probes.append((name, rank)), call(),
+        )[1],
+    )
+    ctx = ns["UnshardedEpilogueGatherContext"](rank=6, parallel_manager="psm")
+
+    engine._record_unsharded_epilogue_gather(
+        ctx, "tracer", "rows", num_global_rows=12,
+    )
+
+    assert seen == [("tracer", "rows", 12, "psm")]
+    assert probes == [("epilogue_trace.gather_unsharded", 6)]
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the wave epilogue, and the write it hands back
+# --------------------------------------------------------------------------- #
+def finish_wave(*, uuids=("a", "b"), segment_sids=None, global_ids=(100, 101)):
+    return SimpleNamespace(
+        uuids=list(uuids),
+        global_ids=list(global_ids),
+        segment_sids=dict(segment_sids or {7: 900}),
+    )
+
+
+class RecordingPrefixOwner:
+    def __init__(self):
+        self.handles = []
+
+    def append_commit_handle(self, global_id, handle):
+        self.handles.append((global_id, handle))
+
+
+def finish_context(ns, wave, *, prefix=None, released=None, runtime_cfg=None):
+    sequences = {uuid: f"seq-{uuid}" for uuid in (wave.uuids if wave else ())}
+    return ns["PrefillPoolWaveFinishContext"](
+        _prefill_pool_wave=wave,
+        pool=SimpleNamespace(get_sequence=sequences.__getitem__),
+        prefix_runtime=runtime_cfg if runtime_cfg is not None else (
+            SimpleNamespace(
+                namespace_digest="nsd", publish_boundary_tokens=16,
+                max_nodes=4,
+            )
+        ),
+        prefix_coordinator=SimpleNamespace(
+            release_attachment=(released if released is not None else []).append
+        ),
+        prefix=prefix if prefix is not None else RecordingPrefixOwner(),
+    )
+
+
+def wave_runtime_module(monkeypatch, *, commit=None, attach=None, calls=None):
+    calls = calls if calls is not None else []
+
+    def commit_pool_segments(wave, **kwargs):
+        calls.append(("commit", kwargs))
+        return commit if commit is not None else ["h1"]
+
+    def attach_pool_members(wave, **kwargs):
+        calls.append(("attach", kwargs))
+        return attach if attach is not None else {0: "m0"}
+
+    stub_module(monkeypatch, "batchgen.prefix_reuse.wave_runtime",
+                attach_pool_members=attach_pool_members,
+                commit_pool_segments=commit_pool_segments)
+    return calls
+
+
+def finish(engine, ctx, *, owns=True, views=None, seen=None):
+    seen = seen if seen is not None else []
+    return engine._finish_prefill_pool_wave(
+        ctx,
+        _owns_host_kv=lambda seq: (seen.append(seq), owns)[1],
+        _host_views_by_group=lambda: (
+            views if views is not None else {0: SimpleNamespace(
+                unregister_sequences=lambda sids: None,
+            )}
+        ),
+    )
+
+
+def test_no_wave_in_flight_writes_nothing_and_reads_nothing_else():
+    ns, engine = runtime()
+    ctx = ns["PrefillPoolWaveFinishContext"](
+        _prefill_pool_wave=None,
+        pool=Explode("pool"),
+        prefix_runtime=Explode("prefix_runtime"),
+        prefix_coordinator=Explode("prefix_coordinator"),
+        prefix=Explode("prefix"),
+    )
+
+    outcome = engine._finish_prefill_pool_wave(
+        ctx,
+        _owns_host_kv=lambda seq: pytest.fail("asked"),
+        _host_views_by_group=lambda: pytest.fail("asked"),
+    )
+
+    # The sentinel, not ``None``: this path wrote nothing at all, and ``None``
+    # is exactly what the clear assigns.
+    assert outcome._prefill_pool_wave is ns["PREFILL_UNCHANGED"]
+
+
+def test_a_follower_drops_its_mirrored_page_tables_and_clears_the_wave(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    wave = finish_wave(segment_sids={7: 900, 8: 901})
+    ctx = finish_context(ns, wave)
+    dropped, seen = [], []
+
+    outcome = finish(
+        engine, ctx, owns=False, seen=seen,
+        views={0: SimpleNamespace(unregister_sequences=dropped.append)},
+    )
+
+    assert seen == ["seq-a"]
+    assert dropped == [[900, 901]]
+    assert outcome._prefill_pool_wave is None
+
+
+def test_the_leader_commits_then_attaches_then_releases_its_segments(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    wave = finish_wave()
+    prefix, released = RecordingPrefixOwner(), []
+    ctx = finish_context(ns, wave, prefix=prefix, released=released)
+    calls = wave_runtime_module(
+        monkeypatch, commit=["s0", "s1"], attach={0: "m0", 1: "m1"},
+    )
+
+    outcome = finish(engine, ctx)
+
+    assert [name for name, _ in calls] == ["commit", "attach"]
+    assert calls[0][1]["namespace_digest"] == "nsd"
+    assert calls[0][1]["publish_boundary_tokens"] == 16
+    assert calls[0][1]["max_scan_nodes"] == 4
+    # The segment attachments are released in order, whatever happened above.
+    assert released == ["s0", "s1"]
+    assert prefix.handles == [(100, "m0"), (101, "m1")]
+    assert outcome._prefill_pool_wave is None
+
+
+def test_a_failed_attach_still_releases_the_segments_and_propagates(
+    monkeypatch,
+):
+    """The clear is lost on the raising path, by construction.
+
+    The engine cannot write the worker, so a body whose publication raises
+    leaves this frame before its delegator can apply the clear. The
+    docstring's fatal-path argument is what makes that safe; this pins the
+    mechanism: the release still runs, and the exception is not swallowed.
+    """
+    ns, engine = runtime()
+    released = []
+    ctx = finish_context(ns, finish_wave(), released=released)
+
+    def attach_pool_members(wave, **kwargs):
+        raise RuntimeError("attach failed")
+
+    stub_module(monkeypatch, "batchgen.prefix_reuse.wave_runtime",
+                attach_pool_members=attach_pool_members,
+                commit_pool_segments=lambda wave, **kwargs: ["s0"])
+
+    with pytest.raises(RuntimeError, match="attach failed"):
+        finish(engine, ctx)
+    assert released == ["s0"]
+
+
+@pytest.mark.parametrize("owns", [True, False])
+def test_the_host_view_map_is_asked_once_on_whichever_path_runs(
+    monkeypatch, owns,
+):
+    """One call per run, exactly as the pre-move body made it.
+
+    The map is rebuilt per phase, so it is resolved where it is used: the
+    follower's unregister loop asks once, the leader's commit asks once, and
+    the two paths are exclusive. Holding one resolution across both would be a
+    mechanism change.
+    """
+    ns, engine = runtime()
+    wave_runtime_module(monkeypatch)
+    asked = []
+    ctx = finish_context(ns, finish_wave())
+
+    engine._finish_prefill_pool_wave(
+        ctx,
+        _owns_host_kv=lambda seq: owns,
+        _host_views_by_group=lambda: (
+            asked.append(1),
+            {0: SimpleNamespace(unregister_sequences=lambda sids: None)},
+        )[1],
+    )
+
+    assert len(asked) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  D7.4: the seven worker delegators
+# --------------------------------------------------------------------------- #
+def test_the_micro_batch_delegator_builds_its_context_and_the_kv_builder(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.parallel_manager = "psm"
+    worker._prefill_prefix_kv_budget_bytes = 84
+    worker._server_prefill_token_cap = lambda: 128
+    worker._prefill_attn_tp_size = lambda: 1
+    worker._prefix_materialization_kv_config = lambda lengths: None
+    seen = []
+    recording(engine, "_plan_prefill_micro_batches", seen)
+
+    assert worker._plan_prefill_micro_batches([1], [2], [3]) == "recorded"
+    (context, suffix, full, cached), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillMicroBatchPlanContext"])
+    assert (context.parallel_manager,
+            context._prefill_prefix_kv_budget_bytes) == ("psm", 84)
+    assert (suffix, full, cached) == ([1], [2], [3])
+    assert kwargs == {
+        "token_cap": 128,
+        "attn_group_size": 1,
+        "_prefix_materialization_kv_config":
+            worker._prefix_materialization_kv_config,
+    }
+
+
+def test_the_micro_batch_delegator_reads_the_live_budget_each_call(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.parallel_manager = "psm"
+    worker._server_prefill_token_cap = lambda: 1
+    worker._prefill_attn_tp_size = lambda: 1
+    worker._prefix_materialization_kv_config = lambda lengths: None
+    seen = []
+    recording(engine, "_plan_prefill_micro_batches", seen)
+    worker._prefill_prefix_kv_budget_bytes = None
+    worker._plan_prefill_micro_batches([], [], [])
+    worker._prefill_prefix_kv_budget_bytes = 7
+    worker._plan_prefill_micro_batches([], [], [])
+
+    assert [args[0]._prefill_prefix_kv_budget_bytes for args, _ in seen] == [
+        None, 7,
+    ]
+
+
+def test_the_wave_plan_delegator_passes_nine_collaborators(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 2
+    worker.torch_device = "cuda:2"
+    worker.parallel_manager = "psm"
+    worker.huggingface_ckpt_name = "org/model"
+    worker.global_batch = "pool"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker._prefill_pool_page_budget = 20
+    worker._server_prefill_token_cap = lambda: 64
+    # The two collaborators the worker owns outside this engine's delegators.
+    worker._trajectory_tokens = lambda seq, length=None, **_: None
+    worker._materialized_prefix_hits = lambda *a, **k: None
+    seen = []
+    recording(engine, "_plan_prefill_pool_wave", seen)
+
+    assert worker._plan_prefill_pool_wave(["u0"], {"s": 1}) == "recorded"
+    (context, uuids, states), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolWavePlanContext"])
+    assert (context.rank, context.torch_device, context.parallel_manager,
+            context.huggingface_ckpt_name, context.pool,
+            context.prefix_runtime, context._prefill_pool_page_budget) == (
+        2, "cuda:2", "psm", "org/model", "pool", "runtime", 20,
+    )
+    assert (uuids, states) == (["u0"], {"s": 1})
+    assert kwargs == {
+        "token_cap": 64,
+        "_trajectory_tokens": worker._trajectory_tokens,
+        "_prefill_pool_group": worker._prefill_pool_group,
+        "_prefill_pool_layout": worker._prefill_pool_layout,
+        "_prefill_pool_free_state_slots":
+            worker._prefill_pool_free_state_slots,
+        "_prefill_pool_psm_layout": worker._prefill_pool_psm_layout,
+        "_materialized_prefix_hits": worker._materialized_prefix_hits,
+        "_check_pool_plan_identical": worker._check_pool_plan_identical,
+        "_replace_prefix_lookup_hits": worker._replace_prefix_lookup_hits,
+        "_settle_trajectory_restore_plan":
+            worker._settle_trajectory_restore_plan,
+    }
+
+
+def test_the_wave_plan_delegator_reads_the_live_page_budget_each_call(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 0
+    worker.torch_device = "cuda:0"
+    worker.parallel_manager = "psm"
+    worker.huggingface_ckpt_name = "org/model"
+    worker.global_batch = "pool"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker._server_prefill_token_cap = lambda: 64
+    worker._trajectory_tokens = lambda seq, length=None, **_: None
+    worker._materialized_prefix_hits = lambda *a, **k: None
+    seen = []
+    recording(engine, "_plan_prefill_pool_wave", seen)
+    worker._prefill_pool_page_budget = None
+    worker._plan_prefill_pool_wave([], {})
+    worker._prefill_pool_page_budget = 11
+    worker._plan_prefill_pool_wave([], {})
+
+    assert [args[0]._prefill_pool_page_budget for args, _ in seen] == [None, 11]
+
+
+def test_the_three_recorder_delegators_share_the_probe_context_builder(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 9
+    worker._phase_prefill_debug = {"prefix_pool_offload_check": True}
+    worker._debug_flag_enabled = lambda value: bool(value)
+    seen = []
+    for name in PROBE_RECORDERS:
+        recording(engine, name, seen)
+
+    worker._new_pool_epilogue_tracer("wave")
+    worker._new_pool_kernel_dump_recorder("wave")
+    worker._new_pool_offload_check_recorder("wave")
+
+    for args, _ in seen:
+        assert isinstance(args[0], ns["PoolProbeContext"])
+        assert args[0].rank == 9
+        assert args[0]._phase_prefill_debug == {
+            "prefix_pool_offload_check": True,
+        }
+        assert args[1] == "wave"
+    # Only the offload check takes the flag reader, as the pad-poison
+    # predicate does; the other two parse their own values.
+    assert seen[0][1] == {} and seen[1][1] == {}
+    assert seen[2][1] == {"_debug_flag_enabled": worker._debug_flag_enabled}
+
+
+def test_the_recorder_delegators_rebuild_the_probe_context_per_call(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 1
+    seen = []
+    recording(engine, "_new_pool_kernel_dump_recorder", seen)
+    worker._phase_prefill_debug = {"a": 1}
+    worker._new_pool_kernel_dump_recorder("wave")
+    worker._phase_prefill_debug = {"b": 2}
+    worker._new_pool_kernel_dump_recorder("wave")
+
+    assert [args[0]._phase_prefill_debug for args, _ in seen] == [
+        {"a": 1}, {"b": 2},
+    ]
+
+
+def test_the_gather_record_delegator_builds_its_own_context(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 4
+    worker.parallel_manager = "first"
+    seen = []
+    recording(engine, "_record_unsharded_epilogue_gather", seen)
+
+    worker._record_unsharded_epilogue_gather("t", "rows", num_global_rows=3)
+    worker.parallel_manager = "second"
+    worker._record_unsharded_epilogue_gather("t", "rows", num_global_rows=3)
+
+    (context, tracer, selected), kwargs = seen[0]
+    assert isinstance(context, ns["UnshardedEpilogueGatherContext"])
+    assert (context.rank, context.parallel_manager) == (4, "first")
+    assert (tracer, selected) == ("t", "rows")
+    assert kwargs == {"num_global_rows": 3}
+    # Resolved per call: the phase lifecycle rebinds the manager.
+    assert [args[0].parallel_manager for args, _ in seen] == [
+        "first", "second",
+    ]
+
+
+def test_the_wave_epilogue_delegator_applies_the_clear(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker._prefill_pool_wave = "wave"
+    worker.global_batch = "pool"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker.prefix_cache_coordinator = "coordinator"
+    worker._prefix = "prefix state"
+    # Collaborators the worker owns outside this engine's delegators.
+    worker._owns_host_kv = lambda seq: True
+    worker._host_views_by_group = lambda: {}
+    seen = []
+    recording(engine, "_finish_prefill_pool_wave", seen,
+              result=ns["PrefillPoolWaveFinishOutcome"](None))
+
+    worker._finish_prefill_pool_wave()
+
+    (context,), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolWaveFinishContext"])
+    assert (context._prefill_pool_wave, context.pool, context.prefix_runtime,
+            context.prefix_coordinator, context.prefix) == (
+        "wave", "pool", "runtime", "coordinator", "prefix state",
+    )
+    assert kwargs == {
+        "_owns_host_kv": worker._owns_host_kv,
+        "_host_views_by_group": worker._host_views_by_group,
+    }
+    assert worker._prefill_pool_wave is None
+
+
+def test_the_wave_epilogue_delegator_leaves_the_handle_on_the_sentinel(
+    monkeypatch,
+):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker._prefill_pool_wave = "wave"
+    worker.global_batch = "pool"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker.prefix_cache_coordinator = "coordinator"
+    worker._prefix = "prefix state"
+    # Collaborators the worker owns outside this engine's delegators.
+    worker._owns_host_kv = lambda seq: True
+    worker._host_views_by_group = lambda: {}
+    recording(engine, "_finish_prefill_pool_wave", [],
+              result=ns["PrefillPoolWaveFinishOutcome"]())
+
+    worker._finish_prefill_pool_wave()
+
+    assert worker._prefill_pool_wave == "wave"
+
+
+def test_the_wave_epilogue_delegator_reads_the_live_wave_each_call(monkeypatch):
+    ns, engine = runtime()
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.global_batch = "pool"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker.prefix_cache_coordinator = "coordinator"
+    worker._prefix = "prefix state"
+    # Collaborators the worker owns outside this engine's delegators.
+    worker._owns_host_kv = lambda seq: True
+    worker._host_views_by_group = lambda: {}
+    seen = []
+    recording(engine, "_finish_prefill_pool_wave", seen,
+              result=ns["PrefillPoolWaveFinishOutcome"]())
+    worker._prefill_pool_wave = "first"
+    worker._finish_prefill_pool_wave()
+    worker._prefill_pool_wave = "second"
+    worker._finish_prefill_pool_wave()
+
+    assert [args[0]._prefill_pool_wave for args, _ in seen] == [
+        "first", "second",
+    ]
+
+
+def test_every_d7_4_delegator_names_no_worker_in_its_engine_call():
+    """One assertion over the whole stage: no engine call passes a bare self."""
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    checked = set()
+    for node in cls.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in D7_4_METHODS:
+            continue
+        checked.add(node.name)
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "engine"):
+                continue
+            assert not any(isinstance(arg, ast.Name) and arg.id == "self"
+                           for arg in call.args), node.name
+            assert not any(isinstance(kw.value, ast.Name)
+                           and kw.value.id == "self"
+                           for kw in call.keywords), node.name
+    assert checked == D7_4_METHODS

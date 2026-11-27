@@ -5851,21 +5851,31 @@ class BatchGenWorker:
 		return limits
 
 	def _plan_prefill_micro_batches(self, seq_lengths: List[int], full_seq_lengths: List[int], compute_cached_tokens: List[int]) -> Tuple[List[Tuple[int, int]], int, bool]:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillMicroBatchPlanContext
 		# The engine never reaches into the worker for the cap: the delegator
 		# resolves the server mode's one cap and hands it over explicitly.
+		# Read HERE, not from a held snapshot: the KV budget is re-measured
+		# after every configure_prefill.
 		return engine._plan_prefill_micro_batches(
-			self,
+			PrefillMicroBatchPlanContext(
+				parallel_manager=self.parallel_manager,
+				_prefill_prefix_kv_budget_bytes=self._prefill_prefix_kv_budget_bytes,
+			),
 			seq_lengths,
 			full_seq_lengths,
 			compute_cached_tokens,
 			token_cap=self._server_prefill_token_cap(),
 			attn_group_size=self._prefill_attn_tp_size(),
+			# The temporary-KV config builder resolves the Host geometry from
+			# the checkpoint name, which this context does not carry, so it
+			# arrives as the worker method the pre-move body called.
+			_prefix_materialization_kv_config=self._prefix_materialization_kv_config,
 		)
 
 	def _prefix_materialization_kv_config(self, full_seq_lengths: List[int]):
@@ -9963,19 +9973,43 @@ class BatchGenWorker:
 		)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolWavePlanContext
 		# The engine never reaches into the worker for the cap: the delegator
 		# resolves the server mode's one cap and hands it over explicitly.
+		# The page budget is read HERE, not from a held snapshot: it is
+		# re-measured after every configure_prefill and the plan must see the
+		# one the current prefill phase measured.
 		return engine._plan_prefill_pool_wave(
-			self,
+			PrefillPoolWavePlanContext(
+				rank=self.rank,
+				torch_device=self.torch_device,
+				parallel_manager=self.parallel_manager,
+				huggingface_ckpt_name=self.huggingface_ckpt_name,
+				pool=self.global_batch,
+				prefix_runtime=self.prefix_cache_runtime_config,
+				_prefill_pool_page_budget=self._prefill_pool_page_budget,
+			),
 			uuids,
 			prefix_states,
 			token_cap=self._server_prefill_token_cap(),
+			# Each collaborator is the worker's own method of that name, which
+			# is what the pre-move body called; none of them shares this read
+			# set.
+			_trajectory_tokens=self._trajectory_tokens,
+			_prefill_pool_group=self._prefill_pool_group,
+			_prefill_pool_layout=self._prefill_pool_layout,
+			_prefill_pool_free_state_slots=self._prefill_pool_free_state_slots,
+			_prefill_pool_psm_layout=self._prefill_pool_psm_layout,
+			_materialized_prefix_hits=self._materialized_prefix_hits,
+			_check_pool_plan_identical=self._check_pool_plan_identical,
+			_replace_prefix_lookup_hits=self._replace_prefix_lookup_hits,
+			_settle_trajectory_restore_plan=self._settle_trajectory_restore_plan,
 		)
 
 	def _prefill_pool_psm_layout(self):
@@ -10385,14 +10419,14 @@ class BatchGenWorker:
 		)
 
 	def _new_pool_epilogue_tracer(self, wave):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._new_pool_epilogue_tracer(
-			self,
+			self._pool_probe_context(),
 			wave,
 		)
 
@@ -10415,28 +10449,36 @@ class BatchGenWorker:
 		)
 
 	def _record_unsharded_epilogue_gather(self, tracer, selected, *, num_global_rows) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import UnshardedEpilogueGatherContext
+		# NOT the probe context the three recorders share: this record never
+		# reads the probe state, and it does read the manager the premise is
+		# asserted against. Resolved per call, because the phase lifecycle
+		# rebinds the manager.
 		return engine._record_unsharded_epilogue_gather(
-			self,
+			UnshardedEpilogueGatherContext(
+				rank=self.rank,
+				parallel_manager=self.parallel_manager,
+			),
 			tracer,
 			selected,
 			num_global_rows=num_global_rows,
 		)
 
 	def _new_pool_kernel_dump_recorder(self, wave):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._new_pool_kernel_dump_recorder(
-			self,
+			self._pool_probe_context(),
 			wave,
 		)
 
@@ -10454,15 +10496,16 @@ class BatchGenWorker:
 		)
 
 	def _new_pool_offload_check_recorder(self, wave):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
 		return engine._new_pool_offload_check_recorder(
-			self,
+			self._pool_probe_context(),
 			wave,
+			_debug_flag_enabled=self._debug_flag_enabled,
 		)
 
 	def _verify_prefill_pool_offload_bytes(self) -> None:
@@ -10501,15 +10544,37 @@ class BatchGenWorker:
 		)
 
 	def _finish_prefill_pool_wave(self) -> None:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		return engine._finish_prefill_pool_wave(
-			self,
+		from batchgen.worker.prefill_engine import (
+			PREFILL_UNCHANGED,
+			PrefillPoolWaveFinishContext,
 		)
+		# Read HERE, not from a held snapshot: this runs once per wave and the
+		# wave handle is whatever the current prefill phase planned.
+		outcome = engine._finish_prefill_pool_wave(
+			PrefillPoolWaveFinishContext(
+				_prefill_pool_wave=self._prefill_pool_wave,
+				pool=self.global_batch,
+				prefix_runtime=self.prefix_cache_runtime_config,
+				prefix_coordinator=self.prefix_cache_coordinator,
+				prefix=self._prefix,
+			),
+			# Neither collaborator shares this read set, so both arrive as the
+			# worker methods the pre-move body called.
+			_owns_host_kv=self._owns_host_kv,
+			_host_views_by_group=self._host_views_by_group,
+		)
+		# The wave handle is cleared on every path that got past the "no wave
+		# in flight" exit, which leaves the field at the sentinel -- and
+		# ``None`` could not stand for that, because ``None`` is exactly what
+		# the clear assigns.
+		if outcome._prefill_pool_wave is not PREFILL_UNCHANGED:
+			self._prefill_pool_wave = outcome._prefill_pool_wave
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
 		# Resolve values and live collaborators at the worker boundary.

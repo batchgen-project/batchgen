@@ -236,11 +236,11 @@ class _PlanWorker:
         return temporary_gpu_kv_config(PROFILE, full_seq_lengths)
 
     def _plan_prefill_micro_batches(self, *args):
-        # Mirror the worker's delegator: it resolves the server mode's one
-        # prefill cap and hands it to the engine explicitly.
-        return _PLAN["_plan_prefill_micro_batches"](
-            self, *args, token_cap=self._server_prefill_token_cap()
-        )
+        # D7.4 converted the planner, so the lifted body is already the
+        # worker's own shape: it resolves the server mode's one prefill cap
+        # and the phase's group width inline, through the two accessors below,
+        # exactly as the real delegator does. Nothing is injected here.
+        return _PLAN["_plan_prefill_micro_batches"](self, *args)
 
     # The real once-per-process mode read and its token-cap accessor: the
     # fake resolves the mode at construction, so no manager is consulted.

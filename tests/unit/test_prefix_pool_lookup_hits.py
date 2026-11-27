@@ -30,11 +30,22 @@ def _method(name):
 
 
 def _calls(node, name):
+    """Every call of ``name``, under either spelling.
+
+    D7.4 made the wave planner take its collaborators as keyword-only
+    callables, so the release it used to reach as ``self._replace_prefix
+    _lookup_hits(...)`` is now the bare parameter of that name. Both spellings
+    are the same call to the worker's method of that name, so both count --
+    which keeps this test's claim (the pooled return releases hits exactly
+    once, the three declines release nothing) intact rather than weakening it.
+    """
     return [
         call for call in ast.walk(node)
         if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == name
+        and (
+            (isinstance(call.func, ast.Attribute) and call.func.attr == name)
+            or (isinstance(call.func, ast.Name) and call.func.id == name)
+        )
     ]
 
 

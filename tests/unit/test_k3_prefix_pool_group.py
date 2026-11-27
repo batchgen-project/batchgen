@@ -125,6 +125,11 @@ _CONTEXT_MOVED = {
     "_allocate_prefill_pool_host_pages", "_materialized_segment_loader",
     "_prefix_pool_index_key_carrier", "_materialized_pool_index_key_layers",
     "_load_materialized_segments",
+    # D7.4: wave planning and the pooled instrumentation.
+    "_plan_prefill_micro_batches", "_plan_prefill_pool_wave",
+    "_finish_prefill_pool_wave", "_new_pool_epilogue_tracer",
+    "_record_unsharded_epilogue_gather", "_new_pool_kernel_dump_recorder",
+    "_new_pool_offload_check_recorder",
 }
 
 
@@ -168,16 +173,11 @@ def _worker_methods(names, globals_=None):
         scope = dict(namespace)
         exec(compile(module, str(source), "exec"), scope)
         function = scope[name]
-        if name == "_plan_prefill_pool_wave":
-            # Mirror the worker's delegator: it resolves the server mode's
-            # one prefill cap and hands it to the engine explicitly.
-            def worker_method(worker, *args, _function=function, **kwargs):
-                kwargs.setdefault(
-                    "token_cap", worker._server_prefill_token_cap()
-                )
-                return _function(None, worker, *args, **kwargs)
-            function = worker_method
-        elif name in _MOVED and name not in _CONTEXT_MOVED:
+        # D7.4 converted the wave planner, so its token cap no longer needs an
+        # adapter here: the lift inlines the delegator's own
+        # ``self._server_prefill_token_cap()`` at every use, which is a
+        # stricter mirror of the delegator than setting a keyword was.
+        if name in _MOVED and name not in _CONTEXT_MOVED:
             def worker_method(
                 worker, *args, _function=function, _name=name, **kwargs
             ):

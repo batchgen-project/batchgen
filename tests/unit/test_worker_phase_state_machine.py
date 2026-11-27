@@ -14,7 +14,11 @@ import pytest
 from batchgen.phase_lifecycle import PHASES, ExitMode, PhaseEnterContext, PhaseKey
 from batchgen.phase_lifecycle import verify_phase_contract
 from tests.kimi_layout_fixture import planned_kimi_layout
-from tests.worker_method_source import delegated_method_names, worker_shaped_method_node
+from tests.worker_method_source import (
+    delegated_method_names,
+    delegated_method_source,
+    worker_shaped_method_node,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -512,7 +516,13 @@ def test_pool_plan_cap_is_the_server_cap_for_every_group_subset():
         if node.name == "_plan_prefill_pool_wave"
     ))
     assert "token_cap=self._server_prefill_token_cap()" in delegator
-    source = _method_source("_plan_prefill_pool_wave")
+    # D7.4 converted the planner, so the "never reaches back" half is read
+    # off the ENGINE's own source: the worker-shaped view deliberately
+    # inlines every resolution the delegator performs (that is what makes it
+    # the body that runs), so the accessor is expected to appear THERE. The
+    # engine body takes the cap as a parameter and names neither the
+    # accessor nor the worker.
+    source = delegated_method_source("_plan_prefill_pool_wave")
     assert "token_cap" in source
     assert "_server_prefill_token_cap" not in source
     assert "_active_batchgen_debug_for_sequences" not in source
