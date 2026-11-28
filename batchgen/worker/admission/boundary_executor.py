@@ -11,6 +11,59 @@ arrive as a ``CompletionIO`` from the caller.
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (
+        "completion.gather_completed_tokens",
+        "completion.report_completion",
+        "ctx.chunk_sizer",
+        "ctx.facts",
+        "ctx.gpu_resident",
+        "ctx.sched",
+        "decisions.active_uuids",
+        "decisions.completed_uuids",
+        "decisions.growth_feasible",
+        "decisions.host_evicted_uuids",
+        "decisions.host_growth_pages",
+        "decisions.host_growth_uuids",
+        "decisions.new_load_uuids",
+        "decisions.onhold_uuids",
+        "decisions.seqs_needing_extension",
+        "global_seq_state.get",
+        "gpu_manager.export_active_sequence_page_counts",
+        "gpu_manager.free_pages_for_sequences",
+        "gpu_manager.get_padded_3d_page_pointers",
+        "gpu_manager.get_stats",
+        "gpu_manager.is_initialized",
+        "gpu_manager.rebuild_page_table",
+        "worker_view.async_load_layer_paged_kv_to_device",
+        "worker_view.grow_pages_for_sequences",
+        "worker_view.release_sequence_pages",
+        "worker_view.unregister_sequences",
+    ),
+    "writes": (
+        "timing.extension_ms",
+        "timing.load_alloc_ms",
+        "timing.load_launch_ms",
+        "timing.num_loaded",
+        "timing.process_ms",
+        "timing.total_completed_cumulative",
+        "timing.total_ms",
+    ),
+    "writes_via_local": (),
+    "mutates": (),
+    "orderings": (
+        "releases precede acquisitions, because the pages an acquisition needs are the ones a release just freed.",
+        "the completion read precedes the releases and the completion send follows them, so a completed sequence's tokens are read while its pages still exist.",
+        "the page table is rebuilt after every page set changes, once.",
+    ),
+}
+
 import logging
 import time
 from dataclasses import dataclass

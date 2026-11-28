@@ -10,6 +10,46 @@ in as a callable.
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (
+        "ctx.core_engine",
+        "ctx.facts",
+        "ctx.host_view",
+        "ctx.sched",
+        "gpu_manager.get_stats",
+        "gpu_manager.is_initialized",
+        "kv._make_boundary_decision_request",
+        "seq.uuid",
+        "state.get",
+    ),
+    "writes": (
+        "timing.gather_ms",
+        "timing.num_completed",
+        "timing.num_onhold",
+    ),
+    "writes_via_local": (
+        "seq._rep_detected",
+        "seq.eos_reached",
+        "seq.kda_record_pages",
+        "seq.max_decode_length",
+        "seq.original_max_decode_length",
+        "seq.prompt_length",
+        "seq.reentry_decoded_baseline",
+        "seq.total_decoded_before_eviction",
+    ),
+    "mutates": (),
+    "orderings": (
+        "the gather precedes the decision, and the decision precedes the broadcast, because every rank must act on the same verdict.",
+        "the local mirror of another rank's sequence is updated only after that rank's state has been gathered, and only for a sequence this rank does not own.",
+    ),
+}
+
 import logging
 import time
 from typing import Callable, List

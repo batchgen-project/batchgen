@@ -23,6 +23,36 @@ twice (acceptable migration-window cost).
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (
+        "ctx.global_batch",
+        "ctx.rank",
+        "ctx.torch_device",
+        "ctx.uuid_to_local",
+    ),
+    "writes": (),
+    "writes_via_local": (
+        "seq.eos_reached",
+    ),
+    "mutates": (),
+    "orderings": (
+        "every rank issues the same collective, in the same order, with the"
+        " same shapes: the handler takes a backend rather than calling the"
+        " collective library itself, so the order is the caller's and is the"
+        " same on every rank.",
+        "the local end-of-sequence flag is set only after the collective has"
+        " returned, so it reflects the agreed result and not this rank's guess;"
+        " the write is idempotent, which is what makes a compare-mode run end"
+        " in the same state.",
+    ),
+}
+
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Set, Tuple

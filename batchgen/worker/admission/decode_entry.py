@@ -11,6 +11,31 @@ with the caller.
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (
+        "capacity.free_pages",
+        "capacity.total_pages",
+        "ctx.facts",
+        "ctx.gpu_kv",
+        "ctx.sched",
+        "shared_segments.get",
+    ),
+    "writes": (),
+    "writes_via_local": (),
+    "mutates": (
+        "all_candidates.sort()",
+    ),
+    "orderings": (
+        "the candidate list is sorted before it is cut, so the batch is a prefix of one order and not of whichever order arrived.",
+    ),
+}
+
 from typing import Dict, List, Optional, Tuple
 
 import torch.distributed as dist
