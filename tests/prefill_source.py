@@ -58,6 +58,9 @@ CONTEXT_CLASSES = {
     "PrefillModelPassContext",
     "PrefillTokenWritebackContext",
     "PrefillPoolWaveRunContext",
+    # D7.6: the unpooled prepacked driver's own context. One new context, no
+    # reuse: its eighteen fields are no earlier context's read set.
+    "PrefillPrepackedRunContext",
 }
 # The frozen outcomes this engine declares: a converted body hands its worker
 # writes back in one of these for the delegator to apply.
@@ -135,6 +138,12 @@ D7_5_METHODS = {
     "_write_prefill_tokens",
     "_prefill_prepacked_pool",
 }
+# The D7.6 name: the unpooled prepacked driver, alone in its stage. It reads
+# worker state, so it is not stateless, and its ONE store is an in-place
+# mutation of the model the context carries, so it has no outcome.
+D7_6_METHODS = {
+    "prefill_prepacked",
+}
 STATELESS_METHODS = {
     "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
     "_unmaterializable_frontier", "_prefix_pool_index_key_carrier",
@@ -160,7 +169,7 @@ COLLECTIVE_METHODS = {
 }
 METHODS = (
     set(D7_1_METHODS) | set(D7_2_METHODS) | set(D7_3_METHODS)
-    | set(D7_4_METHODS) | set(D7_5_METHODS)
+    | set(D7_4_METHODS) | set(D7_5_METHODS) | set(D7_6_METHODS)
 )
 
 
@@ -224,6 +233,9 @@ def load_prefill(namespace=None):
         # ``dist``: a progress bar over a fake plan has to be observed.
         time=time,
         json=json,
+        # D7.6: the prepacked driver reads its two memory-profile switches off
+        # the real environment, like D7.4's L2-balance switch above
+        # (``os`` is already supplied for that one).
     ).items():
         namespace.setdefault(name, value)
     tree = ast.parse(SOURCE.read_text())

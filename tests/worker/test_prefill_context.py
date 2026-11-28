@@ -46,6 +46,18 @@ shared: the token write-back's three fields are a strict subset of both
 drivers', and the rejection is tested, because sharing would make the one call
 both drivers end on resolve the model and the weight-copy pipeline.
 
+D7.6, the sixth stage: ONE method, the unpooled prepacked driver. Its context
+is wide (eighteen fields) and the tests below prove that is honest rather than
+lazy -- the read set of every prefix of the body intersects the read set of
+its suffix, so no cut yields two disjoint sets, and the declared fields are
+exactly what the body reads. It carries no collective, no outcome, and the
+file's ONE explicit stream wait, which is pinned three ways: its statement
+position between the two timing samples, its complete absence of enclosing
+conditions, and the ordered sequence of the body's seven host-pulling calls
+around it. The transitional model-pass call D7.5 documented here is finished,
+so the test that pinned the transitional spelling is replaced by one that
+pins the converted spelling and the disappearance of the inline context.
+
 The bodies are compiled out of the engine's own AST
 (``tests/prefill_source.py``), because importing the engine pulls in the
 compiled core engine and UCX; the delegators are compiled out of the real
@@ -68,6 +80,7 @@ from tests.prefill_source import (
     D7_3_METHODS,
     D7_4_METHODS,
     D7_5_METHODS,
+    D7_6_METHODS,
     METHODS,
     OUTCOME_METHODS,
     STATELESS_METHODS,
@@ -256,9 +269,10 @@ def test_every_context_is_frozen():
         if isinstance(value, type) and name.endswith("Context")
     ]
     # Eight from D7.1, four from D7.2, eight from D7.3, four from D7.4 (whose
-    # three probe recorders reuse D7.1's probe context instead of declaring)
-    # and four from D7.5, one per execution path, with no reuse at all.
-    assert len(contexts) == 28
+    # three probe recorders reuse D7.1's probe context instead of declaring),
+    # four from D7.5, one per execution path, with no reuse at all, and one
+    # from D7.6 for the unpooled prepacked driver.
+    assert len(contexts) == 29
     for context in contexts:
         instance = context(**{field.name: None for field in fields(context)})
         with pytest.raises(FrozenInstanceError):
@@ -324,10 +338,10 @@ def test_no_context_carries_a_field_its_operations_do_not_read():
             and isinstance(n.value, ast.Name) and n.value.id == "ctx"
         )
     ns, _ = runtime()
-    # One entry per DISTINCT annotation: 28 contexts, and the probe context is
+    # One entry per DISTINCT annotation: 29 contexts, and the probe context is
     # annotated five times (D7.1's pair plus D7.4's three recorders), so the
     # union it is measured against spans all five bodies.
-    assert len(reads) == 28
+    assert len(reads) == 29
     for context_name, read in sorted(reads.items()):
         declared = {field.name for field in fields(ns[context_name])}
         assert declared == read, (context_name, declared ^ read)
@@ -356,10 +370,10 @@ def test_the_probe_pair_shares_one_context_because_their_reads_coincide():
 
 
 def test_the_stage_converted_exactly_its_own_methods():
-    """The file still holds worker-shaped operations: this is stage five of seven.
+    """The file still holds worker-shaped operations: this is stage six of seven.
 
-    The later stages of this engine convert the rest, so the guard that the
-    whole FILE names no worker belongs to the last one, not here.
+    D7.7 converts the rest, so the guard that the whole FILE names no worker
+    belongs to that stage, not here.
     """
     converted, worker_shaped = set(), set()
     for node in engine_class_node().body:
@@ -372,26 +386,29 @@ def test_the_stage_converted_exactly_its_own_methods():
             converted.add(node.name)
     assert converted == METHODS
     assert not worker_shaped & METHODS
-    assert worker_shaped, "nothing left to convert, but D7.5 is not the last stage"
-    # The five stages are disjoint, and what is left is what D7.6-D7.7 take:
+    assert worker_shaped, "nothing left to convert, but D7.6 is not the last stage"
+    # The six stages are disjoint, and what is left is what D7.7 takes:
     # fourteen converted in D7.1, five in D7.2, nine in D7.3, seven in D7.4,
-    # four here, and the three preparation/config bodies still worker-shaped --
-    # `prefill_prepacked` (D7.6), `_prepare_prefill_batch` and
-    # `_config_prefill_for_batch` (D7.7).
+    # four in D7.5, one here, and the two preparation/config bodies still
+    # worker-shaped -- `_prepare_prefill_batch` and `_config_prefill_for_batch`.
     assert D7_1_METHODS.isdisjoint(D7_2_METHODS)
     assert D7_3_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS)
     assert D7_4_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS | D7_3_METHODS)
     assert D7_5_METHODS.isdisjoint(
         D7_1_METHODS | D7_2_METHODS | D7_3_METHODS | D7_4_METHODS
     )
+    assert D7_6_METHODS.isdisjoint(
+        D7_1_METHODS | D7_2_METHODS | D7_3_METHODS | D7_4_METHODS
+        | D7_5_METHODS
+    )
     assert worker_shaped == {
-        "prefill_prepacked", "_prepare_prefill_batch",
-        "_config_prefill_for_batch",
+        "_prepare_prefill_batch", "_config_prefill_for_batch",
     }
     assert (
         len(D7_1_METHODS), len(D7_2_METHODS), len(D7_3_METHODS),
-        len(D7_4_METHODS), len(D7_5_METHODS), len(worker_shaped),
-    ) == (14, 5, 9, 7, 4, 3)
+        len(D7_4_METHODS), len(D7_5_METHODS), len(D7_6_METHODS),
+        len(worker_shaped),
+    ) == (14, 5, 9, 7, 4, 1, 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -5519,38 +5536,15 @@ def test_the_pooled_driver_reaches_the_model_pass_as_a_collaborator():
                 if isinstance(n, ast.Name) and n.id == "_engine"]
 
 
-def test_the_still_worker_shaped_driver_builds_the_passs_context_itself():
-    """D7.6's body keeps the direct engine call, and why.
-
-    ``prefill_prepacked`` is still worker-shaped. Routing its model-pass call
-    through the worker's same-name delegator would make this engine file name
-    a worker attribute (`_prefill_model_pass`) it has never named, which the
-    boundary census counts as a RISE. So it keeps the direct engine call and
-    builds the pass's context at the call site, out of the two attributes it
-    already reads.
-    """
-    node = method_node("prefill_prepacked")
-    calls = [n for n in ast.walk(node)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-             and n.func.attr == "_prefill_model_pass"]
-    assert len(calls) == 1
-    call, = calls
-    assert ast.unparse(call.func.value) == "_engine"
-    assert ast.unparse(call.args[0]) == (
-        "PrefillModelPassContext(model=self.model, "
-        "parallel_manager=self.parallel_manager)"
-    )
-    assert {kw.arg for kw in call.keywords} == {
-        "lmhead_fp32", "trace", "layer_probe",
-        "_record_unsharded_epilogue_gather",
-    }
-    # It reaches the pass through NO worker attribute of that name.
-    assert not [
-        n for n in ast.walk(node)
-        if isinstance(n, ast.Attribute)
-        and isinstance(n.value, ast.Name) and n.value.id == "self"
-        and n.attr == "_prefill_model_pass"
-    ]
+# D7.5 pinned the transitional spelling of the prepacked driver's model-pass
+# call -- the direct engine call with the context built inline -- because that
+# driver was still worker-shaped and routing the call through the worker's
+# delegator would have made the engine file name a worker attribute it had
+# never named. That claim is unprovable once the driver is converted: a
+# converted body has no `_engine` and no worker attribute to avoid. Its
+# replacement is `test_the_prepacked_driver_reaches_the_model_pass_as_a
+# _collaborator` in the D7.6 section below, which pins the converted spelling
+# AND that the inline construction is gone rather than duplicated.
 
 
 # --------------------------------------------------------------------------- #
@@ -5972,3 +5966,568 @@ def test_every_d7_5_delegator_names_no_worker_in_its_engine_call():
                            and kw.value.id == "self"
                            for kw in call.keywords), node.name
     assert checked == D7_5_METHODS
+
+
+# --------------------------------------------------------------------------- #
+#  D7.6: the unpooled prepacked driver -- one method, a wide context proved
+#  honest, no collective, and the file's one explicit stream wait
+# --------------------------------------------------------------------------- #
+PREPACKED = "prefill_prepacked"
+PREPACKED_CONTEXT = "PrefillPrepackedRunContext"
+# The twenty-two worker methods this driver reached through the worker, in the
+# order its signature declares them. `_prefill_model_pass` is among them since
+# this stage: the pass takes a context a converted body may not build, so it
+# arrives as a collaborator and the worker's own delegator builds it -- which
+# is also where the unsharded-gather recorder is resolved, so this body stops
+# naming that one.
+PREPACKED_COLLABORATORS = (
+    "_bind_prefill_host_views",
+    "_prefill_prepacked_pool",
+    "_prefill_deepseek_family_name",
+    "_trajectory_tokens",
+    "_plan_prefill_micro_batches",
+    "_debug_flag_enabled",
+    "_k3_prefill_profile_flag_name",
+    "_glm5_lmhead_fp32_flag_name",
+    "feed_watchdog",
+    "_sync_prefill_moe_rank_counts",
+    "_prefix_materialization_kv_config",
+    "_new_prefill_temporary_gpu_kv_manager",
+    "_install_prefill_prepack_metadata",
+    "_prefill_model_pass",
+    "_select_tokens",
+    "_retire_prefill_pending_offloads",
+    "_close_prefix_materialization",
+    "_clear_prefill_prefix_materialization",
+    "_emit_k3_prefill_profile_log",
+    "_reset_prefill_prepack_metadata",
+    "_log_prefill_timing",
+    "_write_prefill_tokens",
+)
+# The five model-named ones. Phase E2 removes model-specific branches from the
+# worker and the engines; this stage keeps every one of them, which is why
+# these names survive the conversion instead of being resolved away.
+PREPACKED_MODEL_NAMED = (
+    "_prefill_deepseek_family_name",
+    "_glm5_lmhead_fp32_flag_name",
+    "_k3_prefill_profile_flag_name",
+    "_emit_k3_prefill_profile_log",
+    "_sync_prefill_moe_rank_counts",
+)
+# Every process-group entry point. NOT the stream/event names D7.5 could check
+# for as well: this body has the file's one explicit stream wait, pinned
+# separately below by position and conditionality.
+_COLLECTIVE_NAMES = (
+    "all_reduce", "all_gather", "all_gather_into_tensor", "broadcast",
+    "barrier", "reduce", "reduce_scatter", "send", "recv", "isend", "irecv",
+    "gather", "scatter",
+)
+
+
+def _parent_map(node):
+    out = {}
+    for parent in ast.walk(node):
+        for child in ast.iter_child_nodes(parent):
+            out[id(child)] = parent
+    return out
+
+
+def _enclosing(node, target, parents):
+    """The compound statements ``target`` stands under, outermost first."""
+    out, cur = [], parents.get(id(target))
+    while cur is not None and cur is not node:
+        if isinstance(cur, ast.If):
+            out.append("if " + ast.unparse(cur.test))
+        elif isinstance(cur, ast.For):
+            out.append("for " + ast.unparse(cur.target) + " in ...")
+        elif isinstance(cur, ast.While):
+            out.append("while " + ast.unparse(cur.test))
+        elif isinstance(cur, ast.With):
+            out.append("with " + ", ".join(
+                ast.unparse(item.context_expr) for item in cur.items
+            ))
+        elif isinstance(cur, ast.Try):
+            out.append("try")
+        elif isinstance(cur, (ast.FunctionDef, ast.Lambda)):
+            out.append("nested " + getattr(cur, "name", "<lambda>"))
+        cur = parents.get(id(cur))
+    return list(reversed(out))
+
+
+def _statements(node):
+    """The method's top-level statements, docstring dropped."""
+    body = list(node.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return body
+
+
+def _ctx_reads(statements):
+    return {
+        sub.attr
+        for stmt in statements for sub in ast.walk(stmt)
+        if isinstance(sub, ast.Attribute)
+        and isinstance(sub.value, ast.Name) and sub.value.id == "ctx"
+    }
+
+
+def test_the_prepacked_driver_declares_the_context_it_reads():
+    node = method_node(PREPACKED)
+    assert [arg.arg for arg in node.args.args] == ["self", "ctx", "batch"]
+    assert ast.unparse(node.args.args[1].annotation) == PREPACKED_CONTEXT
+    # ``token_cap`` stays the delegator-resolved VALUE it already was, and it
+    # comes first so the collaborators read as one block.
+    assert [arg.arg for arg in node.args.kwonlyargs] == [
+        "token_cap", *PREPACKED_COLLABORATORS,
+    ]
+    assert len(PREPACKED_COLLABORATORS) == 22
+
+
+def test_the_prepacked_context_is_one_honest_context_not_two():
+    """Wide, and measured: no cut through the body splits the reads.
+
+    Eighteen fields is a lot, so the share question has to be answered rather
+    than asserted. For EVERY cut between two top-level statements where both
+    sides read something at all, the two read sets intersect -- so there is no
+    pair of phases with disjoint read sets to split this into, and two
+    contexts would each have to carry most of the fields anyway.
+    """
+    statements = _statements(method_node(PREPACKED))
+    assert len(statements) == 51
+    split = []
+    for cut in range(1, len(statements)):
+        before = _ctx_reads(statements[:cut])
+        after = _ctx_reads(statements[cut:])
+        if before and after and not before & after:
+            split.append((cut, sorted(before), sorted(after)))
+    assert split == [], split
+    # The widest honest split still shares seven of the eighteen fields, which
+    # is what makes a two-context version a duplication rather than a
+    # narrowing.
+    best = max(
+        len(_ctx_reads(statements[:cut]) & _ctx_reads(statements[cut:]))
+        for cut in range(1, len(statements))
+        if _ctx_reads(statements[:cut]) and _ctx_reads(statements[cut:])
+    )
+    assert best == 7
+
+
+def test_the_prepacked_context_is_no_earlier_contexts_read_set():
+    """The only ground on which this stage could have reused one."""
+    ns, _ = runtime()
+    mine = frozenset(f.name for f in fields(ns[PREPACKED_CONTEXT]))
+    assert len(mine) == 18
+    earlier = {
+        ast.unparse(method_node(other).args.args[1].annotation)
+        for other in sorted(METHODS - STATELESS_METHODS - D7_6_METHODS)
+    }
+    for name in sorted(earlier):
+        assert mine != frozenset(f.name for f in fields(ns[name])), name
+    # The two it is closest to, with the exact difference each way: the padded
+    # forward's set is a strict SUBSET (sharing it would mean widening it to
+    # this one, i.e. no share), and the pooled driver's is neither.
+    padded = frozenset(f.name for f in fields(ns["PrefillBatchForwardContext"]))
+    pooled = frozenset(f.name for f in fields(ns["PrefillPoolWaveRunContext"]))
+    assert padded < mine
+    assert mine - padded == {
+        "world_size", "parallel_manager", "core_engine", "prefix",
+        "prefix_coordinator", "prefix_runtime", "prefix_cache_debug_stats",
+        "_prefill_pool_wave", "_prefill_global_passes",
+        "_phase_prefill_debug",
+    }
+    assert not (pooled <= mine) and not (mine <= pooled)
+    assert pooled - mine == {"local_rank", "_prefill_pool_base"}
+
+
+def test_no_earlier_stages_context_was_widened_for_the_prepacked_stage():
+    """D7.1-D7.5's contexts keep exactly the fields they were declared with."""
+    ns, _ = runtime()
+    assert [f.name for f in fields(ns["PrefillBatchForwardContext"])] == [
+        "rank", "torch_device", "model", "model_config", "engine_config",
+        "pool", "local_to_uuid", "_weight_passes",
+    ]
+    assert [f.name for f in fields(ns["PrefillModelPassContext"])] == [
+        "model", "parallel_manager",
+    ]
+    assert [f.name for f in fields(ns["PrefillTokenWritebackContext"])] == [
+        "rank", "pool", "local_to_uuid",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolWaveRunContext"])] == [
+        "rank", "local_rank", "world_size", "engine_config", "pool",
+        "local_to_uuid", "parallel_manager", "_weight_passes",
+        "_prefill_pool_wave", "_prefill_pool_base",
+    ]
+    assert [f.name for f in fields(ns["PoolProbeContext"])] == [
+        "rank", "_phase_prefill_debug",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolWaveContext"])] == [
+        "_prefill_pool_wave",
+    ]
+
+
+def test_the_prepacked_stage_declares_no_outcome_and_makes_one_store():
+    """One store, and it is an in-place mutation of the model the ctx carries.
+
+    The family branch clearing the model wrapper's attention-2 flag is the
+    whole of this body's writing, so there is nothing for a delegator to
+    apply and the stage needs no outcome, no sentinel and no fatal-path
+    reasoning about a write lost mid-function.
+    """
+    assert not (OUTCOME_METHODS & D7_6_METHODS)
+    ns, _ = runtime()
+    outcomes = {name for name in ns if name.endswith("Outcome")}
+    node = method_node(PREPACKED)
+    assert not ({
+        sub.func.id for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+    } & outcomes)
+    stores = []
+    for sub in ast.walk(node):
+        targets = []
+        if isinstance(sub, ast.Assign):
+            targets = list(sub.targets)
+        elif isinstance(sub, (ast.AugAssign, ast.AnnAssign)):
+            targets = [sub.target]
+        for target in targets:
+            parts = (target.elts
+                     if isinstance(target, (ast.Tuple, ast.List))
+                     else [target])
+            for part in parts:
+                if isinstance(part, ast.Attribute):
+                    stores.append(ast.unparse(part))
+    assert stores == ["ctx.model.model._use_flash_attention_2"]
+    # Through the model, never a bare ``ctx.<field> = ...`` (which the frozen
+    # context refuses) and never a worker attribute binding.
+    assert not [
+        sub for sub in ast.walk(node)
+        if isinstance(sub, ast.Name) and sub.id == "self"
+    ]
+
+
+def test_the_prepacked_driver_issues_no_collective():
+    """Proved by absence: the body names ``dist`` and no collective at all.
+
+    The pass alignment that a resident-EP prefill needs happens BEFORE this
+    call -- a rank with no local rows never enters here, so a collective in
+    this function would hang the serve group. The converted body must keep
+    that property, and it does.
+    """
+    node = method_node(PREPACKED)
+    assert not [
+        sub for sub in ast.walk(node)
+        if isinstance(sub, ast.Name) and sub.id == "dist"
+    ]
+    reached = {
+        sub.attr for sub in ast.walk(node) if isinstance(sub, ast.Attribute)
+    } | {
+        sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)
+    }
+    assert not reached & set(_COLLECTIVE_NAMES)
+
+
+def test_the_prepacked_driver_keeps_its_ordered_host_syncs():
+    """Seven host-pulling calls: the text, the ORDER and the conditions.
+
+    The file's total is what the boundary checker ratchets at 45; this pins
+    where this body's share of them is. The debug top-k pair is the site that
+    could break silently: both halves of each ``.cpu().tolist()`` must stay
+    inside the profile arm, because a half that escaped it would pull a tensor
+    back on every production prefill.
+    """
+    node = method_node(PREPACKED)
+    parents = _parent_map(node)
+    in_loop = [
+        "with torch.inference_mode(), ctx._weight_passes.scope('prefill')",
+        "for (batch_idx, (seq_start, seq_end)) in ...",
+        "if unpooled_trace is not None",
+    ]
+    profile_arm = ["if _k3_profile_enabled", "for profile_logits in ..."]
+    expected = [
+        ("tolist", "last_token_indices.tolist()", in_loop),
+        ("tolist", "torch.cat([t.reshape(-1) for t in output_tokens]).tolist()",
+         ["if ctx.rank == 0 and output_tokens"]),
+        ("tolist", "top_indices.cpu().tolist()", profile_arm),
+        ("cpu", "top_indices.cpu()", profile_arm),
+        ("tolist", "top_values.cpu().tolist()", profile_arm),
+        ("cpu", "top_values.cpu()", profile_arm),
+        ("tolist", "output_tokens[0].reshape(-1).tolist()", []),
+    ]
+    found = [
+        (method, text, _enclosing(
+            node,
+            next(sub for sub in ast.walk(node)
+                 if isinstance(sub, ast.Call) and ast.unparse(sub) == text),
+            parents,
+        ))
+        for method, text in _host_sync_calls(node)
+    ]
+    assert found == expected, found
+
+
+def test_the_stream_wait_keeps_its_position_and_stands_under_no_condition():
+    """The one explicit device wait in the file, pinned the way D7.3/D7.4
+    pinned their collectives.
+
+    A host perf-counter sample alone does not prove a non-default stream has
+    finished, and the last layer's KV D2H is deliberately off the compute
+    stream -- so this wait is what makes the GPU-complete boundary true. It
+    must stay BETWEEN the two samples, and it must stay unconditional: a
+    conversion that slid it inside the micro-batch loop or under the rank-0
+    branch would still pass every other assertion here.
+    """
+    node = method_node(PREPACKED)
+    parents = _parent_map(node)
+    waits = [
+        sub for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        and sub.func.attr == "synchronize"
+    ]
+    assert len(waits) == 1
+    wait, = waits
+    assert ast.unparse(wait) == (
+        "torch.cuda.current_stream(ctx.torch_device).synchronize()"
+    )
+    assert _enclosing(node, wait, parents) == []
+    statements = _statements(node)
+    position = next(
+        index for index, stmt in enumerate(statements)
+        if any(sub is wait for sub in ast.walk(stmt))
+    )
+    assert ast.unparse(statements[position]) == ast.unparse(wait)
+    assert ast.unparse(statements[position - 1]) == (
+        "_prefill_forward_host_s = time.perf_counter() - _prefill_forward_t0"
+    )
+    assert ast.unparse(statements[position + 1]) == (
+        "_prefill_forward_gpu_complete_s = time.perf_counter() "
+        "- _prefill_forward_t0"
+    )
+
+
+def test_the_prepacked_driver_reaches_the_model_pass_as_a_collaborator():
+    """The call D7.5 left transitional, finished -- and not duplicated.
+
+    D7.5 converted the shared pass and this driver, still worker-shaped, kept
+    the direct engine call with the pass's context built INLINE. Now the pass
+    is a collaborator like the rest: the two positionals are unchanged, the
+    worker's delegator builds the context and supplies the unsharded-gather
+    recorder, and the inline construction is GONE from this body rather than
+    living on beside the collaborator.
+    """
+    node = method_node(PREPACKED)
+    assert "_prefill_model_pass" in {a.arg for a in node.args.kwonlyargs}
+    calls = [sub for sub in ast.walk(node)
+             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+             and sub.func.id == "_prefill_model_pass"]
+    assert len(calls) == 1
+    call, = calls
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "batch_input_ids_flat.to(ctx.torch_device, dtype=torch.int64)",
+        "last_token_indices",
+    ]
+    assert {kw.arg: ast.unparse(kw.value) for kw in call.keywords} == {
+        "lmhead_fp32": "_lmhead_fp32",
+        "trace": "unpooled_trace",
+        "layer_probe": "_memprof_probe",
+    }
+    # No engine capture, no inline context, and the recorder is not named here
+    # any more -- the delegator resolves it, as it already did for the pooled
+    # driver.
+    assert not [sub for sub in ast.walk(node)
+                if isinstance(sub, ast.Name) and sub.id == "_engine"]
+    assert not [sub for sub in ast.walk(node)
+                if isinstance(sub, ast.Name)
+                and sub.id == "PrefillModelPassContext"]
+    assert not [sub for sub in ast.walk(node)
+                if isinstance(sub, ast.Name)
+                and sub.id == "_record_unsharded_epilogue_gather"]
+    # The pooled driver still builds no context either: the inline
+    # construction moved to the worker, not to the sibling driver.
+    pool = method_node("_prefill_prepacked_pool")
+    assert not [sub for sub in ast.walk(pool)
+                if isinstance(sub, ast.Name)
+                and sub.id == "PrefillModelPassContext"]
+
+
+def test_the_prepacked_driver_keeps_the_pooled_delegators_spelling():
+    """The pooled hand-off is reached by name, as the pre-move body did.
+
+    ``_prefill_prepacked_pool`` is itself converted (D7.5), but this driver
+    called the worker's same-name delegator, not the engine, so it keeps
+    receiving that delegator as a collaborator -- which also keeps it from
+    having to build the pooled driver's own context.
+    """
+    node = method_node(PREPACKED)
+    calls = [sub for sub in ast.walk(node)
+             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+             and sub.func.id == "_prefill_prepacked_pool"]
+    assert len(calls) == 1
+    call, = calls
+    assert [ast.unparse(arg) for arg in call.args] == ["batch"]
+    assert not call.keywords
+    # Inside the weight-pass scope, as before, and it is the early return.
+    parents = _parent_map(node)
+    assert _enclosing(node, call, parents) == [
+        "if ctx._prefill_pool_wave is not None",
+        "with ctx._weight_passes.scope('prefill')",
+    ]
+
+
+def test_every_model_specific_branch_is_kept_as_a_collaborator():
+    """Phase E2's work is not done here, and the count says so.
+
+    Five of the twenty-two collaborators are model-named. They are kept
+    because the branches they feed are kept: the family branch that clears the
+    attention-2 flag, the two debug-key readers, the K3 profile emitter and
+    the resident-EP rank-count sync.
+    """
+    node = method_node(PREPACKED)
+    declared = {a.arg for a in node.args.kwonlyargs}
+    for name in PREPACKED_MODEL_NAMED:
+        assert name in declared, name
+        assert [sub for sub in ast.walk(node)
+                if isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id == name], name
+    assert len(set(PREPACKED_MODEL_NAMED)) == 5
+
+
+# --------------------------------------------------------------------------- #
+#  D7.6: the worker delegator
+# --------------------------------------------------------------------------- #
+def prepacked_worker(monkeypatch, ns, engine):
+    """A worker shell carrying every value and collaborator the driver needs."""
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 2
+    worker.world_size = 8
+    worker.torch_device = "cuda:1"
+    worker.model = "model"
+    worker.model_config = "model_config"
+    worker.engine_config = "engine_config"
+    worker.global_batch = "pool"
+    worker._local_to_uuid_map = {0: "u0"}
+    worker.parallel_manager = "psm"
+    worker.core_engine = "core"
+    worker._prefix = "prefix"
+    worker.prefix_cache_coordinator = "coordinator"
+    worker.prefix_cache_runtime_config = "runtime"
+    worker.prefix_cache_debug_stats = True
+    worker._weight_passes = "passes"
+    worker._prefill_pool_wave = "wave"
+    worker._phase_prefill_debug = {"k": "v"}
+    worker._server_prefill_token_cap = lambda: 4096
+    for name in PREPACKED_COLLABORATORS:
+        setattr(worker, name, lambda *a, _n=name, **k: _n)
+    return worker
+
+
+def test_the_prepacked_delegator_builds_its_context(monkeypatch):
+    ns, engine = runtime()
+    worker = prepacked_worker(monkeypatch, ns, engine)
+    worker._prefill_global_passes = 3
+    seen = []
+    recording(engine, PREPACKED, seen)
+
+    assert worker.prefill_prepacked([0, 1]) == "recorded"
+    (context, batch), kwargs = seen[0]
+    assert isinstance(context, ns[PREPACKED_CONTEXT])
+    assert {
+        field.name: getattr(context, field.name)
+        for field in fields(context)
+    } == {
+        "rank": 2, "world_size": 8, "torch_device": "cuda:1",
+        "model": "model", "model_config": "model_config",
+        "engine_config": "engine_config", "pool": "pool",
+        "local_to_uuid": {0: "u0"}, "parallel_manager": "psm",
+        "core_engine": "core", "prefix": "prefix",
+        "prefix_coordinator": "coordinator", "prefix_runtime": "runtime",
+        "prefix_cache_debug_stats": True, "_weight_passes": "passes",
+        "_prefill_pool_wave": "wave", "_prefill_global_passes": 3,
+        "_phase_prefill_debug": {"k": "v"},
+    }
+    assert batch == [0, 1]
+    # The cap is resolved HERE, as it already was, and the twenty-two
+    # collaborators are each the worker's own method of that name.
+    assert kwargs.pop("token_cap") == 4096
+    assert set(kwargs) == set(PREPACKED_COLLABORATORS)
+    assert len(kwargs) == 22
+    for name, value in kwargs.items():
+        assert value == getattr(worker, name), name
+
+
+def test_the_prepacked_delegator_passes_the_pass_count_miss_as_none(monkeypatch):
+    """The ONE field the pre-move body read through a presence guard.
+
+    Only the pass alignment that precedes a resident-EP prefill binds
+    ``_prefill_global_passes``, and the pre-move body read it with a
+    ``getattr`` default. A frozen context always carries the field, so the
+    default lives in the delegator -- a shell that never ran the alignment
+    must see ``None``, not an AttributeError.
+    """
+    ns, engine = runtime()
+    worker = prepacked_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, PREPACKED, seen)
+
+    assert not hasattr(worker, "_prefill_global_passes")
+    worker.prefill_prepacked([0])
+    worker._prefill_global_passes = 7
+    worker.prefill_prepacked([0])
+
+    assert [args[0]._prefill_global_passes for args, _ in seen] == [None, 7]
+
+
+def test_the_prepacked_delegator_reads_the_live_phase_state(monkeypatch):
+    """Every one of these is rebound with the phase or with the batch, so the
+    delegator may not snapshot them: the model and its config, the prefix
+    cache handles, the weight-copy pipeline, the planned wave and the adopted
+    debug state."""
+    ns, engine = runtime()
+    worker = prepacked_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, PREPACKED, seen)
+
+    worker.prefill_prepacked([0])
+    worker.model = "rebound"
+    worker.model_config = "rebound_config"
+    worker.prefix_cache_runtime_config = "runtime2"
+    worker._weight_passes = "passes2"
+    worker._prefill_pool_wave = None
+    worker._phase_prefill_debug = {}
+    worker.prefill_prepacked([0])
+
+    assert [
+        (args[0].model, args[0].model_config, args[0].prefix_runtime,
+         args[0]._weight_passes, args[0]._prefill_pool_wave,
+         args[0]._phase_prefill_debug)
+        for args, _ in seen
+    ] == [
+        ("model", "model_config", "runtime", "passes", "wave", {"k": "v"}),
+        ("rebound", "rebound_config", "runtime2", "passes2", None, {}),
+    ]
+
+
+def test_the_prepacked_delegator_names_no_worker_in_its_engine_call():
+    """One assertion over the stage: the engine call passes no bare self."""
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    checked = set()
+    for node in cls.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in D7_6_METHODS:
+            continue
+        checked.add(node.name)
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "engine"):
+                continue
+            assert not any(isinstance(arg, ast.Name) and arg.id == "self"
+                           for arg in call.args), node.name
+            assert not any(isinstance(kw.value, ast.Name)
+                           and kw.value.id == "self"
+                           for kw in call.keywords), node.name
+    assert checked == D7_6_METHODS

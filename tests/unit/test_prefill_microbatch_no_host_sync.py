@@ -54,7 +54,9 @@ def test_no_sampled_token_tolist_inside_any_loop():
 
 
 def test_sampled_ids_line_is_emitted_after_the_completion_boundary():
+    # D7.6 converted the driver: the launch device it waits on is a context
+    # field now, not a worker attribute. The ordering invariant is unchanged.
     src = ast.unparse(_prefill_prepacked())
-    sync = src.index("current_stream(self.torch_device).synchronize()")
+    sync = src.index("current_stream(ctx.torch_device).synchronize()")
     log = src.index("[PREFILL] first sampled token ids")
     assert sync < log

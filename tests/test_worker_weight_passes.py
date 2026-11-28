@@ -719,12 +719,19 @@ def test_profiled_prefill_records_the_pass_counts_without_stopping_the_producer(
     prefill = _method("prefill_prepacked")
     # S5b: the K3 profile record moved verbatim into the worker helper the
     # engine body calls at the span's former position (spec F3 item 4).
+    # D7.6 converted the driver, so that helper arrives as a keyword-only
+    # collaborator and the call is a bare name; the invariant -- the driver
+    # still records through the worker's own helper, and neither stops the
+    # producer -- is unchanged.
     profile_log = _method("_emit_k3_prefill_profile_log")
     assert any(
         isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "self._emit_k3_prefill_profile_log"
+        and ast.unparse(node.func) == "_emit_k3_prefill_profile_log"
         for node in ast.walk(prefill)
     )
+    assert "_emit_k3_prefill_profile_log" in {
+        arg.arg for arg in prefill.args.kwonlyargs
+    }
     for function in (prefill, profile_log):
         assert not any(
             isinstance(node, ast.Call)

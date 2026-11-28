@@ -3654,6 +3654,25 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     assert "static constexpr std::chrono::seconds kStallTimeout{300};" in header
 
 
+def _called_at(function, name):
+    """Line numbers where ``function`` calls ``name``, in either spelling.
+
+    D7.6 converted ``prefill_prepacked``, so the two calls this invariant
+    orders are now bare collaborator names rather than ``self.<name>``
+    attributes. The invariant itself is unchanged, so the match covers both
+    spellings instead of being pinned to the pre-conversion one.
+    """
+    return [
+        node.lineno
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+            or (isinstance(node.func, ast.Name) and node.func.id == name)
+        )
+    ]
+
+
 def test_prefill_sync_happens_before_decoder_layers():
     # S5b: prefill_prepacked's body moved verbatim to PrefillEngine. Step 4:
     # the decoder-layer loop lives in the ONE model pass, so the invariant is
@@ -3661,20 +3680,8 @@ def test_prefill_sync_happens_before_decoder_layers():
     # the pass holds the layer loop and makes no collective of its own.
     engine_path = ROOT / "batchgen" / "worker" / "prefill_engine.py"
     function = _function(engine_path, "PrefillEngine", "prefill_prepacked")
-    sync_lines = [
-        node.lineno
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_sync_prefill_moe_rank_counts"
-    ]
-    pass_lines = [
-        node.lineno
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_prefill_model_pass"
-    ]
+    sync_lines = _called_at(function, "_sync_prefill_moe_rank_counts")
+    pass_lines = _called_at(function, "_prefill_model_pass")
     assert sync_lines and pass_lines
     assert min(sync_lines) < min(pass_lines)
 

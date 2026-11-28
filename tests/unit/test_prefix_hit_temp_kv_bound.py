@@ -552,10 +552,15 @@ def _method(name):
 
 
 def test_prefill_sizes_the_temporary_manager_with_the_planned_function():
+    # D7.6 converted ``prefill_prepacked``: the KV-config sizer and the
+    # micro-batch planner arrive as keyword-only collaborators, so both calls
+    # are bare names. The claim -- the temporary manager is sized by the SAME
+    # function the planner capped against, over the same argument -- is
+    # unchanged.
     body = ast.unparse(_method("prefill_prepacked"))
-    assert "self._prefix_materialization_kv_config(batch_full_seq_lengths)" in body
+    assert "_prefix_materialization_kv_config(batch_full_seq_lengths)" in body
     assert (
-        "self._plan_prefill_micro_batches(seq_lengths_list, full_seq_lengths, "
+        "_plan_prefill_micro_batches(seq_lengths_list, full_seq_lengths, "
         "compute_cached_tokens)" in body
     )
     # The old inline full-length sizing must not come back beside it.
