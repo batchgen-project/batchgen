@@ -11,11 +11,11 @@ in as a callable.
 from __future__ import annotations
 
 # Declared contract, checked against this module's source by
-# tests/worker/test_admission_module_contracts.py: what this module
-# reads off the objects it is given, what it writes on them, what it
-# mutates through them, and the orderings it relies on. A change here
-# that the source does not match, or a source change this does not
-# cover, fails that test.
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
 MODULE_CONTRACT = {
     "reads": (
         "ctx.core_engine",
@@ -33,9 +33,20 @@ MODULE_CONTRACT = {
         "timing.num_completed",
         "timing.num_onhold",
     ),
+    "writes_via_local": (
+        "seq._rep_detected",
+        "seq.eos_reached",
+        "seq.kda_record_pages",
+        "seq.max_decode_length",
+        "seq.original_max_decode_length",
+        "seq.prompt_length",
+        "seq.reentry_decoded_baseline",
+        "seq.total_decoded_before_eviction",
+    ),
     "mutates": (),
     "orderings": (
         "the gather precedes the decision, and the decision precedes the broadcast, because every rank must act on the same verdict.",
+        "the local mirror of another rank's sequence is updated only after that rank's state has been gathered, and only for a sequence this rank does not own.",
     ),
 }
 

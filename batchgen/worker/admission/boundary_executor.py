@@ -12,11 +12,11 @@ arrive as a ``CompletionIO`` from the caller.
 from __future__ import annotations
 
 # Declared contract, checked against this module's source by
-# tests/worker/test_admission_module_contracts.py: what this module
-# reads off the objects it is given, what it writes on them, what it
-# mutates through them, and the orderings it relies on. A change here
-# that the source does not match, or a source change this does not
-# cover, fails that test.
+# tests/worker/test_admission_module_contracts.py: what this module reads
+# off the objects it is given, what it writes on them directly, what it
+# writes on an object it reached THROUGH one of them, what it mutates in
+# place, and the orderings it relies on. A change here that the source
+# does not match, or a source change this does not cover, fails that test.
 MODULE_CONTRACT = {
     "reads": (
         "completion.gather_completed_tokens",
@@ -55,6 +55,7 @@ MODULE_CONTRACT = {
         "timing.total_completed_cumulative",
         "timing.total_ms",
     ),
+    "writes_via_local": (),
     "mutates": (),
     "orderings": (
         "releases precede acquisitions, because the pages an acquisition needs are the ones a release just freed.",
