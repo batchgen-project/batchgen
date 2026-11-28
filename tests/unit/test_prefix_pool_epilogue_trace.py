@@ -493,11 +493,11 @@ def test_every_line_says_which_prefill_wrote_it():
 
 
 def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
-    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine.
+    # S5b: prefill_prepacked's body moved verbatim to PrefillEngine. D7.6
+    # converted it, so the signature is multi-line and the calls it makes are
+    # bare collaborator names; the trace ordering claims are unchanged.
     source = _ROOT.joinpath("batchgen", "worker", "prefill_engine.py").read_text()
-    body = source.split(
-        "    def prefill_prepacked(self, worker, batch: list[int], *, token_cap: int):"
-    )[1]
+    body = source.split("    def prefill_prepacked(")[1]
     body = body.split("\n    def ")[0]
 
     # Armed from the debug dict this path already resolves, and only after
@@ -508,8 +508,8 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     )
     assert 'path="unpooled"' in body[arm:arm + 600]
     # The pooled wave still takes its own branch first.
-    assert body.index("return self._prefill_prepacked_pool(batch)") < arm
-    select = body.index("batch_new_tokens = self._select_tokens(logits, batch_sequences)")
+    assert body.index("return _prefill_prepacked_pool(batch)") < arm
+    select = body.index("batch_new_tokens = _select_tokens(logits, batch_sequences)")
     emit = body.index("unpooled_trace.emit(")
     assert select < emit
     assert "logits=logits," in body[emit:emit + 900]
@@ -518,11 +518,11 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     # inside the one pass), so the gather-side record the gather itself
     # writes is still the one this emit reports.
     assert body.index("unpooled_trace.begin_chunk(batch_idx)") < body.index(
-        "logits = _engine._prefill_model_pass("
+        "logits = _prefill_model_pass("
     )
-    # D7.5: this driver is still worker-shaped, so it keeps the direct engine
-    # call and builds the converted pass's context at the call site.
-    assert "PrefillModelPassContext(" in body
+    # D7.6 finished the transitional call: the pass is a collaborator and the
+    # inline context construction is gone from this driver.
+    assert "PrefillModelPassContext(" not in body
     model_pass = source.split("    def _prefill_model_pass(")[1]
     model_pass = model_pass.split("\n    def ")[0]
     assert "last_token_hidden = gather_last_token_hidden(" in model_pass

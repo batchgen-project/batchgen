@@ -269,6 +269,20 @@ def _context_attr_worker_expr(node: ast.AST) -> Optional[ast.AST]:
         "ctx.model_config": "self.model_config",
         "ctx._weight_passes": "self._weight_passes",
         "ctx._prefill_pool_base": "self._prefill_pool_base",
+        # D7.6 the unpooled prepacked driver's context. `rank`, `world_size`,
+        # `torch_device`, `model`, `model_config`, `engine_config`, `pool`,
+        # `local_to_uuid`, `parallel_manager`, `core_engine`, `prefix`,
+        # `prefix_coordinator`, `prefix_runtime`, `_weight_passes`,
+        # `_prefill_pool_wave` and `_phase_prefill_debug` already map above,
+        # onto the same worker attributes this context snapshots. The
+        # debug-stats flag is a plain read the worker binds in ``__init__``;
+        # the aligned global pass count is the one field the pre-move body
+        # read through a PRESENCE guard, because only the pass alignment of a
+        # resident-EP prefill binds it.
+        "ctx.prefix_cache_debug_stats": "self.prefix_cache_debug_stats",
+        "ctx._prefill_global_passes": (
+            "getattr(self, '_prefill_global_passes', None)"
+        ),
     }
     if text == "ctx.facts.attn_tp_size":
         return ast.parse("self._decode_attn_tp_size()", mode="eval").body
@@ -500,6 +514,51 @@ class _ContextToWorker(ast.NodeTransformer):
                     "self._unbind_prefill_pool_segments"
                 ),
                 "_write_prefill_tokens": "self._write_prefill_tokens",
+                # D7.6 keyword-only collaborators of the unpooled prepacked
+                # driver, each the worker's own method of that name -- what
+                # the pre-move body called. `_bind_prefill_host_views`,
+                # `_prefill_deepseek_family_name`, `_trajectory_tokens`,
+                # `_plan_prefill_micro_batches`, `_debug_flag_enabled`,
+                # `feed_watchdog`, `_prefix_materialization_kv_config`,
+                # `_select_tokens` and `_write_prefill_tokens` already map
+                # above. `_prefill_prepacked_pool` is a converted operation
+                # the driver reaches through the worker's same-name delegator,
+                # which is the spelling the pre-move body used. The shared
+                # model pass is NOT here, for the same reason as in the
+                # pooled driver: its pre-move spelling is the direct engine
+                # call, restored by ``_restore_model_pass_call`` below.
+                "_k3_prefill_profile_flag_name": (
+                    "self._k3_prefill_profile_flag_name"
+                ),
+                "_glm5_lmhead_fp32_flag_name": (
+                    "self._glm5_lmhead_fp32_flag_name"
+                ),
+                "_sync_prefill_moe_rank_counts": (
+                    "self._sync_prefill_moe_rank_counts"
+                ),
+                "_new_prefill_temporary_gpu_kv_manager": (
+                    "self._new_prefill_temporary_gpu_kv_manager"
+                ),
+                "_install_prefill_prepack_metadata": (
+                    "self._install_prefill_prepack_metadata"
+                ),
+                "_retire_prefill_pending_offloads": (
+                    "self._retire_prefill_pending_offloads"
+                ),
+                "_close_prefix_materialization": (
+                    "self._close_prefix_materialization"
+                ),
+                "_clear_prefill_prefix_materialization": (
+                    "self._clear_prefill_prefix_materialization"
+                ),
+                "_emit_k3_prefill_profile_log": (
+                    "self._emit_k3_prefill_profile_log"
+                ),
+                "_reset_prefill_prepack_metadata": (
+                    "self._reset_prefill_prepack_metadata"
+                ),
+                "_log_prefill_timing": "self._log_prefill_timing",
+                "_prefill_prepacked_pool": "self._prefill_prepacked_pool",
             }
             replacement = replacements.get(node.id)
             if replacement is not None:
@@ -954,36 +1013,60 @@ def _restore_cost_profile_cache_writes(
     return _Restore().visit(method)
 
 
-# D7.5: the pooled driver's ONE engine-internal call. Step 4 of the three-step
-# extraction gave both prefill drivers the direct engine spelling for the
-# shared model pass -- ``_engine`` captured before the verbatim self-rebinding,
-# with the worker handed over as the pass's first argument -- so the
-# worker-shaped view of the pooled driver is that spelling, not a ``self.``
-# delegator call. D7.5 converted the pass, so it no longer accepts a worker and
-# the converted driver reaches it as a collaborator; this restore puts the two
-# statements of the pre-move spelling back (the capture, and the call with the
-# worker first) so the lift stays character-exact. It is scoped to the one
-# method by name: no other converted body in any engine captures the engine
-# instance.
-_POOL_MODEL_PASS = "_prefill_model_pass"
-_POOL_ENGINE_ALIAS = "_engine"
+# D7.5/D7.6: each prefill driver's ONE engine-internal call. Step 4 of the
+# three-step extraction gave both prefill drivers the direct engine spelling
+# for the shared model pass -- ``_engine`` captured before the verbatim
+# self-rebinding -- so the worker-shaped view of a driver is that spelling, not
+# a ``self.`` delegator call. The two drivers differ in what preceded the
+# pass's own two positionals, and in one keyword: the pooled driver handed the
+# WORKER over (the pass still took one), while the prepacked driver, converted
+# a stage later, built the pass's context INLINE and named the unsharded-gather
+# recorder itself, because it was the only caller that had to. D7.5 and D7.6
+# converted the pass and then both drivers, so each now reaches the pass as a
+# collaborator and the worker's own delegator builds the context and supplies
+# the recorder; this restore puts each driver's pre-move spelling back (the
+# capture, and the call) so the lift stays character-exact. It is scoped to
+# these two methods by name: no other converted body in any engine captures
+# the engine instance.
+_MODEL_PASS = "_prefill_model_pass"
+_MODEL_PASS_ENGINE_ALIAS = "_engine"
+# Per driver: the argument its pre-move call passed BEFORE the pass's own two
+# positionals, and the collaborator keyword it supplied by hand (always
+# ``self.<name>``).
+_MODEL_PASS_PRE_MOVE = {
+    "_prefill_prepacked_pool": ("self", ()),
+    "prefill_prepacked": (
+        "PrefillModelPassContext(model=self.model, "
+        "parallel_manager=self.parallel_manager)",
+        ("_record_unsharded_epilogue_gather",),
+    ),
+}
 
 
-def _restore_pool_model_pass_call(method: ast.FunctionDef) -> ast.FunctionDef:
-    """Put ``_prefill_prepacked_pool``'s direct engine call back."""
+def _restore_model_pass_call(method: ast.FunctionDef) -> ast.FunctionDef:
+    """Put a prefill driver's direct engine call of the model pass back."""
+    lead, by_hand = _MODEL_PASS_PRE_MOVE[method.name]
 
     class _Restore(ast.NodeTransformer):
         def visit_Call(self, node):
             node = self.generic_visit(node)
-            if isinstance(node.func, ast.Name) and node.func.id == _POOL_MODEL_PASS:
+            if isinstance(node.func, ast.Name) and node.func.id == _MODEL_PASS:
                 return ast.Call(
                     func=ast.Attribute(
-                        value=ast.Name(id=_POOL_ENGINE_ALIAS, ctx=ast.Load()),
-                        attr=_POOL_MODEL_PASS,
+                        value=ast.Name(
+                            id=_MODEL_PASS_ENGINE_ALIAS, ctx=ast.Load(),
+                        ),
+                        attr=_MODEL_PASS,
                         ctx=ast.Load(),
                     ),
-                    args=[ast.Name(id="self", ctx=ast.Load())] + node.args,
-                    keywords=node.keywords,
+                    args=[ast.parse(lead, mode="eval").body] + node.args,
+                    keywords=node.keywords + [
+                        ast.keyword(
+                            arg=name,
+                            value=ast.parse(f"self.{name}", mode="eval").body,
+                        )
+                        for name in by_hand
+                    ],
                 )
             return node
 
@@ -992,11 +1075,11 @@ def _restore_pool_model_pass_call(method: ast.FunctionDef) -> ast.FunctionDef:
         node for node in ast.walk(method)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == _POOL_MODEL_PASS
+        and node.func.attr == _MODEL_PASS
     ]
     if len(calls) != 1:
         raise AssertionError(
-            f"_prefill_prepacked_pool: expected one model-pass call, "
+            f"{method.name}: expected one model-pass call, "
             f"found {len(calls)}"
         )
     # The capture was the pre-move body's FIRST statement, i.e. straight after
@@ -1007,7 +1090,9 @@ def _restore_pool_model_pass_call(method: ast.FunctionDef) -> ast.FunctionDef:
         and isinstance(method.body[0].value, ast.Constant)
         and isinstance(method.body[0].value.value, str)
     ) else 0
-    method.body.insert(at, ast.parse(f"{_POOL_ENGINE_ALIAS} = self").body[0])
+    method.body.insert(
+        at, ast.parse(f"{_MODEL_PASS_ENGINE_ALIAS} = self").body[0]
+    )
     return method
 
 
@@ -1340,8 +1425,8 @@ def engine_method_as_worker_method(node: ast.FunctionDef) -> ast.FunctionDef:
             method = _restore_migration_receive_writes(method)
         if node.name == "_cached_prefix_rank_cost_profile":
             method = _restore_cost_profile_cache_writes(method)
-        if node.name == "_prefill_prepacked_pool":
-            method = _restore_pool_model_pass_call(method)
+        if node.name in _MODEL_PASS_PRE_MOVE:
+            method = _restore_model_pass_call(method)
         worker_method = _class_methods(WORKER_SOURCE, WORKER_CLASS).get(node.name)
         if worker_method is not None:
             extras = _extra_value_args(

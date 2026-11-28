@@ -56,10 +56,17 @@ def test_the_flag_is_read_once_per_prefill_from_the_batch_debug_dict():
         and node.targets[0].id == LOCAL
     ]
     assert len(body_assigns) == 1, body_assigns
+    # D7.6 converted the driver: the flag reader and the key reader arrive as
+    # keyword-only collaborators, so both are bare names here. The claim -- ONE
+    # read, in the function body, of the key the worker's own helper spells --
+    # is unchanged.
     assert ast.unparse(body_assigns[0].value) == (
-        "self._debug_flag_enabled(prefill_debug.get("
-        "self._glm5_lmhead_fp32_flag_name()))"
+        "_debug_flag_enabled(prefill_debug.get("
+        "_glm5_lmhead_fp32_flag_name()))"
     )
+    assert {"_debug_flag_enabled", "_glm5_lmhead_fp32_flag_name"} <= {
+        arg.arg for arg in _method("prefill_prepacked").args.kwonlyargs
+    }
     helper = _method("_glm5_lmhead_fp32_flag_name")
     assert ast.unparse(helper.body[-1]) == f"return '{FLAG}'"
 
@@ -107,10 +114,10 @@ def test_the_unpooled_driver_hands_its_read_to_the_pass_and_the_pool_keeps_false
 
     expected = {"prefill_prepacked": LOCAL, "_prefill_prepacked_pool": "False"}
     for driver, value in expected.items():
-        # D7.5 converted the pass, so the pooled driver (converted too) reaches
-        # it as a keyword-only collaborator -- a bare ``Name`` callee -- while
-        # the still-worker-shaped unpooled driver keeps the direct engine call.
-        # The flag it hands over is the claim here, not the route.
+        # D7.5 converted the pass and the pooled driver, D7.6 the unpooled
+        # one, so both now reach it as a keyword-only collaborator -- a bare
+        # ``Name`` callee. The flag each hands over is the claim here, not the
+        # route, so the match still accepts either spelling.
         calls = [
             node for node in ast.walk(_method(driver))
             if isinstance(node, ast.Call)

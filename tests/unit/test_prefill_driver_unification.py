@@ -134,36 +134,37 @@ def test_the_drivers_hand_the_pass_their_own_seams():
         "lmhead_fp32": "_lmhead_fp32",
         "trace": "unpooled_trace",
         "layer_probe": "_memprof_probe",
-        # D7.5: the pass's one collaborator, which it no longer reaches
-        # through a worker. The pooled driver does not pass it -- its own
-        # delegator resolves it.
-        "_record_unsharded_epilogue_gather": (
-            "self._record_unsharded_epilogue_gather"
-        ),
+        # D7.6 converted the unpooled driver too, so the recorder is no longer
+        # named here: the worker's own model-pass delegator resolves it for
+        # BOTH drivers now, exactly as it already did for the pooled one.
     }
     assert pool_kwargs == {
         "lmhead_fp32": "False",
         "trace": "epilogue_trace",
     }
-    # The pooled chunk's tail arm: segments-only chunks pass None. Since D7.5
-    # the pass takes a declared context, so no driver hands it a worker: the
-    # CONVERTED pooled driver receives the pass itself as a keyword-only
-    # collaborator and passes the chunk ids and the tail arm, nothing else.
+    # Since D7.5 the pass takes a declared context, so no driver hands it a
+    # worker: each CONVERTED driver receives the pass itself as a keyword-only
+    # collaborator and passes its own two positionals -- the chunk ids and the
+    # tail arm for the pooled wave (segments-only chunks pass None), the
+    # micro-batch ids and the tail rows for the unpooled one. D7.6 finished
+    # the transitional call the prepacked driver used to keep, so neither
+    # driver builds the pass's context any more.
     assert isinstance(pool.func, ast.Name)
     assert [ast.unparse(arg) for arg in pool.args] == [
         "rows.input_ids",
         "rows.tail_rows if rows.tail_wave_indices else None",
     ]
-    # The still worker-shaped unpooled driver (D7.6) keeps the direct engine
-    # call and builds the pass's context at the call site, out of the two
-    # attributes it already reads -- routing it through the worker's delegator
-    # instead would make the engine file name a worker attribute it has never
-    # named, which the boundary census counts as a rise.
-    assert ast.unparse(prepacked.func) == "_engine._prefill_model_pass"
-    assert ast.unparse(prepacked.args[0]) == (
-        "PrefillModelPassContext(model=self.model, "
-        "parallel_manager=self.parallel_manager)"
-    )
+    assert isinstance(prepacked.func, ast.Name)
+    assert [ast.unparse(arg) for arg in prepacked.args] == [
+        "batch_input_ids_flat.to(ctx.torch_device, dtype=torch.int64)",
+        "last_token_indices",
+    ]
+    for fn in (functions["prefill_prepacked"],
+               functions["_prefill_prepacked_pool"]):
+        assert not [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and n.id == "PrefillModelPassContext"
+        ]
 
 
 # --------------------------------------------------------------------------- #

@@ -11765,18 +11765,79 @@ class BatchGenWorker:
 		)
 
 	def prefill_prepacked(self, batch: list[int]):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
-		# The engine never reaches into the worker for the cap: the delegator
-		# resolves the server mode's one cap and hands it over explicitly.
+		from batchgen.worker.prefill_engine import PrefillPrepackedRunContext
+		# Read HERE, not from a held snapshot: the model, its config, the
+		# prefix cache handles and the weight-copy pipeline are bound and
+		# dropped with the phase, and the planned wave and the aligned global
+		# pass count are rebound per batch.
 		return engine.prefill_prepacked(
-			self,
+			PrefillPrepackedRunContext(
+				rank=self.rank,
+				world_size=self.world_size,
+				torch_device=self.torch_device,
+				model=self.model,
+				model_config=self.model_config,
+				engine_config=self.engine_config,
+				pool=self.global_batch,
+				local_to_uuid=self._local_to_uuid_map,
+				parallel_manager=self.parallel_manager,
+				core_engine=self.core_engine,
+				prefix=self._prefix,
+				prefix_coordinator=self.prefix_cache_coordinator,
+				prefix_runtime=self.prefix_cache_runtime_config,
+				prefix_cache_debug_stats=self.prefix_cache_debug_stats,
+				_weight_passes=self._weight_passes,
+				_prefill_pool_wave=self._prefill_pool_wave,
+				# The pass alignment that precedes a resident-EP prefill binds
+				# this; the pre-move body read it with the same default, so the
+				# default lives here rather than turning "absent" into an
+				# AttributeError at the context.
+				_prefill_global_passes=getattr(
+					self, "_prefill_global_passes", None
+				),
+				_phase_prefill_debug=self._phase_prefill_debug,
+			),
 			batch,
+			# The engine never reaches into the worker for the cap: the
+			# delegator resolves the server mode's one cap and hands it over
+			# explicitly.
 			token_cap=self._server_prefill_token_cap(),
+			# Twenty-two collaborators, each this worker's own method of that
+			# name -- what the pre-move body called. Five are model-named
+			# readers/emitters: removing model-specific branches from the
+			# worker and the engines is a separate phase, so the branches are
+			# kept and only their route changes. The shared model pass is one
+			# of them: it no longer accepts the worker, so this delegator hands
+			# over the worker's own same-name delegator, which builds the
+			# pass's context and supplies the unsharded-gather recorder.
+			_bind_prefill_host_views=self._bind_prefill_host_views,
+			_prefill_prepacked_pool=self._prefill_prepacked_pool,
+			_prefill_deepseek_family_name=self._prefill_deepseek_family_name,
+			_trajectory_tokens=self._trajectory_tokens,
+			_plan_prefill_micro_batches=self._plan_prefill_micro_batches,
+			_debug_flag_enabled=self._debug_flag_enabled,
+			_k3_prefill_profile_flag_name=self._k3_prefill_profile_flag_name,
+			_glm5_lmhead_fp32_flag_name=self._glm5_lmhead_fp32_flag_name,
+			feed_watchdog=self.feed_watchdog,
+			_sync_prefill_moe_rank_counts=self._sync_prefill_moe_rank_counts,
+			_prefix_materialization_kv_config=self._prefix_materialization_kv_config,
+			_new_prefill_temporary_gpu_kv_manager=self._new_prefill_temporary_gpu_kv_manager,
+			_install_prefill_prepack_metadata=self._install_prefill_prepack_metadata,
+			_prefill_model_pass=self._prefill_model_pass,
+			_select_tokens=self._select_tokens,
+			_retire_prefill_pending_offloads=self._retire_prefill_pending_offloads,
+			_close_prefix_materialization=self._close_prefix_materialization,
+			_clear_prefill_prefix_materialization=self._clear_prefill_prefix_materialization,
+			_emit_k3_prefill_profile_log=self._emit_k3_prefill_profile_log,
+			_reset_prefill_prepack_metadata=self._reset_prefill_prepack_metadata,
+			_log_prefill_timing=self._log_prefill_timing,
+			_write_prefill_tokens=self._write_prefill_tokens,
 		)
 
 	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
