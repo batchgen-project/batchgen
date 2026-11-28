@@ -429,13 +429,19 @@ def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
     # sharded.
     model_pass = source.split("    def _prefill_model_pass(")[1]
     model_pass = model_pass.split("\n    def ")[0]
-    assert "logits = self.model.lm_head.forward(last_token_hidden).float()" in (
+    # D7.5 converted the pass: the model it drives is the declared context's
+    # field now, and the vocab-parallel branch is otherwise unchanged.
+    assert "logits = ctx.model.lm_head.forward(last_token_hidden).float()" in (
         model_pass
     )
     pool = source.split("    def _prefill_prepacked_pool(")[1]
     pool = pool.split("\n    def ")[0]
-    block = pool.split("logits = _engine._prefill_model_pass(")[1]
-    assert block.index("self._select_tokens(") < block.index("logits=logits")
+    # The converted pooled driver reaches the pass and the selection as
+    # keyword-only collaborators, so neither call carries `self.` or `_engine.`
+    # any more; the ORDER (select, then emit the logits it consumed) is the
+    # claim, and it is unchanged.
+    block = pool.split("logits = _prefill_model_pass(")[1]
+    assert block.index("_select_tokens(") < block.index("logits=logits")
 
 
 def test_the_vocab_parallel_head_returns_the_full_vocabulary():
@@ -514,6 +520,9 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     assert body.index("unpooled_trace.begin_chunk(batch_idx)") < body.index(
         "logits = _engine._prefill_model_pass("
     )
+    # D7.5: this driver is still worker-shaped, so it keeps the direct engine
+    # call and builds the converted pass's context at the call site.
+    assert "PrefillModelPassContext(" in body
     model_pass = source.split("    def _prefill_model_pass(")[1]
     model_pass = model_pass.split("\n    def ")[0]
     assert "last_token_hidden = gather_last_token_hidden(" in model_pass
@@ -550,9 +559,11 @@ def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     )
     # S5b: the pooled forward (arming and pairing sites) moved to PrefillEngine.
     source = engine_source
-    # The pooled forward is still worker-shaped (D7.5), so it reaches the
-    # tracer through the worker delegator of that name, as it did.
-    assert "epilogue_trace = self._new_pool_epilogue_tracer(wave)" in source
+    # D7.5 converted the pooled forward, so it reaches the tracer as a
+    # keyword-only collaborator callable of that name instead of through the
+    # worker delegator -- same operation, resolved by its delegator.
+    assert "epilogue_trace = _new_pool_epilogue_tracer(wave)" in source
+    assert "_new_pool_epilogue_tracer: Callable[[object], object]," in source
     seam = engine_source.split("    def _new_pool_epilogue_tracer")[1].split("\n    def ")[0]
     assert "self._pool_probe_debug(ctx, wave)" in seam
     assert "tracer_from_debug" in seam

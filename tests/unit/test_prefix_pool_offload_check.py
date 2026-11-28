@@ -656,11 +656,20 @@ def test_verification_consumes_the_recorder_and_tags_the_wave(monkeypatch):
 # Placement: the check runs at the retire point, and the flag gates the hash
 # --------------------------------------------------------------------------
 def _call_lines(node, attr):
+    """Lines of calls to ``attr``, whichever route the caller reaches it by.
+
+    D7.5 converted ``_prefill_prepacked_pool``: a converted body receives the
+    operations it calls as keyword-only collaborators, so inside it the callee
+    is a bare ``Name`` instead of an attribute of the rebound worker. Both
+    spellings are the same call, and the placement is what this file pins.
+    """
     return sorted(
         call.lineno for call in ast.walk(node)
         if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == attr
+        and (
+            (isinstance(call.func, ast.Attribute) and call.func.attr == attr)
+            or (isinstance(call.func, ast.Name) and call.func.id == attr)
+        )
     )
 
 
@@ -795,9 +804,11 @@ def test_a_wave_that_died_drops_both_probe_recorders():
     assert "wave.pool.kernel_dump = None" in final
     # Dropped unless this wave completed and handed the recorder to the
     # post-D2H verification step, which is the only other consumer.
+    # D7.5: the drop arrives as a keyword-only collaborator, so the call no
+    # longer carries `self.`; the guard and its position are unchanged.
     assert (
         "if not offload_recorder_handed_off:\n"
-        "    self._drop_prefill_pool_offload_recorder()"
+        "    _drop_prefill_pool_offload_recorder()"
     ) in final
     drop = ast.unparse(_worker_method("_drop_prefill_pool_offload_recorder"))
     assert (

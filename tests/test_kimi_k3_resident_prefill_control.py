@@ -907,7 +907,13 @@ def test_worker_uses_model_prefill_last_token_gather_seam():
     driver = ast.unparse(
         _function(engine_path, "PrefillEngine", "prefill_prepacked")
     )
-    assert "self._prefill_model_pass(" in driver
+    # Route-agnostic on purpose. The pin was written when the driver reached
+    # the pass as `self._prefill_model_pass(`; the step-4 extraction then gave
+    # it the direct engine spelling and D7.5 gave the pass a declared context,
+    # and after D7.6 it will be a collaborator callable. The claim is that this
+    # driver drives the one shared pass over its own flat batch, which none of
+    # those routes changes.
+    assert "_prefill_model_pass(" in driver
     assert "batch_input_ids_flat" in driver
 
 

@@ -33,6 +33,19 @@ instruments SHARE D7.1's `PoolProbeContext`, because their read set is
 exactly its two fields; the fourth reads the parallel manager instead. The
 wave epilogue is the stage's one worker write and it CLEARS the planned wave.
 
+D7.5, the fifth stage: the EXECUTION paths -- the padded forward, the one
+shared model pass, the token write-back and the pooled wave driver. It is the
+first prefill stage since D7.2 with no collective, no stream and no event in
+any of its bodies, and the first with no outcome at all: every attribute store
+it makes is an in-place mutation of an object a context carries. What it does
+carry is host synchronisation, so the tests below pin each body's ordered
+sequence of host-pulling calls and, for both write-backs, that the ONE device
+copy stays outside the per-row loop -- a conversion that moved it inside would
+fail no other assertion and would simply make prefill slower. Nothing is
+shared: the token write-back's three fields are a strict subset of both
+drivers', and the rejection is tested, because sharing would make the one call
+both drivers end on resolve the model and the weight-copy pipeline.
+
 The bodies are compiled out of the engine's own AST
 (``tests/prefill_source.py``), because importing the engine pulls in the
 compiled core engine and UCX; the delegators are compiled out of the real
@@ -54,6 +67,7 @@ from tests.prefill_source import (
     D7_2_METHODS,
     D7_3_METHODS,
     D7_4_METHODS,
+    D7_5_METHODS,
     METHODS,
     OUTCOME_METHODS,
     STATELESS_METHODS,
@@ -242,8 +256,9 @@ def test_every_context_is_frozen():
         if isinstance(value, type) and name.endswith("Context")
     ]
     # Eight from D7.1, four from D7.2, eight from D7.3, four from D7.4 (whose
-    # three probe recorders reuse D7.1's probe context instead of declaring).
-    assert len(contexts) == 24
+    # three probe recorders reuse D7.1's probe context instead of declaring)
+    # and four from D7.5, one per execution path, with no reuse at all.
+    assert len(contexts) == 28
     for context in contexts:
         instance = context(**{field.name: None for field in fields(context)})
         with pytest.raises(FrozenInstanceError):
@@ -309,10 +324,10 @@ def test_no_context_carries_a_field_its_operations_do_not_read():
             and isinstance(n.value, ast.Name) and n.value.id == "ctx"
         )
     ns, _ = runtime()
-    # One entry per DISTINCT annotation: 24 contexts, and the probe context is
+    # One entry per DISTINCT annotation: 28 contexts, and the probe context is
     # annotated five times (D7.1's pair plus D7.4's three recorders), so the
     # union it is measured against spans all five bodies.
-    assert len(reads) == 24
+    assert len(reads) == 28
     for context_name, read in sorted(reads.items()):
         declared = {field.name for field in fields(ns[context_name])}
         assert declared == read, (context_name, declared ^ read)
@@ -341,7 +356,7 @@ def test_the_probe_pair_shares_one_context_because_their_reads_coincide():
 
 
 def test_the_stage_converted_exactly_its_own_methods():
-    """The file still holds worker-shaped operations: this is stage four of seven.
+    """The file still holds worker-shaped operations: this is stage five of seven.
 
     The later stages of this engine convert the rest, so the guard that the
     whole FILE names no worker belongs to the last one, not here.
@@ -357,17 +372,26 @@ def test_the_stage_converted_exactly_its_own_methods():
             converted.add(node.name)
     assert converted == METHODS
     assert not worker_shaped & METHODS
-    assert worker_shaped, "nothing left to convert, but D7.4 is not the last stage"
-    # The four stages are disjoint, and what is left is what D7.5-D7.7 take:
-    # fourteen converted in D7.1, five in D7.2, nine in D7.3, seven here, and
-    # the seven execution/preparation bodies still worker-shaped.
+    assert worker_shaped, "nothing left to convert, but D7.5 is not the last stage"
+    # The five stages are disjoint, and what is left is what D7.6-D7.7 take:
+    # fourteen converted in D7.1, five in D7.2, nine in D7.3, seven in D7.4,
+    # four here, and the three preparation/config bodies still worker-shaped --
+    # `prefill_prepacked` (D7.6), `_prepare_prefill_batch` and
+    # `_config_prefill_for_batch` (D7.7).
     assert D7_1_METHODS.isdisjoint(D7_2_METHODS)
     assert D7_3_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS)
     assert D7_4_METHODS.isdisjoint(D7_1_METHODS | D7_2_METHODS | D7_3_METHODS)
+    assert D7_5_METHODS.isdisjoint(
+        D7_1_METHODS | D7_2_METHODS | D7_3_METHODS | D7_4_METHODS
+    )
+    assert worker_shaped == {
+        "prefill_prepacked", "_prepare_prefill_batch",
+        "_config_prefill_for_batch",
+    }
     assert (
         len(D7_1_METHODS), len(D7_2_METHODS), len(D7_3_METHODS),
-        len(D7_4_METHODS), len(worker_shaped),
-    ) == (14, 5, 9, 7, 7)
+        len(D7_4_METHODS), len(D7_5_METHODS), len(worker_shaped),
+    ) == (14, 5, 9, 7, 4, 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -5210,3 +5234,741 @@ def test_every_d7_4_delegator_names_no_worker_in_its_engine_call():
                            and kw.value.id == "self"
                            for kw in call.keywords), node.name
     assert checked == D7_4_METHODS
+
+
+# --------------------------------------------------------------------------- #
+#  D7.5: the execution paths -- shape, narrowness, and the two things that
+#  would break silently (a moved collective, a moved host sync)
+# --------------------------------------------------------------------------- #
+D7_5_CONTEXTS = {
+    "prefill": "PrefillBatchForwardContext",
+    "_prefill_model_pass": "PrefillModelPassContext",
+    "_write_prefill_tokens": "PrefillTokenWritebackContext",
+    "_prefill_prepacked_pool": "PrefillPoolWaveRunContext",
+}
+# Every `dist` entry point, stream/event handle and device-wide wait a prefill
+# body could reach. Spelled out here so the "this stage has none" claim is a
+# membership test over the four bodies, not a reading of them.
+_ASYNC_NAMES = (
+    "all_reduce", "all_gather", "all_gather_into_tensor", "broadcast",
+    "barrier", "reduce", "reduce_scatter", "send", "recv", "isend", "irecv",
+    "gather", "scatter", "synchronize", "Stream", "Event", "stream",
+    "wait_stream", "wait_event", "record_event", "current_stream",
+    "default_stream", "set_stream",
+)
+# The calls the boundary checker counts as host-synchronising, i.e. the ones
+# that make the CPU wait for the GPU.
+_HOST_SYNC_METHODS = ("item", "tolist", "cpu", "numpy")
+
+
+def _host_sync_calls(node):
+    """``(method, call text)`` for each host-pulling call, in source order."""
+    out = []
+    for sub in sorted(
+        (n for n in ast.walk(node) if isinstance(n, ast.Call)),
+        key=lambda n: (n.lineno, n.col_offset),
+    ):
+        if (isinstance(sub.func, ast.Attribute)
+                and sub.func.attr in _HOST_SYNC_METHODS
+                and not sub.args and not sub.keywords):
+            out.append((sub.func.attr, ast.unparse(sub)))
+    return out
+
+
+@pytest.mark.parametrize("name", sorted(D7_5_CONTEXTS))
+def test_each_execution_path_declares_the_context_it_reads(name):
+    node = method_node(name)
+    assert ast.unparse(node.args.args[1].annotation) == D7_5_CONTEXTS[name]
+
+
+def test_the_four_execution_contexts_are_four_distinct_read_sets():
+    """No share, proved by the read sets rather than by family resemblance."""
+    ns, _ = runtime()
+    sets = {
+        name: frozenset(f.name for f in fields(ns[context]))
+        for name, context in D7_5_CONTEXTS.items()
+    }
+    assert len(set(sets.values())) == 4, sets
+    # And none of them equals any context an earlier stage declared, which is
+    # the only ground on which this stage could have reused one.
+    earlier = {
+        ast.unparse(method_node(other).args.args[1].annotation)
+        for other in sorted(
+            (D7_1_METHODS | D7_2_METHODS | D7_3_METHODS | D7_4_METHODS)
+            - STATELESS_METHODS
+        )
+    }
+    declared = {
+        name: frozenset(f.name for f in fields(ns[name])) for name in earlier
+    }
+    for name, read in sets.items():
+        assert read not in set(declared.values()), (name, read)
+
+
+def test_the_token_writeback_does_not_share_a_drivers_context():
+    """The tempting share, rejected, with the arithmetic that rejects it.
+
+    ``_write_prefill_tokens`` is the one operation BOTH prefill drivers end
+    on, and its three fields are a strict subset of each driver's. A share
+    would therefore be legal for the narrowness test only as the UNION, i.e.
+    the driver's whole set -- which would make this delegator resolve the
+    model, the model config, the launch device and the weight-copy pipeline on
+    a call that does nothing but turn sampled rows into sequence state.
+    """
+    ns, _ = runtime()
+    writeback = frozenset(f.name for f in fields(ns["PrefillTokenWritebackContext"]))
+    padded = frozenset(f.name for f in fields(ns["PrefillBatchForwardContext"]))
+    pooled = frozenset(f.name for f in fields(ns["PrefillPoolWaveRunContext"]))
+    assert writeback == {"rank", "pool", "local_to_uuid"}
+    assert writeback < padded and writeback < pooled
+    # What a share would force each delegator to resolve, and nobody reads.
+    assert padded - writeback == {
+        "torch_device", "model", "model_config", "engine_config",
+        "_weight_passes",
+    }
+    assert pooled - writeback == {
+        "local_rank", "world_size", "engine_config", "parallel_manager",
+        "_weight_passes", "_prefill_pool_wave", "_prefill_pool_base",
+    }
+
+
+def test_no_earlier_stages_context_was_widened_for_the_execution_stage():
+    """D7.1-D7.4's contexts keep exactly the fields they were declared with."""
+    ns, _ = runtime()
+    assert [f.name for f in fields(ns["PrefillPoolLayoutContext"])] == [
+        "model", "_prefill_pool_layout_cache",
+    ]
+    assert [f.name for f in fields(ns["MaterializedIndexKeyLayersContext"])] == [
+        "model",
+    ]
+    assert [f.name for f in fields(ns["UnshardedEpilogueGatherContext"])] == [
+        "rank", "parallel_manager",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolWavePlanContext"])] == [
+        "rank", "torch_device", "parallel_manager", "huggingface_ckpt_name",
+        "pool", "prefix_runtime", "_prefill_pool_page_budget",
+    ]
+    assert [f.name for f in fields(ns["PrefillPoolWaveContext"])] == [
+        "_prefill_pool_wave",
+    ]
+
+
+def test_the_execution_stage_declares_no_outcome_at_all():
+    """Nothing travels back: every store is an in-place mutation.
+
+    The four bodies store through an attribute PATH -- the model wrapper's
+    attention-2 flag, a sequence's EOS latch, the pool's dump recorder and its
+    three row handles -- and never bind a worker attribute, so there is no
+    write for a delegator to apply.
+    """
+    assert not (OUTCOME_METHODS & D7_5_METHODS)
+    stores = {}
+    for name in sorted(D7_5_METHODS):
+        node = method_node(name)
+        for sub in ast.walk(node):
+            targets = []
+            if isinstance(sub, ast.Assign):
+                targets = list(sub.targets)
+            elif isinstance(sub, (ast.AugAssign, ast.AnnAssign)):
+                targets = [sub.target]
+            for target in targets:
+                parts = (target.elts
+                         if isinstance(target, (ast.Tuple, ast.List))
+                         else [target])
+                for part in parts:
+                    if isinstance(part, ast.Attribute):
+                        stores.setdefault(name, []).append(ast.unparse(part))
+    assert stores == {
+        # The family branch, kept verbatim for Phase E2: the flag lives on the
+        # model the context carries. Then the EOS latch, on the sequence the
+        # pool handed back.
+        "prefill": [
+            "ctx.model.model._use_flash_attention_2", "seq.eos_reached",
+        ],
+        "_write_prefill_tokens": ["seq.eos_reached"],
+        # The pooled wave's teardown, on the pool the wave object holds.
+        "_prefill_prepacked_pool": [
+            "wave.pool.kernel_dump", "wave.pool.k", "wave.pool.v",
+            "wave.pool.indexer",
+        ],
+    }, stores
+    # Each store goes THROUGH an object: either a local the body was handed
+    # (``seq``, ``wave``) or an attribute of one the context carries. None is a
+    # bare ``ctx.<field> = ...``, which the frozen context would refuse anyway,
+    # and none is a worker attribute binding.
+    for name, paths in stores.items():
+        for path in paths:
+            head, _, rest = path.partition(".")
+            assert head != "self", (name, path)
+            assert rest and "." in rest or head != "ctx", (name, path)
+
+
+def test_no_execution_body_issues_a_collective_a_stream_or_an_event():
+    """The D6.4/D7.3 rule, discharged by absence rather than by position.
+
+    An async or collective call that MOVED would be the one defect this shape
+    change could introduce and no runtime test on one rank would see it. There
+    is none to move: the four bodies name neither ``dist`` nor any stream,
+    event or device-wide wait, so the claim is checked as emptiness.
+    """
+    for name in sorted(D7_5_METHODS):
+        node = method_node(name)
+        assert not [
+            n for n in ast.walk(node)
+            if isinstance(n, ast.Name) and n.id == "dist"
+        ], name
+        reached = {
+            n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)
+        } | {
+            n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+        }
+        assert not reached & set(_ASYNC_NAMES), (name, reached & set(_ASYNC_NAMES))
+
+
+def test_each_body_keeps_its_exact_ordered_sequence_of_host_syncs():
+    """The call text and the ORDER, per body, as the pre-move bodies had them.
+
+    The file's total is what the boundary checker ratchets; this pins where
+    those calls are, which the total cannot. ``_prefill_model_pass`` is listed
+    with an empty sequence on purpose: the one body of the stage that pulls
+    nothing back must keep pulling nothing back.
+    """
+    expected = {
+        "prefill": [
+            ("cpu", "new_tokens.cpu()"),
+            ("item", "new_tokens_cpu[i].item()"),
+        ],
+        "_prefill_model_pass": [],
+        "_write_prefill_tokens": [
+            ("cpu", "new_tokens.cpu()"),
+            ("item", "new_tokens_cpu[i].item()"),
+            ("item", "new_tokens_cpu[i].item()"),
+        ],
+        "_prefill_prepacked_pool": [
+            ("tolist", "rows.tail_rows.tolist()"),
+            ("tolist", "new_tokens.reshape(-1).tolist()"),
+        ],
+    }
+    for name in sorted(D7_5_METHODS):
+        assert _host_sync_calls(method_node(name)) == expected[name], name
+
+
+@pytest.mark.parametrize("name", ["prefill", "_write_prefill_tokens"])
+def test_the_one_device_copy_stays_outside_the_per_row_loop(name):
+    """One copy, then a host read per row -- the pattern, not just the count.
+
+    A conversion that pulled ``new_tokens.cpu()`` into the write-back loop
+    would fail no other assertion here and would simply make prefill slower:
+    one device-to-host copy per sequence instead of one per batch. So the copy
+    is pinned OUTSIDE every loop of the body, and both per-row reads inside
+    one.
+    """
+    node = method_node(name)
+
+    def loops_above(target):
+        found = []
+
+        def walk(stmt, depth):
+            for sub in ast.iter_child_nodes(stmt):
+                nxt = depth + isinstance(stmt, (ast.For, ast.While))
+                if sub is target:
+                    found.append(nxt)
+                walk(sub, nxt)
+
+        walk(node, 0)
+        return found
+
+    copies = [n for n in ast.walk(node)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "cpu"]
+    assert len(copies) == 1
+    assert loops_above(copies[0]) == [0], "the device copy moved into a loop"
+    reads = [n for n in ast.walk(node)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "item"]
+    assert reads
+    for read in reads:
+        assert loops_above(read) == [1], "a per-row read left its loop"
+
+
+def test_the_pooled_driver_reaches_the_model_pass_as_a_collaborator():
+    """It hands over no worker, because the pass no longer takes one.
+
+    Before this stage both drivers called the pass on the engine instance they
+    had captured, with the worker as its first argument. The pass now takes a
+    declared context, which a converted body cannot build, so the pooled
+    driver receives the worker's own delegator as a keyword-only callable --
+    and passes exactly the two positionals it always did.
+    """
+    node = method_node("_prefill_prepacked_pool")
+    assert "_prefill_model_pass" in {a.arg for a in node.args.kwonlyargs}
+    calls = [n for n in ast.walk(node)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_prefill_model_pass"]
+    assert len(calls) == 1
+    call, = calls
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "rows.input_ids",
+        "rows.tail_rows if rows.tail_wave_indices else None",
+    ]
+    assert {kw.arg: ast.unparse(kw.value) for kw in call.keywords} == {
+        "lmhead_fp32": "False", "trace": "epilogue_trace",
+    }
+    # No `_engine` capture survives in the converted body, and no `self`.
+    assert not [n for n in ast.walk(node)
+                if isinstance(n, ast.Name) and n.id == "_engine"]
+
+
+def test_the_still_worker_shaped_driver_builds_the_passs_context_itself():
+    """D7.6's body keeps the direct engine call, and why.
+
+    ``prefill_prepacked`` is still worker-shaped. Routing its model-pass call
+    through the worker's same-name delegator would make this engine file name
+    a worker attribute (`_prefill_model_pass`) it has never named, which the
+    boundary census counts as a RISE. So it keeps the direct engine call and
+    builds the pass's context at the call site, out of the two attributes it
+    already reads.
+    """
+    node = method_node("prefill_prepacked")
+    calls = [n for n in ast.walk(node)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "_prefill_model_pass"]
+    assert len(calls) == 1
+    call, = calls
+    assert ast.unparse(call.func.value) == "_engine"
+    assert ast.unparse(call.args[0]) == (
+        "PrefillModelPassContext(model=self.model, "
+        "parallel_manager=self.parallel_manager)"
+    )
+    assert {kw.arg for kw in call.keywords} == {
+        "lmhead_fp32", "trace", "layer_probe",
+        "_record_unsharded_epilogue_gather",
+    }
+    # It reaches the pass through NO worker attribute of that name.
+    assert not [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Name) and n.value.id == "self"
+        and n.attr == "_prefill_model_pass"
+    ]
+
+
+# --------------------------------------------------------------------------- #
+#  D7.5 runtime: the padded forward and the token write-back, driven
+# --------------------------------------------------------------------------- #
+class WeightPasses:
+    """The weight-copy pipeline, recording its scope/begin/end sequence."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def scope(self, name):
+        log = self.log
+
+        class Scope:
+            def __enter__(self):
+                log.append(("scope_enter", name))
+                return self
+
+            def __exit__(self, *exc):
+                log.append(("scope_exit", name))
+                return False
+
+        return Scope()
+
+    def begin(self, *, carry):
+        self.log.append(("begin", carry))
+
+    def end(self):
+        self.log.append(("end",))
+
+
+class CountingTokens:
+    """A token tensor that counts the device copies taken of it."""
+
+    def __init__(self, values):
+        self._tensor = torch.tensor(values, dtype=torch.int64)
+        self.copies = 0
+
+    def cpu(self):
+        self.copies += 1
+        return self._tensor
+
+    @property
+    def shape(self):
+        return self._tensor.shape
+
+
+def sequence(prompt_length, tokens):
+    seq = SimpleNamespace(
+        prompt_length=prompt_length, tokens=tokens, advanced=0,
+        eos_reached=False,
+    )
+    seq.advance_one_token = lambda: setattr(seq, "advanced", seq.advanced + 1)
+    return seq
+
+
+def padded_forward(ns, engine, *, seqs, batch, micro=2, log=None, stops=(),
+                   model_type="kimi_linear", family="deepseek", inner=None):
+    """Drive the converted ``prefill`` over CPU fakes."""
+    log = [] if log is None else log
+    uuids = {index: f"u{index}" for index in range(len(seqs))}
+    inner = inner if inner is not None else SimpleNamespace(
+        _use_flash_attention_2=True,
+    )
+
+    def forward(ids, attention_mask, use_cache):
+        log.append(("forward", tuple(ids.shape), bool(use_cache)))
+        return SimpleNamespace(logits=torch.zeros((ids.shape[0], ids.shape[1], 4)))
+
+    # The model is a callable that also carries the wrapper whose attention
+    # flag the family branch clears, exactly as the worker's model object does.
+    forward.model = inner
+    ctx = ns["PrefillBatchForwardContext"](
+        rank=0,
+        torch_device="cpu",
+        model=forward,
+        model_config=SimpleNamespace(model_type=model_type),
+        engine_config=SimpleNamespace(
+            Module_Batching_Config=SimpleNamespace(
+                MoE_prefill_micro_batch_size=micro,
+            ),
+        ),
+        pool=SimpleNamespace(get_sequence=lambda uuid: seqs[int(uuid[1:])]),
+        local_to_uuid=uuids,
+        _weight_passes=WeightPasses(log),
+    )
+    issued = []
+
+    def select(logits, sequences):
+        log.append(("select", logits.shape[0]))
+        base = 7 + sum(len(previous) for previous in issued)
+        rows = torch.tensor(
+            [base + i for i in range(logits.shape[0])], dtype=torch.int64,
+        )
+        issued.append(rows)
+        return rows
+
+    appended = []
+    out = engine.prefill(
+        ctx, batch,
+        _bind_prefill_host_views=lambda: log.append(("bind_host_views",)),
+        _prefill_deepseek_family_name=lambda: family,
+        _trajectory_tokens=lambda seq, *, length, dtype: torch.tensor(
+            seq.tokens[:length], dtype=dtype,
+        ),
+        feed_watchdog=lambda: log.append(("watchdog",)),
+        _bind_prefill_step_metadata=lambda mask: log.append(
+            ("bind_metadata", tuple(mask.shape)),
+        ),
+        _bind_prefill_step_batch=lambda local: log.append(
+            ("bind_batch", tuple(local)),
+        ),
+        _select_tokens=select,
+        _append_trajectory_batch=lambda b, cpu: appended.append(
+            (tuple(b), cpu.tolist()),
+        ),
+        _should_stop_at_eos=lambda token, seq: token in stops,
+    )
+    return out, log, appended, inner
+
+
+def test_the_padded_forward_binds_then_runs_one_pass_per_micro_batch():
+    ns, engine = runtime(tqdm=lambda iterable, **_: iterable)
+    seqs = [sequence(3, [1, 2, 3]), sequence(2, [4, 5]), sequence(3, [6, 7, 8])]
+    out, log, appended, _ = padded_forward(
+        ns, engine, seqs=seqs, batch=[0, 1, 2], micro=2,
+    )
+    # The host-view binding comes FIRST, before anything reads a sequence.
+    assert log[0] == ("bind_host_views",)
+    # Two micro-batches (3 sequences, size 2), each watchdog-fed, begun with
+    # the carry flag the position implies, bound, forwarded, selected and
+    # ended -- all inside ONE weight-pass scope. The padded rows are the
+    # batch's own max length (3), not a global one.
+    assert log[1:] == [
+        ("scope_enter", "prefill"),
+        ("watchdog",), ("begin", True),
+        ("bind_metadata", (2, 3)), ("bind_batch", (0, 1)),
+        ("forward", (2, 3), False), ("select", 2), ("end",),
+        ("watchdog",), ("begin", False),
+        ("bind_metadata", (1, 3)), ("bind_batch", (2,)),
+        ("forward", (1, 3), False), ("select", 1), ("end",),
+        ("scope_exit", "prefill"),
+    ]
+    assert [seq.advanced for seq in seqs] == [1, 1, 1]
+    assert not any(seq.eos_reached for seq in seqs)
+    # ONE trajectory append for the whole batch, off the one host copy.
+    assert appended == [((0, 1, 2), [7, 8, 9])]
+    assert out.tolist() == [7, 8, 9]
+
+
+def test_the_padded_forwards_eos_latch_lands_on_the_sequence_the_pool_gave():
+    ns, engine = runtime(tqdm=lambda iterable, **_: iterable)
+    seqs = [sequence(2, [1, 2]), sequence(2, [3, 4])]
+    padded_forward(ns, engine, seqs=seqs, batch=[0, 1], micro=2, stops={8})
+    # `select` hands back 7, 8: the second row stops.
+    assert [seq.eos_reached for seq in seqs] == [False, True]
+
+
+@pytest.mark.parametrize("model_type,cleared", [
+    ("deepseek_v3", True), ("glm_moe", False),
+])
+def test_the_padded_forward_clears_the_attention_flag_only_on_its_family(
+    model_type, cleared,
+):
+    """The model-specific branch, kept verbatim: Phase E2 removes it, not this.
+
+    The flag it clears lives on the model wrapper the CONTEXT carries, so the
+    store is an in-place mutation and no outcome is involved -- and a model
+    outside the family is still left alone.
+    """
+    ns, engine = runtime(tqdm=lambda iterable, **_: iterable)
+    seqs = [sequence(1, [1])]
+    _, _, _, inner = padded_forward(
+        ns, engine, seqs=seqs, batch=[0], micro=1, model_type=model_type,
+    )
+    assert inner._use_flash_attention_2 is not cleared
+
+
+def writeback(ns, engine, *, seqs, batch, stops=(), tokens=None):
+    uuids = {index: f"u{index}" for index in range(len(seqs))}
+    ctx = ns["PrefillTokenWritebackContext"](
+        rank=3,
+        pool=SimpleNamespace(get_sequence=lambda uuid: seqs[int(uuid[1:])]),
+        local_to_uuid=uuids,
+    )
+    appended = []
+    new_tokens = tokens if tokens is not None else CountingTokens(
+        [11 + i for i in range(len(batch))]
+    )
+    out = engine._write_prefill_tokens(
+        ctx, batch, new_tokens,
+        _append_trajectory_token=lambda seq, token: appended.append(
+            (seq, token),
+        ),
+        _should_stop_at_eos=lambda token, seq: token in stops,
+    )
+    return out, new_tokens, appended
+
+
+def test_the_writeback_copies_once_and_reads_each_row_on_the_host():
+    """The one-copy-then-read pattern, observed rather than read off the AST."""
+    ns, engine = runtime()
+    seqs = [sequence(1, [1]), sequence(1, [2]), sequence(1, [3])]
+    out, new_tokens, appended = writeback(
+        ns, engine, seqs=seqs, batch=[0, 1, 2],
+    )
+    assert new_tokens.copies == 1, "one device copy per batch, not per row"
+    assert [token for _, token in appended] == [11, 12, 13]
+    assert [seq.advanced for seq in seqs] == [1, 1, 1]
+    assert out is new_tokens
+
+
+def test_the_writeback_appends_before_it_advances_and_latches_eos():
+    ns, engine = runtime()
+    seqs = [sequence(1, [1]), sequence(1, [2])]
+    _, _, appended = writeback(
+        ns, engine, seqs=seqs, batch=[0, 1], stops={12},
+    )
+    assert [seq is got for (got, _), seq in zip(appended, seqs)] == [True, True]
+    assert [seq.eos_reached for seq in seqs] == [False, True]
+
+
+def test_a_writeback_shaped_against_another_batch_is_refused_by_rank():
+    ns, engine = runtime()
+    seqs = [sequence(1, [1])]
+    with pytest.raises(RuntimeError, match=r"Rank 3: prefill writeback shape"):
+        writeback(ns, engine, seqs=seqs, batch=[0, 1],
+                  tokens=CountingTokens([5]))
+
+
+# --------------------------------------------------------------------------- #
+#  D7.5: the four worker delegators
+# --------------------------------------------------------------------------- #
+def execution_worker(monkeypatch, ns, engine):
+    """A worker shell carrying every value and collaborator the four need."""
+    worker = load_delegators(monkeypatch, ns)
+    worker._prefill_engine = engine
+    worker.rank = 2
+    worker.local_rank = 1
+    worker.world_size = 8
+    worker.torch_device = "cuda:1"
+    worker.model = "model"
+    worker.model_config = "model_config"
+    worker.engine_config = "engine_config"
+    worker.global_batch = "pool"
+    worker.parallel_manager = "psm"
+    worker._local_to_uuid_map = {0: "u0"}
+    worker._weight_passes = "passes"
+    worker._prefill_pool_wave = "wave"
+    worker._prefill_pool_base = (1, 2, 3)
+    # Collaborators the worker owns outside this engine's own delegators.
+    for name in (
+        "_bind_prefill_host_views", "_prefill_deepseek_family_name",
+        "_trajectory_tokens", "feed_watchdog", "_bind_prefill_step_metadata",
+        "_bind_prefill_step_batch", "_select_tokens",
+        "_append_trajectory_batch", "_should_stop_at_eos",
+        "_append_trajectory_token", "_record_unsharded_epilogue_gather",
+        "_bind_prefill_pool_segments", "_bind_prefill_pool_layer_state",
+        "_install_prefill_pool_rows", "_release_kda_state_slots",
+        "_drop_prefill_pool_offload_recorder", "_unbind_prefill_pool_segments",
+    ):
+        setattr(worker, name, lambda *a, _n=name, **k: _n)
+    return worker
+
+
+def test_the_padded_forward_delegator_builds_its_context(monkeypatch):
+    ns, engine = runtime()
+    worker = execution_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, "prefill", seen)
+
+    assert worker.prefill([0, 1]) == "recorded"
+    (context, batch), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillBatchForwardContext"])
+    assert (
+        context.rank, context.torch_device, context.model,
+        context.model_config, context.engine_config, context.pool,
+        context.local_to_uuid, context._weight_passes,
+    ) == (2, "cuda:1", "model", "model_config", "engine_config", "pool",
+          {0: "u0"}, "passes")
+    assert batch == [0, 1]
+    assert kwargs == {
+        "_bind_prefill_host_views": worker._bind_prefill_host_views,
+        "_prefill_deepseek_family_name": worker._prefill_deepseek_family_name,
+        "_trajectory_tokens": worker._trajectory_tokens,
+        "feed_watchdog": worker.feed_watchdog,
+        "_bind_prefill_step_metadata": worker._bind_prefill_step_metadata,
+        "_bind_prefill_step_batch": worker._bind_prefill_step_batch,
+        "_select_tokens": worker._select_tokens,
+        "_append_trajectory_batch": worker._append_trajectory_batch,
+        "_should_stop_at_eos": worker._should_stop_at_eos,
+    }
+
+
+def test_the_model_pass_delegator_reads_the_live_model_each_call(monkeypatch):
+    """The model is bound and dropped with the phase, so it is read per call."""
+    ns, engine = runtime()
+    worker = execution_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, "_prefill_model_pass", seen)
+
+    worker._prefill_model_pass("ids", "rows", lmhead_fp32=True)
+    worker.model = "rebound"
+    worker.parallel_manager = "psm2"
+    worker._prefill_model_pass("ids", None, lmhead_fp32=False, trace="t")
+
+    assert [(args[0].model, args[0].parallel_manager) for args, _ in seen] == [
+        ("model", "psm"), ("rebound", "psm2"),
+    ]
+    assert [args[1:] for args, _ in seen] == [("ids", "rows"), ("ids", None)]
+    assert [kwargs for _, kwargs in seen] == [
+        {
+            "lmhead_fp32": True, "trace": None, "layer_probe": None,
+            "_record_unsharded_epilogue_gather":
+                worker._record_unsharded_epilogue_gather,
+        },
+        {
+            "lmhead_fp32": False, "trace": "t", "layer_probe": None,
+            "_record_unsharded_epilogue_gather":
+                worker._record_unsharded_epilogue_gather,
+        },
+    ]
+
+
+def test_the_writeback_delegator_builds_its_narrow_context(monkeypatch):
+    ns, engine = runtime()
+    worker = execution_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, "_write_prefill_tokens", seen)
+
+    assert worker._write_prefill_tokens([0], "tokens") == "recorded"
+    (context, batch, tokens), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillTokenWritebackContext"])
+    assert (context.rank, context.pool, context.local_to_uuid) == (
+        2, "pool", {0: "u0"},
+    )
+    assert (batch, tokens) == ([0], "tokens")
+    # Exactly two collaborators: it resolves no model and no weight pass.
+    assert kwargs == {
+        "_append_trajectory_token": worker._append_trajectory_token,
+        "_should_stop_at_eos": worker._should_stop_at_eos,
+    }
+
+
+def test_the_pool_driver_delegator_passes_fourteen_collaborators(monkeypatch):
+    ns, engine = runtime()
+    worker = execution_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, "_prefill_prepacked_pool", seen)
+
+    assert worker._prefill_prepacked_pool([0]) == "recorded"
+    (context, batch), kwargs = seen[0]
+    assert isinstance(context, ns["PrefillPoolWaveRunContext"])
+    assert (
+        context.rank, context.local_rank, context.world_size,
+        context.engine_config, context.pool, context.local_to_uuid,
+        context.parallel_manager, context._weight_passes,
+        context._prefill_pool_wave, context._prefill_pool_base,
+    ) == (2, 1, 8, "engine_config", "pool", {0: "u0"}, "psm", "passes",
+          "wave", (1, 2, 3))
+    assert batch == [0]
+    # The shared model pass is among them: it no longer takes a worker, so
+    # this delegator hands over the worker's own same-name delegator.
+    assert set(kwargs) == {
+        "_construct_prefill_pool", "_new_pool_epilogue_tracer",
+        "_bind_prefill_pool_segments", "_bind_prefill_pool_layer_state",
+        "_materialized_segment_loader", "feed_watchdog",
+        "_install_prefill_pool_rows", "_load_materialized_segments",
+        "_prefill_model_pass", "_select_tokens", "_release_kda_state_slots",
+        "_drop_prefill_pool_offload_recorder",
+        "_unbind_prefill_pool_segments", "_write_prefill_tokens",
+    }
+    assert len(kwargs) == 14
+    for name, value in kwargs.items():
+        assert value == getattr(worker, name), name
+
+
+def test_the_pool_driver_delegator_reads_the_live_wave_and_baseline(monkeypatch):
+    """Both are rebound per wave -- the baseline by the construction this
+    body's own first statement may trigger -- so neither may be snapshotted."""
+    ns, engine = runtime()
+    worker = execution_worker(monkeypatch, ns, engine)
+    seen = []
+    recording(engine, "_prefill_prepacked_pool", seen)
+
+    worker._prefill_pool_wave = "first"
+    worker._prefill_pool_base = (0, 0, 0)
+    worker._prefill_prepacked_pool([])
+    worker._prefill_pool_wave = "second"
+    worker._prefill_pool_base = (9, 9, 9)
+    worker._prefill_prepacked_pool([])
+
+    assert [(args[0]._prefill_pool_wave, args[0]._prefill_pool_base)
+            for args, _ in seen] == [
+        ("first", (0, 0, 0)), ("second", (9, 9, 9)),
+    ]
+
+
+def test_every_d7_5_delegator_names_no_worker_in_its_engine_call():
+    """One assertion over the stage: no engine call passes a bare self."""
+    tree = ast.parse(WORKER_SOURCE.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
+    checked = set()
+    for node in cls.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in D7_5_METHODS:
+            continue
+        checked.add(node.name)
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "engine"):
+                continue
+            assert not any(isinstance(arg, ast.Name) and arg.id == "self"
+                           for arg in call.args), node.name
+            assert not any(isinstance(kw.value, ast.Name)
+                           and kw.value.id == "self"
+                           for kw in call.keywords), node.name
+    assert checked == D7_5_METHODS

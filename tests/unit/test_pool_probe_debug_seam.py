@@ -361,11 +361,19 @@ def test_no_prefill_path_hand_writes_a_gather_record(function_name):
 def test_both_drivers_hand_their_tracer_to_the_one_model_pass(
     function_name, tracer_local,
 ):
+    # D7.5: the converted pooled driver reaches the pass as a keyword-only
+    # collaborator (a bare ``Name`` callee); the still-worker-shaped unpooled
+    # driver keeps the direct engine call. The tracer it hands over is the
+    # claim here, not the route.
     passes = [
         node for node in ast.walk(_method(function_name))
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_prefill_model_pass"
+        and (
+            (isinstance(node.func, ast.Attribute)
+             and node.func.attr == "_prefill_model_pass")
+            or (isinstance(node.func, ast.Name)
+                and node.func.id == "_prefill_model_pass")
+        )
     ]
     assert len(passes) == 1, f"{function_name}: {len(passes)} pass calls"
     trace_kw = {kw.arg: ast.unparse(kw.value) for kw in passes[0].keywords}
