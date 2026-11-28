@@ -73,9 +73,18 @@ def _tainted_locals(fn, params):
             names = {x.id for x in ast.walk(source) if isinstance(x, ast.Name)}
             if names & (params | tainted):
                 for target in targets:
-                    for name in ast.walk(target):
-                        if isinstance(name, ast.Name):
-                            tainted.add(name.id)
+                    # Only a plain local name becomes tainted. Walking an
+                    # attribute target would pick up its RECEIVER, so
+                    # ``self._backend = backend`` would taint ``self`` and
+                    # every later ``self.x = ...`` would be reported as a write
+                    # through a local. That is how the first version of this
+                    # helper produced a false entry.
+                    if isinstance(target, ast.Name):
+                        tainted.add(target.id)
+                    elif isinstance(target, (ast.Tuple, ast.List)):
+                        for element in target.elts:
+                            if isinstance(element, ast.Name):
+                                tainted.add(element.id)
     return tainted
 
 
@@ -122,8 +131,15 @@ def _derive(path: Path):
     }
 
 
+# Every module that declares a contract. The admission package, plus any other
+# worker module already fully in the declared-input shape -- `sync.py` is the
+# only one on this tree, and a module that still has a worker-shaped method
+# cannot state a meaningful contract, because the worker would dominate it.
+EXTRA_MODULES = (ROOT / "batchgen" / "worker" / "sync.py",)
+
+
 def _modules():
-    return sorted(PACKAGE_DIR.glob("*.py"))
+    return sorted(PACKAGE_DIR.glob("*.py")) + list(EXTRA_MODULES)
 
 
 def _contract(path: Path):
@@ -230,7 +246,11 @@ def test_the_packages_whole_write_surface_is_three_named_things():
             if not name.startswith("timing."):
                 offenders.append(f"{path.name}: writes {name}")
         for name in sorted(derived["writes_via_local"]):
-            if not (path.name == "boundary_planner.py" and name.startswith("seq.")):
+            allowed = (
+                (path.name == "boundary_planner.py" and name.startswith("seq."))
+                or (path.name == "sync.py" and name == "seq.eos_reached")
+            )
+            if not allowed:
                 offenders.append(f"{path.name}: writes through a local {name}")
         for name in sorted(derived["mutates"]):
             if not (path.name == "decode_entry.py" and name == "all_candidates.sort()"):
