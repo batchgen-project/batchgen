@@ -2,6 +2,21 @@
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module
+# reads off the objects it is given, what it writes on them, what it
+# mutates through them, and the orderings it relies on. A change here
+# that the source does not match, or a source change this does not
+# cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (),
+    "writes": (),
+    "mutates": (),
+    "orderings": (
+        "nothing: the bundles are frozen and hold no behaviour.",
+    ),
+}
+
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 

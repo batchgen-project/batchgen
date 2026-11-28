@@ -19,6 +19,26 @@ gated on a condition its return value does not carry), and the two-line
 
 from __future__ import annotations
 
+# Declared contract, checked against this module's source by
+# tests/worker/test_admission_module_contracts.py: what this module
+# reads off the objects it is given, what it writes on them, what it
+# mutates through them, and the orderings it relies on. A change here
+# that the source does not match, or a source change this does not
+# cover, fails that test.
+MODULE_CONTRACT = {
+    "reads": (
+        "ctx.facts",
+        "ctx.prefix",
+        "ctx.sched",
+        "shared_segments.get",
+    ),
+    "writes": (),
+    "mutates": (),
+    "orderings": (
+        "nothing: the snapshot is a pure function of the candidates it is given.",
+    ),
+}
+
 import hashlib
 from typing import Dict, List, Tuple
 
