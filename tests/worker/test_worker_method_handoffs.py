@@ -32,7 +32,10 @@ object the value it needs, or a small owner object, instead of a door back to
 the worker -- and an entry that no longer matches must be removed, so a
 removed hand-off cannot quietly return.
 
-Measured on ``8ef48633``: 6 call sites, 8 hand-offs, 5 distinct receivers.
+Measured on ``8ef48633``: 6 call sites, 11 hand-offs counted as call site and
+method, 6 distinct worker methods, and 3 receiving objects -- the three
+``_traj.build_*`` entries are factories on the trajectory store, so the object
+that ends up holding those methods is reached through it.
 """
 import ast
 import re
