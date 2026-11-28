@@ -63,6 +63,26 @@ operand order.  Three of the four probe instruments SHARE
 its two fields; the fourth reads the parallel manager instead and takes its
 own.  The one worker write of the stage is the wave epilogue clearing the
 planned wave, handed back in :class:`PrefillPoolWaveFinishOutcome`.
+
+D7.5 converted the EXECUTION paths: ``prefill``, ``_prefill_model_pass``,
+``_write_prefill_tokens`` and ``_prefill_prepacked_pool``.  This is the first
+prefill stage since D7.2 with NO collective, no stream and no event in any of
+its bodies; what it carries instead is host synchronisation, and none of it
+moves.  Both token write-backs keep the one-copy-then-read pattern -- a single
+``new_tokens.cpu()`` outside the loop and ``.item()`` per row inside it -- and
+the pooled driver keeps its two ``tolist()`` reads at the wave boundary, so the
+file's host-sync call count is unchanged.  The stage declares NO outcome: every
+attribute store in the four bodies is an in-place mutation of an object a
+context carries by reference (the model wrapper's attention-2 flag, a
+sequence's EOS latch, the pool's four row handles), never a worker attribute
+binding.  Nothing is shared: no two of the four read sets are equal, and the
+token write-back's three fields, though a strict SUBSET of both drivers' sets,
+stay their own context so its delegator never resolves the model or the
+weight-copy pipeline it does not touch.  The pooled driver reaches the shared
+model pass as a collaborator callable, because the pass now takes a context
+the driver may not build; the still-worker-shaped prepacked driver (D7.6)
+builds that context at its own call site, which keeps the engine file from
+naming a worker attribute it did not name before.
 """
 
 from __future__ import annotations
@@ -602,6 +622,106 @@ class PrefillPoolWaveFinishOutcome:
     """
 
     _prefill_pool_wave: object = PREFILL_UNCHANGED
+
+
+# D7.5: the execution paths. Four contexts, one per body, and NO outcome. The
+# only attribute stores these bodies make are in-place mutations of objects a
+# context carries by reference -- the model wrapper's attention-2 flag, a
+# sequence's EOS latch and the pool's four row handles -- so nothing travels
+# back. Nothing is shared either: no two of the four read sets are EQUAL, which
+# is the only ground a share stands on. The token write-back is the tempting
+# one, because its three fields are a strict subset of both drivers' sets, and
+# it is refused: sharing a driver's context would make the write-back's
+# delegator resolve the model, the model config, the launch device and the
+# weight-copy pipeline on a call that only turns sampled rows into sequence
+# state.
+
+
+@dataclass(frozen=True)
+class PrefillBatchForwardContext:
+    """What the padded (non-prepacked) prefill forward reads.
+
+    The launch identity and device, the model it calls and the model config
+    whose ``model_type`` the family branch tests, the micro-batch size from the
+    engine config, the sequence pool and its local->uuid map, and the
+    weight-copy pipeline whose scope the whole forward runs inside. The family
+    branch itself is NOT resolved here: removing model-specific branches from
+    the worker and the engines is Phase E2's, so the name reader arrives as one
+    more collaborator and the branch is kept exactly as it was.
+    """
+
+    rank: int
+    torch_device: object
+    model: object
+    model_config: object
+    engine_config: object
+    pool: object
+    local_to_uuid: object
+    _weight_passes: object
+
+
+@dataclass(frozen=True)
+class PrefillModelPassContext:
+    """What the ONE prefill model loop reads.
+
+    The model wrapper it drives (embedding, decoder layers, depth mix, norm,
+    lm_head) and the parallel manager whose optional row-shard gather decides
+    the epilogue arm. Nothing else: this pass owns everything between the bound
+    state and the logits, and the drivers keep their own batch assembly, token
+    selection, trace emission and metrics. Neither
+    :class:`PrefillPoolLayoutContext` (cache + model) nor
+    :class:`MaterializedIndexKeyLayersContext` (the model alone) is this read
+    set, and the gather declaration is read here and in no other converted
+    body.
+    """
+
+    model: object
+    parallel_manager: object
+
+
+@dataclass(frozen=True)
+class PrefillTokenWritebackContext:
+    """What storing each sequence's first generated token reads.
+
+    The rank the refusal names, the sequence pool and its local->uuid map. Its
+    OWN context although these three are a subset of both drivers': this is the
+    one operation both prefill drivers end on, and a shared driver context
+    would make it resolve the model and the weight-copy pipeline it never
+    touches. The trajectory append and the EOS test are the worker's own
+    methods, so they arrive as collaborators, exactly as the pre-move body
+    called them.
+    """
+
+    rank: int
+    pool: object
+    local_to_uuid: object
+
+
+@dataclass(frozen=True)
+class PrefillPoolWaveRunContext:
+    """What running a planned pooled wave reads.
+
+    The three rank identities (the refusals and the metrics line name the rank,
+    the memory probes read the local rank, the metrics line reports the world
+    size), the workspace bound from the engine config, the sequence pool and
+    its local->uuid map, the parallel manager whose pool layout places the
+    engine layers' rows, the weight-copy pipeline each chunk steps, the planned
+    wave this body executes and the memory baseline the construction recorded.
+    Not :class:`PrefillPoolWavePlanContext`: that one reads the checkpoint name,
+    the device and the prefix runtime config, and never the memory baseline or
+    the weight passes.
+    """
+
+    rank: int
+    local_rank: int
+    world_size: int
+    engine_config: object
+    pool: object
+    local_to_uuid: object
+    parallel_manager: object
+    _weight_passes: object
+    _prefill_pool_wave: object
+    _prefill_pool_base: object
 
 
 class PrefillModelStateBinder(Protocol):
@@ -2589,15 +2709,32 @@ class PrefillEngine:
         return PrefillPoolWaveFinishOutcome(_prefill_pool_wave)
 
 
-    def prefill(self, worker, batch: list[int]):
+    def prefill(
+        self, ctx: PrefillBatchForwardContext, batch: list[int], *,
+        _bind_prefill_host_views: Callable[[], None],
+        _prefill_deepseek_family_name: Callable[[], str],
+        _trajectory_tokens: Callable[..., torch.Tensor],
+        feed_watchdog: Callable[[], None],
+        _bind_prefill_step_metadata: Callable[[object], None],
+        _bind_prefill_step_batch: Callable[[object], None],
+        _select_tokens: Callable[..., torch.Tensor],
+        _append_trajectory_batch: Callable[..., None],
+        _should_stop_at_eos: Callable[..., bool],
+    ):
         """
         Handle the prefill for a batch.
         batch: list of local indices
+
+        The padded forward, converted in D7.5: it reads the launch identity,
+        the model and its config, the micro-batch size, the sequence pool and
+        the weight-copy pipeline from :class:`PrefillBatchForwardContext`, and
+        every worker method it called arrives as a keyword-only collaborator.
+        The ONE attribute store it makes -- the family branch clearing the
+        model wrapper's attention-2 flag -- is an in-place mutation of the
+        model the context carries, so the stage declares no outcome. The
+        host-sync pair is untouched: the single device copy stays outside the
+        write-back loop and the per-row ``.item()`` stays inside it.
         """
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
         # Bind the attention wrappers' host_paged_kv_worker_view_aux BEFORE the decoder
         # loop. Without this binding, GLM-5's prefill indexer-K offload at
         # wrappers.py:_offload_prepacked_indexer_kv silently early-returns
@@ -2608,17 +2745,17 @@ class PrefillEngine:
         # it does NOT use the GPU paged KV manager. Binding host_*_aux here
         # ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
         # the host aux cache instead of early-returning on a None view.
-        self._bind_prefill_host_views()
+        _bind_prefill_host_views()
 
-        if self._prefill_deepseek_family_name() in self.model_config.model_type:
-            self.model.model._use_flash_attention_2 = False
+        if _prefill_deepseek_family_name() in ctx.model_config.model_type:
+            ctx.model.model._use_flash_attention_2 = False
 
         # Dynamic padding: find max length within THIS batch, not global max
         # This is critical for long-tailed distributions
         batch_seq_lengths = []
         for query_idx in batch:
-            uuid = self._local_to_uuid_map[query_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.local_to_uuid[query_idx]
+            seq = ctx.pool.get_sequence(uuid)
             batch_seq_lengths.append(int(seq.prompt_length))
         batch_max_len = max(batch_seq_lengths)
 
@@ -2626,10 +2763,10 @@ class PrefillEngine:
         padded_input_ids = []
         padded_attention_masks = []
         for query_idx in batch:
-            uuid = self._local_to_uuid_map[query_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.local_to_uuid[query_idx]
+            seq = ctx.pool.get_sequence(uuid)
             prompt_len = seq.prompt_length
-            seq_input_ids = self._trajectory_tokens(
+            seq_input_ids = _trajectory_tokens(
                 seq, length=prompt_len, dtype=torch.int64
             ).view(1, -1)
             seq_len = seq_input_ids.shape[1]
@@ -2657,32 +2794,32 @@ class PrefillEngine:
         attention_masks = torch.cat(padded_attention_masks, dim=0)
 
         num_prefill_micro_batches = math.ceil(
-            len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+            len(batch) / ctx.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
         )
         prefill_micro_batch_input_ids = torch.split(
             input_ids,
-            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
+            ctx.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
         )
         prefill_micro_batch_attention_masks = torch.split(
             attention_masks,
-            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
+            ctx.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
         )
-        if self.rank == 0:
+        if ctx.rank == 0:
             logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
 
         cur_batch_start = 0
         output_tokens = []
 
-        with self._weight_passes.scope("prefill"):
+        with ctx._weight_passes.scope("prefill"):
             for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
                 # Feed watchdog during long prefill operations
-                self.feed_watchdog()
-                self._weight_passes.begin(
+                feed_watchdog()
+                ctx._weight_passes.begin(
                     carry=micro_batch_idx + 1 < num_prefill_micro_batches
                 )
 
                 with torch.inference_mode():
-                    self._bind_prefill_step_metadata(
+                    _bind_prefill_step_metadata(
                         prefill_micro_batch_attention_masks[micro_batch_idx]
                     )
 
@@ -2690,22 +2827,22 @@ class PrefillEngine:
                     cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
 
                     # Pass local indices - the C++ layer handles rank offset internally
-                    self._bind_prefill_step_batch(cur_batch_local)
+                    _bind_prefill_step_batch(cur_batch_local)
 
                     cur_batch_start += cur_batch_size
                     assert len(cur_batch_local) == cur_batch_size
 
-                    outputs = self.model(
-                        prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
-                        attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
+                    outputs = ctx.model(
+                        prefill_micro_batch_input_ids[micro_batch_idx].to(ctx.torch_device, dtype=torch.int64),
+                        attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(ctx.torch_device),
                         use_cache=False,
                     )
                     cur_batch_sequences = [
-                        self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+                        ctx.pool.get_sequence(ctx.local_to_uuid[local_idx])
                         for local_idx in cur_batch_local
                     ]
-                    new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
-                    self._weight_passes.end()
+                    new_tokens = _select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
+                    ctx._weight_passes.end()
                     output_tokens.append(new_tokens)
 
         new_tokens = torch.cat(output_tokens, dim=0)
@@ -2714,27 +2851,28 @@ class PrefillEngine:
         # For evicted re-entry: first new token goes at decoded_length offset (not 0)
         # For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
         new_tokens_cpu = new_tokens.cpu()
-        self._append_trajectory_batch(batch, new_tokens_cpu)
+        _append_trajectory_batch(batch, new_tokens_cpu)
         for i, local_idx in enumerate(batch):
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
+            uuid = ctx.local_to_uuid[local_idx]
+            seq = ctx.pool.get_sequence(uuid)
             seq.advance_one_token()
 
             # MODIFIED: Check for EOS respecting ignore_eos flag
-            if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
+            if _should_stop_at_eos(new_tokens_cpu[i].item(), seq):
                 seq.eos_reached = True
 
         return new_tokens
 
     def _prefill_model_pass(
         self,
-        worker,
+        ctx: PrefillModelPassContext,
         input_ids: torch.Tensor,
         tail_rows,
         *,
         lmhead_fp32: bool,
         trace=None,
         layer_probe=None,
+        _record_unsharded_epilogue_gather: Callable[..., None],
     ):
         """One prefill model pass: embed -> layers -> depth-mix -> norm ->
         tail gather -> lm_head.
@@ -2768,20 +2906,25 @@ class PrefillEngine:
                 ``(layer_idx, decoder_layer, block_residual) -> None`` run
                 after every layer; the prepacked driver's env-gated memory
                 profile. Observation only -- it must not touch the tensors.
-        """
-        # The moved statements are kept VERBATIM from the two former inline
-        # loops where they agreed: source pins depend on the ``self.``
-        # spellings. Rebinding self to the worker preserves those spellings;
-        # this engine instance remains stateless.
-        self = worker
+            _record_unsharded_epilogue_gather: the worker's own hand-written
+                "no sharded gather" record, the collaborator the single-rank
+                arm calls. It has its own read set (the rank and the manager
+                it asserts the branch's premise against), so it stays a
+                callable instead of widening this context.
 
+        Converted in D7.5: the model it drives and the parallel manager whose
+        optional row-shard gather decides the epilogue arm arrive in
+        :class:`PrefillModelPassContext`. This body writes no worker attribute
+        and makes no host-synchronising call at all -- it is the one body of
+        the stage with neither.
+        """
         # The unsqueeze is a VIEW, so binding only ``hidden_states`` keeps
         # the embedding storage alive exactly as long as layer 0 needs it; a
         # second local pinning that storage for the whole stack cost 1.75 GiB
         # dead across layers 1-92 at S=131,072 / H=7168 / bf16
         # (batchgen_design/model_support/kimi_k3/PREFILL_MEMORY_AUDIT.md
         # section 7, fix 4).
-        hidden_states = self.model.model.embed_tokens(input_ids).unsqueeze(0)
+        hidden_states = ctx.model.model.embed_tokens(input_ids).unsqueeze(0)
 
         # Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
         # classic residual body, so the per-layer state has to be carried
@@ -2789,16 +2932,16 @@ class PrefillEngine:
         # model runs happily while computing something that is not K3 --
         # wrong text, no error. Mirrors KimiLinearModel.forward
         # (kimi_linear/model.py:880-910), which is the eager reference.
-        use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
+        use_attn_res = getattr(ctx.model.model, "use_attn_residuals", False)
         block_residual = None
         if use_attn_res:
             # Zero-column view of a buffer preallocated for ALL the
             # stack's block boundaries, so the per-boundary `cat` never
             # holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
             # GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
-            block_residual = self.model.model._new_block_residual(hidden_states)
+            block_residual = ctx.model.model._new_block_residual(hidden_states)
 
-        for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+        for layer_idx, decoder_layer in enumerate(ctx.model.model.layers):
             if use_attn_res:
                 hidden_states, block_residual = decoder_layer(
                     hidden_states,
@@ -2828,7 +2971,7 @@ class PrefillEngine:
         if use_attn_res and tail_rows is not None:
             hidden_dim = hidden_states.shape[2]
             batch_sz, seq_sz = hidden_states.shape[:2]
-            hidden_states = self.model.model._apply_output_attn_res(
+            hidden_states = ctx.model.model._apply_output_attn_res(
                 hidden_states.view(-1, hidden_dim), block_residual
             ).view(batch_sz, seq_sz, hidden_dim)
         if use_attn_res:
@@ -2837,27 +2980,27 @@ class PrefillEngine:
             # here rather than left pinned until the next seed
             # (PREFILL_MEMORY_AUDIT.md fix 3).
             block_residual = None
-            self.model.model._release_block_residual()
+            ctx.model.model._release_block_residual()
 
         if tail_rows is None:
             return None
 
         gather_last_token_hidden = getattr(
-            self.parallel_manager,
+            ctx.parallel_manager,
             "gather_prefill_last_token_hidden",
             None,
         )
         if gather_last_token_hidden is None:
             # Final norm over the tail rows only: RMSNorm is per-row, so
             # norming the gathered rows equals gathering the normed rows.
-            last_token_hidden = self.model.model.norm(
+            last_token_hidden = ctx.model.model.norm(
                 hidden_states[:, tail_rows, :]
             )[0]
             if trace is not None:
                 # Genuinely single-rank: this manager has no gather, so
                 # the rank holds every row. Asserted inside, not
                 # assumed - see _record_unsharded_epilogue_gather.
-                self._record_unsharded_epilogue_gather(
+                _record_unsharded_epilogue_gather(
                     trace,
                     last_token_hidden,
                     num_global_rows=int(input_ids.numel()),
@@ -2869,7 +3012,7 @@ class PrefillEngine:
             # only in there. Writing a tp=0/1 record out here instead would
             # report a broken multi-rank gather as healthy.
             last_token_hidden = gather_last_token_hidden(
-                self.model.model.norm(hidden_states),
+                ctx.model.model.norm(hidden_states),
                 tail_rows,
                 int(input_ids.numel()),
                 **(
@@ -2882,23 +3025,23 @@ class PrefillEngine:
         # lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
         # The FP32 cast rides the driver's debug-state read (a debug-state
         # key; no env guard).
-        if getattr(self.model.lm_head, "tp_size", 1) > 1:
+        if getattr(ctx.model.lm_head, "tp_size", 1) > 1:
             # vocab-parallel head (K3 TP8): the module all_gathers the
             # full logits; the raw shard weight must not be used here.
             # .forward skips the decode-only pre-hook (``[:, -1, :]``
             # expects [bsz, seq, H]; this input is the gathered [n, H]).
-            logits = self.model.lm_head.forward(last_token_hidden).float()
+            logits = ctx.model.lm_head.forward(last_token_hidden).float()
         elif lmhead_fp32:
             logits = torch.nn.functional.linear(
                 last_token_hidden.float(),
-                self.model.lm_head.weight.float(),
-                self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+                ctx.model.lm_head.weight.float(),
+                ctx.model.lm_head.bias.float() if hasattr(ctx.model.lm_head, 'bias') and ctx.model.lm_head.bias is not None else None
             )
         else:
             logits = torch.nn.functional.linear(
                 last_token_hidden,
-                self.model.lm_head.weight,
-                self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+                ctx.model.lm_head.weight,
+                ctx.model.lm_head.bias if hasattr(ctx.model.lm_head, 'bias') and ctx.model.lm_head.bias is not None else None
             ).float()
         return logits
 
@@ -3309,13 +3452,26 @@ class PrefillEngine:
                     unpooled_trace.begin_chunk(batch_idx)
                 # The ONE model loop (embed -> layers -> depth-mix -> norm ->
                 # tail gather -> lm_head), shared with the pooled driver.
+                # D7.5 converted the pass, so it takes its own declared
+                # context: this driver is still worker-shaped, so it builds
+                # that context here from the two attributes it already reads
+                # and keeps the direct engine call. Routing this call through
+                # the worker's delegator instead would make the engine file
+                # name a worker attribute (`_prefill_model_pass`) it has never
+                # named, which the boundary census counts as a rise. D7.6
+                # converts this driver and the call becomes a collaborator,
+                # exactly as in the pooled driver.
                 logits = _engine._prefill_model_pass(
-                    self,
+                    PrefillModelPassContext(
+                        model=self.model,
+                        parallel_manager=self.parallel_manager,
+                    ),
                     batch_input_ids_flat.to(self.torch_device, dtype=torch.int64),
                     last_token_indices,
                     lmhead_fp32=_lmhead_fp32,
                     trace=unpooled_trace,
                     layer_probe=_memprof_probe,
+                    _record_unsharded_epilogue_gather=self._record_unsharded_epilogue_gather,
                 )
                 if _k3_profile_enabled:
                     _k3_profile_logits.append(logits.detach())
@@ -3464,33 +3620,63 @@ class PrefillEngine:
         new_tokens = torch.cat(output_tokens, dim=0)
         return self._write_prefill_tokens(batch, new_tokens)
 
-    def _prefill_prepacked_pool(self, worker, batch: list[int]) -> torch.Tensor:
-        """Prefill a planned wave: each pooled segment once, then every tail."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        _engine = self
-        self = worker
+    def _prefill_prepacked_pool(
+        self, ctx: PrefillPoolWaveRunContext, batch: list[int], *,
+        _construct_prefill_pool: Callable[[object], None],
+        _new_pool_epilogue_tracer: Callable[[object], object],
+        _bind_prefill_pool_segments: Callable[[object], None],
+        _bind_prefill_pool_layer_state: Callable[[object, object], None],
+        _materialized_segment_loader: Callable[[object], object],
+        feed_watchdog: Callable[[], None],
+        _install_prefill_pool_rows: Callable[..., None],
+        _load_materialized_segments: Callable[..., int],
+        _prefill_model_pass: Callable[..., object],
+        _select_tokens: Callable[..., torch.Tensor],
+        _release_kda_state_slots: Callable[[list], None],
+        _drop_prefill_pool_offload_recorder: Callable[[], None],
+        _unbind_prefill_pool_segments: Callable[[], None],
+        _write_prefill_tokens: Callable[..., torch.Tensor],
+    ) -> torch.Tensor:
+        """Prefill a planned wave: each pooled segment once, then every tail.
+
+        Converted in D7.5. :class:`PrefillPoolWaveRunContext` carries the three
+        rank identities, the workspace bound, the sequence pool and its map,
+        the PSM, the weight-copy pipeline, the planned wave and the memory
+        baseline; the fourteen worker methods this body called arrive as
+        keyword-only collaborators. Fourteen, not thirteen: the shared model
+        pass is now converted too, so it no longer accepts the worker and is
+        reached as a collaborator like the rest -- the still-worker-shaped
+        prepacked driver (D7.6) keeps the direct engine call and builds the
+        pass's context at its own call site, so this file names no worker
+        attribute it did not name before.
+
+        The four stores in the ``finally`` (``wave.pool.kernel_dump`` and the
+        three row handles) are in-place mutations of the pool the wave carries,
+        not worker attributes, so the stage declares no outcome. Both
+        ``tolist()`` reads keep their place: the trace row list inside the
+        armed-tracer branch of a tail chunk, and the metrics line's sampled ids
+        after the wave has drained.
+        """
         from batchgen.prefix_reuse.wave_plan import prefill_plan_work
 
-        wave = self._prefill_pool_wave
+        wave = ctx._prefill_pool_wave
         if wave.pool is None:
-            self._construct_prefill_pool(wave)
+            _construct_prefill_pool(wave)
         index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
-        order = [index_of[self._local_to_uuid_map[local_idx]] for local_idx in batch]
+        order = [index_of[ctx.local_to_uuid[local_idx]] for local_idx in batch]
         if sorted(order) != list(range(len(wave.uuids))):
             raise RuntimeError(
-                f"Rank {self.rank}: prefill batch does not match the planned wave"
+                f"Rank {ctx.rank}: prefill batch does not match the planned wave"
             )
         workspace = int(
-            self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+            ctx.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
         )
         # The model seams prefill_prepacked also goes through (K3 block
         # residual + depth mix, streamed-SP8 row-shard gather, vocab-parallel
         # lm_head) live in the shared ``_prefill_model_pass``, duck-typed so
         # they collapse to the plain path.
         # Batch-level ``prefix_pool_epilogue_trace``: None in production.
-        epilogue_trace = self._new_pool_epilogue_tracer(wave)
+        epilogue_trace = _new_pool_epilogue_tracer(wave)
         if epilogue_trace is not None:
             # The wave boundary is the earliest point this seam can stamp: the
             # plan and the Host attachment happen in the reservation
@@ -3506,26 +3692,26 @@ class PrefillEngine:
         executed = 0
         workspace_peak = 0
         reserved_peak = 0
-        base_alloc, base_reserved, base_other = self._prefill_pool_base
+        base_alloc, base_reserved, base_other = ctx._prefill_pool_base
         # As in prefill_prepacked: layers offload through these views, and a DSA
         # model writes its indexer keys through the aux one.
-        self._bind_prefill_pool_segments(wave)
+        _bind_prefill_pool_segments(wave)
         # The pool row of an engine layer comes from the model's own pool
         # layout, never from a KV cache's layer mapping: a cache that keeps
         # every layer resolves to itself and would index past the pool.
-        pool_layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
-        self._bind_prefill_pool_layer_state(wave, pool_layout)
+        pool_layout = getattr(ctx.parallel_manager, "prefill_pool_layout", None)
+        _bind_prefill_pool_layer_state(wave, pool_layout)
         # Staging for the wave's loads; None unless it materializes something.
-        materialized_loader = self._materialized_segment_loader(wave)
+        materialized_loader = _materialized_segment_loader(wave)
         materialized_tokens = 0
         offload_recorder_handed_off = False
         try:
             start = time.perf_counter()
             for chunk_index, chunk in enumerate(
-                tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0))
+                tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(ctx.rank != 0))
             ):
-                self.feed_watchdog()
-                self._weight_passes.begin(
+                feed_watchdog()
+                ctx._weight_passes.begin(
                     carry=chunk_index + 1 < len(wave.plan.chunks)
                 )
                 rows = wave.executor.build(chunk)
@@ -3536,11 +3722,11 @@ class PrefillEngine:
                         tokens=int(rows.input_ids.numel()),
                     )
                 host_ids, host_starts = wave.row_host_targets(rows)
-                self._install_prefill_pool_rows(rows, host_ids, host_starts)
+                _install_prefill_pool_rows(rows, host_ids, host_starts)
                 # Before the forward, never during it: every layer's pool row
                 # holds the committed prefix by the time any row attends over
                 # it, and a failure here has not yet touched the forward.
-                materialized_tokens += self._load_materialized_segments(
+                materialized_tokens += _load_materialized_segments(
                     wave, rows, materialized_loader
                 )
                 # The ONE model loop (embed -> layers -> depth-mix -> norm ->
@@ -3550,17 +3736,19 @@ class PrefillEngine:
                 # and returns None. The pooled wave has never read the
                 # unpooled driver's lm_head FP32 debug key; this step is
                 # behaviour-preserving, so it keeps passing False.
-                logits = _engine._prefill_model_pass(
-                    self,
+                # The pass is now converted too, so it arrives as a
+                # collaborator instead of being called on the engine with the
+                # worker: its context is the delegator's to build.
+                logits = _prefill_model_pass(
                     rows.input_ids,
                     rows.tail_rows if rows.tail_wave_indices else None,
                     lmhead_fp32=False,
                     trace=epilogue_trace,
                 )
                 if rows.tail_wave_indices:
-                    selected = self._select_tokens(
+                    selected = _select_tokens(
                         logits,
-                        [self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
+                        [ctx.pool.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
                     )
                     for row, index in enumerate(rows.tail_wave_indices):
                         tokens_by_index[index] = selected[row]
@@ -3586,7 +3774,7 @@ class PrefillEngine:
                 # The chunk's hidden state and the K3 block-residual buffer
                 # were dropped/released inside the model pass before it
                 # returned (PREFILL_MEMORY_AUDIT.md fix 3).
-                self._weight_passes.end()
+                ctx._weight_passes.end()
                 executed += int(rows.input_ids.numel())
                 wave.executor.finish(chunk)
                 if epilogue_trace is not None:
@@ -3597,18 +3785,18 @@ class PrefillEngine:
                 # Allocated bytes are what a chunk needs. The allocator's reserve
                 # grows into whatever the pool left free and drops cached blocks
                 # only when a cudaMalloc fails, so it is reported, not checked.
-                free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
-                reserved_now = torch.cuda.memory_reserved(self.local_rank)
+                free_now, device_total = torch.cuda.mem_get_info(ctx.local_rank)
+                reserved_now = torch.cuda.memory_reserved(ctx.local_rank)
                 reserved_peak = max(
                     reserved_peak,
-                    torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
+                    torch.cuda.max_memory_reserved(ctx.local_rank) - base_reserved
                     + (device_total - free_now - reserved_now) - base_other,
                 )
-                peak = torch.cuda.max_memory_allocated(self.local_rank) - base_alloc
+                peak = torch.cuda.max_memory_allocated(ctx.local_rank) - base_alloc
                 workspace_peak = max(workspace_peak, peak)
                 if peak > workspace:
                     raise RuntimeError(
-                        f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
+                        f"Rank {ctx.rank}: prefill workspace peaked at {peak} B, above the "
                         f"{workspace} B kept beside the prefix pool"
                     )
             prefill_s = time.perf_counter() - start
@@ -3625,7 +3813,7 @@ class PrefillEngine:
                 )
             if executed != wave.plan.computed_tokens:
                 raise RuntimeError(
-                    f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
+                    f"Rank {ctx.rank}: pool prefill ran {executed} tokens, planned "
                     f"{wave.plan.computed_tokens}"
                 )
             wave.executor.close()
@@ -3635,11 +3823,11 @@ class PrefillEngine:
             offload_recorder_handed_off = True
         finally:
             if wave.pool.free_pages != wave.pool.num_pages:
-                logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
+                logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", ctx.rank)
             # A segment's recurrent state is keyed by its pseudo sequence id and
             # has to live across the chunks that continue it, so it is released
             # here — the wave is over and no later batch carries those ids.
-            self._release_kda_state_slots(list(wave.segment_sids.values()))
+            _release_kda_state_slots(list(wave.segment_sids.values()))
             if materialized_loader is not None:
                 for group_loader in materialized_loader.values():
                     group_loader.release()
@@ -3651,9 +3839,9 @@ class PrefillEngine:
             # handed it to the post-D2H verification step.
             wave.pool.kernel_dump = None
             if not offload_recorder_handed_off:
-                self._drop_prefill_pool_offload_recorder()
+                _drop_prefill_pool_offload_recorder()
             wave.pool.k = wave.pool.v = wave.pool.indexer = None
-            self._unbind_prefill_pool_segments()
+            _unbind_prefill_pool_segments()
             torch.cuda.empty_cache()
         work = prefill_plan_work(wave.plan)
         new_tokens = torch.stack([tokens_by_index[index] for index in order])
@@ -3665,13 +3853,13 @@ class PrefillEngine:
         # above has drained the compute stream, so the tolist() is a
         # wave-boundary scalar transfer, same as the prepacked emission.
         wave_seq_lens = [
-            int(self.global_batch.get_sequence(uuid).prompt_length)
+            int(ctx.pool.get_sequence(uuid).prompt_length)
             for uuid in wave.uuids
         ]
         logging.info("[METRICS] " + json.dumps({
             "component": "prefix_pool",
             "phase": "prefill",
-            "rank": self.rank,
+            "rank": ctx.rank,
             "sequences": len(order),
             "prompt_tokens": wave.plan.prompt_tokens,
             "computed_tokens": executed,
@@ -3690,22 +3878,32 @@ class PrefillEngine:
             "prefill_s": prefill_s,
             "seq_len_min": min(wave_seq_lens) if wave_seq_lens else 0,
             "seq_len_max": max(wave_seq_lens) if wave_seq_lens else 0,
-            "world_size": self.world_size,
+            "world_size": ctx.world_size,
             "first_sampled_token_ids": (
                 new_tokens.reshape(-1).tolist()[:16]
             ),
         }, separators=(",", ":")))
-        return self._write_prefill_tokens(batch, new_tokens)
+        return _write_prefill_tokens(batch, new_tokens)
 
-    def _write_prefill_tokens(self, worker, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
-        """Store each sequence's first generated token (batch order)."""
-        # The moved body is kept VERBATIM from batchgen_worker.py: source pins
-        # depend on its original self. spellings. Rebinding self to the worker
-        # preserves those spellings; this engine instance remains stateless.
-        self = worker
+    def _write_prefill_tokens(
+        self, ctx: PrefillTokenWritebackContext, batch: list[int],
+        new_tokens: torch.Tensor, *,
+        _append_trajectory_token: Callable[..., None],
+        _should_stop_at_eos: Callable[..., bool],
+    ) -> torch.Tensor:
+        """Store each sequence's first generated token (batch order).
+
+        Converted in D7.5. Both prefill drivers end here, so this reads its
+        own three values (:class:`PrefillTokenWritebackContext`) rather than
+        sharing either driver's wider context. The EOS latch it sets lives on
+        the sequence the pool handed back, in place, so no outcome is needed.
+        The device copy stays where it was -- ONE ``new_tokens.cpu()`` before
+        the loop, and both per-row ``.item()`` reads inside it, on the host
+        copy.
+        """
         if new_tokens.shape[0] != len(batch):
             raise RuntimeError(
-                f"Rank {self.rank}: prefill writeback shape mismatch, "
+                f"Rank {ctx.rank}: prefill writeback shape mismatch, "
                 f"got {new_tokens.shape[0]} rows for {len(batch)} local sequences"
             )
 
@@ -3713,15 +3911,15 @@ class PrefillEngine:
         # For evicted re-entry: first new token goes at decoded_length offset (not 0)
         new_tokens_cpu = new_tokens.cpu()
         for i, local_idx in enumerate(batch):
-            uuid = self._local_to_uuid_map[local_idx]
-            seq = self.global_batch.get_sequence(uuid)
-            self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
+            uuid = ctx.local_to_uuid[local_idx]
+            seq = ctx.pool.get_sequence(uuid)
+            _append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
             # The unified book owns the append position. Keep the scalar
             # completion counter in lockstep for fresh prefill and KV re-entry.
             seq.advance_one_token()
 
             # Check for EOS respecting ignore_eos flag
-            if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
+            if _should_stop_at_eos(new_tokens_cpu[i].item(), seq):
                 seq.eos_reached = True
 
         return new_tokens

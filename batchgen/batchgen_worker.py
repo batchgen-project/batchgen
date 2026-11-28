@@ -10382,15 +10382,49 @@ class BatchGenWorker:
 		)
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillPoolWaveRunContext
+		# Read HERE, not from a held snapshot: the planned wave is bound per
+		# wave and the memory baseline is written by the pool construction the
+		# body may itself trigger on its first statement.
 		return engine._prefill_prepacked_pool(
-			self,
+			PrefillPoolWaveRunContext(
+				rank=self.rank,
+				local_rank=self.local_rank,
+				world_size=self.world_size,
+				engine_config=self.engine_config,
+				pool=self.global_batch,
+				local_to_uuid=self._local_to_uuid_map,
+				parallel_manager=self.parallel_manager,
+				_weight_passes=self._weight_passes,
+				_prefill_pool_wave=self._prefill_pool_wave,
+				_prefill_pool_base=self._prefill_pool_base,
+			),
 			batch,
+			# Fourteen collaborators, each this worker's own method of that
+			# name -- what the pre-move body called. The model pass is one of
+			# them since D7.5: it no longer accepts the worker, so the pooled
+			# driver reaches it through this delegator, which builds its
+			# context.
+			_construct_prefill_pool=self._construct_prefill_pool,
+			_new_pool_epilogue_tracer=self._new_pool_epilogue_tracer,
+			_bind_prefill_pool_segments=self._bind_prefill_pool_segments,
+			_bind_prefill_pool_layer_state=self._bind_prefill_pool_layer_state,
+			_materialized_segment_loader=self._materialized_segment_loader,
+			feed_watchdog=self.feed_watchdog,
+			_install_prefill_pool_rows=self._install_prefill_pool_rows,
+			_load_materialized_segments=self._load_materialized_segments,
+			_prefill_model_pass=self._prefill_model_pass,
+			_select_tokens=self._select_tokens,
+			_release_kda_state_slots=self._release_kda_state_slots,
+			_drop_prefill_pool_offload_recorder=self._drop_prefill_pool_offload_recorder,
+			_unbind_prefill_pool_segments=self._unbind_prefill_pool_segments,
+			_write_prefill_tokens=self._write_prefill_tokens,
 		)
 
 	def _pool_probe_context(self):
@@ -10433,19 +10467,29 @@ class BatchGenWorker:
 	def _prefill_model_pass(
 		self, input_ids, tail_rows, *, lmhead_fp32, trace=None, layer_probe=None
 	):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillModelPassContext
+		# Read HERE, not from a held snapshot: the model is bound and dropped
+		# with the phase, and this pass runs once per micro-batch or chunk.
 		return engine._prefill_model_pass(
-			self,
+			PrefillModelPassContext(
+				model=self.model,
+				parallel_manager=self.parallel_manager,
+			),
 			input_ids,
 			tail_rows,
 			lmhead_fp32=lmhead_fp32,
 			trace=trace,
 			layer_probe=layer_probe,
+			# The unsharded-gather record has its own read set (the rank and
+			# the manager it asserts the premise against), so it stays this
+			# worker's method of that name.
+			_record_unsharded_epilogue_gather=self._record_unsharded_epilogue_gather,
 		)
 
 	def _record_unsharded_epilogue_gather(self, tracer, selected, *, num_global_rows) -> None:
@@ -11683,16 +11727,41 @@ class BatchGenWorker:
 	# ============ Prefill and Decode ============
 
 	def prefill(self, batch: list[int]):
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		# PrefillEngine is stateless; this lazy path (shared by every delegator) only serves test fakes built without __init__ -- deliberate, not a special-case branch.
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillBatchForwardContext
+		# Read HERE, not from a held snapshot: the model, its config and the
+		# weight-copy pipeline are bound and dropped with the phase.
 		return engine.prefill(
-			self,
+			PrefillBatchForwardContext(
+				rank=self.rank,
+				torch_device=self.torch_device,
+				model=self.model,
+				model_config=self.model_config,
+				engine_config=self.engine_config,
+				pool=self.global_batch,
+				local_to_uuid=self._local_to_uuid_map,
+				_weight_passes=self._weight_passes,
+			),
 			batch,
+			# Nine collaborators, each this worker's own method of that name --
+			# what the pre-move body called. The deepseek-family name reader
+			# is one of them: removing model-specific branches is Phase E2's,
+			# so the branch is kept and only its route changes.
+			_bind_prefill_host_views=self._bind_prefill_host_views,
+			_prefill_deepseek_family_name=self._prefill_deepseek_family_name,
+			_trajectory_tokens=self._trajectory_tokens,
+			feed_watchdog=self.feed_watchdog,
+			_bind_prefill_step_metadata=self._bind_prefill_step_metadata,
+			_bind_prefill_step_batch=self._bind_prefill_step_batch,
+			_select_tokens=self._select_tokens,
+			_append_trajectory_batch=self._append_trajectory_batch,
+			_should_stop_at_eos=self._should_stop_at_eos,
 		)
 
 	def prefill_prepacked(self, batch: list[int]):
@@ -11711,16 +11780,26 @@ class BatchGenWorker:
 		)
 
 	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
-		# The engine receives this worker as its sole state collaborator.
+		# Resolve values and live collaborators at the worker boundary.
 		engine = getattr(self, "_prefill_engine", None)
 		if engine is None:
 			from batchgen.worker.prefill_engine import PrefillEngine
 			engine = PrefillEngine()
 			self._prefill_engine = engine
+		from batchgen.worker.prefill_engine import PrefillTokenWritebackContext
+		# Read HERE, not from a held snapshot: both prefill drivers end on this
+		# call and the local map is rebuilt per batch.
 		return engine._write_prefill_tokens(
-			self,
+			PrefillTokenWritebackContext(
+				rank=self.rank,
+				pool=self.global_batch,
+				local_to_uuid=self._local_to_uuid_map,
+			),
 			batch,
 			new_tokens,
+			# Both are this worker's own methods of that name.
+			_append_trajectory_token=self._append_trajectory_token,
+			_should_stop_at_eos=self._should_stop_at_eos,
 		)
 
 	# ============ PREFILL MODEL-STATE BINDER (S5b) ============

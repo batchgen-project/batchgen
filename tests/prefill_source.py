@@ -13,9 +13,11 @@ the real body changes, and re-implements nothing.
 import ast
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -50,6 +52,12 @@ CONTEXT_CLASSES = {
     "PrefillPoolWavePlanContext",
     "UnshardedEpilogueGatherContext",
     "PrefillPoolWaveFinishContext",
+    # D7.5: the execution paths. Four new contexts, no reuse -- no two of the
+    # four read sets are equal.
+    "PrefillBatchForwardContext",
+    "PrefillModelPassContext",
+    "PrefillTokenWritebackContext",
+    "PrefillPoolWaveRunContext",
 }
 # The frozen outcomes this engine declares: a converted body hands its worker
 # writes back in one of these for the delegator to apply.
@@ -117,6 +125,16 @@ D7_4_METHODS = {
     "_new_pool_kernel_dump_recorder",
     "_new_pool_offload_check_recorder",
 }
+# The D7.5 names: the execution paths. All four read worker state, so none of
+# them is stateless, and none of them writes a worker attribute, so none has an
+# outcome -- the first prefill stage since D7.2 with neither a collective nor
+# an outcome.
+D7_5_METHODS = {
+    "prefill",
+    "_prefill_model_pass",
+    "_write_prefill_tokens",
+    "_prefill_prepacked_pool",
+}
 STATELESS_METHODS = {
     "_prefix_rank_packing_mode", "_prefix_rank_cost_profile_disabled",
     "_unmaterializable_frontier", "_prefix_pool_index_key_carrier",
@@ -142,7 +160,7 @@ COLLECTIVE_METHODS = {
 }
 METHODS = (
     set(D7_1_METHODS) | set(D7_2_METHODS) | set(D7_3_METHODS)
-    | set(D7_4_METHODS)
+    | set(D7_4_METHODS) | set(D7_5_METHODS)
 )
 
 
@@ -201,6 +219,11 @@ def load_prefill(namespace=None):
         hashlib=hashlib,
         # D7.4: the micro-batch planner reads the real L2-balance switch.
         os=os,
+        # D7.5: the pooled driver times its wave and serialises its metrics
+        # line with the real modules. ``tqdm`` stays caller-supplied, like
+        # ``dist``: a progress bar over a fake plan has to be observed.
+        time=time,
+        json=json,
     ).items():
         namespace.setdefault(name, value)
     tree = ast.parse(SOURCE.read_text())

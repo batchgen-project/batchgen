@@ -107,11 +107,19 @@ def test_the_unpooled_driver_hands_its_read_to_the_pass_and_the_pool_keeps_false
 
     expected = {"prefill_prepacked": LOCAL, "_prefill_prepacked_pool": "False"}
     for driver, value in expected.items():
+        # D7.5 converted the pass, so the pooled driver (converted too) reaches
+        # it as a keyword-only collaborator -- a bare ``Name`` callee -- while
+        # the still-worker-shaped unpooled driver keeps the direct engine call.
+        # The flag it hands over is the claim here, not the route.
         calls = [
             node for node in ast.walk(_method(driver))
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_prefill_model_pass"
+            and (
+                (isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "_prefill_model_pass")
+                or (isinstance(node.func, ast.Name)
+                    and node.func.id == "_prefill_model_pass")
+            )
         ]
         assert len(calls) == 1, driver
         kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}

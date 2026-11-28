@@ -66,11 +66,20 @@ def _engine_functions():
 
 
 def _calls_of(node, attr):
+    """Calls of ``attr``, whichever route the caller reaches it by.
+
+    D7.5 converted ``_prefill_model_pass`` and the pooled driver: a converted
+    body receives the operations it calls as keyword-only collaborators, so the
+    callee is a bare ``Name`` there and an ``Attribute`` in a still
+    worker-shaped body. Both are the same call.
+    """
     return [
         n for n in ast.walk(node)
         if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == attr
+        and (
+            (isinstance(n.func, ast.Attribute) and n.func.attr == attr)
+            or (isinstance(n.func, ast.Name) and n.func.id == attr)
+        )
     ]
 
 
@@ -125,18 +134,35 @@ def test_the_drivers_hand_the_pass_their_own_seams():
         "lmhead_fp32": "_lmhead_fp32",
         "trace": "unpooled_trace",
         "layer_probe": "_memprof_probe",
+        # D7.5: the pass's one collaborator, which it no longer reaches
+        # through a worker. The pooled driver does not pass it -- its own
+        # delegator resolves it.
+        "_record_unsharded_epilogue_gather": (
+            "self._record_unsharded_epilogue_gather"
+        ),
     }
     assert pool_kwargs == {
         "lmhead_fp32": "False",
         "trace": "epilogue_trace",
     }
-    # The pooled chunk's tail arm: segments-only chunks pass None. The first
-    # positional is the worker (the drivers call the pass on the engine
-    # instance captured before the verbatim self-rebinding, so the engine
-    # file reads no new worker attribute).
-    assert ast.unparse(pool.args[0]) == "self"
-    assert ast.unparse(pool.args[2]) == (
-        "rows.tail_rows if rows.tail_wave_indices else None"
+    # The pooled chunk's tail arm: segments-only chunks pass None. Since D7.5
+    # the pass takes a declared context, so no driver hands it a worker: the
+    # CONVERTED pooled driver receives the pass itself as a keyword-only
+    # collaborator and passes the chunk ids and the tail arm, nothing else.
+    assert isinstance(pool.func, ast.Name)
+    assert [ast.unparse(arg) for arg in pool.args] == [
+        "rows.input_ids",
+        "rows.tail_rows if rows.tail_wave_indices else None",
+    ]
+    # The still worker-shaped unpooled driver (D7.6) keeps the direct engine
+    # call and builds the pass's context at the call site, out of the two
+    # attributes it already reads -- routing it through the worker's delegator
+    # instead would make the engine file name a worker attribute it has never
+    # named, which the boundary census counts as a rise.
+    assert ast.unparse(prepacked.func) == "_engine._prefill_model_pass"
+    assert ast.unparse(prepacked.args[0]) == (
+        "PrefillModelPassContext(model=self.model, "
+        "parallel_manager=self.parallel_manager)"
     )
 
 
@@ -417,29 +443,66 @@ def test_norming_the_gathered_rows_equals_gathering_the_normed_rows(dtype):
 # --------------------------------------------------------------------------- #
 
 
-def test_the_worker_delegator_forwards_to_the_engine_pass():
+def test_the_worker_delegator_builds_the_passs_context_and_collaborator():
+    """D7.5: the delegator resolves the pass's two values and its one callable.
+
+    The pass no longer receives the worker, so the claim this replaces ("the
+    delegator forwards the worker unchanged") is no longer true of anything.
+    What it forwards now is the declared context -- read LIVE, because the
+    model is bound and dropped with the phase -- plus the unsharded-gather
+    record, which keeps its own read set and therefore stays a callable.
+    """
+    import sys as _sys
+    from types import ModuleType
+
     seen = {}
 
     class Engine:
         def _prefill_model_pass(
-            self, worker, input_ids, tail_rows, *, lmhead_fp32,
+            self, ctx, input_ids, tail_rows, *, lmhead_fp32,
             trace=None, layer_probe=None,
+            _record_unsharded_epilogue_gather,
         ):
             seen.update(
-                worker=worker, input_ids=input_ids, tail_rows=tail_rows,
+                ctx=ctx, input_ids=input_ids, tail_rows=tail_rows,
                 lmhead_fp32=lmhead_fp32, trace=trace, layer_probe=layer_probe,
+                record=_record_unsharded_epilogue_gather,
             )
             return "logits"
 
-    delegator = load_worker_methods(["_prefill_model_pass"], {})[
-        "_prefill_model_pass"
-    ]
-    worker = SimpleNamespace(_prefill_engine=Engine())
-    ids, rows, trace, probe = object(), object(), object(), object()
-    assert delegator(
-        worker, ids, rows, lmhead_fp32=True, trace=trace, layer_probe=probe
-    ) == "logits"
+    class PrefillModelPassContext:
+        def __init__(self, *, model, parallel_manager):
+            self.model, self.parallel_manager = model, parallel_manager
+
+    module = ModuleType("batchgen.worker.prefill_engine")
+    module.PrefillModelPassContext = PrefillModelPassContext
+    saved = _sys.modules.get("batchgen.worker.prefill_engine")
+    _sys.modules["batchgen.worker.prefill_engine"] = module
+    try:
+        delegator = load_worker_methods(["_prefill_model_pass"], {})[
+            "_prefill_model_pass"
+        ]
+        model, manager = object(), object()
+        record = lambda *a, **k: None  # noqa: E731
+        worker = SimpleNamespace(
+            _prefill_engine=Engine(), model=model, parallel_manager=manager,
+            _record_unsharded_epilogue_gather=record,
+        )
+        ids, rows, trace, probe = object(), object(), object(), object()
+        assert delegator(
+            worker, ids, rows, lmhead_fp32=True, trace=trace,
+            layer_probe=probe,
+        ) == "logits"
+    finally:
+        if saved is None:
+            del _sys.modules["batchgen.worker.prefill_engine"]
+        else:
+            _sys.modules["batchgen.worker.prefill_engine"] = saved
+
+    ctx = seen.pop("ctx")
+    assert isinstance(ctx, PrefillModelPassContext)
+    assert ctx.model is model and ctx.parallel_manager is manager
     assert seen == {
-        "worker": worker, "input_ids": ids, "tail_rows": rows,
-        "lmhead_fp32": True, "trace": trace, "layer_probe": probe,
+        "input_ids": ids, "tail_rows": rows, "lmhead_fp32": True,
+        "trace": trace, "layer_probe": probe, "record": record,
     }
